@@ -17,6 +17,7 @@
 
 ### Windows 系统要求
 
+- v0.1.0 仅提供 Windows 桌面版本；Android/iOS 不在本版本发布范围内。
 - Windows 10 1809 或更新版本（x64）或 Windows 11。
 - 已安装并保持更新的 Microsoft Edge WebView2 Evergreen Runtime。
 - 运行已发布安装包不需要 Node.js 或 Rust；从源码构建需要 Node.js 22 和仓库锁定的 Rust 1.94.1。各 crate 的 `rust-version = 1.85` 仍表示代码最低版本，但当前锁定依赖要求更高的构建工具链。

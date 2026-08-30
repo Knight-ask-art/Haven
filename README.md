@@ -54,11 +54,13 @@ React UI
 
 Rust + SQLite 是持久化事实源。前端的 Mock 只在显式浏览器开发模式存在；独立 Tauri custom-protocol 构建不会回退到演示数据。图片字节、视频帧、PDF 页面和漫画原图不进入 JSON IPC，而是使用受控资源协议或有界上传。
 
+`contracts/ipc/v1/fixtures/` 是随仓库公开的、脱敏且稳定的 IPC 契约样例，供 Browser Mock 构建使用；它不是验收测试、诊断日志或用户数据目录。
+
 ## Supported formats and boundaries
 
 首发目标是 Windows 本地内容核心：视频、TXT、Markdown、EPUB、PDF、HTML、CBZ 和图片目录。支持范围、已知限制和升级说明请参阅[公开变更记录](CHANGELOG.md)。
 
-当前明确不提供：外挂字幕、音轨切换、HEVC 控制；OCR/翻译/AI、Sync 和“清除全部本地数据”需要独立 Foundation/风险评审后再开放。自动更新已经接入 Tauri 官方签名更新链，但必须由维护者配置签名私钥并发布 GitHub Release 后才会提供可安装版本；长时间播放、1000 页 EPUB/漫画和 Downloads Worker 的极限稳定性保留为用户反馈阶段，不会在没有证据时写成保证。
+当前明确不提供：外挂字幕、音轨切换、HEVC 控制；OCR/翻译/AI、Sync 和“清除全部本地数据”需要独立 Foundation/风险评审后再开放。v0.1.0 只发布 Windows 桌面版本，不包含 Android/iOS 构建或图标资源。自动更新已经接入 Tauri 官方签名更新链，但必须由维护者配置签名私钥并发布 GitHub Release 后才会提供可安装版本；长时间播放、1000 页 EPUB/漫画和 Downloads Worker 的极限稳定性保留为用户反馈阶段，不会在没有证据时写成保证。
 
 ## Quick start (Windows)
 

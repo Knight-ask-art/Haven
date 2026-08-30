@@ -70,6 +70,11 @@ plan/
 # Project tracking, ADRs and acceptance evidence are maintained locally.
 /docs/
 
+# Haven v0.1.0 is a Windows desktop release; mobile icon bundles are not
+# generated or distributed with the public source snapshot.
+/src-tauri/icons/android/
+/src-tauri/icons/ios/
+
 # Public release curation: source maps and local project tracking stay local.
 **/*.map
 /docs/project/

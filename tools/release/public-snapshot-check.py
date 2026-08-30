@@ -29,6 +29,10 @@ REQUIRED_FILES = {
     "前端/app/src/lib/ipc/generated/wire.ts",
 }
 FORBIDDEN_ROOT_SEGMENTS = {"docs", "plan", "测试", "参考项目", "logs", "tmp", ".tmp"}
+FORBIDDEN_PUBLIC_PREFIXES = (
+    "src-tauri/icons/android/",
+    "src-tauri/icons/ios/",
+)
 FORBIDDEN_SUFFIXES = (
     ".map",
     ".log",
@@ -75,6 +79,8 @@ def check_public_tree(root: Path, files: list[str], errors: list[str]) -> None:
         normalized = relative.replace("\\", "/")
         if path.parts and path.parts[0] in FORBIDDEN_ROOT_SEGMENTS:
             add_error(errors, f"forbidden public root path is tracked: {normalized}")
+        if any(normalized.startswith(prefix) for prefix in FORBIDDEN_PUBLIC_PREFIXES):
+            add_error(errors, f"unsupported mobile asset is tracked: {normalized}")
         forbidden_directory_names = {
             "tests",
             "__tests__",
