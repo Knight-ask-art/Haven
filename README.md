@@ -1,6 +1,8 @@
 <div align="center">
   <img src="assets/haven-banner.png" alt="Haven" width="720" />
 
+  <br>
+
   <img src="assets/haven-icon.png" alt="栖阅 Haven 图标" width="112" />
 
   <h1>栖阅 Haven</h1>
