@@ -24,14 +24,14 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version-file: .node-version
           cache: npm
           cache-dependency-path: 前端/app/package-lock.json
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.85.1
+          toolchain: 1.94.1
 
       - name: Build frontend
         working-directory: 前端/app
@@ -54,8 +54,8 @@ jobs:
           tagName: v__VERSION__
           releaseName: Haven v__VERSION__
           releaseBody: |
-            See the repository README and the release notes for supported formats,
-            known limitations, and upgrade behavior.
+            See [CHANGELOG.md](https://github.com/Knight-ask-art/Haven/blob/main/CHANGELOG.md)
+            for supported formats, known limitations, and upgrade behavior.
           releaseDraft: true
           prerelease: false
           args: --target x86_64-pc-windows-msvc

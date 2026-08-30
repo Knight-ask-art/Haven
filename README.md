@@ -15,7 +15,7 @@
   <p>
     <img src="https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white" alt="Tauri 2" />
     <img src="https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=111827" alt="React 19" />
-    <img src="https://img.shields.io/badge/Rust-1.85%2B-000000?logo=rust&logoColor=white" alt="Rust 1.85+" />
+    <img src="https://img.shields.io/badge/Rust-1.94.1-000000?logo=rust&logoColor=white" alt="Rust 1.94.1" />
     <img src="https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white" alt="Windows" />
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2ea44f" alt="MIT License" /></a>
   </p>
@@ -38,7 +38,7 @@ Haven（中文名：栖阅）是一个 Local-first 桌面阅读与媒体库工�
 - Artwork Cache、默认封面 fallback、离线读取和缓存自愈；前端不直接请求第三方海报。
 - 严格 CSP、最小 Tauri Capability、命令清单/ACL 一致性检查和脱敏日志。
 - 播放器 `Ctrl+Shift+S` 截图：受限 JPEG 分块上传，Windows 原生保存对话框，默认保存到“下载 / 栖阅 / 截图”。
-- 设置页的 General、Appearance、Playback、Reading、Comic、Downloads、Privacy、Sources、Storage、Updates 和 About 真实数据闭环；AI、Sync 等未接入分区会明确显示不可用。
+- 设置页的 General、Appearance、Playback、Reading、Comic、Downloads、Privacy、Sources、Storage、Updates 和 About 真实数据闭环；AI、Sync 等未接入分区会明确显示不可用，未配置签名发布时更新安装也会安全显示不可用。
 
 ## Architecture
 
@@ -56,13 +56,13 @@ Rust + SQLite 是持久化事实源。前端的 Mock 只在显式浏览器开发
 
 ## Supported formats and boundaries
 
-首发目标是 Windows 本地内容核心：视频、TXT、Markdown、EPUB、PDF、HTML、CBZ 和图片目录。真实样本、异常文件、长篇性能和关闭/重启证据按格式持续更新在发布清单中。
+首发目标是 Windows 本地内容核心：视频、TXT、Markdown、EPUB、PDF、HTML、CBZ 和图片目录。支持范围、已知限制和升级说明请参阅[公开变更记录](CHANGELOG.md)。
 
 当前明确不提供：外挂字幕、音轨切换、HEVC 控制；OCR/翻译/AI、Sync 和“清除全部本地数据”需要独立 Foundation/风险评审后再开放。自动更新已经接入 Tauri 官方签名更新链，但必须由维护者配置签名私钥并发布 GitHub Release 后才会提供可安装版本；长时间播放、1000 页 EPUB/漫画和 Downloads Worker 的极限稳定性保留为用户反馈阶段，不会在没有证据时写成保证。
 
 ## Quick start (Windows)
 
-安装 Node.js、Rust stable（`rustc 1.85+`）和 Tauri 2 所需的 Windows 构建工具后：
+安装 Node.js 22、仓库锁定的 Rust 1.94.1 和 Tauri 2 所需的 Windows 构建工具后：
 
 ```powershell
 cd 前端/app
@@ -78,6 +78,8 @@ npm run build
 cd ../../src-tauri
 cargo build --locked --features custom-protocol
 ```
+
+也可以在仓库根目录运行 `.\build.ps1` 一键完成依赖安装、前端构建和 Tauri 构建；已有依赖时可使用 `.\build.ps1 -SkipInstall`。
 
 浏览器 Preview 只验证 Mock/不可用分支，不能替代真实 Tauri、SQLite、Windows 权限或重启恢复验收。
 
@@ -104,14 +106,16 @@ cargo build --locked --features custom-protocol
 
 设置页提供脱敏诊断报告预览和本地导出。报告只包含报告 ID、版本/系统/运行模式、稳定错误码和经过脱敏的有限日志；不会包含数据库、媒体文件、正文、搜索词、Cookie、Token、Signed URL、完整 URL 或绝对路径。用户确认后可以打开固定的 Haven GitHub Issue 模板，并在页面中手动附加导出的报告。
 
-Haven 不会在没有用户授权的情况下保存或发送 GitHub Token。发现安全问题请阅读 [SECURITY.md](SECURITY.md)（若该文件尚未随发布候选提交，请先通过私下渠道联系维护者）。
+Haven 不会在没有用户授权的情况下保存或发送 GitHub Token。发现安全问题请阅读 [SECURITY.md](SECURITY.md)，不要在公开 Issue 中粘贴凭据或完整诊断导出。
 
 ## Updates
 
-Tauri 桌面版本在启动时通过固定的 HTTPS GitHub Release endpoint 检查更新；设置页可手动重试、查看版本说明并在用户确认后安装。更新包由 Tauri Updater 校验 minisign 签名，Windows 使用被动安装模式。签名私钥只配置在 GitHub Actions Secret，仓库不保存私钥；没有签名 Release 时，客户端会安全显示更新不可用或检查失败，不会安装未签名文件。
+Tauri 桌面版本已经接入固定的 HTTPS GitHub Release 检查链；在维护者配置签名私钥并发布签名 Release 前，v0.1.0 设置页只显示“更新不可用/检查失败”，不会安装未签名文件。正式开放后，用户确认才会安装由 Tauri Updater 校验 minisign 签名的 Windows 被动更新包；签名私钥只配置在 GitHub Actions Secret，仓库不保存私钥。
 
 ## Documentation
 
+- [公开变更记录](CHANGELOG.md)
+- [内置来源能力表](SOURCES.md)
 - [第三方许可说明](THIRD_PARTY_NOTICES.md)
 
 ## License

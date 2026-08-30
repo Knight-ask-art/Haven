@@ -1,0 +1,90 @@
+name: Public CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-check:
+    name: Public build and release checks
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: 前端/app/package-lock.json
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+
+      - name: Check public snapshot
+        run: python tools/release/public-snapshot-check.py
+
+      - name: Check release versions
+        run: python tools/release/version-check.py --version 0.1.0
+
+      - name: Install frontend dependencies
+        working-directory: 前端/app
+        run: npm ci --no-audit --no-fund
+
+      - name: Frontend lint
+        working-directory: 前端/app
+        run: npm run lint
+
+      - name: Frontend governance
+        working-directory: 前端/app
+        run: npm run governance:check
+
+      - name: Frontend build
+        working-directory: 前端/app
+        run: npm run build
+
+      - name: Backend format
+        working-directory: 后端
+        run: cargo fmt --all -- --check
+
+      - name: Backend clippy
+        working-directory: 后端
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Backend build
+        working-directory: 后端
+        run: cargo build --workspace
+
+      - name: Tauri format
+        working-directory: src-tauri
+        run: cargo fmt --all -- --check
+
+      - name: Tauri clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tauri custom-protocol build
+        working-directory: src-tauri
+        run: cargo build --locked --features custom-protocol

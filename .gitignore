@@ -71,7 +71,7 @@ plan/
 /docs/
 
 # Public release curation: source maps and local project tracking stay local.
-/前端/app/src/spike/foliate/foliate-js/vendor/pdfjs/*.map
+**/*.map
 /docs/project/
 
 # Internal-only helper documentation is not part of the public release snapshot.

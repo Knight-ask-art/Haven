@@ -15,7 +15,7 @@ only after explicit user confirmation.
 ## Supported versions
 
 Only the latest tagged release and the current `main` branch receive security
-fixes while the project is in its `v0.1.0` internal-test phase.
+fixes while the project is in its `v0.1.0` public-preview phase.
 
 ## Safe diagnostics
 
