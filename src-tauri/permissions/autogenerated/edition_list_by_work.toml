@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-edition-list-by-work"
+description = "Enables the edition_list_by_work command without any pre-configured scope."
+commands.allow = ["edition_list_by_work"]
+
+[[permission]]
+identifier = "deny-edition-list-by-work"
+description = "Denies the edition_list_by_work command without any pre-configured scope."
+commands.deny = ["edition_list_by_work"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-trending-boards-get"
+description = "Enables the trending_boards_get command without any pre-configured scope."
+commands.allow = ["trending_boards_get"]
+
+[[permission]]
+identifier = "deny-trending-boards-get"
+description = "Denies the trending_boards_get command without any pre-configured scope."
+commands.deny = ["trending_boards_get"]

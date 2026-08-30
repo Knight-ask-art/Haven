@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "items": [
+    {
+      "workId": "0196f0d2-0000-7000-8000-000000000001",
+      "title": "三体",
+      "originalTitle": "三体",
+      "description": "文化大革命时期，军方探秘工程寻找地外文明。",
+      "categories": ["book"],
+      "availableMediaTypes": ["book"],
+      "posterUri": "haven://artwork/0196f0d2-0000-7000-8000-000000000002",
+      "backdropUri": null,
+      "releaseYear": 2008,
+      "ratingValue": null,
+      "ratingScale": null,
+      "favorite": true,
+      "progress": {
+        "mediaItemId": "0196f0d2-0000-7000-8000-000000000003",
+        "completion": "in_progress",
+        "progressRatio": 0.42,
+        "revision": "progress-0000000000000001",
+        "updatedAt": "2026-08-13T08:30:00Z",
+        "locator": {
+          "version": 1,
+          "kind": "book",
+          "data": {
+            "publicationResource": "c.xhtml",
+            "progression": 0.42,
+            "textAnchor": null,
+            "formatLocator": null
+          }
+        }
+      },
+      "externalIds": [
+        { "provider": "gutenberg", "externalId": "125/12572" }
+      ],
+      "primaryAction": {
+        "kind": "reader",
+        "labelHint": "continue",
+        "editionId": "0196f0d2-0000-7000-8000-000000000004",
+        "mediaItemId": "0196f0d2-0000-7000-8000-000000000003",
+        "locator": null
+      }
+    }
+  ],
+  "nextCursor": null,
+  "total": 1,
+  "revision": "r-7f3a"
+}

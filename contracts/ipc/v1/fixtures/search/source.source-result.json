@@ -1,0 +1,33 @@
+{
+  "operationId": "op-search-0196f0d2",
+  "sequence": 2,
+  "at": "2026-08-22T09:00:01Z",
+  "kind": "source_result",
+  "data": {
+    "sourceId": "bangumi",
+    "works": [
+      {
+        "workId": "0196f0d2-0000-7000-8000-000000000101",
+        "title": "庆余年（源候选）",
+        "originalTitle": null,
+        "description": null,
+        "categories": ["video"],
+        "availableMediaTypes": ["series"],
+        "posterUri": null,
+        "backdropUri": null,
+        "releaseYear": 2019,
+        "ratingValue": null,
+        "ratingScale": null,
+        "favorite": false,
+        "progress": null,
+        "primaryAction": null,
+        "externalIds": [
+          { "provider": "bangumi", "externalId": "32645" }
+        ]
+      }
+    ],
+    "code": null,
+    "message": null
+  }
+}
+

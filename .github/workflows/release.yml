@@ -1,0 +1,61 @@
+name: Release Haven
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-release:
+    name: Build signed Windows updater artifacts
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: 前端/app/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.1
+
+      - name: Build frontend
+        working-directory: 前端/app
+        run: |
+          npm ci
+          npm run lint
+          npm run governance:check
+          npm run build
+
+      - name: Build and publish Tauri release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The private key is never stored in the repository. Configure these
+          # two secrets before creating a release tag.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: src-tauri
+          tagName: v__VERSION__
+          releaseName: Haven v__VERSION__
+          releaseBody: |
+            See the repository README and the release notes for supported formats,
+            known limitations, and upgrade behavior.
+          releaseDraft: true
+          prerelease: false
+          args: --target x86_64-pc-windows-msvc

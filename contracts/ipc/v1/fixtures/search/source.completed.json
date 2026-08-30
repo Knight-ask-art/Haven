@@ -1,0 +1,12 @@
+{
+  "operationId": "op-search-0196f0d2",
+  "sequence": 3,
+  "at": "2026-08-22T09:00:02Z",
+  "kind": "completed",
+  "data": {
+    "sourceId": null,
+    "works": [],
+    "code": null,
+    "message": null
+  }
+}

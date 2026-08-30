@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-source-registry-set"
+description = "Enables the source_registry_set command without any pre-configured scope."
+commands.allow = ["source_registry_set"]
+
+[[permission]]
+identifier = "deny-source-registry-set"
+description = "Denies the source_registry_set command without any pre-configured scope."
+commands.deny = ["source_registry_set"]

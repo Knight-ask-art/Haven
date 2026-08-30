@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-video-screenshot-commit"
+description = "Enables the video_screenshot_commit command without any pre-configured scope."
+commands.allow = ["video_screenshot_commit"]
+
+[[permission]]
+identifier = "deny-video-screenshot-commit"
+description = "Denies the video_screenshot_commit command without any pre-configured scope."
+commands.deny = ["video_screenshot_commit"]

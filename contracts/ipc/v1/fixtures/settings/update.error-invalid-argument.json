@@ -1,0 +1,5 @@
+{
+  "code": "INVALID_ARGUMENT",
+  "userMessage": "设置字段非法（未知字段/非法枚举/类型错误）",
+  "retryable": false
+}

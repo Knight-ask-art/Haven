@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "items": [
+    {
+      "resourceId": "0196f0d2-0000-7000-8000-000000000201",
+      "resourceType": "remote_stream",
+      "availability": "available",
+      "mimeType": null,
+      "size": null,
+      "storageDisplayName": null,
+      "sourceDisplayName": "苹果CMS 端点",
+      "isOffline": false,
+      "isLocal": false,
+      "requiresReauthorization": false,
+      "streamKind": "hls"
+    },
+    {
+      "resourceId": "0196f0d2-0000-7000-8000-000000000202",
+      "resourceType": "remote_stream",
+      "availability": "source_unavailable",
+      "mimeType": null,
+      "size": null,
+      "storageDisplayName": null,
+      "sourceDisplayName": "M3U 播放列表",
+      "isOffline": false,
+      "isLocal": false,
+      "requiresReauthorization": false,
+      "streamKind": "direct"
+    }
+  ]
+}

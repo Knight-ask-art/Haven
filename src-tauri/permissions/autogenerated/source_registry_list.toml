@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-source-registry-list"
+description = "Enables the source_registry_list command without any pre-configured scope."
+commands.allow = ["source_registry_list"]
+
+[[permission]]
+identifier = "deny-source-registry-list"
+description = "Denies the source_registry_list command without any pre-configured scope."
+commands.deny = ["source_registry_list"]

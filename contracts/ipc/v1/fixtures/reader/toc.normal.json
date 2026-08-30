@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "sessionId": "11111111-1111-4111-8111-111111111111",
+  "items": [
+    {
+      "id": "9a00d70e24a8f7b1",
+      "title": "序言",
+      "depth": 0,
+      "progression": 0
+    },
+    {
+      "id": "c3f52a1d8b9e4410",
+      "title": "第一章 起点",
+      "depth": 0,
+      "progression": 0.25
+    },
+    {
+      "id": "5e1fca2d77b3c9a4",
+      "title": "第一节 童年",
+      "depth": 1,
+      "progression": 0.25
+    },
+    {
+      "id": "77c1a0f3e92d56b8",
+      "title": "第二章 转折",
+      "depth": 0,
+      "progression": 0.5
+    },
+    {
+      "id": "1b2d4f6a8c0e1234",
+      "title": "尾声",
+      "depth": 0,
+      "progression": 1
+    }
+  ]
+}

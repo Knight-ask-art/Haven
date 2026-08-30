@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-work-get"
+description = "Enables the work_get command without any pre-configured scope."
+commands.allow = ["work_get"]
+
+[[permission]]
+identifier = "deny-work-get"
+description = "Denies the work_get command without any pre-configured scope."
+commands.deny = ["work_get"]

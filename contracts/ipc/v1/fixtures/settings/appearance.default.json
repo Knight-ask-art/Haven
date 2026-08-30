@@ -1,0 +1,10 @@
+{
+  "value": {
+    "section": "appearance",
+    "theme": "system",
+    "density": "comfortable",
+    "sidebar": "auto",
+    "reduceMotion": false
+  },
+  "revision": null
+}

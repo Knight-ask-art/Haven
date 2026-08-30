@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "appVersion": "0.1.0",
+  "buildChannel": "release",
+  "sourcePackVersion": "builtin-1",
+  "protocolVersion": "ipc-v1",
+  "databaseVersion": "024_resource_preferences",
+  "appLicense": "MIT",
+  "thirdPartyNotices": [
+    { "name": "Live2D widget model packages", "license": "GPL-2.0" },
+    { "name": "oh-my-live2d runtime component", "license": "MIT" },
+    { "name": "Pixi CSP-safe ShaderSystem implementation", "license": "MIT" }
+  ],
+  "directories": [
+    { "kind": "data", "displayName": "应用数据目录", "displayPath": "%APPDATA%/com.haven.reader", "exists": true, "canOpen": true },
+    { "kind": "logs", "displayName": "日志目录", "displayPath": "%APPDATA%/com.haven.reader/Logs", "exists": true, "canOpen": true },
+    { "kind": "cache", "displayName": "缓存目录", "displayPath": "%APPDATA%/com.haven.reader/Cache", "exists": true, "canOpen": true }
+  ]
+}

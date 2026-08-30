@@ -1,0 +1,5 @@
+{
+  "code": "CURSOR_EXPIRED",
+  "userMessage": "列表已刷新，请从第一页重新加载",
+  "retryable": false
+}

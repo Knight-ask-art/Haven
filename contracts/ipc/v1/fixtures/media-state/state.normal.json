@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 2,
+  "workId": "0196f0d2-0000-7000-8000-000000000001",
+  "favorite": true,
+  "progress": {
+    "editionId": "0196f0d2-0000-7000-8000-000000000004",
+    "mediaItemId": "0196f0d2-0000-7000-8000-000000000003",
+    "locatorKind": "book",
+    "updatedAt": "2026-08-13T08:30:00Z"
+  },
+  "historySummary": {
+    "lastOpenedAt": "2026-08-13T08:30:00Z",
+    "openCount": 7
+  },
+  "markerCount": 3,
+  "rating": null
+}

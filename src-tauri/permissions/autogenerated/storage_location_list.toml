@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-storage-location-list"
+description = "Enables the storage_location_list command without any pre-configured scope."
+commands.allow = ["storage_location_list"]
+
+[[permission]]
+identifier = "deny-storage-location-list"
+description = "Denies the storage_location_list command without any pre-configured scope."
+commands.deny = ["storage_location_list"]

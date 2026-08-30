@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-storage-location-remove"
+description = "Enables the storage_location_remove command without any pre-configured scope."
+commands.allow = ["storage_location_remove"]
+
+[[permission]]
+identifier = "deny-storage-location-remove"
+description = "Denies the storage_location_remove command without any pre-configured scope."
+commands.deny = ["storage_location_remove"]

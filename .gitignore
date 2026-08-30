@@ -1,0 +1,102 @@
+# Dependencies and generated output
+**/node_modules/
+**/dist/
+**/dist-ssr/
+**/build/
+**/out/
+**/coverage/
+**/target/
+**/.vite/
+**/.cache/
+**/*.tsbuildinfo
+
+# Logs and temporary files
+**/logs/
+**/tmp/
+**/.tmp/
+.superpowers/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+*.pem
+*.key
+*.p12
+*.pfx
+*.bak
+*.tmp
+
+# Local runtime data
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# Local research material and extracted third-party artifacts
+参考项目/
+
+# Local test/design material (kept on developer machines, never tracked)
+/测试/*
+
+# Public repository curation: local test sources and test-only samples stay on
+# developer machines.  The checked-in IPC contract fixtures are intentionally
+# kept because the browser Mock client imports them at build time.
+**/tests/
+**/__tests__/
+**/*.test.*
+**/*.spec.*
+**/*_test.*
+/前端/app/public/test-*.epub
+/前端/app/scripts/*fixtures-check*
+
+# Local diagnostics and test output (including files without a .log suffix).
+**/diagnostics/
+**/diagnostic/
+**/*.out
+**/*.trace
+**/*.dump
+**/*.har
+
+# Local planning material (kept on developer machines, never committed)
+plan/
+
+# Project tracking, ADRs and acceptance evidence are maintained locally.
+/docs/
+
+# Public release curation: source maps and local project tracking stay local.
+/前端/app/src/spike/foliate/foliate-js/vendor/pdfjs/*.map
+/docs/project/
+
+# Internal-only helper documentation is not part of the public release snapshot.
+**/AGENTS.md
+/design-qa.md
+/后端/README.md
+/tools/README.md
+
+# Design references and one-off local authoring notes are not runtime assets.
+/前端/设计原则/
+/前端/tokens-setup/
+/前端/前端开发要求.txt
+/前端/前端开发要点.txt
+/前端/app/update_rules.py
+
+
+# Independent review Cargo target cache (EVID-SENIOR-REVIEW-2026-08-17 等)
+.target-review-tests/
+
+# Editors and operating systems
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo

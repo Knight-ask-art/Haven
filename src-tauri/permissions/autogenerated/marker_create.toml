@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-marker-create"
+description = "Enables the marker_create command without any pre-configured scope."
+commands.allow = ["marker_create"]
+
+[[permission]]
+identifier = "deny-marker-create"
+description = "Denies the marker_create command without any pre-configured scope."
+commands.deny = ["marker_create"]

@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "boards": [
+    {
+      "boardId": "cn_drama",
+      "title": "国产剧热门",
+      "subtitle": "TOP 10",
+      "items": [
+        {
+          "title": "可离线展示的旧快照",
+          "subtitle": "2025 / 中国",
+          "description": "七天内 stale 快照仍可展示",
+          "posterUri": "haven://artwork/stale-poster",
+          "statusBadge": null
+        }
+      ]
+    }
+  ]
+}

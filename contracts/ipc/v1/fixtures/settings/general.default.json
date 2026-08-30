@@ -1,0 +1,10 @@
+{
+  "value": {
+    "section": "general",
+    "launchPage": "home",
+    "restoreSession": false,
+    "language": "zh_cn",
+    "notifications": true
+  },
+  "revision": null
+}

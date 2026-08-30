@@ -1,0 +1,17 @@
+{
+  "operationId": "scan-op-002",
+  "sequence": 4,
+  "at": "2026-08-13T09:05:00Z",
+  "kind": "cancelled",
+  "data": {
+    "taskId": "task-002",
+    "filesSeen": 40,
+    "recognized": 30,
+    "new": 28,
+    "updated": 0,
+    "skipped": 2,
+    "errors": 0,
+    "currentItem": null,
+    "message": "扫描已被用户取消"
+  }
+}

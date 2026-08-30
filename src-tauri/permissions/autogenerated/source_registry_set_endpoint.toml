@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-source-registry-set-endpoint"
+description = "Enables the source_registry_set_endpoint command without any pre-configured scope."
+commands.allow = ["source_registry_set_endpoint"]
+
+[[permission]]
+identifier = "deny-source-registry-set-endpoint"
+description = "Denies the source_registry_set_endpoint command without any pre-configured scope."
+commands.deny = ["source_registry_set_endpoint"]

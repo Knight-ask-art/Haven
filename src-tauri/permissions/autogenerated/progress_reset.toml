@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-progress-reset"
+description = "Enables the progress_reset command without any pre-configured scope."
+commands.allow = ["progress_reset"]
+
+[[permission]]
+identifier = "deny-progress-reset"
+description = "Denies the progress_reset command without any pre-configured scope."
+commands.deny = ["progress_reset"]

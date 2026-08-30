@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "boards": [
+    {
+      "boardId": "anime",
+      "title": "动漫热门",
+      "subtitle": "TOP 10",
+      "items": [
+        {
+          "title": "缺少海报的作品",
+          "subtitle": "2026",
+          "description": "图片登记失败仍保留榜单项",
+          "posterUri": null,
+          "statusBadge": null
+        }
+      ]
+    }
+  ]
+}

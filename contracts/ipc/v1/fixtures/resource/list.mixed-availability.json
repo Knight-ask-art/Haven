@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "items": [
+    {
+      "resourceId": "0196f0d2-0000-7000-8000-000000000001",
+      "resourceType": "local_file",
+      "availability": "available",
+      "mimeType": "video/x-matroska",
+      "size": 4096,
+      "storageDisplayName": "本地电影库",
+      "sourceDisplayName": null,
+      "isOffline": false,
+      "isLocal": true,
+      "requiresReauthorization": false,
+      "streamKind": null
+    },
+    {
+      "resourceId": "0196f0d2-0000-7000-8000-000000000002",
+      "resourceType": "http_file",
+      "availability": "source_unavailable",
+      "mimeType": null,
+      "size": null,
+      "storageDisplayName": null,
+      "sourceDisplayName": null,
+      "isOffline": false,
+      "isLocal": false,
+      "requiresReauthorization": false,
+      "streamKind": null
+    }
+  ]
+}

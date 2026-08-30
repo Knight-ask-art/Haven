@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "boards": [
+    {
+      "boardId": "anime",
+      "title": "动漫热门",
+      "subtitle": "TOP 10",
+      "items": [
+        {
+          "title": "作品 A",
+          "subtitle": "2026 / 日本",
+          "description": "简介",
+          "posterUri": "haven://artwork/poster-a",
+          "statusBadge": null
+        }
+      ]
+    }
+  ]
+}

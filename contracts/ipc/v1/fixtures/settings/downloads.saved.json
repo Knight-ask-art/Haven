@@ -1,0 +1,9 @@
+{
+  "value": {
+    "section": "downloads",
+    "concurrentTasks": "five",
+    "speedLimit": "mbps2",
+    "autoContinue": false
+  },
+  "revision": "set-0000000000000006-00000001"
+}

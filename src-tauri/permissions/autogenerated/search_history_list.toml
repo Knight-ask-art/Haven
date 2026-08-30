@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-search-history-list"
+description = "Enables the search_history_list command without any pre-configured scope."
+commands.allow = ["search_history_list"]
+
+[[permission]]
+identifier = "deny-search-history-list"
+description = "Denies the search_history_list command without any pre-configured scope."
+commands.deny = ["search_history_list"]

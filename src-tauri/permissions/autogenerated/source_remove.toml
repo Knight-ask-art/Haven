@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-source-remove"
+description = "Enables the source_remove command without any pre-configured scope."
+commands.allow = ["source_remove"]
+
+[[permission]]
+identifier = "deny-source-remove"
+description = "Denies the source_remove command without any pre-configured scope."
+commands.deny = ["source_remove"]

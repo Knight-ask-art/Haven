@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-comic-page-manifest-get"
+description = "Enables the comic_page_manifest_get command without any pre-configured scope."
+commands.allow = ["comic_page_manifest_get"]
+
+[[permission]]
+identifier = "deny-comic-page-manifest-get"
+description = "Denies the comic_page_manifest_get command without any pre-configured scope."
+commands.deny = ["comic_page_manifest_get"]

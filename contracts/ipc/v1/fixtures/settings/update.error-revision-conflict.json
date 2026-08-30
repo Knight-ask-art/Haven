@@ -1,0 +1,5 @@
+{
+  "code": "REVISION_CONFLICT",
+  "userMessage": "设置已被其他窗口/请求更新，请重新加载后再保存",
+  "retryable": false
+}

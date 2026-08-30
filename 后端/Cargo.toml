@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/haven-common",
+    "crates/haven-domain",
+    "crates/haven-application",
+    "crates/haven-infrastructure",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+# 出站网络（CMS10 适配器等 Source 运行时）统一走 reqwest + rustls；
+# 仅允许访问用户显式配置的端点（SECURITY_PRIVACY_COMPLIANCE S8：防 SSRF）。
+
+[workspace.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# 许可证为 PO 决策项（DECISIONS.md），公开发布前锁定。

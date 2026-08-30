@@ -1,0 +1,47 @@
+# Live2D 模型二进制资源防 EOL 转换
+前端/app/public/live2d/**/*.moc binary
+前端/app/public/live2d/**/*.png binary
+前端/app/public/live2d/**/*.mp3 binary
+前端/app/public/live2d/**/*.mtn binary
+
+# 应用图标二进制防 EOL 转换
+src-tauri/icons/**/*.ico binary
+src-tauri/icons/**/*.icns binary
+src-tauri/icons/**/*.png binary
+
+# Text source files use LF across platforms.
+*.js text eol=lf
+*.jsx text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.pdf binary
+*.zip binary
+*.7z binary
+
+# Generated text files must stay LF and ignore generator-owned trailing blanks.
+前端/app/src/lib/ipc/generated/wire.ts text eol=lf
+后端/crates/haven-application/bindings/*.ts text eol=lf
+后端/crates/haven-application/bindings/*.ts whitespace=-blank-at-eol

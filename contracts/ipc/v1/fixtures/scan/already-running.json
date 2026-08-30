@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "operationId": "scan-op-001",
+  "taskId": "task-001",
+  "alreadyRunning": true
+}

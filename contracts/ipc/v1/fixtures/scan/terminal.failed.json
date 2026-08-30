@@ -1,0 +1,17 @@
+{
+  "operationId": "scan-op-003",
+  "sequence": 7,
+  "at": "2026-08-13T09:10:00Z",
+  "kind": "failed",
+  "data": {
+    "taskId": "task-003",
+    "filesSeen": 60,
+    "recognized": 45,
+    "new": 40,
+    "updated": 0,
+    "skipped": 5,
+    "errors": 1,
+    "currentItem": null,
+    "message": "读取文件失败：访问被拒绝"
+  }
+}

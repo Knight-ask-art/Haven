@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-marker-delete"
+description = "Enables the marker_delete command without any pre-configured scope."
+commands.allow = ["marker_delete"]
+
+[[permission]]
+identifier = "deny-marker-delete"
+description = "Denies the marker_delete command without any pre-configured scope."
+commands.deny = ["marker_delete"]

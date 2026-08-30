@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "at": "2026-08-22T09:05:00Z",
+  "operationId": "op-enrich-0196f0d2",
+  "sequence": 1,
+  "workId": "0196f0d2-0000-7000-8000-000000000001",
+  "status": "enriched",
+  "sourceId": "gutenberg",
+  "error": null
+}

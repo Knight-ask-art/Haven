@@ -1,0 +1,25 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["react", "typescript", "oxc"],
+  "ignorePatterns": ["src/spike/foliate/foliate-js"],
+  "rules": {
+    "react/rules-of-hooks": "error",
+    "react/only-export-components": ["warn", { "allowConstantExport": true }],
+    "eslint/no-restricted-imports": [
+      "error",
+      {
+        "patterns": [
+          {
+            "group": [
+              "@/components/external/*",
+              "@/components/external/**",
+              "../components/external/*",
+              "../../components/external/*"
+            ],
+            "message": "Gate A (Oxlint) Blocked: External quarantine components cannot be imported by production code. Complete Havenization and promote the component first."
+          }
+        ]
+      }
+    ]
+  }
+}

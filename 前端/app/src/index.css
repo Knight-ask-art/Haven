@@ -1,0 +1,345 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Permanent+Marker&family=Rock+Salt&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* PDF 文本选择层：透明文本覆盖画布，仅提供选区与复制能力。
+   容器保持 opacity:1（pdfjs 惯例）——span 文本本身透明，压暗容器会连带削弱选区高亮。 */
+.pdf-text-layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  line-height: 1;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  opacity: 1;
+}
+.pdf-text-layer span,
+.pdf-text-layer br {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0 0;
+}
+.pdf-text-layer ::selection {
+  background: rgba(59, 130, 246, 0.3);
+}
+.pdf-text-layer .endOfContent {
+  position: absolute;
+  inset: 100% 0 0 0;
+  z-index: -1;
+  cursor: default;
+  user-select: none;
+}
+
+@layer utilities {
+  .settings-scrollbar-hidden {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  .settings-scrollbar-hidden::-webkit-scrollbar {
+    display: none;
+    height: 0;
+    width: 0;
+  }
+
+  /* AppShell 主滚动容器：细滚动条（桌面应用质感，内容真超长时才出现） */
+  .haven-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(0 0 0 / 0.18) transparent;
+  }
+
+  .haven-scroll::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  .haven-scroll::-webkit-scrollbar-thumb {
+    border-radius: 9999px;
+    background: rgb(0 0 0 / 0.18);
+  }
+
+  .haven-scroll::-webkit-scrollbar-thumb:hover {
+    background: rgb(0 0 0 / 0.3);
+  }
+
+  .dark .haven-scroll {
+    scrollbar-color: rgb(255 255 255 / 0.2) transparent;
+  }
+
+  .dark .haven-scroll::-webkit-scrollbar-thumb {
+    background: rgb(255 255 255 / 0.2);
+  }
+
+  .dark .haven-scroll::-webkit-scrollbar-thumb:hover {
+    background: rgb(255 255 255 / 0.32);
+  }
+
+  .font-haven-sans {
+    font-family: "Inter", "Segoe UI Variable", "Microsoft YaHei UI", system-ui, sans-serif;
+  }
+
+  .font-haven-marker {
+    font-family: "Permanent Marker", "Segoe UI Variable", "Microsoft YaHei UI", cursive;
+  }
+
+  .font-haven-salt {
+    font-family: "Rock Salt", "Segoe UI Variable", "Microsoft YaHei UI", cursive;
+  }
+
+  /* 设置页专用的系统字体栈：桌面端不依赖远程字体即可保持中英文
+     字形、字重和字距一致；仅作用于设置页，不改变其他页面的视觉语言。 */
+  .settings-page {
+    font-family: "Segoe UI Variable", "Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC", system-ui, sans-serif;
+    font-feature-settings: "kern" 1, "liga" 1, "cv01" 1, "cv02" 1;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+}
+
+@layer base {
+  :root {
+    /* =========================================================================
+       HAVEN DESIGN SYSTEM - GLOBAL TOKENS
+       Mapped from DESIGN_TOKENS.md
+       ========================================================================= */
+
+    /* 1. Neutral Palette (Light Foundation) */
+    --ds-neutral-0: #ffffff;
+    --ds-neutral-25: #fbfbfd;
+    --ds-neutral-50: #f5f5f7;
+    --ds-neutral-100: #efeff4;
+    --ds-neutral-200: #d1d1d6;
+    --ds-neutral-300: #c7c7cc;
+    --ds-neutral-400: #aeaeb2;
+    --ds-neutral-500: #8e8e93;
+    --ds-neutral-600: #6e6e73;
+    --ds-neutral-700: #48484a;
+    --ds-neutral-800: #2c2c2e;
+    --ds-neutral-900: #1c1c1e;
+    --ds-neutral-1000: #000000;
+
+    /* 2. Brand Colors (Light) */
+    --ds-blue-500: #007aff;
+    --ds-green-500: #34c759;
+    --ds-red-500: #ff3b30;
+    --ds-orange-500: #ff9500;
+    --ds-purple-500: #af52de;
+
+    /* ==================== SEMANTIC TOKENS (LIGHT) ==================== */
+
+    /* Backgrounds */
+    --ds-color-bg-primary: var(--ds-neutral-0);
+    --ds-color-bg-secondary: var(--ds-neutral-50);
+    --ds-color-bg-tertiary: var(--ds-neutral-100);
+
+    /* Surfaces */
+    --ds-color-surface-primary: var(--ds-neutral-0);
+    --ds-color-surface-secondary: var(--ds-neutral-50);
+    --ds-color-surface-elevated: var(--ds-neutral-0);
+
+    /* Text */
+    --ds-color-text-primary: #1d1d1f;
+    --ds-color-text-secondary: var(--ds-neutral-600);
+    --ds-color-text-tertiary: #86868b;
+    --ds-color-text-placeholder: var(--ds-neutral-500);
+    --ds-color-text-disabled: rgba(60, 60, 67, 0.3);
+    --ds-color-text-inverse: var(--ds-neutral-0);
+
+    /* Actions */
+    --ds-color-action-primary: var(--ds-blue-500);
+    --ds-color-action-hover: #0071eb;
+    --ds-color-action-pressed: #0067d9;
+    --ds-color-action-destructive: var(--ds-red-500);
+
+    /* Borders & Separators */
+    --ds-color-border-subtle: rgba(60, 60, 67, 0.1);
+    --ds-color-border-standard: rgba(60, 60, 67, 0.16);
+    --ds-color-border-strong: rgba(60, 60, 67, 0.28);
+
+    /* Focus Ring */
+    --ds-color-focus-primary: var(--ds-blue-500);
+
+    /* ==================== NON-COLOR TOKENS ==================== */
+    
+    /* Spacing */
+    --ds-space-2: 2px;
+    --ds-space-4: 4px;
+    --ds-space-8: 8px;
+    --ds-space-12: 12px;
+    --ds-space-16: 16px;
+    --ds-space-20: 20px;
+    --ds-space-24: 24px;
+    --ds-space-32: 32px;
+    --ds-space-40: 40px;
+    --ds-space-48: 48px;
+    --ds-space-48: 48px;
+    --ds-space-64: 64px;
+
+    /* ==================== V2 COMPOSITION TOKENS ==================== */
+    /* Layout / App Shell */
+    --ds-layout-sidebar-expanded-width: 232px;
+    --ds-layout-sidebar-collapsed-width: 64px;
+    --ds-layout-page-padding-compact: 24px;
+    --ds-layout-page-padding-regular: 32px;
+
+    /* Layout / Page Header */
+    --ds-layout-pageHeader-titleGap: 16px;
+    --ds-layout-pageHeader-sectionGap: 32px;
+
+    /* Layout / Content Grid */
+    --ds-layout-contentGrid-columnGap: 24px;
+
+    /* ==================== V2 OPTICAL TOKENS ==================== */
+    --ds-optical-iconTextGap: 8px;
+    --ds-optical-coverTextGap: 12px;
+    --ds-optical-titleMetadataGap: 4px;
+    --ds-optical-navItemInset: 12px;
+
+    /* Radius */
+    --ds-radius-sm: 8px;
+    --ds-radius-md: 12px;
+    --ds-radius-lg: 16px;
+    --ds-radius-xl: 20px;
+    --ds-radius-2xl: 24px;
+
+    /* Typography (Fluid Base Examples) */
+    --ds-text-sm: clamp(12px, 1vw + 8px, 14px);
+    --ds-text-base: clamp(14px, 1.2vw + 9px, 16px);
+    --ds-text-lg: clamp(16px, 1.5vw + 10px, 20px);
+    --ds-text-xl: clamp(20px, 2vw + 12px, 24px);
+    --ds-text-2xl: clamp(24px, 3vw + 12px, 32px);
+    --ds-text-3xl: clamp(32px, 4vw + 12px, 40px);
+
+    /* Shadows */
+    --ds-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04), 0 2px 8px rgba(0, 0, 0, 0.04);
+    --ds-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.06), 0 8px 24px rgba(0, 0, 0, 0.06);
+    --ds-shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.08), 0 20px 48px rgba(0, 0, 0, 0.10);
+    
+    /* Motion */
+    --ds-motion-fast: 120ms;
+    --ds-motion-normal: 200ms;
+    --ds-motion-moderate: 300ms;
+  }
+
+  .dark {
+    /* ==================== SEMANTIC TOKENS (DARK) ==================== */
+
+    /* Backgrounds */
+    --ds-color-bg-primary: var(--ds-neutral-1000);
+    --ds-color-bg-secondary: var(--ds-neutral-900);
+    --ds-color-bg-tertiary: var(--ds-neutral-800);
+
+    /* Surfaces */
+    --ds-color-surface-primary: var(--ds-neutral-900);
+    --ds-color-surface-secondary: var(--ds-neutral-800);
+    --ds-color-surface-elevated: #242426;
+
+    /* Text */
+    --ds-color-text-primary: var(--ds-neutral-50);
+    --ds-color-text-secondary: var(--ds-neutral-400);
+    --ds-color-text-tertiary: var(--ds-neutral-500);
+    --ds-color-text-placeholder: #636366;
+    --ds-color-text-disabled: rgba(235, 235, 245, 0.3);
+    --ds-color-text-inverse: var(--ds-neutral-1000);
+
+    /* Actions */
+    --ds-color-action-primary: #0a84ff;
+    --ds-color-action-hover: #2995ff;
+    --ds-color-action-pressed: #0077e6;
+    --ds-color-action-destructive: #ff453a;
+
+    /* Borders & Separators */
+    --ds-color-border-subtle: rgba(84, 84, 88, 0.32);
+    --ds-color-border-standard: rgba(84, 84, 88, 0.48);
+    --ds-color-border-strong: rgba(142, 142, 147, 0.58);
+    
+    /* Focus Ring */
+    --ds-color-focus-primary: #0a84ff;
+  }
+
+  /* shadcn/ui CSS Variables Mapping */
+  /* This maps the shadcn default tokens to our Haven DS tokens */
+  :root {
+    --background: var(--ds-color-bg-primary);
+    --foreground: var(--ds-color-text-primary);
+    --card: var(--ds-color-surface-elevated);
+    --card-foreground: var(--ds-color-text-primary);
+    --popover: var(--ds-color-surface-elevated);
+    --popover-foreground: var(--ds-color-text-primary);
+    --primary: var(--ds-color-action-primary);
+    --primary-foreground: var(--ds-color-text-inverse);
+    --secondary: var(--ds-color-bg-secondary);
+    --secondary-foreground: var(--ds-color-text-primary);
+    --muted: var(--ds-color-bg-secondary);
+    --muted-foreground: var(--ds-color-text-secondary);
+    --accent: var(--ds-color-bg-secondary);
+    --accent-foreground: var(--ds-color-text-primary);
+    --destructive: var(--ds-color-action-destructive);
+    --destructive-foreground: var(--ds-color-text-inverse);
+    --border: var(--ds-color-border-standard);
+    --input: var(--ds-color-border-standard);
+    --ring: var(--ds-color-focus-primary);
+    --radius: var(--ds-radius-md);
+  }
+
+  .dark {
+    --background: var(--ds-color-bg-primary);
+    --foreground: var(--ds-color-text-primary);
+    --card: var(--ds-color-surface-elevated);
+    --card-foreground: var(--ds-color-text-primary);
+    --popover: var(--ds-color-surface-elevated);
+    --popover-foreground: var(--ds-color-text-primary);
+    --primary: var(--ds-color-action-primary);
+    --primary-foreground: var(--ds-color-text-inverse);
+    --secondary: var(--ds-color-bg-secondary);
+    --secondary-foreground: var(--ds-color-text-primary);
+    --muted: var(--ds-color-bg-secondary);
+    --muted-foreground: var(--ds-color-text-secondary);
+    --accent: var(--ds-color-bg-secondary);
+    --accent-foreground: var(--ds-color-text-primary);
+    --destructive: var(--ds-color-action-destructive);
+    --destructive-foreground: var(--ds-color-text-inverse);
+    --border: var(--ds-color-border-standard);
+    --input: var(--ds-color-border-standard);
+    --ring: var(--ds-color-focus-primary);
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+    /* Apply anti-aliasing for Apple-inspired crispness */
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+/* oh-my-live2d 会动态写入舞台样式；仅在看板娘自己的挂载范围内强制透明，
+   避免重新召唤或第三方重载时出现蓝色底板，也不影响首页 Plexus Canvas。 */
+.haven-live2d-stage {
+  position: relative;
+}
+
+.haven-live2d-instance-host {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.haven-live2d-stage #oml2d-stage,
+.haven-live2d-stage #oml2d-stage canvas {
+  background: transparent !important;
+  background-color: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+}

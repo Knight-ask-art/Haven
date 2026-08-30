@@ -1,0 +1,17 @@
+{
+  "operationId": "scan-op-001",
+  "sequence": 9,
+  "at": "2026-08-13T09:00:00Z",
+  "kind": "completed",
+  "data": {
+    "taskId": "task-001",
+    "filesSeen": 120,
+    "recognized": 100,
+    "new": 98,
+    "updated": 0,
+    "skipped": 2,
+    "errors": 0,
+    "currentItem": null,
+    "message": "扫描完成：98 新增，2 跳过"
+  }
+}

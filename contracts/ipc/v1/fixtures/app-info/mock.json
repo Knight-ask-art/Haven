@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "appVersion": "Mock",
+  "buildChannel": "mock",
+  "sourcePackVersion": null,
+  "protocolVersion": "mock",
+  "databaseVersion": "mock",
+  "appLicense": "MIT",
+  "thirdPartyNotices": [],
+  "directories": [
+    { "kind": "data", "displayName": "Mock 环境目录", "displayPath": "Mock 环境不提供本地目录", "exists": false, "canOpen": false },
+    { "kind": "logs", "displayName": "Mock 环境目录", "displayPath": "Mock 环境不提供本地目录", "exists": false, "canOpen": false },
+    { "kind": "cache", "displayName": "Mock 环境目录", "displayPath": "Mock 环境不提供本地目录", "exists": false, "canOpen": false }
+  ]
+}

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-source-add"
+description = "Enables the source_add command without any pre-configured scope."
+commands.allow = ["source_add"]
+
+[[permission]]
+identifier = "deny-source-add"
+description = "Denies the source_add command without any pre-configured scope."
+commands.deny = ["source_add"]

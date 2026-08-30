@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-source-work-import"
+description = "Enables the source_work_import command without any pre-configured scope."
+commands.allow = ["source_work_import"]
+
+[[permission]]
+identifier = "deny-source-work-import"
+description = "Denies the source_work_import command without any pre-configured scope."
+commands.deny = ["source_work_import"]

@@ -1,0 +1,10 @@
+{
+  "value": {
+    "section": "appearance",
+    "theme": "dark",
+    "density": "compact",
+    "sidebar": "expanded",
+    "reduceMotion": true
+  },
+  "revision": "set-0000000000000002-00000001"
+}

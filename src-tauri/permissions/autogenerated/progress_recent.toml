@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-progress-recent"
+description = "Enables the progress_recent command without any pre-configured scope."
+commands.allow = ["progress_recent"]
+
+[[permission]]
+identifier = "deny-progress-recent"
+description = "Denies the progress_recent command without any pre-configured scope."
+commands.deny = ["progress_recent"]

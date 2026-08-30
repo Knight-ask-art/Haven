@@ -1,0 +1,5 @@
+{
+  "code": "TRENDING_REFRESH_FAILED",
+  "message": "暂无可用热榜，网络恢复后可重试",
+  "retryable": true
+}

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-preference-get"
+description = "Enables the preference_get command without any pre-configured scope."
+commands.allow = ["preference_get"]
+
+[[permission]]
+identifier = "deny-preference-get"
+description = "Denies the preference_get command without any pre-configured scope."
+commands.deny = ["preference_get"]

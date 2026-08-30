@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "workId": "0196f0d2-0000-7000-8000-000000000901",
+  "title": "示例作品",
+  "originalTitle": null,
+  "description": null,
+  "posterUri": null,
+  "backdropUri": null,
+  "releaseYear": null,
+  "categories": [],
+  "availableMediaTypes": [],
+  "favorite": false,
+  "primaryAction": null,
+  "progress": null,
+  "externalIds": [
+    { "provider": "openlibrary", "externalId": "OL1163881M" }
+  ],
+  "counts": {
+    "editions": 0,
+    "relations": 0,
+    "availableResources": 0,
+    "activeDownloads": 0,
+    "markers": 0
+  }
+}

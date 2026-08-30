@@ -1,0 +1,59 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "栖阅 Haven",
+  "version": "0.1.0",
+  "identifier": "com.haven.reader",
+  "build": {
+    "beforeDevCommand": "",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "",
+    "frontendDist": "../前端/app/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "栖阅 Haven",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 1024,
+        "minHeight": 640,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' blob: data:; font-src 'self' data: blob:; frame-src 'self' blob:; worker-src 'self' blob:; media-src 'self' blob: haven-resource: http://haven-resource.session http://haven-resource.stream; img-src 'self' https: data: blob: haven-resource: http://haven-resource.session http://haven-resource.comic-page http://haven-resource.artwork; connect-src 'self' ipc: http://ipc.localhost blob: haven-resource: http://haven-resource.session http://haven-resource.comic-page http://haven-resource.stream http://haven-resource.artwork; base-uri 'none'; object-src 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": ["msi", "nsis"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "wix": {
+        "language": "zh-CN"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI3RjcxQzlGNkUyOTJFNkQKUldRdExpbHVueHozSjdqNFdIc1JBUE5EMjQzQVc3RjV3dStxaVpyK1E2N1pQWEMvdWZDaG5Ocm0K",
+      "endpoints": [
+        "https://github.com/Knight-ask-art/Haven/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    },
+    "windowState": {
+      "filename": ".window-state"
+    }
+  }
+}

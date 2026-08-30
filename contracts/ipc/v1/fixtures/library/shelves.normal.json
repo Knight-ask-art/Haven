@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "shelves": [
+    {
+      "shelfId": "shelf-continue",
+      "titleKey": "shelf.continue",
+      "preview": [],
+      "viewMore": {
+        "category": "all",
+        "mediaTypes": null,
+        "query": null,
+        "sort": "last_active",
+        "cursor": null,
+        "limit": 50
+      }
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "boards": [
+    {
+      "boardId": "us_drama",
+      "title": "英美剧热门",
+      "subtitle": "TOP 10",
+      "items": [
+        {
+          "title": "旧快照",
+          "subtitle": "2025 / 美国",
+          "description": "上游失败时保留七天内旧数据",
+          "posterUri": null,
+          "statusBadge": null
+        }
+      ]
+    }
+  ]
+}

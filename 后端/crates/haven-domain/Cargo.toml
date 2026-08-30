@@ -1,0 +1,13 @@
+[package]
+name = "haven-domain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+haven-common = { path = "../haven-common" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+uuid = { version = "1.24.0", features = ["v7", "serde"] }
+zeroize = "1.9.0"

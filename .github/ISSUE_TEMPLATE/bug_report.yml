@@ -1,0 +1,101 @@
+name: Bug report
+description: 报告一个可以复现的栖阅问题
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你帮助改进栖阅。请先搜索已有 Issue，避免重复提交。
+
+        请不要粘贴密码、Cookie、Token、完整本地路径、完整远程 URL、书籍正文或其他个人信息。
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: 问题摘要
+      description: 请用一句话说明发生了什么，以及你预期的结果。
+      placeholder: 例如：打开某个 EPUB 后，目录跳转到错误章节。
+    validations:
+      required: true
+
+  - type: input
+    id: report-id
+    attributes:
+      label: 诊断报告 ID
+      description: 如果你在栖阅设置页生成过诊断报告，请填写报告 ID；没有则填写“无”。
+      placeholder: 例如：xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx 或 无
+    validations:
+      required: true
+
+  - type: input
+    id: haven-version
+    attributes:
+      label: Haven 版本
+      description: 从设置页 About 或诊断报告中复制版本号。
+      placeholder: 例如：0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: windows-version
+    attributes:
+      label: Windows 版本
+      description: 请填写 Windows 版本和架构，不要填写设备名称或用户名。
+      placeholder: 例如：Windows 11 24H2 x64
+    validations:
+      required: true
+
+  - type: dropdown
+    id: runtime-mode
+    attributes:
+      label: 运行模式
+      description: 请选择问题发生时使用的运行模式。
+      options:
+        - 独立 custom-protocol 桌面程序
+        - Browser Mock / 浏览器预览
+        - 不确定
+    validations:
+      required: true
+
+  - type: input
+    id: stable-error-code
+    attributes:
+      label: 稳定错误码
+      description: 从界面或诊断报告中复制稳定错误码；没有则填写“无”。
+      placeholder: 例如：RESOURCE_OPEN_FAILED 或 无
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤
+      description: 请按编号写出最小复现步骤，并说明问题是否每次都发生。
+      placeholder: |
+        1. 打开……
+        2. 点击……
+        3. 观察到……
+    validations:
+      required: true
+
+  - type: dropdown
+    id: diagnostic-report
+    attributes:
+      label: 是否包含脱敏诊断报告
+      description: 诊断报告必须由栖阅设置页生成并经过脱敏检查；不要上传原始日志或用户文件。
+      options:
+        - 是，已检查并附上脱敏报告
+        - 否，没有附加诊断报告
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: privacy-confirmation
+    attributes:
+      label: 隐私确认
+      description: 提交前请确认 Issue 内容和附件中没有敏感信息。
+      options:
+        - label: 我确认没有包含密码、Cookie、Token、完整本地路径、完整远程 URL、书籍正文或其他个人信息。
+          required: true

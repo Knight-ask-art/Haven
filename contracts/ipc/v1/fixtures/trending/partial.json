@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "boards": [
+    {
+      "boardId": "anime",
+      "title": "动漫热门",
+      "subtitle": "TOP 10",
+      "items": [
+        {
+          "title": "作品 A",
+          "subtitle": "2026 / 日本",
+          "description": "简介",
+          "posterUri": null,
+          "statusBadge": "TOP 1"
+        }
+      ]
+    },
+    {
+      "boardId": "variety",
+      "title": "综艺热门",
+      "subtitle": "TOP 10",
+      "items": [
+        {
+          "title": "节目 B",
+          "subtitle": "2026 / 中国",
+          "description": "简介",
+          "posterUri": null,
+          "statusBadge": null
+        }
+      ]
+    }
+  ]
+}

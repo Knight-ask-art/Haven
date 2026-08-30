@@ -1,0 +1,30 @@
+{
+  "catalogVersion": 1,
+  "codes": [
+    { "code": "INVALID_ARGUMENT", "retryable": false },
+    { "code": "INVALID_ID", "retryable": false },
+    { "code": "INVALID_CATEGORY", "retryable": false },
+    { "code": "INVALID_MEDIA_TYPE", "retryable": false },
+    { "code": "INVALID_CURSOR", "retryable": false },
+    { "code": "CURSOR_EXPIRED", "retryable": false },
+    { "code": "REVISION_CONFLICT", "retryable": false },
+    { "code": "WORK_NOT_FOUND", "retryable": false },
+    { "code": "EDITION_NOT_FOUND", "retryable": false },
+    { "code": "MEDIA_ITEM_NOT_FOUND", "retryable": false },
+    { "code": "RESOURCE_NOT_FOUND", "retryable": false },
+    { "code": "RESOURCE_UNAVAILABLE", "retryable": false },
+    { "code": "FORMAT_UNSUPPORTED", "retryable": false },
+    { "code": "OPERATION_CANCELLED", "retryable": false },
+    { "code": "LOCATOR_KIND_INCOMPATIBLE", "retryable": false },
+    { "code": "LOCATOR_MAP_UNSUPPORTED", "retryable": false },
+    { "code": "SOURCE_UNAVAILABLE", "retryable": true },
+    { "code": "SOURCE_AUTH_EXPIRED", "retryable": false },
+    { "code": "ARTICLE_EXTRACTION_FAILED", "retryable": true },
+    { "code": "DOWNLOAD_DISK_FULL", "retryable": false },
+    { "code": "DOWNLOAD_INTEGRITY_FAILED", "retryable": true },
+    { "code": "CREDENTIAL_ACCESS_FAILED", "retryable": "by-classification" },
+    { "code": "SECURITY_POLICY_DENIED", "retryable": false },
+    { "code": "DATABASE_ERROR", "retryable": true },
+    { "code": "INTERNAL_ERROR", "retryable": false }
+  ]
+}

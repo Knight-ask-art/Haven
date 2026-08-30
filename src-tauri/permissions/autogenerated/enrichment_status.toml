@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-enrichment-status"
+description = "Enables the enrichment_status command without any pre-configured scope."
+commands.allow = ["enrichment_status"]
+
+[[permission]]
+identifier = "deny-enrichment-status"
+description = "Denies the enrichment_status command without any pre-configured scope."
+commands.deny = ["enrichment_status"]

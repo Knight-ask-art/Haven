@@ -1,0 +1,42 @@
+[package]
+name = "haven-tauri"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "栖阅 Haven Tauri 壳（IPC-TAURI-001A：library_list / favorite_set）"
+
+[lib]
+name = "haven_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+e2e = []
+# Tauri 官方模板约定：只有启用 crate 自身的 custom-protocol feature，
+# tauri::generate_context! 才会使用 frontendDist 内嵌资源而不是 devUrl。
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# tauri "test" feature（mock runtime）只在测试目标需要——移入 dev-dependencies，
+# 避免测试桩编译进 release 产物（审查 P3）。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tauri = "2"
+tauri-plugin-window-state = "2"
+tauri-plugin-updater = "2.10.1"
+chrono = "0.4.45"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1.24.0", features = ["v4"] }
+haven-common = { path = "../后端/crates/haven-common" }
+haven-domain = { path = "../后端/crates/haven-domain" }
+haven-application = { path = "../后端/crates/haven-application" }
+haven-infrastructure = { path = "../后端/crates/haven-infrastructure" }
+
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+tokio = { version = "1.53.1", features = ["macros", "rt", "time", "sync"] }
+tempfile = "3.27.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }

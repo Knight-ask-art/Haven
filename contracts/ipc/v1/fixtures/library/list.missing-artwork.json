@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "items": [
+    {
+      "workId": "0196f0d2-0000-7000-8000-000000000010",
+      "title": "无封面示例",
+      "originalTitle": null,
+      "description": null,
+      "categories": ["video"],
+      "availableMediaTypes": ["movie"],
+      "posterUri": null,
+      "backdropUri": null,
+      "releaseYear": null,
+      "ratingValue": null,
+      "ratingScale": null,
+      "favorite": false,
+      "progress": null,
+      "primaryAction": null,
+      "externalIds": []
+    }
+  ],
+  "nextCursor": null,
+  "total": 1,
+  "revision": "r-missing-art"
+}

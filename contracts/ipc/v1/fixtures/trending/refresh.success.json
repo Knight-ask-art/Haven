@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "boards": [
+    {
+      "boardId": "anime",
+      "title": "动漫热门",
+      "subtitle": "TOP 10",
+      "items": [
+        {
+          "title": "刷新后的作品",
+          "subtitle": "2026 / 日本",
+          "description": "刷新成功后替换快照",
+          "posterUri": "haven://artwork/fresh-poster",
+          "statusBadge": null
+        }
+      ]
+    }
+  ]
+}

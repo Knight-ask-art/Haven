@@ -1,0 +1,10 @@
+{
+  "value": {
+    "section": "comic",
+    "viewMode": "single",
+    "direction": "rtl",
+    "pageGap": "twelve",
+    "preloadPages": "three"
+  },
+  "revision": null
+}

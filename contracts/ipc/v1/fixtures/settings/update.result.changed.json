@@ -1,0 +1,11 @@
+{
+  "value": {
+    "section": "general",
+    "launchPage": "continue",
+    "restoreSession": true,
+    "language": "zh_cn",
+    "notifications": true
+  },
+  "revision": "set-0000000000000003-00000001",
+  "changed": true
+}

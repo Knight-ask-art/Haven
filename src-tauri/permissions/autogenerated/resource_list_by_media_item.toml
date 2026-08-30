@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resource-list-by-media-item"
+description = "Enables the resource_list_by_media_item command without any pre-configured scope."
+commands.allow = ["resource_list_by_media_item"]
+
+[[permission]]
+identifier = "deny-resource-list-by-media-item"
+description = "Denies the resource_list_by_media_item command without any pre-configured scope."
+commands.deny = ["resource_list_by_media_item"]

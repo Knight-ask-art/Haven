@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-reader-toc-get"
+description = "Enables the reader_toc_get command without any pre-configured scope."
+commands.allow = ["reader_toc_get"]
+
+[[permission]]
+identifier = "deny-reader-toc-get"
+description = "Denies the reader_toc_get command without any pre-configured scope."
+commands.deny = ["reader_toc_get"]

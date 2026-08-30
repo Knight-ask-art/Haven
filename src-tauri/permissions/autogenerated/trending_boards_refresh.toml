@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-trending-boards-refresh"
+description = "Enables the trending_boards_refresh command without any pre-configured scope."
+commands.allow = ["trending_boards_refresh"]
+
+[[permission]]
+identifier = "deny-trending-boards-refresh"
+description = "Denies the trending_boards_refresh command without any pre-configured scope."
+commands.deny = ["trending_boards_refresh"]

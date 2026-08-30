@@ -1,0 +1,9 @@
+{
+  "value": {
+    "section": "playback",
+    "defaultPlaybackRate": "one",
+    "autoResume": true,
+    "autoNext": true
+  },
+  "revision": null
+}

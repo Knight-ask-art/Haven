@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-download-reveal-offline"
+description = "Enables the download_reveal_offline command without any pre-configured scope."
+commands.allow = ["download_reveal_offline"]
+
+[[permission]]
+identifier = "deny-download-reveal-offline"
+description = "Denies the download_reveal_offline command without any pre-configured scope."
+commands.deny = ["download_reveal_offline"]

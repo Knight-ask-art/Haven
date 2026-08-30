@@ -1,0 +1,18 @@
+{
+  "value": {
+    "section": "reading",
+    "fontFamily": "serif",
+    "customFontFamily": null,
+    "fontSize": "medium",
+    "lineHeight": "comfortable",
+    "contentWidth": "medium",
+    "theme": "warm",
+    "customBackground": null,
+    "customText": null,
+    "fontWeight": "regular",
+    "letterSpacing": "normal",
+    "systemAuto": true,
+    "pagination": "scroll"
+  },
+  "revision": null
+}

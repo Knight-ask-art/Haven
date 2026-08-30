@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-reader-search-cancel"
+description = "Enables the reader_search_cancel command without any pre-configured scope."
+commands.allow = ["reader_search_cancel"]
+
+[[permission]]
+identifier = "deny-reader-search-cancel"
+description = "Denies the reader_search_cancel command without any pre-configured scope."
+commands.deny = ["reader_search_cancel"]
