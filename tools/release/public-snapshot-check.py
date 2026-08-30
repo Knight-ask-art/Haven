@@ -1,8 +1,9 @@
 """Validate the files and runtime metadata allowed in the public snapshot.
 
 This is a release check, not a product test suite. It intentionally inspects
-Git's tracked tree so ignored local tests, diagnostics, plans, and acceptance
-evidence cannot affect the result on a developer machine.
+Git's tracked tree so ignored local diagnostics, plans, and acceptance evidence
+cannot affect the result on a developer machine. Product unit/integration test
+source is expected to be public and is therefore allowed in the tracked tree.
 """
 
 from __future__ import annotations
@@ -25,13 +26,22 @@ REQUIRED_FILES = {
     ".node-version",
     ".editorconfig",
     ".github/workflows/ci.yml",
+    ".github/workflows/codeql.yml",
+    ".github/dependabot.yml",
+    "README.en.md",
     "后端/crates/haven-application/resources/builtin-sources.json",
     "前端/app/src/lib/ipc/generated/wire.ts",
+    "contracts/ipc/v1/fixtures/README.md",
 }
 FORBIDDEN_ROOT_SEGMENTS = {"docs", "plan", "测试", "参考项目", "logs", "tmp", ".tmp"}
 FORBIDDEN_PUBLIC_PREFIXES = (
     "src-tauri/icons/android/",
     "src-tauri/icons/ios/",
+)
+FORBIDDEN_LOCAL_ONLY_PREFIXES = (
+    "后端/crates/haven-infrastructure/tests/metadata_sources_live_diagnostic.rs",
+    "后端/crates/haven-infrastructure/tests/opds_live_diagnostic.rs",
+    "前端/app/src/spike/foliate/foliate-js/tests/",
 )
 FORBIDDEN_SUFFIXES = (
     ".map",
@@ -81,9 +91,9 @@ def check_public_tree(root: Path, files: list[str], errors: list[str]) -> None:
             add_error(errors, f"forbidden public root path is tracked: {normalized}")
         if any(normalized.startswith(prefix) for prefix in FORBIDDEN_PUBLIC_PREFIXES):
             add_error(errors, f"unsupported mobile asset is tracked: {normalized}")
+        if any(normalized.startswith(prefix) for prefix in FORBIDDEN_LOCAL_ONLY_PREFIXES):
+            add_error(errors, f"local-only diagnostic or upstream test is tracked: {normalized}")
         forbidden_directory_names = {
-            "tests",
-            "__tests__",
             "diagnostics",
             "diagnostic",
             "logs",
@@ -91,14 +101,10 @@ def check_public_tree(root: Path, files: list[str], errors: list[str]) -> None:
             ".tmp",
         }
         if any(part.lower() in forbidden_directory_names for part in path.parts):
-            add_error(errors, f"local test or diagnostic directory is tracked: {normalized}")
+            add_error(errors, f"local diagnostic directory is tracked: {normalized}")
         lower = normalized.lower()
         if any(lower.endswith(suffix) for suffix in FORBIDDEN_SUFFIXES):
             add_error(errors, f"diagnostic or source-map artifact is tracked: {normalized}")
-        if re.search(r"(?:^|/)(?:[^/]*\.(?:test|spec)\.[^/]+|[^/]*_test\.[^/]+)$", lower):
-            add_error(errors, f"test source is tracked: {normalized}")
-        if path.parts and path.parts[-1].lower().startswith("test-"):
-            add_error(errors, f"test-only sample is tracked: {normalized}")
 
 
 def read_json(root: Path, relative: str, errors: list[str]) -> dict[str, Any] | None:

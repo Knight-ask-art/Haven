@@ -10,6 +10,7 @@
   <p>
     <a href="https://github.com/Knight-ask-art/Haven">GitHub</a>
     · <a href="LICENSE">MIT License</a>
+    · <a href="README.en.md">English</a>
   </p>
 
   <p>
@@ -25,7 +26,7 @@
 
 Haven（中文名：栖阅）是一个 Local-first 桌面阅读与媒体库工具。文件、进度、收藏、历史、标记和设置由本机 Rust + SQLite 负责，React 只负责交互和展示。网络来源、远程图片和外部 Provider 都经过受控的来源、资源和安全策略；没有账号也可以使用本地核心能力。
 
-当前主线是 `v0.1.0` Windows Local Core。项目内部的任务台账、验收记录和发布跟踪不随公开仓库分发；公开仓库只包含可运行产品、构建配置和必要的公开契约样例。
+当前主线是 `v0.1.0` Windows Local Core。项目内部的任务台账、验收记录和发布跟踪不随公开仓库分发；公开仓库只包含可运行产品、产品测试源码、构建配置和必要的公开契约样例。
 
 ## Core capabilities
 
@@ -87,7 +88,7 @@ cargo build --locked --features custom-protocol
 
 ## Development checks
 
-公开发布流水线只运行构建所需的静态检查和构建步骤；本地测试源码、验收记录和诊断输出不随仓库分发。
+公开发布流水线运行静态检查、产品自动化测试和构建步骤。产品测试源码属于公开仓库的一部分；真机验收记录、诊断输出和本地测试资料不随仓库分发。
 
 ```powershell
 cd 前端/app

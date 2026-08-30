@@ -5,11 +5,11 @@
 ## 提交前准备
 
 1. 使用仓库提供的 Node.js 与 Rust 版本：Node.js 22、Rust 1.94.1。`rust-toolchain.toml` 会让 rustup 自动选择该版本。
-2. 在 `前端/app` 安装依赖并运行 `npm run ci:check`。
-3. 在 `后端` 运行 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings` 和 `cargo build --workspace`。
-4. 如果修改了 Tauri 界面或 IPC，在前端构建完成后从 `src-tauri` 运行 `cargo build --locked --features custom-protocol`。
+2. 在 `前端/app` 安装依赖并运行 `npm run ci:check`（包含公开前端测试）。
+3. 在 `后端` 运行 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace --locked` 和 `cargo build --workspace`。
+4. 如果修改了 Tauri 界面或 IPC，在前端构建完成后从 `src-tauri` 运行 `cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --locked` 和 `cargo build --locked --features custom-protocol`。
 
-公共 CI 会重复执行这些检查。生成的 `dist/`、`target/`、日志、诊断导出和本地测试资料不应提交。
+公共 CI 会重复执行这些检查。产品单元/集成测试源码属于公开仓库的一部分；生成的 `dist/`、`target/`、日志、诊断导出、真机验收证据和本地测试资料不应提交。
 
 ## 代码与架构边界
 

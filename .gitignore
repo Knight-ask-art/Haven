@@ -9,6 +9,8 @@
 **/.vite/
 **/.cache/
 **/*.tsbuildinfo
+**/__pycache__/
+**/*.pyc
 
 # Logs and temporary files
 **/logs/
@@ -45,14 +47,11 @@ pnpm-debug.log*
 # Local test/design material (kept on developer machines, never tracked)
 /测试/*
 
-# Public repository curation: local test sources and test-only samples stay on
-# developer machines.  The checked-in IPC contract fixtures are intentionally
-# kept because the browser Mock client imports them at build time.
-**/tests/
-**/__tests__/
-**/*.test.*
-**/*.spec.*
-**/*_test.*
+# Product unit/integration tests are public source and are checked by CI. Keep
+# local-only diagnostics and upstream demo tests out of the public snapshot.
+/后端/crates/haven-infrastructure/tests/metadata_sources_live_diagnostic.rs
+/后端/crates/haven-infrastructure/tests/opds_live_diagnostic.rs
+/前端/app/src/spike/foliate/foliate-js/tests/
 /前端/app/public/test-*.epub
 /前端/app/scripts/*fixtures-check*
 

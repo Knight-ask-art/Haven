@@ -61,6 +61,10 @@ jobs:
         working-directory: 前端/app
         run: npm run governance:check
 
+      - name: Frontend tests
+        working-directory: 前端/app
+        run: npm run test
+
       - name: Frontend build
         working-directory: 前端/app
         run: npm run build
@@ -77,6 +81,10 @@ jobs:
         working-directory: 后端
         run: cargo build --workspace
 
+      - name: Backend tests
+        working-directory: 后端
+        run: cargo test --workspace --locked
+
       - name: Tauri format
         working-directory: src-tauri
         run: cargo fmt --all -- --check
@@ -88,3 +96,7 @@ jobs:
       - name: Tauri custom-protocol build
         working-directory: src-tauri
         run: cargo build --locked --features custom-protocol
+
+      - name: Tauri tests
+        working-directory: src-tauri
+        run: cargo test --locked
