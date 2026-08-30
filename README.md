@@ -1,6 +1,8 @@
 <div align="center">
   <img src="assets/haven-banner.png" alt="Haven" width="720" />
 
+  <img src="assets/haven-icon.png" alt="栖阅 Haven 图标" width="112" />
+
   <h1>栖阅 Haven</h1>
 
   <p>一个本地优先、面向 Windows 的个人内容空间，让所有故事在一个地方继续。</p>
