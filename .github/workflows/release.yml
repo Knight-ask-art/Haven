@@ -42,6 +42,7 @@ jobs:
           npm run build
 
       - name: Prepare Windows bundle version
+        id: bundle-version
         shell: pwsh
         env:
           RELEASE_REF: ${{ github.ref_name }}
@@ -73,6 +74,8 @@ jobs:
           @{ version = $bundleVersion } |
             ConvertTo-Json -Compress |
             Set-Content -Path src-tauri/tauri.release.conf.json -Encoding utf8
+          "release_version=$releaseVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "bundle_version=$bundleVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           Write-Host "Prepared Windows bundle version $bundleVersion for release $releaseVersion"
 
       - name: Build and publish Tauri release
@@ -85,8 +88,10 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: src-tauri
-          tagName: v__VERSION__
-          releaseName: Haven v__VERSION__
+          # The config override changes the internal Windows bundle version,
+          # so always target the exact pushed Git tag explicitly.
+          tagName: ${{ github.ref_name }}
+          releaseName: Haven ${{ github.ref_name }}
           releaseBody: |
             See [CHANGELOG.md](https://github.com/Knight-ask-art/Haven/blob/main/CHANGELOG.md)
             for supported formats, known limitations, and upgrade behavior.
