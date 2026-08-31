@@ -21,6 +21,11 @@ jobs:
     name: Public build and release checks
     runs-on: windows-latest
     timeout-minutes: 45
+    env:
+      # Keep native build outputs outside the Chinese checkout path. Some
+      # third-party C/assembly build scripts (notably aws-lc-sys) still fail
+      # when their output path contains non-ASCII characters.
+      CARGO_TARGET_DIR: ${{ runner.temp }}/haven-target
     steps:
       - name: Checkout
         uses: actions/checkout@v4
