@@ -23,7 +23,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Configure ASCII Cargo target directory
         # Keep native build outputs outside the Chinese checkout path. Some
@@ -40,14 +40,14 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "TMP=$temp"
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version-file: .node-version
           cache: npm
           cache-dependency-path: 前端/app/package-lock.json
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.x"
 
