@@ -44,7 +44,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQwMTk2RDEwMTVEQjk0QUMKUldTc2xOc1ZFRzBaUUM5NnFpRDZBcGFsSnEvZTBBZXZlekRsWHVleG9Ta3FRRjNjQ1RtM0ZhYm0K",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDc3NDlBRjkxNTFDMzJDMTIKUldRU0xNTlJrYTlKZHpGc2JldERZaFZKRFJWZXhiMVQzYTg4NEJtYkhFYndhRHhJdWZPZWxpRWcK",
       "endpoints": [
         "https://github.com/Knight-ask-art/Haven/releases/latest/download/latest.json"
       ],
