@@ -53,7 +53,6 @@ pnpm-debug.log*
 /后端/crates/haven-infrastructure/tests/opds_live_diagnostic.rs
 /前端/app/src/spike/foliate/foliate-js/tests/
 /前端/app/public/test-*.epub
-/前端/app/scripts/*fixtures-check*
 
 # Local diagnostics and test output (including files without a .log suffix).
 **/diagnostics/
