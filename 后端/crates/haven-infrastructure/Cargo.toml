@@ -8,7 +8,7 @@ rust-version.workspace = true
 async-trait = "0.1.92"
 fast-webp = { version = "=0.1.1", default-features = false, features = ["image"] }
 fs2 = "0.4.3"
-haven-application = { version = "0.1.0", path = "../haven-application" }
+haven-application = { version = "0.1.0-beta.1", path = "../haven-application" }
 haven-common = { path = "../haven-common" }
 haven-domain = { path = "../haven-domain" }
 reqwest = { workspace = true }

@@ -15,7 +15,8 @@ use tauri::http::{Method, Response, Uri};
 use tauri::Manager;
 use uuid::Uuid;
 
-use haven_application::services::{ComicPageBody, PreparedSession};
+use haven_application::services::ports::{RemoteByteRange, RemoteSessionBody};
+use haven_application::services::{ComicPageBody, PreparedSession, PreparedSessionSource};
 use haven_application::wire::SessionEngineDto;
 use haven_common::{AppError, ErrorKind};
 use haven_domain::contracts::{ResourceRepository, StorageLocationRepository};
@@ -24,7 +25,7 @@ use haven_domain::enums::{Availability, ResourceType, StorageProviderType, Stora
 use haven_domain::ids::{MediaItemId, ResourceId, StorageLocationId};
 use haven_infrastructure::artwork_cache::{ArtworkResponse, ArtworkVariant};
 
-use crate::session_registry::VerifiedSessionFile;
+use crate::session_registry::VerifiedSession;
 use crate::state::AppState;
 use crate::stream_registry::StreamGrantInner;
 
@@ -122,6 +123,47 @@ pub(crate) fn parse_byte_range(
         requested.min(total - 1)
     };
     Ok(Some(ByteRange { start, end }))
+}
+
+/// Parse the single-range form used by remote PDF sessions. The total size is
+/// intentionally unknown until the provider responds, so suffix ranges are
+/// rejected and open-ended ranges are represented as `end = None`.
+fn parse_remote_byte_range(header: Option<&str>) -> Result<Option<RemoteByteRange>, RangeError> {
+    let Some(header) = header else {
+        return Ok(None);
+    };
+    let Some(spec) = header.strip_prefix("bytes=") else {
+        return Err(RangeError::Invalid);
+    };
+    if spec.is_empty() || spec.contains(',') {
+        return Err(RangeError::Invalid);
+    }
+    let (first, second) = spec.split_once('-').ok_or(RangeError::Invalid)?;
+    if first.is_empty() {
+        // We cannot safely resolve a suffix range before knowing the remote
+        // total, and must not fetch the entire body to discover it.
+        return Err(RangeError::Unsatisfiable);
+    }
+    let start = first.parse::<u64>().map_err(|_| RangeError::Overflow)?;
+    let end = if second.is_empty() {
+        None
+    } else {
+        let end = second.parse::<u64>().map_err(|_| RangeError::Overflow)?;
+        if end < start {
+            return Err(RangeError::Unsatisfiable);
+        }
+        Some(end)
+    };
+    Ok(Some(RemoteByteRange { start, end }))
+}
+
+fn invalid_remote_range() -> AppError {
+    AppError::new(
+        "RANGE_INVALID",
+        ErrorKind::Validation,
+        "远端正文的范围请求无效",
+        false,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,12 +361,15 @@ pub(crate) fn validate_resource_binding(
     prepared: &PreparedSession,
     resource: &Resource,
 ) -> Result<PathBuf, AppError> {
+    if !matches!(&prepared.source, PreparedSessionSource::Local) {
+        return Err(policy_denied("资源类型不允许由本地 Session 打开"));
+    }
     let resource_id: ResourceId = prepared.resource_id;
     let media_item_id: MediaItemId = prepared
         .media_item_id
         .parse()
         .map_err(|_| stale_session())?;
-    let storage_id: StorageLocationId = prepared.storage_location_id;
+    let storage_id: StorageLocationId = prepared.storage_location_id.ok_or_else(stale_session)?;
     if resource.id != resource_id
         || resource.media_item_id != media_item_id
         || resource.storage_location_id != Some(storage_id)
@@ -359,7 +404,7 @@ pub(crate) fn validate_storage_binding(
     storage: &StorageLocation,
     current_canonical_root: &Path,
 ) -> Result<(), AppError> {
-    if storage.id != prepared.storage_location_id
+    if storage.id != prepared.storage_location_id.ok_or_else(stale_session)?
         || storage.provider_type != StorageProviderType::Local
     {
         return Err(policy_denied("资源存储策略不允许由本地 Session 打开"));
@@ -370,7 +415,7 @@ pub(crate) fn validate_storage_binding(
     ) {
         return Err(resource_unavailable());
     }
-    if current_canonical_root != prepared.canonical_root {
+    if Some(current_canonical_root) != prepared.canonical_root.as_deref() {
         return Err(stale_session());
     }
     Ok(())
@@ -382,7 +427,7 @@ pub(crate) async fn authorize_and_open(
     state: &AppState,
     session_id: &str,
     owner_webview_label: &str,
-) -> Result<VerifiedSessionFile, AppError> {
+) -> Result<VerifiedSession, AppError> {
     let prepared = state
         .session_registry
         .lookup_for_owner(session_id, owner_webview_label)?;
@@ -397,17 +442,82 @@ pub(crate) async fn authorize_and_open(
     }
     authorize_session_binding(state, &prepared).await?;
 
-    // This is the final atomic registry/path check. Its returned handle is the
-    // only source of bytes passed to response_for_open_file.
+    // This is the final atomic registry/source check. Local sessions return an
+    // already-open handle; remote sessions return only the immutable opaque
+    // source facts for the provider read below.
     state
         .session_registry
-        .revalidate(session_id, owner_webview_label)
+        .revalidate_any(session_id, owner_webview_label)
 }
 
 async fn authorize_session_binding(
     state: &AppState,
     prepared: &PreparedSession,
 ) -> Result<(), AppError> {
+    if let PreparedSessionSource::Remote {
+        source_id,
+        source_key,
+        remote_id,
+    } = &prepared.source
+    {
+        let resource = state
+            .repos
+            .resource
+            .get(prepared.resource_id)
+            .await?
+            .ok_or_else(stale_session)?;
+        if resource.id != prepared.resource_id
+            || resource.media_item_id
+                != prepared
+                    .media_item_id
+                    .parse::<MediaItemId>()
+                    .map_err(|_| stale_session())?
+            || resource.source_id != Some(*source_id)
+            || resource.storage_location_id.is_some()
+            || resource.resource_type != prepared.resource_type
+            || resource.mime_type != prepared.mime_type
+        {
+            return Err(stale_session());
+        }
+        let ResourceLocator::SourceObject {
+            source_id: current_source_id,
+            remote_id: current_remote_id,
+        } = &resource.locator
+        else {
+            return Err(stale_session());
+        };
+        if current_source_id != source_id || current_remote_id != remote_id {
+            return Err(stale_session());
+        }
+        if haven_application::services::source_import::source_key_for_id(*source_id)
+            != Some(source_key.as_str())
+        {
+            return Err(policy_denied("远端来源未被授权"));
+        }
+        // Re-run the Application-level SourceObject validator on every
+        // protocol read.  Session preparation already validates the identity,
+        // but a persisted row (or a future provider) may be changed between
+        // open and the first/next resource request.  A length/control-byte
+        // check alone would allow a malformed remote id to reach the
+        // provider, so keep the protocol boundary fail-closed and aligned
+        // with Download/Resource capability projection.
+        if haven_application::services::source_import::validate_remote_source_object(
+            source_key,
+            resource.resource_type,
+            remote_id,
+        )
+        .is_err()
+        {
+            return Err(policy_denied("远端资源身份校验失败"));
+        }
+        if !matches!(
+            resource.availability,
+            Availability::Available | Availability::OfflineAvailable
+        ) {
+            return Err(resource_unavailable());
+        }
+        return Ok(());
+    }
     let resource = state
         .repos
         .resource
@@ -419,7 +529,7 @@ async fn authorize_session_binding(
     let storage = state
         .repos
         .storage_location
-        .get(prepared.storage_location_id)
+        .get(prepared.storage_location_id.ok_or_else(stale_session)?)
         .await?
         .ok_or_else(stale_session)?;
     let current_root =
@@ -438,7 +548,7 @@ async fn authorize_session_binding(
     };
     let current_file = std::fs::canonicalize(&raw_file).map_err(|_| resource_unavailable())?;
     let expects_directory = prepared.resource_type == ResourceType::ImageSequence;
-    if current_file != prepared.canonical_file
+    if Some(current_file.as_path()) != prepared.canonical_file.as_deref()
         || current_file.strip_prefix(&current_root).is_err()
         || (expects_directory && !current_file.is_dir())
         || (!expects_directory && !current_file.is_file())
@@ -468,13 +578,15 @@ fn resolver_error_response(error: &AppError, origin: Option<&str>) -> Response<V
     } else {
         match error.code().as_str() {
             "SESSION_NOT_FOUND" | "RESOURCE_NOT_FOUND" => 404,
+            "RANGE_INVALID" => 416,
+            "SOURCE_RANGE_UNSUPPORTED" => 501,
             "ARTWORK_NOT_FOUND" => 404,
             "ARTWORK_QUERY_INVALID" => 400,
             "SESSION_STALE" | "RESOURCE_UNAVAILABLE" => 410,
             "SECURITY_POLICY_DENIED" => 403,
             "FORMAT_UNSUPPORTED" | "ARTWORK_FORMAT_UNSUPPORTED" => 415,
             "ARTWORK_TOO_LARGE" => 413,
-            "ARTWORK_FETCH_FAILED" => 502,
+            "ARTWORK_FETCH_FAILED" | "SOURCE_UNAVAILABLE" => 502,
             "ARTWORK_CACHE_IO_FAILED" => 503,
             "DATABASE_ERROR" => 503,
             _ if error.kind() == ErrorKind::Database => 503,
@@ -546,14 +658,33 @@ pub(crate) fn register_resource_protocol<R: tauri::Runtime>(
                                 &session_id.to_string(),
                                 &owner_webview_label,
                             ))?;
-                            let path = verified.prepared.canonical_file.clone();
-                            Ok::<_, AppError>(response_for_open_file_with_origin(
-                                &method,
-                                verified.file,
-                                &path,
-                                range.as_deref(),
-                                origin.as_deref(),
-                            ))
+                            match verified {
+                                VerifiedSession::Local(verified) => {
+                                    let Some(path) = verified.prepared.canonical_file.as_deref()
+                                    else {
+                                        return Err(resource_unavailable());
+                                    };
+                                    Ok::<_, AppError>(response_for_open_file_with_origin(
+                                        &method,
+                                        verified.file,
+                                        path,
+                                        range.as_deref(),
+                                        origin.as_deref(),
+                                    ))
+                                }
+                                VerifiedSession::Remote(prepared) => {
+                                    let remote_range = parse_remote_byte_range(range.as_deref())
+                                        .map_err(|_| invalid_remote_range())?;
+                                    let body = tauri::async_runtime::block_on(
+                                        state.session.read_remote(&prepared, remote_range),
+                                    )?;
+                                    Ok::<_, AppError>(response_for_remote_session(
+                                        &method,
+                                        body,
+                                        origin.as_deref(),
+                                    ))
+                                }
+                            }
                         }
                         ResourceRequest::Stream(grant_id, target) => {
                             if method == Method::HEAD {
@@ -622,10 +753,11 @@ pub(crate) fn register_resource_protocol<R: tauri::Runtime>(
                                 &grant_id.to_string(),
                                 &owner_webview_label,
                             ))?;
-                            let page = state
-                                .comic_pages
-                                .read_page(&verified.prepared, &verified.page);
-                            let page = page?;
+                            let page = tauri::async_runtime::block_on(
+                                state
+                                    .comic_pages
+                                    .read_page(&verified.prepared, &verified.page),
+                            )?;
                             Ok::<_, AppError>(response_for_comic_page(
                                 &method,
                                 page,
@@ -860,6 +992,81 @@ fn response_for_open_file_with_origin(
     headers.push(("Vary", "Origin".to_owned()));
     push_allowed_origin(&mut headers, origin);
     response(status, &headers, body)
+}
+
+/// Build a bounded response for an application-provided remote body. URLs and
+/// provider headers are deliberately discarded; only the validated MIME,
+/// length and (for arXiv) content range cross the resource protocol.
+fn response_for_remote_session(
+    method: &Method,
+    body: RemoteSessionBody,
+    origin: Option<&str>,
+) -> Response<Vec<u8>> {
+    let content_length = body.bytes.len() as u64;
+    if *method != Method::GET && *method != Method::HEAD {
+        return method_not_allowed_response(origin);
+    }
+    if content_length > MAX_RESPONSE_BYTES {
+        return error_response(413, body.accept_ranges, None, origin);
+    }
+    if !remote_session_body_is_valid(&body, content_length) {
+        // The provider/application boundary should already reject malformed
+        // metadata. Keep the protocol fail-closed as a second line of defence
+        // in case a future provider returns an inconsistent body.
+        return error_response(502, false, None, origin);
+    }
+    let (status, content_range) = match body.content_range {
+        Some(range) => (
+            206,
+            Some(format!(
+                "bytes {}-{}/{}",
+                range.start, range.end, range.total
+            )),
+        ),
+        None => (200, None),
+    };
+    let mut headers = vec![
+        ("Content-Length", content_length.to_string()),
+        ("Content-Type", body.mime_type),
+        ("X-Content-Type-Options", "nosniff".to_owned()),
+        ("Cache-Control", "no-store".to_owned()),
+        ("Vary", "Origin".to_owned()),
+    ];
+    if body.accept_ranges {
+        headers.push(("Accept-Ranges", "bytes".to_owned()));
+    }
+    if let Some(content_range) = content_range {
+        headers.push(("Content-Range", content_range));
+    }
+    push_allowed_origin(&mut headers, origin);
+    let payload = if *method == Method::HEAD {
+        Vec::new()
+    } else {
+        body.bytes
+    };
+    response(status, &headers, payload)
+}
+
+fn remote_session_body_is_valid(body: &RemoteSessionBody, content_length: u64) -> bool {
+    if body.total_size == 0 || content_length == 0 {
+        return false;
+    }
+    match body.content_range {
+        Some(range) => {
+            let Some(expected_length) = range
+                .end
+                .checked_sub(range.start)
+                .and_then(|length| length.checked_add(1))
+            else {
+                return false;
+            };
+            range.start <= range.end
+                && range.end < range.total
+                && range.total == body.total_size
+                && expected_length == content_length
+        }
+        None => content_length == body.total_size,
+    }
 }
 
 fn response_for_comic_page(
@@ -1423,6 +1630,100 @@ mod tests {
     }
 
     #[test]
+    fn remote_byte_ranges_are_single_forward_ranges_only() {
+        assert_eq!(parse_remote_byte_range(None), Ok(None));
+        assert_eq!(
+            parse_remote_byte_range(Some("bytes=2-5")),
+            Ok(Some(RemoteByteRange {
+                start: 2,
+                end: Some(5),
+            }))
+        );
+        assert_eq!(
+            parse_remote_byte_range(Some("bytes=2-")),
+            Ok(Some(RemoteByteRange {
+                start: 2,
+                end: None,
+            }))
+        );
+        for header in [
+            "bytes=-500",
+            "bytes=5-2",
+            "bytes=0-1,2-3",
+            "items=0-1",
+            "bytes=",
+        ] {
+            assert!(
+                parse_remote_byte_range(Some(header)).is_err(),
+                "accepted {header}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_session_response_exposes_only_bounded_body_metadata() {
+        let body = RemoteSessionBody {
+            mime_type: "application/pdf".into(),
+            bytes: b"pdf-page".to_vec(),
+            total_size: 100,
+            content_range: Some(haven_application::services::ports::RemoteContentRange {
+                start: 10,
+                end: 17,
+                total: 100,
+            }),
+            accept_ranges: true,
+        };
+        let response = response_for_remote_session(&Method::GET, body.clone(), None);
+        assert_eq!(response.status().as_u16(), 206);
+        assert_eq!(response.body(), b"pdf-page");
+        assert_eq!(response.headers().get("content-length").unwrap(), "8");
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/pdf"
+        );
+        assert_eq!(response.headers().get("accept-ranges").unwrap(), "bytes");
+        assert_eq!(
+            response.headers().get("content-range").unwrap(),
+            "bytes 10-17/100"
+        );
+        assert!(response.headers().get("x-haven-source-url").is_none());
+
+        let response = response_for_remote_session(&Method::HEAD, body, Some("tauri://localhost"));
+        assert_eq!(response.status().as_u16(), 206);
+        assert!(response.body().is_empty());
+        assert_eq!(response.headers().get("content-length").unwrap(), "8");
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            "tauri://localhost"
+        );
+    }
+
+    #[test]
+    fn remote_session_response_rejects_inconsistent_range_metadata() {
+        let response = response_for_remote_session(
+            &Method::GET,
+            RemoteSessionBody {
+                mime_type: "application/pdf".into(),
+                bytes: b"short".to_vec(),
+                total_size: 100,
+                content_range: Some(haven_application::services::ports::RemoteContentRange {
+                    start: 10,
+                    end: 20,
+                    total: 100,
+                }),
+                accept_ranges: true,
+            },
+            None,
+        );
+        assert_eq!(response.status().as_u16(), 502);
+        assert!(response.body().is_empty());
+        assert!(response.headers().get("content-range").is_none());
+    }
+
+    #[test]
     fn responses_cover_statuses_headers_and_body_cap() {
         let (_dir, path) = file_with(b"0123456789", "mp4");
         let response =
@@ -1631,9 +1932,10 @@ mod tests {
             media_item_id: media_item_id.to_string(),
             engine: SessionEngineDto::Playback,
             resource_id,
-            storage_location_id: storage_id,
-            canonical_root: canonical_root.clone(),
-            canonical_file,
+            storage_location_id: Some(storage_id),
+            canonical_root: Some(canonical_root.clone()),
+            canonical_file: Some(canonical_file),
+            source: PreparedSessionSource::Local,
             mime_type: Some("video/x-matroska".into()),
             media_type: MediaType::Movie,
             resource_type: ResourceType::LocalFile,
@@ -1685,7 +1987,12 @@ mod tests {
                 .as_str(),
             "SESSION_STALE"
         );
-        assert!(validate_storage_binding(&prepared, &storage, &prepared.canonical_root).is_ok());
+        assert!(validate_storage_binding(
+            &prepared,
+            &storage,
+            prepared.canonical_root.as_deref().unwrap(),
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1695,10 +2002,14 @@ mod tests {
         storage.status = StorageStatus::Disconnected;
         assert!(validate_resource_binding(&prepared, &resource).is_ok());
         assert_eq!(
-            validate_storage_binding(&prepared, &storage, &prepared.canonical_root)
-                .unwrap_err()
-                .code()
-                .as_str(),
+            validate_storage_binding(
+                &prepared,
+                &storage,
+                prepared.canonical_root.as_deref().unwrap(),
+            )
+            .unwrap_err()
+            .code()
+            .as_str(),
             "RESOURCE_UNAVAILABLE"
         );
     }

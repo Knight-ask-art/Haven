@@ -83,6 +83,7 @@ import {
   SOURCE_MODE_DESCRIPTIONS,
   SOURCE_MODE_LABELS,
   sourceMatchesCategory,
+  sourceUsesConfiguredEndpoint,
 } from "../lib/source-catalog"
 import {
   DENSITY_OPTIONS,
@@ -2032,7 +2033,7 @@ function SourceCard({
   const healthTone = SOURCE_HEALTH_TONES[source.health] ?? SOURCE_HEALTH_TONES.unknown
   const modeTone = SOURCE_MODE_TONES[source.mode]
   const ModeIcon = modeTone.icon
-  const supportsEndpoint = source.kinds.includes("stream") || source.kinds.includes("download")
+  const supportsEndpoint = sourceUsesConfiguredEndpoint(source.sourceId)
   const [detailsOpen, setDetailsOpen] = useState(false)
   const [endpointOpen, setEndpointOpen] = useState(false)
   return (
@@ -2069,7 +2070,7 @@ function SourceCard({
         <div className="min-w-0 flex items-center gap-1.5 md:flex-wrap">
           <span className="mr-1 text-[10px] text-[#a1a1a6] md:hidden">能力</span>
           {source.kinds.map((kind: SourceKindDto) => {
-            const Icon = kind === "stream" ? PlaySquare : kind === "download" ? Download : BookOpen
+            const Icon = kind === "online_read" ? PlaySquare : kind === "offline_download" ? Download : Search
             return <span key={kind} title={SOURCE_KIND_LABELS[kind]} className="inline-flex h-[28px] w-[28px] items-center justify-center rounded-lg border border-black/[0.06] bg-black/[0.025] text-[#6e6e73] dark:border-white/[0.07] dark:bg-white/[0.05] dark:text-[#c7c7cc]"><Icon aria-hidden="true" className="h-[14px] w-[14px]" strokeWidth={1.8} /><span className="sr-only">{SOURCE_KIND_LABELS[kind]}</span></span>
           })}
           {supportsEndpoint && <span className="ml-1 truncate text-[10px] text-[#86868b]">{source.endpointConfigured ? "接口已配" : "待配置"}</span>}

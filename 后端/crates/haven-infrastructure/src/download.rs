@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use haven_application::services::download_batch::DownloadBatchService;
+use haven_application::services::ports::RemoteAcquisitionPort;
 use haven_application::services::settings::SettingsService;
 use haven_application::services::{DownloadEventSink, DownloadRunner, OfflineResourceFiles};
 use haven_common::{AppError, ErrorKind};
@@ -252,13 +253,67 @@ pub struct LocalDownloadRunner {
     settings: Arc<SettingsService>,
     events: Arc<dyn DownloadEventSink>,
     batch: Arc<DownloadBatchService>,
+    remote: Arc<dyn RemoteAcquisitionPort>,
 }
 
 #[derive(Clone, Default)]
 pub struct LocalOfflineResourceFiles;
 
+/// The result of promoting a downloaded file into the resource index.  The
+/// `created` bit is important for compensation: an existing valid offline
+/// resource must never be deleted just because a later task-state CAS failed,
+/// while a resource created by this worker must not be left orphaned.
+#[derive(Debug, Clone, Copy)]
+struct OfflineResourceHandle {
+    id: haven_domain::ids::ResourceId,
+    created: bool,
+}
+
+#[derive(Clone, Copy)]
+struct UnavailableRemoteAcquisition;
+
+#[async_trait]
+impl RemoteAcquisitionPort for UnavailableRemoteAcquisition {
+    async fn acquire(
+        &self,
+        _source_key: &str,
+        _remote_id: &str,
+        _destination: &Path,
+    ) -> Result<haven_application::services::ports::RemoteAcquiredFile, AppError> {
+        Err(AppError::new(
+            "DOWNLOAD_SOURCE_UNAVAILABLE",
+            ErrorKind::Network,
+            "远端来源当前不可用",
+            true,
+        ))
+    }
+}
+
 #[async_trait]
 impl OfflineResourceFiles for LocalOfflineResourceFiles {
+    async fn is_available(
+        &self,
+        storage: &haven_domain::entities::StorageLocation,
+        resource: &Resource,
+    ) -> Result<bool, AppError> {
+        match registered_offline_path(storage, resource).await {
+            Ok(path) => {
+                let metadata = fs::metadata(path).await.map_err(|error| {
+                    AppError::new(
+                        "DOWNLOAD_OFFLINE_FILE_CHECK_FAILED",
+                        ErrorKind::Io,
+                        "无法确认离线文件状态",
+                        true,
+                    )
+                    .with_source(error)
+                })?;
+                Ok(metadata.is_file() && metadata.len() > 0)
+            }
+            Err(error) if error.code().as_str() == "DOWNLOAD_OFFLINE_FILE_NOT_FOUND" => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn delete(
         &self,
         storage: &haven_domain::entities::StorageLocation,
@@ -319,6 +374,22 @@ impl LocalDownloadRunner {
         events: Arc<dyn DownloadEventSink>,
         batch: Arc<DownloadBatchService>,
     ) -> Self {
+        Self::new_with_remote(
+            repos,
+            settings,
+            events,
+            batch,
+            Arc::new(UnavailableRemoteAcquisition),
+        )
+    }
+
+    pub fn new_with_remote(
+        repos: Arc<SqliteRepositories>,
+        settings: Arc<SettingsService>,
+        events: Arc<dyn DownloadEventSink>,
+        batch: Arc<DownloadBatchService>,
+        remote: Arc<dyn RemoteAcquisitionPort>,
+    ) -> Self {
         Self {
             repos,
             active: Arc::new(Mutex::new(HashSet::new())),
@@ -326,6 +397,7 @@ impl LocalDownloadRunner {
             settings,
             events,
             batch,
+            remote,
         }
     }
 
@@ -439,12 +511,57 @@ impl LocalDownloadRunner {
                 false,
             ));
         }
+        if let ResourceLocator::SourceObject {
+            source_id,
+            remote_id,
+        } = &resource.locator
+        {
+            return self
+                .run_remote_inner(task_id, &task, &resource, &storage, *source_id, remote_id)
+                .await;
+        }
         let source_path = match &resource.locator {
-            ResourceLocator::LocalPath { path } => PathBuf::from(path),
-            // 不允许任意网络访问；后续 Source Resolver 接入后由另一条端口处理。
-            ResourceLocator::Http { .. }
-            | ResourceLocator::StorageObject { .. }
-            | ResourceLocator::SourceObject { .. } => {
+            ResourceLocator::LocalPath { path } => {
+                resolve_registered_local_source(&self.repos, &resource, path).await?
+            }
+            ResourceLocator::StorageObject {
+                provider_id,
+                path_hint,
+                ..
+            } => {
+                let source_storage = self
+                    .repos
+                    .storage_location
+                    .get(*provider_id)
+                    .await
+                    .map_err(|_| DownloadWorkerFailure::new("DOWNLOAD_SOURCE_UNAVAILABLE", false))?
+                    .ok_or_else(|| {
+                        DownloadWorkerFailure::new("DOWNLOAD_SOURCE_UNAVAILABLE", false)
+                    })?;
+                let relative = path_hint.as_deref().ok_or_else(|| {
+                    DownloadWorkerFailure::new("DOWNLOAD_SOURCE_UNAVAILABLE", false)
+                })?;
+                validate_relative_object_path(relative).map_err(|_| {
+                    DownloadWorkerFailure::new("DOWNLOAD_SOURCE_UNAVAILABLE", false)
+                })?;
+                let root = fs::canonicalize(&source_storage.root_ref)
+                    .await
+                    .map_err(|_| {
+                        DownloadWorkerFailure::new("DOWNLOAD_SOURCE_UNAVAILABLE", false)
+                    })?;
+                let candidate = root.join(relative);
+                let canonical = fs::canonicalize(candidate).await.map_err(|_| {
+                    DownloadWorkerFailure::new("DOWNLOAD_SOURCE_UNAVAILABLE", false)
+                })?;
+                if !canonical.starts_with(&root) || canonical == root {
+                    return Err(DownloadWorkerFailure::new(
+                        "DOWNLOAD_SOURCE_UNAVAILABLE",
+                        false,
+                    ));
+                }
+                canonical
+            }
+            ResourceLocator::Http { .. } | ResourceLocator::SourceObject { .. } => {
                 return Err(DownloadWorkerFailure::new(
                     "DOWNLOAD_SOURCE_UNAVAILABLE",
                     false,
@@ -468,7 +585,7 @@ impl LocalDownloadRunner {
             ));
         }
 
-        let offline_dir = Path::new(&storage.root_ref).join(".haven").join("offline");
+        let offline_dir = download_category_dir(Path::new(&storage.root_ref), &resource);
         fs::create_dir_all(&offline_dir)
             .await
             .map_err(|error| io_failure(&error, "DOWNLOAD_DIRECTORY_UNAVAILABLE"))?;
@@ -478,10 +595,18 @@ impl LocalDownloadRunner {
 
         match fs::metadata(&final_path).await {
             Ok(final_meta) if final_meta.len() == total => {
-                let offline_resource_id = self
+                let offline = match self
                     .ensure_offline_resource(&resource, task.target_storage_id, &final_path, total)
-                    .await?;
-                self.repos
+                    .await
+                {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        let _ = fs::remove_file(&final_path).await;
+                        return Err(error);
+                    }
+                };
+                let resolving = match self
+                    .repos
                     .download
                     .compare_and_set_state(
                         task_id,
@@ -489,21 +614,35 @@ impl LocalDownloadRunner {
                         DownloadState::Verifying,
                     )
                     .await
-                    .map_err(|_| repository_failure())?;
-                if !self
+                {
+                    Ok(value) => value,
+                    Err(_) => {
+                        self.compensate_failed_promotion(&final_path, offline).await;
+                        return Err(repository_failure());
+                    }
+                };
+                if !resolving {
+                    self.compensate_failed_promotion(&final_path, offline).await;
+                    return Ok(());
+                }
+                let associated = match self
                     .repos
                     .download
-                    .associate_offline_resource(
-                        task_id,
-                        DownloadState::Verifying,
-                        offline_resource_id,
-                    )
+                    .associate_offline_resource(task_id, DownloadState::Verifying, offline.id)
                     .await
-                    .map_err(|_| repository_failure())?
                 {
+                    Ok(value) => value,
+                    Err(_) => {
+                        self.compensate_failed_promotion(&final_path, offline).await;
+                        return Err(repository_failure());
+                    }
+                };
+                if !associated {
+                    self.compensate_failed_promotion(&final_path, offline).await;
                     return Err(repository_failure());
                 }
-                self.repos
+                let completed = match self
+                    .repos
                     .download
                     .compare_and_set_state(
                         task_id,
@@ -511,7 +650,16 @@ impl LocalDownloadRunner {
                         DownloadState::Completed,
                     )
                     .await
-                    .map_err(|_| repository_failure())?;
+                {
+                    Ok(value) => value,
+                    Err(_) => {
+                        self.compensate_failed_promotion(&final_path, offline).await;
+                        return Err(repository_failure());
+                    }
+                };
+                if !completed {
+                    self.compensate_failed_promotion(&final_path, offline).await;
+                }
                 return Ok(());
             }
             Ok(_) => fs::remove_file(&final_path)
@@ -689,26 +837,320 @@ impl LocalDownloadRunner {
         fs::rename(&part_path, &final_path)
             .await
             .map_err(|error| io_failure(&error, "DOWNLOAD_DIRECTORY_UNAVAILABLE"))?;
-        let offline_resource_id = self
+        let offline = match self
             .ensure_offline_resource(&resource, task.target_storage_id, &final_path, total)
-            .await?;
-        if !self
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = fs::remove_file(&final_path).await;
+                return Err(error);
+            }
+        };
+        let associated = match self
             .repos
             .download
-            .associate_offline_resource(task_id, DownloadState::Verifying, offline_resource_id)
+            .associate_offline_resource(task_id, DownloadState::Verifying, offline.id)
             .await
-            .map_err(|_| repository_failure())?
         {
+            Ok(value) => value,
+            Err(_) => {
+                self.compensate_failed_promotion(&final_path, offline).await;
+                return Err(repository_failure());
+            }
+        };
+        if !associated {
+            self.compensate_failed_promotion(&final_path, offline).await;
             return Err(repository_failure());
         }
-        if !self
+        let completed = match self
             .repos
             .download
             .compare_and_set_state(task_id, DownloadState::Verifying, DownloadState::Completed)
             .await
+        {
+            Ok(value) => value,
+            Err(_) => {
+                self.compensate_failed_promotion(&final_path, offline).await;
+                return Err(repository_failure());
+            }
+        };
+        if !completed {
+            self.compensate_failed_promotion(&final_path, offline).await;
+        }
+        Ok(())
+    }
+
+    async fn run_remote_inner(
+        &self,
+        task_id: DownloadTaskId,
+        task: &DownloadTask,
+        resource: &Resource,
+        storage: &haven_domain::entities::StorageLocation,
+        source_id: haven_domain::ids::SourceId,
+        remote_id: &str,
+    ) -> Result<(), DownloadWorkerFailure> {
+        let source_key =
+            haven_application::services::source_import::source_key_for_id(source_id)
+                .ok_or_else(|| DownloadWorkerFailure::new("DOWNLOAD_SOURCE_UNAVAILABLE", false))?;
+        let offline_dir = download_category_dir(Path::new(&storage.root_ref), resource);
+        fs::create_dir_all(&offline_dir)
+            .await
+            .map_err(|error| io_failure(&error, "DOWNLOAD_DIRECTORY_UNAVAILABLE"))?;
+        let extension = resource_extension(resource);
+        let final_path = offline_dir.join(format!("{}.{}", task_id, extension));
+        let part_path = offline_dir.join(format!("{}.part", task_id));
+
+        // A previous successful run may have completed the file before the
+        // process was interrupted. Reuse it only after checking its expected
+        // container/magic; a truncated or unrelated file must be reacquired.
+        if let Ok(meta) = fs::metadata(&final_path).await {
+            if meta.is_file()
+                && meta.len() > 0
+                && validate_remote_payload(&final_path, resource).await.is_ok()
+            {
+                let total = meta.len();
+                let offline = match self
+                    .ensure_offline_resource(resource, task.target_storage_id, &final_path, total)
+                    .await
+                {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        let _ = fs::remove_file(&final_path).await;
+                        return Err(error);
+                    }
+                };
+                let resolving = match self
+                    .repos
+                    .download
+                    .compare_and_set_state(
+                        task_id,
+                        DownloadState::Resolving,
+                        DownloadState::Verifying,
+                    )
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(_) => {
+                        self.compensate_failed_promotion(&final_path, offline).await;
+                        return Err(repository_failure());
+                    }
+                };
+                if !resolving {
+                    self.compensate_failed_promotion(&final_path, offline).await;
+                    return Ok(());
+                }
+                let associated = match self
+                    .repos
+                    .download
+                    .associate_offline_resource(task_id, DownloadState::Verifying, offline.id)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(_) => {
+                        self.compensate_failed_promotion(&final_path, offline).await;
+                        return Err(repository_failure());
+                    }
+                };
+                if !associated {
+                    self.compensate_failed_promotion(&final_path, offline).await;
+                    return Err(repository_failure());
+                }
+                let completed = match self
+                    .repos
+                    .download
+                    .compare_and_set_state(
+                        task_id,
+                        DownloadState::Verifying,
+                        DownloadState::Completed,
+                    )
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(_) => {
+                        self.compensate_failed_promotion(&final_path, offline).await;
+                        return Err(repository_failure());
+                    }
+                };
+                if !completed {
+                    self.compensate_failed_promotion(&final_path, offline).await;
+                }
+                return Ok(());
+            }
+            let _ = fs::remove_file(&final_path).await;
+        }
+
+        // Remote providers currently acquire a complete object rather than a
+        // byte-range resume. Remove stale worker/provider partials before a new
+        // attempt so Windows rename cannot collide with an old `.part` file.
+        match fs::remove_file(&part_path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(io_failure(&error, "DOWNLOAD_DIRECTORY_UNAVAILABLE"));
+            }
+        }
+        self.ensure_space(&offline_dir, resource.size.unwrap_or(0))
+            .await?;
+        if !self
+            .repos
+            .download
+            .compare_and_set_state(
+                task_id,
+                DownloadState::Resolving,
+                DownloadState::Downloading,
+            )
+            .await
             .map_err(|_| repository_failure())?
         {
             return Ok(());
+        }
+
+        // Poll the task state while the provider is awaiting network IO. The
+        // future is dropped on cancellation, which aborts reqwest's in-flight
+        // request; providers also clean their own temporary file on errors.
+        let acquisition = self.remote.acquire(source_key, remote_id, &part_path);
+        tokio::pin!(acquisition);
+        let acquired = loop {
+            tokio::select! {
+                result = &mut acquisition => match result {
+                    Ok(acquired) => break acquired,
+                    Err(error) => {
+                        let _ = fs::remove_file(&part_path).await;
+                        return Err(map_remote_error(error));
+                    }
+                },
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    let state = self
+                        .repos
+                        .download
+                        .get(task_id)
+                        .await
+                        .map_err(|_| repository_failure())?
+                        .ok_or_else(repository_failure)?
+                        .state;
+                    if state == DownloadState::Cancelled {
+                        let _ = fs::remove_file(&part_path).await;
+                        return Ok(());
+                    }
+                }
+            }
+        };
+        let current = self
+            .repos
+            .download
+            .get(task_id)
+            .await
+            .map_err(|_| repository_failure())?
+            .ok_or_else(repository_failure)?;
+        if current.state != DownloadState::Downloading {
+            let _ = fs::remove_file(&part_path).await;
+            return Ok(());
+        }
+        let total = acquired.size_bytes;
+        if total == 0 {
+            let _ = fs::remove_file(&part_path).await;
+            return Err(DownloadWorkerFailure::new(
+                "DOWNLOAD_PARTIAL_INVALID",
+                false,
+            ));
+        }
+        if !remote_mime_matches(resource, &acquired.mime)
+            || validate_remote_payload(&part_path, resource).await.is_err()
+        {
+            let _ = fs::remove_file(&part_path).await;
+            return Err(DownloadWorkerFailure::new(
+                "DOWNLOAD_PARTIAL_INVALID",
+                false,
+            ));
+        }
+        // Providers write the complete object to `.part`; recheck the reserve
+        // after that write so an unknown-size source cannot consume the last
+        // available space while still being promoted to an Offline Resource.
+        if let Err(error) = self.ensure_space(&offline_dir, 0).await {
+            let _ = fs::remove_file(&part_path).await;
+            return Err(error);
+        }
+        self.repos
+            .download
+            .update_progress(
+                task_id,
+                DownloadState::Downloading,
+                Some(total),
+                total,
+                None,
+                None,
+            )
+            .await
+            .map_err(|_| repository_failure())?;
+        if !self
+            .repos
+            .download
+            .compare_and_set_state(
+                task_id,
+                DownloadState::Downloading,
+                DownloadState::Verifying,
+            )
+            .await
+            .map_err(|_| repository_failure())?
+        {
+            let _ = fs::remove_file(&part_path).await;
+            return Ok(());
+        }
+        let part_meta = fs::metadata(&part_path)
+            .await
+            .map_err(|error| io_failure(&error, "DOWNLOAD_PARTIAL_INVALID"))?;
+        if part_meta.len() != total {
+            let _ = fs::remove_file(&part_path).await;
+            return Err(DownloadWorkerFailure::new(
+                "DOWNLOAD_PARTIAL_INVALID",
+                false,
+            ));
+        }
+        fs::rename(&part_path, &final_path).await.map_err(|error| {
+            let _ = std::fs::remove_file(&part_path);
+            io_failure(&error, "DOWNLOAD_DIRECTORY_UNAVAILABLE")
+        })?;
+        let offline = match self
+            .ensure_offline_resource(resource, task.target_storage_id, &final_path, total)
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = fs::remove_file(&final_path).await;
+                return Err(error);
+            }
+        };
+        let associated = match self
+            .repos
+            .download
+            .associate_offline_resource(task_id, DownloadState::Verifying, offline.id)
+            .await
+        {
+            Ok(value) => value,
+            Err(_) => {
+                self.compensate_failed_promotion(&final_path, offline).await;
+                return Err(repository_failure());
+            }
+        };
+        if !associated {
+            self.compensate_failed_promotion(&final_path, offline).await;
+            return Err(repository_failure());
+        }
+        let completed = match self
+            .repos
+            .download
+            .compare_and_set_state(task_id, DownloadState::Verifying, DownloadState::Completed)
+            .await
+        {
+            Ok(value) => value,
+            Err(_) => {
+                self.compensate_failed_promotion(&final_path, offline).await;
+                return Err(repository_failure());
+            }
+        };
+        if !completed {
+            self.compensate_failed_promotion(&final_path, offline).await;
         }
         Ok(())
     }
@@ -719,7 +1161,7 @@ impl LocalDownloadRunner {
         target_storage_id: haven_domain::ids::StorageLocationId,
         final_path: &Path,
         total: u64,
-    ) -> Result<haven_domain::ids::ResourceId, DownloadWorkerFailure> {
+    ) -> Result<OfflineResourceHandle, DownloadWorkerFailure> {
         let resources = self
             .repos
             .resource
@@ -730,7 +1172,10 @@ impl LocalDownloadRunner {
         if let Some(existing) = resources.iter().find(|item| {
             matches!(&item.locator, ResourceLocator::LocalPath { path } if path == &final_string)
         }) {
-            return Ok(existing.id);
+            return Ok(OfflineResourceHandle {
+                id: existing.id,
+                created: false,
+            });
         }
         let now = haven_common::UtcMillis::now();
         let mut offline = source.clone();
@@ -748,7 +1193,20 @@ impl LocalDownloadRunner {
             .save(&offline)
             .await
             .map_err(|_| repository_failure())?;
-        Ok(offline_id)
+        Ok(OfflineResourceHandle {
+            id: offline_id,
+            created: true,
+        })
+    }
+
+    /// Compensate a promotion that could not be associated with a completed
+    /// task.  Only artifacts created by this worker are removed; a pre-existing
+    /// valid offline resource may be shared by a later retry and is retained.
+    async fn compensate_failed_promotion(&self, final_path: &Path, offline: OfflineResourceHandle) {
+        if offline.created {
+            let _ = self.repos.resource.delete(offline.id).await;
+            let _ = fs::remove_file(final_path).await;
+        }
     }
 
     async fn ensure_space(
@@ -815,6 +1273,75 @@ impl LocalDownloadRunner {
     }
 }
 
+/// Resolve a LocalPath only through the StorageLocation that owns the
+/// resource. Canonicalization happens before containment checking so `..`
+/// components and symlink escapes are rejected identically. This helper is
+/// intentionally shared by the worker path instead of accepting an arbitrary
+/// filesystem path from the Wire layer.
+async fn resolve_registered_local_source(
+    repos: &SqliteRepositories,
+    resource: &Resource,
+    path: &str,
+) -> Result<PathBuf, DownloadWorkerFailure> {
+    let source_storage_id = resource
+        .storage_location_id
+        .ok_or_else(|| DownloadWorkerFailure::new("DOWNLOAD_SOURCE_UNAVAILABLE", false))?;
+    let source_storage = repos
+        .storage_location
+        .get(source_storage_id)
+        .await
+        .map_err(|_| DownloadWorkerFailure::new("DOWNLOAD_SOURCE_UNAVAILABLE", false))?
+        .ok_or_else(|| DownloadWorkerFailure::new("DOWNLOAD_SOURCE_UNAVAILABLE", false))?;
+    if source_storage.provider_type != StorageProviderType::Local
+        || !matches!(
+            source_storage.status,
+            StorageStatus::Connected | StorageStatus::ReadOnly
+        )
+    {
+        return Err(DownloadWorkerFailure::new(
+            "DOWNLOAD_SOURCE_UNAVAILABLE",
+            false,
+        ));
+    }
+
+    let root = fs::canonicalize(&source_storage.root_ref)
+        .await
+        .map_err(|_| DownloadWorkerFailure::new("DOWNLOAD_SOURCE_UNAVAILABLE", false))?;
+    let root_metadata = fs::metadata(&root)
+        .await
+        .map_err(|_| DownloadWorkerFailure::new("DOWNLOAD_SOURCE_UNAVAILABLE", false))?;
+    if !root_metadata.is_dir() {
+        return Err(DownloadWorkerFailure::new(
+            "DOWNLOAD_SOURCE_UNAVAILABLE",
+            false,
+        ));
+    }
+    let raw_file = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        root.join(path)
+    };
+    let canonical = fs::canonicalize(raw_file)
+        .await
+        .map_err(|_| DownloadWorkerFailure::new("DOWNLOAD_SOURCE_UNAVAILABLE", false))?;
+    if canonical == root || !canonical.starts_with(&root) {
+        return Err(DownloadWorkerFailure::new(
+            "DOWNLOAD_SOURCE_UNAVAILABLE",
+            false,
+        ));
+    }
+    let metadata = fs::metadata(&canonical)
+        .await
+        .map_err(|_| DownloadWorkerFailure::new("DOWNLOAD_SOURCE_UNAVAILABLE", false))?;
+    if !metadata.is_file() {
+        return Err(DownloadWorkerFailure::new(
+            "DOWNLOAD_SOURCE_UNAVAILABLE",
+            false,
+        ));
+    }
+    Ok(canonical)
+}
+
 impl DownloadRunner for LocalDownloadRunner {
     fn start(&self, task_id: DownloadTaskId) {
         let should_start = self
@@ -870,6 +1397,136 @@ fn safe_extension(path: &Path) -> String {
     }
 }
 
+fn resource_extension(resource: &Resource) -> &'static str {
+    match resource.resource_type {
+        haven_domain::enums::ResourceType::ComicArchive => "cbz",
+        haven_domain::enums::ResourceType::PublicationFile => {
+            if resource
+                .mime_type
+                .as_deref()
+                .is_some_and(|mime| mime.to_ascii_lowercase().contains("epub"))
+            {
+                "epub"
+            } else {
+                "pdf"
+            }
+        }
+        haven_domain::enums::ResourceType::ArticleSnapshot => "html",
+        _ => "bin",
+    }
+}
+
+fn zip_magic(header: &[u8]) -> bool {
+    header.starts_with(b"PK\x03\x04")
+        || header.starts_with(b"PK\x05\x06")
+        || header.starts_with(b"PK\x07\x08")
+}
+
+fn normalized_mime(value: &str) -> &str {
+    value.split(';').next().unwrap_or(value).trim()
+}
+
+fn remote_mime_matches(resource: &Resource, actual: &str) -> bool {
+    let actual = normalized_mime(actual).to_ascii_lowercase();
+    match resource.resource_type {
+        haven_domain::enums::ResourceType::ComicArchive => {
+            actual == "application/vnd.comicbook+zip" || actual == "application/zip"
+        }
+        haven_domain::enums::ResourceType::PublicationFile => {
+            let expected = resource
+                .mime_type
+                .as_deref()
+                .map(normalized_mime)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if expected.contains("epub") {
+                actual.contains("epub") || actual == "application/zip"
+            } else if expected.contains("pdf") {
+                actual == "application/pdf"
+            } else {
+                actual == "application/pdf"
+                    || actual.contains("epub")
+                    || actual == "application/zip"
+            }
+        }
+        haven_domain::enums::ResourceType::ArticleSnapshot => {
+            actual == "text/html" || actual == "application/xhtml+xml"
+        }
+        _ => false,
+    }
+}
+
+async fn validate_remote_payload(path: &Path, resource: &Resource) -> Result<(), ()> {
+    let mut file = File::open(path).await.map_err(|_| ())?;
+    let mut header = [0_u8; 8];
+    let read = file.read(&mut header).await.map_err(|_| ())?;
+    if read == 0 {
+        return Err(());
+    }
+    let mime = resource.mime_type.as_deref().unwrap_or_default();
+    let valid_magic = match resource.resource_type {
+        haven_domain::enums::ResourceType::ComicArchive => zip_magic(&header[..read]),
+        haven_domain::enums::ResourceType::PublicationFile
+            if mime.to_ascii_lowercase().contains("epub") =>
+        {
+            zip_magic(&header[..read])
+        }
+        haven_domain::enums::ResourceType::PublicationFile => header[..read].starts_with(b"%PDF-"),
+        haven_domain::enums::ResourceType::ArticleSnapshot => header[0] == b'<',
+        _ => false,
+    };
+    valid_magic.then_some(()).ok_or(())
+}
+
+fn validate_relative_object_path(path: &str) -> Result<(), ()> {
+    if path.is_empty()
+        || path.contains('\\')
+        || Path::new(path).is_absolute()
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn download_category_dir(root: &Path, resource: &Resource) -> PathBuf {
+    let category = match resource.resource_type {
+        haven_domain::enums::ResourceType::ComicArchive
+        | haven_domain::enums::ResourceType::ImageSequence
+        | haven_domain::enums::ResourceType::RemoteChapter
+        | haven_domain::enums::ResourceType::RemotePageSet => "comics",
+        haven_domain::enums::ResourceType::PublicationFile => {
+            if resource
+                .mime_type
+                .as_deref()
+                .is_some_and(|mime| mime.to_ascii_lowercase().contains("epub"))
+            {
+                "books"
+            } else {
+                "articles"
+            }
+        }
+        haven_domain::enums::ResourceType::ArticleSnapshot => "articles",
+        _ => "books",
+    };
+    root.join(category)
+}
+
+fn map_remote_error(error: AppError) -> DownloadWorkerFailure {
+    match error.code().as_str() {
+        "DOWNLOAD_DISK_SPACE_LOW" => DownloadWorkerFailure::new("DOWNLOAD_DISK_SPACE_LOW", false),
+        "DOWNLOAD_DIRECTORY_UNAVAILABLE" | "STORAGE_ERROR" => {
+            DownloadWorkerFailure::new("DOWNLOAD_DIRECTORY_UNAVAILABLE", true)
+        }
+        "SECURITY_POLICY_DENIED" | "INVALID_ARGUMENT" => {
+            DownloadWorkerFailure::new("DOWNLOAD_SOURCE_UNAVAILABLE", false)
+        }
+        _ => DownloadWorkerFailure::new("DOWNLOAD_SOURCE_UNAVAILABLE", error.retryable()),
+    }
+}
+
 async fn registered_offline_path(
     storage: &haven_domain::entities::StorageLocation,
     resource: &Resource,
@@ -883,16 +1540,6 @@ async fn registered_offline_path(
     let ResourceLocator::LocalPath { path } = &resource.locator else {
         return Err(invalid_offline_path());
     };
-    let offline_root = Path::new(&storage.root_ref).join(".haven").join("offline");
-    let canonical_root = fs::canonicalize(&offline_root).await.map_err(|error| {
-        AppError::new(
-            "DOWNLOAD_OFFLINE_FILE_NOT_FOUND",
-            ErrorKind::NotFound,
-            "离线目录不存在",
-            false,
-        )
-        .with_source(error)
-    })?;
     let canonical_file = fs::canonicalize(path).await.map_err(|error| {
         AppError::new(
             "DOWNLOAD_OFFLINE_FILE_NOT_FOUND",
@@ -902,7 +1549,22 @@ async fn registered_offline_path(
         )
         .with_source(error)
     })?;
-    if !canonical_file.starts_with(&canonical_root) || canonical_file == canonical_root {
+    let root = Path::new(&storage.root_ref);
+    let mut contained = false;
+    for candidate in [
+        root.join(".haven").join("offline"),
+        root.join("books"),
+        root.join("comics"),
+        root.join("articles"),
+    ] {
+        if let Ok(canonical_root) = fs::canonicalize(candidate).await {
+            if canonical_file.starts_with(&canonical_root) && canonical_file != canonical_root {
+                contained = true;
+                break;
+            }
+        }
+    }
+    if !contained {
         return Err(invalid_offline_path());
     }
     let metadata = fs::metadata(&canonical_file).await.map_err(|error| {
@@ -962,6 +1624,7 @@ mod tests {
 
     use haven_application::services::DownloadService;
     use haven_application::services::download_batch::DownloadBatchService;
+    use haven_application::services::ports::RemoteAcquiredFile;
     use haven_application::services::settings::{SettingsService, SettingsTxPorts, SettingsUoW};
     use haven_application::wire::{DownloadCreateRequest, DownloadStateDto};
     use haven_domain::contracts::{
@@ -981,6 +1644,10 @@ mod tests {
     use haven_domain::settings::{
         DownloadConcurrency, DownloadPatch, DownloadSpeedLimit, SettingsPatch, SettingsSection,
     };
+    use std::io::{Cursor, Write as _};
+    use tokio::sync::Notify;
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
 
     struct NoopDownloadEventSink;
 
@@ -1073,6 +1740,76 @@ mod tests {
         assert!(has_enough_space(u64::MAX, u64::MAX, u64::MAX));
         assert!(has_enough_space(16, 0, 16));
         assert!(!has_enough_space(15, 0, 16));
+    }
+
+    #[tokio::test]
+    async fn local_source_path_is_bound_to_storage_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("source");
+        let outside = temp.path().join("outside.bin");
+        std::fs::create_dir_all(&root).unwrap();
+        let inside = root.join("inside.bin");
+        std::fs::write(&inside, b"inside").unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+
+        let db = Arc::new(crate::Db::open_in_memory().unwrap());
+        let repos = Arc::new(SqliteRepositories::new(db));
+        let storage_id = StorageLocationId::new();
+        repos
+            .storage_location
+            .save(&StorageLocation {
+                id: storage_id,
+                provider_type: StorageProviderType::Local,
+                display_name: "源目录".into(),
+                root_ref: root.to_string_lossy().into_owned(),
+                credential_ref: None,
+                status: StorageStatus::Connected,
+                created_at: haven_common::UtcMillis(1),
+                updated_at: haven_common::UtcMillis(1),
+            })
+            .await
+            .unwrap();
+        let resource = Resource {
+            id: ResourceId::new(),
+            media_item_id: MediaItemId::new(),
+            resource_type: ResourceType::LocalFile,
+            source_id: None,
+            storage_location_id: Some(storage_id),
+            locator: ResourceLocator::LocalPath {
+                path: inside.to_string_lossy().into_owned(),
+            },
+            mime_type: None,
+            size: None,
+            hash: None,
+            availability: Availability::Available,
+            availability_source: AvailabilitySource::User,
+            modified_ms: None,
+            fingerprint_first: None,
+            fingerprint_last: None,
+            created_at: haven_common::UtcMillis(1),
+            updated_at: haven_common::UtcMillis(1),
+        };
+
+        assert!(
+            resolve_registered_local_source(&repos, &resource, "inside.bin")
+                .await
+                .is_ok()
+        );
+        assert!(
+            resolve_registered_local_source(&repos, &resource, &outside.to_string_lossy())
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve_registered_local_source(&repos, &resource, "..")
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve_registered_local_source(&repos, &resource, &root.to_string_lossy())
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -1370,6 +2107,7 @@ mod tests {
         let edition_id = EditionId::new();
         let media_item_id = MediaItemId::new();
         let storage_id = StorageLocationId::new();
+        let source_storage_id = StorageLocationId::new();
         let source_id = ResourceId::new();
 
         repos
@@ -1450,13 +2188,27 @@ mod tests {
             .await
             .unwrap();
         repos
+            .storage_location
+            .save(&StorageLocation {
+                id: source_storage_id,
+                provider_type: StorageProviderType::Local,
+                display_name: "源文件目录".into(),
+                root_ref: temp.path().to_string_lossy().into_owned(),
+                credential_ref: None,
+                status: StorageStatus::Connected,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        repos
             .resource
             .save(&Resource {
                 id: source_id,
                 media_item_id,
                 resource_type: ResourceType::PublicationFile,
                 source_id: None,
-                storage_location_id: None,
+                storage_location_id: Some(source_storage_id),
                 locator: ResourceLocator::LocalPath {
                     path: source_path.to_string_lossy().into_owned(),
                 },
@@ -1572,6 +2324,609 @@ mod tests {
                 .count(),
             1,
             "已有 Offline Resource 时不得再次复制文件",
+        );
+
+        // 索引仍在但文件已被用户移除时，不能继续伪造 Completed；下一次创建
+        // 必须重新排队，让 Worker 按正常下载流程恢复文件。
+        std::fs::remove_file(path).unwrap();
+        let recreated_task_id: DownloadTaskId = recreated.task_id.parse().unwrap();
+        assert!(
+            repos
+                .download
+                .delete_terminal(recreated_task_id)
+                .await
+                .unwrap()
+        );
+        let retry_runner = Arc::new(CountingDownloadRunner::default());
+        let retry_service = DownloadService::new(
+            repos.clone(),
+            retry_runner.clone(),
+            Arc::new(LocalOfflineResourceFiles),
+            Arc::new(NoopDownloadEventSink),
+            settings_service(db.clone()),
+            Arc::new(DownloadBatchService::new(repos.clone())),
+        );
+        let retry = retry_service
+            .create(DownloadCreateRequest {
+                source_resource_id: source_id.to_string(),
+                target_storage_id: storage_id.to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(retry.state, DownloadStateDto::Queued);
+        assert_eq!(retry_runner.starts.load(Ordering::Relaxed), 1);
+    }
+
+    #[derive(Clone)]
+    struct TestRemoteAcquisition {
+        payload: Vec<u8>,
+        mime: String,
+        failure: Option<(&'static str, bool)>,
+        started: Option<Arc<Notify>>,
+        release: Option<Arc<Notify>>,
+    }
+
+    impl TestRemoteAcquisition {
+        fn success(payload: Vec<u8>, mime: &str) -> Self {
+            Self {
+                payload,
+                mime: mime.to_owned(),
+                failure: None,
+                started: None,
+                release: None,
+            }
+        }
+
+        fn failure(code: &'static str, retryable: bool) -> Self {
+            Self {
+                payload: Vec::new(),
+                mime: String::new(),
+                failure: Some((code, retryable)),
+                started: None,
+                release: None,
+            }
+        }
+
+        fn blocking(
+            payload: Vec<u8>,
+            mime: &str,
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+        ) -> Self {
+            Self {
+                payload,
+                mime: mime.to_owned(),
+                failure: None,
+                started: Some(started),
+                release: Some(release),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RemoteAcquisitionPort for TestRemoteAcquisition {
+        async fn acquire(
+            &self,
+            _source_key: &str,
+            _remote_id: &str,
+            destination: &Path,
+        ) -> Result<RemoteAcquiredFile, AppError> {
+            if let Some((code, retryable)) = self.failure {
+                return Err(AppError::new(
+                    code,
+                    ErrorKind::Network,
+                    "测试远端来源失败",
+                    retryable,
+                ));
+            }
+            if let (Some(started), Some(release)) = (&self.started, &self.release) {
+                tokio::fs::write(destination, b"partial")
+                    .await
+                    .map_err(|_| {
+                        AppError::new("STORAGE_ERROR", ErrorKind::Storage, "测试写入失败", true)
+                    })?;
+                started.notify_one();
+                release.notified().await;
+            }
+            tokio::fs::write(destination, &self.payload)
+                .await
+                .map_err(|_| {
+                    AppError::new("STORAGE_ERROR", ErrorKind::Storage, "测试写入失败", true)
+                })?;
+            Ok(RemoteAcquiredFile {
+                size_bytes: self.payload.len() as u64,
+                mime: self.mime.clone(),
+            })
+        }
+    }
+
+    fn zip_payload(file_name: &str, content: &[u8]) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file(file_name, SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(content).unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    async fn seed_remote_download(
+        source_key: &str,
+        media_type: MediaType,
+        resource_type: ResourceType,
+        mime_type: &str,
+        remote_id: &str,
+    ) -> (
+        tempfile::TempDir,
+        Arc<crate::Db>,
+        Arc<SqliteRepositories>,
+        Arc<SettingsService>,
+        DownloadTask,
+        Resource,
+    ) {
+        let target_root = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::Db::open_in_memory().unwrap());
+        let repos = Arc::new(SqliteRepositories::new(db.clone()));
+        let now = haven_common::UtcMillis::now();
+        let work_id = WorkId::new();
+        let edition_id = EditionId::new();
+        let media_item_id = MediaItemId::new();
+        let storage_id = StorageLocationId::new();
+        let resource_id = ResourceId::new();
+        let source_id =
+            haven_application::services::source_import::stable_source_id(source_key).unwrap();
+
+        repos
+            .work
+            .save(&Work {
+                id: work_id,
+                canonical_title: "远端下载测试".into(),
+                original_title: None,
+                sort_title: None,
+                description: None,
+                work_type: if media_type == MediaType::Article {
+                    WorkType::Article
+                } else {
+                    WorkType::Fiction
+                },
+                release_year: None,
+                language: None,
+                director: None,
+                actor: None,
+                status: WorkStatus::Completed,
+                rating_value: None,
+                rating_scale: None,
+                artwork: ArtworkSet::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        repos
+            .edition
+            .save(&Edition {
+                id: edition_id,
+                work_id,
+                title: "远端测试版本".into(),
+                subtitle: None,
+                edition_type: media_type,
+                release_date: None,
+                language: None,
+                region: None,
+                publisher_or_studio: None,
+                description: None,
+                artwork: ArtworkSet::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        repos
+            .media_item
+            .save(&MediaItem {
+                id: media_item_id,
+                edition_id,
+                parent_id: None,
+                media_type,
+                title: "远端正文".into(),
+                index: match media_type {
+                    MediaType::Comic => MediaIndex::Chapter {
+                        volume: None,
+                        chapter: 1.0,
+                    },
+                    MediaType::Article => MediaIndex::Article { ordinal: Some(1) },
+                    _ => MediaIndex::Custom {
+                        label: "正文".into(),
+                        ordinal: Some(1.0),
+                    },
+                },
+                duration_ms: None,
+                page_count: None,
+                chapter_count: None,
+                published_at: None,
+                status: MediaItemStatus::Available,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        repos
+            .storage_location
+            .save(&StorageLocation {
+                id: storage_id,
+                provider_type: StorageProviderType::Local,
+                display_name: "远端下载目录".into(),
+                root_ref: target_root.path().to_string_lossy().into_owned(),
+                credential_ref: None,
+                status: StorageStatus::Connected,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+
+        let resource = Resource {
+            id: resource_id,
+            media_item_id,
+            resource_type,
+            source_id: Some(source_id),
+            storage_location_id: None,
+            locator: ResourceLocator::SourceObject {
+                source_id,
+                remote_id: remote_id.to_owned(),
+            },
+            mime_type: Some(mime_type.to_owned()),
+            size: None,
+            hash: None,
+            availability: Availability::Available,
+            availability_source: AvailabilitySource::User,
+            modified_ms: None,
+            fingerprint_first: None,
+            fingerprint_last: None,
+            created_at: now,
+            updated_at: now,
+        };
+        repos.resource.save(&resource).await.unwrap();
+
+        let task = DownloadTask {
+            id: DownloadTaskId::new(),
+            work_id: Some(work_id),
+            edition_id: Some(edition_id),
+            media_item_id: Some(media_item_id),
+            source_resource_id: resource_id,
+            target_storage_id: storage_id,
+            offline_resource_id: None,
+            state: DownloadState::Queued,
+            bytes_total: None,
+            bytes_downloaded: 0,
+            speed_bps: None,
+            eta_seconds: None,
+            created_at: now,
+            updated_at: now,
+            batch_id: None,
+            priority: DownloadPriority::Normal,
+            provider_key: None,
+            host_key: None,
+            variant_key: String::new(),
+            resource_identity: None,
+            retry_count: 0,
+            not_before: None,
+            resumable: None,
+        };
+        repos.download.save(&task).await.unwrap();
+        // Keep the database handle for tests that need to inject a precise
+        // state transition between resource association and completion CAS.
+        // Production code never exposes this handle through the service API.
+        let settings = settings_service(db.clone());
+        (target_root, db, repos, settings, task, resource)
+    }
+
+    #[tokio::test]
+    async fn remote_worker_acquires_each_supported_type_into_the_expected_category() {
+        let cases = [
+            (
+                "mangadex",
+                MediaType::Comic,
+                ResourceType::ComicArchive,
+                "application/vnd.comicbook+zip",
+                "manga:chapter",
+                "cbz",
+                "comics",
+                zip_payload("page-0001.jpg", b"jpg"),
+            ),
+            (
+                "opds_gutenberg",
+                MediaType::Book,
+                ResourceType::PublicationFile,
+                "application/epub+zip",
+                "https://www.gutenberg.org/ebooks/84.opds",
+                "epub",
+                "books",
+                zip_payload("mimetype", b"application/epub+zip"),
+            ),
+            (
+                "arxiv",
+                MediaType::Article,
+                ResourceType::PublicationFile,
+                "application/pdf",
+                "2401.12345",
+                "pdf",
+                "articles",
+                b"%PDF-1.7\nminimal test pdf".to_vec(),
+            ),
+            (
+                "wikisource",
+                MediaType::Article,
+                ResourceType::ArticleSnapshot,
+                "text/html; charset=utf-8",
+                "测试页面",
+                "html",
+                "articles",
+                b"<!doctype html><article>test</article>".to_vec(),
+            ),
+        ];
+
+        for (
+            source_key,
+            media_type,
+            resource_type,
+            mime_type,
+            remote_id,
+            extension,
+            category,
+            payload,
+        ) in cases
+        {
+            let (target_root, _db, repos, settings, task, resource) =
+                seed_remote_download(source_key, media_type, resource_type, mime_type, remote_id)
+                    .await;
+            let runner = LocalDownloadRunner::new_with_remote(
+                repos.clone(),
+                settings,
+                Arc::new(NoopDownloadEventSink),
+                Arc::new(DownloadBatchService::new(repos.clone())),
+                Arc::new(TestRemoteAcquisition::success(payload.clone(), mime_type)),
+            );
+            runner.run(task.id).await;
+
+            let completed = repos.download.get(task.id).await.unwrap().unwrap();
+            assert_eq!(completed.state, DownloadState::Completed, "{source_key}");
+            assert!(completed.offline_resource_id.is_some(), "{source_key}");
+            assert_eq!(
+                completed.bytes_downloaded,
+                payload.len() as u64,
+                "{source_key}"
+            );
+            let final_path = target_root
+                .path()
+                .join(category)
+                .join(format!("{}.{}", task.id, extension));
+            assert_eq!(
+                tokio::fs::read(&final_path).await.unwrap(),
+                payload,
+                "{source_key}"
+            );
+            assert!(!final_path.with_extension("part").exists(), "{source_key}");
+            assert!(
+                !final_path.with_extension("provider-part").exists(),
+                "{source_key}"
+            );
+
+            let resources = repos
+                .resource
+                .list_by_media_item(resource.media_item_id)
+                .await
+                .unwrap();
+            let offline = resources
+                .iter()
+                .find(|candidate| candidate.id != resource.id)
+                .expect("远端下载必须创建 Offline Resource");
+            assert_eq!(offline.availability, Availability::OfflineAvailable);
+            assert!(matches!(offline.locator, ResourceLocator::LocalPath { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_worker_rejects_provider_failure_and_mismatched_mime_without_residue() {
+        let (target_root, _db, repos, settings, task, resource) = seed_remote_download(
+            "wikisource",
+            MediaType::Article,
+            ResourceType::ArticleSnapshot,
+            "text/html; charset=utf-8",
+            "失败页面",
+        )
+        .await;
+        let runner = LocalDownloadRunner::new_with_remote(
+            repos.clone(),
+            settings,
+            Arc::new(NoopDownloadEventSink),
+            Arc::new(DownloadBatchService::new(repos.clone())),
+            Arc::new(TestRemoteAcquisition::failure("SOURCE_UNAVAILABLE", false)),
+        );
+        runner.run(task.id).await;
+        let failed = repos.download.get(task.id).await.unwrap().unwrap();
+        assert_eq!(failed.state, DownloadState::Failed);
+        let expected_dir = target_root.path().join("articles");
+        assert!(!expected_dir.join(format!("{}.part", task.id)).exists());
+        assert_eq!(
+            repos
+                .resource
+                .list_by_media_item(resource.media_item_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let (target_root, _db, repos, settings, task, resource) = seed_remote_download(
+            "wikisource",
+            MediaType::Article,
+            ResourceType::ArticleSnapshot,
+            "text/html; charset=utf-8",
+            "错误类型",
+        )
+        .await;
+        let runner = LocalDownloadRunner::new_with_remote(
+            repos.clone(),
+            settings,
+            Arc::new(NoopDownloadEventSink),
+            Arc::new(DownloadBatchService::new(repos.clone())),
+            Arc::new(TestRemoteAcquisition::success(
+                b"<!doctype html><article>test</article>".to_vec(),
+                "application/pdf",
+            )),
+        );
+        runner.run(task.id).await;
+        let failed = repos.download.get(task.id).await.unwrap().unwrap();
+        assert_eq!(failed.state, DownloadState::Failed);
+        assert!(
+            !target_root
+                .path()
+                .join("articles")
+                .join(format!("{}.part", task.id))
+                .exists()
+        );
+        assert_eq!(
+            repos
+                .resource
+                .list_by_media_item(resource.media_item_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_worker_cancellation_drops_provider_and_removes_partial_file() {
+        let (target_root, _db, repos, settings, task, resource) = seed_remote_download(
+            "mangadex",
+            MediaType::Comic,
+            ResourceType::ComicArchive,
+            "application/vnd.comicbook+zip",
+            "manga:chapter",
+        )
+        .await;
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let started_wait = started.notified();
+        let runner = Arc::new(LocalDownloadRunner::new_with_remote(
+            repos.clone(),
+            settings,
+            Arc::new(NoopDownloadEventSink),
+            Arc::new(DownloadBatchService::new(repos.clone())),
+            Arc::new(TestRemoteAcquisition::blocking(
+                zip_payload("page-0001.jpg", b"jpg"),
+                "application/vnd.comicbook+zip",
+                started.clone(),
+                release.clone(),
+            )),
+        ));
+        let running = {
+            let runner = runner.clone();
+            tokio::spawn(async move { runner.run(task.id).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), started_wait)
+            .await
+            .expect("远端 Provider 应进入等待状态");
+        assert!(
+            repos
+                .download
+                .compare_and_set_state(
+                    task.id,
+                    DownloadState::Downloading,
+                    DownloadState::Cancelled
+                )
+                .await
+                .unwrap()
+        );
+        release.notify_one();
+        running.await.unwrap();
+
+        let cancelled = repos.download.get(task.id).await.unwrap().unwrap();
+        assert_eq!(cancelled.state, DownloadState::Cancelled);
+        let articles = target_root.path().join("comics");
+        assert!(!articles.join(format!("{}.part", task.id)).exists());
+        assert!(!articles.join(format!("{}.cbz", task.id)).exists());
+        assert_eq!(
+            repos
+                .resource
+                .list_by_media_item(resource.media_item_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_cas_failure_compensates_new_offline_resource_after_association() {
+        let (target_root, db, repos, settings, task, resource) = seed_remote_download(
+            "wikisource",
+            MediaType::Article,
+            ResourceType::ArticleSnapshot,
+            "text/html; charset=utf-8",
+            "cas-race",
+        )
+        .await;
+
+        // Inject a deterministic state race at the exact boundary under test:
+        // the association update succeeds, then another actor cancels the
+        // task before the Verifying -> Completed CAS.  This is a SQLite
+        // trigger only in the test database; production has no such trigger.
+        let task_id = task.id;
+        db.lock()
+            .execute_batch(&format!(
+                "CREATE TRIGGER test_cancel_after_offline_association
+                 AFTER UPDATE OF offline_resource_id ON download_tasks
+                 WHEN NEW.id = '{task_id}'
+                   AND NEW.offline_resource_id IS NOT NULL
+                   AND NEW.state = 'verifying'
+                 BEGIN
+                   UPDATE download_tasks
+                      SET state = 'cancelled', updated_at = NEW.updated_at
+                    WHERE id = NEW.id AND state = 'verifying';
+                 END;"
+            ))
+            .unwrap();
+
+        let payload = b"<!doctype html><article>cas-race</article>".to_vec();
+        let runner = LocalDownloadRunner::new_with_remote(
+            repos.clone(),
+            settings,
+            Arc::new(NoopDownloadEventSink),
+            Arc::new(DownloadBatchService::new(repos.clone())),
+            Arc::new(TestRemoteAcquisition::success(
+                payload.clone(),
+                "text/html; charset=utf-8",
+            )),
+        );
+        runner.run(task.id).await;
+
+        let cancelled = repos.download.get(task.id).await.unwrap().unwrap();
+        assert_eq!(cancelled.state, DownloadState::Cancelled);
+        assert_eq!(cancelled.offline_resource_id, None);
+
+        let final_path = target_root
+            .path()
+            .join("articles")
+            .join(format!("{}.html", task.id));
+        assert!(
+            !final_path.exists(),
+            "完成 CAS 失败后不得留下未关联的最终文件"
+        );
+        assert!(
+            !final_path.with_extension("part").exists(),
+            "完成 CAS 失败后不得留下 .part"
+        );
+        assert_eq!(
+            repos
+                .resource
+                .list_by_media_item(resource.media_item_id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "当前 Worker 创建的 Offline Resource 必须一并补偿删除"
         );
     }
 

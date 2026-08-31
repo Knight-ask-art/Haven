@@ -45,7 +45,7 @@ pub use cache::{ArtworkCacheClearPort, CacheService};
 pub use cast::{CastControlPort, CastDiscoveryPort, CastGrantRegistry, CastMediaPort, CastService};
 pub use comic::{
     ComicImageMime, ComicPageBody, ComicPageProvider, ComicPageService, PreparedComicPage,
-    PreparedComicPageAvailability, PreparedComicPageSource,
+    PreparedComicPageAvailability, PreparedComicPageSource, RemoteComicPageProvider,
 };
 pub use credential::{CredentialDeleteOutcome, CredentialDeletePorts, CredentialDeletionService};
 pub use credential_access::{CredentialAccessService, DEFAULT_PROFILE_ID};
@@ -80,7 +80,7 @@ pub use search_source::{
     DEFAULT_LIMIT_PER_SOURCE, MAX_LIMIT_PER_SOURCE, MAX_QUERY_LEN, SearchCancelOutcome,
     SearchEventSink, SearchSourceParticipant, SearchSourceService,
 };
-pub use session::{PreparedSession, SessionService};
+pub use session::{PreparedSession, PreparedSessionSource, SessionService};
 pub use settings::{
     SettingsService, SettingsSnapshot, SettingsTxPorts, SettingsUoW, SettingsUpdateResult,
 };

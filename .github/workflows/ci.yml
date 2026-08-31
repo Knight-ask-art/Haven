@@ -47,7 +47,7 @@ jobs:
         run: python tools/release/public-snapshot-check.py
 
       - name: Check release versions
-        run: python tools/release/version-check.py --version 0.1.0
+        run: python tools/release/version-check.py --version 0.1.0-beta.1
 
       - name: Install frontend dependencies
         working-directory: 前端/app

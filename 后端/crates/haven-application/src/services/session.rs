@@ -1,7 +1,8 @@
 //! Session open preparation (Phase A).
 //!
-//! This service resolves a media item to a checked, local file.  It deliberately
-//! does not create History and does not know about the Tauri session registry.
+//! This service resolves a media item to a checked local file or an opaque,
+//! allowlisted remote source identity. It deliberately does not create
+//! History and does not know about the Tauri session registry.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,11 +16,14 @@ use haven_domain::entities::{Resource, ResourceLocator};
 use haven_domain::enums::{
     Availability, MediaType, ResourceType, StorageProviderType, StorageStatus,
 };
-use haven_domain::ids::{MediaItemId, ResourceId, StorageLocationId};
+use haven_domain::ids::{MediaItemId, ResourceId, SourceId, StorageLocationId};
 
 use crate::mapper::progress::progress_summary;
 use crate::services::comic::{ComicPageService, PreparedComicPage};
-use crate::services::ports::SessionOpenPorts;
+use crate::services::ports::{
+    RemoteByteRange, RemoteSessionBody, RemoteSessionPort, SessionOpenPorts,
+};
+use crate::services::source_import::{source_key_for_id, validate_remote_source_object};
 use crate::wire::{ProgressSummaryDto, SessionEngineDto, SessionOpenRequest};
 
 /// A prepared session is server-only state.  In particular, its paths and
@@ -31,9 +35,13 @@ pub struct PreparedSession {
     pub media_item_id: String,
     pub engine: SessionEngineDto,
     pub resource_id: ResourceId,
-    pub storage_location_id: StorageLocationId,
-    pub canonical_root: PathBuf,
-    pub canonical_file: PathBuf,
+    /// `Some` only for a local session. Remote sessions deliberately carry no
+    /// path or storage identity, preventing a remote locator from masquerading
+    /// as a local file.
+    pub storage_location_id: Option<StorageLocationId>,
+    pub canonical_root: Option<PathBuf>,
+    pub canonical_file: Option<PathBuf>,
+    pub source: PreparedSessionSource,
     pub mime_type: Option<String>,
     pub media_type: MediaType,
     pub resource_type: ResourceType,
@@ -41,19 +49,76 @@ pub struct PreparedSession {
     pub progress: Option<ProgressSummaryDto>,
 }
 
+/// Server-only origin of the prepared session. The remote identity is opaque
+/// to the frontend and is revalidated against the Resource row before every
+/// protocol read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparedSessionSource {
+    Local,
+    Remote {
+        source_id: SourceId,
+        source_key: String,
+        remote_id: String,
+    },
+}
+
 #[derive(Clone)]
 pub struct SessionService {
     ports: Arc<dyn SessionOpenPorts>,
     comic_pages: ComicPageService,
+    remote: Option<Arc<dyn RemoteSessionPort>>,
 }
 
 impl SessionService {
     pub fn new(ports: Arc<dyn SessionOpenPorts>, comic_pages: ComicPageService) -> Self {
-        Self { ports, comic_pages }
+        Self {
+            ports,
+            comic_pages,
+            remote: None,
+        }
     }
 
-    /// Validate the hierarchy, engine, storage policy and file containment,
-    /// then return server-only facts for registry registration.
+    /// Composition-root constructor for sessions that can read fixed,
+    /// allowlisted remote providers. Keeping the provider behind an
+    /// application port prevents Tauri and domain layers from learning URLs.
+    pub fn new_with_remote(
+        ports: Arc<dyn SessionOpenPorts>,
+        comic_pages: ComicPageService,
+        remote: Arc<dyn RemoteSessionPort>,
+    ) -> Self {
+        Self {
+            ports,
+            comic_pages,
+            remote: Some(remote),
+        }
+    }
+
+    /// Fetch one bounded body for a prepared remote Article/PDF session. The
+    /// caller must already have checked the session owner in the registry;
+    /// this method only accepts the immutable remote facts captured at open.
+    pub async fn read_remote(
+        &self,
+        prepared: &PreparedSession,
+        range: Option<RemoteByteRange>,
+    ) -> Result<RemoteSessionBody, AppError> {
+        let PreparedSessionSource::Remote {
+            source_key,
+            remote_id,
+            ..
+        } = &prepared.source
+        else {
+            return Err(remote_session_unavailable());
+        };
+        let provider = self
+            .remote
+            .as_ref()
+            .ok_or_else(remote_session_unavailable)?;
+        provider.read(source_key, remote_id, range).await
+    }
+
+    /// Validate the hierarchy, engine and resource policy, then return
+    /// server-only facts for registry registration. Local resources are
+    /// canonicalized here; remote resources retain only their source identity.
     pub async fn prepare(&self, request: SessionOpenRequest) -> Result<PreparedSession, AppError> {
         let media_item_id: MediaItemId = request.media_item_id.parse().map_err(|_| {
             AppError::new(
@@ -115,13 +180,27 @@ impl SessionService {
                     canonical_root,
                     canonical_file,
                 } => {
-                    resolved.push((
+                    resolved.push(ResolvedCandidate {
                         resource,
-                        storage_location_id,
-                        canonical_root,
-                        canonical_file,
-                    ));
+                        resolution: ResolvedResource::Local {
+                            storage_location_id,
+                            canonical_root,
+                            canonical_file,
+                        },
+                    });
                 }
+                CandidateResolution::Remote {
+                    source_id,
+                    source_key,
+                    remote_id,
+                } => resolved.push(ResolvedCandidate {
+                    resource,
+                    resolution: ResolvedResource::Remote {
+                        source_id,
+                        source_key,
+                        remote_id,
+                    },
+                }),
                 CandidateResolution::Skipped => {
                     // 远端流等非本地候选：静默跳过，不污染 rejected 语义。
                 }
@@ -130,21 +209,23 @@ impl SessionService {
                 }
             }
         }
-        resolved.sort_by_key(|(resource, ..)| {
+        resolved.sort_by_key(|candidate| {
             (
-                if resource.availability == Availability::OfflineAvailable {
+                if candidate.resource.availability == Availability::OfflineAvailable {
                     0u8
                 } else {
                     1u8
                 },
-                resource.id.to_string(),
+                candidate.resource.id.to_string(),
             )
         });
-        let Some((resource, storage_location_id, canonical_root, canonical_file)) =
-            resolved.into_iter().next()
+        let Some(ResolvedCandidate {
+            resource,
+            resolution,
+        }) = resolved.into_iter().next()
         else {
-            // 全部 Skipped = 本地无候选（远端流条目）→ RESOURCE_NOT_FOUND，
-            // 前端据此回退受控流会话；有 rejected 才保留原错误语义。
+            // 全部 Skipped = 没有可由该引擎打开的候选（例如传统远端流）
+            // → RESOURCE_NOT_FOUND，由上层决定是否回退受控流会话。
             return Err(rejected.unwrap_or_else(resource_not_found));
         };
         let progress = ProgressRepository::get_for_media_item(&*self.ports, media_item_id)
@@ -153,6 +234,32 @@ impl SessionService {
             .map(progress_summary)
             .transpose()?;
 
+        let (storage_location_id, canonical_root, canonical_file, source) = match resolution {
+            ResolvedResource::Local {
+                storage_location_id,
+                canonical_root,
+                canonical_file,
+            } => (
+                Some(storage_location_id),
+                Some(canonical_root),
+                Some(canonical_file),
+                PreparedSessionSource::Local,
+            ),
+            ResolvedResource::Remote {
+                source_id,
+                source_key,
+                remote_id,
+            } => (
+                None,
+                None,
+                None,
+                PreparedSessionSource::Remote {
+                    source_id,
+                    source_key,
+                    remote_id,
+                },
+            ),
+        };
         let mut prepared = PreparedSession {
             work_id: work.id.to_string(),
             edition_id: edition.id.to_string(),
@@ -165,11 +272,12 @@ impl SessionService {
             mime_type: resource.mime_type,
             media_type: media_item.media_type,
             resource_type: resource.resource_type,
+            source,
             comic_pages: None,
             progress,
         };
         if prepared.engine == SessionEngineDto::Comic {
-            prepared.comic_pages = Some(self.comic_pages.inspect(&prepared)?);
+            prepared.comic_pages = Some(self.comic_pages.inspect(&prepared).await?);
         }
         Ok(prepared)
     }
@@ -178,10 +286,44 @@ impl SessionService {
         &self,
         resource: &Resource,
     ) -> Result<CandidateResolution, AppError> {
-        // 本地受控存储有两种定位形态：扫描入库的 LocalPath 与来源下载入库的
-        // StorageObject（相对路径取 path_hint，退化用对象名）。两者同策略：
-        // 规范化后必须仍位于存储根内。Http 等远端定位不属于本地 Session，
-        // 交给受控流通道处理。
+        // SourceObject 只能通过固定来源映射进入 Remote session；它不会被
+        // 解释为路径，也不会被转换为 URL。Provider 在真正读取时再次校验
+        // source_key/remote_id。
+        if let ResourceLocator::SourceObject {
+            source_id,
+            remote_id,
+        } = &resource.locator
+        {
+            let Some(source_key) = source_key_for_id(*source_id) else {
+                return Ok(CandidateResolution::Rejected(security_denied(
+                    "远端来源未被授权",
+                )));
+            };
+            if resource.source_id != Some(*source_id)
+                || validate_remote_source_object(source_key, resource.resource_type, remote_id)
+                    .is_err()
+            {
+                return Ok(CandidateResolution::Rejected(security_denied(
+                    "远端资源身份校验失败",
+                )));
+            }
+            // A persisted SourceObject is not, by itself, proof that the
+            // requested engine has an online reader.  Keep OPDS/Gutenberg
+            // EPUBs in the explicit "download first" state instead of
+            // issuing a session URI that the provider cannot consume.
+            if !remote_session_compatible(
+                resource.resource_type,
+                resource.mime_type.as_deref(),
+                source_key,
+            ) {
+                return Ok(CandidateResolution::Skipped);
+            }
+            return Ok(CandidateResolution::Remote {
+                source_id: *source_id,
+                source_key: source_key.to_owned(),
+                remote_id: remote_id.to_owned(),
+            });
+        }
         let path = match &resource.locator {
             ResourceLocator::LocalPath { path } => path.clone(),
             ResourceLocator::StorageObject {
@@ -262,11 +404,34 @@ enum CandidateResolution {
         canonical_root: PathBuf,
         canonical_file: PathBuf,
     },
+    Remote {
+        source_id: SourceId,
+        source_key: String,
+        remote_id: String,
+    },
     /// 非本地候选（如远端流 Http 资源）：不属于本地 Session 的管辖，
     /// 也不是策略违规；全部 Skip 时按"本地无候选"返回 RESOURCE_NOT_FOUND，
     /// 由前端回退受控流会话（stream_open，契约 §36.4）。
     Skipped,
     Rejected(AppError),
+}
+
+struct ResolvedCandidate {
+    resource: Resource,
+    resolution: ResolvedResource,
+}
+
+enum ResolvedResource {
+    Local {
+        storage_location_id: StorageLocationId,
+        canonical_root: PathBuf,
+        canonical_file: PathBuf,
+    },
+    Remote {
+        source_id: SourceId,
+        source_key: String,
+        remote_id: String,
+    },
 }
 
 pub(crate) fn engine_compatible(engine: SessionEngineDto, media_type: MediaType) -> bool {
@@ -336,6 +501,32 @@ fn security_denied(message: &'static str) -> AppError {
         message,
         false,
     )
+}
+
+fn remote_session_unavailable() -> AppError {
+    AppError::new(
+        "SOURCE_UNAVAILABLE",
+        ErrorKind::Network,
+        "远端正文当前不可用，请重试或下载后阅读",
+        true,
+    )
+}
+
+fn remote_session_compatible(
+    resource_type: ResourceType,
+    mime_type: Option<&str>,
+    source_key: &str,
+) -> bool {
+    match source_key {
+        "mangadex" => resource_type == ResourceType::ComicArchive,
+        "arxiv" => {
+            resource_type == ResourceType::PublicationFile
+                && mime_type.is_some_and(|mime| mime.to_ascii_lowercase().contains("pdf"))
+        }
+        "europepmc" | "wikisource" => resource_type == ResourceType::ArticleSnapshot,
+        // Gutenberg/OPDS currently exposes only an offline EPUB path.
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -602,7 +793,14 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(prepared.canonical_file.file_name().unwrap(), "movie.mkv");
+        assert_eq!(
+            prepared
+                .canonical_file
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .unwrap(),
+            "movie.mkv"
+        );
     }
 
     /// StorageObject 指向不存在的对象 → 不可用拒绝；不得降级为
@@ -672,7 +870,111 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(prepared.canonical_file.file_name().unwrap(), "movie.mkv");
+        assert_eq!(
+            prepared
+                .canonical_file
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .unwrap(),
+            "movie.mkv"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_object_prepares_remote_session_without_local_path() {
+        let f = fixture(None).await;
+        let mut item = MediaItemRepository::get(&*f.repos, f.item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        item.media_type = MediaType::Article;
+        f.repos.media_item.save(&item).await.unwrap();
+        for resource in f
+            .repos
+            .resource
+            .list_by_media_item(f.item_id)
+            .await
+            .unwrap()
+        {
+            f.repos.resource.delete(resource.id).await.unwrap();
+        }
+
+        let source_id = crate::services::source_import::stable_source_id("europepmc").unwrap();
+        let now = haven_common::UtcMillis(3);
+        f.repos
+            .resource
+            .save(&Resource {
+                id: ResourceId::new(),
+                media_item_id: f.item_id,
+                resource_type: ResourceType::ArticleSnapshot,
+                source_id: Some(source_id),
+                storage_location_id: None,
+                locator: ResourceLocator::SourceObject {
+                    source_id,
+                    remote_id: "PMC123456".into(),
+                },
+                mime_type: Some("text/html; charset=utf-8".into()),
+                size: None,
+                hash: None,
+                availability: Availability::Available,
+                availability_source: AvailabilitySource::User,
+                modified_ms: None,
+                fingerprint_first: None,
+                fingerprint_last: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+
+        let prepared = f
+            .service
+            .prepare(SessionOpenRequest {
+                media_item_id: f.item_id.to_string(),
+                engine: SessionEngineDto::Article,
+            })
+            .await
+            .unwrap();
+        assert!(prepared.storage_location_id.is_none());
+        assert!(prepared.canonical_root.is_none());
+        assert!(prepared.canonical_file.is_none());
+        assert!(matches!(
+            prepared.source,
+            PreparedSessionSource::Remote {
+                source_key,
+                remote_id,
+                ..
+            } if source_key == "europepmc" && remote_id == "PMC123456"
+        ));
+    }
+
+    #[test]
+    fn remote_session_requires_a_provider_reader_for_each_resource_kind() {
+        assert!(remote_session_compatible(
+            ResourceType::ComicArchive,
+            Some("application/vnd.comicbook+zip"),
+            "mangadex"
+        ));
+        assert!(remote_session_compatible(
+            ResourceType::PublicationFile,
+            Some("application/pdf"),
+            "arxiv"
+        ));
+        assert!(remote_session_compatible(
+            ResourceType::ArticleSnapshot,
+            Some("text/html"),
+            "wikisource"
+        ));
+        assert!(!remote_session_compatible(
+            ResourceType::PublicationFile,
+            Some("application/epub+zip"),
+            "opds_gutenberg"
+        ));
+        assert!(!remote_session_compatible(
+            ResourceType::PublicationFile,
+            Some("application/pdf"),
+            "unknown"
+        ));
     }
 
     #[tokio::test]
@@ -734,7 +1036,7 @@ mod tests {
         assert_eq!(prepared.resource_type, ResourceType::ImageSequence);
         assert_eq!(
             prepared.canonical_file,
-            std::fs::canonicalize(chapter).unwrap()
+            Some(std::fs::canonicalize(chapter).unwrap())
         );
     }
 

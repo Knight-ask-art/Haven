@@ -1,7 +1,7 @@
 {
   "name": "app",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.0-beta.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,6 +10,7 @@
     "lint": "oxlint",
     "preview": "vite preview",
     "governance:check": "node scripts/governance-audit.js",
+    "fixtures:check": "node scripts/fixtures-check-runner.mjs",
     "ci:check": "npm run lint && npm run governance:check && npm run test && npm run build"
   },
   "dependencies": {

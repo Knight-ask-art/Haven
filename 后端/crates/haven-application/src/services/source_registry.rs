@@ -201,19 +201,10 @@ fn validate_builtin_manifest(manifest: &BuiltinSourcesManifest) -> Result<(), St
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct HealthMetrics {
-    last_checked: Option<String>,
-    latency_ms: Option<u64>,
-    success_rate: Option<f64>,
-    health: SourceHealthDto,
-}
-
 /// 来源注册表服务。
 #[derive(Clone)]
 pub struct SourceRegistryService {
     settings: Arc<dyn SourceRegistryPorts>,
-    health_state: Arc<std::sync::Mutex<std::collections::HashMap<String, HealthMetrics>>>,
 }
 
 /// CMS10 预设采集接口（开箱即用）。顺序即前端展示顺序；首项为出厂默认端点。
@@ -267,68 +258,32 @@ pub fn default_opds_endpoints() -> Vec<(&'static str, &'static str)> {
 
 impl SourceRegistryService {
     pub fn new(settings: Arc<dyn SourceRegistryPorts>) -> Self {
-        Self {
-            settings,
-            health_state: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        }
+        Self { settings }
     }
 
-    /// 探活占位：当前仅记录检测时间与延迟占位，真实网络探测由后续 SourceHealthProbe 服务落地
+    /// 健康探测尚未接入真实 Provider。
+    ///
+    /// 保留这个兼容入口是为了让后续独立的 SourceHealthProbe Foundation 可以
+    /// 在不改变调用面语义的前提下接入；当前绝不写入“成功”指标，也不把未知
+    /// 状态伪装成正常、0ms 或 100%。
     pub async fn probe_health(&self, source_id: &str) -> SourceHealthDto {
-        let now = chrono::Utc::now().to_rfc3339();
-        if let Ok(mut map) = self.health_state.lock() {
-            map.insert(
-                source_id.to_owned(),
-                HealthMetrics {
-                    last_checked: Some(now),
-                    latency_ms: Some(0),
-                    success_rate: Some(1.0),
-                    health: SourceHealthDto::Ok,
-                },
-            );
-        }
-        SourceHealthDto::Ok
+        let _ = source_id;
+        SourceHealthDto::Unknown
     }
 
     /// `source_registry_list`：JSON 内置目录 + 持久化 enabled/endpoint 叠加。
-    /// 首次调用时若 cms10 尚未配置则幂等写入默认预设。
+    /// 首次调用时播种开箱即用来源；已有设置行中的启用/停用选择永不被覆盖。
     pub async fn list(&self) -> Result<SourceRegistryDto, AppError> {
         self.ensure_default_cms10_endpoint().await?;
         let catalog = builtin_catalog()?;
         let payload = self.payload().await?;
         let enabled = self.enabled_set().await?;
         let endpoints = self.endpoints_map().await?;
-        let health_snapshot = self
-            .health_state
-            .lock()
-            .ok()
-            .map(|g| g.clone())
-            .unwrap_or_default();
-        // 后台探活：对已启用且已配置端点的来源，异步刷新健康（不阻塞本次 list）
-        let to_probe: Vec<String> = catalog
-            .iter()
-            .filter(|s| enabled.contains(&s.source_id) && endpoints.contains_key(&s.source_id))
-            .map(|s| s.source_id.clone())
-            .collect();
-        if !to_probe.is_empty() {
-            let svc = self.clone();
-            tokio::spawn(async move {
-                for sid in to_probe {
-                    let _ = svc.probe_health(&sid).await;
-                }
-            });
-        }
         let sources = catalog
             .into_iter()
             .map(|mut source| {
                 source.enabled = enabled.contains(&source.source_id);
                 source.endpoint_configured = endpoints.contains_key(&source.source_id);
-                if let Some(metrics) = health_snapshot.get(&source.source_id) {
-                    source.health = metrics.health;
-                    source.last_checked = metrics.last_checked.clone();
-                    source.latency_ms = metrics.latency_ms;
-                    source.success_rate = metrics.success_rate;
-                }
                 source
             })
             .chain(
@@ -338,7 +293,7 @@ impl SourceRegistryService {
                     .map(|custom| SourceDescriptorDto {
                         source_id: custom.source_id.clone(),
                         display_name: custom.display_name.clone(),
-                        kinds: vec![SourceKindDto::Metadata, SourceKindDto::Download],
+                        kinds: vec![SourceKindDto::Search, SourceKindDto::OfflineDownload],
                         categories: vec![SourceCategoryDto::Book],
                         mode: SourceModeDto::Single,
                         notes: "这是你添加的自定义 OPDS 书库；可在下方编辑地址或配置访问凭据。"
@@ -677,6 +632,12 @@ impl SourceRegistryService {
     }
 
     async fn ensure_default_cms10_endpoint(&self) -> Result<(), AppError> {
+        // 只有 Sources 设置行不存在时才播种默认启用来源。这样用户在设置页
+        // 明确停用来源后，后续 list()/重启不会再次把它自动打开。
+        let first_install =
+            SettingsRepository::get(self.settings.as_settings(), SOURCES_SETTINGS_SECTION)
+                .await?
+                .is_none();
         let mut payload = self.payload().await?;
         let mut changed = false;
         if !payload.endpoints.contains_key("cms10") {
@@ -685,7 +646,7 @@ impl SourceRegistryService {
                 .insert("cms10".to_owned(), default_cms10_endpoint().to_owned());
             changed = true;
         }
-        // OPDS 书源出厂播种端点（不默认启用：启用与否交用户在设置里决定）。
+        // OPDS 书源出厂播种端点；是否默认启用仅由首次安装分支决定。
         // 防御：设置页曾对 download 源复用 Cms10EndpointRow，可能把 CMS 预设 URL
         // 误写入 OPDS 源；已知 CMS 预设地址一律纠正回出厂 OPDS 端点。
         let cms_presets = cms10_presets();
@@ -707,11 +668,22 @@ impl SourceRegistryService {
                 _ => {}
             }
         }
-        if !payload.enabled_sources.contains(&"cms10".to_owned()) {
-            // 首次安装零配置即可搜索：出厂默认启用 cms10，失败闭环由后续健康探测保障
-            payload.enabled_sources.push("cms10".to_owned());
-            payload.enabled_sources.sort();
-            changed = true;
+        if first_install {
+            // 首次安装零配置即可搜索并导入：影视、图书、漫画以及报刊文章各
+            // 提供至少一个固定的真实入口。之后的显式停用选择由已存在的
+            // settings 行保留，不会被再次自动打开。
+            for source_id in std::iter::once("cms10")
+                .chain(default_opds_endpoints().into_iter().map(|(id, _)| id))
+                .chain(["mangadex", "arxiv", "europepmc", "wikisource"])
+            {
+                if !payload.enabled_sources.iter().any(|id| id == source_id) {
+                    payload.enabled_sources.push(source_id.to_owned());
+                    changed = true;
+                }
+            }
+            if changed {
+                payload.enabled_sources.sort();
+            }
         }
         if changed {
             self.persist_payload(&payload).await?;
@@ -934,7 +906,7 @@ mod tests {
             display_name: format!("来源 {index}"),
             categories: vec![category],
             mode: SourceModeDto::Single,
-            kinds: vec![SourceKindDto::Metadata],
+            kinds: vec![SourceKindDto::Search],
             notes: "测试来源".to_owned(),
         })
         .collect();
@@ -970,7 +942,7 @@ mod tests {
                 display_name: "占位来源".to_owned(),
                 categories: vec![SourceCategoryDto::Video],
                 mode: SourceModeDto::Single,
-                kinds: vec![SourceKindDto::Metadata],
+                kinds: vec![SourceKindDto::Search],
                 notes: "目录登记、Provider 待接入".to_owned(),
             }],
         };
@@ -984,7 +956,8 @@ mod tests {
         let registry = service.list().await.unwrap();
         assert_eq!(registry.schema_version, 2);
         assert!(registry.sources.len() >= 8, "内置目录必须完整");
-        // 出厂默认：cms10 已预填并启用（零配置即可搜索），其余停用
+        // 首次安装出厂默认：四类内容各有固定来源可直接搜索；CMS10 与 OPDS
+        // 还会预填端点，在线漫画/文章来源由后端固定地址拥有。
         let cms10 = registry
             .sources
             .iter()
@@ -993,14 +966,72 @@ mod tests {
         assert!(cms10.enabled, "cms10 出厂应已启用");
         assert!(cms10.endpoint_configured, "cms10 出厂应已配置默认端点");
         assert_eq!(cms10.health, SourceHealthDto::Unknown);
+        let gutenberg = registry
+            .sources
+            .iter()
+            .find(|s| s.source_id == "opds_gutenberg")
+            .unwrap();
+        assert!(gutenberg.enabled, "Gutenberg 出厂应已启用");
+        assert!(
+            gutenberg.endpoint_configured,
+            "Gutenberg 出厂应已配置默认端点"
+        );
         assert!(
             registry
                 .sources
                 .iter()
-                .filter(|s| s.source_id != "cms10")
+                .filter(|s| {
+                    !matches!(
+                        s.source_id.as_str(),
+                        "cms10"
+                            | "opds_gutenberg"
+                            | "mangadex"
+                            | "arxiv"
+                            | "europepmc"
+                            | "wikisource"
+                    )
+                })
                 .all(|s| !s.enabled),
-            "除 cms10 外其余来源出厂停用"
+            "除开箱即用来源外其余来源出厂停用"
         );
+        for source_id in ["mangadex", "arxiv", "europepmc", "wikisource"] {
+            let source = registry
+                .sources
+                .iter()
+                .find(|s| s.source_id == source_id)
+                .unwrap();
+            assert!(source.enabled, "{source_id} 出厂应已启用");
+            assert!(!source.endpoint_configured, "{source_id} 不应要求用户端点");
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_disable_is_preserved_after_relisting() {
+        let service = service_from_memory();
+        let _ = service.list().await.unwrap();
+
+        for source_id in ["cms10", "opds_gutenberg"] {
+            service
+                .set(SourceRegistrySetRequest {
+                    source_id: source_id.to_owned(),
+                    enabled: false,
+                })
+                .await
+                .unwrap();
+        }
+
+        let registry = service.list().await.unwrap();
+        for source_id in ["cms10", "opds_gutenberg"] {
+            let source = registry
+                .sources
+                .iter()
+                .find(|item| item.source_id == source_id)
+                .unwrap();
+            assert!(
+                !source.enabled,
+                "用户停用 {source_id} 后不应被 list 重新打开"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1156,7 +1187,7 @@ mod tests {
         let (service, source_id) = seeded_custom_source().await;
         assert!(source_id.starts_with(CUSTOM_SOURCE_PREFIX));
 
-        // 注册表合并投影：默认停用、端点已配置、kinds 为 metadata+download。
+        // 注册表合并投影：默认停用、端点已配置、kinds 为 search+offline_download。
         let registry = service.list().await.unwrap();
         let custom = registry
             .sources

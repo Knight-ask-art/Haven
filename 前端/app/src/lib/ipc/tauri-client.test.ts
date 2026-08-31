@@ -137,7 +137,7 @@ describe("TauriHavenClient updater", () => {
     const close = vi.fn().mockResolvedValue(undefined)
     const downloadAndInstall = vi.fn().mockResolvedValue(undefined)
     check.mockResolvedValueOnce({
-      currentVersion: "0.1.0",
+      currentVersion: "0.1.0-beta.1",
       version: "0.1.1",
       body: "修复\n\u0000泄漏",
       date: "2026-08-30T00:00:00Z",
@@ -149,7 +149,7 @@ describe("TauriHavenClient updater", () => {
     const client = new TauriHavenClient()
     await expect(client.updateCheck()).resolves.toEqual({
       status: "available",
-      currentVersion: "0.1.0",
+      currentVersion: "0.1.0-beta.1",
       availableVersion: "0.1.1",
       releaseNotes: "修复  泄漏",
       publishedAt: "2026-08-30T00:00:00Z",

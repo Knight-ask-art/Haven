@@ -1032,7 +1032,7 @@ export class MockHavenClient implements HavenClient {
       const descriptor: SourceDescriptorDto = {
         sourceId,
         displayName: source.displayName,
-        kinds: ["metadata", "download"],
+        kinds: ["search", "offline_download"],
         categories: ["book"],
         mode: "single",
         notes: "这是你添加的自定义 OPDS 书库；可在来源设置中编辑地址或配置访问凭据。",

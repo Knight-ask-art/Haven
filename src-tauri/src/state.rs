@@ -5,23 +5,7 @@
 //!   禁止 Command 临时创建第二套 DB/Repository。
 //! - DB 在 setup 阶段打开一次（应用数据目录），后续全部复用。
 
-use std::path::PathBuf;
 use std::sync::Arc;
-
-/// 开箱即用书库根：用户「下载」目录下的 `栖阅/`（不把整个 Downloads 登记为扫描根）。
-fn default_books_library_root(db: &haven_infrastructure::Db) -> PathBuf {
-    let downloads = std::env::var_os("USERPROFILE")
-        .map(|home| PathBuf::from(home).join("Downloads"))
-        .filter(|p| p.is_dir())
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Downloads")))
-        .filter(|p| p.is_dir());
-    let base = downloads.unwrap_or_else(|| {
-        db.path()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-            .unwrap_or_else(std::env::temp_dir)
-    });
-    base.join("栖阅")
-}
 
 use tauri::Emitter;
 
@@ -167,19 +151,6 @@ impl AppState {
         );
         let download_sink = Arc::new(TauriDownloadEventSink::new());
         let download_batch = Arc::new(DownloadBatchService::new(repos.clone()));
-        let download = DownloadService::new(
-            repos.clone(),
-            Arc::new(LocalDownloadRunner::new(
-                repos.clone(),
-                Arc::new(settings.clone()),
-                download_sink.clone(),
-                download_batch.clone(),
-            )),
-            Arc::new(LocalOfflineResourceFiles),
-            download_sink.clone(),
-            Arc::new(settings.clone()),
-            download_batch.clone(),
-        );
         let favorite =
             FavoriteService::new(repos.clone(), Arc::new(SqliteUnitOfWork::new(db.clone())));
         let progress = ProgressService::new(repos.clone());
@@ -198,7 +169,28 @@ impl AppState {
         let reader_search_sink = Arc::new(TauriReaderSearchEventSink::new());
         let video_screenshot =
             VideoScreenshotService::new(Arc::new(LocalVideoScreenshotProvider::new()));
-        let session = SessionService::new(repos.clone(), comic_pages.clone());
+        // Remote Session 与漫画页 Provider 共享同一个受控正文来源实例。
+        // 这样生产组合根不会落回仅支持本地文件的默认 Service，也不会
+        // 创建第二套 HTTP client/来源事实源。
+        let online_client = Arc::new(
+            haven_infrastructure::online_sources::OnlineContentClient::new().map_err(|e| {
+                haven_common::AppError::new(
+                    "INTERNAL_ERROR",
+                    haven_common::ErrorKind::Internal,
+                    e.user_message(),
+                    false,
+                )
+            })?,
+        );
+        let online_catalog = Arc::new(
+            haven_infrastructure::online_sources::OnlineCatalogProvider::new(online_client),
+        );
+        let comic_pages = comic_pages.with_remote_provider(online_catalog.clone());
+        let session = SessionService::new_with_remote(
+            repos.clone(),
+            comic_pages.clone(),
+            online_catalog.clone(),
+        );
         let history = HistoryService::new(repos.clone(), Arc::new(settings.clone()));
         let marker = MarkerService::new(repos.clone());
         let home = HomeService::new(repos.clone());
@@ -246,11 +238,6 @@ impl AppState {
             )),
         );
         // V2-H1：OPDS 书源——3 个内置参与者 + 已启用自定义源动态参与者。
-        let storage_repo: Arc<
-            dyn haven_domain::contracts::StorageLocationRepository + Send + Sync,
-        > = Arc::new(
-            haven_infrastructure::db::repos::SqliteStorageLocationRepository::new(db.clone()),
-        );
         let mut participants: Vec<Arc<dyn SearchSourceParticipant>> = vec![Arc::new(
             Cms10SearchParticipant::new(source_registry.clone(), cms10_client.clone()),
         )];
@@ -281,13 +268,35 @@ impl AppState {
         ));
         let search_source =
             SearchSourceService::new(source_registry.clone(), participants, search_sink.clone());
+        let opds_catalog = Arc::new(haven_infrastructure::opds::OpdsCatalogProvider::new(
+            opds_client.clone(),
+        ));
+        let online_catalog_source: Arc<dyn haven_application::services::SourceCatalogProvider> =
+            online_catalog.clone();
+        let remote_acquisition = Arc::new(
+            haven_infrastructure::opds::RoutingRemoteAcquisitionPort::new(
+                opds_catalog.clone(),
+                online_catalog.clone(),
+            ),
+        );
+        let download = DownloadService::new(
+            repos.clone(),
+            Arc::new(LocalDownloadRunner::new_with_remote(
+                repos.clone(),
+                Arc::new(settings.clone()),
+                download_sink.clone(),
+                download_batch.clone(),
+                remote_acquisition,
+            )),
+            Arc::new(LocalOfflineResourceFiles),
+            download_sink.clone(),
+            Arc::new(settings.clone()),
+            download_batch.clone(),
+        );
         let catalog_router = haven_infrastructure::opds::RoutingSourceCatalogProvider::new(
             Arc::new(Cms10CatalogProvider::new(cms10_client.clone())),
-            Arc::new(haven_infrastructure::opds::OpdsCatalogProvider::new(
-                opds_client.clone(),
-                storage_repo,
-                default_books_library_root(&db),
-            )),
+            opds_catalog.clone(),
+            online_catalog_source,
         );
         let catalog_router = Arc::new(catalog_router);
         let import_ports: Arc<dyn SourceImportPorts> = repos.clone();

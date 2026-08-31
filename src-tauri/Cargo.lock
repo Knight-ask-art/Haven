@@ -1682,7 +1682,7 @@ dependencies = [
 
 [[package]]
 name = "haven-application"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1698,7 +1698,7 @@ dependencies = [
 
 [[package]]
 name = "haven-common"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1708,7 +1708,7 @@ dependencies = [
 
 [[package]]
 name = "haven-domain"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "haven-common",
@@ -1720,7 +1720,7 @@ dependencies = [
 
 [[package]]
 name = "haven-infrastructure"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "haven-tauri"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "chrono",
  "haven-application",

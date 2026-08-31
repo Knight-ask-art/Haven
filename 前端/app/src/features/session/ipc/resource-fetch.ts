@@ -25,6 +25,10 @@ export interface SessionResourcePayload {
   bytes: ArrayBuffer
   contentType: string
   partial: boolean
+  /** Total resource size when the protocol returned a valid Content-Range. */
+  totalBytes: number | null
+  /** Inclusive range represented by this response, when present. */
+  contentRange: { start: number; end: number; total: number } | null
 }
 
 /** Successful settled states; callers map thrown HavenError retryability into the shared six-state model. */
@@ -71,6 +75,8 @@ function errorForHttpStatus(status: number): HavenError {
       return resourceError("FORMAT_UNSUPPORTED", "资源超过当前版本的 32 MiB 大小限制")
     case 416:
       return resourceError("INVALID_ARGUMENT", "资源读取范围无效")
+    case 501:
+      return resourceError("SOURCE_RANGE_UNSUPPORTED", "该远端正文不支持分段读取，请先下载到本地")
     default:
       return resourceError("INTERNAL_ERROR", "资源读取失败，请稍后重试")
   }
@@ -128,14 +134,37 @@ export async function fetchSessionResource(
     throw resourceError("RESOURCE_UNAVAILABLE", "资源暂时无法读取")
   }
 
+  const rawContentRange = response.headers.get("Content-Range")
+  const contentRange = parseContentRange(rawContentRange)
   const payload: SessionResourcePayload = {
     bytes,
     contentType,
     partial: response.status === 206,
+    totalBytes: contentRange?.total ?? parseContentLength(response.headers.get("Content-Length")),
+    contentRange,
   }
   return bytes.byteLength === 0
     ? { kind: "empty", ...payload }
     : { kind: "data", ...payload }
+}
+
+function parseContentLength(value: string | null): number | null {
+  if (!value || !/^\d+$/.test(value)) return null
+  const length = Number(value)
+  return Number.isSafeInteger(length) && length >= 0 ? length : null
+}
+
+function parseContentRange(value: string | null): { start: number; end: number; total: number } | null {
+  if (!value) return null
+  const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(value.trim())
+  if (!match) return null
+  const start = Number(match[1])
+  const end = Number(match[2])
+  const total = Number(match[3])
+  if (![start, end, total].every(Number.isSafeInteger) || start < 0 || end < start || end >= total) {
+    return null
+  }
+  return { start, end, total }
 }
 
 export { SESSION_URI_PATTERN as SESSION_RESOURCE_URI_PATTERN }

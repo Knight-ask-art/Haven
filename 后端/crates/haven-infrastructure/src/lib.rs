@@ -11,6 +11,7 @@ pub mod download;
 pub mod epub;
 pub mod error_report;
 pub mod metadata_sources;
+pub mod online_sources;
 pub mod opds;
 pub mod reader_search;
 pub mod scanner;
