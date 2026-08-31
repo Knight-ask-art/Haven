@@ -27,7 +27,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Configure ASCII Cargo target directory
         run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/haven-target" >> "$GITHUB_ENV"
@@ -36,7 +36,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y pkg-config libwayland-dev
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: rust
 
@@ -50,7 +50,7 @@ jobs:
         run: cargo build --workspace --locked
 
       - name: Analyze
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
         with:
           category: /language:rust
 
@@ -60,14 +60,14 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: javascript-typescript
 
       - name: Analyze
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
         with:
           category: /language:javascript-typescript
