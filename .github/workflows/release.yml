@@ -41,6 +41,40 @@ jobs:
           npm run governance:check
           npm run build
 
+      - name: Prepare Windows bundle version
+        shell: pwsh
+        env:
+          RELEASE_REF: ${{ github.ref_name }}
+        run: |
+          $releaseRef = $env:RELEASE_REF
+          if ($releaseRef.StartsWith('v')) {
+            $releaseVersion = $releaseRef.Substring(1)
+          } else {
+            # Keep workflow_dispatch usable while making tag-triggered releases strict.
+            $releaseVersion = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          }
+
+          # Windows MSI encodes the optional SemVer prerelease identifier as a
+          # numeric value in the range 0..65535.  Keep the public Git tag
+          # (for example v0.1.0-beta.1), but use the equivalent numeric bundle
+          # version (0.1.0-1) only for the generated installers and updater
+          # manifest.  Stable versions are passed through unchanged.
+          $bundleVersion = $releaseVersion
+          if ($releaseVersion -match '^(?<base>\d+\.\d+\.\d+)-(?<channel>[0-9A-Za-z]+)\.(?<number>\d+)$') {
+            $number = [int]$Matches['number']
+            if ($number -gt 65535) {
+              throw "MSI prerelease number must be <= 65535; got $number"
+            }
+            $bundleVersion = "$($Matches['base'])-$number"
+          } elseif ($releaseVersion.Contains('-')) {
+            throw "MSI prerelease versions must end with a numeric identifier (for example 0.1.0-beta.1); got $releaseVersion"
+          }
+
+          @{ version = $bundleVersion } |
+            ConvertTo-Json -Compress |
+            Set-Content -Path src-tauri/tauri.release.conf.json -Encoding utf8
+          Write-Host "Prepared Windows bundle version $bundleVersion for release $releaseVersion"
+
       - name: Build and publish Tauri release
         uses: tauri-apps/tauri-action@v1
         env:
@@ -62,4 +96,4 @@ jobs:
           # beta would become the channel's "latest" release and the later
           # v0.1.0 stable build could not be distinguished by the updater.
           prerelease: ${{ contains(github.ref_name, '-') }}
-          args: --target x86_64-pc-windows-msvc
+          args: --target x86_64-pc-windows-msvc --config tauri.release.conf.json
