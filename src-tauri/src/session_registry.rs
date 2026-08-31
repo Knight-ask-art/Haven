@@ -9,9 +9,10 @@ use std::fmt;
 use std::fs::File;
 use std::ops::Deref;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{Duration, Instant};
 
 use haven_application::services::{
-    PreparedComicPage, PreparedComicPageAvailability, PreparedSession,
+    PreparedComicPage, PreparedComicPageAvailability, PreparedSession, PreparedSessionSource,
 };
 use haven_application::wire::{
     ComicPageAvailabilityDto, ComicPageDto, ComicPageManifestDto, SessionEngineDto,
@@ -19,6 +20,9 @@ use haven_application::wire::{
 use haven_common::{AppError, ErrorKind};
 
 pub(crate) const MAX_CONCURRENT_COMIC_PAGE_READS: usize = 4;
+/// Runtime sessions are short-lived capabilities. A caller can reopen a
+/// session after expiry; no remote identity is retained as a durable grant.
+pub(crate) const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 
 pub(crate) struct SessionRegistry {
     state: RwLock<RegistryState>,
@@ -34,6 +38,7 @@ struct SessionRecord {
     prepared: PreparedSession,
     owner_webview_label: String,
     owner_window_label: String,
+    expires_at: Instant,
     comic_manifest: Option<RegisteredComicManifest>,
     active_comic_reads: usize,
 }
@@ -56,6 +61,21 @@ struct ComicGrant {
 pub(crate) struct VerifiedSessionFile {
     pub(crate) prepared: PreparedSession,
     pub(crate) file: File,
+}
+
+/// Revalidated session capability. Remote sessions intentionally have no file
+/// handle; the resource protocol delegates their body read to an allowlisted
+/// application port.
+#[derive(Debug)]
+pub(crate) enum VerifiedSession {
+    Local(VerifiedSessionFile),
+    Remote(PreparedSession),
+}
+
+impl SessionRecord {
+    fn is_expired(&self) -> bool {
+        Instant::now() >= self.expires_at
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +135,7 @@ impl SessionRegistry {
                 prepared,
                 owner_webview_label,
                 owner_window_label,
+                expires_at: Instant::now() + SESSION_TTL,
                 comic_manifest: None,
                 active_comic_reads: 0,
             },
@@ -139,7 +160,9 @@ impl SessionRegistry {
         let record = state
             .sessions
             .get(id)
-            .filter(|record| record.owner_webview_label == owner_webview_label)
+            .filter(|record| {
+                record.owner_webview_label == owner_webview_label && !record.is_expired()
+            })
             .ok_or_else(resource_not_found)?;
         Ok(record.prepared.clone())
     }
@@ -154,7 +177,9 @@ impl SessionRegistry {
             let record = state
                 .sessions
                 .get(id)
-                .filter(|record| record.owner_webview_label == owner_webview_label)
+                .filter(|record| {
+                    record.owner_webview_label == owner_webview_label && !record.is_expired()
+                })
                 .ok_or_else(resource_not_found)?;
             if record.prepared.engine != SessionEngineDto::Comic {
                 return Err(format_unsupported());
@@ -254,7 +279,9 @@ impl SessionRegistry {
         let record = state
             .sessions
             .get_mut(&grant.session_id)
-            .filter(|record| record.owner_webview_label == owner_webview_label)
+            .filter(|record| {
+                record.owner_webview_label == owner_webview_label && !record.is_expired()
+            })
             .ok_or_else(resource_not_found)?;
         if record.active_comic_reads >= MAX_CONCURRENT_COMIC_PAGE_READS {
             return Err(resource_busy());
@@ -322,37 +349,61 @@ impl SessionRegistry {
 
     /// Atomically validate and open a non-Comic session file while the record
     /// read lock is held. Comic archive bytes must never use this root channel.
+    #[cfg(test)]
     pub(crate) fn revalidate(
         &self,
         id: &str,
         owner_webview_label: &str,
     ) -> Result<VerifiedSessionFile, AppError> {
+        match self.revalidate_any(id, owner_webview_label)? {
+            VerifiedSession::Local(local) => Ok(local),
+            VerifiedSession::Remote(_) => Err(resource_not_found()),
+        }
+    }
+
+    /// Revalidate an open session without assuming it is backed by a local
+    /// path. This is the resource protocol entry point for both local and
+    /// remote sessions.
+    pub(crate) fn revalidate_any(
+        &self,
+        id: &str,
+        owner_webview_label: &str,
+    ) -> Result<VerifiedSession, AppError> {
         let state = self.read_state()?;
         let record = state
             .sessions
             .get(id)
-            .filter(|record| record.owner_webview_label == owner_webview_label)
+            .filter(|record| {
+                record.owner_webview_label == owner_webview_label && !record.is_expired()
+            })
             .ok_or_else(resource_not_found)?;
         let prepared = &record.prepared;
+        if matches!(&prepared.source, PreparedSessionSource::Remote { .. }) {
+            return Ok(VerifiedSession::Remote(prepared.clone()));
+        }
         if prepared.engine == SessionEngineDto::Comic {
             return Err(resource_not_found());
         }
-        let root =
-            std::fs::canonicalize(&prepared.canonical_root).map_err(|_| resource_unavailable())?;
-        let file =
-            std::fs::canonicalize(&prepared.canonical_file).map_err(|_| resource_unavailable())?;
-        if root != prepared.canonical_root
-            || file != prepared.canonical_file
+        let Some(prepared_root) = prepared.canonical_root.as_deref() else {
+            return Err(resource_unavailable());
+        };
+        let Some(prepared_file) = prepared.canonical_file.as_deref() else {
+            return Err(resource_unavailable());
+        };
+        let root = std::fs::canonicalize(prepared_root).map_err(|_| resource_unavailable())?;
+        let file = std::fs::canonicalize(prepared_file).map_err(|_| resource_unavailable())?;
+        if root != prepared_root
+            || file != prepared_file
             || file.strip_prefix(&root).is_err()
             || !file.is_file()
         {
             return Err(policy_denied("资源路径校验失败"));
         }
         let handle = File::open(&file).map_err(|_| resource_unavailable())?;
-        Ok(VerifiedSessionFile {
+        Ok(VerifiedSession::Local(VerifiedSessionFile {
             prepared: prepared.clone(),
             file: handle,
-        })
+        }))
     }
 
     fn read_state(&self) -> Result<RwLockReadGuard<'_, RegistryState>, AppError> {
@@ -373,7 +424,7 @@ fn verified_comic_page(
     let record = state
         .sessions
         .get(&grant.session_id)
-        .filter(|record| record.owner_webview_label == owner_webview_label)
+        .filter(|record| record.owner_webview_label == owner_webview_label && !record.is_expired())
         .ok_or_else(resource_not_found)?;
     let page = record
         .prepared
@@ -402,6 +453,7 @@ fn comic_session_snapshot(prepared: &PreparedSession) -> PreparedSession {
         mime_type: prepared.mime_type.clone(),
         media_type: prepared.media_type,
         resource_type: prepared.resource_type,
+        source: prepared.source.clone(),
         comic_pages: None,
         progress: prepared.progress.clone(),
     }
@@ -498,9 +550,10 @@ mod tests {
             media_item_id: uuid::Uuid::new_v4().to_string(),
             engine: SessionEngineDto::Playback,
             resource_id: ResourceId::new(),
-            storage_location_id: StorageLocationId::new(),
-            canonical_root: root,
-            canonical_file: file,
+            storage_location_id: Some(StorageLocationId::new()),
+            canonical_root: Some(root),
+            canonical_file: Some(file),
+            source: PreparedSessionSource::Local,
             mime_type: None,
             media_type: MediaType::Movie,
             resource_type: ResourceType::LocalFile,

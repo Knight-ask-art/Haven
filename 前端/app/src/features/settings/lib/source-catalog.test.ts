@@ -6,12 +6,13 @@ import {
   groupSourcesByMode,
   sourceCapabilityLabels,
   sourceMatchesCategory,
+  sourceUsesConfiguredEndpoint,
 } from "./source-catalog"
 
 const source = (sourceId: string, mode: SourceDescriptorDto["mode"], categories: SourceDescriptorDto["categories"]): SourceDescriptorDto => ({
   sourceId,
   displayName: sourceId,
-  kinds: ["metadata"],
+  kinds: ["search"],
   categories,
   mode,
   notes: "测试来源",
@@ -39,14 +40,16 @@ describe("source catalog display mapping", () => {
   })
 
   it("maps capabilities and category filters to user-facing semantics", () => {
-    expect(sourceCapabilityLabels(["metadata", "stream", "download"])).toEqual([
-      "作品信息",
-      "在线播放",
-      "下载到本机",
+    expect(sourceCapabilityLabels(["search", "online_read", "offline_download"])).toEqual([
+      "可搜索",
+      "在线打开",
+      "保存本地",
     ])
     const book = source("book", "single", ["book"])
     expect(sourceMatchesCategory(book, "book")).toBe(true)
     expect(sourceMatchesCategory(book, "comic")).toBe(false)
     expect(sourceMatchesCategory(book, "all")).toBe(true)
+    expect(sourceUsesConfiguredEndpoint("cms10")).toBe(true)
+    expect(sourceUsesConfiguredEndpoint("mangadex")).toBe(false)
   })
 })

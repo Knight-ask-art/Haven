@@ -7,6 +7,7 @@ use haven_domain::enums::{Availability, ResourceType, StorageStatus};
 use haven_domain::ids::MediaItemId;
 
 use crate::services::ports::ResourceListPorts;
+use crate::services::source_import::{source_key_for_id, validate_remote_source_object};
 use crate::wire::{
     AvailabilityDto, ResourceListByMediaItemRequest, ResourceListDto, ResourceSummaryDto,
     ResourceTypeDto,
@@ -73,6 +74,16 @@ impl ResourceService {
         let requires_reauthorization = storage
             .as_ref()
             .is_some_and(|location| location.status == StorageStatus::AuthExpired);
+        let is_available = matches!(
+            resource.availability,
+            Availability::Available | Availability::OfflineAvailable
+        );
+        let is_offline = resource.availability == Availability::OfflineAvailable;
+        let can_download = !is_offline
+            && is_available
+            && !requires_reauthorization
+            && downloadable_locator(&resource, storage.as_ref());
+        let can_online_read = is_available && online_readable_locator(&resource, storage.as_ref());
         Ok(ResourceSummaryDto {
             resource_id: resource.id.to_string(),
             resource_type: resource_type_dto(resource.resource_type),
@@ -83,14 +94,110 @@ impl ResourceService {
             // Source entities are not yet part of the v0.1 repository surface. Keeping this
             // null is safer than leaking source IDs or remote URL hints into IPC.
             source_display_name: None,
-            is_offline: resource.availability == Availability::OfflineAvailable,
+            is_offline,
             is_local,
             requires_reauthorization,
+            can_download,
+            can_online_read,
             // 契约 §36.4：streamKind 仅 remote_stream 资源非 null；
             // V2-B 引入该资源形态与受控代理 URI 前恒为 null。
             stream_kind: None,
         })
     }
+}
+
+/// 计算下载能力的唯一后端规则。只有登记过的本地存储对象或固定来源
+/// `SourceObject` 可以进入 DownloadTask；Http/播放流永远不能被当作正文下载。
+fn downloadable_locator(
+    resource: &Resource,
+    storage: Option<&haven_domain::entities::StorageLocation>,
+) -> bool {
+    match &resource.locator {
+        ResourceLocator::SourceObject { source_id, .. } => {
+            let Some(source_key) = source_key_for_id(*source_id) else {
+                return false;
+            };
+            let ResourceLocator::SourceObject { remote_id, .. } = &resource.locator else {
+                return false;
+            };
+            if resource.source_id != Some(*source_id)
+                || validate_remote_source_object(source_key, resource.resource_type, remote_id)
+                    .is_err()
+            {
+                return false;
+            }
+            matches!(
+                (source_key, resource.resource_type),
+                ("mangadex", ResourceType::ComicArchive)
+                    | ("arxiv", ResourceType::PublicationFile)
+                    | ("europepmc", ResourceType::ArticleSnapshot)
+                    | ("wikisource", ResourceType::ArticleSnapshot)
+                    | ("opds_gutenberg", ResourceType::PublicationFile)
+            )
+        }
+        ResourceLocator::LocalPath { .. } | ResourceLocator::StorageObject { .. } => {
+            storage.is_some_and(|location| {
+                location.provider_type == haven_domain::enums::StorageProviderType::Local
+                    && matches!(
+                        location.status,
+                        StorageStatus::Connected | StorageStatus::ReadOnly
+                    )
+            }) && !is_stream_resource(resource.resource_type)
+        }
+        ResourceLocator::Http { .. } => false,
+    }
+}
+
+/// 计算在线打开能力。远端正文只开放已经接入 Remote Session 的固定来源；
+/// OPDS/Gutenberg 的 EPUB 首轮仍明确要求下载后阅读。
+fn online_readable_locator(
+    resource: &Resource,
+    storage: Option<&haven_domain::entities::StorageLocation>,
+) -> bool {
+    match &resource.locator {
+        ResourceLocator::SourceObject { source_id, .. } => {
+            let Some(source_key) = source_key_for_id(*source_id) else {
+                return false;
+            };
+            let ResourceLocator::SourceObject { remote_id, .. } = &resource.locator else {
+                return false;
+            };
+            if resource.source_id != Some(*source_id)
+                || validate_remote_source_object(source_key, resource.resource_type, remote_id)
+                    .is_err()
+            {
+                return false;
+            }
+            matches!(
+                (source_key, resource.resource_type),
+                ("mangadex", ResourceType::ComicArchive)
+                    | ("arxiv", ResourceType::PublicationFile)
+                    | ("europepmc", ResourceType::ArticleSnapshot)
+                    | ("wikisource", ResourceType::ArticleSnapshot)
+            )
+        }
+        ResourceLocator::LocalPath { .. } | ResourceLocator::StorageObject { .. } => {
+            storage.is_some_and(|location| {
+                location.provider_type == haven_domain::enums::StorageProviderType::Local
+                    && matches!(
+                        location.status,
+                        StorageStatus::Connected | StorageStatus::ReadOnly
+                    )
+            }) && !is_stream_resource(resource.resource_type)
+        }
+        ResourceLocator::Http { .. } => false,
+    }
+}
+
+fn is_stream_resource(resource_type: ResourceType) -> bool {
+    matches!(
+        resource_type,
+        ResourceType::VideoStream
+            | ResourceType::HlsStream
+            | ResourceType::DashStream
+            | ResourceType::RemoteChapter
+            | ResourceType::RemotePageSet
+    )
 }
 
 fn resource_type_dto(value: ResourceType) -> ResourceTypeDto {
@@ -259,9 +366,52 @@ mod tests {
             Some("电影库")
         );
         assert!(result.items[0].is_local);
+        assert!(result.items[0].can_download);
+        assert!(result.items[0].can_online_read);
         let json = serde_json::to_string(&result).unwrap();
         assert!(!json.contains("private"));
         assert!(!json.contains("locator"));
         assert!(!json.contains("movie.mkv"));
+    }
+
+    #[test]
+    fn local_online_read_requires_a_usable_registered_storage() {
+        let storage_id = haven_domain::ids::StorageLocationId::new();
+        let resource = Resource {
+            id: haven_domain::ids::ResourceId::new(),
+            media_item_id: MediaItemId::new(),
+            resource_type: ResourceType::LocalFile,
+            source_id: None,
+            storage_location_id: Some(storage_id),
+            locator: ResourceLocator::LocalPath {
+                path: "books/example.epub".into(),
+            },
+            mime_type: Some("application/epub+zip".into()),
+            size: Some(1),
+            hash: None,
+            availability: Availability::Available,
+            availability_source: AvailabilitySource::User,
+            modified_ms: None,
+            fingerprint_first: None,
+            fingerprint_last: None,
+            created_at: haven_common::UtcMillis(1),
+            updated_at: haven_common::UtcMillis(1),
+        };
+        let mut storage = StorageLocation {
+            id: storage_id,
+            provider_type: StorageProviderType::Local,
+            display_name: "本地库".into(),
+            root_ref: "C:\\library".into(),
+            credential_ref: None,
+            status: StorageStatus::Disconnected,
+            created_at: haven_common::UtcMillis(1),
+            updated_at: haven_common::UtcMillis(1),
+        };
+
+        assert!(!online_readable_locator(&resource, None));
+        assert!(!online_readable_locator(&resource, Some(&storage)));
+
+        storage.status = StorageStatus::ReadOnly;
+        assert!(online_readable_locator(&resource, Some(&storage)));
     }
 }

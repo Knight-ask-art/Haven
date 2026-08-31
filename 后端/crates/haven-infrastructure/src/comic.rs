@@ -265,10 +265,11 @@ impl LocalComicPageProvider {
         let source = revalidate_source(session, true)?;
         let raw_page = source.join(relative_name);
         let canonical_page = fs::canonicalize(raw_page).map_err(|_| resource_unavailable())?;
+        let Some(session_root) = session.canonical_root.as_deref() else {
+            return Err(resource_unavailable());
+        };
         if canonical_page.strip_prefix(&source).is_err()
-            || canonical_page
-                .strip_prefix(&session.canonical_root)
-                .is_err()
+            || canonical_page.strip_prefix(session_root).is_err()
             || !canonical_page.is_file()
             || has_reparse_point(&canonical_page)?
         {
@@ -328,10 +329,16 @@ pub(crate) fn revalidate_source_with_message(
     expects_directory: bool,
     denied_message: &'static str,
 ) -> Result<std::path::PathBuf, AppError> {
-    let root = fs::canonicalize(&session.canonical_root).map_err(|_| resource_unavailable())?;
-    let source = fs::canonicalize(&session.canonical_file).map_err(|_| resource_unavailable())?;
-    if root != session.canonical_root
-        || source != session.canonical_file
+    let Some(session_root) = session.canonical_root.as_deref() else {
+        return Err(resource_unavailable());
+    };
+    let Some(session_file) = session.canonical_file.as_deref() else {
+        return Err(resource_unavailable());
+    };
+    let root = fs::canonicalize(session_root).map_err(|_| resource_unavailable())?;
+    let source = fs::canonicalize(session_file).map_err(|_| resource_unavailable())?;
+    if root != session_root
+        || source != session_file
         || source.strip_prefix(&root).is_err()
         || (expects_directory && !source.is_dir())
         || (!expects_directory && !source.is_file())
@@ -398,6 +405,7 @@ fn page_name(page: &PreparedComicPage) -> &str {
             normalized_name, ..
         } => normalized_name,
         PreparedComicPageSource::DirectoryFile { relative_name, .. } => relative_name,
+        PreparedComicPageSource::RemotePage { page_name } => page_name,
     }
 }
 
@@ -597,9 +605,10 @@ mod tests {
             media_item_id: uuid::Uuid::now_v7().to_string(),
             engine: SessionEngineDto::Comic,
             resource_id: ResourceId::new(),
-            storage_location_id: StorageLocationId::new(),
-            canonical_root: fs::canonicalize(root).unwrap(),
-            canonical_file: fs::canonicalize(source).unwrap(),
+            storage_location_id: Some(StorageLocationId::new()),
+            canonical_root: Some(fs::canonicalize(root).unwrap()),
+            canonical_file: Some(fs::canonicalize(source).unwrap()),
+            source: haven_application::services::session::PreparedSessionSource::Local,
             mime_type: None,
             media_type: MediaType::Comic,
             resource_type,

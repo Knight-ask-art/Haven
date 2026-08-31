@@ -1730,6 +1730,12 @@ pub struct ResourceSummaryDto {
     pub is_offline: bool,
     pub is_local: bool,
     pub requires_reauthorization: bool,
+    /// 后端根据资源定位、来源能力和存储状态计算的下载能力。
+    /// 前端不得通过 `isLocal` 或资源类型自行推断。
+    pub can_download: bool,
+    /// 后端根据资源定位、来源能力和可用性计算的在线打开能力。
+    /// 该字段不暴露远端 URL、SourceObject 或路径。
+    pub can_online_read: bool,
     /// 在线流种类（契约 §36.4）；仅 remote_stream 资源非 null，其余恒 null。
     pub stream_kind: Option<StreamKindDto>,
 }
@@ -1922,13 +1928,18 @@ pub struct ExternalIdDto {
 }
 
 /// 来源能力种类（capability 投影；契约 §36.2）。
+///
+/// 这些值描述用户可以在栖阅中执行的动作，而不是 Provider 的内部实现。
+/// `search` 表示可以返回真实搜索结果，`online_read` 表示可以创建受控的
+/// 在线 Session，`offline_download` 表示用户明确点击下载后可以生成离线资源。
+/// 导入不会因为 `offline_download` 而隐式落盘。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, rename_all = "snake_case")]
 pub enum SourceKindDto {
-    Metadata,
-    Stream,
-    Download,
+    Search,
+    OnlineRead,
+    OfflineDownload,
 }
 
 /// 来源面向用户的内容分类。该分类只用于设置页分组和来源筛选，

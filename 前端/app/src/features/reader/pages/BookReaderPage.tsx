@@ -5,7 +5,7 @@ import { cn } from "@/lib/utils"
 import ReactMarkdown from "react-markdown"
 import { recordHistory } from "@/lib/havenState"
 import { getHavenClientMode, type HavenClientMode } from "@/lib/ipc/runtime"
-import { toHavenError, type HavenError } from "@/lib/ipc/errors"
+import { HavenError, toHavenError, type HavenError as HavenErrorDto } from "@/lib/ipc/errors"
 import { useMediaSession } from "@/features/session/useMediaSession"
 import { fetchSessionResource } from "@/features/session/ipc/resource-fetch"
 import {
@@ -19,12 +19,14 @@ import { decodeBookText, parseBookText, type BookChapter, type BookContentFormat
 import { parseEpubBook } from "../lib/epub-content"
 import { findBookBookmark } from "../lib/book-marker-match"
 import { isPdfMimeType } from "../lib/pdf-reader-state"
+import { PDF_RANGE_CHUNK_SIZE } from "../lib/pdf-document"
 import {
   createPdfProgressController,
   restorePdfProgress,
   type PdfProgressController,
 } from "../lib/pdf-progress-controller"
 import { PdfReader } from "../components/PdfReader"
+import type { PdfDocumentSource } from "../lib/pdf-document"
 import { useReadingSettings } from "../lib/use-reading-settings"
 import { resolveReadingPresentation } from "../lib/reading-settings-mapping"
 import { bookMarkerLocator, createMarker, deleteMarker, listMarkers } from "@/features/markers/ipc/marker-gateway"
@@ -70,10 +72,10 @@ type BookContentState =
   | { status: "idle" }
   | { status: "loading"; contentUri: string }
   | { status: "ready"; contentUri: string; chapters: BookChapter[]; format: BookContentFormat; title: string | null }
-  | { status: "pdf_ready"; contentUri: string; bytes: ArrayBuffer }
+  | { status: "pdf_ready"; contentUri: string; source: PdfDocumentSource }
   | { status: "empty"; contentUri: string }
-  | { status: "retryable_error"; contentUri: string; error: HavenError }
-  | { status: "terminal_error"; contentUri: string; error: HavenError }
+  | { status: "retryable_error"; contentUri: string; error: HavenErrorDto }
+  | { status: "terminal_error"; contentUri: string; error: HavenErrorDto }
 
 const BOOK_CHAPTERS: BookChapter[] = [
   {
@@ -331,8 +333,8 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
   const bookFormat: BookContentFormat = demoRuntime
     ? "text"
     : (contentState.status === "ready" && contentMatchesSession ? contentState.format : "text")
-  const pdfBytes = contentState.status === "pdf_ready" && contentMatchesSession ? contentState.bytes : null
-  const isTextPagination = !pdfBytes && paginationMode !== "scroll"
+  const pdfSource = contentState.status === "pdf_ready" && contentMatchesSession ? contentState.source : null
+  const isTextPagination = !pdfSource && paginationMode !== "scroll"
   const paginationColumnGapPx = paginationMode === "double" ? 28 : 48
   // The existing article uses 24px padding below the sm breakpoint and 40px
   // above it. Read the breakpoint synchronously so the first layout already
@@ -498,7 +500,11 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
 
     const abortController = new AbortController()
     setContentState({ status: "loading", contentUri: sessionContentUri })
+    // Probe only a small prefix first.  This is enough to identify the MIME
+    // and, for PDFs, obtain Content-Range.total without materialising the
+    // document in the WebView.
     void fetchSessionResource(sessionContentUri, {
+      range: `bytes=0-${PDF_RANGE_CHUNK_SIZE - 1}`,
       signal: abortController.signal,
     })
       .then(async (resource) => {
@@ -508,11 +514,36 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
           return
         }
         if (isPdfMimeType(resource.contentType)) {
-          setContentState({ status: "pdf_ready", contentUri: sessionContentUri, bytes: resource.bytes })
+          // PDF.js must not receive a full remote response just to discover the
+          // document length.  A bounded range probe establishes the total size;
+          // all subsequent page reads go through SessionPdfRangeTransport.
+          if (!resource.partial || !resource.contentRange || resource.contentRange.start !== 0) {
+            throw new HavenError({
+              code: "SOURCE_RANGE_UNSUPPORTED",
+              userMessage: "该 PDF 来源不支持分段读取，请先下载到本地",
+              retryable: false,
+            })
+          }
+          setContentState({
+            status: "pdf_ready",
+            contentUri: sessionContentUri,
+            source: {
+              contentUri: sessionContentUri,
+              totalBytes: resource.contentRange.total,
+              initialData: resource.bytes,
+            },
+          })
           return
         }
-        if (resource.contentType === "application/epub+zip") {
-          const publication = await parseEpubBook(resource.bytes, abortController.signal)
+        // Non-PDF readers still need the complete bounded payload.  The probe
+        // only tells us the MIME and avoids ever making a PDF one-shot request;
+        // EPUB/TXT/Markdown then perform one normal session fetch.
+        const completeResource = resource.partial
+          ? await fetchSessionResource(sessionContentUri, { signal: abortController.signal })
+          : resource
+        if (resourceRequestRef.current !== requestId || abortController.signal.aborted) return
+        if (completeResource.contentType === "application/epub+zip") {
+          const publication = await parseEpubBook(completeResource.bytes, abortController.signal)
           if (resourceRequestRef.current !== requestId || abortController.signal.aborted) return
           setContentState(publication.chapters.length === 0
             ? { status: "empty", contentUri: sessionContentUri }
@@ -525,8 +556,8 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
             })
           return
         }
-        const text = decodeBookText(resource.bytes, resource.contentType)
-        const format: BookContentFormat = resource.contentType === "text/markdown" ? "markdown" : "text"
+        const text = decodeBookText(completeResource.bytes, completeResource.contentType)
+        const format: BookContentFormat = completeResource.contentType === "text/markdown" ? "markdown" : "text"
         const parsed = parseBookText(text, format)
         setContentState(parsed.length === 0
           ? { status: "empty", contentUri: sessionContentUri }
@@ -963,9 +994,9 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
           </div>
         </div>
         <div className="flex items-center gap-1">
-          <button type="button" onClick={() => setDrawerOpen((open) => !open)} disabled={Boolean(pdfBytes)} aria-label="打开章节目录与书签" className={cn("flex h-9 w-9 items-center justify-center rounded-full transition-colors hover:bg-black/[0.06] disabled:cursor-not-allowed disabled:opacity-35 dark:hover:bg-white/[0.08]", drawerOpen && "bg-primary/10 text-primary")}><ListTree className="h-[17px] w-[17px]" /></button>
+          <button type="button" onClick={() => setDrawerOpen((open) => !open)} disabled={Boolean(pdfSource)} aria-label="打开章节目录与书签" className={cn("flex h-9 w-9 items-center justify-center rounded-full transition-colors hover:bg-black/[0.06] disabled:cursor-not-allowed disabled:opacity-35 dark:hover:bg-white/[0.08]", drawerOpen && "bg-primary/10 text-primary")}><ListTree className="h-[17px] w-[17px]" /></button>
           <button type="button" onClick={() => setSettingsOpen((open) => !open)} aria-label="打开阅读排版设置" className={cn("flex h-9 w-9 items-center justify-center rounded-full text-sm font-bold transition-colors hover:bg-black/[0.06] dark:hover:bg-white/[0.08]", settingsOpen && "bg-primary/10 text-primary")}>aA</button>
-          <button type="button" onClick={toggleBookmark} disabled={!contentReady || Boolean(pdfBytes) || isBookmarkPending || (tauriRuntime && !markersLoaded)} aria-label={isBookmarked ? "取消书签" : "添加书签"} className={cn("flex h-9 w-9 items-center justify-center rounded-full transition-colors hover:bg-black/[0.06] disabled:cursor-not-allowed disabled:opacity-35 dark:hover:bg-white/[0.08]", isBookmarked && "bg-primary/10 text-primary")}><Bookmark className={cn("h-[17px] w-[17px]", isBookmarked && "fill-current")} /></button>
+          <button type="button" onClick={toggleBookmark} disabled={!contentReady || Boolean(pdfSource) || isBookmarkPending || (tauriRuntime && !markersLoaded)} aria-label={isBookmarked ? "取消书签" : "添加书签"} className={cn("flex h-9 w-9 items-center justify-center rounded-full transition-colors hover:bg-black/[0.06] disabled:cursor-not-allowed disabled:opacity-35 dark:hover:bg-white/[0.08]", isBookmarked && "bg-primary/10 text-primary")}><Bookmark className={cn("h-[17px] w-[17px]", isBookmarked && "fill-current")} /></button>
         </div>
       </header>
 
@@ -1038,14 +1069,14 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
             </button>
           </>
         )}
-        {contentReady && pdfBytes && state.status === "ready" && <PdfReader key={state.session.sessionId} bytes={pdfBytes} restoreLocator={(pageCount) => (
+        {contentReady && pdfSource && state.status === "ready" && <PdfReader key={state.session.sessionId} source={pdfSource} restoreLocator={(pageCount) => (
           restorePdfProgress(pageCount, state.session, restoredPdfProgressRef)
         )} onLocatorChange={(locator) => {
           const percentage = locator.pageCount <= 1 ? 0 : Math.round((locator.pageIndex / (locator.pageCount - 1)) * 100)
           setReadingProgress(percentage)
           pdfProgressControllerRef.current?.locatorChange(locator)
         }} className="h-full overflow-y-auto" />}
-        {contentReady && !pdfBytes && <div ref={readerScrollRef} style={readerFrameStyle} className={cn("h-full overscroll-contain scroll-smooth [scrollbar-width:none] [&::-webkit-scrollbar]:hidden", isTextPagination ? "overflow-x-auto overflow-y-hidden" : "overflow-x-hidden overflow-y-auto")} aria-label={isTextPagination ? "图书分页阅读区" : "图书纵向阅读区"}>
+        {contentReady && !pdfSource && <div ref={readerScrollRef} style={readerFrameStyle} className={cn("h-full overscroll-contain scroll-smooth [scrollbar-width:none] [&::-webkit-scrollbar]:hidden", isTextPagination ? "overflow-x-auto overflow-y-hidden" : "overflow-x-hidden overflow-y-auto")} aria-label={isTextPagination ? "图书分页阅读区" : "图书纵向阅读区"}>
           <article ref={articleRef} className={cn("mx-auto w-full select-text px-6 pb-[128px] pt-14 sm:px-10 sm:pt-[80px]", FONT_CLASSES[fontFamily], isTextPagination && "break-inside-avoid")} style={articleStyle}>
             <header className="break-inside-avoid border-b border-current/15 pb-[48px]">
               <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-primary">BOOK · LOCAL READER</p>

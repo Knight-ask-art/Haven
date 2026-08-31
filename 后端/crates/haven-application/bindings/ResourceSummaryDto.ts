@@ -9,6 +9,16 @@ import type { StreamKindDto } from "./StreamKindDto";
  */
 export type ResourceSummaryDto = { resourceId: string, resourceType: ResourceTypeDto, availability: AvailabilityDto, mimeType: string | null, size: number | null, storageDisplayName: string | null, sourceDisplayName: string | null, isOffline: boolean, isLocal: boolean, requiresReauthorization: boolean, 
 /**
+ * 后端根据资源定位、来源能力和存储状态计算的下载能力。
+ * 前端不得通过 `isLocal` 或资源类型自行推断。
+ */
+canDownload: boolean, 
+/**
+ * 后端根据资源定位、来源能力和可用性计算的在线打开能力。
+ * 该字段不暴露远端 URL、SourceObject 或路径。
+ */
+canOnlineRead: boolean, 
+/**
  * 在线流种类（契约 §36.4）；仅 remote_stream 资源非 null，其余恒 null。
  */
 streamKind: StreamKindDto | null, };

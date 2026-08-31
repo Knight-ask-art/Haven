@@ -21,7 +21,7 @@ import type {
 
 export type SourceDescriptorWire = SourceRegistryDto["sources"][number];
 
-const SOURCE_KINDS = new Set(["metadata", "stream", "download"]);
+const SOURCE_KINDS = new Set(["search", "online_read", "offline_download"]);
 const SOURCE_CATEGORIES = new Set(["video", "book", "comic", "periodical"]);
 const SOURCE_MODES = new Set(["single", "collection"]);
 const SOURCE_HEALTHS = new Set(["unknown", "ok", "degraded", "down"]);

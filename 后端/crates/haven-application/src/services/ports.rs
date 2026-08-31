@@ -2,6 +2,9 @@
 //!
 //! 依赖方向：Application → Domain 契约；具体实现由组装层（src-tauri / 测试）提供。
 
+use std::path::Path;
+
+use async_trait::async_trait;
 use haven_common::AppError;
 use haven_domain::contracts::{
     EditionRepository, EnrichmentRepository, FavoriteRepository, MarkerRepository,
@@ -164,3 +167,64 @@ pub trait UnitOfWork: Send + Sync {
 /// Enrichment 流水线所需端口（契约 §36.8）。
 pub trait EnrichmentPorts: WorkRepository + EnrichmentRepository + Send + Sync {}
 impl<T> EnrichmentPorts for T where T: WorkRepository + EnrichmentRepository + Send + Sync {}
+
+/// Application 侧的远端正文获取端口。实现层负责固定主机、响应校验和
+/// 临时文件写入；Application/Download Worker 不接触 URL、Cookie 或 Provider
+/// 的内部请求细节。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteAcquiredFile {
+    pub size_bytes: u64,
+    pub mime: String,
+}
+
+/// A single inclusive byte range requested by a remote reader.  The end is
+/// optional because HTTP permits an open-ended `bytes=start-` request; the
+/// infrastructure provider remains responsible for enforcing its own maximum
+/// response size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteByteRange {
+    pub start: u64,
+    pub end: Option<u64>,
+}
+
+/// The bounded response returned by a remote reading session.  The body is
+/// kept inside the application/interface boundary and is never serialized as
+/// JSON IPC; callers use the controlled `haven-resource` protocol instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteSessionBody {
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+    pub total_size: u64,
+    pub content_range: Option<RemoteContentRange>,
+    pub accept_ranges: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteContentRange {
+    pub start: u64,
+    pub end: u64,
+    pub total: u64,
+}
+
+#[async_trait]
+pub trait RemoteAcquisitionPort: Send + Sync {
+    async fn acquire(
+        &self,
+        source_key: &str,
+        remote_id: &str,
+        destination: &Path,
+    ) -> Result<RemoteAcquiredFile, AppError>;
+}
+
+/// Controlled remote read port used by Article/PDF sessions.  Implementations
+/// own the provider URL, redirect and response validation; the application
+/// only passes the opaque source identity and an optional bounded range.
+#[async_trait]
+pub trait RemoteSessionPort: Send + Sync {
+    async fn read(
+        &self,
+        source_key: &str,
+        remote_id: &str,
+        range: Option<RemoteByteRange>,
+    ) -> Result<RemoteSessionBody, AppError>;
+}

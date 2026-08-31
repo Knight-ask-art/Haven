@@ -12,6 +12,8 @@
       "isOffline": false,
       "isLocal": false,
       "requiresReauthorization": false,
+      "canDownload": false,
+      "canOnlineRead": false,
       "streamKind": "hls"
     },
     {
@@ -25,6 +27,8 @@
       "isOffline": false,
       "isLocal": false,
       "requiresReauthorization": false,
+      "canDownload": false,
+      "canOnlineRead": false,
       "streamKind": "direct"
     }
   ]

@@ -26,9 +26,12 @@ interface Candidate {
 }
 
 function canImportCandidate(workId: string): boolean {
-  // 只有已有完整详情/入库链路的 CMS10 与 OPDS 候选显示导入操作。
-  // 固定元数据 API 与 M3U 当前提供真实搜索结果，但不伪装成可直接入库的候选。
-  return workId.startsWith("cms10-candidate-") || workId.startsWith("opds-candidate-")
+  // CMS10、Gutenberg OPDS 以及四个固定正文来源具备完整的受控导入链路。
+  // 自定义 OPDS 目前只有真实搜索能力，后端也会拒绝正文导入，因此不能
+  // 在这里显示一个点击后必然失败的“导入媒体库”按钮。
+  return workId.startsWith("cms10-candidate-")
+    || workId.startsWith("opds-candidate-opds_gutenberg")
+    || workId.startsWith("content-candidate-")
 }
 
 type SectionStatus = "idle" | "searching" | "done" | "failed"

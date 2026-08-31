@@ -25,7 +25,11 @@ import { mapEditionListToDetailItems, partitionEditionItems, toMediaDetailEpisod
 import { canConsumeEdition, getEditionListState, type EditionListState } from "../lib/edition-state"
 import { primaryActionRoute } from "../lib/primary-action-route"
 import type { PrimaryActionDto } from "@/lib/ipc/generated/wire"
-import { createDownloadForMediaItem, getWorkDownloadState } from "@/features/downloads/ipc/download-gateway"
+import {
+  createDownloadForMediaItem,
+  getMediaItemDownloadInfo,
+  type DownloadStatus,
+} from "@/features/downloads/ipc/download-gateway"
 
 export interface MediaDetailData {
   id: string
@@ -78,8 +82,6 @@ export interface WorkRelation {
   title: string
   meta: string
 }
-
-type DownloadStatus = "idle" | "queued" | "downloaded"
 
 // 按媒介类型绑定到对应的播放器 / 阅读器路由
 function getConsumeRoute(mediaType: MediaDetailData["type"], mediaItemId: string): string {
@@ -782,7 +784,6 @@ function MediaDetailExperience({ production }: { production: boolean }) {
       }
       : buildUnavailableDetail(requestedId))
     : getMediaDetailData(requestedId)
-  const authoritativeWorkId = authoritativeItem?.id
   const downloadableMediaItemId = authoritativeItem?.primaryAction?.mediaItemId
     ?? editionItems?.find((item) => item.primaryAction?.mediaItemId)?.primaryAction?.mediaItemId
 
@@ -799,17 +800,17 @@ function MediaDetailExperience({ production }: { production: boolean }) {
   const [isFavorite, setIsFavorite] = useState(false)
   const [isFavoriteLoading, setIsFavoriteLoading] = useState(production)
   const [isFavoriteSaving, setIsFavoriteSaving] = useState(false)
+  const editionOpenRequestRef = useRef(0)
+  const [editionOpeningId, setEditionOpeningId] = useState<string | null>(null)
   const [isDownloadSaving, setIsDownloadSaving] = useState(false)
   const favoriteRequestRef = useRef(0)
-  const [downloadStatus, setDownloadStatus] = useState<DownloadStatus>(() => {
-    if (production) return "idle"
-    const stored = localStorage.getItem(`haven:download:${media.id}`)
-    if (stored === "queued" || stored === "downloaded") return stored
-    return media.episodesOrChapters?.some((item) => item.isDownloaded) ? "downloaded" : "idle"
-  })
-  const initialDownloadStatus: DownloadStatus = production
-    ? "idle"
-    : media.episodesOrChapters?.some((item) => item.isDownloaded) ? "downloaded" : "idle"
+  const [downloadStatus, setDownloadStatus] = useState<DownloadStatus>("idle")
+  const [downloadCapability, setDownloadCapability] = useState<"loading" | "available" | "unavailable" | "error">(
+    production ? "loading" : "unavailable",
+  )
+  const [onlineReadCapability, setOnlineReadCapability] = useState<"loading" | "available" | "unavailable" | "error">(
+    production ? "loading" : "available",
+  )
   const initialSeasonId = media.seasons?.[0]?.id || "s1"
   const [toastMessage, setToastMessage] = useState<string | null>(null)
   const [isShareModalOpen, setIsShareModalOpen] = useState(false)
@@ -855,20 +856,17 @@ function MediaDetailExperience({ production }: { production: boolean }) {
   // 同一组件实例切换 /work/:id 时，所有与作品绑定的局部状态都必须重置。
   useEffect(() => {
     favoriteRequestRef.current += 1
+    editionOpenRequestRef.current += 1
+    setEditionOpeningId(null)
     setIsFavoriteSaving(false)
-    if (production) {
-      setDownloadStatus("idle")
-    } else {
-      const stored = localStorage.getItem(`haven:download:${media.id}`)
-      setDownloadStatus(stored === "queued" || stored === "downloaded"
-        ? stored
-        : initialDownloadStatus)
-    }
+    setDownloadStatus("idle")
+    setDownloadCapability(production ? "loading" : "unavailable")
+    setOnlineReadCapability(production ? "loading" : "available")
     setActiveTab("contents")
     setSelectedSeason(initialSeasonId)
     setIsMoreMenuOpen(false)
     setActiveEditionType(null)
-  }, [initialDownloadStatus, initialSeasonId, media.id, production])
+  }, [initialSeasonId, media.id, production])
 
   // per-作品正倒序持久化（localStorage，仅 UI 偏好）
   useEffect(() => {
@@ -906,25 +904,6 @@ function MediaDetailExperience({ production }: { production: boolean }) {
     }
   }, [media.id, production])
 
-  useEffect(() => {
-    if (!production || !authoritativeWorkId) return
-    let cancelled = false
-    getWorkDownloadState(authoritativeWorkId, downloadableMediaItemId ?? undefined)
-      .then((state) => {
-        if (!cancelled) setDownloadStatus(state)
-      })
-      .catch(() => {
-        // 下载状态读取失败不阻塞作品详情；用户仍可再次点击创建任务。
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [authoritativeWorkId, downloadableMediaItemId, production])
-
-  useEffect(() => {
-    if (!production) localStorage.setItem(`haven:download:${media.id}`, downloadStatus)
-  }, [downloadStatus, media.id, production])
-
   // 收藏切换：乐观更新 + 单飞请求，避免连点时旧请求回滚覆盖新状态。
   const handleFavoriteToggle = () => {
     if (isFavoriteLoading || isFavoriteSaving) return
@@ -950,48 +929,99 @@ function MediaDetailExperience({ production }: { production: boolean }) {
   }
 
   const handleDownloadAction = async () => {
-    if (production) {
-      if (downloadStatus === "queued") {
-        navigate("/downloads")
-        return
-      }
-      if (downloadStatus === "downloaded") {
-        setToastMessage("该作品已有离线任务")
-        setTimeout(() => setToastMessage(null), 2500)
-        return
-      }
-      if (!downloadableMediaItemId) {
-        setToastMessage("当前版本没有可下载的媒体资源")
-        setTimeout(() => setToastMessage(null), 2500)
-        return
-      }
-      setIsDownloadSaving(true)
-      try {
-        const task = await createDownloadForMediaItem(downloadableMediaItemId)
-        setDownloadStatus(task.state === "completed" ? "downloaded" : "queued")
-        setToastMessage(task.state === "completed" ? "已保存到离线库" : "已加入下载列表")
-      } catch (error) {
-        setToastMessage(error instanceof HavenError ? error.dto.userMessage : "创建下载任务失败")
-      } finally {
-        setIsDownloadSaving(false)
-        setTimeout(() => setToastMessage(null), 2500)
-      }
+    if (!production) {
+      setToastMessage("下载功能仅在桌面应用中可用")
+      setTimeout(() => setToastMessage(null), 2500)
       return
     }
-    const nextStatus: DownloadStatus = downloadStatus === "idle"
-      ? "queued"
-      : downloadStatus === "queued"
-        ? "downloaded"
-        : "idle"
-    setDownloadStatus(nextStatus)
-    setToastMessage(
-      nextStatus === "queued"
-        ? "已加入下载列表"
-        : nextStatus === "downloaded"
-          ? "已下载到本地"
-          : "已从下载列表移除"
-    )
-    setTimeout(() => setToastMessage(null), 2500)
+    if (downloadStatus === "queued") {
+      navigate("/downloads")
+      return
+    }
+    if (downloadStatus === "downloaded") {
+      setToastMessage("该作品已有离线内容")
+      setTimeout(() => setToastMessage(null), 2500)
+      return
+    }
+    if (downloadCapability === "loading") {
+      setToastMessage("正在读取下载能力，请稍候")
+      setTimeout(() => setToastMessage(null), 2500)
+      return
+    }
+    if (downloadCapability !== "available" || !downloadableMediaItemId) {
+      setToastMessage(downloadCapability === "error" ? "下载能力读取失败，请重试" : "当前内容没有可保存到本地的资源")
+      setTimeout(() => setToastMessage(null), 2500)
+      return
+    }
+    setIsDownloadSaving(true)
+    try {
+      const task = await createDownloadForMediaItem(downloadableMediaItemId)
+      setDownloadStatus(task.state === "completed" ? "downloaded" : "queued")
+      setToastMessage(task.state === "completed" ? "已保存到离线库" : "已加入下载列表")
+    } catch (error) {
+      setToastMessage(error instanceof HavenError ? error.dto.userMessage : "创建下载任务失败")
+    } finally {
+      setIsDownloadSaving(false)
+      setTimeout(() => setToastMessage(null), 2500)
+    }
+  }
+
+  /**
+   * Edition rows carry the server-selected action so they can still identify
+   * a download-only remote resource.  They must not navigate directly to a
+   * reader route until the backend capability projection confirms that this
+   * specific media item is online-readable (or has a usable Offline Resource).
+   * This keeps an OPDS/Gutenberg EPUB, for example, from landing on a dead
+   * reader route while preserving the existing visual list structure.
+   */
+  const handleEditionOpen = async (action: PrimaryActionDto | null | undefined, fallbackId: string) => {
+    if (!production) {
+      const target = getConsumeRoute(media.type, fallbackId)
+      navigate(target)
+      return
+    }
+    if (!action) {
+      setToastMessage("当前版本暂不可打开")
+      setTimeout(() => setToastMessage(null), 2500)
+      return
+    }
+    const target = primaryActionRoute(action)
+    if (!target) {
+      setToastMessage("当前版本暂不可打开")
+      setTimeout(() => setToastMessage(null), 2500)
+      return
+    }
+    // Opening an edition detail page is a safe metadata navigation.  Only
+    // content-consuming actions need the per-media capability check below.
+    if (action.kind === "open_edition") {
+      navigate(target)
+      return
+    }
+    const mediaItemId = action.mediaItemId
+    if (!mediaItemId) {
+      setToastMessage("当前内容暂不可用")
+      setTimeout(() => setToastMessage(null), 2500)
+      return
+    }
+    const requestId = ++editionOpenRequestRef.current
+    setEditionOpeningId(fallbackId)
+    try {
+      const info = await getMediaItemDownloadInfo(mediaItemId)
+      if (editionOpenRequestRef.current !== requestId) return
+      if (info.canOnlineRead || info.hasOfflineResource) {
+        navigate(target)
+      } else {
+        setToastMessage(info.canDownload ? "该内容需要下载后阅读" : "当前内容暂不可用")
+        setTimeout(() => setToastMessage(null), 2500)
+      }
+    } catch {
+      if (editionOpenRequestRef.current === requestId) {
+        setToastMessage("在线阅读能力读取失败，请重试")
+        setTimeout(() => setToastMessage(null), 2500)
+      }
+    } finally {
+      if (editionOpenRequestRef.current === requestId) setEditionOpeningId(null)
+    }
   }
 
   // 媒介图标/按钮文案适配
@@ -1051,13 +1081,53 @@ function MediaDetailExperience({ production }: { production: boolean }) {
           : "terminal_error"
   const favoriteCanWrite = !production || (!detailLoading && authoritativeItem?.id === media.id)
   const editionState: EditionListState = getEditionListState(production, editionLoading, editionItems, editionError)
-  const primaryActionTarget = production ? primaryActionRoute(primaryAction) : getConsumeRoute(media.type, media.id)
+  // The Work/Edition DTO exposes the selected media item, while the resource
+  // summary owns the actual online-read capability.  Keep the visual action
+  // in place but fail closed until that capability has been resolved; this is
+  // what turns download-only providers (for example OPDS/Gutenberg EPUBs)
+  // into an explicit "download first" state instead of a dead reader route.
+  const primaryActionTarget = production && onlineReadCapability === "available"
+    ? primaryActionRoute(primaryAction)
+    : !production
+      ? getConsumeRoute(media.type, media.id)
+      : null
   const canConsume = canConsumeDetail(production, detailState) && canConsumeEdition(production, editionState, primaryActionTarget !== null)
 
-  const getEditionActionTarget = (action: PrimaryActionDto | null | undefined, fallbackId: string) => {
-    if (!production) return getConsumeRoute(media.type, fallbackId)
-    return primaryActionRoute(action)
-  }
+  // Download state is a projection of server resources/tasks. It is deliberately
+  // loaded only after authoritative detail data is ready, so stale responses
+  // from a previous Work cannot change the newly selected page.
+  useEffect(() => {
+    if (!production || detailState !== "data" || !downloadableMediaItemId) {
+      setDownloadStatus("idle")
+      setDownloadCapability("unavailable")
+      setOnlineReadCapability(production && detailState === "data" ? "unavailable" : production ? "loading" : "available")
+      return
+    }
+    let cancelled = false
+    setDownloadCapability("loading")
+    setOnlineReadCapability("loading")
+    getMediaItemDownloadInfo(downloadableMediaItemId)
+      .then((info) => {
+        if (cancelled) return
+        setDownloadStatus(info.status)
+        setDownloadCapability(
+          info.canDownload || info.hasOfflineResource || info.status === "queued"
+            ? "available"
+            : "unavailable",
+        )
+        setOnlineReadCapability(info.canOnlineRead ? "available" : "unavailable")
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setDownloadStatus("idle")
+          setDownloadCapability("error")
+          setOnlineReadCapability("error")
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [detailState, downloadableMediaItemId, production])
 
   return (
     <div data-slice-state={detailState} className="relative min-h-full w-full bg-background text-foreground flex flex-col overflow-x-hidden select-none">
@@ -1262,6 +1332,16 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                       )}
                     </div>
                   )}
+                  {production && detailState === "data" && onlineReadCapability === "unavailable" && (
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status">
+                      <span>{downloadCapability === "available" ? "需要下载后阅读" : "当前内容暂不可在线阅读"}</span>
+                    </div>
+                  )}
+                  {production && detailState === "data" && onlineReadCapability === "error" && (
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status">
+                      <span>在线阅读能力读取失败，请重试</span>
+                    </div>
+                  )}
 
                   {/* 次级操作组：图标明显放大 (w-14 h-14 容器，w-6 h-6 图标) */}
                   <button
@@ -1279,11 +1359,25 @@ function MediaDetailExperience({ production }: { production: boolean }) {
 
                   <button
                     onClick={handleDownloadAction}
-                    disabled={isDownloadSaving}
-                    title={downloadStatus === "downloaded" ? "已下载" : downloadStatus === "queued" ? "已加入下载列表" : "下载至本地"}
+                    disabled={isDownloadSaving || downloadCapability !== "available" || !production}
+                    title={downloadStatus === "downloaded"
+                      ? "已下载"
+                      : downloadStatus === "queued"
+                        ? "已加入下载列表"
+                        : !production
+                          ? "下载功能仅在桌面应用中可用"
+                          : downloadCapability === "loading"
+                            ? "正在读取下载能力"
+                            : downloadCapability === "error"
+                              ? "下载能力读取失败"
+                              : downloadCapability === "unavailable"
+                                ? "当前内容没有可下载资源"
+                                : "下载至本地"}
+                    aria-label={downloadStatus === "downloaded" ? "已下载" : "下载至本地"}
                     className={cn(
                       "w-14 h-14 rounded-full flex items-center justify-center transition-all duration-300 cursor-pointer shrink-0",
                       "bg-black/5 dark:bg-white/10 hover:bg-black/10 dark:hover:bg-white/20 hover:scale-105 active:scale-95",
+                      (downloadCapability !== "available" || !production) && "cursor-not-allowed opacity-50 hover:scale-100 active:scale-100",
                       downloadStatus === "queued"
                         ? "text-[#007aff] bg-[#007aff]/10 dark:bg-[#007aff]/20"
                         : downloadStatus === "downloaded"
@@ -1349,11 +1443,14 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                 </div>
 
                 {/* 上次定位文本 */}
-                {media.progressText && (
+                {(media.progressText || downloadStatus !== "idle" || (production && downloadCapability !== "available")) && (
                   <div className="flex items-center gap-[8px] text-xs font-semibold text-muted-foreground ml-[8px] mt-1">
-                    上次定位：{media.progressText}
+                    {media.progressText && <span>上次定位：{media.progressText}</span>}
                     {downloadStatus === "queued" && <span className="text-[#007aff]">· 已加入下载列表</span>}
                     {downloadStatus === "downloaded" && <span className="text-emerald-500">· 已下载</span>}
+                    {downloadStatus === "idle" && downloadCapability === "loading" && <span>· 正在读取下载能力</span>}
+                    {downloadStatus === "idle" && downloadCapability === "unavailable" && <span>· 暂无可下载资源</span>}
+                    {downloadStatus === "idle" && downloadCapability === "error" && <span>· 下载能力读取失败</span>}
                   </div>
                 )}
               </div>
@@ -1486,10 +1583,13 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                   <div
                     key={ep.id}
                     onClick={() => {
-                      const target = getEditionActionTarget(ep.primaryAction, ep.id)
-                      if (target) navigate(target)
+                      void handleEditionOpen(ep.primaryAction, ep.id)
                     }}
-                    className="flex flex-col gap-3 p-3.5 rounded-2xl bg-black/5 dark:bg-white/5 border border-black/5 dark:border-white/5 hover:border-black/20 dark:hover:border-white/20 transition-all duration-300 group cursor-pointer"
+                    aria-busy={editionOpeningId === ep.id}
+                    className={cn(
+                      "flex flex-col gap-3 p-3.5 rounded-2xl bg-black/5 dark:bg-white/5 border border-black/5 dark:border-white/5 hover:border-black/20 dark:hover:border-white/20 transition-all duration-300 group cursor-pointer",
+                      editionOpeningId === ep.id && "opacity-70 cursor-wait",
+                    )}
                   >
                     <div className="relative w-full aspect-video rounded-xl overflow-hidden bg-muted shrink-0">
                       <ArtworkImage
@@ -1542,10 +1642,13 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                     <div
                       key={chap.id}
                       onClick={() => {
-                        const target = getEditionActionTarget(chap.primaryAction, chap.id)
-                        if (target) navigate(target)
+                        void handleEditionOpen(chap.primaryAction, chap.id)
                       }}
-                      className="flex items-center justify-between py-5 px-[16px] -mx-[16px] rounded-2xl hover:bg-black/5 dark:hover:bg-white/5 transition-colors cursor-pointer group gap-[16px]"
+                      aria-busy={editionOpeningId === chap.id}
+                      className={cn(
+                        "flex items-center justify-between py-5 px-[16px] -mx-[16px] rounded-2xl hover:bg-black/5 dark:hover:bg-white/5 transition-colors cursor-pointer group gap-[16px]",
+                        editionOpeningId === chap.id && "opacity-70 cursor-wait",
+                      )}
                     >
                       <div className="flex items-center gap-5 min-w-0">
                         <div className="flex items-center justify-center shrink-0 group-hover:scale-110 transition-transform">

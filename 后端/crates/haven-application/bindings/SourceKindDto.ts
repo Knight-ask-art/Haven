@@ -2,5 +2,10 @@
 
 /**
  * 来源能力种类（capability 投影；契约 §36.2）。
+ *
+ * 这些值描述用户可以在栖阅中执行的动作，而不是 Provider 的内部实现。
+ * `search` 表示可以返回真实搜索结果，`online_read` 表示可以创建受控的
+ * 在线 Session，`offline_download` 表示用户明确点击下载后可以生成离线资源。
+ * 导入不会因为 `offline_download` 而隐式落盘。
  */
-export type SourceKindDto = "metadata" | "stream" | "download";
+export type SourceKindDto = "search" | "online_read" | "offline_download";

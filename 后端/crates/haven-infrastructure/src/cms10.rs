@@ -366,6 +366,8 @@ impl haven_application::services::SourceCatalogProvider for Cms10CatalogProvider
             director: entry.director,
             actor: entry.actor,
             local_file: None,
+            media_type: None,
+            remote: None,
         })
     }
 
@@ -398,6 +400,8 @@ impl haven_application::services::SourceCatalogProvider for Cms10CatalogProvider
                 director: entry.director,
                 actor: entry.actor,
                 local_file: None,
+                media_type: None,
+                remote: None,
             })
             .collect())
     }

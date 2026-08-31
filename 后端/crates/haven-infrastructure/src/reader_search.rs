@@ -236,54 +236,192 @@ fn extract_epub_content(path: &Path) -> Result<RawBookContent, AppError> {
     Ok(RawBookContent { chapters })
 }
 
+/// Convert untrusted XHTML to the same paragraph-preserving plain-text shape
+/// used by the frontend EPUB parser.  In particular, block boundaries remain
+/// as newlines until `extract_epub_content` splits them into paragraphs.  A
+/// whitespace-only `split_whitespace()` would collapse every chapter into one
+/// paragraph and make `paragraph_index` useless for search navigation.
 fn html_to_plain_text(html: &str) -> String {
-    let without_head = html.replace("<head", "\n").replace("</head>", "\n");
-    let re_script = regex_like_strip(&without_head);
-    let with_boundaries = re_script
-        .replace("<br", "\n<br")
-        .replace("</p>", "\n</p>")
-        .replace("<p", "\n<p");
-    // Very simplified: strip tags via state machine
-    let mut result = String::with_capacity(with_boundaries.len());
-    let mut in_tag = false;
-    for ch in with_boundaries.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => result.push(ch),
-            _ => {}
+    const ACTIVE_TAGS: &[&str] = &[
+        "head", "script", "style", "iframe", "object", "embed", "svg", "math", "form", "textarea",
+    ];
+    const BOUNDARY_TAGS: &[&str] = &[
+        "br",
+        "p",
+        "div",
+        "section",
+        "article",
+        "header",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "li",
+        "blockquote",
+        "pre",
+        "tr",
+        "td",
+        "th",
+    ];
+
+    let mut result = String::with_capacity(html.len());
+    let mut cursor = 0usize;
+    let mut skipped_tag: Option<String> = None;
+
+    while cursor < html.len() {
+        let Some(relative_start) = html[cursor..].find('<') else {
+            if skipped_tag.is_none() {
+                result.push_str(&html[cursor..]);
+            }
+            break;
+        };
+        let tag_start = cursor + relative_start;
+        if skipped_tag.is_none() {
+            result.push_str(&html[cursor..tag_start]);
         }
+
+        // Comments are never content.  If a malformed comment has no end,
+        // discard the remainder rather than exposing active markup.
+        if html[tag_start..].starts_with("<!--") {
+            if let Some(end) = html[tag_start + 4..].find("-->") {
+                cursor = tag_start + 4 + end + 3;
+                continue;
+            }
+            break;
+        }
+
+        let Some(tag_end) = find_html_tag_end(html, tag_start + 1) else {
+            if skipped_tag.is_none() {
+                result.push_str(&html[tag_start..]);
+            }
+            break;
+        };
+        let raw_tag = html[tag_start + 1..tag_end].trim();
+        let is_closing = raw_tag.starts_with('/');
+        let tag_body = raw_tag.strip_prefix('/').unwrap_or(raw_tag).trim_start();
+        let tag_name = tag_body
+            .split(|ch: char| ch.is_ascii_whitespace() || ch == '/' || ch == '>')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let self_closing = raw_tag.ends_with('/');
+
+        if let Some(active) = skipped_tag.as_deref() {
+            if is_closing && tag_name == active {
+                skipped_tag = None;
+            }
+            cursor = tag_end + 1;
+            continue;
+        }
+
+        if ACTIVE_TAGS.iter().any(|candidate| *candidate == tag_name) {
+            if !is_closing && !self_closing {
+                skipped_tag = Some(tag_name);
+            }
+            cursor = tag_end + 1;
+            continue;
+        }
+
+        if BOUNDARY_TAGS.iter().any(|candidate| *candidate == tag_name) {
+            result.push('\n');
+        }
+        cursor = tag_end + 1;
     }
-    // Decode entities (basic)
-    result
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim()
-        .to_string()
+
+    normalize_html_text(&decode_html_entities(&result))
 }
 
-fn regex_like_strip(html: &str) -> String {
-    // Remove script/style blocks naively
-    let mut out = html.to_string();
-    for tag in ["script", "style", "iframe", "object"] {
-        loop {
-            let Some(start) = out.to_lowercase().find(&format!("<{tag}")) else {
-                break;
-            };
-            let Some(end) = out[start..].to_lowercase().find(&format!("</{tag}>")) else {
-                break;
-            };
-            out.replace_range(start..start + end + tag.len() + 3, "\n");
+fn find_html_tag_end(html: &str, mut cursor: usize) -> Option<usize> {
+    let mut quote = None;
+    while cursor < html.len() {
+        let ch = html.as_bytes()[cursor] as char;
+        if let Some(expected) = quote {
+            if ch == expected {
+                quote = None;
+            }
+        } else if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch == '>' {
+            return Some(cursor);
         }
+        cursor += 1;
+    }
+    None
+}
+
+fn decode_html_entities(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0usize;
+    while index < chars.len() {
+        if chars[index] == '&' {
+            let mut end = index + 1;
+            while end < chars.len() && end - index <= 32 && chars[end] != ';' {
+                end += 1;
+            }
+            if end < chars.len() && chars[end] == ';' {
+                let entity: String = chars[index + 1..end].iter().collect();
+                let decoded = match entity.to_ascii_lowercase().as_str() {
+                    "nbsp" => Some(' '),
+                    "amp" => Some('&'),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+                        u32::from_str_radix(&entity[2..], 16)
+                            .ok()
+                            .and_then(char::from_u32)
+                    }
+                    _ if entity.starts_with('#') => {
+                        entity[1..].parse::<u32>().ok().and_then(char::from_u32)
+                    }
+                    _ => None,
+                };
+                if let Some(ch) = decoded {
+                    out.push(ch);
+                    index = end + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[index]);
+        index += 1;
     }
     out
+}
+
+fn normalize_html_text(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut pending_space = false;
+    let mut newline_count = 0usize;
+    for ch in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
+        match ch {
+            '\n' => {
+                while normalized.ends_with([' ', '\t']) {
+                    normalized.pop();
+                }
+                pending_space = false;
+                if newline_count < 2 {
+                    normalized.push('\n');
+                    newline_count += 1;
+                }
+            }
+            ' ' | '\t' => pending_space = true,
+            _ => {
+                if pending_space && !normalized.is_empty() && !normalized.ends_with('\n') {
+                    normalized.push(' ');
+                }
+                pending_space = false;
+                normalized.push(ch);
+                newline_count = 0;
+            }
+        }
+    }
+    normalized.trim().to_string()
 }
 
 fn extract_title(html: &str) -> Option<String> {
@@ -515,4 +653,46 @@ fn resource_unavailable() -> AppError {
         "本地资源当前不可用",
         false,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use haven_application::services::reader_search::{build_book_search_index, search_book};
+
+    #[test]
+    fn html_text_preserves_paragraph_boundaries_for_search() {
+        let html = r#"
+            <html><head><title>忽略的标题</title></head>
+            <body><p>第一段保留换行。</p><p>第二段包含目标词。</p>
+            <script>目标词不应进入索引</script><div>第三段&nbsp;也保留。</div></body>
+        "#;
+        let plain = html_to_plain_text(html);
+        assert_eq!(
+            plain,
+            "第一段保留换行。\n\n第二段包含目标词。\n\n第三段 也保留。"
+        );
+
+        let paragraphs = plain
+            .split("\n\n")
+            .map(|paragraph| paragraph.replace('\n', " ").trim().to_string())
+            .filter(|paragraph| !paragraph.is_empty())
+            .collect::<Vec<_>>();
+        let chapters = vec![RawChapter {
+            id: "epub-chapter-1".to_string(),
+            title: "测试章节".to_string(),
+            paragraphs,
+        }];
+        let index = build_book_search_index(&chapters);
+        let hits = search_book(&chapters, &index, "目标词");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].paragraph_index, 1);
+        assert!(hits[0].progression_in_chapter > 0.0);
+    }
+
+    #[test]
+    fn html_text_removes_active_blocks_and_decodes_entities() {
+        let html = r#"<p>A &amp; B &#x4E2D;&#25991;</p><iframe>隐藏</iframe><p>C<br>D</p>"#;
+        assert_eq!(html_to_plain_text(html), "A & B 中文\n\nC\nD");
+    }
 }

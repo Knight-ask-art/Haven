@@ -28,7 +28,7 @@
       "displayName": "TVMaze",
       "categories": ["video"],
       "mode": "single",
-      "kinds": ["metadata"],
+      "kinds": ["search"],
       "notes": "单一影视资料来源，适合补充剧集、季和集数信息。"
     },
     {
@@ -36,7 +36,7 @@
       "displayName": "Bangumi",
       "categories": ["video", "comic"],
       "mode": "single",
-      "kinds": ["metadata"],
+      "kinds": ["search"],
       "notes": "单一作品资料来源，偏向中文动画、漫画和番组信息。"
     },
     {
@@ -44,7 +44,7 @@
       "displayName": "AniList",
       "categories": ["video", "comic"],
       "mode": "single",
-      "kinds": ["metadata"],
+      "kinds": ["search"],
       "notes": "单一作品资料来源，适合补充动画和漫画的国际化信息。"
     },
     {
@@ -52,15 +52,15 @@
       "displayName": "MangaDex",
       "categories": ["comic"],
       "mode": "single",
-      "kinds": ["metadata"],
-      "notes": "MangaDex 公开漫画 API，支持标题搜索和漫画元数据。"
+      "kinds": ["search", "online_read", "offline_download"],
+      "notes": "MangaDex 公开漫画 API，支持标题搜索、章节在线阅读；下载后将章节保存为本地 CBZ。"
     },
     {
       "sourceId": "itunes",
       "displayName": "iTunes Search",
       "categories": ["video"],
       "mode": "single",
-      "kinds": ["metadata"],
+      "kinds": ["search"],
       "notes": "Apple iTunes 公开剧集季搜索 API，提供剧集元数据。"
     },
     {
@@ -68,7 +68,7 @@
       "displayName": "Project Gutenberg",
       "categories": ["book"],
       "mode": "single",
-      "kinds": ["metadata"],
+      "kinds": ["search"],
       "notes": "单一公共领域图书目录；正文是否可下载由对应书目资源决定。"
     },
     {
@@ -76,7 +76,7 @@
       "displayName": "Internet Archive",
       "categories": ["book"],
       "mode": "single",
-      "kinds": ["metadata"],
+      "kinds": ["search"],
       "notes": "公开图书资料搜索 API，限定文本类条目，提供作品标题和描述。"
     },
     {
@@ -84,23 +84,39 @@
       "displayName": "古腾堡计划（OPDS）",
       "categories": ["book"],
       "mode": "single",
-      "kinds": ["metadata", "download"],
-      "notes": "单一 OPDS 图书目录，可浏览并把允许下载的电子书保存到本机。"
+      "kinds": ["search", "offline_download"],
+      "notes": "单一 OPDS 图书目录，搜索结果可下载 EPUB；需要下载后阅读。"
     },
     {
       "sourceId": "arxiv",
       "displayName": "arXiv",
       "categories": ["periodical"],
       "mode": "single",
-      "kinds": ["metadata"],
-      "notes": "arXiv 公开 Atom API，支持学术文章标题和摘要搜索。"
+      "kinds": ["search", "online_read", "offline_download"],
+      "notes": "arXiv 公开 Atom API，支持学术文章搜索；服务端支持范围读取时可在线打开 PDF，也可下载保存。"
+    },
+    {
+      "sourceId": "europepmc",
+      "displayName": "Europe PMC",
+      "categories": ["periodical"],
+      "mode": "single",
+      "kinds": ["search", "online_read", "offline_download"],
+      "notes": "开放获取医学文章搜索，可在线阅读清洗后的全文，也可下载安全 HTML 快照。"
+    },
+    {
+      "sourceId": "wikisource",
+      "displayName": "中文维基文库",
+      "categories": ["periodical"],
+      "mode": "single",
+      "kinds": ["search", "online_read", "offline_download"],
+      "notes": "中文公版文本搜索，可在线阅读清洗后的正文，也可下载安全 HTML 快照。"
     },
     {
       "sourceId": "crossref",
       "displayName": "Crossref",
       "categories": ["periodical"],
       "mode": "single",
-      "kinds": ["metadata"],
+      "kinds": ["search"],
       "notes": "Crossref 公开 DOI 元数据 API，支持期刊与文章搜索。"
     },
     {
@@ -108,7 +124,7 @@
       "displayName": "OpenAlex",
       "categories": ["periodical"],
       "mode": "single",
-      "kinds": ["metadata"],
+      "kinds": ["search"],
       "notes": "OpenAlex 公开学术作品 API，支持文章、期刊和作者元数据搜索。"
     },
     {
@@ -116,16 +132,16 @@
       "displayName": "苹果CMS V10",
       "categories": ["video"],
       "mode": "collection",
-      "kinds": ["stream", "download"],
-      "notes": "聚合来源：一个采集接口可以汇总多个视频站点；可从预设接口中切换。"
+      "kinds": ["search", "online_read", "offline_download"],
+      "notes": "聚合来源：一个采集接口可以汇总多个视频站点；支持搜索、在线播放和用户明确发起的下载。"
     },
     {
       "sourceId": "m3u",
       "displayName": "M3U 播放列表",
       "categories": ["video"],
       "mode": "collection",
-      "kinds": ["stream"],
-      "notes": "聚合来源：配置一个 M3U 播放列表后，可按频道名称搜索并返回受控播放候选。"
+      "kinds": ["search", "online_read"],
+      "notes": "聚合来源：配置一个 M3U 播放列表后，可按频道名称搜索并返回受控在线播放候选。"
     }
   ]
 }

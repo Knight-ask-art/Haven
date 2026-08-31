@@ -36,7 +36,13 @@ describe("fetchSessionResource", () => {
   it("sends a validated Range and marks a 206 response partial", async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(
       new Uint8Array([4, 5]),
-      { status: 206, headers: { "Content-Type": "application/pdf" } },
+      {
+        status: 206,
+        headers: {
+          "Content-Type": "application/pdf",
+          "Content-Range": "bytes 10-11/100",
+        },
+      },
     ))
     vi.stubGlobal("fetch", fetchMock)
 
@@ -46,7 +52,13 @@ describe("fetchSessionResource", () => {
       headers: { Range: "bytes=10-19" },
       signal: undefined,
     })
-    expect(result).toMatchObject({ kind: "data", contentType: "application/pdf", partial: true })
+    expect(result).toMatchObject({
+      kind: "data",
+      contentType: "application/pdf",
+      partial: true,
+      totalBytes: 100,
+      contentRange: { start: 10, end: 11, total: 100 },
+    })
   })
 
   it("uses the WebView2 compatibility URL in a Windows Tauri runtime", async () => {
@@ -142,6 +154,16 @@ describe("fetchSessionResource", () => {
       retryable: false,
     })
     expect(serverBody).not.toHaveBeenCalled()
+  })
+
+  it("maps a valid range request rejected by the provider to an explicit download fallback", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 501 })))
+
+    await expect(fetchSessionResource(CONTENT_URI, { range: "bytes=0-0" })).rejects.toMatchObject({
+      code: "SOURCE_RANGE_UNSUPPORTED",
+      message: "该远端正文不支持分段读取，请先下载到本地",
+      retryable: false,
+    })
   })
 
   it("maps an oversized response to a safe non-retryable catalog error without reading its body", async () => {

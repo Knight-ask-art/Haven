@@ -705,6 +705,9 @@ async fn run_dispatch(
                                     || card
                                         .work_id
                                         .starts_with(super::source_import::OPDS_CANDIDATE_PREFIX)
+                                    || card
+                                        .work_id
+                                        .starts_with(super::source_import::CONTENT_CANDIDATE_PREFIX)
                                 {
                                     cache.push(card.work_id.clone());
                                 }
@@ -747,15 +750,12 @@ async fn run_dispatch(
     }
 }
 
-/// 只有需要访问用户配置端点的流/下载来源才要求 `endpointConfigured`。
-/// 固定公开 metadata Provider 的地址由后端代码拥有，不能因 Wire 中没有端点而被跳过。
+/// 只有需要访问用户配置端点的聚合来源才要求 `endpointConfigured`。
+/// 能力（search/onlineRead/offlineDownload）描述可执行动作，不能用来推断
+/// 端点归属：MangaDex、arXiv 等固定 Provider 同样可能支持在线读取或下载，
+/// 但它们的地址由后端拥有，不应因为 Wire 中没有端点而被跳过。
 fn source_requires_endpoint(source: &crate::wire::SourceDescriptorDto) -> bool {
-    source.kinds.iter().any(|kind| {
-        matches!(
-            kind,
-            crate::wire::SourceKindDto::Stream | crate::wire::SourceKindDto::Download
-        )
-    })
+    matches!(source.source_id.as_str(), "cms10" | "m3u") || source.source_id.starts_with("custom_")
 }
 
 /// 生成 opaque id（时间戳 + 纳秒后缀，保证唯一性）。
@@ -851,7 +851,7 @@ mod tests {
             .map(|i| crate::wire::SourceDescriptorDto {
                 source_id: format!("src{i}"),
                 display_name: format!("src{i}"),
-                kinds: vec![crate::wire::SourceKindDto::Metadata],
+                kinds: vec![crate::wire::SourceKindDto::Search],
                 categories: vec![crate::wire::SourceCategoryDto::Video],
                 mode: crate::wire::SourceModeDto::Single,
                 notes: "测试来源".to_owned(),
@@ -909,11 +909,11 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_gate_only_applies_to_stream_or_download_sources() {
+    fn endpoint_gate_only_applies_to_configured_aggregate_sources() {
         let metadata = crate::wire::SourceDescriptorDto {
             source_id: "tvmaze".into(),
             display_name: "TVMaze".into(),
-            kinds: vec![crate::wire::SourceKindDto::Metadata],
+            kinds: vec![crate::wire::SourceKindDto::Search],
             categories: vec![crate::wire::SourceCategoryDto::Video],
             mode: crate::wire::SourceModeDto::Single,
             notes: "公开 API".into(),
@@ -926,7 +926,8 @@ mod tests {
         };
         assert!(!source_requires_endpoint(&metadata));
         let stream = crate::wire::SourceDescriptorDto {
-            kinds: vec![crate::wire::SourceKindDto::Stream],
+            source_id: "cms10".into(),
+            kinds: vec![crate::wire::SourceKindDto::OnlineRead],
             ..metadata
         };
         assert!(source_requires_endpoint(&stream));
@@ -954,7 +955,7 @@ mod tests {
             crate::wire::SourceDescriptorDto {
                 source_id: "fast".to_owned(),
                 display_name: "fast".to_owned(),
-                kinds: vec![crate::wire::SourceKindDto::Metadata],
+                kinds: vec![crate::wire::SourceKindDto::Search],
                 categories: vec![crate::wire::SourceCategoryDto::Video],
                 mode: crate::wire::SourceModeDto::Single,
                 notes: "测试来源".to_owned(),
@@ -968,7 +969,7 @@ mod tests {
             crate::wire::SourceDescriptorDto {
                 source_id: "slow".to_owned(),
                 display_name: "slow".to_owned(),
-                kinds: vec![crate::wire::SourceKindDto::Metadata],
+                kinds: vec![crate::wire::SourceKindDto::Search],
                 categories: vec![crate::wire::SourceCategoryDto::Video],
                 mode: crate::wire::SourceModeDto::Single,
                 notes: "测试来源".to_owned(),

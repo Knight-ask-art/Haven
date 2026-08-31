@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use haven_application::services::search_source::SearchSourceParticipant;
+use haven_application::services::source_import::CONTENT_CANDIDATE_PREFIX;
 use haven_application::services::source_registry::SourceRegistryService;
 use haven_application::wire::{
     ContentCategory, ExternalIdDto, ExternalIdProviderDto, MediaTypeDto, QueryCategory, WorkCardDto,
@@ -32,13 +33,15 @@ const GUTENBERG_OPDS_URL: &str = "https://www.gutenberg.org/ebooks/search.opds";
 const INTERNET_ARCHIVE_URL: &str = "https://archive.org/advancedsearch.php";
 const MANGADEX_URL: &str = "https://api.mangadex.org/manga";
 const ARXIV_URL: &str = "https://export.arxiv.org/api/query";
+const EUROPE_PMC_URL: &str = "https://www.ebi.ac.uk/europepmc/webservices/rest/search";
+const WIKISOURCE_URL: &str = "https://zh.wikisource.org/w/api.php";
 const CROSSREF_URL: &str = "https://api.crossref.org/works";
 const OPENALEX_URL: &str = "https://api.openalex.org/works";
 
 /// 固定公开 metadata Provider 的 sourceId 快照。保留该公开常量供诊断/测试使用；
 /// 运行时覆盖校验使用下面的 `METADATA_SOURCE_KINDS`，并由同一数组驱动参与者工厂，
 /// 避免“清单更新了但工厂忘记注册”时仍被误判为已接入。
-pub const METADATA_SOURCE_IDS: [&str; 10] = [
+pub const METADATA_SOURCE_IDS: [&str; 12] = [
     "tvmaze",
     "bangumi",
     "anilist",
@@ -47,13 +50,15 @@ pub const METADATA_SOURCE_IDS: [&str; 10] = [
     "archive",
     "mangadex",
     "arxiv",
+    "europepmc",
+    "wikisource",
     "crossref",
     "openalex",
 ];
 
 pub const M3U_SOURCE_ID: &str = "m3u";
 
-const METADATA_SOURCE_KINDS: [MetadataSourceKind; 10] = [
+const METADATA_SOURCE_KINDS: [MetadataSourceKind; 12] = [
     MetadataSourceKind::Tvmaze,
     MetadataSourceKind::Bangumi,
     MetadataSourceKind::Anilist,
@@ -62,6 +67,8 @@ const METADATA_SOURCE_KINDS: [MetadataSourceKind; 10] = [
     MetadataSourceKind::InternetArchive,
     MetadataSourceKind::Mangadex,
     MetadataSourceKind::Arxiv,
+    MetadataSourceKind::EuropePmc,
+    MetadataSourceKind::Wikisource,
     MetadataSourceKind::Crossref,
     MetadataSourceKind::Openalex,
 ];
@@ -123,6 +130,8 @@ enum MetadataSourceKind {
     InternetArchive,
     Mangadex,
     Arxiv,
+    EuropePmc,
+    Wikisource,
     Crossref,
     Openalex,
 }
@@ -138,6 +147,8 @@ impl MetadataSourceKind {
             Self::InternetArchive => "archive",
             Self::Mangadex => "mangadex",
             Self::Arxiv => "arxiv",
+            Self::EuropePmc => "europepmc",
+            Self::Wikisource => "wikisource",
             Self::Crossref => "crossref",
             Self::Openalex => "openalex",
         }
@@ -170,6 +181,10 @@ impl MetadataSourceKind {
                 )
             }
             Self::Arxiv | Self::Crossref | Self::Openalex => matches!(
+                category,
+                None | Some(QueryCategory::All) | Some(QueryCategory::Periodical)
+            ),
+            Self::EuropePmc | Self::Wikisource => matches!(
                 category,
                 None | Some(QueryCategory::All) | Some(QueryCategory::Periodical)
             ),
@@ -300,6 +315,8 @@ impl MetadataClient {
             MetadataSourceKind::InternetArchive => self.search_internet_archive(query, limit).await,
             MetadataSourceKind::Mangadex => self.search_mangadex(query, limit).await,
             MetadataSourceKind::Arxiv => self.search_arxiv(query, limit).await,
+            MetadataSourceKind::EuropePmc => self.search_europe_pmc(query, limit).await,
+            MetadataSourceKind::Wikisource => self.search_wikisource(query, limit).await,
             MetadataSourceKind::Crossref => self.search_crossref(query, limit).await,
             MetadataSourceKind::Openalex => self.search_openalex(query, limit).await,
         }
@@ -610,15 +627,96 @@ impl MetadataClient {
             .into_iter()
             .take(limit as usize)
             .map(|entry| {
+                let external_id = normalize_arxiv_id(&entry.id).unwrap_or(entry.id);
                 card(
                     "arxiv",
-                    &entry.id,
+                    &external_id,
                     entry.title,
                     Some(entry.summary),
                     entry.year,
                     (ContentCategory::Periodical, MediaTypeDto::Article),
                     None,
                 )
+            })
+            .collect())
+    }
+
+    async fn search_europe_pmc(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<WorkCardDto>, AppError> {
+        // 只选择开放获取文章，并要求返回 PMCID；没有 PMCID 的记录无法在本地
+        // 获取全文，因此不把它们投影为可导入候选。
+        let url = format!(
+            "{EUROPE_PMC_URL}?query={}%20AND%20OPEN_ACCESS:Y&format=json&resultType=core&pageSize={limit}",
+            urlencode(query)
+        );
+        let value = self.get_json(self.http.get(url)).await?;
+        let items = value
+            .get("resultList")
+            .and_then(|v| v.get("result"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| source_unavailable("Europe PMC 返回结构异常"))?;
+        Ok(items
+            .iter()
+            .take(limit as usize)
+            .filter_map(|item| {
+                let pmcid = string_field(item, "pmcid")
+                    .or_else(|| string_field(item, "pmcId"))
+                    .filter(|id| is_pmcid(id))?;
+                let title = string_field(item, "title")?;
+                let year = string_field(item, "firstPublicationDate")
+                    .and_then(|value| value.get(0..4).and_then(|part| part.parse().ok()))
+                    .or_else(|| {
+                        item.get("pubYear")
+                            .and_then(Value::as_i64)
+                            .and_then(|value| i32::try_from(value).ok())
+                    });
+                Some(card(
+                    "europepmc",
+                    &pmcid,
+                    title,
+                    string_field(item, "abstractText").map(|v| clean_text(&v)),
+                    year,
+                    (ContentCategory::Periodical, MediaTypeDto::Article),
+                    None,
+                ))
+            })
+            .collect())
+    }
+
+    async fn search_wikisource(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<WorkCardDto>, AppError> {
+        let url = format!(
+            "{WIKISOURCE_URL}?action=query&list=search&srsearch={}&srlimit={limit}&format=json&formatversion=2",
+            urlencode(query)
+        );
+        let value = self.get_json(self.http.get(url)).await?;
+        let items = value
+            .get("query")
+            .and_then(|v| v.get("search"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| source_unavailable("Wikisource 返回结构异常"))?;
+        Ok(items
+            .iter()
+            .take(limit as usize)
+            .filter_map(|item| {
+                let title = string_field(item, "title")?;
+                // 标题会在 content-candidate 中进行 UTF-8 百分号编码；这里仍
+                // 只把页面标题放到候选外部 ID，不把页面 URL暴露给前端。
+                Some(card(
+                    "wikisource",
+                    &title,
+                    title.clone(),
+                    string_field(item, "snippet").map(|v| clean_text(&v)),
+                    None,
+                    (ContentCategory::Periodical, MediaTypeDto::Article),
+                    None,
+                ))
             })
             .collect())
     }
@@ -1055,7 +1153,57 @@ fn stable_key(value: &str) -> String {
 }
 
 fn candidate_id(source_id: &str, external_id: &str) -> String {
+    if matches!(source_id, "mangadex" | "arxiv" | "europepmc" | "wikisource") {
+        return format!(
+            "{}{}-{}",
+            CONTENT_CANDIDATE_PREFIX,
+            source_id,
+            encode_candidate_component(external_id)
+        );
+    }
     format!("metadata-candidate-{source_id}-{}", stable_key(external_id))
+}
+
+/// Candidate ID 不是 URL；对可能包含 `/` 或非 ASCII 标题的外部标识做
+/// UTF-8 百分号编码，之后只由 SourceImportService 在来源 allowlist 通过后解码。
+fn encode_candidate_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+fn normalize_arxiv_id(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let candidate = trimmed
+        .split_once("/abs/")
+        .map(|(_, id)| id)
+        .or_else(|| trimmed.split_once("/pdf/").map(|(_, id)| id))
+        .unwrap_or(trimmed)
+        .trim_end_matches(".pdf")
+        .trim_matches('/');
+    if candidate.is_empty()
+        || candidate.len() > 128
+        || candidate
+            .chars()
+            .any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '/')))
+    {
+        return None;
+    }
+    Some(candidate.to_owned())
+}
+
+fn is_pmcid(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("PMC") else {
+        return false;
+    };
+    !rest.is_empty() && rest.len() <= 12 && rest.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 type CardKind = (ContentCategory, MediaTypeDto);
@@ -1122,8 +1270,10 @@ mod tests {
 
     #[test]
     fn all_fixed_sources_have_real_participants() {
-        assert_eq!(METADATA_SOURCE_IDS.len(), 10);
+        assert_eq!(METADATA_SOURCE_IDS.len(), 12);
         assert!(METADATA_SOURCE_IDS.contains(&"mangadex"));
+        assert!(METADATA_SOURCE_IDS.contains(&"europepmc"));
+        assert!(METADATA_SOURCE_IDS.contains(&"wikisource"));
         assert!(METADATA_SOURCE_IDS.contains(&"openalex"));
         assert!(METADATA_SOURCE_IDS.contains(&"archive"));
         let factory_ids: Vec<&str> = METADATA_SOURCE_KINDS

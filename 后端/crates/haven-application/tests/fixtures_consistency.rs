@@ -261,11 +261,15 @@ fn resource_mixed_availability_loads() {
     assert_eq!(result.items[0].resource_type, ResourceTypeDto::LocalFile);
     assert_eq!(result.items[0].availability, AvailabilityDto::Available);
     assert!(result.items[0].is_local);
+    assert!(result.items[0].can_download);
+    assert!(result.items[0].can_online_read);
     assert_eq!(
         result.items[1].availability,
         AvailabilityDto::SourceUnavailable
     );
     assert!(!result.items[1].requires_reauthorization);
+    assert!(!result.items[1].can_download);
+    assert!(!result.items[1].can_online_read);
 }
 
 #[test]
@@ -388,7 +392,7 @@ fn source_registry_fixtures_load() {
         .iter()
         .find(|s| s.source_id == "cms10")
         .expect("fixture 必须包含 cms10");
-    assert!(cms10.kinds.contains(&SourceKindDto::Stream));
+    assert!(cms10.kinds.contains(&SourceKindDto::OnlineRead));
     assert_eq!(cms10.mode, SourceModeDto::Collection);
     assert!(cms10.categories.contains(&SourceCategoryDto::Video));
     assert!(!cms10.notes.is_empty());
@@ -398,7 +402,7 @@ fn source_registry_fixtures_load() {
         .iter()
         .find(|s| s.source_id == "archive")
         .expect("fixture 必须包含 Internet Archive metadata Provider");
-    assert!(archive.kinds.contains(&SourceKindDto::Metadata));
+    assert!(archive.kinds.contains(&SourceKindDto::Search));
     assert_eq!(archive.mode, SourceModeDto::Single);
     assert!(!archive.endpoint_configured, "固定 API 不依赖用户端点");
 

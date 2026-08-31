@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use haven_common::{AppError, ErrorKind};
 use haven_domain::enums::{MediaType, ResourceType};
 
@@ -25,6 +26,11 @@ pub enum PreparedComicPageSource {
         expected_size: u64,
         sha256: [u8; 32],
     },
+    /// A page belonging to a remote provider.  The page name is an opaque,
+    /// provider-validated fact; it is never serialized to the frontend.  The
+    /// provider must derive the actual request from the session's source
+    /// identity and re-check its allowlist on every read.
+    RemotePage { page_name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,28 +77,79 @@ pub trait ComicPageProvider: Send + Sync {
     ) -> Result<ComicPageBody, AppError>;
 }
 
+/// Asynchronous provider port for remote comic pages.  It is kept separate
+/// from the local synchronous provider so local archive/directory behavior
+/// remains unchanged while the controlled protocol can perform network IO.
+#[async_trait]
+pub trait RemoteComicPageProvider: Send + Sync {
+    async fn inspect(&self, session: &PreparedSession) -> Result<Vec<PreparedComicPage>, AppError>;
+
+    async fn read_page(
+        &self,
+        session: &PreparedSession,
+        page: &PreparedComicPage,
+    ) -> Result<ComicPageBody, AppError>;
+}
+
 #[derive(Clone)]
 pub struct ComicPageService {
     provider: Arc<dyn ComicPageProvider>,
+    remote_provider: Option<Arc<dyn RemoteComicPageProvider>>,
 }
 
 impl ComicPageService {
     pub fn new(provider: Arc<dyn ComicPageProvider>) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            remote_provider: None,
+        }
     }
 
-    pub fn inspect(&self, session: &PreparedSession) -> Result<Vec<PreparedComicPage>, AppError> {
+    /// Attach the single controlled remote comic provider at the composition
+    /// root.  A missing provider fails closed for remote sessions; local
+    /// archives and image directories continue to use `provider`.
+    pub fn with_remote_provider(mut self, provider: Arc<dyn RemoteComicPageProvider>) -> Self {
+        self.remote_provider = Some(provider);
+        self
+    }
+
+    pub async fn inspect(
+        &self,
+        session: &PreparedSession,
+    ) -> Result<Vec<PreparedComicPage>, AppError> {
         self.validate_session(session)?;
-        self.provider.inspect(session)
+        if matches!(
+            &session.source,
+            crate::services::session::PreparedSessionSource::Remote { .. }
+        ) {
+            let provider = self
+                .remote_provider
+                .as_ref()
+                .ok_or_else(remote_unavailable)?;
+            provider.inspect(session).await
+        } else {
+            self.provider.inspect(session)
+        }
     }
 
-    pub fn read_page(
+    pub async fn read_page(
         &self,
         session: &PreparedSession,
         page: &PreparedComicPage,
     ) -> Result<ComicPageBody, AppError> {
         self.validate_session(session)?;
-        self.provider.read_page(session, page)
+        if matches!(
+            &session.source,
+            crate::services::session::PreparedSessionSource::Remote { .. }
+        ) {
+            let provider = self
+                .remote_provider
+                .as_ref()
+                .ok_or_else(remote_unavailable)?;
+            provider.read_page(session, page).await
+        } else {
+            self.provider.read_page(session, page)
+        }
     }
 
     fn validate_session(&self, session: &PreparedSession) -> Result<(), AppError> {
@@ -112,4 +169,13 @@ impl ComicPageService {
         }
         Ok(())
     }
+}
+
+fn remote_unavailable() -> AppError {
+    AppError::new(
+        "SOURCE_UNAVAILABLE",
+        ErrorKind::Network,
+        "远端漫画来源当前不可用，请重试或下载后阅读",
+        true,
+    )
 }

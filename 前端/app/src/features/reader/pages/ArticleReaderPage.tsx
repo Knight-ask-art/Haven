@@ -17,7 +17,7 @@ import { cn } from "@/lib/utils"
 import ReactMarkdown from "react-markdown"
 import { recordHistory } from "@/lib/havenState"
 import { getHavenClientMode, type HavenClientMode } from "@/lib/ipc/runtime"
-import { toHavenError, type HavenError } from "@/lib/ipc/errors"
+import { HavenError, toHavenError, type HavenError as HavenErrorType } from "@/lib/ipc/errors"
 import { useMediaSession } from "@/features/session/useMediaSession"
 import { fetchSessionResource } from "@/features/session/ipc/resource-fetch"
 import {
@@ -47,6 +47,7 @@ import {
   type PdfProgressController,
 } from "../lib/pdf-progress-controller"
 import { PdfReader } from "../components/PdfReader"
+import { PDF_RANGE_CHUNK_SIZE, type PdfSessionSource } from "../lib/pdf-document"
 import { useReadingSettings } from "../lib/use-reading-settings"
 import { resolveReadingPresentation } from "../lib/reading-settings-mapping"
 import { articleMarkerLocator, createMarker, deleteMarker, listMarkers } from "@/features/markers/ipc/marker-gateway"
@@ -74,10 +75,10 @@ type ArticleContentState =
   | { status: "idle" }
   | { status: "loading"; storageId: string; contentUri: string }
   | { status: "ready"; storageId: string; contentUri: string; document: ArticleDocument }
-  | { status: "pdf_ready"; storageId: string; contentUri: string; bytes: ArrayBuffer }
+  | { status: "pdf_ready"; storageId: string; contentUri: string; source: PdfSessionSource }
   | { status: "empty"; storageId: string; contentUri: string }
-  | { status: "retryable_error"; storageId: string; contentUri: string; error: HavenError }
-  | { status: "terminal_error"; storageId: string; contentUri: string; error: HavenError }
+  | { status: "retryable_error"; storageId: string; contentUri: string; error: HavenErrorType }
+  | { status: "terminal_error"; storageId: string; contentUri: string; error: HavenErrorType }
 
 const ARTICLE_SECTIONS: ArticleSection[] = [
   {
@@ -319,7 +320,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
       Math.max(0, Math.min(1, progress / 100)),
     )
     : null
-  const pdfBytes = contentState.status === "pdf_ready" && contentMatchesSession ? contentState.bytes : null
+  const pdfSource = contentState.status === "pdf_ready" && contentMatchesSession ? contentState.source : null
 
   const isDark = theme === "slate" || theme === "dark" || theme === "custom"
   const themeClass = {
@@ -461,21 +462,50 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
 
     const abortController = new AbortController()
     setContentState({ status: "loading", storageId, contentUri: sessionContentUri })
-    void fetchSessionResource(sessionContentUri, {
-      signal: abortController.signal,
-    })
-      .then((resource) => {
+    const loadContent = async () => {
+      // Probe a bounded prefix first. PDFs use the returned total length to construct
+      // a range transport; article HTML is then fetched as one bounded,
+      // sanitised snapshot. A PDF source that does not honour Range fails
+      // closed instead of silently downloading the whole document.
+      const probe = await fetchSessionResource(sessionContentUri, {
+        range: `bytes=0-${PDF_RANGE_CHUNK_SIZE - 1}`,
+        signal: abortController.signal,
+      })
+      if (isPdfMimeType(probe.contentType)) {
+        if (!probe.partial || probe.totalBytes === null) {
+          throw new HavenError({
+            code: "SOURCE_RANGE_UNSUPPORTED",
+            userMessage: "该 PDF 来源不支持分段读取，请先下载到本地",
+            retryable: false,
+          })
+        }
+        return {
+          kind: "pdf" as const,
+          source: {
+            contentUri: sessionContentUri,
+            totalBytes: probe.totalBytes,
+            initialData: probe.bytes,
+          },
+        }
+      }
+      const resource = probe.partial
+        ? await fetchSessionResource(sessionContentUri, { signal: abortController.signal })
+        : probe
+      return { kind: "article" as const, resource }
+    }
+    void loadContent()
+      .then((loaded) => {
         if (resourceRequestRef.current !== requestId || abortController.signal.aborted) return
-        if (resource.kind === "empty") {
+        if (loaded.kind === "pdf") {
+          setContentState({ status: "pdf_ready", storageId, contentUri: sessionContentUri, source: loaded.source })
+          return
+        }
+        if (loaded.resource.kind === "empty") {
           setContentState({ status: "empty", storageId, contentUri: sessionContentUri })
           return
         }
-        if (isPdfMimeType(resource.contentType)) {
-          setContentState({ status: "pdf_ready", storageId, contentUri: sessionContentUri, bytes: resource.bytes })
-          return
-        }
-        const text = decodeArticleText(resource.bytes, resource.contentType)
-        const document = parseArticleContent(text, resource.contentType)
+        const text = decodeArticleText(loaded.resource.bytes, loaded.resource.contentType)
+        const document = parseArticleContent(text, loaded.resource.contentType)
         setContentState(document
           ? { status: "ready", storageId, contentUri: sessionContentUri, document }
           : { status: "empty", storageId, contentUri: sessionContentUri })
@@ -562,7 +592,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
       const maxScroll = document.documentElement.scrollHeight - window.innerHeight
       const ratio = maxScroll <= 0 ? 0 : Math.min(1, Math.max(0, window.scrollY / maxScroll))
       setChromeDimmed(window.scrollY > 48)
-      if (pdfBytes) return
+      if (pdfSource) return
       setProgress(ratio * 100)
       // Tauri 环境向进度控制器报告 progression（0..1）+ 当前小节 blockId。
       if (tauriRuntime && articleDocument && maxScroll > 0) {
@@ -572,7 +602,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
     window.addEventListener("scroll", onScroll, { passive: true })
     onScroll()
     return () => window.removeEventListener("scroll", onScroll)
-  }, [articleDocument, pdfBytes, tauriRuntime])
+  }, [articleDocument, pdfSource, tauriRuntime])
 
   useEffect(() => {
     const observer = new IntersectionObserver(
@@ -834,7 +864,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
           </div>
         </div>
         <div className="flex items-center gap-1">
-          <button type="button" onClick={() => setOutlineOpen((open) => !open)} disabled={!contentReady || Boolean(pdfBytes)} aria-label="打开文章目录" className={cn("flex h-9 w-9 items-center justify-center rounded-full transition-colors hover:bg-black/[0.06] disabled:cursor-not-allowed disabled:opacity-35 dark:hover:bg-white/[0.08]", outlineOpen && "bg-primary/10 text-primary")}>
+          <button type="button" onClick={() => setOutlineOpen((open) => !open)} disabled={!contentReady || Boolean(pdfSource)} aria-label="打开文章目录" className={cn("flex h-9 w-9 items-center justify-center rounded-full transition-colors hover:bg-black/[0.06] disabled:cursor-not-allowed disabled:opacity-35 dark:hover:bg-white/[0.08]", outlineOpen && "bg-primary/10 text-primary")}>
             <ListTree className="h-[17px] w-[17px]" />
           </button>
           <button type="button" onClick={() => setSettingsOpen((open) => !open)} aria-label="打开阅读排版设置" className={cn("flex h-9 w-9 items-center justify-center rounded-full text-sm font-bold transition-colors hover:bg-black/[0.06] dark:hover:bg-white/[0.08]", settingsOpen && "bg-primary/10 text-primary")}>
@@ -889,7 +919,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
             )}
           </div>
         )}
-        {contentReady && pdfBytes && state.status === "ready" && <PdfReader key={state.session.sessionId} bytes={pdfBytes} restoreLocator={(pageCount) => (
+        {contentReady && pdfSource && state.status === "ready" && <PdfReader key={state.session.sessionId} source={pdfSource} restoreLocator={(pageCount) => (
           restorePdfProgress(pageCount, state.session, restoredPdfProgressRef)
         )} onLocatorChange={(locator) => {
           const progression = locator.pageCount <= 1 ? 0 : locator.pageIndex / (locator.pageCount - 1)
@@ -970,7 +1000,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
                 </button>
               ))}
             </nav>
-            <button type="button" onClick={toggleArticleBookmark} disabled={!contentReady || Boolean(pdfBytes) || isBookmarkPending || (tauriRuntime && !markersLoaded)} className={cn("mt-[16px] flex min-h-[46px] w-full items-center justify-center gap-[10px] rounded-xl border px-[16px] py-[12px] text-sm leading-5 font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-35", isBookmarked ? "border-primary/30 bg-primary/10 text-primary" : "border-current/10 hover:bg-black/[0.05] dark:hover:bg-white/[0.08]")}>
+            <button type="button" onClick={toggleArticleBookmark} disabled={!contentReady || Boolean(pdfSource) || isBookmarkPending || (tauriRuntime && !markersLoaded)} className={cn("mt-[16px] flex min-h-[46px] w-full items-center justify-center gap-[10px] rounded-xl border px-[16px] py-[12px] text-sm leading-5 font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-35", isBookmarked ? "border-primary/30 bg-primary/10 text-primary" : "border-current/10 hover:bg-black/[0.05] dark:hover:bg-white/[0.08]")}>
               <Bookmark className={cn("h-[16px] w-[16px]", isBookmarked && "fill-current")} />
               {isBookmarked ? "已存文章书签" : "保存文章书签"}
             </button>

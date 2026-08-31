@@ -28,7 +28,7 @@
 
 Haven（中文名：栖阅）是一个 Local-first 桌面阅读与媒体库工具。文件、进度、收藏、历史、标记和设置由本机 Rust + SQLite 负责，React 只负责交互和展示。网络来源、远程图片和外部 Provider 都经过受控的来源、资源和安全策略；没有账号也可以使用本地核心能力。
 
-当前主线是 `v0.1.0` Windows Local Core。项目内部的任务台账、验收记录和发布跟踪不随公开仓库分发；公开仓库只包含可运行产品、产品测试源码、构建配置和必要的公开契约样例。
+当前主线是 `v0.1.0-beta.1` Windows Local Core 内测版；`v0.1.0` 保留为后续正式版版本号。项目内部的任务台账、验收记录和发布跟踪不随公开仓库分发；公开仓库只包含可运行产品、产品测试源码、构建配置和必要的公开契约样例。
 
 ## Core capabilities
 
@@ -63,7 +63,7 @@ Rust + SQLite 是持久化事实源。前端的 Mock 只在显式浏览器开发
 
 首发目标是 Windows 本地内容核心：视频、TXT、Markdown、EPUB、PDF、HTML、CBZ 和图片目录。支持范围、已知限制和升级说明请参阅[公开变更记录](CHANGELOG.md)。
 
-当前明确不提供：外挂字幕、音轨切换、HEVC 控制；OCR/翻译/AI、Sync 和“清除全部本地数据”需要独立 Foundation/风险评审后再开放。v0.1.0 只发布 Windows 桌面版本，不包含 Android/iOS 构建或图标资源。自动更新已经接入 Tauri 官方签名更新链，但必须由维护者配置签名私钥并发布 GitHub Release 后才会提供可安装版本；长时间播放、1000 页 EPUB/漫画和 Downloads Worker 的极限稳定性保留为用户反馈阶段，不会在没有证据时写成保证。
+当前明确不提供：外挂字幕、音轨切换、HEVC 控制；OCR/翻译/AI、Sync 和“清除全部本地数据”需要独立 Foundation/风险评审后再开放。`v0.1.0-beta.1` 只发布 Windows 桌面版本，不包含 Android/iOS 构建或图标资源。自动更新已经接入 Tauri 官方签名更新链，但必须由维护者配置签名私钥并发布 GitHub Release 后才会提供可安装版本；长时间播放、1000 页 EPUB/漫画和 Downloads Worker 的极限稳定性保留为用户反馈阶段，不会在没有证据时写成保证。
 
 ## Quick start (Windows)
 
@@ -115,7 +115,7 @@ Haven 不会在没有用户授权的情况下保存或发送 GitHub Token。发�
 
 ## Updates
 
-Tauri 桌面版本已经接入固定的 HTTPS GitHub Release 检查链；在维护者配置签名私钥并发布签名 Release 前，v0.1.0 设置页只显示“更新不可用/检查失败”，不会安装未签名文件。正式开放后，用户确认才会安装由 Tauri Updater 校验 minisign 签名的 Windows 被动更新包；签名私钥只配置在 GitHub Actions Secret，仓库不保存私钥。
+Tauri 桌面版本已经接入固定的 HTTPS GitHub Release 检查链；在维护者配置签名私钥并发布签名 Release 前，`v0.1.0-beta.1` 设置页只显示“更新不可用/检查失败”，不会安装未签名文件。正式开放后，用户确认才会安装由 Tauri Updater 校验 minisign 签名的 Windows 被动更新包；签名私钥只配置在 GitHub Actions Secret，仓库不保存私钥。版本路线固定为：内测 `0.1.0-beta.1`，正式版 `0.1.0`。
 
 ## Documentation
 
