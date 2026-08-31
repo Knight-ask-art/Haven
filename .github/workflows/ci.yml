@@ -21,14 +21,16 @@ jobs:
     name: Public build and release checks
     runs-on: windows-latest
     timeout-minutes: 45
-    env:
-      # Keep native build outputs outside the Chinese checkout path. Some
-      # third-party C/assembly build scripts (notably aws-lc-sys) still fail
-      # when their output path contains non-ASCII characters.
-      CARGO_TARGET_DIR: ${{ runner.temp }}/haven-target
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Configure ASCII Cargo target directory
+        # Keep native build outputs outside the Chinese checkout path. Some
+        # third-party C/assembly build scripts (notably aws-lc-sys) still fail
+        # when their output path contains non-ASCII characters.
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$env:RUNNER_TEMP/haven-target"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
