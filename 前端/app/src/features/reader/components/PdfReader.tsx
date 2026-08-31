@@ -5,7 +5,7 @@ import type { TextAnchorDto } from "@/lib/ipc/generated/wire"
 import { HavenError, toHavenError, type HavenError as HavenErrorType } from "@/lib/ipc/errors"
 import { TextLayer } from "pdfjs-dist/legacy/build/pdf.mjs"
 import type { PDFDocumentProxy, PDFPageProxy, RenderTask, TextLayer as PdfTextLayer } from "pdfjs-dist/legacy/build/pdf.mjs"
-import { destroyPdfDocument, loadPdfDocument, PdfReaderError } from "../lib/pdf-document"
+import { destroyPdfDocument, loadPdfDocument, PdfReaderError, type PdfDocumentSource } from "../lib/pdf-document"
 import {
   clampPdfPage,
   clampPdfZoom,
@@ -31,7 +31,10 @@ export interface PdfReaderLocator {
 }
 
 interface PdfReaderProps {
-  bytes: ArrayBuffer
+  /** A bounded in-memory payload for legacy/local callers. */
+  bytes?: ArrayBuffer
+  /** Range-backed session source for remote or large local PDFs. */
+  source?: PdfDocumentSource
   restoreLocator?: (pageCount: number) => PdfInitialLocator | null
   onLocatorChange?: (locator: PdfReaderLocator) => void
   className?: string
@@ -53,9 +56,13 @@ const MAX_CANVAS_SIDE = 8_192
 function readablePdfError(error: unknown, fallback: string): HavenErrorType {
   if (!(error instanceof PdfReaderError)) return toHavenError(error)
   const userMessage = error.code === "PDF_TOO_LARGE"
-    ? "PDF 文件超过当前版本的 32 MiB 大小限制"
+    ? "PDF 文件超过当前版本的大小限制"
     : error.code === "PDF_CANCELLED"
       ? "PDF 读取已取消"
+      : error.code === "PDF_RANGE_UNSUPPORTED"
+        ? "该 PDF 来源不支持分段读取，请先下载到本地"
+        : error.code === "PDF_RANGE_FAILED"
+          ? "PDF 分段读取失败，请重试或下载到本地"
       : fallback
   return new HavenError({
     code: "FORMAT_UNSUPPORTED",
@@ -70,7 +77,7 @@ function readablePdfError(error: unknown, fallback: string): HavenErrorType {
  * or raster memory. The text layer and per-page text cache are rebuilt per
  * document and bounded the same way.
  */
-export function PdfReader({ bytes, restoreLocator, onLocatorChange, className }: PdfReaderProps) {
+export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, className }: PdfReaderProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const stageRef = useRef<HTMLDivElement>(null)
   const textLayerRef = useRef<HTMLDivElement>(null)
@@ -103,6 +110,18 @@ export function PdfReader({ bytes, restoreLocator, onLocatorChange, className }:
   }, [state])
 
   useEffect(() => {
+    const documentSource = source ?? bytes
+    if (!documentSource) {
+      setState({
+        status: "error",
+        error: new HavenError({
+          code: "INVALID_ARGUMENT",
+          userMessage: "PDF 资源不可用",
+          retryable: false,
+        }),
+      })
+      return
+    }
     const requestId = ++requestRef.current
     setState({ status: "loading" })
     setZoom(1)
@@ -117,7 +136,7 @@ export function PdfReader({ bytes, restoreLocator, onLocatorChange, className }:
     const abortController = new AbortController()
     let active = true
     let loadedDocument: PDFDocumentProxy | null = null
-    void loadPdfDocument(bytes, { signal: abortController.signal })
+    void loadPdfDocument(documentSource, { signal: abortController.signal })
       .then((document) => {
         if (!active || requestRef.current !== requestId) {
           void document.destroy()
@@ -151,7 +170,7 @@ export function PdfReader({ bytes, restoreLocator, onLocatorChange, className }:
       abortController.abort()
       void destroyPdfDocument(document)
     }
-  }, [bytes])
+  }, [bytes, source])
 
   useEffect(() => {
     if (state.status !== "ready") return

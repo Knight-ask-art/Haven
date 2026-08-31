@@ -18,7 +18,7 @@ REPOSITORY_ROOT = Path(__file__).parents[2]
 
 class VersionCheckTests(unittest.TestCase):
     def test_release_manifests_use_one_first_party_version(self) -> None:
-        errors = VERSION_CHECK.validate(REPOSITORY_ROOT, "0.1.0")
+        errors = VERSION_CHECK.validate(REPOSITORY_ROOT, "0.1.0-beta.1")
 
         self.assertEqual(errors, [])
 
@@ -31,29 +31,29 @@ class VersionCheckTests(unittest.TestCase):
             (root / "后端").mkdir(exist_ok=True)
 
             (root / "前端/app/package.json").write_text(
-                '{"version":"0.1.0"}', encoding="utf-8"
+                '{"version":"0.1.0-beta.1"}', encoding="utf-8"
             )
             (root / "前端/app/package-lock.json").write_text(
-                '{"version":"0.1.0","packages":{"":{"version":"0.1.0"}}}',
+                '{"version":"0.1.0-beta.1","packages":{"":{"version":"0.1.0-beta.1"}}}',
                 encoding="utf-8",
             )
             (root / "src-tauri/tauri.conf.json").write_text(
-                '{"version":"0.1.0"}', encoding="utf-8"
+                '{"version":"0.1.0-beta.1"}', encoding="utf-8"
             )
             (root / "src-tauri/Cargo.toml").write_text(
-                '[package]\nname="haven-tauri"\nversion="0.1.0"\n', encoding="utf-8"
+                '[package]\nname="haven-tauri"\nversion="0.1.0-beta.1"\n', encoding="utf-8"
             )
             (root / "后端/Cargo.toml").write_text(
-                '[workspace.package]\nversion="0.1.0"\n', encoding="utf-8"
+                '[workspace.package]\nversion="0.1.0-beta.1"\n', encoding="utf-8"
             )
             (root / "后端/crates/haven-infrastructure/Cargo.toml").write_text(
-                '[package]\nname="haven-infrastructure"\nversion="0.1.0"\n'
+                '[package]\nname="haven-infrastructure"\nversion="0.1.0-beta.1"\n'
                 '[dependencies]\n'
-                'haven-application={version="0.1.0",path="../haven-application"}\n',
+                'haven-application={version="0.1.0-beta.1",path="../haven-application"}\n',
                 encoding="utf-8",
             )
 
-            errors = VERSION_CHECK.validate(root, "0.1.0")
+            errors = VERSION_CHECK.validate(root, "0.1.0-beta.1")
 
             self.assertEqual(errors, [])
 

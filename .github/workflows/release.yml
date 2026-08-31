@@ -57,5 +57,9 @@ jobs:
             See [CHANGELOG.md](https://github.com/Knight-ask-art/Haven/blob/main/CHANGELOG.md)
             for supported formats, known limitations, and upgrade behavior.
           releaseDraft: true
-          prerelease: false
+          # Tag names containing a prerelease marker (for example
+          # v0.1.0-beta.1) must remain prereleases.  Otherwise the first
+          # beta would become the channel's "latest" release and the later
+          # v0.1.0 stable build could not be distinguished by the updater.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           args: --target x86_64-pc-windows-msvc

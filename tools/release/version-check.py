@@ -174,7 +174,7 @@ def validate(repository_root: Path, expected_version: str) -> list[str]:
 
 def main(arguments: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Check first-party release versions")
-    parser.add_argument("--version", default="0.1.0")
+    parser.add_argument("--version", default="0.1.0-beta.1")
     parser.add_argument(
         "--root",
         type=Path,

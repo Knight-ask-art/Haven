@@ -8,15 +8,23 @@
 //! - 落盘文件只写入已登记的本地存储位置（受控资源，禁止任意路径拼接）。
 
 use std::collections::HashMap;
+use std::io::{Cursor, Read};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
 use haven_application::services::SourceRegistryService;
+use haven_application::services::ports::{RemoteAcquiredFile, RemoteAcquisitionPort};
 use haven_application::services::search_source::SearchSourceParticipant;
-use haven_application::services::source_import::{SourceCatalogEntry, SourceCatalogProvider};
+use haven_application::services::source_import::{
+    RemoteContentRef, SourceCatalogEntry, SourceCatalogProvider,
+};
 use haven_common::{AppError, ErrorKind};
-use haven_domain::contracts::StorageLocationRepository;
+
+use tokio::io::AsyncWriteExt;
+
+use zip::ZipArchive;
 
 use crate::cms10::{CMS10_SOURCE_ID, Cms10CatalogProvider};
 
@@ -32,6 +40,7 @@ pub fn is_opds_source_id(source_id: &str) -> bool {
 const FEED_CAP_BYTES: usize = 8 * 1024 * 1024;
 const BOOK_CAP_BYTES: u64 = 64 * 1024 * 1024;
 const EPUB_MIME: &str = "application/epub+zip";
+const MAX_REDIRECTS: usize = 3;
 
 /// 单条 OPDS 条目（解析投影）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +57,15 @@ pub struct OpdsEntry {
 
 fn invalid_feed(detail: &'static str) -> AppError {
     AppError::new("SOURCE_UNAVAILABLE", ErrorKind::Network, detail, true)
+}
+
+fn storage_failure(detail: &'static str) -> AppError {
+    AppError::new(
+        "DOWNLOAD_DIRECTORY_UNAVAILABLE",
+        ErrorKind::Storage,
+        detail,
+        true,
+    )
 }
 
 // ---------- Atom 最小解析 ----------
@@ -270,15 +288,10 @@ impl OpdsClient {
         let http = reqwest::Client::builder()
             .user_agent("haven/0.1")
             .timeout(std::time::Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() > 3 {
-                    return attempt.stop();
-                }
-                match attempt.url().scheme() {
-                    "http" | "https" => attempt.follow(),
-                    _ => attempt.stop(),
-                }
-            }))
+            // Redirects are followed explicitly in `get_limited_once`.  This
+            // lets the built-in Gutenberg source re-validate every hop instead
+            // of allowing reqwest to visit an arbitrary host first.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| invalid_feed("HTTP 客户端初始化失败"))?;
         Ok(Self {
@@ -313,38 +326,58 @@ impl OpdsClient {
         url: &str,
         cap: usize,
     ) -> Result<Vec<u8>, AppError> {
-        let mut builder = self.http.get(url);
-        if let (Some(sid), Some(resolver)) = (source_id, &self.credential_resolver) {
-            if let Some(secret) = resolver(sid).await {
-                // secret 即取即用；reqwest 内部按 header 编码，不落日志。
-                builder = builder.basic_auth::<&str, String>(sid, Some(secret));
+        let mut current = validate_opds_url(url, source_id)?;
+        for _ in 0..=MAX_REDIRECTS {
+            let mut builder = self.http.get(current.clone());
+            if let (Some(sid), Some(resolver)) = (source_id, &self.credential_resolver) {
+                // Built-in sources are always anonymous.  We still pass the
+                // source key here so redirect policy can be enforced.
+                if !is_builtin_opds(sid) {
+                    if let Some(secret) = resolver(sid).await {
+                        // secret 即取即用；reqwest 内部按 header 编码，不落日志。
+                        builder = builder.basic_auth::<&str, String>(sid, Some(secret));
+                    }
+                }
             }
-        }
-        let resp = builder
-            .send()
-            .await
-            .map_err(|_| invalid_feed("目录服务不可达"))?;
-        if !resp.status().is_success() {
-            return Err(invalid_feed("目录响应异常"));
-        }
-        if let Some(len) = resp.content_length() {
-            if len as usize > cap {
-                return Err(invalid_feed("目录响应超出大小上限"));
+            let resp = builder
+                .send()
+                .await
+                .map_err(|_| invalid_feed("目录服务不可达"))?;
+            if resp.status().is_redirection() {
+                let location = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| invalid_feed("目录重定向地址无效"))?;
+                current = current
+                    .join(location)
+                    .map_err(|_| invalid_feed("目录重定向地址无效"))?;
+                validate_opds_url(current.as_str(), source_id)?;
+                continue;
             }
-        }
-        let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
-        let mut stream = resp;
-        while let Some(chunk) = stream
-            .chunk()
-            .await
-            .map_err(|_| invalid_feed("目录读取中断"))?
-        {
-            if out.len() + chunk.len() > cap {
-                return Err(invalid_feed("目录响应超出大小上限"));
+            if !resp.status().is_success() {
+                return Err(invalid_feed("目录响应异常"));
             }
-            out.extend_from_slice(chunk.as_ref());
+            if let Some(len) = resp.content_length() {
+                if len > cap as u64 {
+                    return Err(invalid_feed("目录响应超出大小上限"));
+                }
+            }
+            let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
+            let mut stream = resp;
+            while let Some(chunk) = stream
+                .chunk()
+                .await
+                .map_err(|_| invalid_feed("目录读取中断"))?
+            {
+                if out.len().saturating_add(chunk.len()) > cap {
+                    return Err(invalid_feed("目录响应超出大小上限"));
+                }
+                out.extend_from_slice(chunk.as_ref());
+            }
+            return Ok(out);
         }
-        Ok(out)
+        Err(invalid_feed("目录重定向次数过多"))
     }
 
     async fn get_feed(&self, source_id: Option<&str>, url: &str) -> Result<Vec<u8>, AppError> {
@@ -518,23 +551,32 @@ impl OpdsClient {
         None
     }
 
-    /// 条目页 → 解析单条目并下载其首个 EPUB 到目标目录（受控存储根内 books/ 子目录）。
-    /// 返回 (entry, 相对对象名, 字节数)。文件写入由调用方提供的同步回调完成，
-    /// 以便把阻塞 IO 放进 spawn_blocking。
+    /// 条目页 → 只解析单条目元数据，不获取 EPUB 正文。
+    pub async fn fetch_entry_metadata(
+        &self,
+        source_id: Option<&str>,
+        entry_page_url: &str,
+    ) -> Result<OpdsEntry, AppError> {
+        let (page_url, body) = self
+            .get_feed_with_host_fallback(source_id, entry_page_url)
+            .await?;
+        let xml = String::from_utf8_lossy(&body);
+        let entries = parse_atom(&xml, &page_url).0;
+        let entry = entries
+            .into_iter()
+            .find(|e| e.epub_href.is_some() || !e.title.is_empty())
+            .ok_or_else(|| invalid_feed("该条目没有可用元数据"))?;
+        Ok(entry)
+    }
+
+    /// 仅供显式 DownloadTask 使用：条目页 → 获取首个 EPUB。
+    /// 搜索/导入流程不得调用此方法。
     pub async fn fetch_entry_and_epub(
         &self,
         source_id: Option<&str>,
         entry_page_url: &str,
     ) -> Result<(OpdsEntry, Vec<u8>), AppError> {
-        let (page_url, body) = self
-            .get_feed_with_host_fallback(source_id, entry_page_url)
-            .await?;
-        let xml = String::from_utf8_lossy(&body);
-        let (entries, _) = parse_atom(&xml, &page_url);
-        let entry = entries
-            .into_iter()
-            .find(|e| e.epub_href.is_some())
-            .ok_or_else(|| invalid_feed("该条目没有 EPUB 获取链接"))?;
+        let entry = self.fetch_entry_metadata(source_id, entry_page_url).await?;
         let href = entry
             .epub_href
             .clone()
@@ -571,6 +613,92 @@ fn extract_atom_template(desc: &str) -> Option<String> {
 
 fn is_gutenberg_endpoint(endpoint: &str) -> bool {
     endpoint.to_ascii_lowercase().contains("gutenberg.org")
+}
+
+/// 校验 OPDS 请求地址。自定义目录可以访问其已登记的 http(s) 端点；内置
+/// Gutenberg 只允许公开站点的 HTTPS 主机，并且每个手工跟随的重定向都会再次
+/// 进入本函数。请求凭据、端口和片段不会从候选句柄进入网络层。
+fn validate_opds_url(raw: &str, source_id: Option<&str>) -> Result<reqwest::Url, AppError> {
+    let url = reqwest::Url::parse(raw).map_err(|_| invalid_feed("目录地址无效"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid_feed("目录地址不安全"));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| invalid_feed("目录地址缺少主机"))?
+        .to_ascii_lowercase();
+    if source_id.is_some_and(is_builtin_opds)
+        && (url.scheme() != "https"
+            // `url::Url::port()` normalizes an explicitly written default
+            // port (`:443`) to `None`.  Inspect the authority as well so the
+            // built-in allowlist never accepts a caller-supplied port.
+            || url.port().is_some()
+            || has_explicit_authority_port(raw)
+            || !matches!(host.as_str(), "www.gutenberg.org" | "m.gutenberg.org"))
+    {
+        return Err(invalid_feed("古腾堡目录地址不安全"));
+    }
+    Ok(url)
+}
+
+/// Return whether the raw URL authority contains an explicit port.  This is
+/// intentionally only used after URL parsing and user-info rejection; it
+/// exists because the URL parser erases the default HTTPS port when exposing
+/// `Url::port()`.  Gutenberg only needs the bare public HTTPS hosts.
+fn has_explicit_authority_port(raw: &str) -> bool {
+    let Some((_, after_scheme)) = raw.split_once("://") else {
+        return false;
+    };
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if host.starts_with('[') {
+        return host.find(']').is_some_and(|end| {
+            host.get(end + 1..)
+                .is_some_and(|tail| tail.starts_with(':'))
+        });
+    }
+    host.contains(':')
+}
+
+fn validate_builtin_gutenberg_url(raw: &str) -> Result<reqwest::Url, AppError> {
+    validate_opds_url(raw, Some(OPDS_SOURCE_GUTENBERG))
+}
+
+fn is_epub_payload(bytes: &[u8]) -> bool {
+    // ZIP local-file, empty-archive and spanned-archive signatures are all
+    // valid ZIP headers.  The EPUB `mimetype` entry check below is the stronger
+    // discriminator and prevents accepting arbitrary ZIP downloads.
+    bytes.starts_with(b"PK\x03\x04")
+        || bytes.starts_with(b"PK\x05\x06")
+        || bytes.starts_with(b"PK\x07\x08")
+}
+
+fn validate_epub_payload(bytes: &[u8]) -> Result<(), AppError> {
+    if !is_epub_payload(bytes) {
+        return Err(invalid_feed("目录返回的文件不是 EPUB"));
+    }
+    let mut archive = ZipArchive::new(Cursor::new(bytes))
+        .map_err(|_| invalid_feed("目录返回的 EPUB 归档损坏"))?;
+    let mut mimetype = archive
+        .by_name("mimetype")
+        .map_err(|_| invalid_feed("目录返回的 EPUB 缺少类型声明"))?;
+    let mut value = String::new();
+    mimetype
+        .read_to_string(&mut value)
+        .map_err(|_| invalid_feed("目录返回的 EPUB 类型声明无效"))?;
+    if value != EPUB_MIME {
+        return Err(invalid_feed("目录返回的文件不是 EPUB"));
+    }
+    Ok(())
 }
 
 /// 内置三预设（匿名访问）；仅自定义 `custom_` 前缀源注入凭据。
@@ -610,59 +738,16 @@ fn urlencode(input: &str) -> String {
     out
 }
 
-// ---------- 目录提供方（含 EPUB 受控落盘） ----------
+// ---------- 目录提供方（元数据 + 远端身份） ----------
 
-/// OPDS 目录适配器：detail 时抓取条目并把 EPUB 写入默认本地存储位置。
+/// OPDS 目录适配器：detail 只抓取条目元数据，不下载 EPUB。
 pub struct OpdsCatalogProvider {
     client: Arc<OpdsClient>,
-    storage: Arc<dyn StorageLocationRepository + Send + Sync>,
-    /// 无已登记本地位置时自动创建的书库根（应用数据目录下 library/）。
-    default_root: std::path::PathBuf,
 }
 
 impl OpdsCatalogProvider {
-    pub fn new(
-        client: Arc<OpdsClient>,
-        storage: Arc<dyn StorageLocationRepository + Send + Sync>,
-        default_root: std::path::PathBuf,
-    ) -> Self {
-        Self {
-            client,
-            storage,
-            default_root,
-        }
-    }
-
-    async fn resolve_books_dir(
-        &self,
-    ) -> Result<(haven_domain::ids::StorageLocationId, std::path::PathBuf), AppError> {
-        let locations = StorageLocationRepository::list(&*self.storage).await?;
-        if let Some(location) = locations
-            .into_iter()
-            .find(|l| l.provider_type == haven_domain::enums::StorageProviderType::Local)
-        {
-            let root = std::path::PathBuf::from(&location.root_ref);
-            return Ok((location.id, root.join("books")));
-        }
-        let root = self.default_root.clone();
-        let root_for_io = root.clone();
-        tokio::task::spawn_blocking(move || std::fs::create_dir_all(&root_for_io))
-            .await
-            .map_err(|_| invalid_feed("书籍目录创建失败"))?
-            .map_err(|_| invalid_feed("书籍目录创建失败"))?;
-        let now = haven_common::UtcMillis::now();
-        let location = haven_domain::entities::StorageLocation {
-            id: haven_domain::ids::StorageLocationId::new(),
-            provider_type: haven_domain::enums::StorageProviderType::Local,
-            display_name: "下载书库".to_owned(),
-            root_ref: root.to_string_lossy().into_owned(),
-            credential_ref: None,
-            status: haven_domain::enums::StorageStatus::Connected,
-            created_at: now,
-            updated_at: now,
-        };
-        StorageLocationRepository::save(&*self.storage, &location).await?;
-        Ok((location.id, root.join("books")))
+    pub fn new(client: Arc<OpdsClient>) -> Self {
+        Self { client }
     }
 }
 
@@ -686,24 +771,15 @@ impl SourceCatalogProvider for OpdsCatalogProvider {
         }
         let _ = endpoint; // external_id 已是绝对条目页地址
         // 私有源凭据：sourceId 即 profile（`haven:opds:<sourceId>`），detail 走同源 Basic Auth。
-        let source_for_auth = (is_opds_source_id(source_id) || is_custom)
-            .then(|| source_id.to_owned())
-            .filter(|_| !is_builtin_opds(source_id));
-        let (entry, data) = self
+        // Built-in source key is passed to the HTTP layer for strict host and
+        // redirect validation; `get_limited_once` deliberately skips auth for
+        // built-in IDs. Custom OPDS IDs retain their credential lookup path.
+        let source_for_auth =
+            (is_opds_source_id(source_id) || is_custom).then(|| source_id.to_owned());
+        let entry = self
             .client
-            .fetch_entry_and_epub(source_for_auth.as_deref(), external_id)
+            .fetch_entry_metadata(source_for_auth.as_deref(), external_id)
             .await?;
-        let (location_id, dir) = self.resolve_books_dir().await?;
-        let file_name = format!("{}.epub", uuid::Uuid::new_v4());
-        let target = dir.join(&file_name);
-        let write_dir = dir.clone();
-        let payload = data.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-            std::fs::create_dir_all(&write_dir).map_err(|_| invalid_feed("书籍目录创建失败"))?;
-            std::fs::write(&target, &payload).map_err(|_| invalid_feed("书籍写入失败"))
-        })
-        .await
-        .map_err(|_| invalid_feed("书籍写入任务失败"))??;
 
         Ok(SourceCatalogEntry {
             external_id: external_id.to_owned(),
@@ -715,16 +791,135 @@ impl SourceCatalogProvider for OpdsCatalogProvider {
             content: entry.summary,
             director: entry.author,
             actor: None,
-            local_file: Some(
-                haven_application::services::source_import::LocalAcquiredFile {
-                    storage_location_id: location_id.to_string(),
-                    object_rel_path: format!("books/{file_name}"),
-                    size_bytes: data.len() as u64,
-                    mime: EPUB_MIME.to_owned(),
-                },
-            ),
+            local_file: None,
+            media_type: Some(haven_domain::enums::MediaType::Book),
+            remote: Some(RemoteContentRef {
+                source_key: source_id.to_owned(),
+                remote_id: external_id.to_owned(),
+                media_type: haven_domain::enums::MediaType::Book,
+                mime_type: Some(EPUB_MIME.to_owned()),
+            }),
         })
     }
+}
+
+/// OPDS/Gutenberg 的正文只在 DownloadTask 中获取。导入阶段登记的
+/// `RemoteContentRef.remote_id` 是经过后端生成的条目页身份；这里再次校验
+/// 固定主机，读取 EPUB 后先落到 provider 临时文件，成功后再原子替换 Worker
+/// 的 `.part` 文件。任何失败都会清理两种临时文件。
+#[async_trait]
+impl RemoteAcquisitionPort for OpdsCatalogProvider {
+    async fn acquire(
+        &self,
+        source_key: &str,
+        remote_id: &str,
+        destination: &Path,
+    ) -> Result<RemoteAcquiredFile, AppError> {
+        if source_key != OPDS_SOURCE_GUTENBERG {
+            return Err(AppError::new(
+                "INVALID_ARGUMENT",
+                ErrorKind::Validation,
+                "未知远端书籍来源",
+                false,
+            ));
+        }
+        if destination.as_os_str().is_empty() {
+            return Err(storage_failure("书籍临时文件路径无效"));
+        }
+        let remote_url = validate_builtin_gutenberg_url(remote_id)?;
+        let entry = self
+            .client
+            .fetch_entry_metadata(Some(source_key), remote_url.as_str())
+            .await?;
+        let href = entry
+            .epub_href
+            .as_deref()
+            .ok_or_else(|| invalid_feed("该条目没有 EPUB 获取链接"))?;
+        let href = validate_builtin_gutenberg_url(href)?;
+        let bytes = self
+            .client
+            .get_limited_with_host_fallback(
+                Some(source_key),
+                href.as_str(),
+                BOOK_CAP_BYTES as usize,
+            )
+            .await?;
+        validate_epub_payload(&bytes)?;
+        let size_bytes = write_epub_atomic(destination, &bytes).await?;
+        Ok(RemoteAcquiredFile {
+            size_bytes,
+            mime: EPUB_MIME.to_owned(),
+        })
+    }
+}
+
+/// Download Worker 使用的远端来源路由。OPDS Provider 与 MangaDex/arXiv/
+/// Europe PMC/Wikisource Provider 都实现同一个 Application Port；组合根只需
+/// 注入此路由器即可，Worker 不需要知道具体 Infrastructure 类型。
+pub struct RoutingRemoteAcquisitionPort {
+    opds: Arc<OpdsCatalogProvider>,
+    online: Arc<dyn RemoteAcquisitionPort>,
+}
+
+impl RoutingRemoteAcquisitionPort {
+    pub fn new(opds: Arc<OpdsCatalogProvider>, online: Arc<dyn RemoteAcquisitionPort>) -> Self {
+        Self { opds, online }
+    }
+}
+
+#[async_trait]
+impl RemoteAcquisitionPort for RoutingRemoteAcquisitionPort {
+    async fn acquire(
+        &self,
+        source_key: &str,
+        remote_id: &str,
+        destination: &Path,
+    ) -> Result<RemoteAcquiredFile, AppError> {
+        if source_key == OPDS_SOURCE_GUTENBERG {
+            self.opds.acquire(source_key, remote_id, destination).await
+        } else {
+            self.online
+                .acquire(source_key, remote_id, destination)
+                .await
+        }
+    }
+}
+
+async fn write_epub_atomic(destination: &Path, bytes: &[u8]) -> Result<u64, AppError> {
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| storage_failure("书籍临时文件路径无效"))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|_| storage_failure("书籍目录创建失败"))?;
+    let temporary = destination.with_extension("provider-part");
+    // Provider 获取不支持从旧 `.part` 续传；覆盖前一次未完成尝试，避免
+    // Windows rename 因为目标已存在而失败。
+    let _ = tokio::fs::remove_file(&temporary).await;
+    let _ = tokio::fs::remove_file(destination).await;
+    let result = async {
+        let mut file = tokio::fs::File::create(&temporary)
+            .await
+            .map_err(|_| storage_failure("书籍临时文件创建失败"))?;
+        file.write_all(bytes)
+            .await
+            .map_err(|_| storage_failure("书籍写入失败"))?;
+        file.sync_all()
+            .await
+            .map_err(|_| storage_failure("书籍写入失败"))?;
+        drop(file);
+        tokio::fs::rename(&temporary, destination)
+            .await
+            .map_err(|_| storage_failure("书籍保存失败"))?;
+        Ok(bytes.len() as u64)
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        let _ = tokio::fs::remove_file(destination).await;
+    }
+    result
 }
 
 // ---------- 搜索参与者 ----------
@@ -798,8 +993,10 @@ impl SearchSourceParticipant for OpdsSearchParticipant {
         if is_cancelled() {
             return Ok(Vec::new());
         }
-        let source_for_auth: Option<&str> =
-            (!is_builtin_opds(dispatched_id)).then_some(dispatched_id);
+        // Keep the built-in key visible to the HTTP policy while still making
+        // its requests anonymous (the client skips credential injection for
+        // built-in IDs).
+        let source_for_auth: Option<&str> = Some(dispatched_id);
         let entries = self
             .client
             .search_entries(source_for_auth, &endpoint, query, limit)
@@ -807,11 +1004,16 @@ impl SearchSourceParticipant for OpdsSearchParticipant {
         Ok(entries
             .into_iter()
             .map(|entry| haven_application::wire::WorkCardDto {
+                // The operation cache must never expose a directly callable remote
+                // URL as a candidate handle. Keep the source key visible only for
+                // server-side routing and percent-encode the entry identity; the
+                // import service is the sole component that decodes it after the
+                // source policy has been checked.
                 work_id: format!(
                     "{}{}\u{1}{}",
                     haven_application::services::OPDS_CANDIDATE_PREFIX,
                     dispatched_id,
-                    entry.entry_id
+                    urlencode(&entry.entry_id)
                 ),
                 title: entry.title,
                 original_title: entry.author,
@@ -841,12 +1043,19 @@ pub struct RoutingSourceCatalogProvider {
 }
 
 impl RoutingSourceCatalogProvider {
-    pub fn new(cms10: Arc<Cms10CatalogProvider>, opds: Arc<OpdsCatalogProvider>) -> Self {
+    pub fn new(
+        cms10: Arc<Cms10CatalogProvider>,
+        opds: Arc<OpdsCatalogProvider>,
+        online: Arc<dyn SourceCatalogProvider>,
+    ) -> Self {
         let mut routes: std::collections::HashMap<String, Arc<dyn SourceCatalogProvider>> =
             std::collections::HashMap::new();
         routes.insert(CMS10_SOURCE_ID.to_owned(), cms10);
         for id in OPDS_SOURCE_IDS {
             routes.insert(id.to_owned(), opds.clone());
+        }
+        for id in ["mangadex", "arxiv", "europepmc", "wikisource"] {
+            routes.insert(id.to_owned(), online.clone());
         }
         Self {
             routes,
@@ -914,6 +1123,9 @@ impl SourceCatalogProvider for RoutingSourceCatalogProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Cursor, Write as _};
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
 
     #[test]
     fn absolutize_upgrades_http_and_resolves_relative() {
@@ -978,6 +1190,62 @@ mod tests {
             url,
             "https://m.gutenberg.org/ebooks/search.opds/?query=frankenstein"
         );
+    }
+
+    #[test]
+    fn builtin_gutenberg_policy_rejects_untrusted_urls() {
+        assert!(validate_builtin_gutenberg_url("https://www.gutenberg.org/ebooks/84.opds").is_ok());
+        assert!(
+            validate_builtin_gutenberg_url("https://m.gutenberg.org/cache/epub/84/pg84.epub")
+                .is_ok()
+        );
+        assert!(validate_builtin_gutenberg_url("http://www.gutenberg.org/ebooks/84.opds").is_err());
+        assert!(validate_builtin_gutenberg_url("https://evil.example/ebooks/84.opds").is_err());
+        assert!(
+            validate_builtin_gutenberg_url("https://www.gutenberg.org:443/ebooks/84.opds").is_err()
+        );
+        assert!(
+            validate_builtin_gutenberg_url("https://user:secret@www.gutenberg.org/ebooks/84.opds")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn epub_payload_requires_zip_and_mimetype() {
+        assert!(validate_epub_payload(b"<html>not an epub</html>").is_err());
+
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                "mimetype",
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+            )
+            .unwrap();
+        writer.write_all(EPUB_MIME.as_bytes()).unwrap();
+        writer
+            .start_file("META-INF/container.xml", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"<container/>").unwrap();
+        let epub = writer.finish().unwrap().into_inner();
+        assert!(validate_epub_payload(&epub).is_ok());
+
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file("mimetype", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"application/zip").unwrap();
+        let wrong = writer.finish().unwrap().into_inner();
+        assert!(validate_epub_payload(&wrong).is_err());
+    }
+
+    #[tokio::test]
+    async fn epub_atomic_write_leaves_no_provider_partial() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("task.part");
+        let bytes = b"PK\x03\x04test";
+        write_epub_atomic(&destination, bytes).await.unwrap();
+        assert_eq!(tokio::fs::read(&destination).await.unwrap(), bytes);
+        assert!(!destination.with_extension("provider-part").exists());
     }
 
     #[test]

@@ -25,6 +25,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Configure ASCII Cargo target directory
+        # Keep native build outputs outside the Chinese checkout path. Some
+        # third-party C/assembly build scripts (notably aws-lc-sys) still fail
+        # when their output path contains non-ASCII characters.
+        shell: pwsh
+        run: |
+          $temp = Join-Path $env:RUNNER_TEMP "haven-temp"
+          New-Item -ItemType Directory -Force -Path $temp | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$env:RUNNER_TEMP/haven-target"
+          # Keep tempfile paths stable and free of Windows 8.3 aliases. The
+          # storage-location integration tests compare canonical paths.
+          Add-Content -Path $env:GITHUB_ENV -Value "TEMP=$temp"
+          Add-Content -Path $env:GITHUB_ENV -Value "TMP=$temp"
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -47,7 +61,7 @@ jobs:
         run: python tools/release/public-snapshot-check.py
 
       - name: Check release versions
-        run: python tools/release/version-check.py --version 0.1.0
+        run: python tools/release/version-check.py --version 0.1.0-beta.1
 
       - name: Install frontend dependencies
         working-directory: 前端/app

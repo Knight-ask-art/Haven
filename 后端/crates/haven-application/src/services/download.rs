@@ -22,6 +22,7 @@ use haven_domain::settings::{SettingsSection, SettingsValue};
 use crate::mapper::time::utc_millis_to_rfc3339;
 use crate::services::download_batch::DownloadBatchService;
 use crate::services::settings::SettingsService;
+use crate::services::source_import::{source_key_for_id, validate_remote_source_object};
 use crate::wire::{
     ContentCategory as ContentCategoryDto, DownloadCreateRequest, DownloadEventData,
     DownloadListRequest, DownloadMutationResultDto, DownloadRevealResultDto, DownloadStateDto,
@@ -96,6 +97,15 @@ pub trait DownloadEventSink: Send + Sync {
 /// 已登记 Offline Resource 的受控文件能力；实现必须拒绝 Offline Root 之外的路径。
 #[async_trait]
 pub trait OfflineResourceFiles: Send + Sync {
+    /// 检查已登记离线资源的文件是否仍然存在且可读取。
+    ///
+    /// `Ok(false)` 只表示受控离线目录中的文件已丢失；调用方应重新创建下载任务。
+    /// 路径越界、权限或其他 IO 错误必须返回错误，不能把安全失败伪装成缺失。
+    async fn is_available(
+        &self,
+        storage: &StorageLocation,
+        resource: &Resource,
+    ) -> Result<bool, AppError>;
     async fn delete(&self, storage: &StorageLocation, resource: &Resource) -> Result<(), AppError>;
     async fn reveal(&self, storage: &StorageLocation, resource: &Resource) -> Result<(), AppError>;
 }
@@ -155,14 +165,15 @@ impl DownloadService {
                 true,
             ));
         }
-        if !matches!(&resource.locator, ResourceLocator::LocalPath { .. }) {
+        if matches!(&resource.locator, ResourceLocator::Http { .. }) {
             return Err(AppError::new(
                 "DOWNLOAD_SOURCE_UNSUPPORTED",
                 ErrorKind::Validation,
-                "当前版本只支持将本地媒体保存到离线位置",
+                "该资源没有受控的可下载来源",
                 false,
             ));
         }
+        validate_download_source_object(&resource)?;
         let storage = self
             .ports
             .as_storage()
@@ -208,17 +219,31 @@ impl DownloadService {
             return self.to_dto(existing).await;
         }
 
-        let existing_offline = self
-            .ports
-            .as_resource()
-            .list_by_media_item(media_item.id)
-            .await?
-            .into_iter()
-            .find(|candidate| {
-                candidate.storage_location_id == Some(target_storage_id)
-                    && candidate.availability == Availability::OfflineAvailable
-                    && matches!(&candidate.locator, ResourceLocator::LocalPath { .. })
-            });
+        let existing_offline = {
+            let candidates = self
+                .ports
+                .as_resource()
+                .list_by_media_item(media_item.id)
+                .await?;
+            let mut available = None;
+            for candidate in candidates {
+                if candidate.storage_location_id != Some(target_storage_id)
+                    || candidate.availability != Availability::OfflineAvailable
+                    || !matches!(&candidate.locator, ResourceLocator::LocalPath { .. })
+                {
+                    continue;
+                }
+                if self
+                    .offline_files
+                    .is_available(&storage, &candidate)
+                    .await?
+                {
+                    available = Some(candidate);
+                    break;
+                }
+            }
+            available
+        };
 
         let now = haven_common::UtcMillis::now();
         if let Some(offline_resource) = existing_offline {
@@ -619,6 +644,44 @@ impl DownloadService {
     }
 }
 
+/// Fail closed before a DownloadTask is created when a persisted remote
+/// resource no longer matches the fixed source allowlist.  The worker repeats
+/// the check at execution time; this early check keeps the task table free of
+/// identities that could never be safely acquired.
+fn validate_download_source_object(resource: &Resource) -> Result<(), AppError> {
+    let ResourceLocator::SourceObject {
+        source_id,
+        remote_id,
+    } = &resource.locator
+    else {
+        return Ok(());
+    };
+    let Some(source_key) = source_key_for_id(*source_id) else {
+        return Err(AppError::new(
+            "DOWNLOAD_SOURCE_UNSUPPORTED",
+            ErrorKind::Validation,
+            "该资源没有受控的可下载来源",
+            false,
+        ));
+    };
+    if resource.source_id != Some(*source_id) {
+        return Err(AppError::new(
+            "DOWNLOAD_SOURCE_UNSUPPORTED",
+            ErrorKind::Security,
+            "该资源的来源身份无效",
+            false,
+        ));
+    }
+    validate_remote_source_object(source_key, resource.resource_type, remote_id).map_err(|_| {
+        AppError::new(
+            "DOWNLOAD_SOURCE_UNSUPPORTED",
+            ErrorKind::Validation,
+            "该资源没有受控的可下载来源",
+            false,
+        )
+    })
+}
+
 fn should_start_on_boot(state: DownloadState, auto_continue: bool) -> bool {
     match state {
         // Queued 任务代表本次运行中已明确提交的下载意图，即使关闭“自动继续”，
@@ -740,6 +803,8 @@ fn category_dto(value: ContentCategory) -> ContentCategoryDto {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use haven_domain::enums::ResourceType;
+    use haven_domain::ids::MediaItemId;
 
     #[test]
     fn state_machine_keeps_verification_atomic() {
@@ -772,5 +837,86 @@ mod tests {
         assert!(!should_start_on_boot(DownloadState::Interrupted, false));
         assert!(!should_start_on_boot(DownloadState::Completed, true));
         assert!(!should_start_on_boot(DownloadState::Paused, true));
+    }
+
+    fn remote_resource(
+        source_key: &str,
+        resource_type: ResourceType,
+        remote_id: &str,
+        row_source_id: Option<haven_domain::ids::SourceId>,
+    ) -> Resource {
+        let source_id = crate::services::source_import::stable_source_id(source_key)
+            .unwrap_or_else(|_| haven_domain::ids::SourceId::new());
+        Resource {
+            id: ResourceId::new(),
+            media_item_id: MediaItemId::new(),
+            resource_type,
+            source_id: row_source_id.or(Some(source_id)),
+            storage_location_id: None,
+            locator: ResourceLocator::SourceObject {
+                source_id,
+                remote_id: remote_id.to_owned(),
+            },
+            mime_type: None,
+            size: None,
+            hash: None,
+            availability: Availability::Available,
+            availability_source: haven_domain::enums::AvailabilitySource::User,
+            modified_ms: None,
+            fingerprint_first: None,
+            fingerprint_last: None,
+            created_at: haven_common::UtcMillis(1),
+            updated_at: haven_common::UtcMillis(1),
+        }
+    }
+
+    #[test]
+    fn download_rejects_malformed_or_mismatched_source_objects() {
+        let valid = remote_resource(
+            "mangadex",
+            ResourceType::ComicArchive,
+            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002",
+            None,
+        );
+        assert!(validate_download_source_object(&valid).is_ok());
+
+        let unknown = Resource {
+            locator: ResourceLocator::SourceObject {
+                source_id: haven_domain::ids::SourceId::new(),
+                remote_id: "anything".into(),
+            },
+            ..valid.clone()
+        };
+        assert_eq!(
+            validate_download_source_object(&unknown)
+                .unwrap_err()
+                .code()
+                .as_str(),
+            "DOWNLOAD_SOURCE_UNSUPPORTED"
+        );
+
+        let mismatch = remote_resource(
+            "arxiv",
+            ResourceType::PublicationFile,
+            "2401.12345",
+            Some(haven_domain::ids::SourceId::new()),
+        );
+        assert!(validate_download_source_object(&mismatch).is_err());
+
+        let url = remote_resource(
+            "arxiv",
+            ResourceType::PublicationFile,
+            "https://evil.invalid/paper.pdf",
+            None,
+        );
+        assert!(validate_download_source_object(&url).is_err());
+
+        let wrong_type = remote_resource(
+            "mangadex",
+            ResourceType::PublicationFile,
+            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002",
+            None,
+        );
+        assert!(validate_download_source_object(&wrong_type).is_err());
     }
 }

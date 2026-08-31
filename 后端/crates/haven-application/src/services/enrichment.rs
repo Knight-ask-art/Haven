@@ -216,6 +216,8 @@ mod tests {
                 director: Some("刘慈欣".into()),
                 actor: Some("演员甲".into()),
                 local_file: None,
+                media_type: None,
+                remote: None,
             })
         }
 
@@ -238,6 +240,8 @@ mod tests {
                     director: Some("刘慈欣".into()),
                     actor: Some("演员甲".into()),
                     local_file: None,
+                    media_type: None,
+                    remote: None,
                 }])
             } else {
                 Ok(Vec::new())

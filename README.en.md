@@ -29,10 +29,11 @@ and reading progress together. Rust and SQLite own the local data model;
 React renders the interface and talks to the backend through typed, restricted
 Tauri commands. No account is required for the local core.
 
-The public `v0.1.0` snapshot contains the runnable Windows local core, build
-configuration, public IPC contract examples, and the runtime assets required by
-the application. Internal plans, acceptance evidence, diagnostic exports, and
-release binaries are kept out of the source repository.
+The public `v0.1.0-beta.1` snapshot contains the runnable Windows local core,
+build configuration, public IPC contract examples, and the runtime assets
+required by the application. `v0.1.0` is reserved for the later stable release.
+Internal plans, acceptance evidence, diagnostic exports, and release binaries
+are kept out of the source repository.
 
 ## Core capabilities
 
@@ -67,7 +68,8 @@ selection, or user-controlled HEVC decoding. OCR/translation/AI, Sync, and
 full local-data deletion require separate foundations and risk reviews. Auto-
 update signing is wired to the Tauri updater, but installable releases are only
 available after the maintainer configures signing secrets and publishes a
-signed GitHub Release. Long-running playback, very large EPUB/comic libraries,
+signed GitHub Release. The beta route is `0.1.0-beta.1`; `0.1.0` is reserved for
+the stable release. Long-running playback, very large EPUB/comic libraries,
 and extreme download-worker conditions remain user-feedback areas rather than
 unsupported guarantees.
 

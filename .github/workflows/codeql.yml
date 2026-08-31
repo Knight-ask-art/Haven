@@ -29,6 +29,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Configure ASCII Cargo target directory
+        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/haven-target" >> "$GITHUB_ENV"
+
+      - name: Install Linux dialog build dependencies
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y pkg-config libwayland-dev
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:

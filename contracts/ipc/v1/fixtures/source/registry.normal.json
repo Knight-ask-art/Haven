@@ -4,7 +4,7 @@
     {
       "sourceId": "tvmaze",
       "displayName": "TVMaze",
-      "kinds": ["metadata"],
+      "kinds": ["search"],
       "categories": ["video"],
       "mode": "single",
       "notes": "公开影视资料 API，支持剧集标题搜索。",
@@ -15,7 +15,7 @@
     {
       "sourceId": "bangumi",
       "displayName": "Bangumi",
-      "kinds": ["metadata"],
+      "kinds": ["search"],
       "categories": ["video", "comic"],
       "mode": "single",
       "notes": "公开作品资料 API，支持动画与漫画标题搜索。",
@@ -26,7 +26,7 @@
     {
       "sourceId": "anilist",
       "displayName": "AniList",
-      "kinds": ["metadata"],
+      "kinds": ["search"],
       "categories": ["video", "comic"],
       "mode": "single",
       "notes": "公开 GraphQL 资料 API，支持动画与漫画标题搜索。",
@@ -37,7 +37,7 @@
     {
       "sourceId": "itunes",
       "displayName": "iTunes Search",
-      "kinds": ["metadata"],
+      "kinds": ["search"],
       "categories": ["video"],
       "mode": "single",
       "notes": "Apple 公开剧集季搜索 API，支持剧集标题搜索。",
@@ -48,18 +48,18 @@
     {
       "sourceId": "mangadex",
       "displayName": "MangaDex",
-      "kinds": ["metadata"],
+      "kinds": ["search", "online_read", "offline_download"],
       "categories": ["comic"],
       "mode": "single",
-      "notes": "公开漫画 API，支持漫画标题搜索。",
-      "enabled": false,
+      "notes": "公开漫画 API，支持漫画搜索、章节在线阅读和下载 CBZ。",
+      "enabled": true,
       "health": "unknown",
       "endpointConfigured": false
     },
     {
       "sourceId": "gutenberg",
       "displayName": "Project Gutenberg",
-      "kinds": ["metadata"],
+      "kinds": ["search"],
       "categories": ["book"],
       "mode": "single",
       "notes": "Gutenberg 公开 OPDS 图书 API，支持书名搜索。",
@@ -70,7 +70,7 @@
     {
       "sourceId": "archive",
       "displayName": "Internet Archive",
-      "kinds": ["metadata"],
+      "kinds": ["search"],
       "categories": ["book"],
       "mode": "single",
       "notes": "公开图书资料搜索 API，限定文本类条目，提供作品标题和描述。",
@@ -81,7 +81,7 @@
     {
       "sourceId": "opds_gutenberg",
       "displayName": "古腾堡计划（OPDS）",
-      "kinds": ["metadata", "download"],
+      "kinds": ["search", "offline_download"],
       "categories": ["book"],
       "mode": "single",
       "notes": "公开 OPDS 图书目录，搜索结果可下载 EPUB。",
@@ -92,18 +92,40 @@
     {
       "sourceId": "arxiv",
       "displayName": "arXiv",
-      "kinds": ["metadata"],
+      "kinds": ["search", "online_read", "offline_download"],
       "categories": ["periodical"],
       "mode": "single",
-      "notes": "公开 Atom API，支持学术文章标题与摘要搜索。",
-      "enabled": false,
+      "notes": "公开 Atom API，支持学术文章搜索、在线 PDF（服务端支持范围读取时）和下载。",
+      "enabled": true,
+      "health": "unknown",
+      "endpointConfigured": false
+    },
+    {
+      "sourceId": "europepmc",
+      "displayName": "Europe PMC",
+      "kinds": ["search", "online_read", "offline_download"],
+      "categories": ["periodical"],
+      "mode": "single",
+      "notes": "开放获取文章搜索、在线安全全文和 HTML 快照下载。",
+      "enabled": true,
+      "health": "unknown",
+      "endpointConfigured": false
+    },
+    {
+      "sourceId": "wikisource",
+      "displayName": "中文维基文库",
+      "kinds": ["search", "online_read", "offline_download"],
+      "categories": ["periodical"],
+      "mode": "single",
+      "notes": "中文公版文本搜索、在线安全正文和 HTML 快照下载。",
+      "enabled": true,
       "health": "unknown",
       "endpointConfigured": false
     },
     {
       "sourceId": "crossref",
       "displayName": "Crossref",
-      "kinds": ["metadata"],
+      "kinds": ["search"],
       "categories": ["periodical"],
       "mode": "single",
       "notes": "公开 DOI 元数据 API，支持期刊与文章搜索。",
@@ -114,7 +136,7 @@
     {
       "sourceId": "openalex",
       "displayName": "OpenAlex",
-      "kinds": ["metadata"],
+      "kinds": ["search"],
       "categories": ["periodical"],
       "mode": "single",
       "notes": "公开学术作品 API，支持文章、期刊和作者元数据搜索。",
@@ -125,10 +147,10 @@
     {
       "sourceId": "cms10",
       "displayName": "苹果CMS V10",
-      "kinds": ["stream", "download"],
+      "kinds": ["search", "online_read", "offline_download"],
       "categories": ["video"],
       "mode": "collection",
-      "notes": "聚合来源：配置采集接口后可搜索并播放视频。",
+      "notes": "聚合来源：配置采集接口后可搜索、在线播放并按需下载视频。",
       "enabled": false,
       "health": "unknown",
       "endpointConfigured": true
@@ -136,7 +158,7 @@
     {
       "sourceId": "m3u",
       "displayName": "M3U 播放列表",
-      "kinds": ["stream"],
+      "kinds": ["search", "online_read"],
       "categories": ["video"],
       "mode": "collection",
       "notes": "聚合来源：配置 M3U 地址后可按频道名称搜索。",

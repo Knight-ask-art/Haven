@@ -62,7 +62,10 @@ FORBIDDEN_STATUS_WORDS = (
     "not implemented",
 )
 SOURCE_CATEGORIES = {"video", "book", "comic", "periodical"}
-SOURCE_KINDS = {"metadata", "stream", "download"}
+# Source capabilities are action-oriented.  Keep this list in lock-step with
+# `SourceKindDto` so the public snapshot check rejects stale manifests rather
+# than silently accepting the pre-v0.2 metadata/stream/download vocabulary.
+SOURCE_KINDS = {"search", "online_read", "offline_download"}
 
 
 def tracked_files(root: Path) -> list[str]:

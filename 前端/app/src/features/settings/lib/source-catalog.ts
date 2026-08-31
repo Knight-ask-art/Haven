@@ -36,9 +36,9 @@ export const SOURCE_MODE_DESCRIPTIONS: Record<SourceModeDto, string> = {
 }
 
 export const SOURCE_KIND_LABELS: Record<SourceKindDto, string> = {
-  metadata: "作品信息",
-  stream: "在线播放",
-  download: "下载到本机",
+  search: "可搜索",
+  online_read: "在线打开",
+  offline_download: "保存本地",
 }
 
 export function sourceCategoryLabel(category: SourceCategoryDto): string {
@@ -51,6 +51,18 @@ export function sourceModeLabel(mode: SourceModeDto): string {
 
 export function sourceCapabilityLabels(kinds: readonly SourceKindDto[]): string[] {
   return kinds.map((kind) => SOURCE_KIND_LABELS[kind])
+}
+
+export function sourceHasCapability(
+  source: Pick<SourceDescriptorDto, "kinds">,
+  capability: SourceKindDto,
+): boolean {
+  return source.kinds.includes(capability)
+}
+
+/** 只有这些来源的端点由用户配置；固定 Provider 的地址由后端拥有。 */
+export function sourceUsesConfiguredEndpoint(sourceId: string): boolean {
+  return sourceId === "cms10" || sourceId === "m3u" || sourceId.startsWith("custom_")
 }
 
 export function sourceMatchesCategory(
