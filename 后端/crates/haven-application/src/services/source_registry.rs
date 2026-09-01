@@ -207,47 +207,6 @@ pub struct SourceRegistryService {
     settings: Arc<dyn SourceRegistryPorts>,
 }
 
-/// CMS10 预设采集接口（开箱即用）。顺序即前端展示顺序；首项为出厂默认端点。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Cms10Preset {
-    pub id: &'static str,
-    pub label: &'static str,
-    pub endpoint: &'static str,
-}
-
-pub fn cms10_presets() -> Vec<Cms10Preset> {
-    vec![
-        Cms10Preset {
-            id: "bfzy",
-            label: "暴风资源",
-            endpoint: "https://bfzyapi.com/api.php/provide/vod",
-        },
-        Cms10Preset {
-            id: "wujin",
-            label: "无尽资源",
-            endpoint: "https://api.wujinapi.me/api.php/provide/vod",
-        },
-        Cms10Preset {
-            id: "suoni",
-            label: "索尼资源",
-            endpoint: "https://suonizy.net/api.php/provide/vod",
-        },
-        Cms10Preset {
-            id: "guangsu",
-            label: "光速资源",
-            endpoint: "https://api.guangsuapi.com/api.php/provide/vod",
-        },
-    ]
-}
-
-pub fn default_cms10_endpoint() -> &'static str {
-    cms10_presets()
-        .first()
-        .map(|p| p.endpoint)
-        .unwrap_or("https://bfzyapi.com/api.php/provide/vod")
-}
-
 /// OPDS 书源出厂预设端点（开箱即用；用户可在设置中覆盖）。
 /// 仅保留无需额外账户且已验证可搜索的公开目录；Internet Archive 与
 /// Open Library 的旧 OPDS/JSON 端点在当前网络经常 TLS 失败；不再把
@@ -272,9 +231,9 @@ impl SourceRegistryService {
     }
 
     /// `source_registry_list`：JSON 内置目录 + 持久化 enabled/endpoint 叠加。
-    /// 首次调用时播种开箱即用来源；已有设置行中的启用/停用选择永不被覆盖。
+    /// 首次调用时播种已有的内置来源；已有设置行中的启用/停用选择永不被覆盖。
     pub async fn list(&self) -> Result<SourceRegistryDto, AppError> {
-        self.ensure_default_cms10_endpoint().await?;
+        self.ensure_default_sources().await?;
         let catalog = builtin_catalog()?;
         let payload = self.payload().await?;
         let enabled = self.enabled_set().await?;
@@ -631,7 +590,7 @@ impl SourceRegistryService {
         Ok(self.payload().await?.endpoints)
     }
 
-    async fn ensure_default_cms10_endpoint(&self) -> Result<(), AppError> {
+    async fn ensure_default_sources(&self) -> Result<(), AppError> {
         // 只有 Sources 设置行不存在时才播种默认启用来源。这样用户在设置页
         // 明确停用来源后，后续 list()/重启不会再次把它自动打开。
         let first_install =
@@ -640,26 +599,11 @@ impl SourceRegistryService {
                 .is_none();
         let mut payload = self.payload().await?;
         let mut changed = false;
-        if !payload.endpoints.contains_key("cms10") {
-            payload
-                .endpoints
-                .insert("cms10".to_owned(), default_cms10_endpoint().to_owned());
-            changed = true;
-        }
-        // OPDS 书源出厂播种端点；是否默认启用仅由首次安装分支决定。
-        // 防御：设置页曾对 download 源复用 Cms10EndpointRow，可能把 CMS 预设 URL
-        // 误写入 OPDS 源；已知 CMS 预设地址一律纠正回出厂 OPDS 端点。
-        let cms_presets = cms10_presets();
-        let cms_urls: HashSet<&str> = cms_presets.iter().map(|p| p.endpoint).collect();
+        // 仅为仍然需要出厂端点的内置 OPDS 目录播种地址。CMS10 必须由用户
+        // 明确填写端点，避免仓库默认指向具体的第三方采集站。
         for (source_id, factory) in default_opds_endpoints() {
             match payload.endpoints.get(source_id).map(String::as_str) {
                 None => {
-                    payload
-                        .endpoints
-                        .insert(source_id.to_owned(), factory.to_owned());
-                    changed = true;
-                }
-                Some(url) if cms_urls.contains(url) => {
                     payload
                         .endpoints
                         .insert(source_id.to_owned(), factory.to_owned());
@@ -669,11 +613,12 @@ impl SourceRegistryService {
             }
         }
         if first_install {
-            // 首次安装零配置即可搜索并导入：影视、图书、漫画以及报刊文章各
-            // 提供至少一个固定的真实入口。之后的显式停用选择由已存在的
-            // settings 行保留，不会被再次自动打开。
-            for source_id in std::iter::once("cms10")
-                .chain(default_opds_endpoints().into_iter().map(|(id, _)| id))
+            // 首次安装继续启用已有的固定来源；CMS10 需要用户先配置端点，
+            // 因此不加入默认启用集合。之后的显式停用选择由已存在的 settings
+            // 行保留，不会被再次自动打开。
+            for source_id in default_opds_endpoints()
+                .into_iter()
+                .map(|(id, _)| id)
                 .chain(["mangadex", "arxiv", "europepmc", "wikisource"])
             {
                 if !payload.enabled_sources.iter().any(|id| id == source_id) {
@@ -956,15 +901,15 @@ mod tests {
         let registry = service.list().await.unwrap();
         assert_eq!(registry.schema_version, 2);
         assert!(registry.sources.len() >= 8, "内置目录必须完整");
-        // 首次安装出厂默认：四类内容各有固定来源可直接搜索；CMS10 与 OPDS
-        // 还会预填端点，在线漫画/文章来源由后端固定地址拥有。
+        // 首次安装出厂默认：固定来源继续启用，CMS10 必须由用户配置端点后
+        // 再主动启用；它不应被仓库指向任何具体采集站。
         let cms10 = registry
             .sources
             .iter()
             .find(|s| s.source_id == "cms10")
             .unwrap();
-        assert!(cms10.enabled, "cms10 出厂应已启用");
-        assert!(cms10.endpoint_configured, "cms10 出厂应已配置默认端点");
+        assert!(!cms10.enabled, "cms10 出厂应停用");
+        assert!(!cms10.endpoint_configured, "cms10 出厂不应配置默认端点");
         assert_eq!(cms10.health, SourceHealthDto::Unknown);
         let gutenberg = registry
             .sources
@@ -992,7 +937,7 @@ mod tests {
                     )
                 })
                 .all(|s| !s.enabled),
-            "除开箱即用来源外其余来源出厂停用"
+            "除固定来源外其余来源出厂停用"
         );
         for source_id in ["mangadex", "arxiv", "europepmc", "wikisource"] {
             let source = registry
@@ -1058,7 +1003,7 @@ mod tests {
             .find(|s| s.source_id == "cms10")
             .unwrap();
         assert!(cms10.enabled);
-        assert!(cms10.endpoint_configured, "cms10 已配置默认端点");
+        assert!(!cms10.endpoint_configured, "仅启用 CMS10 不应自动配置端点");
 
         // 幂等：重复设置同值不报错且结果同值。
         let repeat = second
@@ -1072,6 +1017,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cms10_endpoint_is_user_configured_and_persists_across_instances() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repos = Arc::new(SqliteRepositories::new(db));
+        let first = SourceRegistryService::new(repos.clone());
+
+        assert!(
+            first
+                .set_endpoint("cms10", "https://example.invalid/api.php/provide/vod")
+                .await
+                .unwrap()
+        );
+        first
+            .set(SourceRegistrySetRequest {
+                source_id: "cms10".into(),
+                enabled: true,
+            })
+            .await
+            .unwrap();
+
+        let second = SourceRegistryService::new(repos);
+        let registry = second.list().await.unwrap();
+        let cms10 = registry
+            .sources
+            .iter()
+            .find(|source| source.source_id == "cms10")
+            .unwrap();
+        assert!(cms10.enabled);
+        assert!(cms10.endpoint_configured);
+        assert_eq!(
+            second.endpoint("cms10").await.unwrap().as_deref(),
+            Some("https://example.invalid/api.php/provide/vod")
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_source_returns_invalid_argument() {
         let service = service_from_memory();
         let err = service
@@ -1082,21 +1062,6 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
-    }
-
-    #[tokio::test]
-    async fn heals_cms_preset_url_written_onto_opds_source() {
-        let service = service_from_memory();
-        service
-            .set_endpoint(
-                "opds_gutenberg",
-                "https://api.guangsuapi.com/api.php/provide/vod",
-            )
-            .await
-            .unwrap();
-        let _ = service.list().await.unwrap();
-        let endpoint = service.endpoint("opds_gutenberg").await.unwrap().unwrap();
-        assert_eq!(endpoint, "https://m.gutenberg.org/ebooks.opds/");
     }
 
     // ---- 自定义源（V2-H 收尾批次） ----

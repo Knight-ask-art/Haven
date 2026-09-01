@@ -70,7 +70,10 @@ pub fn run() {
         app.manage(state);
         tauri::async_runtime::spawn(async move {
             // 启动恢复失败不会阻止 UI 打开；任务仍保持可解释状态，可在下载页重试。
-            let _ = download.resume_startable().await;
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                tauri::async_runtime::block_on(download.resume_startable())
+            })
+            .await;
         });
         Ok(())
     })

@@ -148,6 +148,24 @@ pub(crate) fn save_on_conn(conn: &rusqlite::Connection, work: &Work) -> Result<(
     Ok(())
 }
 
+/// 在指定连接上保存来源作品去重引用（普通连接或事务连接复用）。
+pub(crate) fn save_source_ref_on_conn(
+    conn: &rusqlite::Connection,
+    provider: &str,
+    external_id: &str,
+    work_id: WorkId,
+) -> Result<(), AppError> {
+    conn.execute(
+        "INSERT INTO work_source_refs (provider, external_id, work_id) VALUES (?1, ?2, ?3)
+         ON CONFLICT (work_id) DO NOTHING",
+        rusqlite::params![provider, external_id, work_id.to_string()],
+    )
+    .map_err(map_db_error(
+        "保存来源作品引用失败（外部条目可能已绑定其他作品）",
+    ))?;
+    Ok(())
+}
+
 /// 构造 WHERE 子句与参数（category/media_types/query 过滤；参数顺序与 ?N 占位一致）。
 /// category/media_types 匹配 media_items（category 列由 media_type 推导，同一事实源）。
 /// 序列化失败显式传播（原 unwrap_or_default 会按空串过滤 → 必然空结果）。
@@ -449,15 +467,7 @@ impl WorkRepository for SqliteWorkRepository {
         work_id: WorkId,
     ) -> Result<(), AppError> {
         let conn = self.db.lock();
-        conn.execute(
-            "INSERT INTO work_source_refs (provider, external_id, work_id) VALUES (?1, ?2, ?3)
-             ON CONFLICT (work_id) DO NOTHING",
-            rusqlite::params![provider, external_id, work_id.to_string()],
-        )
-        .map_err(map_db_error(
-            "保存来源作品引用失败（外部条目可能已绑定其他作品）",
-        ))?;
-        Ok(())
+        save_source_ref_on_conn(&conn, provider, external_id, work_id)
     }
 }
 

@@ -65,8 +65,10 @@ pnpm-debug.log*
 # Local planning material (kept on developer machines, never committed)
 plan/
 
-# Project tracking, ADRs and acceptance evidence are maintained locally.
-/docs/
+# Project tracking, ADRs and acceptance evidence are maintained locally. The
+# user-facing CMS10 setup reference is the one public exception.
+/docs/*
+!/docs/CMS10_USER_CONFIG.md
 
 # Haven v0.1.0 is a Windows desktop release; mobile icon bundles are not
 # generated or distributed with the public source snapshot.
