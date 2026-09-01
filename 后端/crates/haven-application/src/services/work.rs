@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use haven_common::AppError;
 use haven_domain::contracts::WorkRepository;
-use haven_domain::entities::FavoriteTarget;
+use haven_domain::entities::{FavoriteTarget, Resource, ResourceLocator};
+use haven_domain::enums::Availability;
 use haven_domain::ids::WorkId;
 
 use crate::mapper::work_card::{WorkCardInput, work_card};
@@ -45,23 +46,9 @@ impl WorkService {
             let resources = self.ports.list_by_media_item(item.id).await?;
             available_resources += resources
                 .iter()
-                .filter(|r| {
-                    matches!(
-                        r.availability,
-                        haven_domain::enums::Availability::Available
-                            | haven_domain::enums::Availability::OfflineAvailable
-                    )
-                })
+                .filter(|resource| resource_is_actionable(resource))
                 .count() as u32;
-            if selected.is_none()
-                && resources.iter().any(|r| {
-                    matches!(
-                        r.availability,
-                        haven_domain::enums::Availability::Available
-                            | haven_domain::enums::Availability::OfflineAvailable
-                    )
-                })
-            {
+            if selected.is_none() && resources.iter().any(resource_is_actionable) {
                 selected = Some(item);
             }
             markers += self.ports.list_for_media_item(item.id).await?.len() as u32;
@@ -173,11 +160,15 @@ impl WorkService {
                     match resource.availability {
                         haven_domain::enums::Availability::Available => {
                             available += 1;
-                            action_item.get_or_insert(item);
+                            if resource_is_actionable(&resource) {
+                                action_item.get_or_insert(item);
+                            }
                         }
                         haven_domain::enums::Availability::OfflineAvailable => {
                             offline_available += 1;
-                            action_item.get_or_insert(item);
+                            if resource_is_actionable(&resource) {
+                                action_item.get_or_insert(item);
+                            }
                         }
                         _ => unavailable += 1,
                     }
@@ -254,13 +245,7 @@ impl WorkService {
             let resources = self.ports.list_by_media_item(item.id).await?;
             let available_resource_count = resources
                 .iter()
-                .filter(|resource| {
-                    matches!(
-                        resource.availability,
-                        haven_domain::enums::Availability::Available
-                            | haven_domain::enums::Availability::OfflineAvailable
-                    )
-                })
+                .filter(|resource| resource_is_actionable(resource))
                 .count() as u32;
             let progress_domain = self.ports.get_for_media_item(item.id).await?;
             let primary_action = if available_resource_count > 0 {
@@ -402,6 +387,42 @@ impl WorkService {
         let _ = WorkRepository::delete(&*self.ports, loser).await?;
         Ok(())
     }
+}
+
+/// Decide whether a persisted Resource may identify a detail-page action.
+///
+/// Existing library rows are intentionally read-only during an upgrade.  We
+/// therefore do not rewrite or delete malformed rows here; we simply prevent a
+/// stale/unknown remote identity from being selected as the work's primary
+/// action.  Valid local, storage-backed and HTTP resources keep their existing
+/// behavior, while `SourceObject` rows must pass the same fixed-provider
+/// validation used by Session/Resource services.
+fn resource_is_actionable(resource: &Resource) -> bool {
+    if !matches!(
+        resource.availability,
+        Availability::Available | Availability::OfflineAvailable
+    ) {
+        return false;
+    }
+
+    let ResourceLocator::SourceObject {
+        source_id,
+        remote_id,
+    } = &resource.locator
+    else {
+        return true;
+    };
+
+    let Some(source_key) = crate::services::source_import::source_key_for_id(*source_id) else {
+        return false;
+    };
+    resource.source_id == Some(*source_id)
+        && crate::services::source_import::validate_remote_source_object(
+            source_key,
+            resource.resource_type,
+            remote_id,
+        )
+        .is_ok()
 }
 
 /// 季号投影（契约 §36.6）：仅 Episode 索引携带 season 时非 null。
@@ -555,6 +576,7 @@ mod tests {
         Availability, AvailabilitySource, CompletionState, MediaItemStatus, MediaType,
         ResourceType, WorkStatus, WorkType,
     };
+    use haven_domain::ids::{EditionId, MediaItemId};
     use haven_domain::locator::{Locator, VideoLocator};
     use haven_infrastructure::Db;
     use haven_infrastructure::db::repos::SqliteRepositories;
@@ -1057,6 +1079,239 @@ mod tests {
         assert_eq!(
             decode_edition_cursor(&encode_edition_cursor(&key)).unwrap(),
             key
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_remote_mangadex_work_keeps_action_and_is_read_only() {
+        let db = std::sync::Arc::new(Db::open_in_memory().unwrap());
+        let repos = std::sync::Arc::new(SqliteRepositories::new(db));
+        let now = haven_common::UtcMillis(1);
+        let work = Work {
+            id: WorkId::new(),
+            canonical_title: "火影忍者".into(),
+            original_title: None,
+            sort_title: None,
+            description: Some("已有媒体库项目".into()),
+            work_type: WorkType::Standalone,
+            release_year: Some(2002),
+            language: Some("ja".into()),
+            director: None,
+            actor: None,
+            status: WorkStatus::Completed,
+            rating_value: None,
+            rating_scale: None,
+            artwork: Default::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        let edition = Edition {
+            id: EditionId::new(),
+            work_id: work.id,
+            title: "火影忍者 · MangaDex".into(),
+            subtitle: None,
+            edition_type: MediaType::Comic,
+            release_date: None,
+            language: Some("ja".into()),
+            region: None,
+            publisher_or_studio: None,
+            description: None,
+            artwork: Default::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        let item = MediaItem {
+            id: MediaItemId::new(),
+            edition_id: edition.id,
+            parent_id: None,
+            media_type: MediaType::Comic,
+            title: "第 1 章".into(),
+            index: MediaIndex::Chapter {
+                volume: None,
+                chapter: 1.0,
+            },
+            duration_ms: None,
+            page_count: None,
+            chapter_count: None,
+            published_at: None,
+            status: MediaItemStatus::Available,
+            created_at: now,
+            updated_at: now,
+        };
+        repos.work.save(&work).await.unwrap();
+        repos.edition.save(&edition).await.unwrap();
+        repos.media_item.save(&item).await.unwrap();
+
+        let source_id = crate::services::source_import::stable_source_id("mangadex").unwrap();
+        let resource = Resource {
+            id: haven_domain::ids::ResourceId::new(),
+            media_item_id: item.id,
+            resource_type: ResourceType::ComicArchive,
+            source_id: Some(source_id),
+            storage_location_id: None,
+            locator: ResourceLocator::SourceObject {
+                source_id,
+                remote_id:
+                    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                        .into(),
+            },
+            mime_type: Some("application/vnd.comicbook+zip".into()),
+            size: None,
+            hash: None,
+            availability: Availability::Available,
+            availability_source: AvailabilitySource::User,
+            modified_ms: None,
+            fingerprint_first: None,
+            fingerprint_last: None,
+            created_at: now,
+            updated_at: now,
+        };
+        repos.resource.save(&resource).await.unwrap();
+        let before = repos.resource.list_by_media_item(item.id).await.unwrap();
+
+        let header = WorkService::new(repos.clone()).get(work.id).await.unwrap();
+        let action = header.primary_action.expect("已有远端漫画仍应有主操作");
+        assert_eq!(action.kind, crate::wire::PrimaryActionKind::Comic);
+        let item_id = item.id.to_string();
+        assert_eq!(action.media_item_id.as_deref(), Some(item_id.as_str()));
+        assert_eq!(header.counts.available_resources, 1);
+
+        let detail = WorkService::new(repos.clone())
+            .get_edition(crate::wire::EditionGetRequest {
+                edition_id: edition.id.to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(detail.items[0].primary_action.is_some());
+
+        let after = repos.resource.list_by_media_item(item.id).await.unwrap();
+        assert_eq!(before, after, "读取已有项目不得改写或删除资源");
+    }
+
+    #[tokio::test]
+    async fn invalid_existing_remote_row_does_not_hide_valid_media_item() {
+        let db = std::sync::Arc::new(Db::open_in_memory().unwrap());
+        let repos = std::sync::Arc::new(SqliteRepositories::new(db));
+        let now = haven_common::UtcMillis(1);
+        let work = sample_work(WorkId::new());
+        let edition = Edition {
+            id: haven_domain::ids::EditionId::new(),
+            work_id: work.id,
+            title: "漫画版本".into(),
+            subtitle: None,
+            edition_type: MediaType::Comic,
+            release_date: None,
+            language: None,
+            region: None,
+            publisher_or_studio: None,
+            description: None,
+            artwork: Default::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        let stale = MediaItem {
+            id: MediaItemId::new(),
+            edition_id: edition.id,
+            parent_id: None,
+            media_type: MediaType::Comic,
+            title: "损坏的旧远端条目".into(),
+            index: MediaIndex::Chapter {
+                volume: None,
+                chapter: 1.0,
+            },
+            duration_ms: None,
+            page_count: None,
+            chapter_count: None,
+            published_at: None,
+            status: MediaItemStatus::Available,
+            created_at: haven_common::UtcMillis(1),
+            updated_at: haven_common::UtcMillis(1),
+        };
+        let valid = MediaItem {
+            id: MediaItemId::new(),
+            edition_id: edition.id,
+            parent_id: None,
+            media_type: MediaType::Comic,
+            title: "可用的远端条目".into(),
+            index: MediaIndex::Chapter {
+                volume: None,
+                chapter: 2.0,
+            },
+            duration_ms: None,
+            page_count: None,
+            chapter_count: None,
+            published_at: None,
+            status: MediaItemStatus::Available,
+            created_at: haven_common::UtcMillis(2),
+            updated_at: haven_common::UtcMillis(2),
+        };
+        repos.work.save(&work).await.unwrap();
+        repos.edition.save(&edition).await.unwrap();
+        repos.media_item.save(&stale).await.unwrap();
+        repos.media_item.save(&valid).await.unwrap();
+
+        let stale_source_id = haven_domain::ids::SourceId::new();
+        repos
+            .resource
+            .save(&Resource {
+                id: haven_domain::ids::ResourceId::new(),
+                media_item_id: stale.id,
+                resource_type: ResourceType::ComicArchive,
+                source_id: Some(stale_source_id),
+                storage_location_id: None,
+                locator: ResourceLocator::SourceObject {
+                    source_id: stale_source_id,
+                    remote_id: "not-a-valid-remote-id".into(),
+                },
+                mime_type: Some("application/vnd.comicbook+zip".into()),
+                size: None,
+                hash: None,
+                availability: Availability::Available,
+                availability_source: AvailabilitySource::User,
+                modified_ms: None,
+                fingerprint_first: None,
+                fingerprint_last: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        let source_id = crate::services::source_import::stable_source_id("mangadex").unwrap();
+        repos
+            .resource
+            .save(&Resource {
+                id: haven_domain::ids::ResourceId::new(),
+                media_item_id: valid.id,
+                resource_type: ResourceType::ComicArchive,
+                source_id: Some(source_id),
+                storage_location_id: None,
+                locator: ResourceLocator::SourceObject {
+                    source_id,
+                    remote_id:
+                        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                            .into(),
+                },
+                mime_type: Some("application/vnd.comicbook+zip".into()),
+                size: None,
+                hash: None,
+                availability: Availability::Available,
+                availability_source: AvailabilitySource::User,
+                modified_ms: None,
+                fingerprint_first: None,
+                fingerprint_last: None,
+                created_at: haven_common::UtcMillis(2),
+                updated_at: haven_common::UtcMillis(2),
+            })
+            .await
+            .unwrap();
+
+        let header = WorkService::new(repos).get(work.id).await.unwrap();
+        assert_eq!(header.counts.available_resources, 1);
+        assert_eq!(
+            header
+                .primary_action
+                .and_then(|action| action.media_item_id),
+            Some(valid.id.to_string())
         );
     }
 }

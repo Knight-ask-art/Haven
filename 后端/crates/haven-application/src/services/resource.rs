@@ -374,6 +374,123 @@ mod tests {
         assert!(!json.contains("movie.mkv"));
     }
 
+    #[tokio::test]
+    async fn remote_mangadex_resource_projects_download_and_online_capabilities() {
+        let db = std::sync::Arc::new(Db::open_in_memory().unwrap());
+        let repos = std::sync::Arc::new(SqliteRepositories::new(db));
+        let now = haven_common::UtcMillis(1);
+        let work_id = WorkId::new();
+        let edition_id = EditionId::new();
+        let media_item_id = MediaItemId::new();
+        repos
+            .work
+            .save(&Work {
+                id: work_id,
+                canonical_title: "火影忍者".into(),
+                original_title: None,
+                sort_title: None,
+                description: None,
+                work_type: WorkType::Standalone,
+                release_year: None,
+                language: None,
+                director: None,
+                actor: None,
+                status: WorkStatus::Completed,
+                rating_value: None,
+                rating_scale: None,
+                artwork: Default::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        repos
+            .edition
+            .save(&Edition {
+                id: edition_id,
+                work_id,
+                title: "火影忍者".into(),
+                subtitle: None,
+                edition_type: MediaType::Comic,
+                release_date: None,
+                language: Some("zh".into()),
+                region: None,
+                publisher_or_studio: None,
+                description: None,
+                artwork: Default::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        repos
+            .media_item
+            .save(&MediaItem {
+                id: media_item_id,
+                edition_id,
+                parent_id: None,
+                media_type: MediaType::Comic,
+                title: "第 1 章".into(),
+                index: MediaIndex::Chapter {
+                    volume: None,
+                    chapter: 1.0,
+                },
+                duration_ms: None,
+                page_count: None,
+                chapter_count: None,
+                published_at: None,
+                status: MediaItemStatus::Available,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+
+        let source_id = crate::services::source_import::stable_source_id("mangadex").unwrap();
+        repos
+            .resource
+            .save(&Resource {
+                id: haven_domain::ids::ResourceId::new(),
+                media_item_id,
+                resource_type: ResourceType::ComicArchive,
+                source_id: Some(source_id),
+                storage_location_id: None,
+                locator: ResourceLocator::SourceObject {
+                    source_id,
+                    remote_id:
+                        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                            .into(),
+                },
+                mime_type: Some("application/vnd.comicbook+zip".into()),
+                size: None,
+                hash: None,
+                availability: Availability::Available,
+                availability_source: AvailabilitySource::User,
+                modified_ms: None,
+                fingerprint_first: None,
+                fingerprint_last: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+
+        let result = ResourceService::new(repos)
+            .list_by_media_item(ResourceListByMediaItemRequest {
+                media_item_id: media_item_id.to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        let summary = &result.items[0];
+        assert!(!summary.is_local);
+        assert!(summary.can_download, "远端 MangaDex 资源必须可下载");
+        assert!(summary.can_online_read, "远端 MangaDex 资源必须可在线阅读");
+        let json = serde_json::to_string(summary).unwrap();
+        assert!(!json.contains("mangadex"));
+        assert!(!json.contains("aaaaaaaa"));
+    }
+
     #[test]
     fn local_online_read_requires_a_usable_registered_storage() {
         let storage_id = haven_domain::ids::StorageLocationId::new();
