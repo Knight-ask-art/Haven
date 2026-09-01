@@ -26,8 +26,8 @@
 
 ## Overview
 
-<b>Haven (栖阅)<b>
-Haven（栖阅）是一个以 Local-first（本地优先） 为核心理念的桌面阅读与多媒体库管理工具。
+<b>Haven (栖阅)</b>
+Haven（栖阅）是一个以 Local-first（本地优先）为核心理念的桌面阅读与多媒体库管理工具。
 
 项目采用系统级底层与现代前端结合的架构：文件索引、阅读进度、媒体收藏、历史记录、标注及配置全部由本地 Rust + SQLite 驱动，确保极致性能与数据绝对私有；React 仅作为纯粹的交互与展示层。
 
@@ -73,7 +73,7 @@ Rust + SQLite 是持久化事实源。前端的 Mock 只在显式浏览器开发
 
 目前支持的 Windows 本地内容核心有：视频、TXT、Markdown、EPUB、PDF、HTML、CBZ 和图片目录。支持范围、已知限制和升级说明请参阅[公开变更记录](CHANGELOG.md)。
 
-当前明确不提供：外挂字幕、音轨切换、HEVC 控制；OCR/翻译/AI、Sync 和“清除全部本地数据”需要独立 Foundation/风险评审后再开放。自动更新已经接入 Tauri 官方签名更新链。
+当前明确不提供：外挂字幕、音轨切换、HEVC 控制；OCR/翻译/AI、Sync 和“清除全部本地数据”需要独立 Foundation/风险评审后再开放。自动更新在签名 Release 正式发布前保持不可用。
 
 ## Quick start (Windows)
 
