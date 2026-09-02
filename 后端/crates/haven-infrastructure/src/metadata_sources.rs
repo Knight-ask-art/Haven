@@ -887,7 +887,10 @@ impl SearchSourceParticipant for M3uSearchParticipant {
                 let key = format!("{}\u{1}{}", entry.title, entry.url);
                 card(
                     M3U_SOURCE_ID,
-                    &stable_key(&key),
+                    // Keep the title/URL pair inside the opaque candidate
+                    // payload. Hashing it here would make the import side
+                    // unable to recover the validated stream URL.
+                    &key,
                     entry.title,
                     entry.group,
                     None,
@@ -1153,7 +1156,10 @@ fn stable_key(value: &str) -> String {
 }
 
 fn candidate_id(source_id: &str, external_id: &str) -> String {
-    if matches!(source_id, "mangadex" | "arxiv" | "europepmc" | "wikisource") {
+    if matches!(
+        source_id,
+        "mangadex" | "arxiv" | "europepmc" | "wikisource" | M3U_SOURCE_ID
+    ) {
         return format!(
             "{}{}-{}",
             CONTENT_CANDIDATE_PREFIX,
@@ -1311,6 +1317,21 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].title, "News");
         assert_eq!(entries[0].group.as_deref(), Some("Live"));
+    }
+
+    #[test]
+    fn m3u_candidate_id_keeps_encoded_title_and_stream_payload() {
+        let external_id = "新闻\u{1}https://cdn.example/live.m3u8?token=opaque";
+        let candidate = candidate_id(M3U_SOURCE_ID, external_id);
+        assert!(candidate.starts_with("content-candidate-m3u-"));
+        assert!(candidate.contains("%01"), "separator must be encoded");
+        assert!(
+            candidate.contains("%3A%2F%2F"),
+            "URL punctuation must be encoded"
+        );
+        assert!(!candidate.contains("https://"));
+        assert!(!candidate.contains('\u{1}'));
+        assert!(!candidate.contains(' '));
     }
 
     #[test]

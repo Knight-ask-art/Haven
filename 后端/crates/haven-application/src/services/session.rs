@@ -155,7 +155,7 @@ impl SessionService {
                 matches!(
                     resource.availability,
                     Availability::Available | Availability::OfflineAvailable
-                ) && resource_type_compatible(request.engine, resource.resource_type)
+                ) && resource_type_compatible(request.engine, resource)
             })
             .collect();
         candidates.sort_by_key(|resource| {
@@ -308,9 +308,9 @@ impl SessionService {
                 )));
             }
             // A persisted SourceObject is not, by itself, proof that the
-            // requested engine has an online reader.  Keep OPDS/Gutenberg
-            // EPUBs in the explicit "download first" state instead of
-            // issuing a session URI that the provider cannot consume.
+            // requested engine has an online reader.  Keep this allowlist in
+            // lockstep with the provider router so a capability projection
+            // can never issue a session URI that no provider can consume.
             if !remote_session_compatible(
                 resource.resource_type,
                 resource.mime_type.as_deref(),
@@ -333,6 +333,13 @@ impl SessionService {
             } => path_hint.clone().unwrap_or_else(|| object_id.clone()),
             _ => return Ok(CandidateResolution::Skipped),
         };
+        if let ResourceLocator::StorageObject { provider_id, .. } = &resource.locator {
+            if resource.storage_location_id != Some(*provider_id) {
+                return Ok(CandidateResolution::Rejected(security_denied(
+                    "资源存储位置身份校验失败",
+                )));
+            }
+        }
         let Some(storage_location_id) = resource.storage_location_id else {
             return Ok(CandidateResolution::Rejected(resource_unavailable()));
         };
@@ -446,12 +453,137 @@ pub(crate) fn engine_compatible(engine: SessionEngineDto, media_type: MediaType)
     }
 }
 
-fn resource_type_compatible(engine: SessionEngineDto, resource_type: ResourceType) -> bool {
-    engine != SessionEngineDto::Comic
-        || matches!(
-            resource_type,
+/// Check the persisted resource kind *and* its format hint before a session is
+/// handed to an engine.  `ResourceType` is intentionally coarse for local
+/// files (TXT/Markdown/HTML/video are all `LocalFile`), so MIME and the
+/// controlled locator extension are part of the gate as well.  This keeps a
+/// stale or incorrectly classified row from reaching the wrong reader.
+pub(crate) fn resource_type_compatible(engine: SessionEngineDto, resource: &Resource) -> bool {
+    match &resource.locator {
+        // Remote identities are checked again by `remote_session_compatible`
+        // after the fixed source mapping has been resolved.  This first gate
+        // only rejects impossible engine/resource combinations.
+        ResourceLocator::SourceObject { .. } => match engine {
+            SessionEngineDto::Playback => false,
+            SessionEngineDto::Reader => {
+                resource.resource_type == ResourceType::PublicationFile
+                    && is_epub_mime(resource.mime_type.as_deref())
+            }
+            SessionEngineDto::Comic => resource.resource_type == ResourceType::ComicArchive,
+            SessionEngineDto::Article => {
+                (resource.resource_type == ResourceType::ArticleSnapshot
+                    && is_html_mime(resource.mime_type.as_deref()))
+                    || (resource.resource_type == ResourceType::PublicationFile
+                        && is_pdf_mime(resource.mime_type.as_deref()))
+            }
+        },
+        // HTTP locators are consumed by StreamService, not the file/session
+        // protocol.  Returning false here deliberately preserves the
+        // RESOURCE_NOT_FOUND -> stream_open fallback for Playback only.
+        ResourceLocator::Http { .. } => false,
+        ResourceLocator::LocalPath { path } => {
+            local_resource_type_compatible(engine, resource, Some(path.as_str()))
+        }
+        ResourceLocator::StorageObject { path_hint, .. } => {
+            local_resource_type_compatible(engine, resource, path_hint.as_deref())
+        }
+    }
+}
+
+fn local_resource_type_compatible(
+    engine: SessionEngineDto,
+    resource: &Resource,
+    path_hint: Option<&str>,
+) -> bool {
+    match engine {
+        SessionEngineDto::Playback => {
+            matches!(
+                resource.resource_type,
+                ResourceType::LocalFile | ResourceType::CloudFile | ResourceType::HttpFile
+            ) && is_video_or_audio(resource.mime_type.as_deref(), path_hint)
+        }
+        SessionEngineDto::Reader => {
+            (matches!(
+                resource.resource_type,
+                ResourceType::LocalFile | ResourceType::CloudFile
+            ) && is_text_book(resource.mime_type.as_deref(), path_hint))
+                || (resource.resource_type == ResourceType::PublicationFile
+                    && (is_epub_mime(resource.mime_type.as_deref())
+                        || is_pdf_mime(resource.mime_type.as_deref())
+                        || extension_is(path_hint, "epub")
+                        || extension_is(path_hint, "pdf")))
+        }
+        SessionEngineDto::Comic => matches!(
+            resource.resource_type,
             ResourceType::ComicArchive | ResourceType::ImageSequence
-        )
+        ),
+        SessionEngineDto::Article => {
+            (matches!(
+                resource.resource_type,
+                ResourceType::LocalFile | ResourceType::CloudFile
+            ) && is_article_text(resource.mime_type.as_deref(), path_hint))
+                || (resource.resource_type == ResourceType::PublicationFile
+                    && (is_pdf_mime(resource.mime_type.as_deref())
+                        || extension_is(path_hint, "pdf")))
+                || (resource.resource_type == ResourceType::ArticleSnapshot
+                    && is_html_mime(resource.mime_type.as_deref()))
+        }
+    }
+}
+
+fn normalized_mime(mime: Option<&str>) -> Option<&str> {
+    mime.and_then(|value| {
+        let value = value.split(';').next()?.trim();
+        (!value.is_empty()).then_some(value)
+    })
+}
+
+fn is_epub_mime(mime: Option<&str>) -> bool {
+    normalized_mime(mime).is_some_and(|value| value.eq_ignore_ascii_case("application/epub+zip"))
+}
+
+fn is_pdf_mime(mime: Option<&str>) -> bool {
+    normalized_mime(mime).is_some_and(|value| value.eq_ignore_ascii_case("application/pdf"))
+}
+
+fn is_html_mime(mime: Option<&str>) -> bool {
+    normalized_mime(mime).is_some_and(|value| {
+        value.eq_ignore_ascii_case("text/html")
+            || value.eq_ignore_ascii_case("application/xhtml+xml")
+    })
+}
+
+fn is_text_book(mime: Option<&str>, path_hint: Option<&str>) -> bool {
+    normalized_mime(mime).is_some_and(|value| {
+        value.eq_ignore_ascii_case("text/plain") || value.eq_ignore_ascii_case("text/markdown")
+    }) || extension_is(path_hint, "txt")
+        || extension_is(path_hint, "md")
+        || extension_is(path_hint, "markdown")
+}
+
+fn is_article_text(mime: Option<&str>, path_hint: Option<&str>) -> bool {
+    is_text_book(mime, path_hint)
+        || is_html_mime(mime)
+        || extension_is(path_hint, "html")
+        || extension_is(path_hint, "htm")
+}
+
+fn is_video_or_audio(mime: Option<&str>, path_hint: Option<&str>) -> bool {
+    normalized_mime(mime).is_some_and(|value| {
+        value.to_ascii_lowercase().starts_with("video/")
+            || value.to_ascii_lowercase().starts_with("audio/")
+    }) || [
+        "mp4", "m4v", "webm", "mkv", "avi", "mov", "wmv", "flv", "mp3", "m4a", "flac", "wav", "ogg",
+    ]
+    .iter()
+    .any(|extension| extension_is(path_hint, extension))
+}
+
+fn extension_is(path_hint: Option<&str>, expected: &str) -> bool {
+    path_hint
+        .and_then(|value| Path::new(value).extension())
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
 }
 
 fn media_item_not_found() -> AppError {
@@ -512,21 +644,32 @@ fn remote_session_unavailable() -> AppError {
     )
 }
 
-fn remote_session_compatible(
+pub(crate) fn remote_session_compatible(
     resource_type: ResourceType,
     mime_type: Option<&str>,
     source_key: &str,
 ) -> bool {
     match source_key {
-        "mangadex" => resource_type == ResourceType::ComicArchive,
-        "arxiv" => {
-            resource_type == ResourceType::PublicationFile
-                && mime_type.is_some_and(|mime| mime.to_ascii_lowercase().contains("pdf"))
+        "mangadex" => {
+            resource_type == ResourceType::ComicArchive && is_comic_archive_mime(mime_type)
         }
-        "europepmc" | "wikisource" => resource_type == ResourceType::ArticleSnapshot,
-        // Gutenberg/OPDS currently exposes only an offline EPUB path.
+        "arxiv" => resource_type == ResourceType::PublicationFile && is_pdf_mime(mime_type),
+        "europepmc" | "wikisource" => {
+            resource_type == ResourceType::ArticleSnapshot && is_html_mime(mime_type)
+        }
+        "opds_gutenberg" => {
+            resource_type == ResourceType::PublicationFile && is_epub_mime(mime_type)
+        }
         _ => false,
     }
+}
+
+fn is_comic_archive_mime(mime: Option<&str>) -> bool {
+    normalized_mime(mime).is_some_and(|value| {
+        value.eq_ignore_ascii_case("application/vnd.comicbook+zip")
+            || value.eq_ignore_ascii_case("application/zip")
+            || value.eq_ignore_ascii_case("application/x-cbz")
+    })
 }
 
 #[cfg(test)]
@@ -705,6 +848,7 @@ mod tests {
             media_item_id: prepared.media_item_id,
             engine: prepared.engine,
             progress: prepared.progress,
+            stream_kind: None,
         })
         .unwrap();
         assert!(!json.contains("movie.mkv"));
@@ -965,10 +1109,20 @@ mod tests {
             Some("text/html"),
             "wikisource"
         ));
-        assert!(!remote_session_compatible(
+        assert!(remote_session_compatible(
             ResourceType::PublicationFile,
             Some("application/epub+zip"),
             "opds_gutenberg"
+        ));
+        assert!(!remote_session_compatible(
+            ResourceType::PublicationFile,
+            Some("application/pdf"),
+            "opds_gutenberg"
+        ));
+        assert!(!remote_session_compatible(
+            ResourceType::PublicationFile,
+            Some("application/epub+zip"),
+            "unknown"
         ));
         assert!(!remote_session_compatible(
             ResourceType::PublicationFile,
@@ -1105,5 +1259,97 @@ mod tests {
         );
         assert_eq!(edition_not_found().code().as_str(), "EDITION_NOT_FOUND");
         assert_eq!(work_not_found().code().as_str(), "WORK_NOT_FOUND");
+    }
+
+    fn matrix_resource(
+        resource_type: ResourceType,
+        mime_type: Option<&str>,
+        locator: ResourceLocator,
+    ) -> Resource {
+        Resource {
+            id: ResourceId::new(),
+            media_item_id: MediaItemId::new(),
+            resource_type,
+            source_id: None,
+            storage_location_id: None,
+            locator,
+            mime_type: mime_type.map(str::to_owned),
+            size: None,
+            hash: None,
+            availability: Availability::Available,
+            availability_source: AvailabilitySource::User,
+            modified_ms: None,
+            fingerprint_first: None,
+            fingerprint_last: None,
+            created_at: haven_common::UtcMillis(1),
+            updated_at: haven_common::UtcMillis(1),
+        }
+    }
+
+    #[test]
+    fn engine_resource_matrix_rejects_cross_format_sessions() {
+        let video = matrix_resource(
+            ResourceType::LocalFile,
+            Some("video/x-matroska"),
+            ResourceLocator::LocalPath {
+                path: "movie.mkv".into(),
+            },
+        );
+        assert!(resource_type_compatible(SessionEngineDto::Playback, &video));
+        assert!(!resource_type_compatible(SessionEngineDto::Reader, &video));
+        assert!(!resource_type_compatible(SessionEngineDto::Article, &video));
+        assert!(!resource_type_compatible(SessionEngineDto::Comic, &video));
+
+        let epub = matrix_resource(
+            ResourceType::PublicationFile,
+            Some("application/epub+zip; charset=binary"),
+            ResourceLocator::LocalPath {
+                path: "book.epub".into(),
+            },
+        );
+        assert!(resource_type_compatible(SessionEngineDto::Reader, &epub));
+        assert!(!resource_type_compatible(SessionEngineDto::Playback, &epub));
+        assert!(!resource_type_compatible(SessionEngineDto::Comic, &epub));
+
+        let pdf = matrix_resource(
+            ResourceType::PublicationFile,
+            Some("application/pdf"),
+            ResourceLocator::LocalPath {
+                path: "paper.pdf".into(),
+            },
+        );
+        assert!(resource_type_compatible(SessionEngineDto::Reader, &pdf));
+        assert!(resource_type_compatible(SessionEngineDto::Article, &pdf));
+        assert!(!resource_type_compatible(SessionEngineDto::Playback, &pdf));
+
+        let html = matrix_resource(
+            ResourceType::LocalFile,
+            Some("text/html; charset=utf-8"),
+            ResourceLocator::LocalPath {
+                path: "article.html".into(),
+            },
+        );
+        assert!(resource_type_compatible(SessionEngineDto::Article, &html));
+        assert!(!resource_type_compatible(SessionEngineDto::Reader, &html));
+
+        let comic = matrix_resource(
+            ResourceType::ComicArchive,
+            Some("application/vnd.comicbook+zip"),
+            ResourceLocator::LocalPath {
+                path: "chapter.cbz".into(),
+            },
+        );
+        assert!(resource_type_compatible(SessionEngineDto::Comic, &comic));
+        assert!(!resource_type_compatible(SessionEngineDto::Reader, &comic));
+        assert!(!resource_type_compatible(SessionEngineDto::Article, &comic));
+
+        let dash = matrix_resource(
+            ResourceType::DashStream,
+            Some("application/dash+xml"),
+            ResourceLocator::Http {
+                url: "https://stream.example.test/manifest.mpd".into(),
+            },
+        );
+        assert!(!resource_type_compatible(SessionEngineDto::Playback, &dash));
     }
 }
