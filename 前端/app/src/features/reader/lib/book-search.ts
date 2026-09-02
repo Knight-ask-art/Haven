@@ -1,4 +1,4 @@
-import type { TextAnchorDto } from "@/lib/ipc/generated/wire"
+import type { ReaderSearchResultDto, TextAnchorDto } from "@/lib/ipc/generated/wire"
 import type { BookChapter } from "./book-content"
 
 /**
@@ -239,6 +239,23 @@ export interface SearchBookOptions {
   signal?: AbortSignal
 }
 
+export interface BookSearchWithFallbackOptions extends SearchBookOptions {
+  chapters: readonly BookChapter[]
+  index: BookSearchIndex
+  remoteSearch: () => Promise<ReaderSearchResultDto>
+  /** Returns false when the owning UI operation has already been replaced. */
+  isCurrent?: () => boolean
+}
+
+/** An operation may be aborted by the browser or superseded by a new query. */
+export function isBookSearchOperationCurrent(
+  operation: number,
+  currentOperation: number,
+  signal?: AbortSignal,
+): boolean {
+  return operation === currentOperation && !signal?.aborted
+}
+
 function cancelled(): Error {
   return new DOMException("图书搜索已取消", "AbortError")
 }
@@ -337,6 +354,40 @@ export function searchBook(
 
   all.sort((left, right) => right.score - left.score || left.chapterIndex - right.chapterIndex)
   return all.slice(0, MAX_BOOK_SEARCH_HITS)
+}
+
+/**
+ * Search a remote-reader index first and fall back to the already parsed local
+ * chapter model when that optional backend projection is unavailable. `null`
+ * means the result became stale while the remote request was in flight; the
+ * caller must not replace the current query's results in that case.
+ */
+export async function searchBookWithRemoteFallback(
+  options: BookSearchWithFallbackOptions,
+): Promise<BookSearchHit[] | null> {
+  const isCurrent = options.isCurrent ?? (() => true)
+  try {
+    const result = await options.remoteSearch()
+    if (options.signal?.aborted || !isCurrent()) return null
+    return result.hits.map((hit) => ({
+      chapterId: hit.chapterId,
+      chapterTitle: hit.chapterTitle,
+      chapterIndex: hit.chapterIndex,
+      paragraphIndex: hit.paragraphIndex,
+      progressionInChapter: hit.progressionInChapter,
+      exact: hit.textAnchor.exact ?? options.query,
+      prefix: hit.textAnchor.prefix ?? null,
+      suffix: hit.textAnchor.suffix ?? null,
+      score: hit.score,
+    }))
+  } catch (error) {
+    // A cancelled/stale operation must not spend work computing a fallback or
+    // overwrite a newer query. Other remote failures intentionally degrade to
+    // the same parsed chapters used by the browser reader.
+    if (options.signal?.aborted || !isCurrent()) return null
+    if (error instanceof DOMException && error.name === "AbortError") throw error
+    return searchBook(options.chapters, options.index, options)
+  }
 }
 
 /** 命中直接转为 TextAnchor（exact 12..240 原文；prefix/suffix 各 30 字符）。 */

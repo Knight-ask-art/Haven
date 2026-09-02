@@ -30,6 +30,7 @@ pub async fn run_session_open(
         media_item_id: prepared.media_item_id.clone(),
         engine: prepared.engine,
         progress: prepared.progress.clone(),
+        stream_kind: None,
     };
     let media_item_id_for_history = prepared.media_item_id.clone();
     let session_id = state
