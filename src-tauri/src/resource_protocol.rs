@@ -36,6 +36,8 @@ pub(crate) const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_STREAM_BYTES: u64 = 256 * 1024 * 1024;
 /// HLS manifest 文本上限。
 const MAX_MANIFEST_BYTES: usize = 2 * 1024 * 1024;
+/// Do not follow an unbounded redirect chain while proxying a stream.
+const MAX_STREAM_REDIRECTS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ByteRange {
@@ -714,22 +716,6 @@ pub(crate) fn register_resource_protocol<R: tauri::Runtime>(
                                 origin.as_deref(),
                             )) {
                                 Ok(resp) => resp,
-                                Err(err) if err.code().as_str() == "RESOURCE_UNAVAILABLE" => {
-                                    // 过期自愈（③）：410 触发后台静默刷新（1s/2s/4s 退避由前端 HLS 重试驱动）
-                                    let work_id = inner.facts.work_id.clone();
-                                    let state_clone = state.inner().clone();
-                                    tauri::async_runtime::spawn(async move {
-                                        // 最小闭环：按 work_source_refs 重拉 CMS 新鲜 play_url 并原子更新 resources
-                                        // 为控 bug 风险，本次仅记录刷新意图，下次 HLS 重试将命中新 locator
-                                        eprintln!(
-                                            "stream 410 for work {}, scheduling refresh",
-                                            work_id
-                                        );
-                                        // 实际刷新由 SourceImportService::refresh_by_work 实现（下次迭代落地）
-                                        let _ = state_clone;
-                                    });
-                                    return Err(err);
-                                }
                                 Err(err) => return Err(err),
                             };
                             Ok(response)
@@ -851,7 +837,14 @@ fn parse_stream_request(uri: &Uri) -> Result<(Uuid, String), ResourceUriError> {
     if key != "u" || pairs.next().is_some() || value.is_empty() {
         return Err(ResourceUriError::InvalidPath);
     }
-    if value.contains("%00") {
+    // Manifest rewrites carry only UUID tokens. Reject percent-encoded values
+    // (in particular a URL) and require the canonical UUID representation.
+    if value.contains('%')
+        || Uuid::parse_str(value).is_err()
+        || Uuid::parse_str(value)
+            .ok()
+            .is_some_and(|id| id.to_string() != value)
+    {
         return Err(ResourceUriError::InvalidPath);
     }
     let id = parse_stream_grant_path_without_query(uri)?;
@@ -1137,6 +1130,9 @@ fn stream_http_client() -> &'static reqwest::Client {
         reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
+            // Redirects are followed explicitly in `fetch_stream_response`
+            // after checking the grant's host allowlist at every hop.
+            .redirect(reqwest::redirect::Policy::none())
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .pool_max_idle_per_host(8)
             .tcp_keepalive(std::time::Duration::from_secs(30))
@@ -1146,7 +1142,8 @@ fn stream_http_client() -> &'static reqwest::Client {
     })
 }
 
-/// 解码 `u` 查询参数（%XX；其余字节原样保留）。
+/// 解码测试中的百分号编码（生产 manifest 只使用不编码的 UUID token）。
+#[cfg(test)]
 fn percent_decode(value: &str) -> Result<String, AppError> {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -1183,26 +1180,34 @@ fn percent_encode(value: &str) -> String {
     out
 }
 
-/// 相对地址 → 绝对地址（仅 scheme/host/path/query 组合，足够 HLS 场景）。
+/// 相对地址 → 绝对地址。只允许 HTTP(S)，并使用 URL 解析器处理
+/// `../`、查询和 IPv6 authority，避免手工拼接产生跨主机或路径歧义。
 fn absolutize(base_url: &str, target: &str) -> Option<String> {
-    if target.starts_with("http://") || target.starts_with("https://") {
-        return Some(target.to_owned());
+    let base = reqwest::Url::parse(base_url).ok()?;
+    if !matches!(base.scheme(), "http" | "https")
+        || !base.username().is_empty()
+        || base.password().is_some()
+    {
+        return None;
     }
-    let (scheme, rest) = base_url.split_once("://")?;
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    if let Some(path) = target.strip_prefix('/') {
-        return Some(format!("{scheme}://{authority}/{path}"));
+    let joined = base.join(target).ok()?;
+    if !matches!(joined.scheme(), "http" | "https")
+        || !joined.username().is_empty()
+        || joined.password().is_some()
+    {
+        return None;
     }
-    // 相对路径：基于 base 的目录部分（dir 已含 host）。
-    let dir_end = rest.rfind('/').unwrap_or(rest.len());
-    let dir = &rest[..dir_end];
-    Some(format!("{scheme}://{dir}/{target}"))
+    Some(joined.to_string())
 }
 
 /// 改写 HLS manifest：所有片段/子清单 URI 与 URI="..." 属性都收敛到本会话代理。
 /// 返回改写后的文本与需要学习的主机列表。
-fn rewrite_hls_manifest(body: &str, manifest_base: &str, grant_id: &str) -> (String, Vec<String>) {
+fn rewrite_hls_manifest(
+    body: &str,
+    manifest_base: &str,
+    grant_id: &str,
+    register_target: &mut dyn FnMut(&str) -> String,
+) -> (String, Vec<String>) {
     let mut hosts: Vec<String> = Vec::new();
     let mut proxy_for = |raw: &str| -> Option<String> {
         let raw = raw.trim();
@@ -1214,9 +1219,10 @@ fn rewrite_hls_manifest(body: &str, manifest_base: &str, grant_id: &str) -> (Str
         if !hosts.contains(&host) {
             hosts.push(host);
         }
+        let token = register_target(&absolute);
         Some(format!(
             "http://haven-resource.stream/{grant_id}?u={}",
-            percent_encode(&absolute)
+            percent_encode(&token)
         ))
     };
     let mut rewritten = String::with_capacity(body.len());
@@ -1224,38 +1230,17 @@ fn rewrite_hls_manifest(body: &str, manifest_base: &str, grant_id: &str) -> (Str
         let trimmed_end = line.trim_end_matches(['\n', '\r']);
         if trimmed_end.starts_with('#') {
             // 标签行：仅改写其中 URI="..." 属性（EXT-X-MAP / EXT-X-KEY 等）。
-            if let Some(key) = trimmed_end.split(',').find_map(|part| {
-                part.trim_start().strip_prefix("URI=\"").map(|inner| {
-                    (
-                        part.trim_start().len(),
-                        inner.strip_suffix('"').unwrap_or(inner),
-                    )
-                })
-            }) {
-                let _ = key;
+            // 任一属性缺少结束引号或无法通过受控 URL 校验时丢弃整行，绝不能
+            // 把原始第三方 URI 留给 WebView。
+            if let Some(line_out) = rewrite_hls_uri_attributes(trimmed_end, &mut proxy_for) {
+                rewritten.push_str(&line_out);
             }
-            // 简化实现：正则不可用时逐段扫描 URI="..."。
-            let mut line_out = String::from(trimmed_end);
-            let mut search_from = 0;
-            while let Some(attr_pos) = line_out[search_from..].find("URI=\"") {
-                let start = search_from + attr_pos + 5;
-                if let Some(end_rel) = line_out[start..].find('"') {
-                    let end = start + end_rel;
-                    let raw_uri = line_out[start..end].to_owned();
-                    if let Some(proxied) = proxy_for(&raw_uri) {
-                        line_out.replace_range(start..end, &proxied);
-                        search_from = start + proxied.len();
-                        continue;
-                    }
-                }
-                break;
-            }
-            rewritten.push_str(&line_out);
         } else if !trimmed_end.trim().is_empty() {
-            match proxy_for(trimmed_end.trim()) {
-                Some(proxied) => rewritten.push_str(&proxied),
-                None => rewritten.push_str(trimmed_end),
+            if let Some(proxied) = proxy_for(trimmed_end.trim()) {
+                rewritten.push_str(&proxied);
             }
+            // An unsupported/data URI cannot be safely proxied. Drop the
+            // segment line instead of leaking it to the WebView.
         } else {
             rewritten.push('\n');
         }
@@ -1264,6 +1249,26 @@ fn rewrite_hls_manifest(body: &str, manifest_base: &str, grant_id: &str) -> (Str
         }
     }
     (rewritten, hosts)
+}
+
+fn rewrite_hls_uri_attributes(
+    line: &str,
+    proxy_for: &mut dyn FnMut(&str) -> Option<String>,
+) -> Option<String> {
+    let mut output = String::with_capacity(line.len());
+    let mut cursor = 0usize;
+    while let Some(relative) = line[cursor..].find("URI=\"") {
+        let attribute_start = cursor + relative;
+        let value_start = attribute_start + "URI=\"".len();
+        let value_end = value_start + line[value_start..].find('"')?;
+        let raw_uri = &line[value_start..value_end];
+        let proxied = proxy_for(raw_uri)?;
+        output.push_str(&line[cursor..value_start]);
+        output.push_str(&proxied);
+        cursor = value_end;
+    }
+    output.push_str(&line[cursor..]);
+    Some(output)
 }
 
 /// 服务远端流请求。`target` 为空表示拉取 grant 初始上游（manifest 或直连媒体）。
@@ -1277,36 +1282,17 @@ async fn serve_stream(
     let upstream = if target_encoded.is_empty() {
         inner.facts.upstream_url.clone()
     } else {
-        percent_decode(target_encoded)?
+        inner
+            .resolve_target(target_encoded)
+            .ok_or_else(|| policy_denied("流目标令牌已失效"))?
     };
-    let Some(host) = crate::stream_registry::host_of(&upstream) else {
-        return Err(policy_denied("流目标必须是 http/https 地址"));
-    };
-    if !inner.host_allowed(&host) {
-        // 未学习的主机一律拒绝（防代理被用作任意出站通道）。
-        return Err(policy_denied("流目标主机未被授权"));
+    // Reject malformed/multi-range requests before contacting the upstream.
+    // A remote stream response is never allowed to silently turn an invalid
+    // browser range into a full-object fetch.
+    if range_header.is_some() && parse_remote_byte_range(range_header).is_err() {
+        return Err(invalid_remote_range());
     }
-
-    let mut request = stream_http_client().get(&upstream);
-    if let Some(range) = range_header {
-        request = request.header("range", range);
-    }
-    let response = request.send().await.map_err(|err| {
-        let message = if err.is_timeout() {
-            "流源请求超时"
-        } else {
-            "流源连接失败"
-        };
-        AppError::new("RESOURCE_UNAVAILABLE", ErrorKind::Network, message, true)
-    })?;
-    if !response.status().is_success() {
-        return Err(AppError::new(
-            "RESOURCE_UNAVAILABLE",
-            ErrorKind::Network,
-            "流源返回非成功状态",
-            true,
-        ));
-    }
+    let (response, upstream) = fetch_stream_response(inner, upstream, range_header).await?;
 
     let content_type = response
         .headers()
@@ -1314,18 +1300,19 @@ async fn serve_stream(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     let upstream_total = response.content_length();
-    let is_manifest = content_type
-        .as_deref()
-        .is_some_and(|value| value.contains("mpegurl"))
-        || upstream.ends_with(".m3u8");
+    let is_manifest = (target_encoded.is_empty() && inner.facts.is_hls)
+        || is_hls_manifest_mime(content_type.as_deref())
+        || is_hls_manifest_url(&upstream);
 
     if is_manifest {
-        let bytes = response.bytes().await.map_err(map_stream_fetch)?;
-        if bytes.len() > MAX_MANIFEST_BYTES {
+        let bytes = read_stream_body_bounded(response, MAX_MANIFEST_BYTES as u64).await?;
+        if !looks_like_hls_manifest(&bytes) {
             return Err(resource_unavailable());
         }
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        let (rewritten, learned) = rewrite_hls_manifest(&text, &upstream, grant_id);
+        let mut register_target = |target: &str| inner.register_target(target);
+        let (rewritten, learned) =
+            rewrite_hls_manifest(&text, &upstream, grant_id, &mut register_target);
         inner.learn_hosts(learned);
         let mut headers = vec![
             ("Content-Length", rewritten.len().to_string()),
@@ -1344,38 +1331,53 @@ async fn serve_stream(
         .headers()
         .get(reqwest::header::CONTENT_RANGE)
         .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    let total_known = upstream_total;
-    if let Some(total) = total_known {
-        if total > MAX_STREAM_BYTES {
-            return Err(AppError::new(
-                "RESOURCE_UNAVAILABLE",
-                ErrorKind::Storage,
-                "直连媒体超出单响应上限",
-                false,
-            ));
-        }
+        .and_then(parse_stream_content_range);
+    let upstream_accept_ranges = response
+        .headers()
+        .get(reqwest::header::ACCEPT_RANGES)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("bytes"))
+        });
+    let requested_range =
+        range_header.and_then(|header| parse_remote_byte_range(Some(header)).ok().flatten());
+    validate_direct_stream_headers(
+        upstream_status,
+        content_type.as_deref(),
+        requested_range,
+        upstream_content_range,
+    )?;
+    if upstream_total.is_some_and(|total| total > MAX_STREAM_BYTES) {
+        return Err(resource_unavailable());
     }
-    let bytes = response.bytes().await.map_err(map_stream_fetch)?;
-    if bytes.len() as u64 > MAX_STREAM_BYTES {
-        return Err(AppError::new(
-            "RESOURCE_UNAVAILABLE",
-            ErrorKind::Storage,
-            "直连媒体超出单响应上限",
-            false,
-        ));
+    let bytes = read_stream_body_bounded(response, MAX_STREAM_BYTES).await?;
+    if bytes.is_empty() {
+        return Err(resource_unavailable());
     }
+    if is_partial {
+        let content_range = upstream_content_range.expect("partial response range checked above");
+        validate_direct_stream_body_len(content_range, bytes.len() as u64)?;
+    }
+    let accept_ranges = is_partial || upstream_accept_ranges;
     let mut headers = vec![
         ("Content-Length", bytes.len().to_string()),
         (
             "Content-Type",
-            content_type.unwrap_or_else(|| "video/mp4".to_owned()),
+            canonical_direct_stream_mime(content_type.as_deref()),
         ),
-        ("Accept-Ranges", "bytes".to_owned()),
+        (
+            "Accept-Ranges",
+            if accept_ranges { "bytes" } else { "none" }.to_owned(),
+        ),
         ("Cache-Control", "no-store".to_owned()),
     ];
     if let Some(cr) = upstream_content_range {
-        headers.push(("Content-Range", cr));
+        headers.push((
+            "Content-Range",
+            format!("bytes {}-{}/{}", cr.start, cr.end, cr.total),
+        ));
     }
     headers.push(("Vary", "Origin".into()));
     push_allowed_origin(&mut headers, origin);
@@ -1385,6 +1387,251 @@ async fn serve_stream(
         builder = builder.header(*name, value.as_str());
     }
     Ok(builder.body(bytes.to_vec()).expect("静态响应头合法"))
+}
+
+fn is_hls_manifest_url(raw_url: &str) -> bool {
+    reqwest::Url::parse(raw_url)
+        .ok()
+        .map(|url| url.path().to_ascii_lowercase())
+        .is_some_and(|path| path.ends_with(".m3u8") || path.ends_with(".m3u"))
+}
+
+fn is_hls_manifest_mime(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let base = value.split(';').next().unwrap_or_default().trim();
+    matches!(
+        base.to_ascii_lowercase().as_str(),
+        "application/vnd.apple.mpegurl"
+            | "application/x-mpegurl"
+            | "application/mpegurl"
+            | "audio/mpegurl"
+            | "audio/x-mpegurl"
+    )
+}
+
+fn looks_like_hls_manifest(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    text.trim_start_matches('\u{feff}')
+        .trim_start()
+        .starts_with("#EXTM3U")
+}
+
+fn canonical_direct_stream_mime(value: Option<&str>) -> String {
+    let base = value
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(base) = base else {
+        return "video/mp4".to_owned();
+    };
+    if base.eq_ignore_ascii_case("application/octet-stream") {
+        return "application/octet-stream".to_owned();
+    }
+    if is_video_mime_base(base) {
+        return base.to_ascii_lowercase();
+    }
+    "video/mp4".to_owned()
+}
+
+fn is_video_mime_base(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let Some(subtype) = lower.strip_prefix("video/") else {
+        return false;
+    };
+    !subtype.is_empty()
+        && subtype
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$&^_.+-".contains(&byte))
+}
+
+fn validate_direct_stream_headers(
+    status: u16,
+    content_type: Option<&str>,
+    requested_range: Option<RemoteByteRange>,
+    content_range: Option<StreamContentRange>,
+) -> Result<(), AppError> {
+    let mime_is_empty = content_type
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+        })
+        .unwrap_or(true);
+    let mime_is_video = content_type
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| {
+            is_video_mime_base(value) || value.eq_ignore_ascii_case("application/octet-stream")
+        });
+    if !mime_is_empty && !mime_is_video {
+        return Err(resource_unavailable());
+    }
+
+    match (status, requested_range, content_range) {
+        (200, None, None) => Ok(()),
+        (206, Some(requested), Some(actual)) => {
+            if actual.total > MAX_STREAM_BYTES
+                || actual.start != requested.start
+                || requested.end.is_some_and(|end| actual.end != end)
+            {
+                return Err(resource_unavailable());
+            }
+            Ok(())
+        }
+        // A request with Range must not silently become a full-object 200; a
+        // partial response without a requested range is equally ambiguous.
+        _ => Err(resource_unavailable()),
+    }
+}
+
+fn validate_direct_stream_body_len(
+    content_range: StreamContentRange,
+    body_len: u64,
+) -> Result<(), AppError> {
+    let expected = content_range
+        .end
+        .checked_sub(content_range.start)
+        .and_then(|length| length.checked_add(1))
+        .ok_or_else(resource_unavailable)?;
+    (expected == body_len)
+        .then_some(())
+        .ok_or_else(resource_unavailable)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamContentRange {
+    start: u64,
+    end: u64,
+    total: u64,
+}
+
+fn parse_stream_content_range(value: &str) -> Option<StreamContentRange> {
+    let value = value.strip_prefix("bytes ")?;
+    let (range, total) = value.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse::<u64>().ok()?;
+    let end = end.parse::<u64>().ok()?;
+    let total = total.parse::<u64>().ok()?;
+    if start > end || end >= total {
+        return None;
+    }
+    Some(StreamContentRange { start, end, total })
+}
+
+async fn read_stream_body_bounded(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+) -> Result<Vec<u8>, AppError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes)
+    {
+        return Err(resource_unavailable());
+    }
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or(64 * 1024)
+            .min(max_bytes) as usize,
+    );
+    while let Some(chunk) = response.chunk().await.map_err(map_stream_fetch)? {
+        let next_len = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(resource_unavailable)?;
+        if next_len as u64 > max_bytes {
+            return Err(resource_unavailable());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Fetch one stream response with an explicit, owner-bound redirect policy.
+/// reqwest's automatic redirect support is disabled for the shared client so a
+/// redirect cannot silently escape the grant's learned host allowlist.
+async fn fetch_stream_response(
+    inner: &Arc<StreamGrantInner>,
+    mut upstream: String,
+    range_header: Option<&str>,
+) -> Result<(reqwest::Response, String), AppError> {
+    for redirect_count in 0..=MAX_STREAM_REDIRECTS {
+        let Some(host) = crate::stream_registry::host_of(&upstream) else {
+            return Err(policy_denied("流目标必须是 http/https 地址"));
+        };
+        if !inner.host_allowed(&host) {
+            return Err(policy_denied("流目标主机未被授权"));
+        }
+
+        let mut request = stream_http_client().get(&upstream);
+        if let Some(range) = range_header {
+            request = request.header("range", range);
+        }
+        let response = request.send().await.map_err(|err| {
+            let message = if err.is_timeout() {
+                "流源请求超时"
+            } else {
+                "流源连接失败"
+            };
+            AppError::new("RESOURCE_UNAVAILABLE", ErrorKind::Network, message, true)
+        })?;
+        if response.status().is_redirection() {
+            if redirect_count == MAX_STREAM_REDIRECTS {
+                return Err(AppError::new(
+                    "RESOURCE_UNAVAILABLE",
+                    ErrorKind::Network,
+                    "流源跳转次数过多",
+                    true,
+                ));
+            }
+            let Some(location) = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+            else {
+                return Err(AppError::new(
+                    "RESOURCE_UNAVAILABLE",
+                    ErrorKind::Network,
+                    "流源跳转地址无效",
+                    true,
+                ));
+            };
+            let Some(next) = absolutize(&upstream, location) else {
+                return Err(policy_denied("流源跳转地址不受支持"));
+            };
+            let Some(next_host) = crate::stream_registry::host_of(&next) else {
+                return Err(policy_denied("流源跳转地址不受支持"));
+            };
+            if !inner.host_allowed(&next_host) {
+                return Err(policy_denied("流源跳转主机未被授权"));
+            }
+            upstream = next;
+            continue;
+        }
+        if !response.status().is_success() {
+            return Err(AppError::new(
+                "RESOURCE_UNAVAILABLE",
+                ErrorKind::Network,
+                "流源返回非成功状态",
+                true,
+            ));
+        }
+        return Ok((response, upstream));
+    }
+    Err(AppError::new(
+        "RESOURCE_UNAVAILABLE",
+        ErrorKind::Network,
+        "流源跳转次数过多",
+        true,
+    ))
 }
 
 fn map_stream_fetch(err: reqwest::Error) -> AppError {
@@ -1435,22 +1682,71 @@ mod tests {
     #[test]
     fn hls_manifest_rewrites_segments_and_uri_attrs_to_proxy() {
         let manifest = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MAP:URI=\"init.mp4\"\nseg0.ts\nhttps://other-cdn.example.net/abs.ts\n";
-        let (rewritten, hosts) =
-            rewrite_hls_manifest(manifest, "https://cdn.example.com/a/index.m3u8", "grant-1");
+        let mut targets = std::collections::HashMap::new();
+        let mut register_target = |target: &str| {
+            let token = Uuid::new_v4().to_string();
+            targets.insert(token.clone(), target.to_owned());
+            token
+        };
+        let (rewritten, hosts) = rewrite_hls_manifest(
+            manifest,
+            "https://cdn.example.com/a/index.m3u8",
+            "00000000-0000-0000-0000-000000000001",
+            &mut register_target,
+        );
         assert!(rewritten.contains("#EXTM3U"));
-        // 相对片段 → 代理 URL（携带 u= 编码目标；'/' 编码为 %2F）。
-        assert!(rewritten.contains("http://haven-resource.stream/grant-1?u="));
+        // 相对片段 → 代理 URL（u 仅携带 opaque token，不是远端 URL）。
+        assert!(rewritten
+            .contains("http://haven-resource.stream/00000000-0000-0000-0000-000000000001?u="));
         let seg_line = rewritten
             .lines()
-            .find(|line| line.contains("seg0.ts"))
-            .expect("改写后必须保留片段名（编码内）");
-        let decoded_target = percent_decode(seg_line.split_once("?u=").unwrap().1).unwrap();
-        assert_eq!(decoded_target, "https://cdn.example.com/a/seg0.ts");
+            .find(|line| line.starts_with("http://haven-resource.stream/"))
+            .expect("改写后必须保留片段代理行");
+        let target_token = percent_decode(seg_line.split_once("?u=").unwrap().1).unwrap();
+        assert!(!target_token.contains("://"));
+        assert_eq!(
+            targets.get(&target_token).map(String::as_str),
+            Some("https://cdn.example.com/a/seg0.ts")
+        );
         // URI="..." 属性同样被改写。
-        assert!(rewritten.contains("URI=\"http://haven-resource.stream/grant-1?u="));
+        assert!(rewritten.contains(
+            "URI=\"http://haven-resource.stream/00000000-0000-0000-0000-000000000001?u="
+        ));
         // 学习主机包含初始 CDN 与绝对地址的另一个 CDN。
         assert!(hosts.contains(&"cdn.example.com".to_owned()));
         assert!(hosts.contains(&"other-cdn.example.net".to_owned()));
+    }
+
+    #[test]
+    fn hls_uri_attributes_drop_unclosed_or_unsupported_values() {
+        let mut proxy = |raw: &str| {
+            raw.starts_with("https://")
+                .then(|| format!("proxy://{}", raw.len()))
+        };
+        assert_eq!(
+            rewrite_hls_uri_attributes(
+                "#EXT-X-KEY:METHOD=AES-128,URI=\"https://key.bin\"",
+                &mut proxy,
+            )
+            .as_deref(),
+            Some("#EXT-X-KEY:METHOD=AES-128,URI=\"proxy://15\"")
+        );
+        assert!(rewrite_hls_uri_attributes("#EXT-X-MAP:URI=\"", &mut proxy).is_none());
+        assert!(rewrite_hls_uri_attributes(
+            "#EXT-X-KEY:METHOD=AES-128,URI=\"data:text/plain,x\"",
+            &mut proxy
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn hls_manifest_validation_rejects_non_manifest_body() {
+        assert!(looks_like_hls_manifest(
+            b"\xEF\xBB\xBF #EXTM3U\n#EXTINF:1\nsegment.ts\n"
+        ));
+        assert!(!looks_like_hls_manifest(b"<html>upstream error</html>"));
+        assert!(!looks_like_hls_manifest(b""));
+        assert!(!looks_like_hls_manifest(b"\xFF\xFE#EXTM3U"));
     }
 
     #[test]
@@ -1464,11 +1760,16 @@ mod tests {
     #[test]
     fn stream_query_requires_single_u_param() {
         let base = format!("http://haven-resource.stream/{}", Uuid::new_v4());
-        let with_u = format!("{base}?u=https%3A%2F%2Fcdn.example.com%2Fa.ts");
+        let target_token = Uuid::new_v4().to_string();
+        let with_u = format!("{base}?u={target_token}");
         let parsed = with_u.parse::<Uri>().unwrap();
-        // u 值保持编码形态返回；解码发生在 serve_stream。
+        // u 值是服务端注册的 opaque token；真实 URL 不进入 URI。
         let (_, target) = parse_stream_request(&parsed).unwrap();
-        assert_eq!(target, "https%3A%2F%2Fcdn.example.com%2Fa.ts");
+        assert_eq!(target, target_token);
+
+        let raw_url = format!("{base}?u=https%3A%2F%2Fcdn.example.com%2Fa.ts");
+        let parsed = raw_url.parse::<Uri>().unwrap();
+        assert!(parse_stream_request(&parsed).is_err());
 
         let no_query = base.parse::<Uri>().unwrap();
         let (id, empty) = parse_stream_request(&no_query).unwrap();
@@ -1487,7 +1788,7 @@ mod tests {
         AvailabilitySource, MediaType, ResourceType, StorageProviderType, StorageStatus,
     };
     use haven_domain::ids::{MediaItemId, ResourceId, StorageLocationId};
-    use std::io::Write;
+    use std::io::{Read, Write};
 
     fn file_with(data: &[u8], extension: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -1721,6 +2022,155 @@ mod tests {
         assert_eq!(response.status().as_u16(), 502);
         assert!(response.body().is_empty());
         assert!(response.headers().get("content-range").is_none());
+    }
+
+    #[test]
+    fn direct_stream_validation_is_fail_closed_for_mime_and_range_semantics() {
+        let requested = RemoteByteRange {
+            start: 10,
+            end: Some(19),
+        };
+        let content_range = StreamContentRange {
+            start: 10,
+            end: 19,
+            total: 100,
+        };
+        assert!(validate_direct_stream_headers(
+            206,
+            Some("video/mp4; codecs=avc1"),
+            Some(requested),
+            Some(content_range),
+        )
+        .is_ok());
+        assert!(validate_direct_stream_headers(200, Some("video/mp4"), None, None,).is_ok());
+        assert!(
+            validate_direct_stream_headers(200, Some("Video/WebM; codecs=vp9"), None, None,)
+                .is_ok()
+        );
+        assert!(validate_direct_stream_headers(200, None, None, None,).is_ok());
+
+        for mime in [
+            Some("text/html"),
+            Some("application/json; charset=utf-8"),
+            Some("text/plain"),
+            Some("audio/mpeg"),
+            Some("video/mp4, text/html"),
+        ] {
+            assert!(
+                validate_direct_stream_headers(200, mime, None, None).is_err(),
+                "non-video MIME must be rejected: {mime:?}"
+            );
+        }
+        assert!(validate_direct_stream_headers(
+            200,
+            Some("video/mp4"),
+            Some(requested),
+            Some(content_range),
+        )
+        .is_err());
+        assert!(
+            validate_direct_stream_headers(206, Some("video/mp4"), None, Some(content_range),)
+                .is_err()
+        );
+        assert!(validate_direct_stream_headers(
+            206,
+            Some("video/mp4"),
+            Some(requested),
+            Some(StreamContentRange {
+                start: 10,
+                end: 18,
+                total: 100,
+            }),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn direct_stream_body_must_match_content_range_exactly() {
+        let range = StreamContentRange {
+            start: 10,
+            end: 19,
+            total: 100,
+        };
+        assert!(validate_direct_stream_body_len(range, 10).is_ok());
+        assert!(validate_direct_stream_body_len(range, 9).is_err());
+        assert!(validate_direct_stream_body_len(range, 11).is_err());
+    }
+
+    fn spawn_stream_fixture(status: &str, headers: &str, body: &[u8]) -> String {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let response = format!(
+            "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let body = body.to_vec();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        });
+        format!("http://{address}/video.mp4")
+    }
+
+    fn direct_stream_facts(url: &str) -> crate::stream_registry::StreamGrantFacts {
+        crate::stream_registry::StreamGrantFacts {
+            work_id: "w".into(),
+            edition_id: "e".into(),
+            media_item_id: "m".into(),
+            mime_type: Some("video/mp4".into()),
+            is_hls: false,
+            progress: None,
+            upstream_url: url.to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_stream_rejects_full_response_to_a_range_request() {
+        let url = spawn_stream_fixture("200 OK", "Content-Type: video/mp4\r\n", b"abc");
+        let registry = crate::stream_registry::StreamRegistry::new();
+        let grant = registry.register(direct_stream_facts(&url), &url, "main");
+        let inner = registry.lookup(&grant.to_string(), "main").unwrap();
+        let error = serve_stream(&inner, &grant.to_string(), "", Some("bytes=0-2"), None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), "RESOURCE_UNAVAILABLE");
+    }
+
+    #[tokio::test]
+    async fn direct_stream_rejects_html_even_when_status_is_success() {
+        let url = spawn_stream_fixture("200 OK", "Content-Type: text/html\r\n", b"<html>");
+        let registry = crate::stream_registry::StreamRegistry::new();
+        let grant = registry.register(direct_stream_facts(&url), &url, "main");
+        let inner = registry.lookup(&grant.to_string(), "main").unwrap();
+        let error = serve_stream(&inner, &grant.to_string(), "", None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), "RESOURCE_UNAVAILABLE");
+    }
+
+    #[tokio::test]
+    async fn direct_stream_accepts_matching_partial_response() {
+        let url = spawn_stream_fixture(
+            "206 Partial Content",
+            "Content-Type: video/mp4\r\nContent-Range: bytes 0-2/3\r\n",
+            b"abc",
+        );
+        let registry = crate::stream_registry::StreamRegistry::new();
+        let grant = registry.register(direct_stream_facts(&url), &url, "main");
+        let inner = registry.lookup(&grant.to_string(), "main").unwrap();
+        let response = serve_stream(&inner, &grant.to_string(), "", Some("bytes=0-2"), None)
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 206);
+        assert_eq!(response.body(), b"abc");
+        assert_eq!(
+            response.headers().get("content-range").unwrap(),
+            "bytes 0-2/3"
+        );
     }
 
     #[test]

@@ -129,6 +129,11 @@ pub const OPDS_GUTENBERG_SOURCE_ID: &str = "opds_gutenberg";
 /// 可导入正文候选的 opaque 句柄前缀。句柄只在搜索操作缓存与导入命令之间流转，
 /// 不表示可由前端直接访问的 URL。
 pub const CONTENT_CANDIDATE_PREFIX: &str = "content-candidate-";
+/// M3U is a user-configured video collection.  It uses the same opaque
+/// candidate envelope as the fixed online-content providers, but its payload
+/// is a provider-owned `(display title, stream URL)` pair and is only decoded
+/// at this application boundary.
+pub const M3U_SOURCE_ID: &str = "m3u";
 
 impl SourceImportService {
     pub fn new(
@@ -365,7 +370,14 @@ impl SourceImportService {
                     false,
                 ));
             };
-            let external_id = decode_candidate_component(encoded_external_id)?;
+            let external_id = if source_id == M3U_SOURCE_ID {
+                decode_candidate_component_with_separator(encoded_external_id)?
+            } else {
+                decode_candidate_component(encoded_external_id)?
+            };
+            if source_id == M3U_SOURCE_ID {
+                return self.import_m3u_candidate(&external_id).await;
+            }
             return self.import_content_candidate(source_id, &external_id).await;
         }
         if let Some(external_id) = handle.strip_prefix(CMS10_CANDIDATE_PREFIX) {
@@ -418,6 +430,115 @@ impl SourceImportService {
         })?;
         self.import_remote_entry(source_id, external_id, entry, remote)
             .await
+    }
+
+    /// Import one M3U entry without ever asking the catalog provider to fetch
+    /// the stream.  The playlist endpoint is fetched during search; this
+    /// method receives only the opaque title/URL pair from the operation cache
+    /// and persists the URL as a server-side HTTP locator.  The frontend never
+    /// sees that locator and playback still goes through `stream_open`.
+    async fn import_m3u_candidate(&self, external_id: &str) -> Result<ImportedWork, AppError> {
+        let (title, url) = external_id
+            .split_once('\u{1}')
+            .ok_or_else(invalid_m3u_candidate)?;
+        let title = title.trim();
+        let url = url.trim();
+        validate_m3u_stream_url(url)?;
+        if title.is_empty() || title.len() > 240 || has_control_character(title) {
+            return Err(invalid_m3u_candidate());
+        }
+        let dedupe_key = format!("{title}\u{1}{url}");
+        if let Some(work_id) =
+            WorkRepository::id_for_source_ref(&*self.ports, M3U_SOURCE_ID, &dedupe_key).await?
+        {
+            return self.existing_identity(work_id).await;
+        }
+
+        let now = UtcMillis::now();
+        let work = Work {
+            id: WorkId::new(),
+            canonical_title: title.to_owned(),
+            original_title: None,
+            sort_title: None,
+            description: None,
+            work_type: WorkType::Standalone,
+            release_year: None,
+            language: None,
+            director: None,
+            actor: None,
+            status: WorkStatus::Completed,
+            rating_value: None,
+            rating_scale: None,
+            artwork: Default::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        WorkRepository::save(&*self.ports, &work).await?;
+        WorkRepository::save_source_ref(&*self.ports, M3U_SOURCE_ID, &dedupe_key, work.id).await?;
+
+        let media_type = MediaType::Series;
+        let edition = Edition {
+            id: haven_domain::ids::EditionId::new(),
+            work_id: work.id,
+            title: title.to_owned(),
+            subtitle: None,
+            edition_type: media_type,
+            release_date: None,
+            language: None,
+            region: None,
+            publisher_or_studio: None,
+            description: None,
+            artwork: Default::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        EditionRepository::save(&*self.ports, &edition).await?;
+
+        let item = MediaItem {
+            id: MediaItemId::new(),
+            edition_id: edition.id,
+            parent_id: None,
+            media_type: MediaType::Episode,
+            title: title.to_owned(),
+            index: MediaIndex::Episode {
+                season: None,
+                episode: 1,
+            },
+            duration_ms: None,
+            page_count: None,
+            chapter_count: None,
+            published_at: None,
+            status: haven_domain::enums::MediaItemStatus::Available,
+            created_at: now,
+            updated_at: now,
+        };
+        MediaItemRepository::save(&*self.ports, &item).await?;
+
+        let resource = Resource {
+            id: ResourceId::new(),
+            media_item_id: item.id,
+            resource_type: stream_resource_type(url),
+            source_id: None,
+            storage_location_id: None,
+            locator: haven_domain::entities::ResourceLocator::Http {
+                url: url.to_owned(),
+            },
+            mime_type: Some(stream_mime(url).to_owned()),
+            size: None,
+            hash: None,
+            availability: Availability::Available,
+            availability_source: AvailabilitySource::User,
+            modified_ms: None,
+            fingerprint_first: None,
+            fingerprint_last: None,
+            created_at: now,
+            updated_at: now,
+        };
+        ResourceRepository::save(&*self.ports, &resource).await?;
+        Ok(ImportedWork {
+            work_id: work.id,
+            media_item_id: item.id,
+        })
     }
 
     async fn import_remote_entry(
@@ -880,23 +1001,130 @@ fn parse_episode_number(label: &str, fallback: u32) -> u32 {
 }
 
 fn stream_resource_type(url: &str) -> ResourceType {
-    if url.contains(".m3u8") {
-        ResourceType::HlsStream
-    } else {
-        ResourceType::VideoStream
+    match stream_url_kind(url) {
+        StreamUrlKind::Hls => ResourceType::HlsStream,
+        StreamUrlKind::Dash => ResourceType::DashStream,
+        StreamUrlKind::Video => ResourceType::VideoStream,
     }
 }
 
 fn stream_mime(url: &str) -> &'static str {
-    if url.contains(".m3u8") {
-        "application/vnd.apple.mpegurl"
+    match stream_url_kind(url) {
+        StreamUrlKind::Hls => "application/vnd.apple.mpegurl",
+        StreamUrlKind::Dash => "application/dash+xml",
+        StreamUrlKind::Video => "video/mp4",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamUrlKind {
+    Video,
+    Hls,
+    Dash,
+}
+
+/// Classify a stream from its URL path only. Query strings and fragments are
+/// deliberately ignored so a token such as `?format=.m3u8` cannot change the
+/// resource type, while case differences in the actual path remain harmless.
+pub(crate) fn stream_url_kind(url: &str) -> StreamUrlKind {
+    let Some((_, remainder)) = url.split_once("://") else {
+        return StreamUrlKind::Video;
+    };
+    let Some(path_start) = remainder.find(['/', '?', '#']) else {
+        return StreamUrlKind::Video;
+    };
+    // A slash is the only delimiter that begins the URL path. If the first
+    // delimiter is a query or fragment, any later slash belongs to that query
+    // and must not influence stream classification.
+    if remainder.as_bytes().get(path_start) != Some(&b'/') {
+        return StreamUrlKind::Video;
+    };
+    let path = remainder[path_start..]
+        .split_once(['?', '#'])
+        .map_or(&remainder[path_start..], |(path, _)| path)
+        .to_ascii_lowercase();
+    if path.ends_with(".m3u8") || path.ends_with(".m3u") {
+        StreamUrlKind::Hls
+    } else if path.ends_with(".mpd") {
+        StreamUrlKind::Dash
     } else {
-        "video/mp4"
+        StreamUrlKind::Video
     }
 }
 
 fn has_control_character(value: &str) -> bool {
     value.chars().any(|ch| ch == '\0' || ch.is_control())
+}
+
+/// M3U entries are stored in the candidate cache as a title + separator + URL
+/// pair. The separator itself is an internal framing byte and is allowed only
+/// for this one decoding path; all other control characters remain rejected.
+fn decode_candidate_component_with_separator(value: &str) -> Result<String, AppError> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return Err(invalid_m3u_candidate());
+        }
+        let high = hex_value(bytes[index + 1]).ok_or_else(invalid_m3u_candidate)?;
+        let low = hex_value(bytes[index + 2]).ok_or_else(invalid_m3u_candidate)?;
+        decoded.push((high << 4) | low);
+        index += 3;
+    }
+    let decoded = String::from_utf8(decoded).map_err(|_| invalid_m3u_candidate())?;
+    if decoded.is_empty() || decoded.chars().any(|ch| ch.is_control() && ch != '\u{1}') {
+        return Err(invalid_m3u_candidate());
+    }
+    Ok(decoded)
+}
+
+/// Validate the URL carried by an M3U candidate before it becomes a persisted
+/// `ResourceLocator::Http`. This mirrors the controlled stream gate: the M3U
+/// provider may only create HTTP(S) streams with an unambiguous authority.
+fn validate_m3u_stream_url(url: &str) -> Result<(), AppError> {
+    if url.is_empty() || url.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+        return Err(invalid_m3u_candidate());
+    }
+    let Some((scheme, remainder)) = url.split_once("://") else {
+        return Err(invalid_m3u_candidate());
+    };
+    if !matches!(scheme, "http" | "https") {
+        return Err(invalid_m3u_candidate());
+    }
+    let authority = remainder
+        .split_once(['/', '?', '#'])
+        .map_or(remainder, |(authority, _)| authority);
+    if authority.is_empty() || authority.contains('@') || authority.ends_with(':') {
+        return Err(invalid_m3u_candidate());
+    }
+
+    let valid = if authority.starts_with('[') {
+        let Some(close) = authority.find(']') else {
+            return Err(invalid_m3u_candidate());
+        };
+        let suffix = &authority[close + 1..];
+        close > 1 && (suffix.is_empty() || valid_m3u_port_suffix(suffix))
+    } else {
+        match authority.split_once(':') {
+            None => true,
+            Some((host, port)) => !host.is_empty() && valid_m3u_port(port),
+        }
+    };
+    valid.then_some(()).ok_or_else(invalid_m3u_candidate)
+}
+
+fn valid_m3u_port_suffix(value: &str) -> bool {
+    value.strip_prefix(':').is_some_and(valid_m3u_port)
+}
+
+fn valid_m3u_port(value: &str) -> bool {
+    !value.is_empty() && value.parse::<u16>().is_ok()
 }
 
 /// Candidate IDs use percent-encoding so a remote URL or title never travels
@@ -965,6 +1193,15 @@ fn hex_value(value: u8) -> Option<u8> {
         b'A'..=b'F' => Some(value - b'A' + 10),
         _ => None,
     }
+}
+
+fn invalid_m3u_candidate() -> AppError {
+    AppError::new(
+        "INVALID_ARGUMENT",
+        ErrorKind::Validation,
+        "M3U 候选标识非法",
+        false,
+    )
 }
 
 /// 在来源详情请求前校验 opaque candidate 解码出的远端身份。
@@ -1078,6 +1315,43 @@ pub fn validate_remote_source_object(
     }
 }
 
+/// Provider payload MIME gate shared by capability projection and DownloadTask
+/// creation.  The value is only a hint until the provider validates magic bytes,
+/// but an absent or cross-provider hint must never be advertised as downloadable
+/// in the first place.
+pub fn remote_source_mime_compatible(
+    source_key: &str,
+    resource_type: ResourceType,
+    mime_type: Option<&str>,
+) -> bool {
+    let Some(mime) = mime_type
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let expected = match source_key {
+        "mangadex" if resource_type == ResourceType::ComicArchive => [
+            "application/vnd.comicbook+zip",
+            "application/zip",
+            "application/x-cbz",
+        ]
+        .as_slice(),
+        "arxiv" if resource_type == ResourceType::PublicationFile => ["application/pdf"].as_slice(),
+        "opds_gutenberg" if resource_type == ResourceType::PublicationFile => {
+            ["application/epub+zip"].as_slice()
+        }
+        "europepmc" | "wikisource" if resource_type == ResourceType::ArticleSnapshot => {
+            ["text/html", "application/xhtml+xml"].as_slice()
+        }
+        _ => return false,
+    };
+    expected
+        .iter()
+        .any(|value| mime.eq_ignore_ascii_case(value))
+}
+
 fn is_canonical_uuid(value: &str) -> bool {
     Uuid::parse_str(value)
         .ok()
@@ -1101,7 +1375,10 @@ fn validate_arxiv_remote_id(value: &str) -> bool {
 }
 
 fn validate_gutenberg_remote_id(value: &str) -> bool {
-    let Some(path) = value.strip_prefix("https://www.gutenberg.org/ebooks/") else {
+    let Some(path) = value
+        .strip_prefix("https://www.gutenberg.org/ebooks/")
+        .or_else(|| value.strip_prefix("https://m.gutenberg.org/ebooks/"))
+    else {
         return false;
     };
     !path.is_empty()
@@ -1313,5 +1590,98 @@ mod candidate_tests {
             )
             .is_err()
         );
+        assert!(
+            validate_remote_source_object(
+                "opds_gutenberg",
+                ResourceType::PublicationFile,
+                "https://m.gutenberg.org/ebooks/84.opds",
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn stream_classification_uses_case_insensitive_path_extension() {
+        assert_eq!(
+            stream_url_kind("https://cdn.example/live/index.m3u8?token=opaque"),
+            StreamUrlKind::Hls
+        );
+        assert_eq!(
+            stream_url_kind("https://cdn.example/live/index.M3U"),
+            StreamUrlKind::Hls
+        );
+        assert_eq!(
+            stream_url_kind("https://cdn.example/live/manifest.MpD#fragment"),
+            StreamUrlKind::Dash
+        );
+        assert_eq!(
+            stream_mime("https://cdn.example/live/index.m3u8?format=mp4"),
+            "application/vnd.apple.mpegurl"
+        );
+        assert_eq!(
+            stream_mime("https://cdn.example/live/manifest.mpd?token=.m3u8"),
+            "application/dash+xml"
+        );
+    }
+
+    #[test]
+    fn stream_classification_ignores_query_and_requires_path_boundary() {
+        for url in [
+            "https://cdn.example/video.mp4?manifest=.m3u8",
+            "https://cdn.example/video.mp4#manifest=.mpd",
+            "https://cdn.example/video.m3u8.segment",
+            "https://cdn.example/video.m3u8/segment",
+            "https://cdn.example?path=/video.m3u8",
+            "https://cdn.example/video.m3u8%3Ftoken=opaque",
+        ] {
+            assert_eq!(
+                stream_url_kind(url),
+                StreamUrlKind::Video,
+                "query or an incomplete path suffix must not change type: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn m3u_candidate_payload_allows_only_the_internal_separator() {
+        let encoded = "%E6%96%B0%E9%97%BB%01https%3A%2F%2Fcdn.example%2Flive.m3u8%3Ftoken%3Dopaque";
+        assert_eq!(
+            decode_candidate_component_with_separator(encoded).unwrap(),
+            "新闻\u{1}https://cdn.example/live.m3u8?token=opaque"
+        );
+        for value in ["title%00url", "title%02url", "%GG", "%C3%28"] {
+            assert!(
+                decode_candidate_component_with_separator(value).is_err(),
+                "unsafe M3U candidate payload accepted: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn m3u_stream_url_validation_is_fail_closed() {
+        for url in [
+            "https://cdn.example/live.m3u8",
+            "http://cdn.example:8080/live.m3u?token=opaque",
+            "https://[2001:db8::10]:8443/live.mp4",
+        ] {
+            assert!(
+                validate_m3u_stream_url(url).is_ok(),
+                "valid URL rejected: {url}"
+            );
+        }
+        for url in [
+            "",
+            "ftp://cdn.example/live.m3u8",
+            "https:///live.m3u8",
+            "https://cdn.example:/live.m3u8",
+            "https://cdn.example:99999/live.m3u8",
+            "https://user:secret@cdn.example/live.m3u8",
+            "https://cdn.example/live.m3u8 extra",
+            "https://cdn.example/live\n.m3u8",
+            "https://2001:db8::10/live.m3u8",
+        ] {
+            let err = validate_m3u_stream_url(url).unwrap_err();
+            assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
+        }
     }
 }

@@ -600,6 +600,7 @@ export class MockHavenClient implements HavenClient {
       mediaItemId: request.mediaItemId,
       engine: request.engine,
       progress: null,
+      ...(request.engine === "playback" ? { streamKind: "direct" as const } : {}),
     };
     this.activeSessions.set(sessionId, session);
     return session;

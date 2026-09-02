@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest"
 import {
   alignBookOffsetToPage,
+  BOOK_PAGINATION_COLUMN_GAP_PX,
   bookOffsetForPageDelta,
   bookOffsetForProgression,
   getBookPaginationMetrics,
+  paginationGeometry,
   setBookPaginationOffsetInstant,
   type BookPaginationViewport,
 } from "./book-pagination"
@@ -48,6 +50,16 @@ describe("book-pagination", () => {
     expect(bookOffsetForPageDelta(current, -1, "double")).toBe(0)
     expect(bookOffsetForPageDelta(viewport({ scrollLeft: 0 }), -1, "paginated")).toBe(0)
     expect(bookOffsetForPageDelta(viewport({ scrollLeft: 1600 }), 1, "paginated")).toBe(1600)
+  })
+
+  it("keeps the CSS column geometry aligned to reader viewport strides", () => {
+    const single = paginationGeometry("paginated", 700)
+    expect(single.gap).toBe(BOOK_PAGINATION_COLUMN_GAP_PX)
+    expect(single.pageStride).toBe(700 + BOOK_PAGINATION_COLUMN_GAP_PX)
+
+    const double = paginationGeometry("double", 700)
+    expect(double.columnWidth).toBe((700 - BOOK_PAGINATION_COLUMN_GAP_PX) / 2)
+    expect(double.pageStride).toBe(700 + BOOK_PAGINATION_COLUMN_GAP_PX)
   })
 
   it("aligns chapter/search anchors to the containing page", () => {

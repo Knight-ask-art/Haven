@@ -155,6 +155,14 @@ describe("epub-content", () => {
     expect(publication.chapters[1].title).toBe("第二章")
   })
 
+  it("accepts XHTML and HTML spine MIME parameters", async () => {
+    const publication = await parseEpubBook(validEpub({
+      opf: "<package><manifest><item id=\"c1\" href=\"chapter-one.xhtml\" media-type=\"application/xhtml+xml; charset=utf-8\"/><item id=\"c2\" href=\"chapter-two.xhtml\" media-type=\"text/html; charset=utf-8\"/></manifest><spine><itemref idref=\"c1\"/><itemref idref=\"c2\"/></spine></package>",
+    }))
+
+    expect(publication.chapters).toHaveLength(2)
+  })
+
   it("rejects an invalid spine reference instead of falling back to another chapter", async () => {
     const bytes = validEpub({
       opf: "<package><manifest><item id=\"c1\" href=\"chapter-one.xhtml\" media-type=\"application/xhtml+xml\"/></manifest><spine><itemref idref=\"c1\"/><itemref idref=\"missing\"/></spine></package>",

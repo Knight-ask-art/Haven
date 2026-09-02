@@ -29,16 +29,25 @@ import { PdfReader } from "../components/PdfReader"
 import type { PdfDocumentSource } from "../lib/pdf-document"
 import { useReadingSettings } from "../lib/use-reading-settings"
 import { resolveReadingPresentation } from "../lib/reading-settings-mapping"
+import { resolveBookReaderHeaderContext } from "../lib/book-reader-header"
 import { bookMarkerLocator, createMarker, deleteMarker, listMarkers } from "@/features/markers/ipc/marker-gateway"
 import type { MarkerDto, TocItemDto } from "@/lib/ipc/generated/wire"
 import { getReaderToc } from "../ipc/reader-toc-gateway"
-import { buildBookSearchIndex, searchBook, type BookSearchHit } from "../lib/book-search"
+import {
+  buildBookSearchIndex,
+  isBookSearchOperationCurrent,
+  searchBook,
+  searchBookWithRemoteFallback,
+  type BookSearchHit,
+} from "../lib/book-search"
 import { searchReaderContent } from "../ipc/reader-search-gateway"
 import {
   alignBookOffsetToPage,
+  BOOK_PAGINATION_COLUMN_GAP_PX,
   bookOffsetForPageDelta,
   bookOffsetForProgression,
   getBookPaginationMetrics,
+  paginationGeometry,
   setBookPaginationOffsetInstant,
   type BookPaginationMode,
   type BookPaginationViewport,
@@ -235,6 +244,7 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
   const [contentRetryNonce, setContentRetryNonce] = useState(0)
   const [readerTocItems, setReaderTocItems] = useState<TocItemDto[] | null>(null)
   const searchAbortRef = useRef<AbortController | null>(null)
+  const searchOperationRef = useRef(0)
   const readerScrollRef = useRef<HTMLDivElement>(null)
   const articleRef = useRef<HTMLElement>(null)
   const progressControllerRef = useRef<BookProgressController | null>(null)
@@ -309,6 +319,11 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
   const bookTitle = demoRuntime ? "史蒂夫·乔布斯传" : parsedBookTitle || "本地图书"
   const contentReady = demoRuntime
     || (sessionView.status === "ready" && (contentState.status === "ready" || contentState.status === "pdf_ready") && contentMatchesSession)
+  const headerContext = resolveBookReaderHeaderContext({
+    currentChapterTitle: currentChapter?.title,
+    contentStatus: contentState.status,
+    contentErrorMessage: contentState.status === "retryable_error" || contentState.status === "terminal_error" ? contentState.error.message : null,
+  })
 
   const themeClass = {
     paper: "bg-[#fcfcfc] text-[#1d1d1f]",
@@ -335,15 +350,20 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
     : (contentState.status === "ready" && contentMatchesSession ? contentState.format : "text")
   const pdfSource = contentState.status === "pdf_ready" && contentMatchesSession ? contentState.source : null
   const isTextPagination = !pdfSource && paginationMode !== "scroll"
-  const paginationColumnGapPx = paginationMode === "double" ? 28 : 48
-  // The existing article uses 24px padding below the sm breakpoint and 40px
-  // above it. Read the breakpoint synchronously so the first layout already
-  // uses the same frame width; ResizeObserver then only recalculates columns.
-  const paginationHorizontalPadding = typeof window !== "undefined" && window.innerWidth >= 640 ? 80 : 48
+  // Paginated articles use the same 24px inline padding at every breakpoint.
+  // The column gap intentionally matches the total inline padding (48px):
+  // with one column the next column starts at the next viewport, and with two
+  // columns the third column starts at the next spread.  Using a smaller gap
+  // here makes a partial third column visible in double-page mode.
+  const paginationHorizontalPadding = BOOK_PAGINATION_COLUMN_GAP_PX
   const paginationContentWidth = Math.max(280, paginationViewportWidth - paginationHorizontalPadding)
+  const paginationLayout = paginationMode === "double"
+    ? paginationGeometry("double", paginationContentWidth)
+    : paginationGeometry("paginated", paginationContentWidth)
+  const paginationColumnGapPx = paginationLayout.gap
   const paginationColumnWidth = paginationMode === "double"
-    ? Math.max(120, Math.floor((paginationContentWidth - paginationColumnGapPx) / 2))
-    : paginationContentWidth
+    ? Math.max(120, paginationLayout.columnWidth)
+    : paginationLayout.columnWidth
   const readerFrameStyle: CSSProperties | undefined = isTextPagination
     ? { maxWidth: `${contentWidthPx + paginationHorizontalPadding}px`, marginInline: "auto" }
     : undefined
@@ -423,6 +443,9 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
   const searchIndex = useMemo(() => buildBookSearchIndex(chapters), [chapters])
 
   useEffect(() => {
+    const operation = ++searchOperationRef.current
+    searchAbortRef.current?.abort()
+    searchAbortRef.current = null
     const query = searchQuery.trim()
     if (query.length === 0) {
       setSearchHits([])
@@ -435,30 +458,31 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
       return
     }
     setSearchStatus("searching")
-    searchAbortRef.current?.abort()
     const controller = new AbortController()
     searchAbortRef.current = controller
+    const isCurrent = () => isBookSearchOperationCurrent(
+      operation,
+      searchOperationRef.current,
+      controller.signal,
+    )
     if (tauriRuntime && state.status === "ready" && mediaItemId) {
       const timer = window.setTimeout(() => {
-        void searchReaderContent(state.session, query)
-          .then((result) => {
-            if (controller.signal.aborted) return
-            const hits: BookSearchHit[] = result.hits.map((hit) => ({
-              chapterId: hit.chapterId,
-              chapterTitle: hit.chapterTitle,
-              chapterIndex: hit.chapterIndex,
-              paragraphIndex: hit.paragraphIndex,
-              progressionInChapter: hit.progressionInChapter,
-              exact: hit.textAnchor.exact ?? query,
-              prefix: hit.textAnchor.prefix ?? null,
-              suffix: hit.textAnchor.suffix ?? null,
-              score: hit.score,
-            }))
+        if (!isCurrent()) return
+        void searchBookWithRemoteFallback({
+          chapters,
+          index: searchIndex,
+          query,
+          signal: controller.signal,
+          remoteSearch: () => searchReaderContent(state.session, query),
+          isCurrent,
+        })
+          .then((hits) => {
+            if (hits === null || !isCurrent()) return
             setSearchHits(hits)
             setSearchStatus("done")
           })
           .catch(() => {
-            if (controller.signal.aborted) return
+            if (!isCurrent()) return
             setSearchHits([])
             setSearchStatus("done")
           })
@@ -466,16 +490,17 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
       return () => {
         window.clearTimeout(timer)
         controller.abort()
+        if (searchAbortRef.current === controller) searchAbortRef.current = null
       }
     }
     const timer = window.setTimeout(() => {
       try {
         const hits = searchBook(chapters, searchIndex, { query, signal: controller.signal })
-        if (controller.signal.aborted) return
+        if (!isCurrent()) return
         setSearchHits(hits)
         setSearchStatus("done")
       } catch (error) {
-        if ((error as DOMException)?.name === "AbortError") return
+        if ((error as DOMException)?.name === "AbortError" || !isCurrent()) return
         setSearchHits([])
         setSearchStatus("done")
       }
@@ -483,6 +508,7 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
     return () => {
       window.clearTimeout(timer)
       controller.abort()
+      if (searchAbortRef.current === controller) searchAbortRef.current = null
     }
   }, [chapters, mediaItemId, searchIndex, searchQuery, state, tauriRuntime])
 
@@ -542,7 +568,11 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
           ? await fetchSessionResource(sessionContentUri, { signal: abortController.signal })
           : resource
         if (resourceRequestRef.current !== requestId || abortController.signal.aborted) return
-        if (completeResource.contentType === "application/epub+zip") {
+        const completeMimeType = completeResource.contentType
+          .split(";")[0]
+          .trim()
+          .toLowerCase()
+        if (completeMimeType === "application/epub+zip") {
           const publication = await parseEpubBook(completeResource.bytes, abortController.signal)
           if (resourceRequestRef.current !== requestId || abortController.signal.aborted) return
           setContentState(publication.chapters.length === 0
@@ -557,7 +587,7 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
           return
         }
         const text = decodeBookText(completeResource.bytes, completeResource.contentType)
-        const format: BookContentFormat = completeResource.contentType === "text/markdown" ? "markdown" : "text"
+        const format: BookContentFormat = completeMimeType === "text/markdown" ? "markdown" : "text"
         const parsed = parseBookText(text, format)
         setContentState(parsed.length === 0
           ? { status: "empty", contentUri: sessionContentUri }
@@ -990,7 +1020,7 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
           <button type="button" onClick={() => navigate(-1)} aria-label="返回" className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-colors hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"><ArrowLeft className="h-[16px] w-[16px]" /></button>
           <div className="min-w-0">
             <p className="truncate text-sm font-semibold">{bookTitle}</p>
-            <p className="truncate text-[11px] opacity-55">{currentChapter?.title || "正在准备内容"} · {mediaItemId || "d3"}{isTextPagination && ` · 第 ${paginationPageIndex + 1}/${paginationPageCount} 页`}</p>
+            <p className="truncate text-[11px] opacity-55" aria-live="polite">{headerContext} · {mediaItemId || "d3"}{isTextPagination && ` · 第 ${paginationPageIndex + 1}/${paginationPageCount} 页`}</p>
           </div>
         </div>
         <div className="flex items-center gap-1">
@@ -1034,12 +1064,15 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
         {sessionView.status === "ready" && tauriRuntime && contentMatchesSession && (contentState.status === "retryable_error" || contentState.status === "terminal_error") && (
           <div className="flex h-full items-center justify-center px-6 text-center">
             <div className="max-w-sm space-y-3">
-              <p className="text-base font-semibold">{contentState.error.message}</p>
+              <p className="text-base font-semibold" role="alert">{contentState.error.message}</p>
               {contentState.status === "retryable_error" && (
                 <button type="button" onClick={() => setContentRetryNonce((value) => value + 1)} className="rounded-full border border-current/20 px-4 py-2 text-sm font-semibold transition-colors hover:bg-current/5">
                   重试
                 </button>
               )}
+              <button type="button" onClick={() => navigate(-1)} className="rounded-full border border-current/20 px-4 py-2 text-sm font-semibold transition-colors hover:bg-current/5">
+                返回详情
+              </button>
             </div>
           </div>
         )}
@@ -1077,7 +1110,7 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
           pdfProgressControllerRef.current?.locatorChange(locator)
         }} className="h-full overflow-y-auto" />}
         {contentReady && !pdfSource && <div ref={readerScrollRef} style={readerFrameStyle} className={cn("h-full overscroll-contain scroll-smooth [scrollbar-width:none] [&::-webkit-scrollbar]:hidden", isTextPagination ? "overflow-x-auto overflow-y-hidden" : "overflow-x-hidden overflow-y-auto")} aria-label={isTextPagination ? "图书分页阅读区" : "图书纵向阅读区"}>
-          <article ref={articleRef} className={cn("mx-auto w-full select-text px-6 pb-[128px] pt-14 sm:px-10 sm:pt-[80px]", FONT_CLASSES[fontFamily], isTextPagination && "break-inside-avoid")} style={articleStyle}>
+          <article ref={articleRef} className={cn("mx-auto w-full select-text pb-[128px] pt-14 sm:pt-[80px]", isTextPagination ? "px-6" : "px-6 sm:px-10", FONT_CLASSES[fontFamily], isTextPagination && "break-inside-avoid")} style={articleStyle}>
             <header className="break-inside-avoid border-b border-current/15 pb-[48px]">
               <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-primary">BOOK · LOCAL READER</p>
               <h1 className="mt-6 text-4xl font-semibold leading-[1.08] tracking-[-0.055em] sm:text-6xl">{bookTitle}</h1>
