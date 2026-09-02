@@ -602,14 +602,11 @@ impl SourceRegistryService {
         // 仅为仍然需要出厂端点的内置 OPDS 目录播种地址。CMS10 必须由用户
         // 明确填写端点，避免仓库默认指向具体的第三方采集站。
         for (source_id, factory) in default_opds_endpoints() {
-            match payload.endpoints.get(source_id).map(String::as_str) {
-                None => {
-                    payload
-                        .endpoints
-                        .insert(source_id.to_owned(), factory.to_owned());
-                    changed = true;
-                }
-                _ => {}
+            if !payload.endpoints.contains_key(source_id) {
+                payload
+                    .endpoints
+                    .insert(source_id.to_owned(), factory.to_owned());
+                changed = true;
             }
         }
         if first_install {
