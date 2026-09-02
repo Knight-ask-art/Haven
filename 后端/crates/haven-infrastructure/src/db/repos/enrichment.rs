@@ -96,6 +96,36 @@ impl EnrichmentRepository for SqliteEnrichmentRepository {
             .map_err(map_db_error("查询 enrichment 列表失败"))
     }
 
+    async fn list_stale_pending(
+        &self,
+        cutoff_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<EnrichmentState>, AppError> {
+        let conn = self.db.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT work_id, status, source_id, error, updated_at
+                 FROM enrichment_state
+                 WHERE status = 'pending' AND updated_at <= ?1
+                 ORDER BY updated_at ASC
+                 LIMIT ?2",
+            )
+            .map_err(map_db_error("查询陈旧 enrichment 状态失败"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![cutoff_ms, i64::from(limit)], |row| {
+                Ok(EnrichmentState {
+                    work_id: id_from_row(row.get::<_, String>("work_id")?)?,
+                    status: row.get("status")?,
+                    source_id: row.get("source_id")?,
+                    error: row.get("error")?,
+                    updated_at: UtcMillis(row.get("updated_at")?),
+                })
+            })
+            .map_err(map_db_error("查询陈旧 enrichment 状态失败"))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_db_error("查询陈旧 enrichment 状态失败"))
+    }
+
     async fn upsert(&self, state: &EnrichmentState) -> Result<(), AppError> {
         validate_status(&state.status)?;
         let conn = self.db.lock();
@@ -165,5 +195,29 @@ mod tests {
         assert_eq!(repo.list(Some(a)).await.unwrap()[0].work_id, a);
         assert_eq!(repo.list(None).await.unwrap().len(), 2);
         assert_eq!(repo.get(WorkId::new()).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn list_stale_pending_is_bounded_and_oldest_first() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repo = SqliteEnrichmentRepository::new(db);
+        let old = WorkId::new();
+        let newer = WorkId::new();
+        let fresh = WorkId::new();
+
+        let mut old_state = state(old, "pending");
+        old_state.updated_at = UtcMillis(10);
+        let mut newer_state = state(newer, "pending");
+        newer_state.updated_at = UtcMillis(20);
+        let mut fresh_state = state(fresh, "pending");
+        fresh_state.updated_at = UtcMillis(30);
+        repo.upsert(&old_state).await.unwrap();
+        repo.upsert(&newer_state).await.unwrap();
+        repo.upsert(&fresh_state).await.unwrap();
+
+        let stale = repo.list_stale_pending(20, 1).await.unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].work_id, old);
+        assert_eq!(stale[0].status, "pending");
     }
 }

@@ -8,7 +8,6 @@ import {
   Sun,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
-import { Live2DMascot } from "../components/Live2DMascot"
 import { HavenMascot } from "../components/mascot"
 
 function GithubIcon({ size = 16, className }: { size?: number; className?: string }) {
@@ -44,7 +43,7 @@ export function HomePage() {
       "relative flex min-h-full flex-col overflow-hidden transition-colors duration-500",
       isDark ? "bg-[#171717] text-[#f5f5f7]" : "bg-[#f7f7f5] text-[#1d1d1f]"
     )}>
-      {/* 云朵伴读背景层：居中呼吸云，右下角保留给 Live2D 看板娘 */}
+      {/* 云朵伴读背景层：居中呼吸云 */}
       <div className="pointer-events-none absolute inset-0 overflow-hidden">
         {/* z-20 提到 main(z-10) 之上，保证空白区域点击能落到云朵上 */}
         <div className="absolute left-1/2 top-[42%] z-20 aspect-square w-[clamp(280px,26vw,420px)] -translate-x-1/2 -translate-y-1/2">
@@ -217,8 +216,6 @@ export function HomePage() {
         </section>
       </main>
 
-      {/* 首页右下角二次元 Live2D 看板娘与宝可梦球交互组件 */}
-      <Live2DMascot />
     </div>
   )
 }

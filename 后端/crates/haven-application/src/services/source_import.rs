@@ -19,7 +19,7 @@ use haven_domain::enums::{
 use haven_domain::ids::{MediaItemId, ResourceId, SourceId, WorkId};
 use uuid::Uuid;
 
-use crate::services::ports::SourceImportPorts;
+use crate::services::ports::{SourceImportPorts, UnitOfWork};
 use crate::services::source_registry::SourceRegistryService;
 use crate::wire::ContentCategory;
 
@@ -100,6 +100,7 @@ pub trait SourceCatalogProvider: Send + Sync {
 #[derive(Clone)]
 pub struct SourceImportService {
     ports: Arc<dyn SourceImportPorts>,
+    uow: Arc<dyn UnitOfWork>,
     registry: SourceRegistryService,
     catalog: Arc<dyn SourceCatalogProvider>,
 }
@@ -137,14 +138,31 @@ pub const M3U_SOURCE_ID: &str = "m3u";
 impl SourceImportService {
     pub fn new(
         ports: Arc<dyn SourceImportPorts>,
+        uow: Arc<dyn UnitOfWork>,
         registry: SourceRegistryService,
         catalog: Arc<dyn SourceCatalogProvider>,
     ) -> Self {
         Self {
             ports,
+            uow,
             registry,
             catalog,
         }
+    }
+
+    /// 将一次来源导入的全部业务内容交给单一 SQLite 事务提交。
+    /// `source_ref` 与作品内容必须同生共灭，避免部分导入永久占用去重键。
+    fn persist_import(
+        &self,
+        provider: &str,
+        external_id: &str,
+        work: &Work,
+        edition: &Edition,
+        items: &[MediaItem],
+        resources: &[Resource],
+    ) -> Result<(), AppError> {
+        self.uow
+            .run_source_import(provider, external_id, work, edition, items, resources)
     }
 
     /// 导入（幂等）：已存在引用时直接返回既有身份。
@@ -231,10 +249,6 @@ impl SourceImportService {
             created_at: now,
             updated_at: now,
         };
-        WorkRepository::save(&*self.ports, &work).await?;
-        WorkRepository::save_source_ref(&*self.ports, SOURCE_PROVIDER, external_id, work.id)
-            .await?;
-
         let edition = Edition {
             id: haven_domain::ids::EditionId::new(),
             work_id: work.id,
@@ -250,9 +264,9 @@ impl SourceImportService {
             created_at: now,
             updated_at: now,
         };
-        EditionRepository::save(&*self.ports, &edition).await?;
 
-        let mut first_item: Option<MediaItemId> = None;
+        let mut items = Vec::with_capacity(entry.episodes.len());
+        let mut resources = Vec::with_capacity(entry.episodes.len());
         for (index, (label, url)) in entry.episodes.iter().enumerate() {
             let ordinal = index as u32 + 1;
             let index_kind = if media_type == MediaType::Movie {
@@ -278,7 +292,6 @@ impl SourceImportService {
                 created_at: now,
                 updated_at: now,
             };
-            MediaItemRepository::save(&*self.ports, &item).await?;
             let resource = Resource {
                 id: ResourceId::new(),
                 media_item_id: item.id,
@@ -298,13 +311,21 @@ impl SourceImportService {
                 created_at: now,
                 updated_at: now,
             };
-            ResourceRepository::save(&*self.ports, &resource).await?;
-            first_item.get_or_insert(item.id);
+            items.push(item);
+            resources.push(resource);
         }
 
-        let Some(media_item_id) = first_item else {
+        let Some(media_item_id) = items.first().map(|item| item.id) else {
             return Err(source_unavailable("采集站条目没有可播放地址"));
         };
+        self.persist_import(
+            SOURCE_PROVIDER,
+            external_id,
+            &work,
+            &edition,
+            &items,
+            &resources,
+        )?;
         Ok(ImportedWork {
             work_id: work.id,
             media_item_id,
@@ -598,9 +619,6 @@ impl SourceImportService {
             created_at: now,
             updated_at: now,
         };
-        WorkRepository::save(&*self.ports, &work).await?;
-        WorkRepository::save_source_ref(&*self.ports, source_key, external_id, work.id).await?;
-
         let edition = Edition {
             id: haven_domain::ids::EditionId::new(),
             work_id: work.id,
@@ -616,7 +634,6 @@ impl SourceImportService {
             created_at: now,
             updated_at: now,
         };
-        EditionRepository::save(&*self.ports, &edition).await?;
 
         let item = MediaItem {
             id: haven_domain::ids::MediaItemId::new(),
@@ -643,7 +660,6 @@ impl SourceImportService {
             created_at: now,
             updated_at: now,
         };
-        MediaItemRepository::save(&*self.ports, &item).await?;
 
         let resource = Resource {
             id: ResourceId::new(),
@@ -666,7 +682,14 @@ impl SourceImportService {
             created_at: now,
             updated_at: now,
         };
-        ResourceRepository::save(&*self.ports, &resource).await?;
+        self.persist_import(
+            source_key,
+            external_id,
+            &work,
+            &edition,
+            std::slice::from_ref(&item),
+            std::slice::from_ref(&resource),
+        )?;
         Ok(ImportedWork {
             work_id: work.id,
             media_item_id: item.id,
@@ -742,9 +765,6 @@ impl SourceImportService {
             created_at: now,
             updated_at: now,
         };
-        WorkRepository::save(&*self.ports, &work).await?;
-        WorkRepository::save_source_ref(&*self.ports, source_id, external_id, work.id).await?;
-
         let edition = Edition {
             id: haven_domain::ids::EditionId::new(),
             work_id: work.id,
@@ -760,7 +780,6 @@ impl SourceImportService {
             created_at: now,
             updated_at: now,
         };
-        EditionRepository::save(&*self.ports, &edition).await?;
 
         let item = MediaItem {
             id: haven_domain::ids::MediaItemId::new(),
@@ -787,7 +806,6 @@ impl SourceImportService {
             created_at: now,
             updated_at: now,
         };
-        MediaItemRepository::save(&*self.ports, &item).await?;
 
         let resource = Resource {
             id: ResourceId::new(),
@@ -819,7 +837,14 @@ impl SourceImportService {
             created_at: now,
             updated_at: now,
         };
-        ResourceRepository::save(&*self.ports, &resource).await?;
+        self.persist_import(
+            source_id,
+            external_id,
+            &work,
+            &edition,
+            std::slice::from_ref(&item),
+            std::slice::from_ref(&resource),
+        )?;
 
         Ok(ImportedWork {
             work_id: work.id,
@@ -902,93 +927,8 @@ impl SourceImportService {
             ));
         }
         stable_source_id(source_id)?;
-        return self
-            .import_remote_entry(source_id, &dedupe_external, entry, remote)
-            .await;
-
-        /* Legacy local-entry projection retained below for reference only. The
-         * remote import path above is the sole active path for OPDS candidates.
-        let edition = Edition {
-            id: haven_domain::ids::EditionId::new(),
-            work_id: work.id,
-            title: entry.title.clone(),
-            subtitle: None,
-            edition_type: media_type,
-            release_date: None,
-            language: None,
-            region: None,
-            publisher_or_studio: None,
-            description: None,
-            artwork: Default::default(),
-            created_at: now,
-            updated_at: now,
-        };
-        EditionRepository::save(&*self.ports, &edition).await?;
-
-        let object_id = acquired
-            .object_rel_path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&acquired.object_rel_path)
-            .to_owned();
-        let item = MediaItem {
-            id: haven_domain::ids::MediaItemId::new(),
-            edition_id: edition.id,
-            parent_id: None,
-            media_type,
-            title: entry.title.clone(),
-            index: haven_domain::entities::MediaIndex::Custom {
-                label: "正文".to_owned(),
-                ordinal: Some(1.0),
-            },
-            duration_ms: None,
-            page_count: None,
-            chapter_count: None,
-            published_at: None,
-            status: haven_domain::enums::MediaItemStatus::Available,
-            created_at: now,
-            updated_at: now,
-        };
-        MediaItemRepository::save(&*self.ports, &item).await?;
-
-        let location_id: haven_domain::ids::StorageLocationId =
-            acquired.storage_location_id.parse().map_err(|_| {
-                AppError::new(
-                    "INTERNAL_ERROR",
-                    ErrorKind::Internal,
-                    "存储位置身份解析失败",
-                    false,
-                )
-            })?;
-        let resource = Resource {
-            id: ResourceId::new(),
-            media_item_id: item.id,
-            resource_type: ResourceType::PublicationFile,
-            source_id: None,
-            storage_location_id: Some(location_id),
-            locator: haven_domain::entities::ResourceLocator::StorageObject {
-                provider_id: location_id,
-                object_id,
-                path_hint: Some(acquired.object_rel_path),
-            },
-            mime_type: Some(acquired.mime),
-            size: Some(acquired.size_bytes),
-            hash: None,
-            availability: Availability::Available,
-            availability_source: AvailabilitySource::User,
-            modified_ms: None,
-            fingerprint_first: None,
-            fingerprint_last: None,
-            created_at: now,
-            updated_at: now,
-        };
-        ResourceRepository::save(&*self.ports, &resource).await?;
-
-        Ok(ImportedWork {
-            work_id: work.id,
-            media_item_id: item.id,
-        })
-        */
+        self.import_remote_entry(source_id, &dedupe_external, entry, remote)
+            .await
     }
 
     /// enrichment 标题精确匹配（契约 §36.8）：CMS10 搜索后取标题完全相等的首条。

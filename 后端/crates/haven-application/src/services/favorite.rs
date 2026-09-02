@@ -128,6 +128,27 @@ impl UnitOfWork for MemUnitOfWork {
     ) -> Result<(), AppError> {
         f(&MemFavoriteTx)
     }
+
+    fn run_source_import(
+        &self,
+        _provider: &str,
+        _external_id: &str,
+        _work: &haven_domain::entities::Work,
+        _edition: &haven_domain::entities::Edition,
+        _items: &[haven_domain::entities::MediaItem],
+        _resources: &[haven_domain::entities::Resource],
+    ) -> Result<(), AppError> {
+        Err(source_import_uow_unavailable())
+    }
+}
+
+fn source_import_uow_unavailable() -> AppError {
+    AppError::new(
+        "INTERNAL_ERROR",
+        haven_common::ErrorKind::Internal,
+        "测试 UnitOfWork 不支持来源导入事务",
+        false,
+    )
 }
 
 struct MemFavoriteTx;
@@ -348,6 +369,18 @@ mod tests {
                 favorites: self.favorites.clone(),
                 revisions: self.revisions.clone(),
             })
+        }
+
+        fn run_source_import(
+            &self,
+            _provider: &str,
+            _external_id: &str,
+            _work: &haven_domain::entities::Work,
+            _edition: &haven_domain::entities::Edition,
+            _items: &[haven_domain::entities::MediaItem],
+            _resources: &[haven_domain::entities::Resource],
+        ) -> Result<(), AppError> {
+            Err(source_import_uow_unavailable())
         }
     }
 

@@ -176,8 +176,13 @@ The Tauri updater checks the fixed HTTPS GitHub Release endpoint and verifies
 minisign metadata before installation. The signing private key is configured
 only as GitHub Actions secrets; it is never committed to this repository.
 
+## Documentation
+
+- [CMS10 user configuration](CMS10_USER_CONFIG.md)
+- [Third-party notices](THIRD_PARTY_NOTICES.md)
+
 ## License
 
-Haven source code is released under the [MIT License](LICENSE). Vendored
-runtime components, Live2D models, fonts, and other third-party material remain
-subject to their own licenses and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Haven source code is released under the [MIT License](LICENSE). Third-party
+dependencies and other licensed material remain subject to their respective
+licenses and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
