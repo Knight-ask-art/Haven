@@ -70,10 +70,22 @@ pub fn run() {
         app.manage(state);
         tauri::async_runtime::spawn(async move {
             // 启动恢复失败不会阻止 UI 打开；任务仍保持可解释状态，可在下载页重试。
-            let _ = tauri::async_runtime::spawn_blocking(move || {
+            let result = tauri::async_runtime::spawn_blocking(move || {
                 tauri::async_runtime::block_on(download.resume_startable())
             })
             .await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    eprintln!(
+                        "[startup] download resume failed: {}",
+                        error.code().as_str()
+                    );
+                }
+                Err(error) => {
+                    eprintln!("[startup] download resume worker failed: {error}");
+                }
+            }
         });
         Ok(())
     })

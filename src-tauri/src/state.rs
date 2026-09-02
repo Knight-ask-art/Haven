@@ -346,8 +346,17 @@ impl AppState {
                                     });
                             }
                         }
-                        Ok(Err(_)) | Err(_) => {
-                            // 流水线失败不影响扫描终态；状态留在 pending/上次值。
+                        Ok(Err(error)) => {
+                            // 流水线失败不影响扫描终态；状态留在 pending/上次值，
+                            // 但必须保留错误码，避免后台失败完全不可见。
+                            eprintln!(
+                                "[enrichment] run_pending failed: {}",
+                                error.code().as_str()
+                            );
+                        }
+                        Err(error) => {
+                            // JoinError 包括 worker panic/取消；记录后仍不阻断扫描。
+                            eprintln!("[enrichment] run_pending worker failed: {error}");
                         }
                     }
                 })
