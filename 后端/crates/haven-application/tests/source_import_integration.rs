@@ -110,11 +110,16 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let db = Arc::new(Db::open_in_memory().expect("in-memory DB should open"));
-    let repos = Arc::new(SqliteRepositories::new(db));
+    let repos = Arc::new(SqliteRepositories::new(db.clone()));
     let import_ports: Arc<dyn SourceImportPorts> = repos.clone();
     let registry = SourceRegistryService::new(repos.clone());
     let catalog = Arc::new(FakeCatalog::default());
-    let service = SourceImportService::new(import_ports, registry.clone(), catalog.clone());
+    let service = SourceImportService::new(
+        import_ports,
+        Arc::new(haven_infrastructure::db::uow::SqliteUnitOfWork::new(db)),
+        registry.clone(),
+        catalog.clone(),
+    );
     Fixture {
         service,
         repos,

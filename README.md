@@ -131,8 +131,9 @@ Tauri 桌面版本已经接入固定的 HTTPS GitHub Release 检查链；在维�
 
 - [公开变更记录](CHANGELOG.md)
 - [内置来源能力表](SOURCES.md)
+- [CMS10 用户配置说明](CMS10_USER_CONFIG.md)
 - [第三方许可说明](THIRD_PARTY_NOTICES.md)
 
 ## License
 
-Haven 自有代码以 [MIT License](LICENSE) 发布。第三方依赖、Live2D 模型和运行时仍受各自许可证与 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 约束；发布制品会重新核对 Notice、许可证文本和资源 Hash。
+Haven 自有代码以 [MIT License](LICENSE) 发布。仓库中的第三方依赖和其他受许可约束的材料仍受各自许可证与 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 约束。

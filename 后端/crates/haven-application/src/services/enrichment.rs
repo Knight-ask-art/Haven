@@ -5,6 +5,7 @@
 //! 未命中/失败标 failed，不回滚扫描（保留原始名 Work）。
 //! 状态经 `enrichment_status` 查询；变更以 `metadata.changed` 事件广播。
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use haven_common::{AppError, ErrorKind, UtcMillis};
@@ -30,6 +31,8 @@ pub struct EnrichedWorkOutcome {
 const CMS10_SOURCE_ID: &str = "cms10";
 /// 单次流水线最大处理数（防扫描后风暴；剩余留待下次触发）。
 const MAX_BATCH: usize = 50;
+/// pending 超过该时长即视为上次进程在网络调用或状态写入间崩溃，允许恢复。
+const STALE_PENDING_AFTER_MS: i64 = 15 * 60 * 1_000;
 
 #[derive(Clone)]
 pub struct EnrichmentService {
@@ -63,49 +66,78 @@ impl EnrichmentService {
             .collect())
     }
 
-    /// 扫描完成钩子：对尚无 enrichment 记录的 Work 逐个入队执行。
+    /// 扫描完成钩子：对尚无 enrichment 记录的 Work 逐个入队执行；陈旧
+    /// pending 也会重新入队，以恢复进程崩溃留下的半完成状态。
     /// 单个 Work 失败不影响批次其余项；返回逐条结果。
     pub async fn run_pending(&self) -> Result<Vec<EnrichedWorkOutcome>, AppError> {
-        // 无 external 引用且无记录的 Work 即"新作品"。
-        let candidates: Vec<WorkId> = {
-            let all = WorkRepository::list(&*self.ports, MAX_BATCH as u32, 0).await?;
-            let mut pending = Vec::new();
-            for work in all {
-                if EnrichmentRepository::get(&*self.ports, work.id)
-                    .await?
-                    .is_none()
-                    && !WorkRepository::has_any_source_ref(&*self.ports, work.id).await?
-                {
-                    pending.push(work.id);
-                    if pending.len() >= MAX_BATCH {
-                        break;
-                    }
-                }
+        let cutoff_ms = UtcMillis::now().0.saturating_sub(STALE_PENDING_AFTER_MS);
+        let stale =
+            EnrichmentRepository::list_stale_pending(&*self.ports, cutoff_ms, MAX_BATCH as u32)
+                .await?;
+        let all = WorkRepository::list(&*self.ports, MAX_BATCH as u32, 0).await?;
+
+        let mut candidates = Vec::with_capacity(MAX_BATCH);
+        let mut seen = HashSet::new();
+
+        // 先处理恢复项，避免新作品很多时陈旧 pending 长期饥饿。
+        for state in stale {
+            if candidates.len() >= MAX_BATCH {
+                break;
             }
-            pending
-        };
+            let work_exists = WorkRepository::get(&*self.ports, state.work_id)
+                .await?
+                .is_some();
+            let eligible = !work_exists
+                || !WorkRepository::has_any_source_ref(&*self.ports, state.work_id).await?;
+            if eligible && seen.insert(state.work_id) {
+                candidates.push(state.work_id);
+            }
+        }
+
+        // 无 external 引用且无记录的 Work 即"新作品"；新鲜 pending 会被跳过。
+        for work in all {
+            if candidates.len() >= MAX_BATCH {
+                break;
+            }
+            if seen.contains(&work.id) {
+                continue;
+            }
+            if EnrichmentRepository::get(&*self.ports, work.id)
+                .await?
+                .is_none()
+                && !WorkRepository::has_any_source_ref(&*self.ports, work.id).await?
+            {
+                seen.insert(work.id);
+                candidates.push(work.id);
+            }
+        }
 
         let mut outcomes = Vec::new();
         for work_id in candidates {
-            outcomes.push(self.enrich_one(work_id).await?);
+            match self.enrich_one(work_id).await {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(_) => outcomes.push(EnrichedWorkOutcome {
+                    work_id,
+                    status: EnrichmentStatusWire::Failed,
+                }),
+            }
         }
         Ok(outcomes)
     }
 
     /// 对单个 Work 执行一次 enrichment（状态机 pending → enriched|failed）。
     async fn enrich_one(&self, work_id: WorkId) -> Result<EnrichedWorkOutcome, AppError> {
+        // 先确认 Work 存在，再写 pending。否则删除竞态或旧的孤儿任务会留下
+        // 永远阻塞后续队列的 pending 行。
+        let Some(work) = WorkRepository::get(&*self.ports, work_id).await? else {
+            self.record(work_id, "failed", None, Some("作品不存在"))
+                .await?;
+            return Ok(EnrichedWorkOutcome {
+                work_id,
+                status: EnrichmentStatusWire::Failed,
+            });
+        };
         self.record(work_id, "pending", None, None).await?;
-
-        let work = WorkRepository::get(&*self.ports, work_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::new(
-                    "RESOURCE_NOT_FOUND",
-                    ErrorKind::NotFound,
-                    "作品不存在",
-                    false,
-                )
-            })?;
 
         let outcome = match self
             .import
@@ -189,7 +221,7 @@ fn safe_error(err: &AppError) -> String {
 mod tests {
     use super::*;
     use crate::services::ports::EnrichmentPorts;
-    use haven_domain::contracts::WorkRepository;
+    use haven_domain::contracts::{EnrichmentRepository, WorkRepository};
     use haven_domain::entities::{ArtworkSet, Work};
     use haven_domain::enums::{WorkStatus, WorkType};
     use std::sync::Arc;
@@ -255,14 +287,20 @@ mod tests {
         crate::services::source_registry::SourceRegistryService,
     ) {
         let db = Arc::new(haven_infrastructure::db::Db::open_in_memory().unwrap());
-        let repos = Arc::new(haven_infrastructure::db::repos::SqliteRepositories::new(db));
+        let repos = Arc::new(haven_infrastructure::db::repos::SqliteRepositories::new(
+            db.clone(),
+        ));
         let import_ports: Arc<dyn crate::services::ports::SourceImportPorts> = repos.clone();
         let registry_ports: Arc<dyn crate::services::ports::SourceRegistryPorts> = repos.clone();
         let enrich_ports: Arc<dyn EnrichmentPorts> = repos.clone();
         let registry =
             crate::services::source_registry::SourceRegistryService::new(registry_ports.clone());
-        let import =
-            SourceImportService::new(import_ports, registry.clone(), Arc::new(FakeCatalog));
+        let import = SourceImportService::new(
+            import_ports,
+            Arc::new(NoopImportUnitOfWork),
+            registry.clone(),
+            Arc::new(FakeCatalog),
+        );
         // 预配置端点（settings KV 直写）。
         registry
             .set_endpoint(CMS10_SOURCE_ID, "http://ep.example.com")
@@ -273,6 +311,36 @@ mod tests {
             repos,
             registry,
         )
+    }
+
+    struct NoopImportUnitOfWork;
+
+    impl crate::services::ports::UnitOfWork for NoopImportUnitOfWork {
+        fn run_favorite(
+            &self,
+            _f: &dyn Fn(&dyn crate::services::ports::FavoriteTxPorts) -> Result<(), AppError>,
+        ) -> Result<(), AppError> {
+            Err(AppError::new(
+                "INTERNAL_ERROR",
+                ErrorKind::Internal,
+                "enrichment 测试 UnitOfWork 不支持收藏事务",
+                false,
+            ))
+        }
+
+        fn run_source_import(
+            &self,
+            _provider: &str,
+            _external_id: &str,
+            _work: &haven_domain::entities::Work,
+            _edition: &haven_domain::entities::Edition,
+            _items: &[haven_domain::entities::MediaItem],
+            _resources: &[haven_domain::entities::Resource],
+        ) -> Result<(), AppError> {
+            // Enrichment tests exercise the state machine; persistence atomicity
+            // is covered by the real SQLite UnitOfWork tests in infrastructure.
+            Ok(())
+        }
     }
 
     async fn seed_work(ports: &dyn EnrichmentPorts, title: &str) -> WorkId {
@@ -343,6 +411,102 @@ mod tests {
             0,
             "跳过的 Work 无 enrichment 记录"
         );
+    }
+
+    #[tokio::test]
+    async fn run_pending_retries_stale_pending_work() {
+        let (svc, ports, _registry) = fixture().await;
+        let work_id = seed_work(ports.as_ref(), "三体").await;
+        EnrichmentRepository::upsert(
+            ports.as_ref(),
+            &EnrichmentState {
+                work_id,
+                status: "pending".into(),
+                source_id: None,
+                error: None,
+                updated_at: UtcMillis(
+                    UtcMillis::now()
+                        .0
+                        .saturating_sub(STALE_PENDING_AFTER_MS + 1),
+                ),
+            },
+        )
+        .await
+        .unwrap();
+
+        let outcomes = svc.run_pending().await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].work_id, work_id);
+        assert_eq!(outcomes[0].status, EnrichmentStatusWire::Enriched);
+        assert_eq!(
+            svc.status(Some(work_id.to_string())).await.unwrap()[0].status,
+            EnrichmentStatusWire::Enriched
+        );
+    }
+
+    #[tokio::test]
+    async fn run_pending_skips_fresh_pending_work() {
+        let (svc, ports, _registry) = fixture().await;
+        let work_id = seed_work(ports.as_ref(), "三体").await;
+        EnrichmentRepository::upsert(
+            ports.as_ref(),
+            &EnrichmentState {
+                work_id,
+                status: "pending".into(),
+                source_id: None,
+                error: None,
+                updated_at: UtcMillis::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(svc.run_pending().await.unwrap().is_empty());
+        assert_eq!(
+            svc.status(Some(work_id.to_string())).await.unwrap()[0].status,
+            EnrichmentStatusWire::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn run_pending_reconciles_stale_pending_for_missing_work() {
+        let (svc, ports, _registry) = fixture().await;
+        let work_id = WorkId::new();
+        EnrichmentRepository::upsert(
+            ports.as_ref(),
+            &EnrichmentState {
+                work_id,
+                status: "pending".into(),
+                source_id: None,
+                error: None,
+                updated_at: UtcMillis(
+                    UtcMillis::now()
+                        .0
+                        .saturating_sub(STALE_PENDING_AFTER_MS + 1),
+                ),
+            },
+        )
+        .await
+        .unwrap();
+
+        let outcomes = svc.run_pending().await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].work_id, work_id);
+        assert_eq!(outcomes[0].status, EnrichmentStatusWire::Failed);
+        let state = svc.status(Some(work_id.to_string())).await.unwrap();
+        assert_eq!(state[0].status, EnrichmentStatusWire::Failed);
+    }
+
+    #[tokio::test]
+    async fn missing_work_does_not_leave_pending_state() {
+        let (svc, _ports, _registry) = fixture().await;
+        let work_id = WorkId::new();
+
+        let outcome = svc.enrich_one(work_id).await.unwrap();
+        assert_eq!(outcome.status, EnrichmentStatusWire::Failed);
+        let states = svc.status(Some(work_id.to_string())).await.unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].status, EnrichmentStatusWire::Failed);
     }
 
     #[tokio::test]

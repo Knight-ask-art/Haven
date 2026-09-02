@@ -295,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn in_memory_provider_maps_latest_schema_and_notices() {
+    fn in_memory_provider_maps_latest_schema_without_vendored_notices() {
         let db = Arc::new(Db::open_in_memory().unwrap());
         let provider = LocalAppInfoProvider::new(
             db,
@@ -306,12 +306,7 @@ mod tests {
         let facts = provider.get().unwrap();
         assert_eq!(facts.database_version, "028_work_relations");
         assert_eq!(facts.source_pack_version.as_deref(), Some("builtin-1"));
-        assert!(
-            facts
-                .third_party_notices
-                .iter()
-                .any(|notice| notice.license == "MIT")
-        );
+        assert!(facts.third_party_notices.is_empty());
         assert_eq!(facts.app_license.as_deref(), Some("MIT"));
     }
 
