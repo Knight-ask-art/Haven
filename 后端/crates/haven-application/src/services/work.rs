@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use haven_common::AppError;
-use haven_domain::contracts::WorkRepository;
+use haven_domain::contracts::{StorageLocationRepository, WorkRepository};
 use haven_domain::entities::{FavoriteTarget, Resource, ResourceLocator};
-use haven_domain::enums::Availability;
+use haven_domain::enums::{Availability, MediaType, StorageProviderType, StorageStatus};
 use haven_domain::ids::WorkId;
 
 use crate::mapper::work_card::{WorkCardInput, work_card};
@@ -44,12 +44,14 @@ impl WorkService {
         let mut selected = None;
         for item in &media_items {
             let resources = self.ports.list_by_media_item(item.id).await?;
-            available_resources += resources
-                .iter()
-                .filter(|resource| resource_is_actionable(resource))
-                .count() as u32;
-            if selected.is_none() && resources.iter().any(resource_is_actionable) {
-                selected = Some(item);
+            for resource in &resources {
+                if self
+                    .resource_is_actionable(resource, item.media_type)
+                    .await?
+                {
+                    available_resources += 1;
+                    selected.get_or_insert(item);
+                }
             }
             markers += self.ports.list_for_media_item(item.id).await?.len() as u32;
         }
@@ -160,13 +162,19 @@ impl WorkService {
                     match resource.availability {
                         haven_domain::enums::Availability::Available => {
                             available += 1;
-                            if resource_is_actionable(&resource) {
+                            if self
+                                .resource_is_actionable(&resource, item.media_type)
+                                .await?
+                            {
                                 action_item.get_or_insert(item);
                             }
                         }
                         haven_domain::enums::Availability::OfflineAvailable => {
                             offline_available += 1;
-                            if resource_is_actionable(&resource) {
+                            if self
+                                .resource_is_actionable(&resource, item.media_type)
+                                .await?
+                            {
                                 action_item.get_or_insert(item);
                             }
                         }
@@ -243,10 +251,15 @@ impl WorkService {
         let mut items = Vec::with_capacity(media_items.len());
         for item in media_items {
             let resources = self.ports.list_by_media_item(item.id).await?;
-            let available_resource_count = resources
-                .iter()
-                .filter(|resource| resource_is_actionable(resource))
-                .count() as u32;
+            let mut available_resource_count = 0u32;
+            for resource in &resources {
+                if self
+                    .resource_is_actionable(resource, item.media_type)
+                    .await?
+                {
+                    available_resource_count += 1;
+                }
+            }
             let progress_domain = self.ports.get_for_media_item(item.id).await?;
             let primary_action = if available_resource_count > 0 {
                 crate::mapper::work_card::primary_action(&WorkCardInput {
@@ -387,42 +400,148 @@ impl WorkService {
         let _ = WorkRepository::delete(&*self.ports, loser).await?;
         Ok(())
     }
-}
 
-/// Decide whether a persisted Resource may identify a detail-page action.
-///
-/// Existing library rows are intentionally read-only during an upgrade.  We
-/// therefore do not rewrite or delete malformed rows here; we simply prevent a
-/// stale/unknown remote identity from being selected as the work's primary
-/// action.  Valid local, storage-backed and HTTP resources keep their existing
-/// behavior, while `SourceObject` rows must pass the same fixed-provider
-/// validation used by Session/Resource services.
-fn resource_is_actionable(resource: &Resource) -> bool {
-    if !matches!(
-        resource.availability,
-        Availability::Available | Availability::OfflineAvailable
-    ) {
-        return false;
+    /// Project the detail-page action from the same resource/session policy
+    /// used by `session_open` and `stream_open`.  A persisted `Available` row
+    /// is not enough: local/storage resources must still resolve inside a
+    /// connected local root, while remote and HTTP resources must match a
+    /// fixed provider or an implemented stream transport.
+    async fn resource_is_actionable(
+        &self,
+        resource: &Resource,
+        media_type: MediaType,
+    ) -> Result<bool, AppError> {
+        if !matches!(
+            resource.availability,
+            Availability::Available | Availability::OfflineAvailable
+        ) {
+            return Ok(false);
+        }
+
+        match &resource.locator {
+            ResourceLocator::SourceObject {
+                source_id,
+                remote_id,
+            } => {
+                let Some(source_key) =
+                    crate::services::source_import::source_key_for_id(*source_id)
+                else {
+                    return Ok(false);
+                };
+                if resource.source_id != Some(*source_id)
+                    || crate::services::source_import::validate_remote_source_object(
+                        source_key,
+                        resource.resource_type,
+                        remote_id,
+                    )
+                    .is_err()
+                {
+                    return Ok(false);
+                }
+                let Some(engine) = engine_for_media_type(media_type) else {
+                    return Ok(false);
+                };
+                Ok(
+                    crate::services::session::resource_type_compatible(engine, resource)
+                        && crate::services::session::remote_session_compatible(
+                            resource.resource_type,
+                            resource.mime_type.as_deref(),
+                            source_key,
+                        ),
+                )
+            }
+            ResourceLocator::Http { url } => Ok(media_type_is_playback(media_type)
+                && crate::services::resource::http_stream_online_readable(
+                    resource.resource_type,
+                    url,
+                )),
+            ResourceLocator::LocalPath { path } => {
+                self.local_resource_is_actionable(resource, media_type, path)
+                    .await
+            }
+            ResourceLocator::StorageObject {
+                provider_id,
+                object_id,
+                path_hint,
+            } => {
+                if resource.storage_location_id != Some(*provider_id) {
+                    return Ok(false);
+                }
+                let path = path_hint.as_deref().unwrap_or(object_id.as_str());
+                self.local_resource_is_actionable(resource, media_type, path)
+                    .await
+            }
+        }
     }
 
-    let ResourceLocator::SourceObject {
-        source_id,
-        remote_id,
-    } = &resource.locator
-    else {
-        return true;
-    };
+    async fn local_resource_is_actionable(
+        &self,
+        resource: &Resource,
+        media_type: MediaType,
+        path: &str,
+    ) -> Result<bool, AppError> {
+        let Some(storage_id) = resource.storage_location_id else {
+            return Ok(false);
+        };
+        let Some(storage) = StorageLocationRepository::get(&*self.ports, storage_id).await? else {
+            return Ok(false);
+        };
+        if storage.provider_type != StorageProviderType::Local
+            || !matches!(
+                storage.status,
+                StorageStatus::Connected | StorageStatus::ReadOnly
+            )
+        {
+            return Ok(false);
+        }
+        let Ok(root) = std::fs::canonicalize(&storage.root_ref) else {
+            return Ok(false);
+        };
+        if !root.is_dir() {
+            return Ok(false);
+        }
+        let raw = if std::path::Path::new(path).is_absolute() {
+            std::path::PathBuf::from(path)
+        } else {
+            root.join(path)
+        };
+        let Ok(file) = std::fs::canonicalize(raw) else {
+            return Ok(false);
+        };
+        if file.strip_prefix(&root).is_err() {
+            return Ok(false);
+        }
+        let expects_directory =
+            resource.resource_type == haven_domain::enums::ResourceType::ImageSequence;
+        if (expects_directory && !file.is_dir()) || (!expects_directory && !file.is_file()) {
+            return Ok(false);
+        }
+        let Some(engine) = engine_for_media_type(media_type) else {
+            return Ok(false);
+        };
+        Ok(crate::services::session::resource_type_compatible(
+            engine, resource,
+        ))
+    }
+}
 
-    let Some(source_key) = crate::services::source_import::source_key_for_id(*source_id) else {
-        return false;
-    };
-    resource.source_id == Some(*source_id)
-        && crate::services::source_import::validate_remote_source_object(
-            source_key,
-            resource.resource_type,
-            remote_id,
-        )
-        .is_ok()
+fn engine_for_media_type(media_type: MediaType) -> Option<crate::wire::SessionEngineDto> {
+    match media_type {
+        MediaType::Movie | MediaType::Series | MediaType::Episode | MediaType::Audio => {
+            Some(crate::wire::SessionEngineDto::Playback)
+        }
+        MediaType::Book | MediaType::Document => Some(crate::wire::SessionEngineDto::Reader),
+        MediaType::Comic => Some(crate::wire::SessionEngineDto::Comic),
+        MediaType::Article => Some(crate::wire::SessionEngineDto::Article),
+        MediaType::Unknown => None,
+    }
+}
+
+fn media_type_is_playback(media_type: MediaType) -> bool {
+    matches!(
+        media_type,
+        MediaType::Movie | MediaType::Series | MediaType::Episode | MediaType::Audio
+    )
 }
 
 /// 季号投影（契约 §36.6）：仅 Episode 索引携带 season 时非 null。
@@ -569,17 +688,39 @@ mod tests {
     use super::*;
     use haven_domain::contracts::{
         EditionRepository, MediaItemRepository, ProgressRepository, ResourceRepository,
-        WorkRepository,
+        StorageLocationRepository, WorkRepository,
     };
-    use haven_domain::entities::{Edition, MediaIndex, MediaItem, Progress, Resource, Work};
+    use haven_domain::entities::{
+        Edition, MediaIndex, MediaItem, Progress, Resource, StorageLocation, Work,
+    };
     use haven_domain::enums::{
         Availability, AvailabilitySource, CompletionState, MediaItemStatus, MediaType,
-        ResourceType, WorkStatus, WorkType,
+        ResourceType, StorageProviderType, StorageStatus, WorkStatus, WorkType,
     };
-    use haven_domain::ids::{EditionId, MediaItemId};
+    use haven_domain::ids::{EditionId, MediaItemId, StorageLocationId};
     use haven_domain::locator::{Locator, VideoLocator};
     use haven_infrastructure::Db;
     use haven_infrastructure::db::repos::SqliteRepositories;
+    use tempfile::TempDir;
+
+    async fn local_storage(repos: &SqliteRepositories, root: &TempDir) -> StorageLocationId {
+        let id = StorageLocationId::new();
+        repos
+            .storage_location
+            .save(&StorageLocation {
+                id,
+                provider_type: StorageProviderType::Local,
+                display_name: "测试本地库".into(),
+                root_ref: root.path().to_string_lossy().into_owned(),
+                credential_ref: None,
+                status: StorageStatus::Connected,
+                created_at: haven_common::UtcMillis(1),
+                updated_at: haven_common::UtcMillis(1),
+            })
+            .await
+            .unwrap();
+        id
+    }
 
     fn sample_work(id: WorkId) -> Work {
         let now = haven_common::UtcMillis(1);
@@ -615,6 +756,9 @@ mod tests {
     async fn header_uses_one_selected_media_item_and_real_counts() {
         let db = std::sync::Arc::new(Db::open_in_memory().unwrap());
         let repos = std::sync::Arc::new(SqliteRepositories::new(db));
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("available.mkv"), b"video").unwrap();
+        let storage_id = local_storage(&repos, &root).await;
         let work = sample_work(WorkId::new());
         let edition = Edition {
             id: haven_domain::ids::EditionId::new(),
@@ -656,7 +800,7 @@ mod tests {
                 media_item_id: item.id,
                 resource_type: ResourceType::LocalFile,
                 source_id: None,
-                storage_location_id: None,
+                storage_location_id: Some(storage_id),
                 locator: haven_domain::entities::ResourceLocator::LocalPath {
                     path: "available.mkv".into(),
                 },
@@ -753,6 +897,9 @@ mod tests {
     async fn editions_choose_first_media_item_with_available_resource() {
         let db = std::sync::Arc::new(Db::open_in_memory().unwrap());
         let repos = std::sync::Arc::new(SqliteRepositories::new(db));
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("available.mkv"), b"video").unwrap();
+        let storage_id = local_storage(&repos, &root).await;
         let work = sample_work(WorkId::new());
         let edition = Edition {
             id: haven_domain::ids::EditionId::new(),
@@ -810,7 +957,7 @@ mod tests {
                 media_item_id: first.id,
                 resource_type: ResourceType::LocalFile,
                 source_id: None,
-                storage_location_id: None,
+                storage_location_id: Some(storage_id),
                 locator: haven_domain::entities::ResourceLocator::LocalPath {
                     path: "missing.mkv".into(),
                 },
@@ -834,7 +981,7 @@ mod tests {
                 media_item_id: second.id,
                 resource_type: ResourceType::LocalFile,
                 source_id: None,
-                storage_location_id: None,
+                storage_location_id: Some(storage_id),
                 locator: haven_domain::entities::ResourceLocator::LocalPath {
                     path: "available.mkv".into(),
                 },
@@ -898,6 +1045,9 @@ mod tests {
     async fn edition_detail_lists_real_media_items_and_disables_missing_resources() {
         let db = std::sync::Arc::new(Db::open_in_memory().unwrap());
         let repos = std::sync::Arc::new(SqliteRepositories::new(db));
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("chapter.md"), b"# chapter\n\nbody").unwrap();
+        let storage_id = local_storage(&repos, &root).await;
         let work = sample_work(WorkId::new());
         let edition = Edition {
             id: haven_domain::ids::EditionId::new(),
@@ -961,7 +1111,7 @@ mod tests {
                 media_item_id: available.id,
                 resource_type: ResourceType::LocalFile,
                 source_id: None,
-                storage_location_id: None,
+                storage_location_id: Some(storage_id),
                 locator: haven_domain::entities::ResourceLocator::LocalPath {
                     path: "chapter.md".into(),
                 },

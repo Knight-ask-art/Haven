@@ -155,7 +155,9 @@ fn validate_package_and_spine(
         .filter_map(|attrs| {
             let id = attrs.get("id")?.to_owned();
             let href = attrs.get("href")?.to_owned();
-            let media_type = attrs.get("media-type")?.to_ascii_lowercase();
+            let media_type = attrs
+                .get("media-type")
+                .map(|value| base_mime(value).to_ascii_lowercase())?;
             Some((id, (href, media_type)))
         })
         .collect::<HashMap<_, _>>();
@@ -401,7 +403,7 @@ impl LocalEpubTocProvider {
 
 impl ReaderTocProvider for LocalEpubTocProvider {
     fn extract(&self, session: &PreparedSession) -> Result<RawEpubToc, AppError> {
-        if session.mime_type.as_deref() != Some("application/epub+zip") {
+        if base_mime(session.mime_type.as_deref().unwrap_or("")) != "application/epub+zip" {
             return Err(format_unsupported_toc());
         }
         let source =
@@ -467,6 +469,7 @@ fn parse_publication_toc<R: Read + Seek>(
             .cloned()
             .unwrap_or_default()
             .to_ascii_lowercase();
+        let media_type = base_mime(&media_type).to_owned();
         let properties = attributes
             .get("properties")
             .cloned()
@@ -991,6 +994,13 @@ fn resolve_toc_href(
     Ok((normalized_path, fragment))
 }
 
+/// Compare MIME values by their media-type token.  Scanner probes and remote
+/// responses commonly append parameters such as `charset=utf-8`; those
+/// parameters must not make an otherwise supported EPUB unreadable.
+fn base_mime(value: &str) -> &str {
+    value.split(';').next().unwrap_or("").trim()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1065,6 +1075,25 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("book.epub");
         write_epub(&path, &valid_entries());
+        validate_epub_file(&path).unwrap();
+    }
+
+    #[test]
+    fn accepts_spine_document_with_media_type_parameters() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("book-with-mime-parameters.epub");
+        let entries = [
+            (
+                "META-INF/container.xml",
+                b"<container><rootfile full-path=\"OEBPS/content.opf\"/></container>".as_slice(),
+            ),
+            (
+                "OEBPS/content.opf",
+                b"<package><manifest><item id=\"chapter\" href=\"chapter.xhtml\" media-type=\"application/xhtml+xml; charset=utf-8\"/></manifest><spine><itemref idref=\"chapter\"/></spine></package>".as_slice(),
+            ),
+            ("OEBPS/chapter.xhtml", b"<html><body>content</body></html>".as_slice()),
+        ];
+        write_epub(&path, &entries);
         validate_epub_file(&path).unwrap();
     }
 
@@ -1440,6 +1469,36 @@ mod tests {
             provider.extract(&session).unwrap_err().code().as_str(),
             "FORMAT_UNSUPPORTED"
         );
+    }
+
+    #[test]
+    fn toc_provider_accepts_epub_mime_parameters() {
+        use haven_domain::enums::MediaType;
+        use haven_domain::ids::{ResourceId, StorageLocationId};
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("book.epub");
+        write_epub(&path, &valid_entries());
+        let provider = LocalEpubTocProvider::new();
+        let session = PreparedSession {
+            work_id: "w".into(),
+            edition_id: "e".into(),
+            media_item_id: "m".into(),
+            engine: haven_application::wire::SessionEngineDto::Reader,
+            resource_id: ResourceId::new(),
+            storage_location_id: Some(StorageLocationId::new()),
+            canonical_root: Some(std::fs::canonicalize(dir.path()).unwrap()),
+            canonical_file: Some(std::fs::canonicalize(path).unwrap()),
+            source: haven_application::services::PreparedSessionSource::Local,
+            mime_type: Some("application/epub+zip; charset=binary".into()),
+            media_type: MediaType::Book,
+            resource_type: haven_domain::enums::ResourceType::LocalFile,
+            comic_pages: None,
+            progress: None,
+        };
+
+        let toc = provider.extract(&session).unwrap();
+        assert_eq!(toc.spine, vec!["OEBPS/chapter.xhtml"]);
     }
 
     #[test]

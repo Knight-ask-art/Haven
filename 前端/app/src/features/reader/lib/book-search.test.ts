@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest"
 import {
   buildBookSearchIndex,
   fullWidthToHalfWidth,
+  isBookSearchOperationCurrent,
   normalizeForMatch,
   normalizeWithMap,
+  searchBookWithRemoteFallback,
   searchBook,
   textAnchorFromHit,
   tokenizeForRank,
@@ -108,5 +110,45 @@ describe("searchBook", () => {
     expect(anchor.exact).toBe(hit.exact)
     expect(anchor.prefix).toBe(hit.prefix)
     expect(anchor.suffix).toBe(hit.suffix)
+  })
+})
+
+describe("searchBookWithRemoteFallback", () => {
+  it("falls back to parsed chapters when remote reader search fails", async () => {
+    const chapters = [chapter("c1", ["火影忍者的故事从这里开始，鸣人踏上旅程"])]
+    const index = buildBookSearchIndex(chapters)
+    const remoteSearch = async () => { throw new Error("reader_search unavailable") }
+
+    await expect(searchBookWithRemoteFallback({
+      query: "火影忍者",
+      chapters,
+      index,
+      remoteSearch,
+    })).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ chapterId: "c1", paragraphIndex: 0 }),
+    ]))
+  })
+
+  it("does not let a superseded remote request produce fallback results", async () => {
+    const chapters = [chapter("c1", ["旧查询正文应该被丢弃"])]
+    const index = buildBookSearchIndex(chapters)
+    let currentOperation = 1
+    let resolveRemote: ((error: Error) => void) | undefined
+    const remoteSearch = () => new Promise<never>((_, reject) => {
+      resolveRemote = reject
+    })
+
+    const request = searchBookWithRemoteFallback({
+      query: "旧查询",
+      chapters,
+      index,
+      remoteSearch,
+      isCurrent: () => isBookSearchOperationCurrent(1, currentOperation),
+    })
+    currentOperation = 2
+    resolveRemote?.(new Error("late response"))
+
+    await expect(request).resolves.toBeNull()
+    expect(isBookSearchOperationCurrent(1, currentOperation)).toBe(false)
   })
 })

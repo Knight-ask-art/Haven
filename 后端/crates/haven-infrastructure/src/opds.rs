@@ -15,7 +15,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use haven_application::services::SourceRegistryService;
-use haven_application::services::ports::{RemoteAcquiredFile, RemoteAcquisitionPort};
+use haven_application::services::ports::{
+    RemoteAcquiredFile, RemoteAcquisitionPort, RemoteByteRange, RemoteContentRange,
+    RemoteSessionBody, RemoteSessionPort,
+};
 use haven_application::services::search_source::SearchSourceParticipant;
 use haven_application::services::source_import::{
     RemoteContentRef, SourceCatalogEntry, SourceCatalogProvider,
@@ -39,6 +42,10 @@ pub fn is_opds_source_id(source_id: &str) -> bool {
 
 const FEED_CAP_BYTES: usize = 8 * 1024 * 1024;
 const BOOK_CAP_BYTES: u64 = 64 * 1024 * 1024;
+/// The resource protocol and the browser EPUB parser both cap one response at
+/// 32 MiB. Keep online EPUB sessions below that boundary even though the
+/// explicit download path permits larger provider payloads.
+const ONLINE_EPUB_CAP_BYTES: usize = 32 * 1024 * 1024;
 const EPUB_MIME: &str = "application/epub+zip";
 const MAX_REDIRECTS: usize = 3;
 
@@ -701,6 +708,61 @@ fn validate_epub_payload(bytes: &[u8]) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Return a complete EPUB for ordinary Reader loads, or a safe inclusive byte
+/// slice for the initial resource-protocol probe.  Gutenberg does not provide
+/// a dependable Range endpoint for every mirror, so the provider obtains one
+/// bounded object and slices it in memory.  The online cap intentionally stays
+/// at the 32 MiB protocol/parser boundary; larger books remain download-first.
+fn bounded_epub_session_body(
+    bytes: Vec<u8>,
+    range: Option<RemoteByteRange>,
+) -> Result<RemoteSessionBody, AppError> {
+    let total = u64::try_from(bytes.len()).map_err(|_| invalid_feed("EPUB 大小无效"))?;
+    if total == 0 || total > ONLINE_EPUB_CAP_BYTES as u64 {
+        return Err(invalid_feed("EPUB 超出在线阅读大小限制"));
+    }
+    let Some(range) = range else {
+        return Ok(RemoteSessionBody {
+            mime_type: EPUB_MIME.to_owned(),
+            bytes,
+            total_size: total,
+            content_range: None,
+            accept_ranges: true,
+        });
+    };
+    if range.start >= total {
+        return Err(AppError::new(
+            "RANGE_INVALID",
+            ErrorKind::Validation,
+            "远端正文的范围请求无效",
+            false,
+        ));
+    }
+    let requested_end = range.end.unwrap_or(total - 1);
+    if requested_end < range.start {
+        return Err(AppError::new(
+            "RANGE_INVALID",
+            ErrorKind::Validation,
+            "远端正文的范围请求无效",
+            false,
+        ));
+    }
+    let end = requested_end.min(total - 1);
+    let start = usize::try_from(range.start).map_err(|_| invalid_feed("范围请求无效"))?;
+    let end_exclusive = usize::try_from(end + 1).map_err(|_| invalid_feed("范围请求无效"))?;
+    Ok(RemoteSessionBody {
+        mime_type: EPUB_MIME.to_owned(),
+        bytes: bytes[start..end_exclusive].to_vec(),
+        total_size: total,
+        content_range: Some(RemoteContentRange {
+            start: range.start,
+            end,
+            total,
+        }),
+        accept_ranges: true,
+    })
+}
+
 /// 内置三预设（匿名访问）；仅自定义 `custom_` 前缀源注入凭据。
 fn is_builtin_opds(source_id: &str) -> bool {
     OPDS_SOURCE_IDS.contains(&source_id)
@@ -853,6 +915,55 @@ impl RemoteAcquisitionPort for OpdsCatalogProvider {
     }
 }
 
+/// Gutenberg EPUBs are also readable in an online Reader session.  The
+/// provider deliberately keeps this path separate from `RemoteAcquisitionPort`:
+/// no file is created and no Offline Resource is registered when the reader
+/// probes or fetches the session URI.  We fetch a bounded, validated EPUB in
+/// infrastructure and only return the requested byte slice to the controlled
+/// resource protocol.
+#[async_trait]
+impl RemoteSessionPort for OpdsCatalogProvider {
+    async fn read(
+        &self,
+        source_key: &str,
+        remote_id: &str,
+        range: Option<RemoteByteRange>,
+    ) -> Result<RemoteSessionBody, AppError> {
+        if source_key != OPDS_SOURCE_GUTENBERG {
+            return Err(AppError::new(
+                "INVALID_ARGUMENT",
+                ErrorKind::Validation,
+                "未知远端书籍来源",
+                false,
+            ));
+        }
+
+        // The persisted remote identity is the Gutenberg OPDS entry page, not
+        // a caller-supplied download URL.  Re-validate it before every read,
+        // then resolve the EPUB link from the current entry metadata.
+        let entry_url = validate_builtin_gutenberg_url(remote_id)?;
+        let entry = self
+            .client
+            .fetch_entry_metadata(Some(source_key), entry_url.as_str())
+            .await?;
+        let epub_href = entry
+            .epub_href
+            .as_deref()
+            .ok_or_else(|| invalid_feed("该条目没有 EPUB 在线阅读链接"))?;
+        let epub_url = validate_builtin_gutenberg_url(epub_href)?;
+        let bytes = self
+            .client
+            .get_limited_with_host_fallback(
+                Some(source_key),
+                epub_url.as_str(),
+                ONLINE_EPUB_CAP_BYTES,
+            )
+            .await?;
+        validate_epub_payload(&bytes)?;
+        bounded_epub_session_body(bytes, range)
+    }
+}
+
 /// Download Worker 使用的远端来源路由。OPDS Provider 与 MangaDex/arXiv/
 /// Europe PMC/Wikisource Provider 都实现同一个 Application Port；组合根只需
 /// 注入此路由器即可，Worker 不需要知道具体 Infrastructure 类型。
@@ -881,6 +992,36 @@ impl RemoteAcquisitionPort for RoutingRemoteAcquisitionPort {
             self.online
                 .acquire(source_key, remote_id, destination)
                 .await
+        }
+    }
+}
+
+/// Routes remote Reader sessions to the provider that owns the source key.
+/// Keeping this router in infrastructure means `SessionService` and the Tauri
+/// protocol only depend on the narrow `RemoteSessionPort` contract.
+pub struct RoutingRemoteSessionPort {
+    opds: Arc<OpdsCatalogProvider>,
+    online: Arc<dyn RemoteSessionPort>,
+}
+
+impl RoutingRemoteSessionPort {
+    pub fn new(opds: Arc<OpdsCatalogProvider>, online: Arc<dyn RemoteSessionPort>) -> Self {
+        Self { opds, online }
+    }
+}
+
+#[async_trait]
+impl RemoteSessionPort for RoutingRemoteSessionPort {
+    async fn read(
+        &self,
+        source_key: &str,
+        remote_id: &str,
+        range: Option<RemoteByteRange>,
+    ) -> Result<RemoteSessionBody, AppError> {
+        if source_key == OPDS_SOURCE_GUTENBERG {
+            self.opds.read(source_key, remote_id, range).await
+        } else {
+            self.online.read(source_key, remote_id, range).await
         }
     }
 }
@@ -1236,6 +1377,50 @@ mod tests {
         writer.write_all(b"application/zip").unwrap();
         let wrong = writer.finish().unwrap().into_inner();
         assert!(validate_epub_payload(&wrong).is_err());
+    }
+
+    #[test]
+    fn online_epub_session_returns_complete_or_bounded_ranges() {
+        let body = bounded_epub_session_body(b"0123456789".to_vec(), None).unwrap();
+        assert_eq!(body.mime_type, EPUB_MIME);
+        assert_eq!(body.bytes, b"0123456789");
+        assert_eq!(body.total_size, 10);
+        assert!(body.content_range.is_none());
+        assert!(body.accept_ranges);
+
+        let body = bounded_epub_session_body(
+            b"0123456789".to_vec(),
+            Some(RemoteByteRange {
+                start: 2,
+                end: Some(5),
+            }),
+        )
+        .unwrap();
+        assert_eq!(body.bytes, b"2345");
+        assert_eq!(
+            body.content_range,
+            Some(RemoteContentRange {
+                start: 2,
+                end: 5,
+                total: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn online_epub_session_rejects_invalid_ranges() {
+        for range in [
+            RemoteByteRange {
+                start: 10,
+                end: None,
+            },
+            RemoteByteRange {
+                start: 5,
+                end: Some(4),
+            },
+        ] {
+            assert!(bounded_epub_session_body(b"0123456789".to_vec(), Some(range)).is_err());
+        }
     }
 
     #[tokio::test]

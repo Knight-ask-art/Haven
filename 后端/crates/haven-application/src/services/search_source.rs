@@ -960,6 +960,48 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn starting_search_on_an_empty_database_seeds_and_dispatches_cms10() {
+        let db = Arc::new(haven_infrastructure::Db::open_in_memory().unwrap());
+        let repos = Arc::new(haven_infrastructure::db::repos::SqliteRepositories::new(db));
+        let registry = SourceRegistryService::new(repos);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let participant = Arc::new(ImmediateParticipant {
+            id: "cms10".to_owned(),
+            calls: calls.clone(),
+        });
+        let sink = Arc::new(CaptureSink {
+            events: Mutex::new(Vec::new()),
+        });
+        let service = SearchSourceService::new(registry.clone(), vec![participant], sink);
+
+        service
+            .start(SearchSourceStartRequest {
+                query: "火影忍者".to_owned(),
+                category: Some(crate::wire::QueryCategory::Video),
+                limit_per_source: Some(1),
+            })
+            .await
+            .unwrap();
+
+        let seeded = registry.list().await.unwrap();
+        let cms10 = seeded
+            .sources
+            .iter()
+            .find(|source| source.source_id == "cms10")
+            .expect("空库搜索必须包含 CMS10 来源");
+        assert!(cms10.enabled);
+        assert!(cms10.endpoint_configured);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("CMS10 应被搜索调度");
+    }
+
     #[test]
     fn endpoint_gate_only_applies_to_configured_aggregate_sources() {
         let metadata = crate::wire::SourceDescriptorDto {
@@ -1073,6 +1115,28 @@ mod tests {
         )));
         for w in events.windows(2) {
             assert_eq!(w[1].sequence, w[0].sequence + 1);
+        }
+    }
+
+    struct ImmediateParticipant {
+        id: String,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SearchSourceParticipant for ImmediateParticipant {
+        fn source_id(&self) -> &str {
+            &self.id
+        }
+
+        async fn search(
+            &self,
+            _query: &str,
+            _limit: u32,
+            _is_cancelled: &(dyn Fn() -> bool + Send + Sync),
+        ) -> Result<Vec<WorkCardDto>, AppError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
         }
     }
 }

@@ -105,7 +105,6 @@ function ComicPageView({
   onLoad,
   onError,
   resourcePool,
-  onRelease,
 }: {
   page: ComicPageModel | null
   src: string | null
@@ -115,13 +114,10 @@ function ComicPageView({
   onLoad?: React.ReactEventHandler<HTMLImageElement>
   onError?: React.ReactEventHandler<HTMLImageElement>
   resourcePool?: ComicPageResourcePool | null
-  onRelease?: () => void
 }) {
   const [managedResource, setManagedResource] = useState<ComicPageResource | null>(null)
   const [managedError, setManagedError] = useState(false)
   const managed = Boolean(resourcePool && page?.availability === "ready")
-  const onReleaseRef = useRef(onRelease)
-  onReleaseRef.current = onRelease
 
   useEffect(() => {
     if (!managed || !resourcePool || !page || page.availability !== "ready") {
@@ -132,9 +128,13 @@ function ComicPageView({
     let disposed = false
     setManagedResource(null)
     setManagedError(false)
-    void resourcePool.load(page.pageNumber).then((result) => {
+    const request = resourcePool.load(page.pageNumber)
+    void request.then((result) => {
       if (disposed) {
-        if (result.status === "loaded") onReleaseRef.current?.()
+        // A request can resolve between unmount and its cleanup. The resource
+        // lease is consumer-specific and idempotent, so late completion cannot
+        // release the next page's permit.
+        if (result.status === "loaded") result.resource.release()
         return
       }
       if (result.status === "loaded") {
@@ -145,7 +145,7 @@ function ComicPageView({
     })
     return () => {
       disposed = true
-      onReleaseRef.current?.()
+      request.cancel()
     }
   }, [managed, page, resourcePool])
 
@@ -159,13 +159,14 @@ function ComicPageView({
   }
   return (
     <img
+      key={page.pageNumber}
       src={imageSrc}
       alt={alt}
       className={className}
       style={style}
       onLoad={(event) => {
         onLoad?.(event)
-        if (managed) onRelease?.()
+        if (managed) managedResource?.release()
       }}
       onError={(event) => {
         if (managed) {
@@ -173,7 +174,7 @@ function ComicPageView({
           setManagedResource(null)
         }
         onError?.(event)
-        if (managed) onRelease?.()
+        if (managed) managedResource?.release()
       }}
       loading={managed ? "eager" : "lazy"}
     />
@@ -329,6 +330,8 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
   const [stripViewportWidth, setStripViewportWidth] = useState(760)
   const [stripHeights, setStripHeights] = useState<Record<number, number>>({})
   const stripModeInitializedRef = useRef(false)
+  const previousStripOffsetsRef = useRef<readonly number[] | null>(null)
+  const previousStripAnchorPageRef = useRef<number | null>(null)
 
   // 图片尺寸缓存，用于跨页检测
   const [imageDimensions, setImageDimensions] = useState<Record<number, { width: number, height: number }>>({})
@@ -358,6 +361,8 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     setStripWindow({ start: 1, end: 8 })
     setStripHeights({})
     stripModeInitializedRef.current = false
+    previousStripOffsetsRef.current = null
+    previousStripAnchorPageRef.current = null
   }, [readerSessionIdentity])
 
   useEffect(() => {
@@ -549,11 +554,6 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     })
   }, [])
 
-  const releasePage = useCallback((pageNumber: number, generation: number) => {
-    if (resourcePoolGenerationRef.current !== generation) return
-    resourcePoolRef.current?.release(pageNumber)
-  }, [])
-
   const handlePageLoad = useCallback((pageNumber: number, event: React.SyntheticEvent<HTMLImageElement>, generation: number) => {
     markPageLoaded(pageNumber, event, generation)
   }, [markPageLoaded])
@@ -566,6 +566,13 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     const dim = imageDimensions[pageNum]
     return dim ? (dim.width / dim.height > 1.2) : false
   }, [imageDimensions])
+
+  const thumbnailStart = totalPages > 0 ? Math.max(1, Math.min(totalPages, currentPage - 24)) : 1
+  const thumbnailEnd = totalPages > 0 ? Math.min(totalPages, thumbnailStart + 48) : 0
+  const thumbnailPages = useMemo(
+    () => Array.from({ length: Math.max(0, thumbnailEnd - thumbnailStart + 1) }, (_, index) => thumbnailStart + index),
+    [thumbnailEnd, thumbnailStart],
+  )
 
   // 将页面编排成真正的 spread：宽幅页独占一屏，普通页才会和下一张组成跨页。
   // 当前页即使是跨页中的第二张，也会被归一到该 spread，避免跳页后出现错位。
@@ -603,13 +610,15 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
         { length: Math.max(0, stripWindow.end - stripWindow.start + 1) },
         (_, index) => stripWindow.start + index,
       )
-      return [...new Set([...mounted, ...nearby])]
+      const mountedAndNearby = [...new Set([...mounted, ...nearby])]
+      return isDrawerOpen ? [...new Set([...mountedAndNearby, ...thumbnailPages])] : mountedAndNearby
     }
     if (viewMode === "double") {
-      return [...new Set([...getSpreadForPage(currentPage), ...nearby])]
+      const spreadAndNearby = [...new Set([...getSpreadForPage(currentPage), ...nearby])]
+      return isDrawerOpen ? [...new Set([...spreadAndNearby, ...thumbnailPages])] : spreadAndNearby
     }
-    return nearby
-  }, [currentPage, getSpreadForPage, preloadRadius, stripWindow, totalPages, viewMode])
+    return isDrawerOpen ? [...new Set([...nearby, ...thumbnailPages])] : nearby
+  }, [currentPage, getSpreadForPage, isDrawerOpen, preloadRadius, stripWindow, thumbnailPages, totalPages, viewMode])
 
   useEffect(() => {
     if (demoMode || !sequence || totalPages <= 0) return
@@ -720,13 +729,21 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
 
   // 条漫滚动监听，同步进度
   const getStripPageHeight = useCallback((pageNum: number) => {
-    if (stripHeights[pageNum]) return stripHeights[pageNum]
+    // A bad page is rendered as the fixed 180px placeholder below. Using the
+    // normal image fallback for it would make the virtualized offset table
+    // reserve 420px for a 180px node, so the scroll position would drift every
+    // time a broken page entered the window.
+    const page = getPage(pageNum)
+    if (!page || page.availability === "unavailable" || failedPages.has(pageNum)) return 180
     const dimensions = imageDimensions[pageNum]
     if (dimensions?.width && dimensions.height) {
       return stripViewportWidth * (dimensions.height / dimensions.width)
     }
+    // Natural dimensions are populated before the measured DOM height. Use
+    // the ratio first so a viewport resize cannot keep an old pixel height.
+    if (stripHeights[pageNum]) return stripHeights[pageNum]
     return Math.max(420, stripViewportWidth * 1.35)
-  }, [imageDimensions, stripHeights, stripViewportWidth])
+  }, [failedPages, getPage, imageDimensions, stripHeights, stripViewportWidth])
 
   const stripPageOffsets = useMemo(() => {
     const offsets = Array<number>(totalPages + 2).fill(0)
@@ -736,6 +753,29 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     }
     return offsets
   }, [getStripPageHeight, pageGapPx, totalPages])
+
+  // Actual image dimensions arrive after the initial layout and a window
+  // resize changes every page's pixel height. Preserve the current page's
+  // viewport anchor when those offsets change; otherwise the same scrollTop
+  // would make progress jump to an unrelated page.
+  useLayoutEffect(() => {
+    if (viewMode !== "strip") {
+      previousStripOffsetsRef.current = null
+      previousStripAnchorPageRef.current = null
+      return
+    }
+    const previousOffsets = previousStripOffsetsRef.current
+    const previousPage = previousStripAnchorPageRef.current
+    const container = stripScrollRef.current
+    if (container && previousOffsets && previousPage === currentPage) {
+      const previousOffset = previousOffsets[currentPage] ?? 0
+      const nextOffset = stripPageOffsets[currentPage] ?? 0
+      const delta = nextOffset - previousOffset
+      if (Number.isFinite(delta) && delta !== 0) container.scrollTop += delta
+    }
+    previousStripOffsetsRef.current = stripPageOffsets
+    previousStripAnchorPageRef.current = currentPage
+  }, [currentPage, stripPageOffsets, viewMode])
 
   const getStripPageOffset = useCallback((pageNum: number) => {
     return stripPageOffsets[Math.max(1, Math.min(totalPages + 1, pageNum))] || 0
@@ -913,9 +953,6 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     return <ComicManifestStatus state={{ status: "error", message: "这部漫画没有可阅读页面", retryable: false }} onRetry={() => undefined} onBack={() => navigate(-1)} />
   }
 
-  const thumbnailStart = Math.max(1, Math.min(totalPages, currentPage - 24))
-  const thumbnailEnd = Math.min(totalPages, thumbnailStart + 48)
-  const thumbnailPages = Array.from({ length: Math.max(0, thumbnailEnd - thumbnailStart + 1) }, (_, index) => thumbnailStart + index)
   const renderResourcePoolGeneration = resourcePoolGenerationRef.current
   const renderResourcePool = demoMode ? null : resourcePoolRef.current
 
@@ -1047,7 +1084,6 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
               )}
               style={{ transform: `scale(${zoomScale})` }}
               resourcePool={renderResourcePool}
-              onRelease={() => releasePage(currentPage, renderResourcePoolGeneration)}
             />
           </div>
         )}
@@ -1073,7 +1109,6 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                       className="h-full w-auto max-w-[48%] rounded-r-md object-contain shadow-2xl"
                       style={{ transform: `scale(${zoomScale})` }}
                       resourcePool={renderResourcePool}
-                      onRelease={() => releasePage(spread[1], renderResourcePoolGeneration)}
                     />
                     <ComicPageView
                       page={getPage(spread[0])}
@@ -1084,7 +1119,6 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                       className="h-full w-auto max-w-[48%] rounded-l-md object-contain shadow-2xl"
                       style={{ transform: `scale(${zoomScale})` }}
                       resourcePool={renderResourcePool}
-                      onRelease={() => releasePage(spread[0], renderResourcePoolGeneration)}
                     />
                   </>
                 ) : (
@@ -1098,7 +1132,6 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                       className="h-full w-auto max-w-[48%] rounded-l-md object-contain shadow-2xl"
                       style={{ transform: `scale(${zoomScale})` }}
                       resourcePool={renderResourcePool}
-                      onRelease={() => releasePage(spread[0], renderResourcePoolGeneration)}
                     />
                     <ComicPageView
                       page={getPage(spread[1])}
@@ -1109,7 +1142,6 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                       className="h-full w-auto max-w-[48%] rounded-r-md object-contain shadow-2xl"
                       style={{ transform: `scale(${zoomScale})` }}
                       resourcePool={renderResourcePool}
-                      onRelease={() => releasePage(spread[1], renderResourcePoolGeneration)}
                     />
                   </>
                 )
@@ -1124,7 +1156,6 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                     className="h-full w-full rounded-md object-contain shadow-2xl"
                     style={{ transform: `scale(${zoomScale})` }}
                     resourcePool={renderResourcePool}
-                    onRelease={() => releasePage(spread[0], renderResourcePoolGeneration)}
                   />
                 )
               }
@@ -1138,19 +1169,25 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
             ref={stripScrollRef}
             onScroll={handleStripScroll}
             className="relative h-full w-full overflow-y-auto px-[16px] py-[32px] flex flex-col items-center custom-scrollbar [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-            style={{ gap: `${pageGapPx}px` }}
+            // Keep virtual offsets authoritative. A flex `gap` also applies
+            // between the top/bottom spacer and its neighbour, which creates
+            // phantom spacing not represented by stripPageOffsets. Page gaps
+            // are attached to the page wrappers instead.
+            style={{ gap: 0 }}
           >
             <div
               aria-hidden="true"
-              // The flex gap before the first mounted page already represents the
-              // gap after the last page in the omitted prefix. Subtract it from
-              // the spacer so page offsets stay exact when page spacing is set.
-              style={{ height: Math.max(0, getStripPageOffset(stripWindow.start) - (stripWindow.start > 1 ? pageGapPx : 0)) }}
+              style={{ height: getStripPageOffset(stripWindow.start) }}
             />
             {Array.from({ length: stripWindow.end - stripWindow.start + 1 }).map((_, index) => {
               const pageNum = stripWindow.start + index
               return (
-                <div key={pageNum} data-page={pageNum} className="relative w-full max-w-[760px]">
+                <div
+                  key={pageNum}
+                  data-page={pageNum}
+                  className="relative w-full max-w-[760px]"
+                  style={{ marginBottom: pageNum < totalPages ? pageGapPx : 0 }}
+                >
                   <ComicPageView
                     page={getPage(pageNum)}
                     src={getImageSrc(pageNum)}
@@ -1158,7 +1195,6 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                     alt={`第 ${pageNum} 页`}
                     className="w-full h-auto object-contain block"
                     resourcePool={renderResourcePool}
-                    onRelease={() => releasePage(pageNum, renderResourcePoolGeneration)}
                     onLoad={(e) => {
                       handlePageLoad(pageNum, e, renderResourcePoolGeneration)
                       // React 的事件对象在异步 state updater 执行前可能已经释放 currentTarget。
@@ -1173,7 +1209,10 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                 </div>
               )
             })}
-            <div aria-hidden="true" style={{ height: Math.max(0, getStripPageOffset(totalPages + 1) - getStripPageOffset(stripWindow.end + 1)) }} />
+            <div
+              aria-hidden="true"
+              style={{ height: Math.max(0, getStripPageOffset(totalPages + 1) - getStripPageOffset(stripWindow.end + 1)) }}
+            />
           </div>
         )}
       </main>
@@ -1355,7 +1394,6 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                     alt={`Page ${pageNum}`}
                     className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
                     resourcePool={renderResourcePool}
-                    onRelease={() => releasePage(pageNum, renderResourcePoolGeneration)}
                   />
                   <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent p-[8px] pt-6">
                     <span className="text-[11px] font-bold text-white drop-shadow-md">
