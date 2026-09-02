@@ -24,16 +24,30 @@
 
 ## Overview
 
-Haven is a Windows desktop application for keeping local media, books, comics,
-and reading progress together. Rust and SQLite own the local data model;
-React renders the interface and talks to the backend through typed, restricted
-Tauri commands. No account is required for the local core.
+<b>Haven (栖阅)</b>
+Haven (栖阅) is a Local-first desktop reading and multimedia library management
+tool.
 
-The public `v0.1.0-beta.1` snapshot contains the runnable Windows local core,
-build configuration, public IPC contract examples, and the runtime assets
-required by the application. `v0.1.0` is reserved for the later stable release.
-Internal plans, acceptance evidence, diagnostic exports, and release binaries
-are kept out of the source repository.
+The project combines a system-level backend with a modern frontend: file
+indexing, reading progress, media favorites, history, annotations, and settings
+are all powered by local Rust + SQLite to keep performance high and data
+private; React is used solely for interaction and presentation.
+
+Core features
+
+Local-first: No account is required; all local reading, media management, and
+data organization capabilities are available without signing in.
+
+Rust + SQLite storage engine: Efficiently manages large metadata collections
+and local file indexes with low resource usage and responsive queries.
+
+Controlled network security model: Network fetching, remote image loading, and
+external Provider calls are restricted by strict source allowlists and resource
+isolation policies to reduce privacy risks.
+
+Clean public repository architecture: The open-source repository focuses on the
+runnable core product, product test source, build configuration, and public
+contract examples, keeping the engineering structure concise and transparent.
 
 ## Core capabilities
 
