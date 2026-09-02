@@ -12,6 +12,14 @@
 
 export type BookPaginationMode = "scroll" | "paginated" | "double"
 
+/**
+ * The inline padding used by the paginated article is also the gap between
+ * columns.  Keeping these values equal makes the next column start exactly at
+ * the next reader viewport instead of leaking a sliver of a third column into
+ * a double-page spread.
+ */
+export const BOOK_PAGINATION_COLUMN_GAP_PX = 48
+
 export interface BookPaginationViewport {
   scrollLeft: number
   scrollTop: number
@@ -58,7 +66,7 @@ export function paginationGeometry(
   columnStride: number
   pageStride: number
 } {
-  const gap = mode === "double" ? 48 : 28
+  const gap = BOOK_PAGINATION_COLUMN_GAP_PX
   const columnWidth =
     mode === "double" ? Math.max(1, (contentWidth - gap) / 2) : Math.max(1, contentWidth)
   const columnsPerPage = mode === "double" ? 2 : 1

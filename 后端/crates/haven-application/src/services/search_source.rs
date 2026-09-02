@@ -104,7 +104,13 @@ struct RunningOp {
     operation_id: String,
     task_id: String,
     cancel: Arc<AtomicBool>,
-    /// 候选外部 ID 缓存（按 source_result 到达顺序；供导入定位，容量受限）。
+    /// 搜索结果句柄缓存（按 source_result 到达顺序；供导入定位，容量受限）。
+    ///
+    /// 这里必须缓存每一张展示卡片，而不只是可导入卡片：前端的
+    /// `operationId + index` 索引对应的是搜索结果的展示顺序。metadata-only
+    /// 卡片仍会在 `SourceImportService` 入口被明确拒绝，但不能从缓存中省略，
+    /// 否则后面的可导入卡片会发生索引漂移，用户点击 A 实际导入 B 或收到
+    /// `RESOURCE_NOT_FOUND`。
     candidates: Arc<Mutex<Vec<String>>>,
 }
 
@@ -697,21 +703,11 @@ async fn run_dispatch(
                         elapsed_ms: _,
                     } => {
                         {
-                            let mut cache = candidates.lock().unwrap_or_else(|e| e.into_inner());
-                            for card in &works {
-                                if card
-                                    .work_id
-                                    .starts_with(super::source_import::CMS10_CANDIDATE_PREFIX)
-                                    || card
-                                        .work_id
-                                        .starts_with(super::source_import::OPDS_CANDIDATE_PREFIX)
-                                    || card
-                                        .work_id
-                                        .starts_with(super::source_import::CONTENT_CANDIDATE_PREFIX)
-                                {
-                                    cache.push(card.work_id.clone());
-                                }
-                            }
+                            // `SearchSourceEventData.works` 与此缓存共享同一批次、同一
+                            // 到达顺序。缓存所有展示句柄，确保前端使用的 index 不会因
+                            // metadata-only 结果被跳过而错位；导入能力仍由
+                            // `SourceImportService::import_candidate` 最终裁决。
+                            cache_displayed_candidates(&candidates, &works);
                         }
                         emitter.emit(
                             SearchSourceEventKind::SourceResult,
@@ -748,6 +744,18 @@ async fn run_dispatch(
         End::Completed => None,
         End::Cancelled => Some(SearchSourceEventKind::Cancelled),
     }
+}
+
+/// Keep the import lookup index identical to the order in which cards are
+/// delivered in `SearchSourceEventData.works`.
+///
+/// Search results intentionally include metadata-only cards. They are useful
+/// to the user, but `SourceImportService` will reject their handles with a
+/// stable unsupported error. Omitting them here would make the UI's display
+/// index refer to a different array and could import the wrong work.
+fn cache_displayed_candidates(candidates: &Arc<Mutex<Vec<String>>>, works: &[WorkCardDto]) {
+    let mut cache = candidates.lock().unwrap_or_else(|e| e.into_inner());
+    cache.extend(works.iter().map(|card| card.work_id.clone()));
 }
 
 /// 只有需要访问用户配置端点的聚合来源才要求 `endpointConfigured`。
@@ -833,6 +841,50 @@ mod tests {
         }
     }
 
+    fn card(work_id: &str, title: &str) -> WorkCardDto {
+        WorkCardDto {
+            work_id: work_id.to_owned(),
+            title: title.to_owned(),
+            original_title: None,
+            description: None,
+            categories: vec![crate::wire::ContentCategory::Comic],
+            available_media_types: vec![crate::wire::MediaTypeDto::Comic],
+            poster_uri: None,
+            backdrop_uri: None,
+            release_year: None,
+            rating_value: None,
+            rating_scale: None,
+            favorite: false,
+            progress: None,
+            primary_action: None,
+            external_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn candidate_cache_preserves_display_index_for_mixed_results() {
+        let candidates = Arc::new(Mutex::new(Vec::new()));
+        let works = vec![
+            card("metadata-candidate-bangumi-1", "元数据结果"),
+            card("content-candidate-mangadex-2", "目标漫画"),
+        ];
+
+        cache_displayed_candidates(&candidates, &works);
+
+        let cached = candidates.lock().unwrap().clone();
+        assert_eq!(
+            cached,
+            vec![
+                "metadata-candidate-bangumi-1",
+                "content-candidate-mangadex-2",
+            ]
+        );
+        assert_eq!(
+            cached.get(1).map(String::as_str),
+            Some("content-candidate-mangadex-2")
+        );
+    }
+
     #[tokio::test]
     async fn searches_sources_concurrently() {
         let current = Arc::new(AtomicUsize::new(0));
@@ -906,6 +958,48 @@ mod tests {
         for w in events.windows(2) {
             assert_eq!(w[1].sequence, w[0].sequence + 1);
         }
+    }
+
+    #[tokio::test]
+    async fn starting_search_on_an_empty_database_seeds_and_dispatches_cms10() {
+        let db = Arc::new(haven_infrastructure::Db::open_in_memory().unwrap());
+        let repos = Arc::new(haven_infrastructure::db::repos::SqliteRepositories::new(db));
+        let registry = SourceRegistryService::new(repos);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let participant = Arc::new(ImmediateParticipant {
+            id: "cms10".to_owned(),
+            calls: calls.clone(),
+        });
+        let sink = Arc::new(CaptureSink {
+            events: Mutex::new(Vec::new()),
+        });
+        let service = SearchSourceService::new(registry.clone(), vec![participant], sink);
+
+        service
+            .start(SearchSourceStartRequest {
+                query: "火影忍者".to_owned(),
+                category: Some(crate::wire::QueryCategory::Video),
+                limit_per_source: Some(1),
+            })
+            .await
+            .unwrap();
+
+        let seeded = registry.list().await.unwrap();
+        let cms10 = seeded
+            .sources
+            .iter()
+            .find(|source| source.source_id == "cms10")
+            .expect("空库搜索必须包含 CMS10 来源");
+        assert!(cms10.enabled);
+        assert!(cms10.endpoint_configured);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("CMS10 应被搜索调度");
     }
 
     #[test]
@@ -1021,6 +1115,28 @@ mod tests {
         )));
         for w in events.windows(2) {
             assert_eq!(w[1].sequence, w[0].sequence + 1);
+        }
+    }
+
+    struct ImmediateParticipant {
+        id: String,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SearchSourceParticipant for ImmediateParticipant {
+        fn source_id(&self) -> &str {
+            &self.id
+        }
+
+        async fn search(
+            &self,
+            _query: &str,
+            _limit: u32,
+            _is_cancelled: &(dyn Fn() -> bool + Send + Sync),
+        ) -> Result<Vec<WorkCardDto>, AppError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
         }
     }
 }

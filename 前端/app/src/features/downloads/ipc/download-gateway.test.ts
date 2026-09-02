@@ -207,4 +207,33 @@ describe("getWorkDownloadState", () => {
 
     await expect(createDownloadForMediaItem("media-1", client as HavenClient)).resolves.toBe(created)
   })
+
+  it("keeps an explicitly online-readable stream playable without making it downloadable", async () => {
+    const stream: ResourceSummaryDto = {
+      resourceId: "stream-1",
+      resourceType: "hls_stream",
+      availability: "available",
+      mimeType: "application/vnd.apple.mpegurl",
+      size: null,
+      storageDisplayName: null,
+      sourceDisplayName: null,
+      isOffline: false,
+      isLocal: false,
+      requiresReauthorization: false,
+      canDownload: false,
+      canOnlineRead: true,
+      streamKind: "hls",
+    }
+
+    await expect(getMediaItemDownloadInfo(
+      "media-1",
+      clientWith([], { schemaVersion: 1, items: [stream] }),
+    )).resolves.toMatchObject({
+      status: "idle",
+      canDownload: false,
+      canOnlineRead: true,
+      hasOfflineResource: false,
+      sourceResourceId: null,
+    })
+  })
 })

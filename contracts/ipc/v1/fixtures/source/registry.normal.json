@@ -81,10 +81,10 @@
     {
       "sourceId": "opds_gutenberg",
       "displayName": "古腾堡计划（OPDS）",
-      "kinds": ["search", "offline_download"],
+      "kinds": ["search", "online_read", "offline_download"],
       "categories": ["book"],
       "mode": "single",
-      "notes": "公开 OPDS 图书目录，搜索结果可下载 EPUB。",
+      "notes": "公开 OPDS 图书目录，搜索后可在线读取 EPUB，也可下载保存。",
       "enabled": false,
       "health": "unknown",
       "endpointConfigured": true

@@ -524,7 +524,7 @@ export async function parseEpubBook(bytes: ArrayBuffer, signal?: AbortSignal): P
   for (const attributes of findTags(opfXml, "item")) {
     const id = attributes.get("id")
     const href = attributes.get("href")
-    const mediaType = attributes.get("media-type")?.toLowerCase()
+    const mediaType = attributes.get("media-type")?.split(";", 1)[0].trim().toLowerCase()
     if (!id || !href || !mediaType) continue
     if (manifest.has(id)) throw denied("EPUB manifest 包含重复条目")
     manifest.set(id, { id, href, mediaType })

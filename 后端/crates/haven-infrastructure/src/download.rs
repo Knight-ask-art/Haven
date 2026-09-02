@@ -13,6 +13,9 @@ use async_trait::async_trait;
 use haven_application::services::download_batch::DownloadBatchService;
 use haven_application::services::ports::RemoteAcquisitionPort;
 use haven_application::services::settings::SettingsService;
+use haven_application::services::source_import::{
+    source_key_for_id, validate_remote_source_object,
+};
 use haven_application::services::{DownloadEventSink, DownloadRunner, OfflineResourceFiles};
 use haven_common::{AppError, ErrorKind};
 use haven_domain::contracts::{DownloadRepository, ResourceRepository, StorageLocationRepository};
@@ -529,6 +532,12 @@ impl LocalDownloadRunner {
                 path_hint,
                 ..
             } => {
+                if resource.storage_location_id != Some(*provider_id) {
+                    return Err(DownloadWorkerFailure::new(
+                        "DOWNLOAD_SOURCE_UNAVAILABLE",
+                        false,
+                    ));
+                }
                 let source_storage = self
                     .repos
                     .storage_location
@@ -890,9 +899,21 @@ impl LocalDownloadRunner {
         source_id: haven_domain::ids::SourceId,
         remote_id: &str,
     ) -> Result<(), DownloadWorkerFailure> {
-        let source_key =
-            haven_application::services::source_import::source_key_for_id(source_id)
-                .ok_or_else(|| DownloadWorkerFailure::new("DOWNLOAD_SOURCE_UNAVAILABLE", false))?;
+        let source_key = source_key_for_id(source_id)
+            .ok_or_else(|| DownloadWorkerFailure::new("DOWNLOAD_SOURCE_UNAVAILABLE", false))?;
+        // The task may have been queued before the resource row changed.  Do
+        // not let a worker consume a mutated SourceObject merely because its
+        // locator still yields a known provider key: the persisted source_id,
+        // resource type and opaque remote identity must remain one validated
+        // tuple at execution time as well as at task creation time.
+        if resource.source_id != Some(source_id)
+            || validate_remote_source_object(source_key, resource.resource_type, remote_id).is_err()
+        {
+            return Err(DownloadWorkerFailure::new(
+                "DOWNLOAD_SOURCE_UNAVAILABLE",
+                false,
+            ));
+        }
         let offline_dir = download_category_dir(Path::new(&storage.root_ref), resource);
         fs::create_dir_all(&offline_dir)
             .await
@@ -2364,6 +2385,7 @@ mod tests {
         failure: Option<(&'static str, bool)>,
         started: Option<Arc<Notify>>,
         release: Option<Arc<Notify>>,
+        calls: Option<Arc<AtomicUsize>>,
     }
 
     impl TestRemoteAcquisition {
@@ -2374,6 +2396,18 @@ mod tests {
                 failure: None,
                 started: None,
                 release: None,
+                calls: None,
+            }
+        }
+
+        fn recording(payload: Vec<u8>, mime: &str, calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                payload,
+                mime: mime.to_owned(),
+                failure: None,
+                started: None,
+                release: None,
+                calls: Some(calls),
             }
         }
 
@@ -2384,6 +2418,7 @@ mod tests {
                 failure: Some((code, retryable)),
                 started: None,
                 release: None,
+                calls: None,
             }
         }
 
@@ -2399,6 +2434,7 @@ mod tests {
                 failure: None,
                 started: Some(started),
                 release: Some(release),
+                calls: None,
             }
         }
     }
@@ -2411,6 +2447,9 @@ mod tests {
             _remote_id: &str,
             destination: &Path,
         ) -> Result<RemoteAcquiredFile, AppError> {
+            if let Some(calls) = &self.calls {
+                calls.fetch_add(1, Ordering::Relaxed);
+            }
             if let Some((code, retryable)) = self.failure {
                 return Err(AppError::new(
                     code,
@@ -2438,6 +2477,55 @@ mod tests {
                 mime: self.mime.clone(),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn remote_worker_revalidates_resource_identity_before_provider_call() {
+        let (target_root, _db, repos, settings, task, resource) = seed_remote_download(
+            "mangadex",
+            MediaType::Comic,
+            ResourceType::ComicArchive,
+            "application/vnd.comicbook+zip",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        )
+        .await;
+        let arxiv_id =
+            haven_application::services::source_import::stable_source_id("arxiv").unwrap();
+        let mut tampered = resource.clone();
+        tampered.source_id = Some(arxiv_id);
+        tampered.locator = ResourceLocator::SourceObject {
+            source_id: arxiv_id,
+            remote_id: "2401.12345".into(),
+        };
+        repos.resource.save(&tampered).await.unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runner = LocalDownloadRunner::new_with_remote(
+            repos.clone(),
+            settings,
+            Arc::new(NoopDownloadEventSink),
+            Arc::new(DownloadBatchService::new(repos.clone())),
+            Arc::new(TestRemoteAcquisition::recording(
+                zip_payload("page-0001.jpg", b"jpg"),
+                "application/vnd.comicbook+zip",
+                calls.clone(),
+            )),
+        );
+        runner.run(task.id).await;
+
+        let result = repos.download.get(task.id).await.unwrap().unwrap();
+        assert_eq!(result.state, DownloadState::Failed);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(!target_root.path().join("comics").exists());
+        assert!(
+            repos
+                .resource
+                .list_by_media_item(resource.media_item_id)
+                .await
+                .unwrap()
+                .iter()
+                .all(|item| item.id == resource.id)
+        );
     }
 
     fn zip_payload(file_name: &str, content: &[u8]) -> Vec<u8> {
@@ -2628,7 +2716,7 @@ mod tests {
                 MediaType::Comic,
                 ResourceType::ComicArchive,
                 "application/vnd.comicbook+zip",
-                "manga:chapter",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
                 "cbz",
                 "comics",
                 zip_payload("page-0001.jpg", b"jpg"),
@@ -2803,7 +2891,7 @@ mod tests {
             MediaType::Comic,
             ResourceType::ComicArchive,
             "application/vnd.comicbook+zip",
-            "manga:chapter",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
         )
         .await;
         let started = Arc::new(Notify::new());

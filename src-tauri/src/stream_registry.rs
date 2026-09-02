@@ -5,7 +5,7 @@
 //!   收敛进白名单（防 SSRF：代理不会打开 grant 未学习到的任意地址）。
 //! - 原始 URL 永不出本注册表。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -31,8 +31,23 @@ pub struct StreamGrantInner {
     pub owner_label: String,
     initial_host: String,
     allowed_hosts: Mutex<HashSet<String>>,
+    /// Opaque tokens for HLS manifest targets.  The browser receives only the
+    /// token in the proxy URI; the real upstream URL remains in this
+    /// owner-bound registry entry.
+    targets: Mutex<HashMap<String, String>>,
+    /// Insertion order for `targets`. `HashMap` iteration order is deliberately
+    /// unspecified, so it cannot be used to implement the bounded eviction
+    /// policy safely.
+    target_order: Mutex<VecDeque<String>>,
+    /// Manifest hosts learned after the initial request. Keep their insertion
+    /// order separately so a hostile manifest cannot grow this set without
+    /// bound. The initial host is retained independently and never evicted.
+    host_order: Mutex<VecDeque<String>>,
     created_at: Instant,
 }
+
+const TARGET_CAP: usize = 512;
+const LEARNED_HOST_CAP: usize = 64;
 
 impl StreamGrantInner {
     /// 目标主机是否被授权（初始主机或 manifest 学习到的主机）。
@@ -49,7 +64,77 @@ impl StreamGrantInner {
     /// 学习（收敛）manifest 中出现的主机。
     pub fn learn_hosts(&self, hosts: impl IntoIterator<Item = impl Into<String>>) {
         let mut allowed = self.allowed_hosts.lock().unwrap_or_else(|e| e.into_inner());
-        allowed.extend(hosts.into_iter().map(Into::into));
+        let mut order = self.host_order.lock().unwrap_or_else(|e| e.into_inner());
+        for host in hosts.into_iter().map(Into::into) {
+            // `rewrite_hls_manifest` supplies normalized hosts from `host_of`,
+            // but keep this method defensive because it is the registry's
+            // security boundary and is also exercised directly by tests.
+            if host.is_empty()
+                || host.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+                || host == self.initial_host
+                || !allowed.insert(host.clone())
+            {
+                continue;
+            }
+            order.push_back(host);
+            while order.len() > LEARNED_HOST_CAP {
+                let Some(oldest) = order.pop_front() else {
+                    break;
+                };
+                allowed.remove(&oldest);
+            }
+        }
+    }
+
+    /// Register one validated absolute target and return an opaque UUID token.
+    /// The token is intentionally independent of the target contents so a
+    /// browser-visible manifest cannot disclose the upstream URL. Reuse an
+    /// existing token for repeated URIs so a manifest with repeated segments
+    /// cannot consume the bounded target table unnecessarily.
+    pub fn register_target(&self, target: &str) -> String {
+        let mut targets = self.targets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut order = self.target_order.lock().unwrap_or_else(|e| e.into_inner());
+
+        if let Some(token) = targets
+            .iter()
+            .find_map(|(token, value)| (value == target).then(|| token.clone()))
+        {
+            // Refresh the insertion order as a small LRU rule. A target that
+            // remains referenced by a later manifest should outlive stale
+            // targets when the table reaches its cap.
+            if let Some(position) = order.iter().position(|item| item == &token) {
+                order.remove(position);
+            }
+            order.push_back(token.clone());
+            return token;
+        }
+
+        let token = Uuid::new_v4().to_string();
+        while targets.len() >= TARGET_CAP {
+            let Some(oldest) = order.pop_front() else {
+                // The order list is an internal invariant. If it is ever
+                // damaged, fail closed by removing one actual target rather
+                // than allowing an unbounded map to grow.
+                if let Some(oldest) = targets.keys().next().cloned() {
+                    targets.remove(&oldest);
+                }
+                break;
+            };
+            targets.remove(&oldest);
+        }
+        targets.insert(token.clone(), target.to_owned());
+        order.push_back(token.clone());
+        token
+    }
+
+    /// Resolve a browser-provided target token.  Callers must still apply the
+    /// grant's host policy to the resolved URL before issuing a request.
+    pub fn resolve_target(&self, token: &str) -> Option<String> {
+        self.targets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(token)
+            .cloned()
     }
 }
 
@@ -79,6 +164,9 @@ impl StreamRegistry {
             owner_label: owner_label.to_owned(),
             initial_host,
             allowed_hosts: Mutex::new(hosts),
+            targets: Mutex::new(HashMap::new()),
+            target_order: Mutex::new(VecDeque::new()),
+            host_order: Mutex::new(VecDeque::new()),
             created_at: Instant::now(),
         });
         let mut grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
@@ -122,19 +210,22 @@ impl StreamRegistry {
 
 /// 从 URL 提取小写 host。
 pub(crate) fn host_of(url: &str) -> Option<String> {
-    let (scheme, rest) = url.split_once("://")?;
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+    if url.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
         return None;
     }
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    let host = host.split(':').next().unwrap_or(host);
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_ascii_lowercase())
+    let parsed = url.parse::<reqwest::Url>().ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
     }
+    parsed.host_str().map(|host| {
+        host.strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .unwrap_or(host)
+            .to_ascii_lowercase()
+    })
 }
 
 #[cfg(test)]
@@ -180,6 +271,23 @@ mod tests {
     }
 
     #[test]
+    fn learned_hosts_are_bounded_and_evict_oldest_non_initial_host() {
+        let registry = StreamRegistry::new();
+        let grant = registry.register(facts(), "https://cdn.example.com/a.m3u8", "main");
+        let inner = registry.lookup(&grant.to_string(), "main").unwrap();
+
+        inner.learn_hosts(
+            (0..(LEARNED_HOST_CAP + 2)).map(|index| format!("segment-{index}.example.net")),
+        );
+
+        assert!(inner.host_allowed("cdn.example.com"), "初始主机不能被淘汰");
+        assert!(!inner.host_allowed("segment-0.example.net"));
+        assert!(!inner.host_allowed("segment-1.example.net"));
+        assert!(inner.host_allowed("segment-2.example.net"));
+        assert!(inner.host_allowed("segment-65.example.net"));
+    }
+
+    #[test]
     fn host_of_extracts_lowercased_host() {
         assert_eq!(
             host_of("HTTPS://CDN.Example.COM:8443/a/x.ts").as_deref(),
@@ -187,5 +295,65 @@ mod tests {
         );
         assert_eq!(host_of("ftp://x/y"), None);
         assert_eq!(host_of("not-a-url"), None);
+        assert_eq!(
+            host_of("https://[2001:DB8::10]:8443/a/x.ts").as_deref(),
+            Some("2001:db8::10")
+        );
+        assert_eq!(host_of("https://user:secret@cdn.example.com/a"), None);
+        assert_eq!(host_of("https://cdn.example.com/a\n.ts"), None);
+    }
+
+    #[test]
+    fn target_tokens_are_opaque_and_owner_bound() {
+        let registry = StreamRegistry::new();
+        let grant = registry.register(facts(), "https://cdn.example.com/a.m3u8", "main");
+        let inner = registry.lookup(&grant.to_string(), "main").unwrap();
+        let token = inner.register_target("https://cdn.example.com/seg-01.ts");
+        assert_eq!(token.len(), 36);
+        assert!(!token.contains("://"));
+        assert_eq!(
+            inner.resolve_target(&token).as_deref(),
+            Some("https://cdn.example.com/seg-01.ts")
+        );
+        assert!(registry.lookup(&grant.to_string(), "other").is_none());
+    }
+
+    #[test]
+    fn target_tokens_evict_in_insertion_order() {
+        let registry = StreamRegistry::new();
+        let grant = registry.register(facts(), "https://cdn.example.com/a.m3u8", "main");
+        let inner = registry.lookup(&grant.to_string(), "main").unwrap();
+        let first = inner.register_target("https://cdn.example.com/first.ts");
+        let second = inner.register_target("https://cdn.example.com/second.ts");
+
+        for index in 0..TARGET_CAP {
+            inner.register_target(&format!("https://cdn.example.com/segment-{index}.ts"));
+        }
+
+        assert_eq!(inner.resolve_target(&first), None, "最早令牌应先淘汰");
+        assert_eq!(inner.resolve_target(&second), None, "第二早令牌也应被淘汰");
+        let last = inner.register_target("https://cdn.example.com/last.ts");
+        assert_eq!(
+            inner.resolve_target(&last).as_deref(),
+            Some("https://cdn.example.com/last.ts")
+        );
+    }
+
+    #[test]
+    fn repeated_target_reuses_token_and_refreshes_eviction_order() {
+        let registry = StreamRegistry::new();
+        let grant = registry.register(facts(), "https://cdn.example.com/a.m3u8", "main");
+        let inner = registry.lookup(&grant.to_string(), "main").unwrap();
+        let repeated = "https://cdn.example.com/repeated.ts";
+        let first = inner.register_target(repeated);
+
+        for index in 0..TARGET_CAP - 1 {
+            inner.register_target(&format!("https://cdn.example.com/segment-{index}.ts"));
+        }
+        let refreshed = inner.register_target(repeated);
+        assert_eq!(refreshed, first);
+
+        inner.register_target("https://cdn.example.com/evict-oldest.ts");
+        assert!(inner.resolve_target(&first).is_some());
     }
 }

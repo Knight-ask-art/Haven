@@ -8,7 +8,7 @@ use tauri::State;
 
 use haven_application::wire::{
     ErrorDto, SessionOpenRequest, SessionOpenResultDto, SourceEndpointSetRequest,
-    SourceEndpointSetResult, SourceWorkImportRequest, SourceWorkImportResult,
+    SourceEndpointSetResult, SourceWorkImportRequest, SourceWorkImportResult, StreamKindDto,
 };
 
 use crate::ipc::{invalid_argument, run_blocking, to_error_dto, LIBRARY_CHANGED_TRANSPORT_EVENT};
@@ -116,7 +116,7 @@ pub fn run_stream_open(
             media_item_id: facts.media_item_id.clone(),
             mime_type: facts.mime_type.clone(),
             is_hls: facts.is_hls,
-            progress: facts.progress,
+            progress: facts.progress.clone(),
             upstream_url: facts.upstream_url.clone(),
         },
         &facts.upstream_url,
@@ -137,7 +137,16 @@ pub fn run_stream_open(
         edition_id: facts.edition_id,
         media_item_id: facts.media_item_id,
         engine: haven_application::wire::SessionEngineDto::Playback,
-        progress: None,
+        // `prepare` already resolved the authoritative progress row.  Keep it
+        // on the opening result so remote streams follow the same resume path
+        // as local sessions; the grant registry also retains the same snapshot
+        // for protocol-side revalidation.
+        progress: facts.progress,
+        stream_kind: Some(if facts.is_hls {
+            StreamKindDto::Hls
+        } else {
+            StreamKindDto::Direct
+        }),
     })
 }
 

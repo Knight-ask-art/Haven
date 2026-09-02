@@ -25,7 +25,7 @@ impl LocalReaderSearchProvider {
 
 impl ReaderSearchProvider for LocalReaderSearchProvider {
     fn extract(&self, session: &PreparedSession) -> Result<RawBookContent, AppError> {
-        let mime = session.mime_type.as_deref().unwrap_or("");
+        let mime = base_mime(session.mime_type.as_deref().unwrap_or(""));
         if mime == "application/epub+zip" {
             let source = crate::comic::revalidate_source_with_message(
                 session,
@@ -78,6 +78,14 @@ fn extract_text_content(path: &Path, mime: &str) -> Result<RawBookContent, AppEr
     };
     let chapters = parse_book_text(&text, format);
     Ok(RawBookContent { chapters })
+}
+
+/// MIME values from filesystem probes and HTTP responses may carry optional
+/// parameters (for example `text/plain; charset=utf-8`).  Reader format
+/// dispatch only depends on the media type token, so normalize it once at the
+/// boundary instead of requiring every caller to emit a parameter-free value.
+fn base_mime(value: &str) -> &str {
+    value.split(';').next().unwrap_or("").trim()
 }
 
 fn parse_book_text(text: &str, _format: &str) -> Vec<RawChapter> {
@@ -452,7 +460,7 @@ fn parse_manifest(xml: &str) -> HashMap<String, (String, String)> {
             attrs.get("href").cloned(),
             attrs.get("media-type").cloned(),
         ) {
-            map.insert(id, (href, media.to_ascii_lowercase()));
+            map.insert(id, (href, base_mime(&media).to_ascii_lowercase()));
         }
     }
     map
@@ -659,6 +667,43 @@ fn resource_unavailable() -> AppError {
 mod tests {
     use super::*;
     use haven_application::services::reader_search::{build_book_search_index, search_book};
+    use haven_application::services::{PreparedSession, PreparedSessionSource};
+    use haven_application::wire::SessionEngineDto;
+    use haven_domain::enums::{MediaType, ResourceType};
+    use haven_domain::ids::{ResourceId, StorageLocationId};
+    use tempfile::TempDir;
+
+    fn local_session(root: &Path, file: &Path, mime: &str) -> PreparedSession {
+        PreparedSession {
+            work_id: "work".into(),
+            edition_id: "edition".into(),
+            media_item_id: "media".into(),
+            engine: SessionEngineDto::Reader,
+            resource_id: ResourceId::new(),
+            storage_location_id: Some(StorageLocationId::new()),
+            canonical_root: Some(std::fs::canonicalize(root).unwrap()),
+            canonical_file: Some(std::fs::canonicalize(file).unwrap()),
+            source: PreparedSessionSource::Local,
+            mime_type: Some(mime.into()),
+            media_type: MediaType::Book,
+            resource_type: ResourceType::LocalFile,
+            comic_pages: None,
+            progress: None,
+        }
+    }
+
+    #[test]
+    fn reader_search_accepts_text_mime_parameters() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("notes.txt");
+        std::fs::write(&file, "第一章\n\n目标词").unwrap();
+        let session = local_session(dir.path(), &file, "text/plain; charset=utf-8");
+
+        let content = LocalReaderSearchProvider::new().extract(&session).unwrap();
+        assert_eq!(content.chapters.len(), 1);
+        assert_eq!(content.chapters[0].title, "第一章");
+        assert_eq!(content.chapters[0].paragraphs[0], "目标词");
+    }
 
     #[test]
     fn html_text_preserves_paragraph_boundaries_for_search() {

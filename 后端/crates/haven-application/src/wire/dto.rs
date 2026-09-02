@@ -792,6 +792,11 @@ pub struct SessionOpenResultDto {
     pub media_item_id: String,
     pub engine: SessionEngineDto,
     pub progress: Option<ProgressSummaryDto>,
+    /// 受控播放流的安全类型提示。旧客户端可省略；`hls` 由播放器交给
+    /// hls.js，`direct` 使用浏览器原生 `<video>`，不暴露上游 MIME/URL。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub stream_kind: Option<StreamKindDto>,
 }
 
 /// 关闭消费 Session 的请求（幂等撤销；sessionId 为不透明 UUID token）。

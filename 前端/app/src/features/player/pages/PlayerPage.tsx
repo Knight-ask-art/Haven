@@ -66,6 +66,9 @@ export function PlayerPage() {
   // Windows WebView 需把自定义协议转 http 形式，否则 XHR/MSE 加载器无法请求。
   const playbackSourceUri = controlledResourceUri(sessionView.contentUri)
   const sessionContentUri = playbackSourceUri
+  // 受控流的种类由后端明确投影；旧会话没有该字段时保留 HLS URI 的兼容推断。
+  const streamKind = sessionView.streamKind
+    ?? (sessionContentUri.includes("haven-resource.stream") ? "hls" : null)
 
   useEffect(() => {
     if (mediaItemId) recordDemoPlayerHistory(clientMode, mediaItemId, recordHistory)
@@ -370,10 +373,14 @@ export function PlayerPage() {
     screenshotAbortRef.current?.abort()
   }, [])
 
-  // 远端流（haven-resource://stream/<grant>）经 hls.js 挂载；直连/本地资源走原生 src。
+  // HLS 远端流经 hls.js；普通 MP4/WebM 远端流和本地资源走原生 src。
   useEffect(() => {
     const video = videoRef.current
-    if (!video || !sessionContentUri || !sessionContentUri.includes("haven-resource.stream")) {
+    if (!video || !sessionContentUri || streamKind !== "hls") {
+      if (video && sessionContentUri && streamKind === "direct") {
+        video.src = sessionContentUri
+        video.load()
+      }
       return undefined
     }
     let destroyed = false
@@ -518,7 +525,7 @@ export function PlayerPage() {
       destroyed = true
       hls?.destroy()
     }
-  }, [sessionContentUri])
+  }, [sessionContentUri, streamKind])
 
   useEffect(() => {
     const requestId = ++markerListRequestRef.current
@@ -834,7 +841,7 @@ export function PlayerPage() {
         <video
           key={sessionContentUri ?? "no-session"}
           ref={videoRef}
-          src={sessionContentUri?.includes("haven-resource.stream") ? undefined : (sessionContentUri ?? undefined)}
+          src={streamKind === "hls" ? undefined : (sessionContentUri ?? undefined)}
           data-session-source={sessionContentUri ?? ""}
           poster={posterUri ?? defaultCoverPath("video", mediaItemId ?? "player")}
           preload="metadata"

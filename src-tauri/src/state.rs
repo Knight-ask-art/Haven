@@ -186,11 +186,6 @@ impl AppState {
             haven_infrastructure::online_sources::OnlineCatalogProvider::new(online_client),
         );
         let comic_pages = comic_pages.with_remote_provider(online_catalog.clone());
-        let session = SessionService::new_with_remote(
-            repos.clone(),
-            comic_pages.clone(),
-            online_catalog.clone(),
-        );
         let history = HistoryService::new(repos.clone(), Arc::new(settings.clone()));
         let marker = MarkerService::new(repos.clone());
         let home = HomeService::new(repos.clone());
@@ -271,6 +266,12 @@ impl AppState {
         let opds_catalog = Arc::new(haven_infrastructure::opds::OpdsCatalogProvider::new(
             opds_client.clone(),
         ));
+        let remote_session = Arc::new(haven_infrastructure::opds::RoutingRemoteSessionPort::new(
+            opds_catalog.clone(),
+            online_catalog.clone(),
+        ));
+        let session =
+            SessionService::new_with_remote(repos.clone(), comic_pages.clone(), remote_session);
         let online_catalog_source: Arc<dyn haven_application::services::SourceCatalogProvider> =
             online_catalog.clone();
         let remote_acquisition = Arc::new(

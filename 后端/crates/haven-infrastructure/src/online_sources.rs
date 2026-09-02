@@ -47,6 +47,8 @@ const MAX_MANGA_PAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_MANGA_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_TRANSIENT_ATTEMPTS: usize = 3;
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(3);
 const USER_AGENT: &str = "Haven/0.1.0 (offline content importer)";
 
 #[derive(Debug, Clone, Copy)]
@@ -71,6 +73,12 @@ impl OnlineContentClient {
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .user_agent(USER_AGENT)
+            // The Windows Schannel/WebView2 environment is more reliable for
+            // the fixed public sources when the provider client stays on
+            // HTTP/1.1.  This does not weaken TLS or host validation; it only
+            // avoids an HTTP/2 negotiation failure before a request reaches
+            // the already allow-listed endpoint.
+            .http1_only()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| internal_error("正文来源客户端初始化失败"))?;
@@ -121,10 +129,58 @@ impl OnlineContentClient {
                 };
                 request = request.header(reqwest::header::RANGE, value);
             }
-            let response = request
-                .send()
-                .await
-                .map_err(|_| source_unavailable("正文来源暂时不可达"))?;
+            let response = {
+                let mut response = None;
+                for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
+                    match request.send().await {
+                        Ok(candidate) => {
+                            let status = candidate.status();
+                            if let Some(delay) =
+                                transient_retry_delay(status, candidate.headers(), attempt)
+                            {
+                                drop(candidate);
+                                tokio::time::sleep(delay).await;
+                                // Rebuild the request below.  GET requests have
+                                // no body and therefore do not carry state
+                                // across attempts.
+                                request = self.http.get(current.clone()).header(
+                                    reqwest::header::ACCEPT,
+                                    "application/json,text/plain,application/pdf,image/*,*/*;q=0.1",
+                                );
+                                if let Some(range) = range {
+                                    let value = match range.end {
+                                        Some(end) => format!("bytes={}-{}", range.start, end),
+                                        None => format!("bytes={}-", range.start),
+                                    };
+                                    request = request.header(reqwest::header::RANGE, value);
+                                }
+                                continue;
+                            }
+                            response = Some(candidate);
+                            break;
+                        }
+                        Err(_) if attempt + 1 < MAX_TRANSIENT_ATTEMPTS => {
+                            tokio::time::sleep(transient_backoff(attempt)).await;
+                            // Rebuild the request for the next attempt; the
+                            // current request has already been consumed by
+                            // reqwest::RequestBuilder::send.
+                            request = self.http.get(current.clone()).header(
+                                reqwest::header::ACCEPT,
+                                "application/json,text/plain,application/pdf,image/*,*/*;q=0.1",
+                            );
+                            if let Some(range) = range {
+                                let value = match range.end {
+                                    Some(end) => format!("bytes={}-{}", range.start, end),
+                                    None => format!("bytes={}-", range.start),
+                                };
+                                request = request.header(reqwest::header::RANGE, value);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                response.ok_or_else(|| source_unavailable("正文来源暂时不可达"))?
+            };
             if response.status().is_redirection() {
                 let location = response
                     .headers()
@@ -214,6 +270,40 @@ fn parse_content_range(value: &str) -> Option<RemoteContentRange> {
     (start <= end && end < total).then_some(RemoteContentRange { start, end, total })
 }
 
+/// Only retry transport-level failures and provider throttling/server faults.
+/// Validation, format and allowlist errors are deliberately not retried.  The
+/// cap keeps a busy public endpoint from turning one search into an unbounded
+/// background loop.
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn transient_backoff(attempt: usize) -> Duration {
+    // Small bounded jitter-free backoff keeps tests deterministic and avoids a
+    // long wait when a source is rate-limited.  Retry-After, when supplied,
+    // takes precedence through `transient_retry_delay`.
+    let multiplier = 1u64 << attempt.min(2);
+    Duration::from_millis(100 * multiplier)
+}
+
+fn transient_retry_delay(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    attempt: usize,
+) -> Option<Duration> {
+    if !is_transient_status(status) || attempt + 1 >= MAX_TRANSIENT_ATTEMPTS {
+        return None;
+    }
+    let retry_after = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|seconds| Duration::from_secs(seconds.min(MAX_RETRY_AFTER.as_secs())));
+    Some(retry_after.unwrap_or_else(|| transient_backoff(attempt)))
+}
+
 fn response_content_length(_status: reqwest::StatusCode, body: &[u8]) -> Option<u64> {
     Some(body.len() as u64)
 }
@@ -253,43 +343,31 @@ impl OnlineCatalogProvider {
         let pic = manga_cover_url(manga_id, data);
 
         // 选择最近的可读章节。官方/已删除章节常见 pages=0 或 externalUrl；
-        // 这些条目跳过后继续尝试有限数量的其它章节。
-        let feed_url = format!(
-            "{MANGADEX_API}/manga/{manga_id}/feed?translatedLanguage[]=zh&translatedLanguage[]=zh-hans&translatedLanguage[]=en&order[chapter]=desc&limit=20"
-        );
-        let feed = self.client.json(&feed_url, HostPolicy::MangadexApi).await?;
-        let chapters = feed
-            .get("data")
-            .and_then(Value::as_array)
-            .ok_or_else(|| source_unavailable("MangaDex 章节列表结构异常"))?;
-        for chapter in chapters.iter().take(20) {
-            let Some(chapter_id) = chapter.get("id").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some(chapter_attrs) = chapter.get("attributes") else {
-                continue;
-            };
-            if chapter_attrs
-                .get("isUnavailable")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-                || chapter_attrs
-                    .get("pages")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-                    == 0
-                || chapter_attrs
-                    .get("externalUrl")
-                    .and_then(Value::as_str)
-                    .is_some()
+        // 这些条目跳过后继续尝试有限数量的其它章节。先偏好中文/英文，
+        // 再用无语言过滤的受控 fallback 覆盖只有日文、韩文或其它语言的作品。
+        // 不能因为首个语言筛选为空，就把一个实际可读的作品误报为不可用。
+        let feed_urls = [
+            format!(
+                // MangaDex accepts ISO-639-1 language codes (and optional
+                // two-letter region suffixes).  `zh-hans` is not a valid
+                // value for this endpoint (it is a four-letter script tag),
+                // so sending it makes the whole request fail with HTTP 400
+                // before the fallback feed can run.  Keep the preferred
+                // Chinese/English set within the API's validation grammar;
+                // the second request below still covers every language.
+                "{MANGADEX_API}/manga/{manga_id}/feed?translatedLanguage[]=zh&translatedLanguage[]=zh-hk&translatedLanguage[]=zh-tw&translatedLanguage[]=en&order[chapter]=desc&limit=20"
+            ),
+            format!("{MANGADEX_API}/manga/{manga_id}/feed?order[chapter]=desc&limit=20"),
+        ];
+        for feed_url in feed_urls {
+            let feed = self.client.json(&feed_url, HostPolicy::MangadexApi).await?;
+            let chapters = feed
+                .get("data")
+                .and_then(Value::as_array)
+                .ok_or_else(|| source_unavailable("MangaDex 章节列表结构异常"))?;
+            if let Some((chapter_id, chapter_label)) =
+                chapters.iter().take(20).find_map(readable_mangadex_chapter)
             {
-                continue;
-            }
-            if validate_uuid_like(chapter_id, "MangaDex 章节标识").is_ok() {
-                let chapter_label = chapter_attrs
-                    .get("chapter")
-                    .and_then(Value::as_str)
-                    .unwrap_or("正文");
                 return Ok(SourceCatalogEntry {
                     external_id: manga_id.to_owned(),
                     title,
@@ -992,6 +1070,37 @@ fn validate_page_name(value: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Return a chapter identity only when the MangaDex feed entry is safe to
+/// hand to the At-Home manifest endpoint.  The feed's `pages` field is
+/// optional across API versions; an absent value is not treated as zero because
+/// the manifest itself is the authoritative page-count check.
+fn readable_mangadex_chapter(chapter: &Value) -> Option<(String, String)> {
+    let chapter_id = chapter.get("id").and_then(Value::as_str)?;
+    let chapter_attrs = chapter.get("attributes")?;
+    if chapter_attrs
+        .get("isUnavailable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || chapter_attrs
+            .get("pages")
+            .and_then(Value::as_u64)
+            .is_some_and(|pages| pages == 0)
+        || chapter_attrs
+            .get("externalUrl")
+            .and_then(Value::as_str)
+            .is_some()
+    {
+        return None;
+    }
+    validate_uuid_like(chapter_id, "MangaDex 章节标识").ok()?;
+    let chapter_label = chapter_attrs
+        .get("chapter")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("正文");
+    Some((chapter_id.to_owned(), chapter_label.to_owned()))
+}
+
 fn localized_value(value: Option<&Value>) -> Option<String> {
     let value = value?;
     if let Some(text) = value.as_str() {
@@ -1553,6 +1662,35 @@ mod tests {
     }
 
     #[test]
+    fn mangadex_chapter_selection_accepts_non_preferred_languages_and_unknown_pages() {
+        let chapter = serde_json::json!({
+            "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "attributes": {"translatedLanguage": "ja", "chapter": "12"}
+        });
+        assert_eq!(
+            readable_mangadex_chapter(&chapter),
+            Some((
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_owned(),
+                "12".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn mangadex_chapter_selection_rejects_empty_or_external_entries() {
+        let zero_pages = serde_json::json!({
+            "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "attributes": {"pages": 0}
+        });
+        let external = serde_json::json!({
+            "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "attributes": {"pages": 12, "externalUrl": "https://example.test"}
+        });
+        assert!(readable_mangadex_chapter(&zero_pages).is_none());
+        assert!(readable_mangadex_chapter(&external).is_none());
+    }
+
+    #[test]
     fn bounded_article_ranges_are_clamped_and_keep_total_length() {
         let full = bounded_session_body(
             b"0123456789".to_vec(),
@@ -1651,5 +1789,32 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn transient_status_policy_is_bounded_and_does_not_retry_validation_failures() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+        assert!(is_transient_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_transient_status(reqwest::StatusCode::BAD_GATEWAY));
+        assert!(!is_transient_status(reqwest::StatusCode::BAD_REQUEST));
+        assert!(!is_transient_status(reqwest::StatusCode::NOT_FOUND));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("99"));
+        assert_eq!(
+            transient_retry_delay(reqwest::StatusCode::TOO_MANY_REQUESTS, &headers, 0),
+            Some(MAX_RETRY_AFTER)
+        );
+        assert_eq!(
+            transient_retry_delay(reqwest::StatusCode::TOO_MANY_REQUESTS, &headers, 2),
+            None
+        );
+        assert_eq!(
+            transient_retry_delay(reqwest::StatusCode::BAD_REQUEST, &headers, 0),
+            None
+        );
+        assert_eq!(transient_backoff(0), Duration::from_millis(100));
+        assert_eq!(transient_backoff(2), Duration::from_millis(400));
     }
 }

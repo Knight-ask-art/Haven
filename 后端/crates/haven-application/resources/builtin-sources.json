@@ -84,8 +84,8 @@
       "displayName": "古腾堡计划（OPDS）",
       "categories": ["book"],
       "mode": "single",
-      "kinds": ["search", "offline_download"],
-      "notes": "单一 OPDS 图书目录，搜索结果可下载 EPUB；需要下载后阅读。"
+      "kinds": ["search", "online_read", "offline_download"],
+      "notes": "单一 OPDS 图书目录，搜索后可在线读取 EPUB；也可通过下载保存到本地。"
     },
     {
       "sourceId": "arxiv",

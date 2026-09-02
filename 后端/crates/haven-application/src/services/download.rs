@@ -22,7 +22,9 @@ use haven_domain::settings::{SettingsSection, SettingsValue};
 use crate::mapper::time::utc_millis_to_rfc3339;
 use crate::services::download_batch::DownloadBatchService;
 use crate::services::settings::SettingsService;
-use crate::services::source_import::{source_key_for_id, validate_remote_source_object};
+use crate::services::source_import::{
+    remote_source_mime_compatible, source_key_for_id, validate_remote_source_object,
+};
 use crate::wire::{
     ContentCategory as ContentCategoryDto, DownloadCreateRequest, DownloadEventData,
     DownloadListRequest, DownloadMutationResultDto, DownloadRevealResultDto, DownloadStateDto,
@@ -679,7 +681,20 @@ fn validate_download_source_object(resource: &Resource) -> Result<(), AppError> 
             "该资源没有受控的可下载来源",
             false,
         )
-    })
+    })?;
+    if !remote_source_mime_compatible(
+        source_key,
+        resource.resource_type,
+        resource.mime_type.as_deref(),
+    ) {
+        return Err(AppError::new(
+            "DOWNLOAD_SOURCE_UNSUPPORTED",
+            ErrorKind::Validation,
+            "该资源没有受控的可下载格式",
+            false,
+        ));
+    }
+    Ok(())
 }
 
 fn should_start_on_boot(state: DownloadState, auto_continue: bool) -> bool {
@@ -847,6 +862,13 @@ mod tests {
     ) -> Resource {
         let source_id = crate::services::source_import::stable_source_id(source_key)
             .unwrap_or_else(|_| haven_domain::ids::SourceId::new());
+        let mime_type = match source_key {
+            "mangadex" => Some("application/vnd.comicbook+zip".to_owned()),
+            "arxiv" => Some("application/pdf".to_owned()),
+            "opds_gutenberg" => Some("application/epub+zip".to_owned()),
+            "europepmc" | "wikisource" => Some("text/html; charset=utf-8".to_owned()),
+            _ => None,
+        };
         Resource {
             id: ResourceId::new(),
             media_item_id: MediaItemId::new(),
@@ -857,7 +879,7 @@ mod tests {
                 source_id,
                 remote_id: remote_id.to_owned(),
             },
-            mime_type: None,
+            mime_type,
             size: None,
             hash: None,
             availability: Availability::Available,
@@ -918,5 +940,9 @@ mod tests {
             None,
         );
         assert!(validate_download_source_object(&wrong_type).is_err());
+
+        let mut wrong_mime = valid;
+        wrong_mime.mime_type = Some("application/pdf".into());
+        assert!(validate_download_source_object(&wrong_mime).is_err());
     }
 }

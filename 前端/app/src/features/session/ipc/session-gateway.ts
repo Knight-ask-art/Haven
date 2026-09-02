@@ -38,6 +38,8 @@ function isSessionResult(value: unknown, request: SessionOpenRequest): value is 
   if (typeof value !== "object" || value === null) return false
   const result = value as Record<string, unknown>
   const progress = result.progress
+  const streamKind = result.streamKind
+  const streamKindIsValid = streamKind === undefined || streamKind === null || streamKind === "hls" || streamKind === "direct"
   const progressIsValid = progress === null || (
     typeof progress === "object" && progress !== null
     && typeof (progress as Record<string, unknown>).revision === "string"
@@ -51,6 +53,7 @@ function isSessionResult(value: unknown, request: SessionOpenRequest): value is 
     typeof result.editionId === "string" && result.editionId.length > 0 &&
     result.mediaItemId === request.mediaItemId &&
     result.engine === request.engine &&
+    streamKindIsValid &&
     progressIsValid
   )
 }

@@ -5,18 +5,37 @@ export type ComicPageLoadResult =
   | { status: "loaded"; resource: ComicPageResource }
   | { status: "unavailable" | "error" | "cancelled"; resource: null }
 
+/**
+ * A load request is still a Promise for callers that only need the result,
+ * but exposes cancellation for a DOM node that unmounts before its permit is
+ * granted. Keeping cancellation on the request prevents one page's cleanup
+ * from accidentally releasing another consumer of the same page.
+ */
+export type ComicPageLoadRequest = Promise<ComicPageLoadResult> & {
+  cancel: () => void
+}
+
 export interface ComicPageResource {
   /** The original controlled resource URI (or its Windows WebView2 alias). */
   src: string
   width: number | null
   height: number | null
+  /** Releases this individual DOM consumer's permit. Idempotent. */
+  release: () => void
+}
+
+type ConsumerState = "waiting" | "loaded" | "released"
+
+interface PendingConsumer {
+  resolve: (result: ComicPageLoadResult) => void
+  state: ConsumerState
 }
 
 interface PendingLoad {
   pageNumber: number
   state: "queued" | "granted"
-  resource: ComicPageResource | null
-  resolvers: Array<(result: ComicPageLoadResult) => void>
+  resource: Omit<ComicPageResource, "release"> | null
+  consumers: Set<PendingConsumer>
 }
 
 export interface ComicPageResourcePoolOptions {
@@ -40,9 +59,10 @@ function requestUri(contentUri: string): string {
  *
  * The pool deliberately does not fetch, decode, create Blob/Object URLs, or
  * mount hidden Image nodes. A permit resolves to the original controlled URI;
- * the mounted `<img>` owns the one network read and calls release() from its
- * load/error handler. This keeps the no-store resource protocol inside the
- * four-read budget without requiring a `blob:` CSP exception.
+ * the mounted `<img>` owns the one network read and calls its lease's
+ * release() from its load/error handler. A page may have more than one DOM
+ * consumer (for example, the main image and a thumbnail), so leases are
+ * reference-counted and the permit is held until every consumer releases it.
  */
 export class ComicPageResourcePool {
   private readonly pages: ReadonlyMap<number, ComicPageModel>
@@ -70,36 +90,57 @@ export class ComicPageResourcePool {
     return this.pending.has(pageNumber)
   }
 
-  load(pageNumber: number): Promise<ComicPageLoadResult> {
-    if (this.disposed) return Promise.resolve({ status: "cancelled", resource: null })
+  load(pageNumber: number): ComicPageLoadRequest {
+    if (this.disposed) return cancelledRequest()
     const page = this.pages.get(pageNumber)
     if (!page || page.availability !== "ready" || !page.contentUri) {
-      return Promise.resolve({ status: "unavailable", resource: null })
+      return immediateRequest({ status: "unavailable", resource: null })
     }
     if (!COMIC_PAGE_URI_PATTERN.test(page.contentUri)) {
-      return Promise.resolve({ status: "error", resource: null })
+      return immediateRequest({ status: "error", resource: null })
     }
+
+    let consumer: PendingConsumer | undefined
+    const promise = new Promise<ComicPageLoadResult>((resolve) => {
+      consumer = { resolve, state: "waiting" }
+    }) as ComicPageLoadRequest
 
     const existing = this.pending.get(pageNumber)
-    if (existing) {
-      return new Promise((resolve) => { existing.resolvers.push(resolve) })
+    const job: PendingLoad = existing ?? {
+      pageNumber,
+      state: "queued",
+      resource: null,
+      consumers: new Set<PendingConsumer>(),
     }
-
-    const promise = new Promise<ComicPageLoadResult>((resolve) => {
-      this.pending.set(pageNumber, {
-        pageNumber,
-        state: "queued",
-        resource: null,
-        resolvers: [resolve],
-      })
+    if (!existing) {
+      this.pending.set(pageNumber, job)
       this.queue.push(pageNumber)
+    }
+    const requestConsumer = consumer!
+    job.consumers.add(requestConsumer)
+    promise.cancel = () => this.releaseConsumer(job, requestConsumer)
+
+    // A thumbnail can mount after the main image already owns the permit.
+    // Resolve it immediately with its own idempotent lease instead of leaving
+    // a resolver behind that `pump()` will never visit again.
+    if (job.state === "granted" && job.resource) {
+      this.resolveLoadedConsumer(job, requestConsumer)
+    } else if (!existing) {
       this.pump()
-    })
+    }
     return promise
   }
 
   prefetch(pageNumbers: readonly number[]): void {
-    for (const pageNumber of new Set(pageNumbers)) void this.load(pageNumber)
+    // The pool only grants permits to mounted DOM images; a prefetch request
+    // therefore releases its permit as soon as the controlled URI is issued.
+    // This keeps the convenience API from pinning the bounded pool forever.
+    for (const pageNumber of new Set(pageNumbers)) {
+      const request = this.load(pageNumber)
+      void request.then((result) => {
+        if (result.status === "loaded") result.resource.release()
+      })
+    }
   }
 
   /**
@@ -111,37 +152,29 @@ export class ComicPageResourcePool {
     this.retained = new Set(pageNumbers)
     for (const [pageNumber, job] of this.pending) {
       if (this.retained.has(pageNumber)) continue
-      this.pending.delete(pageNumber)
-      if (job.state === "granted") this.active = Math.max(0, this.active - 1)
-      for (const resolve of job.resolvers) resolve({ status: "cancelled", resource: null })
+      this.cancelJob(job)
     }
     this.onChange?.()
     this.pump()
   }
 
+  /**
+   * Compatibility path for older page-only callers. New DOM callers use the
+   * request cancel() method and the resource lease release() method so a
+   * sibling consumer cannot be released by mistake.
+   */
   release(pageNumber: number): void {
     const job = this.pending.get(pageNumber)
     if (!job) return
-    if (job.state === "queued") {
-      this.pending.delete(pageNumber)
-      for (const resolve of job.resolvers) resolve({ status: "cancelled", resource: null })
-      return
-    }
-    this.pending.delete(pageNumber)
-    this.active = Math.max(0, this.active - 1)
-    this.onChange?.()
-    this.pump()
+    const consumer = [...job.consumers].find((item) => item.state !== "released")
+    if (consumer) this.releaseConsumer(job, consumer)
   }
 
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
     this.queue.length = 0
-    for (const job of this.pending.values()) {
-      for (const resolve of job.resolvers) resolve({ status: "cancelled", resource: null })
-    }
-    this.pending.clear()
-    this.active = 0
+    for (const job of [...this.pending.values()]) this.cancelJob(job)
     this.onChange?.()
   }
 
@@ -152,7 +185,7 @@ export class ComicPageResourcePool {
       const page = this.pages.get(pageNumber)
       if (!job || job.state !== "queued" || !page?.contentUri) continue
 
-      const resource: ComicPageResource = {
+      const resource: Omit<ComicPageResource, "release"> = {
         src: requestUri(page.contentUri),
         width: null,
         height: null,
@@ -160,9 +193,67 @@ export class ComicPageResourcePool {
       job.state = "granted"
       job.resource = resource
       this.active += 1
-      for (const resolve of job.resolvers) resolve({ status: "loaded", resource })
+      for (const consumer of job.consumers) this.resolveLoadedConsumer(job, consumer)
       this.onChange?.()
     }
   }
 
+  private resolveLoadedConsumer(job: PendingLoad, consumer: PendingConsumer): void {
+    if (consumer.state !== "waiting" || !job.resource) return
+    consumer.state = "loaded"
+    const resource: ComicPageResource = {
+      ...job.resource,
+      release: () => this.releaseConsumer(job, consumer),
+    }
+    consumer.resolve({ status: "loaded", resource })
+  }
+
+  private releaseConsumer(job: PendingLoad, consumer: PendingConsumer): void {
+    if (consumer.state === "released") return
+    if (consumer.state === "waiting") {
+      consumer.resolve({ status: "cancelled", resource: null })
+    }
+    consumer.state = "released"
+    job.consumers.delete(consumer)
+
+    // A queued request with no remaining consumers can be removed without
+    // consuming a permit. A granted request stays active until all DOM
+    // consumers release their individual leases.
+    if (job.consumers.size > 0) return
+    this.finishJob(job)
+  }
+
+  private cancelJob(job: PendingLoad): void {
+    if (this.pending.get(job.pageNumber) !== job) return
+    this.pending.delete(job.pageNumber)
+    if (job.state === "granted") this.active = Math.max(0, this.active - 1)
+
+    for (const consumer of job.consumers) {
+      if (consumer.state === "waiting") {
+        consumer.state = "released"
+        consumer.resolve({ status: "cancelled", resource: null })
+      } else {
+        consumer.state = "released"
+      }
+    }
+    job.consumers.clear()
+  }
+
+  private finishJob(job: PendingLoad): void {
+    if (this.pending.get(job.pageNumber) !== job) return
+    this.pending.delete(job.pageNumber)
+    if (job.state === "granted") this.active = Math.max(0, this.active - 1)
+    this.onChange?.()
+    this.pump()
+  }
+}
+
+function immediateRequest(result: ComicPageLoadResult): ComicPageLoadRequest {
+  const promise = Promise.resolve(result) as ComicPageLoadRequest
+  promise.cancel = () => undefined
+  return promise
+}
+
+function cancelledRequest(): ComicPageLoadRequest {
+  return immediateRequest({ status: "cancelled", resource: null })
 }

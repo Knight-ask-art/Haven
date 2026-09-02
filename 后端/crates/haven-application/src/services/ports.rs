@@ -41,6 +41,7 @@ impl<T> LibraryPorts for T where
 pub trait WorkGetPorts:
     LibraryPorts
     + ResourceRepository
+    + StorageLocationRepository
     + MarkerRepository
     + haven_domain::contracts::WorkRelationRepository
     + Send
@@ -50,6 +51,7 @@ pub trait WorkGetPorts:
 impl<T> WorkGetPorts for T where
     T: LibraryPorts
         + ResourceRepository
+        + StorageLocationRepository
         + MarkerRepository
         + haven_domain::contracts::WorkRelationRepository
         + Send

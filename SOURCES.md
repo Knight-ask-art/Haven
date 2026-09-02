@@ -21,7 +21,7 @@
 | `itunes` · iTunes Search | 影视 · 单一来源 | 搜索 | 默认停用；无需账号或凭据 | [iTunes Search API](https://itunes.apple.com/search)。结果受 Apple 目录和地区影响 |
 | `gutenberg` · Project Gutenberg | 图书 · 单一来源 | 搜索 | 默认停用；无需账号或凭据 | [Gutenberg OPDS Search](https://www.gutenberg.org/ebooks/search.opds)。书目资源许可和可用性以条目为准 |
 | `archive` · Internet Archive | 图书 · 单一来源 | 搜索 | 默认停用；无需账号或凭据 | [Advanced Search API](https://archive.org/advancedsearch.php)。条目权限和上游限流可能变化 |
-| `opds_gutenberg` · 古腾堡计划（OPDS） | 图书 · 单一来源 | 搜索 · 保存本地（EPUB）；需下载后阅读 | 首次使用可登记默认端点；无需账号或凭据 | [Gutenberg OPDS](https://m.gutenberg.org/ebooks.opds/)。只接受符合安全策略的 EPUB 资源 |
+| `opds_gutenberg` · 古腾堡计划（OPDS） | 图书 · 单一来源 | 搜索 · 在线打开（EPUB） · 保存本地（EPUB） | 首次使用可登记默认端点；无需账号或凭据 | [Gutenberg OPDS](https://m.gutenberg.org/ebooks.opds/)。在线正文受 32 MiB 读取上限约束，只接受符合安全策略的 EPUB 资源 |
 | `arxiv` · arXiv | 报刊文章 · 单一来源 | 搜索 · 在线打开（服务端支持范围读取时） · 保存本地（PDF） | 首次安装默认启用；无需账号或凭据 | [arXiv API](https://export.arxiv.org/api/query)。遵循上游查询和速率限制 |
 | `europepmc` · Europe PMC | 报刊文章 · 单一来源 | 搜索 · 在线打开（安全全文） · 保存本地（HTML） | 首次安装默认启用；无需账号或凭据 | [Europe PMC API](https://www.ebi.ac.uk/europepmc/webservices/rest/search)。仅开放获取全文可用 |
 | `wikisource` · 中文维基文库 | 报刊文章 · 单一来源 | 搜索 · 在线打开（安全正文） · 保存本地（HTML） | 首次安装默认启用；无需账号或凭据 | [MediaWiki API](https://zh.wikisource.org/w/api.php)。版权和页面可用性以公版来源为准 |
@@ -75,8 +75,8 @@ MangaDex 的章节 Feed 可能包含已删除或没有页面的章节；At-Home 
 ```
 
 当前代码已接入固定来源的 SourceObject、Remote Session 和远端下载分支；OPDS/Gutenberg
-EPUB 仍明确显示“需要下载后阅读”。远端 Provider 当前按完整对象获取，不把这条路径
-描述为 HTTP Range 或长期断点续传能力。
+EPUB 可在 32 MiB 限制内在线打开，超限或来源不可用时明确提示下载后阅读。远端 Provider
+当前按受控完整对象获取后切片，不把这条路径描述为上游 HTTP Range 或长期断点续传能力。
 
 本文件记录的是代码与契约边界，不替代真实网络和 Windows custom-protocol EXE 验收。
 MangaDex、Europe PMC、Wikisource、arXiv、OPDS/Gutenberg 的真实网络、关闭/重启、断网
