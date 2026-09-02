@@ -9,7 +9,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use haven_common::{AppError, ErrorKind, UtcMillis};
-use haven_domain::contracts::{EditionRepository, MediaItemRepository, WorkRepository};
+use haven_domain::contracts::{
+    EditionRepository, MediaItemRepository, ResourceRepository, WorkRepository,
+};
 use haven_domain::entities::{Edition, MediaIndex, MediaItem, Resource, Work};
 use haven_domain::enums::{
     Availability, AvailabilitySource, MediaType, ResourceType, WorkStatus, WorkType,
