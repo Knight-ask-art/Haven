@@ -151,8 +151,8 @@ impl AppState {
         );
         let download_sink = Arc::new(TauriDownloadEventSink::new());
         let download_batch = Arc::new(DownloadBatchService::new(repos.clone()));
-        let favorite =
-            FavoriteService::new(repos.clone(), Arc::new(SqliteUnitOfWork::new(db.clone())));
+        let unit_of_work = Arc::new(SqliteUnitOfWork::new(db.clone()));
+        let favorite = FavoriteService::new(repos.clone(), unit_of_work.clone());
         let progress = ProgressService::new(repos.clone());
         let library = LibraryService::new(repos.clone());
         let storage_location =
@@ -303,6 +303,7 @@ impl AppState {
         let import_ports: Arc<dyn SourceImportPorts> = repos.clone();
         let source_import = SourceImportService::new(
             import_ports,
+            unit_of_work.clone(),
             source_registry.clone(),
             catalog_router.clone(),
         );
@@ -315,6 +316,7 @@ impl AppState {
             enrich_ports,
             SourceImportService::new(
                 import_ports2,
+                unit_of_work.clone(),
                 source_registry.clone(),
                 catalog_router.clone(),
             ),
@@ -326,23 +328,36 @@ impl AppState {
                 let enrichment = enrichment.clone();
                 let sink = sink.clone();
                 Box::pin(async move {
-                    match enrichment.run_pending().await {
-                        Ok(outcomes) => {
+                    let result = tauri::async_runtime::spawn_blocking(move || {
+                        tauri::async_runtime::block_on(enrichment.run_pending())
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(outcomes)) => {
                             for outcome in outcomes {
                                 sink.emit_metadata_changed(haven_application::wire::MetadataChangedDto {
-                                    schema_version: 1,
-                                    at: chrono::Utc::now().to_rfc3339(),
-                                    operation_id: uuid::Uuid::new_v4().to_string(),
-                                    sequence: 1,
-                                    work_id: outcome.work_id.to_string(),
-                                    status: outcome.status,
-                                    source_id: if outcome.status == haven_application::wire::EnrichmentStatusWire::Enriched { Some("cms10".into()) } else { None },
-                                    error: None,
-                                });
+                                        schema_version: 1,
+                                        at: chrono::Utc::now().to_rfc3339(),
+                                        operation_id: uuid::Uuid::new_v4().to_string(),
+                                        sequence: 1,
+                                        work_id: outcome.work_id.to_string(),
+                                        status: outcome.status,
+                                        source_id: if outcome.status == haven_application::wire::EnrichmentStatusWire::Enriched { Some("cms10".into()) } else { None },
+                                        error: None,
+                                    });
                             }
                         }
-                        Err(_) => {
-                            // 流水线失败不影响扫描终态；状态留在 pending/上次值。
+                        Ok(Err(error)) => {
+                            // 流水线失败不影响扫描终态；状态留在 pending/上次值，
+                            // 但必须保留错误码，避免后台失败完全不可见。
+                            eprintln!(
+                                "[enrichment] run_pending failed: {}",
+                                error.code().as_str()
+                            );
+                        }
+                        Err(error) => {
+                            // JoinError 包括 worker panic/取消；记录后仍不阻断扫描。
+                            eprintln!("[enrichment] run_pending worker failed: {error}");
                         }
                     }
                 })

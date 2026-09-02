@@ -961,7 +961,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn starting_search_on_an_empty_database_seeds_and_dispatches_cms10() {
+    async fn starting_search_on_an_empty_database_keeps_cms10_opt_in() {
         let db = Arc::new(haven_infrastructure::Db::open_in_memory().unwrap());
         let repos = Arc::new(haven_infrastructure::db::repos::SqliteRepositories::new(db));
         let registry = SourceRegistryService::new(repos);
@@ -990,16 +990,9 @@ mod tests {
             .iter()
             .find(|source| source.source_id == "cms10")
             .expect("空库搜索必须包含 CMS10 来源");
-        assert!(cms10.enabled);
-        assert!(cms10.endpoint_configured);
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while calls.load(Ordering::SeqCst) == 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("CMS10 应被搜索调度");
+        assert!(!cms10.enabled);
+        assert!(!cms10.endpoint_configured);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "未配置的 CMS10 不应被调度");
     }
 
     #[test]

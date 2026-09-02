@@ -49,14 +49,6 @@ import {
   startLibraryScan,
   type StorageLocationWire,
 } from "../ipc/storage-gateway"
-import {
-  POKEBALL_SKINS,
-  readMascotConfig,
-  saveMascotConfig,
-  type MascotConfig,
-  type BallType,
-} from "@/lib/mascotState"
-import { bundledLive2dModelCatalog } from "@/lib/live2d/model-catalog"
 import type { ComicSettingsValue, GeneralSettingsValue, AppearanceSettingsValue, PlaybackSettingsValue, PreferenceComicPatchWire, PreferenceGetResult, PreferenceReadingPatchWire, PreferenceTargetWire, PrivacySettingsValue, ReadingSettingsValue, DownloadSettingsValue, SettingsValue } from "@/lib/ipc/settings-wire"
 import type { SettingsFormController } from "@/features/settings/lib/useSettingsForm"
 import { useSettingsForm } from "@/features/settings/lib/useSettingsForm"
@@ -1042,145 +1034,7 @@ function AppearanceSettings({ form }: { form: SettingsFormController }) {
         </div>
       </SettingsGroup>
 
-      {/* 二次元伴读看板娘与宝可梦球配置 */}
-      <MascotSettingsGroup />
     </>
-  )
-}
-
-function MascotSettingsGroup() {
-  const [mascotConfig, setMascotConfig] = useState<MascotConfig>(readMascotConfig)
-  const live2dCharacters = bundledLive2dModelCatalog.list()
-
-  const updateMascot = (patch: Partial<MascotConfig>) => {
-    const next = saveMascotConfig(patch)
-    setMascotConfig(next)
-  }
-
-  return (
-    <SettingsGroup
-      title="二次元伴读看板娘"
-      description="首页右下角的动态 Live2D 伴读小人与宝可梦球召唤系统。"
-    >
-      <SettingRow
-        title="开启看板娘"
-        description="在首页右下角显示伴读小人或待命的宝可梦精灵球。"
-      >
-        <Toggle
-          checked={mascotConfig.enabled}
-          onChange={(val) => updateMascot({ enabled: val })}
-          label="开启看板娘"
-        />
-      </SettingRow>
-
-      {mascotConfig.enabled && (
-        <>
-          <SettingRow
-            title="伴读角色选择"
-            description="挑选你喜欢的二次元看板娘，支持动作、表情与互动台词。"
-          >
-            <div className="text-right">
-              <span className="text-xs font-bold text-[#007aff]">
-                当前：{bundledLive2dModelCatalog.resolve(mascotConfig.selectedCharacterId)?.character.name}
-              </span>
-            </div>
-          </SettingRow>
-
-          <div className="grid gap-4 p-6 sm:grid-cols-2 lg:grid-cols-3 border-b border-black/[0.05] dark:border-white/[0.05]">
-            {live2dCharacters.map(({ character: char }) => {
-              const isSelected = char.id === mascotConfig.selectedCharacterId
-              return (
-                <button
-                  key={char.id}
-                  type="button"
-                  onClick={() => updateMascot({ selectedCharacterId: char.id })}
-                  className={cn(
-                    "group relative flex items-start gap-4 rounded-[20px] border p-4 text-left transition-all duration-300 cursor-pointer",
-                    isSelected
-                      ? "border-[#007aff]/30 bg-[#007aff]/[0.04] dark:bg-[#007aff]/[0.08] shadow-[0_4px_24px_rgba(0,122,255,0.12)] ring-1 ring-[#007aff]/20"
-                      : "border-black/[0.04] dark:border-white/[0.04] bg-black/[0.01] dark:bg-white/[0.01] hover:bg-white dark:hover:bg-white/[0.03] hover:shadow-md hover:-translate-y-0.5"
-                  )}
-                >
-                  <div className="relative shrink-0">
-                    <img
-                      src={char.avatarUrl}
-                      alt={char.name}
-                      className={cn(
-                        "h-14 w-14 rounded-full object-cover transition-all duration-300",
-                        isSelected ? "border-[2px] border-[#007aff] bg-white p-[2.5px] dark:bg-[#1c1c1e]" : "border border-black/10 bg-black/5 dark:border-white/10 dark:bg-white/5"
-                      )}
-                    />
-                    {isSelected && (
-                      <div className="absolute -bottom-0.5 -right-0.5 flex h-[22px] w-[22px] items-center justify-center rounded-full border-[2.5px] border-white bg-[#007aff] dark:border-[#1c1c1e]">
-                        <Check className="h-3 w-3 text-white" strokeWidth={3.5} />
-                      </div>
-                    )}
-                  </div>
-                  <div className="min-w-0 flex-1 py-0.5">
-                    <p className={cn("text-[14px] font-bold truncate transition-colors", isSelected ? "text-[#007aff]" : "text-[#1d1d1f] dark:text-[#f5f5f5]")}>
-                      {char.name}
-                    </p>
-                    <p className="mt-0.5 text-[11px] text-[#86868b] dark:text-[#8e8e93] truncate">{char.source}</p>
-                    <span className="mt-[10px] inline-flex items-center rounded-md border border-black/[0.04] dark:border-white/[0.04] bg-white/80 dark:bg-black/20 px-1.5 py-0.5 text-[10px] font-medium text-[#6e6e73] dark:text-[#98989d] shadow-[0_1px_2px_rgba(0,0,0,0.02)]">
-                      {char.tag}
-                    </span>
-                  </div>
-                </button>
-              )
-            })}
-          </div>
-
-          <SettingRow
-            title="宝可梦球款式"
-            description="收回小人时在首页右下角呈现的待命精灵球涂装。"
-          >
-            <div className="flex flex-wrap items-center gap-[8px]">
-              {POKEBALL_SKINS.map((ball) => {
-                const isSelected = mascotConfig.ballType === ball.id
-                return (
-                  <button
-                    key={ball.id}
-                    type="button"
-                    onClick={() => updateMascot({ ballType: ball.id as BallType })}
-                    className={cn(
-                      "flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-semibold transition-all cursor-pointer",
-                      isSelected
-                        ? "border-[#007aff] bg-[#007aff]/10 dark:bg-[#007aff]/20 text-[#007aff] font-bold shadow-sm"
-                        : "border-black/[0.06] dark:border-white/[0.06] bg-black/[0.02] dark:bg-white/[0.04] text-[#6e6e73] dark:text-[#98989d] hover:bg-black/[0.05] dark:hover:bg-white/[0.08]"
-                    )}
-                  >
-                    <span className="h-[8px] w-[8px] rounded-full shrink-0" style={{ backgroundColor: ball.color }} />
-                    <span>{ball.name.split(" ")[0]}</span>
-                  </button>
-                )
-              })}
-            </div>
-          </SettingRow>
-
-          <SettingRow
-            title="鼠标视线追踪"
-            description="让看板娘的眼睛和头部随着鼠标指针移动而平滑注视。"
-          >
-            <Toggle
-              checked={mascotConfig.trackCursor}
-              onChange={(val) => updateMascot({ trackCursor: val })}
-              label="鼠标视线追踪"
-            />
-          </SettingRow>
-
-          <SettingRow
-            title="智能未读足迹气泡"
-            description="在气泡中主动推荐上次未看完的电影、图书或漫画。"
-          >
-            <Toggle
-              checked={mascotConfig.showHistoryHint}
-              onChange={(val) => updateMascot({ showHistoryHint: val })}
-              label="智能未读足迹气泡"
-            />
-          </SettingRow>
-        </>
-      )}
-    </SettingsGroup>
   )
 }
 
@@ -1602,14 +1456,7 @@ function ResourcePreferencePanel({
   )
 }
 
-/** CMS10 端点输入行（V2-B 实战批次）：仅 cms10 显示；保存后只回布尔投影。 */
-const CMS10_PRESETS = [
-  { id: "bfzy", label: "暴风资源", endpoint: "https://bfzyapi.com/api.php/provide/vod" },
-  { id: "wujin", label: "无尽资源", endpoint: "https://api.wujinapi.me/api.php/provide/vod" },
-  { id: "suoni", label: "索尼资源", endpoint: "https://suonizy.net/api.php/provide/vod" },
-  { id: "guangsu", label: "光速资源", endpoint: "https://api.guangsuapi.com/api.php/provide/vod" },
-] as const
-
+/** CMS10 端点输入行：仅 cms10 显示；端点必须由用户明确填写。 */
 function Cms10EndpointRow({
   source,
   showNotice,
@@ -1621,7 +1468,6 @@ function Cms10EndpointRow({
 }) {
   const [endpoint, setEndpoint] = useState("")
   const [saving, setSaving] = useState(false)
-  const [savingPreset, setSavingPreset] = useState<string | null>(null)
   const save = async () => {
     setSaving(true)
     try {
@@ -1638,44 +1484,11 @@ function Cms10EndpointRow({
       setSaving(false)
     }
   }
-  const savePreset = async (presetId: string) => {
-    const preset = CMS10_PRESETS.find((p) => p.id === presetId)
-    if (!preset) return
-    setSavingPreset(presetId)
-    try {
-      await setSourceEndpoint({ sourceId: source.sourceId, endpoint: preset.endpoint })
-      showNotice(`已切换至${preset.label}`)
-      onChanged()
-    } catch (error) {
-      showNotice(toHavenError(error).dto.userMessage)
-    } finally {
-      setSavingPreset(null)
-    }
-  }
   return (
     <div className="flex flex-col gap-3 border-t border-black/[0.06] px-5 py-4">
-      <div className="flex flex-col gap-2">
-        <p className="text-xs font-semibold text-[#1d1d1f]">预设接口（开箱即用）</p>
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-          {CMS10_PRESETS.map((preset) => (
-            <button
-              key={preset.id}
-              type="button"
-              disabled={savingPreset !== null || saving}
-              onClick={() => { void savePreset(preset.id) }}
-              className="rounded-xl border border-black/[0.08] bg-white px-3 py-2.5 text-left transition-colors hover:border-[#007aff] hover:bg-[#f5f7ff] disabled:opacity-50"
-            >
-              <span className="block text-xs font-semibold text-[#1d1d1f]">{preset.label}</span>
-              <span className="mt-0.5 block truncate font-mono text-[10px] text-[#86868b]">{preset.endpoint.replace("https://", "")}</span>
-              {savingPreset === preset.id && <span className="mt-1 block text-[10px] text-[#007aff]">切换中…</span>}
-            </button>
-          ))}
-        </div>
-        <p className="text-[11px] leading-relaxed text-[#86868b]">出厂已预填首个预设（暴风），点选即覆盖；可保留自定义。</p>
-      </div>
       <div className="flex flex-col gap-2 border-t border-black/[0.06] pt-3 sm:flex-row sm:items-center">
         <label className="min-w-0 flex-1 text-xs text-[#86868b]" htmlFor={`endpoint-${source.sourceId}`}>
-          自定义采集接口地址（http/https，例如 https://host/api.php/provide/vod）
+          用户配置采集接口地址（http/https，例如 https://host/api.php/provide/vod）
           <input
             id={`endpoint-${source.sourceId}`}
             value={endpoint}
@@ -1692,7 +1505,7 @@ function Cms10EndpointRow({
           onClick={() => { void save() }}
           className="shrink-0 self-start rounded-full bg-[#007aff] px-[16px] py-[8px] text-xs font-semibold text-white disabled:opacity-50 sm:self-center"
         >
-          {saving ? "保存中…" : "保存自定义"}
+          {saving ? "保存中…" : "保存端点"}
         </button>
       </div>
     </div>

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use rusqlite::Transaction;
 
 use haven_common::AppError;
-use haven_domain::entities::FavoriteTarget;
+use haven_domain::entities::{Edition, FavoriteTarget, MediaItem, Resource, Work};
 use haven_domain::ids::WorkId;
 
 use crate::db::Db;
@@ -48,6 +48,29 @@ impl UnitOfWork for SqliteUnitOfWork {
                 Err(e)
             }
         }
+    }
+
+    fn run_source_import(
+        &self,
+        provider: &str,
+        external_id: &str,
+        work: &Work,
+        edition: &Edition,
+        items: &[MediaItem],
+        resources: &[Resource],
+    ) -> Result<(), AppError> {
+        self.db.with_tx(|tx| {
+            crate::db::repos::work::save_on_conn(tx, work)?;
+            crate::db::repos::work::save_source_ref_on_conn(tx, provider, external_id, work.id)?;
+            crate::db::repos::edition::save_on_conn(tx, edition)?;
+            for item in items {
+                crate::db::repos::media_item::save_on_conn(tx, item)?;
+            }
+            for resource in resources {
+                crate::db::repos::resource::save_on_conn(tx, resource)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -657,6 +680,119 @@ mod tests {
             "版本写入失败，行不得残留"
         );
         assert_eq!(count("works"), 1, "works 不受影响");
+    }
+
+    #[test]
+    fn source_import_rolls_back_dedupe_key_and_content_on_resource_failure() {
+        use haven_domain::entities::{
+            Edition, MediaIndex, MediaItem, Resource, ResourceLocator, Work,
+        };
+        use haven_domain::enums::{
+            Availability, AvailabilitySource, MediaItemStatus, MediaType, ResourceType, WorkStatus,
+            WorkType,
+        };
+        use haven_domain::ids::{EditionId, MediaItemId, ResourceId};
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let now = haven_common::UtcMillis::now();
+        let work = Work {
+            id: WorkId::new(),
+            canonical_title: "事务回滚作品".into(),
+            original_title: None,
+            sort_title: None,
+            description: None,
+            work_type: WorkType::Standalone,
+            release_year: None,
+            language: None,
+            director: None,
+            actor: None,
+            status: WorkStatus::Completed,
+            rating_value: None,
+            rating_scale: None,
+            artwork: Default::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        let edition = Edition {
+            id: EditionId::new(),
+            work_id: work.id,
+            title: "事务回滚版本".into(),
+            subtitle: None,
+            edition_type: MediaType::Movie,
+            release_date: None,
+            language: None,
+            region: None,
+            publisher_or_studio: None,
+            description: None,
+            artwork: Default::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        let item = MediaItem {
+            id: MediaItemId::new(),
+            edition_id: edition.id,
+            parent_id: None,
+            media_type: MediaType::Movie,
+            title: "事务回滚条目".into(),
+            index: MediaIndex::Movie,
+            duration_ms: None,
+            page_count: None,
+            chapter_count: None,
+            published_at: None,
+            status: MediaItemStatus::Available,
+            created_at: now,
+            updated_at: now,
+        };
+        // 故意引用不存在的 MediaItem，让资源写入在 source_ref 已写入事务后失败。
+        let resource = Resource {
+            id: ResourceId::new(),
+            media_item_id: MediaItemId::new(),
+            resource_type: ResourceType::VideoStream,
+            source_id: None,
+            storage_location_id: None,
+            locator: ResourceLocator::Http {
+                url: "https://example.invalid/video.mp4".into(),
+            },
+            mime_type: Some("video/mp4".into()),
+            size: None,
+            hash: None,
+            availability: Availability::Available,
+            availability_source: AvailabilitySource::User,
+            modified_ms: None,
+            fingerprint_first: None,
+            fingerprint_last: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let error = SqliteUnitOfWork::new(db.clone())
+            .run_source_import(
+                "cms10",
+                "external-rollback",
+                &work,
+                &edition,
+                std::slice::from_ref(&item),
+                std::slice::from_ref(&resource),
+            )
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), "DATABASE_ERROR");
+
+        let count = |table: &str| -> i64 {
+            db.lock()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        for table in [
+            "works",
+            "work_source_refs",
+            "editions",
+            "media_items",
+            "resources",
+        ] {
+            assert_eq!(count(table), 0, "{table} 必须随失败的导入事务回滚");
+        }
     }
 
     /// 以 Repository 的正式写入路径建立一条仅属于指定位置的内容链。失败注入测试

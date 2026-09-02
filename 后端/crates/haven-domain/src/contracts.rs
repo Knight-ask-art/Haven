@@ -437,6 +437,12 @@ pub trait EnrichmentRepository: Send + Sync {
     async fn get(&self, work_id: WorkId) -> Result<Option<EnrichmentState>, AppError>;
     /// 读取全部或按 work 过滤的状态（updated_at 倒序）。
     async fn list(&self, work_id: Option<WorkId>) -> Result<Vec<EnrichmentState>, AppError>;
+    /// 读取超过陈旧阈值的 pending 状态，结果有界且按最早更新时间优先。
+    async fn list_stale_pending(
+        &self,
+        cutoff_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<EnrichmentState>, AppError>;
     /// upsert 单条状态。
     async fn upsert(&self, state: &EnrichmentState) -> Result<(), AppError>;
 }

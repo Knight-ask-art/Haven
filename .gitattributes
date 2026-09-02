@@ -1,9 +1,3 @@
-# Live2D 模型二进制资源防 EOL 转换
-前端/app/public/live2d/**/*.moc binary
-前端/app/public/live2d/**/*.png binary
-前端/app/public/live2d/**/*.mp3 binary
-前端/app/public/live2d/**/*.mtn binary
-
 # 应用图标二进制防 EOL 转换
 src-tauri/icons/**/*.ico binary
 src-tauri/icons/**/*.icns binary

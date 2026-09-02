@@ -844,6 +844,13 @@ impl haven_domain::contracts::EnrichmentRepository for SqliteRepositories {
     ) -> Result<Vec<haven_domain::contracts::EnrichmentState>, haven_common::AppError> {
         self.enrichment.list(work_id).await
     }
+    async fn list_stale_pending(
+        &self,
+        cutoff_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<haven_domain::contracts::EnrichmentState>, haven_common::AppError> {
+        self.enrichment.list_stale_pending(cutoff_ms, limit).await
+    }
     async fn upsert(
         &self,
         state: &haven_domain::contracts::EnrichmentState,

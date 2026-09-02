@@ -11,7 +11,7 @@ use haven_domain::contracts::{
     MediaItemRepository, ProgressRepository, ResourceRepository, SettingsRepository,
     StorageLocationRepository, WorkRepository,
 };
-use haven_domain::entities::FavoriteTarget;
+use haven_domain::entities::{Edition, FavoriteTarget, MediaItem, Resource, Work};
 use haven_domain::ids::WorkId;
 
 /// LibraryService 所需端口。
@@ -163,6 +163,18 @@ pub trait UnitOfWork: Send + Sync {
     fn run_favorite(
         &self,
         f: &dyn Fn(&dyn FavoriteTxPorts) -> Result<(), AppError>,
+    ) -> Result<(), AppError>;
+
+    /// 将来源导入的 Work、去重引用、Edition、MediaItem 与 Resource 一起提交。
+    /// 闭包内不得执行异步 IO；任一步失败都必须回滚整次导入。
+    fn run_source_import(
+        &self,
+        provider: &str,
+        external_id: &str,
+        work: &Work,
+        edition: &Edition,
+        items: &[MediaItem],
+        resources: &[Resource],
     ) -> Result<(), AppError>;
 }
 
