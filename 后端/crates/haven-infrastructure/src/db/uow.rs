@@ -11,10 +11,13 @@ use rusqlite::Transaction;
 
 use haven_common::AppError;
 use haven_domain::entities::{Edition, FavoriteTarget, MediaItem, Resource, Work};
+use haven_domain::enums::MediaType;
 use haven_domain::ids::WorkId;
 
 use crate::db::Db;
-use haven_application::services::ports::{FavoriteState, FavoriteTxPorts, UnitOfWork};
+use haven_application::services::ports::{
+    ComicChapterRefreshPlan, FavoriteState, FavoriteTxPorts, UnitOfWork,
+};
 
 /// R-MAIN-09D：purge 中间表唯一内部名（明确 temp schema；DROP 用同一定义，避免散落字符串）。
 const PURGE_TEMP_TABLE: &str = "temp._haven_storage_purge_media_ids";
@@ -72,6 +75,239 @@ impl UnitOfWork for SqliteUnitOfWork {
             Ok(())
         })
     }
+
+    fn run_comic_chapter_refresh(&self, plan: &ComicChapterRefreshPlan) -> Result<(), AppError> {
+        let next_generation = plan.expected_generation.checked_add(1).ok_or_else(|| {
+            AppError::new(
+                "COMIC_CATALOG_GENERATION_INVALID",
+                haven_common::ErrorKind::Validation,
+                "漫画章节目录 generation 已达到上限",
+                false,
+            )
+        })?;
+        if plan.state.source_key != plan.source_key
+            || plan.state.remote_work_id != plan.remote_work_id
+            || plan.state.generation != next_generation
+        {
+            return Err(AppError::new(
+                "COMIC_CATALOG_REFRESH_PLAN_INVALID",
+                haven_common::ErrorKind::Validation,
+                "漫画章节刷新计划的来源或 generation 不一致",
+                false,
+            ));
+        }
+        let expected_generation = i64::try_from(plan.expected_generation).map_err(|_| {
+            AppError::new(
+                "COMIC_CATALOG_GENERATION_INVALID",
+                haven_common::ErrorKind::Validation,
+                "漫画章节目录 generation 超出数据库范围",
+                false,
+            )
+        })?;
+        let next_generation_db = i64::try_from(next_generation).map_err(|_| {
+            AppError::new(
+                "COMIC_CATALOG_GENERATION_INVALID",
+                haven_common::ErrorKind::Validation,
+                "漫画章节目录 generation 超出数据库范围",
+                false,
+            )
+        })?;
+        let total = plan.state.total.map(i64::from);
+        let truncated = i64::from(plan.state.truncated);
+
+        self.db.with_tx(|tx| {
+            let current_generation: Option<i64> = match tx.query_row(
+                "SELECT generation FROM comic_chapter_catalog_states
+                 WHERE source_key = ?1 AND remote_work_id = ?2",
+                rusqlite::params![&plan.source_key, &plan.remote_work_id],
+                |row| row.get(0),
+            ) {
+                Ok(value) => Some(value),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(error) => return Err(tx_err("查询漫画章节目录 generation 失败", error)),
+            };
+            if current_generation != (plan.expected_generation > 0).then_some(expected_generation) {
+                return Err(comic_catalog_generation_conflict());
+            }
+
+            validate_comic_refresh_plan(tx, plan)?;
+            crate::db::repos::work::save_on_conn(tx, &plan.work)?;
+            crate::db::repos::work::save_source_ref_on_conn(
+                tx,
+                &plan.source_key,
+                &plan.remote_work_id,
+                plan.work.id,
+            )?;
+            for edition in &plan.editions {
+                crate::db::repos::edition::save_on_conn(tx, &edition.edition)?;
+                crate::db::repos::edition_profiles::save_on_conn(
+                    tx,
+                    edition.edition.id,
+                    &edition.profile,
+                )?;
+            }
+            for item in &plan.items {
+                crate::db::repos::media_item::save_on_conn(tx, item)?;
+            }
+            for resource in &plan.resources {
+                crate::db::repos::resource::save_on_conn(tx, resource)?;
+            }
+            for reference in &plan.chapter_refs {
+                if reference.identity.source_key != plan.source_key
+                    || reference.identity.remote_work_id != plan.remote_work_id
+                {
+                    return Err(AppError::new(
+                        "COMIC_CATALOG_REFRESH_PLAN_INVALID",
+                        haven_common::ErrorKind::Validation,
+                        "章节来源引用不属于当前目录",
+                        false,
+                    ));
+                }
+                crate::db::repos::comic_identity::save_on_conn(tx, reference)?;
+            }
+
+            match current_generation {
+                Some(_) => {
+                    let affected = tx
+                        .execute(
+                            "UPDATE comic_chapter_catalog_states SET
+                                 generation = ?1,
+                                 fetched_at = ?2,
+                                 total = ?3,
+                                 truncated = ?4
+                             WHERE source_key = ?5 AND remote_work_id = ?6
+                               AND generation = ?7",
+                            rusqlite::params![
+                                next_generation_db,
+                                plan.state.fetched_at.0,
+                                total,
+                                truncated,
+                                &plan.source_key,
+                                &plan.remote_work_id,
+                                expected_generation,
+                            ],
+                        )
+                        .map_err(|error| tx_err("更新漫画章节目录刷新状态失败", error))?;
+                    if affected != 1 {
+                        return Err(comic_catalog_generation_conflict());
+                    }
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO comic_chapter_catalog_states
+                            (source_key, remote_work_id, generation, fetched_at, total, truncated)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![
+                            &plan.source_key,
+                            &plan.remote_work_id,
+                            next_generation_db,
+                            plan.state.fetched_at.0,
+                            total,
+                            truncated,
+                        ],
+                    )
+                    .map_err(|error| tx_err("创建漫画章节目录刷新状态失败", error))?;
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+fn validate_comic_refresh_plan(
+    conn: &rusqlite::Connection,
+    plan: &ComicChapterRefreshPlan,
+) -> Result<(), AppError> {
+    for edition in &plan.editions {
+        if edition.edition.work_id != plan.work.id
+            || edition.edition.edition_type != MediaType::Comic
+        {
+            return Err(invalid_comic_refresh_plan(
+                "刷新计划包含不属于当前 Work 的 Edition",
+            ));
+        }
+    }
+
+    for item in &plan.items {
+        if item.media_type != MediaType::Comic
+            || !plan
+                .editions
+                .iter()
+                .any(|edition| edition.edition.id == item.edition_id)
+        {
+            return Err(invalid_comic_refresh_plan(
+                "刷新计划包含不属于当前 Work 的 MediaItem",
+            ));
+        }
+    }
+
+    for resource in &plan.resources {
+        if !plan
+            .items
+            .iter()
+            .any(|item| item.id == resource.media_item_id)
+            && !comic_item_belongs_to_work(conn, resource.media_item_id, plan.work.id)?
+        {
+            return Err(invalid_comic_refresh_plan(
+                "刷新计划包含不属于当前 Work 的 Resource",
+            ));
+        }
+    }
+
+    for reference in &plan.chapter_refs {
+        if reference.identity.source_key != plan.source_key
+            || reference.identity.remote_work_id != plan.remote_work_id
+        {
+            return Err(invalid_comic_refresh_plan("章节来源引用不属于当前目录"));
+        }
+        if !plan
+            .items
+            .iter()
+            .any(|item| item.id == reference.media_item_id)
+            && !comic_item_belongs_to_work(conn, reference.media_item_id, plan.work.id)?
+        {
+            return Err(invalid_comic_refresh_plan("章节来源引用不属于当前 Work"));
+        }
+    }
+    Ok(())
+}
+
+fn comic_item_belongs_to_work(
+    conn: &rusqlite::Connection,
+    media_item_id: haven_domain::ids::MediaItemId,
+    work_id: WorkId,
+) -> Result<bool, AppError> {
+    let exists: i64 = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM media_items m
+                 JOIN editions e ON e.id = m.edition_id
+                 WHERE m.id = ?1 AND m.media_type = 'comic' AND e.work_id = ?2
+             )",
+            rusqlite::params![media_item_id.to_string(), work_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|error| tx_err("验证漫画刷新计划 MediaItem 归属失败", error))?;
+    Ok(exists != 0)
+}
+
+fn invalid_comic_refresh_plan(message: &'static str) -> AppError {
+    AppError::new(
+        "COMIC_CATALOG_REFRESH_PLAN_INVALID",
+        haven_common::ErrorKind::Validation,
+        message,
+        false,
+    )
+}
+
+fn comic_catalog_generation_conflict() -> AppError {
+    AppError::new(
+        "COMIC_CATALOG_GENERATION_CONFLICT",
+        haven_common::ErrorKind::Conflict,
+        "漫画章节目录已被更新，请重新刷新",
+        false,
+    )
 }
 
 struct SqliteFavoriteTx<'a> {
@@ -1236,8 +1472,8 @@ mod tests {
         {
             let conn = db.lock();
             conn.execute(
-                "INSERT INTO progress (id, work_id, edition_id, media_item_id, locator_json, locator_version, completion, percentage, last_active_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 1, 'in_progress', 0.25, ?6, ?6)",
+                "INSERT INTO progress (id, work_id, edition_id, media_item_id, locator_json, locator_version, completion, percentage, last_active_at, updated_at, revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, 'in_progress', 0.25, ?6, ?6, 'purge-revision')",
                 params![
                     "purge-progress",
                     work_id.to_string(),
@@ -1637,8 +1873,8 @@ mod tests {
             conn.execute(
                 "INSERT INTO progress
                     (id, work_id, edition_id, media_item_id, locator_json, locator_version,
-                     completion, percentage, last_active_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, '{}', 1, 'in_progress', 0.5, ?5, ?5)",
+                     completion, percentage, last_active_at, updated_at, revision)
+                 VALUES (?1, ?2, ?3, ?4, '{}', 1, 'in_progress', 0.5, ?5, ?5, 'seed-progress-revision')",
                 rusqlite::params![
                     haven_domain::ids::ProgressId::new().to_string(),
                     &work_id,
@@ -2025,5 +2261,355 @@ mod tests {
             assert!(rows.next().unwrap().is_none(), "共享保留后不得有 FK 损坏");
         }
         assert!(!purge_temp_leaked(&db), "共享分支不得泄漏 TEMP 中间表");
+    }
+
+    fn comic_refresh_plan(
+        expected_generation: u64,
+    ) -> (
+        haven_application::services::ports::ComicChapterRefreshPlan,
+        haven_domain::ids::EditionId,
+        haven_domain::ids::MediaItemId,
+        haven_domain::ids::ResourceId,
+    ) {
+        use haven_domain::comic_catalog::{ComicChapterCatalogState, ComicChapterSourceStatus};
+        use haven_domain::comic_identity::{
+            ChapterSourceIdentity, ChapterSourceRef, ColorMode, ComicChapterMetadata,
+            EditionProfile, IdentityFacet, ScanGroupFacet,
+        };
+        use haven_domain::entities::{
+            Edition, MediaIndex, MediaItem, Resource, ResourceLocator, Work,
+        };
+        use haven_domain::enums::{
+            Availability, AvailabilitySource, MediaItemStatus, MediaType, ResourceType, WorkStatus,
+            WorkType,
+        };
+        use haven_domain::ids::{EditionId, MediaItemId, ResourceId, SourceId, WorkId};
+
+        let source_key = "mangadex".to_owned();
+        let remote_work_id = "manga-refresh-fixture".to_owned();
+        let remote_chapter_id = "chapter-refresh-fixture".to_owned();
+        let next_generation = expected_generation + 1;
+        let now = haven_common::UtcMillis(10_000 + next_generation as i64);
+        let work_id = WorkId::new();
+        let edition_id = EditionId::new();
+        let media_item_id = MediaItemId::new();
+        let resource_id = ResourceId::new();
+        let source_id = SourceId::new();
+        let profile = EditionProfile {
+            language: IdentityFacet::known("zh-cn"),
+            translation_line: IdentityFacet::known("line-refresh"),
+            scan_group: ScanGroupFacet::content_line("scan-refresh"),
+            color_mode: ColorMode::Grayscale,
+        };
+        let work = Work {
+            id: work_id,
+            canonical_title: "章节刷新事务测试".into(),
+            original_title: Some("Comic Refresh Fixture".into()),
+            sort_title: None,
+            description: Some("用于验证漫画目录刷新原子性的测试作品".into()),
+            work_type: WorkType::Standalone,
+            release_year: Some(2026),
+            language: Some("zh-cn".into()),
+            director: None,
+            actor: None,
+            status: WorkStatus::Ongoing,
+            rating_value: None,
+            rating_scale: None,
+            artwork: Default::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        let edition = Edition {
+            id: edition_id,
+            work_id,
+            title: "中文扫描版".into(),
+            subtitle: Some("刷新事务画像".into()),
+            edition_type: MediaType::Comic,
+            release_date: Some("2026-01-01".into()),
+            language: Some("zh-cn".into()),
+            region: Some("CN".into()),
+            publisher_or_studio: Some("测试扫描组".into()),
+            description: Some("Edition profile fixture".into()),
+            artwork: Default::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        let item = MediaItem {
+            id: media_item_id,
+            edition_id,
+            parent_id: None,
+            media_type: MediaType::Comic,
+            title: "第 1 话".into(),
+            index: MediaIndex::Chapter {
+                volume: Some(1.0),
+                chapter: 1.0,
+            },
+            duration_ms: None,
+            page_count: Some(24),
+            chapter_count: None,
+            published_at: Some("2026-01-02T00:00:00Z".into()),
+            status: MediaItemStatus::Available,
+            created_at: now,
+            updated_at: now,
+        };
+        let remote_id = format!("{remote_work_id}:{remote_chapter_id}");
+        let resource = Resource {
+            id: resource_id,
+            media_item_id,
+            resource_type: ResourceType::ComicArchive,
+            source_id: Some(source_id),
+            storage_location_id: None,
+            locator: ResourceLocator::SourceObject {
+                source_id,
+                remote_id,
+            },
+            mime_type: Some("application/vnd.comicbook+zip".into()),
+            size: None,
+            hash: None,
+            availability: Availability::Available,
+            availability_source: AvailabilitySource::User,
+            modified_ms: None,
+            fingerprint_first: None,
+            fingerprint_last: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let reference = ChapterSourceRef {
+            media_item_id,
+            identity: ChapterSourceIdentity::new(
+                source_key.clone(),
+                remote_work_id.clone(),
+                remote_chapter_id,
+            )
+            .unwrap(),
+            metadata: ComicChapterMetadata {
+                edition_profile: profile.clone(),
+                chapter_number: Some(1.0),
+                volume_number: Some(1.0),
+                title: Some("第一话".into()),
+                page_count: Some(24),
+                authoritative_content_key: Some("refresh-content-1".into()),
+            },
+            source_order: 4,
+            availability: ComicChapterSourceStatus::Available,
+            published_at: Some("2026-01-02T00:00:00Z".into()),
+            source_updated_at: Some("2026-01-03T00:00:00Z".into()),
+            last_seen_generation: Some(next_generation),
+            updated_at: now,
+        };
+        let plan = haven_application::services::ports::ComicChapterRefreshPlan {
+            source_key,
+            remote_work_id,
+            expected_generation,
+            state: ComicChapterCatalogState {
+                source_key: "mangadex".into(),
+                remote_work_id: "manga-refresh-fixture".into(),
+                generation: next_generation,
+                fetched_at: now,
+                total: Some(1),
+                truncated: false,
+            },
+            work,
+            editions: vec![haven_application::services::ports::ComicEditionWrite {
+                edition,
+                profile,
+            }],
+            items: vec![item],
+            resources: vec![resource],
+            chapter_refs: vec![reference],
+        };
+        (plan, edition_id, media_item_id, resource_id)
+    }
+
+    fn count_rows(db: &Db, table: &str) -> i64 {
+        db.lock()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn comic_refresh_uow_roundtrips_catalog_state_and_all_identity_columns() {
+        use haven_domain::contracts::{
+            ChapterSourceRepository, EditionProfileRepository, MediaItemRepository,
+            ResourceRepository,
+        };
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (plan, edition_id, media_item_id, resource_id) = comic_refresh_plan(0);
+        let source_key = plan.source_key.clone();
+        let remote_work_id = plan.remote_work_id.clone();
+        SqliteUnitOfWork::new(db.clone())
+            .run_comic_chapter_refresh(&plan)
+            .unwrap();
+
+        let repos = SqliteRepositories::new(db.clone());
+        let state = repos
+            .chapter_source
+            .refresh_state(&source_key, &remote_work_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.generation, 1);
+        assert_eq!(state.fetched_at, haven_common::UtcMillis(10_001));
+        assert_eq!(state.total, Some(1));
+        assert!(!state.truncated);
+
+        let refs = repos
+            .chapter_source
+            .list_for_source_work(&source_key, &remote_work_id)
+            .await
+            .unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].media_item_id, media_item_id);
+        assert_eq!(refs[0].source_order, 4);
+        assert_eq!(
+            refs[0].availability,
+            haven_domain::comic_catalog::ComicChapterSourceStatus::Available
+        );
+        assert_eq!(
+            refs[0].published_at.as_deref(),
+            Some("2026-01-02T00:00:00Z")
+        );
+        assert_eq!(
+            refs[0].source_updated_at.as_deref(),
+            Some("2026-01-03T00:00:00Z")
+        );
+        assert_eq!(refs[0].last_seen_generation, Some(1));
+        assert_eq!(
+            refs[0].metadata.authoritative_content_key.as_deref(),
+            Some("refresh-content-1")
+        );
+        assert_eq!(
+            refs[0].metadata.edition_profile,
+            repos
+                .edition_profiles
+                .get(edition_id)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+
+        let item = repos.media_item.get(media_item_id).await.unwrap().unwrap();
+        assert_eq!(item.page_count, Some(24));
+        let resource = repos.resource.get(resource_id).await.unwrap().unwrap();
+        assert_eq!(
+            resource.resource_type,
+            haven_domain::enums::ResourceType::ComicArchive
+        );
+        assert_eq!(
+            resource.availability,
+            haven_domain::enums::Availability::Available
+        );
+        assert_eq!(count_rows(&db, "works"), 1);
+        assert_eq!(count_rows(&db, "work_source_refs"), 1);
+        assert_eq!(count_rows(&db, "editions"), 1);
+        assert_eq!(count_rows(&db, "edition_profiles"), 1);
+        assert_eq!(count_rows(&db, "media_items"), 1);
+        assert_eq!(count_rows(&db, "resources"), 1);
+        assert_eq!(count_rows(&db, "comic_chapter_source_refs"), 1);
+        assert_eq!(count_rows(&db, "comic_chapter_catalog_states"), 1);
+    }
+
+    #[test]
+    fn comic_refresh_rejects_cross_work_plan_before_any_write() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (mut plan, _, _, _) = comic_refresh_plan(0);
+        plan.editions[0].edition.work_id = WorkId::new();
+
+        let error = SqliteUnitOfWork::new(db.clone())
+            .run_comic_chapter_refresh(&plan)
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), "COMIC_CATALOG_REFRESH_PLAN_INVALID");
+        for table in [
+            "works",
+            "work_source_refs",
+            "editions",
+            "edition_profiles",
+            "media_items",
+            "resources",
+            "comic_chapter_source_refs",
+            "comic_chapter_catalog_states",
+        ] {
+            assert_eq!(count_rows(&db, table), 0, "无效计划不得写入 {table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_comic_refresh_generation_rejects_without_partial_writes() {
+        use haven_domain::contracts::ChapterSourceRepository;
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        db.lock()
+            .execute(
+                "INSERT INTO comic_chapter_catalog_states
+                    (source_key, remote_work_id, generation, fetched_at, total, truncated)
+                 VALUES (?1, ?2, 1, 9_000, 7, 0)",
+                rusqlite::params!["mangadex", "manga-refresh-fixture"],
+            )
+            .unwrap();
+        let (plan, _, _, _) = comic_refresh_plan(0);
+        let err = SqliteUnitOfWork::new(db.clone())
+            .run_comic_chapter_refresh(&plan)
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "COMIC_CATALOG_GENERATION_CONFLICT");
+
+        for table in [
+            "works",
+            "work_source_refs",
+            "editions",
+            "edition_profiles",
+            "media_items",
+            "resources",
+            "comic_chapter_source_refs",
+        ] {
+            assert_eq!(count_rows(&db, table), 0, "generation 冲突不得写入 {table}");
+        }
+        assert_eq!(count_rows(&db, "comic_chapter_catalog_states"), 1);
+        let repos = SqliteRepositories::new(db);
+        let state = repos
+            .chapter_source
+            .refresh_state("mangadex", "manga-refresh-fixture")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.generation, 1);
+        assert_eq!(state.fetched_at, haven_common::UtcMillis(9_000));
+        assert_eq!(state.total, Some(7));
+    }
+
+    #[test]
+    fn comic_refresh_resource_failure_rolls_back_every_preceding_write() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (plan, _, _, resource_id) = comic_refresh_plan(0);
+        let resource_id = resource_id.to_string();
+        db.lock()
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_comic_refresh_resource_insert
+                 BEFORE INSERT ON resources
+                 WHEN NEW.id = '{resource_id}'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected comic refresh resource failure');
+                 END;"
+            ))
+            .unwrap();
+
+        let err = SqliteUnitOfWork::new(db.clone())
+            .run_comic_chapter_refresh(&plan)
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "DATABASE_ERROR");
+        for table in [
+            "works",
+            "work_source_refs",
+            "editions",
+            "edition_profiles",
+            "media_items",
+            "resources",
+            "comic_chapter_source_refs",
+            "comic_chapter_catalog_states",
+        ] {
+            assert_eq!(count_rows(&db, table), 0, "资源失败不得留下 {table}");
+        }
     }
 }

@@ -6,10 +6,13 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use haven_common::AppError;
+use haven_domain::comic_catalog::ComicChapterCatalogState;
+use haven_domain::comic_identity::{ChapterSourceRef, EditionProfile};
 use haven_domain::contracts::{
-    EditionRepository, EnrichmentRepository, FavoriteRepository, MarkerRepository,
-    MediaItemRepository, ProgressRepository, ResourceRepository, SettingsRepository,
-    StorageLocationRepository, WorkRepository,
+    ChapterSourceRepository, ComicPageIdentityRepository, ComicProgressMigrationRepository,
+    EditionProfileRepository, EditionRepository, EnrichmentRepository, FavoriteRepository,
+    MarkerRepository, MediaItemRepository, ProgressRepository, ResourceRepository,
+    SettingsRepository, StorageLocationRepository, WorkRepository,
 };
 use haven_domain::entities::{Edition, FavoriteTarget, MediaItem, Resource, Work};
 use haven_domain::ids::WorkId;
@@ -117,18 +120,49 @@ where
 pub trait SourceImportPorts:
     WorkRepository
     + EditionRepository
+    + EditionProfileRepository
     + MediaItemRepository
     + ResourceRepository
+    + ChapterSourceRepository
     + haven_domain::contracts::ImageProxyRepository
     + Send
     + Sync
 {
 }
+
+/// 漫画章节匹配与进度迁移所需端口。
+///
+/// 比较在 Application 侧完成，原子进度写入由
+/// `ComicProgressMigrationRepository` 在 Infrastructure 事务中完成。
+pub trait ComicProgressMigrationPorts:
+    ChapterSourceRepository
+    + ComicPageIdentityRepository
+    + ComicProgressMigrationRepository
+    + MediaItemRepository
+    + EditionRepository
+    + ProgressRepository
+    + Send
+    + Sync
+{
+}
+impl<T> ComicProgressMigrationPorts for T where
+    T: ChapterSourceRepository
+        + ComicPageIdentityRepository
+        + ComicProgressMigrationRepository
+        + MediaItemRepository
+        + EditionRepository
+        + ProgressRepository
+        + Send
+        + Sync
+{
+}
 impl<T> SourceImportPorts for T where
     T: WorkRepository
         + EditionRepository
+        + EditionProfileRepository
         + MediaItemRepository
         + ResourceRepository
+        + ChapterSourceRepository
         + haven_domain::contracts::ImageProxyRepository
         + Send
         + Sync
@@ -176,6 +210,43 @@ pub trait UnitOfWork: Send + Sync {
         items: &[MediaItem],
         resources: &[Resource],
     ) -> Result<(), AppError>;
+
+    /// 原子提交一次漫画章节目录刷新。网络读取必须发生在该方法外；此处只接收
+    /// 已经完成 provider 校验和 Application 匹配的同步写入计划。
+    /// 默认实现给内存测试 UoW 返回不支持，真实 SQLite 实现执行 generation CAS。
+    fn run_comic_chapter_refresh(&self, _plan: &ComicChapterRefreshPlan) -> Result<(), AppError> {
+        Err(AppError::new(
+            "COMIC_REFRESH_UOW_UNAVAILABLE",
+            haven_common::ErrorKind::Internal,
+            "当前 UnitOfWork 不支持漫画章节刷新事务",
+            false,
+        ))
+    }
+}
+
+/// 一个需要一起落库的漫画 Edition 及其身份画像。
+#[derive(Debug, Clone)]
+pub struct ComicEditionWrite {
+    pub edition: Edition,
+    pub profile: EditionProfile,
+}
+
+/// 漫画目录刷新/首次章节化导入的完整事务计划。
+///
+/// `expected_generation=0` 表示首次建立目录；已有状态则必须精确匹配，提交后
+/// `state.generation` 应为 expected + 1。计划中的 chapter_refs 可以包含旧章节的
+/// `Missing` 保留记录，但不会删除任何 MediaItem、Progress、Marker 或 History。
+#[derive(Debug, Clone)]
+pub struct ComicChapterRefreshPlan {
+    pub source_key: String,
+    pub remote_work_id: String,
+    pub expected_generation: u64,
+    pub state: ComicChapterCatalogState,
+    pub work: Work,
+    pub editions: Vec<ComicEditionWrite>,
+    pub items: Vec<MediaItem>,
+    pub resources: Vec<Resource>,
+    pub chapter_refs: Vec<ChapterSourceRef>,
 }
 
 /// Enrichment 流水线所需端口（契约 §36.8）。

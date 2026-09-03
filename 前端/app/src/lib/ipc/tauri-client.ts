@@ -50,6 +50,16 @@ import type {
   DownloadTaskDto,
   EditionDetailDto,
   EditionGetRequest,
+  ComicChapterCatalogGetRequest,
+  ComicChapterCatalogDto,
+  ComicRegisteredChapterCatalogDto,
+  ComicChapterSourceCandidatesDto,
+  ComicChapterSourceCandidatesGetRequestDto,
+  ComicProgressMigrationRequestDto,
+  ComicProgressMigrationResultDto,
+  ComicPageProgressRemapRequestDto,
+  ComicProgressMigrationRevertRequestDto,
+  ComicProgressMigrationRevertResultDto,
   ComicPageManifestGetRequest,
   ComicPageManifestDto,
   ReaderTocGetRequest,
@@ -205,6 +215,82 @@ export class TauriHavenClient implements HavenClient {
   async streamClose(request: SessionCloseRequest): Promise<boolean> {
     try {
       return await invoke<boolean>("stream_close", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async comicChapterCatalogGet(
+    request: ComicChapterCatalogGetRequest,
+  ): Promise<ComicChapterCatalogDto> {
+    try {
+      return await invoke<ComicChapterCatalogDto>("comic_chapter_catalog_get", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async comicChapterCatalogRegisteredGet(
+    request: ComicChapterCatalogGetRequest,
+  ): Promise<ComicRegisteredChapterCatalogDto> {
+    try {
+      return await invoke<ComicRegisteredChapterCatalogDto>(
+        "comic_chapter_catalog_registered_get",
+        { request },
+      );
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async comicChapterCatalogRefresh(
+    request: ComicChapterCatalogGetRequest,
+  ): Promise<ComicChapterCatalogDto> {
+    try {
+      return await invoke<ComicChapterCatalogDto>("comic_chapter_catalog_refresh", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async comicChapterSourceCandidatesGet(
+    request: ComicChapterSourceCandidatesGetRequestDto,
+  ): Promise<ComicChapterSourceCandidatesDto> {
+    try {
+      return await invoke<ComicChapterSourceCandidatesDto>(
+        "comic_chapter_source_candidates_get",
+        { request },
+      );
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async comicProgressMigrate(
+    request: ComicProgressMigrationRequestDto,
+  ): Promise<ComicProgressMigrationResultDto> {
+    try {
+      return await invoke<ComicProgressMigrationResultDto>("comic_progress_migrate", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async comicProgressRemap(
+    request: ComicPageProgressRemapRequestDto,
+  ): Promise<ComicProgressMigrationResultDto> {
+    try {
+      return await invoke<ComicProgressMigrationResultDto>("comic_progress_remap", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async comicProgressRevert(
+    request: ComicProgressMigrationRevertRequestDto,
+  ): Promise<ComicProgressMigrationRevertResultDto> {
+    try {
+      return await invoke<ComicProgressMigrationRevertResultDto>("comic_progress_revert", { request });
     } catch (error) {
       throw toHavenError(error);
     }

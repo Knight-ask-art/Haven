@@ -6,8 +6,13 @@
 
 use async_trait::async_trait;
 
-use haven_common::AppError;
+use haven_common::{AppError, ErrorKind};
 
+use crate::comic_catalog::ComicChapterCatalogState;
+use crate::comic_identity::{
+    ChapterSourceIdentity, ChapterSourceRef, ComicPageIdentitySnapshot,
+    ComicProgressMigrationSnapshot, EditionProfile, PageIdentity,
+};
 use crate::entities::*;
 use crate::enums::DownloadState;
 use crate::ids::*;
@@ -121,6 +126,122 @@ pub trait EditionRepository: Send + Sync {
         }
         Ok(out)
     }
+}
+
+/// 漫画 Edition 画像持久化契约。
+///
+/// `language` 继续复用 `editions.language`；Repository 负责把画像中的
+/// language 与现有字段保持一致，翻译线、扫描组和彩色模式保存在独立画像表。
+#[async_trait]
+pub trait EditionProfileRepository: Send + Sync {
+    async fn get(&self, edition_id: EditionId) -> Result<Option<EditionProfile>, AppError>;
+    async fn save(&self, edition_id: EditionId, profile: &EditionProfile) -> Result<(), AppError>;
+}
+
+/// 远端章节身份绑定契约。一个来源章节身份最多绑定一个 MediaItem，多个来源
+/// 身份可以绑定同一个 MediaItem（内容证据成立时共享进度）。
+#[async_trait]
+pub trait ChapterSourceRepository: Send + Sync {
+    async fn get(
+        &self,
+        identity: &ChapterSourceIdentity,
+    ) -> Result<Option<ChapterSourceRef>, AppError>;
+    async fn list_for_media_item(
+        &self,
+        media_item_id: MediaItemId,
+    ) -> Result<Vec<ChapterSourceRef>, AppError>;
+    async fn list_for_source_work(
+        &self,
+        source_key: &str,
+        remote_work_id: &str,
+    ) -> Result<Vec<ChapterSourceRef>, AppError>;
+    async fn refresh_state(
+        &self,
+        source_key: &str,
+        remote_work_id: &str,
+    ) -> Result<Option<ComicChapterCatalogState>, AppError>;
+    async fn save(&self, reference: &ChapterSourceRef) -> Result<(), AppError>;
+}
+
+/// 漫画页面序列的稳定身份持久化契约。
+///
+/// 页面清单可以变化，调用方传入完整新序列后原子替换；没有稳定身份的页面
+/// 允许保存空 `PageIdentity`，以便应用层使用可解释的低置信度比例兜底。
+#[async_trait]
+pub trait ComicPageIdentityRepository: Send + Sync {
+    /// 读取页面序列及其整体观察 revision。页面序列和 revision 必须来自
+    /// 同一个一致性观察，不能由调用方分别读取后自行拼接。
+    async fn get_snapshot(
+        &self,
+        media_item_id: MediaItemId,
+    ) -> Result<ComicPageIdentitySnapshot, AppError>;
+
+    /// 以页面观察 revision 做原子替换。
+    /// - `expected_revision=None` 仅允许创建尚不存在的 state；
+    /// - `Some(revision)` 必须精确匹配当前 state；
+    /// - 返回 None 表示 CAS 冲突，未留下部分写入。
+    async fn replace_if_revision(
+        &self,
+        media_item_id: MediaItemId,
+        pages: &[PageIdentity],
+        updated_at: haven_common::UtcMillis,
+        expected_revision: Option<&str>,
+    ) -> Result<Option<String>, AppError>;
+
+    /// 兼容只需要读取页面列表的查询方；需要 CAS 的调用方必须使用快照。
+    async fn list(&self, media_item_id: MediaItemId) -> Result<Vec<PageIdentity>, AppError> {
+        Ok(self.get_snapshot(media_item_id).await?.pages)
+    }
+
+    /// 兼容旧的无显式 revision 调用方，但内部仍先读取快照并执行 CAS，
+    /// 不再使用“无条件覆盖”语义。
+    async fn replace(
+        &self,
+        media_item_id: MediaItemId,
+        pages: &[PageIdentity],
+        updated_at: haven_common::UtcMillis,
+    ) -> Result<(), AppError> {
+        let snapshot = self.get_snapshot(media_item_id).await?;
+        self.replace_if_revision(
+            media_item_id,
+            pages,
+            updated_at,
+            snapshot.revision.as_deref(),
+        )
+        .await?
+        .ok_or_else(|| {
+            AppError::new(
+                "COMIC_PAGE_IDENTITY_REVISION_CONFLICT",
+                ErrorKind::Conflict,
+                "漫画页面身份已被其他会话更新，请刷新后重试",
+                false,
+            )
+        })?;
+        Ok(())
+    }
+}
+
+/// 漫画进度迁移的原子应用/撤销契约。
+///
+/// Infrastructure 必须在一个 SQLite 事务中同时校验来源/目标 revision、写入
+/// Progress 和保存快照，避免“进度已改但撤销证据没有落库”的半成功状态。
+#[async_trait]
+pub trait ComicProgressMigrationRepository: Send + Sync {
+    async fn apply(
+        &self,
+        snapshot: &ComicProgressMigrationSnapshot,
+        expected_source_revision: &str,
+        expected_target_revision: Option<&str>,
+    ) -> Result<Option<String>, AppError>;
+    async fn get_snapshot(
+        &self,
+        id: ComicProgressMigrationId,
+    ) -> Result<Option<ComicProgressMigrationSnapshot>, AppError>;
+    async fn revert(
+        &self,
+        id: ComicProgressMigrationId,
+        expected_applied_revision: &str,
+    ) -> Result<bool, AppError>;
 }
 
 #[async_trait]

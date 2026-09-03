@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-comic-progress-revert"
+description = "Enables the comic_progress_revert command without any pre-configured scope."
+commands.allow = ["comic_progress_revert"]
+
+[[permission]]
+identifier = "deny-comic-progress-revert"
+description = "Denies the comic_progress_revert command without any pre-configured scope."
+commands.deny = ["comic_progress_revert"]

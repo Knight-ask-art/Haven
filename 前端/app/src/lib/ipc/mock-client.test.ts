@@ -72,6 +72,61 @@ describe("MockHavenClient session lifecycle", () => {
     expect(second.pages.map((page) => page.contentUri)).not.toEqual(first.pages.map((page) => page.contentUri))
   })
 
+  it("returns the sanitized multi-chapter catalog fixture with source-level states", async () => {
+    const client = new MockHavenClient()
+    const catalog = await client.comicChapterCatalogGet({
+      sourceId: "mangadex",
+      remoteWorkId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    })
+    expect(catalog.chapters).toHaveLength(3)
+    expect(catalog.chapters.map((chapter) => chapter.availability)).toEqual([
+      "available",
+      "temporarily_unavailable",
+      "external_only",
+    ])
+    expect(catalog.chapters[0].editionProfile.scanGroupKind).toBe("content_line")
+  })
+
+  it("keeps the explicit refresh method available in browser mocks", async () => {
+    const client = new MockHavenClient()
+    await expect(client.comicChapterCatalogRefresh({
+      sourceId: "mangadex",
+      remoteWorkId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    })).resolves.toEqual(await client.comicChapterCatalogGet({
+      sourceId: "mangadex",
+      remoteWorkId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    }))
+  })
+
+  it("returns an explicit empty source-candidate projection in browser mocks", async () => {
+    const client = new MockHavenClient()
+    const source = {
+      sourceId: "mangadex",
+      remoteWorkId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      remoteChapterId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    } as const
+    await expect(client.comicChapterSourceCandidatesGet({ source })).resolves.toEqual({
+      schemaVersion: 1,
+      source,
+      currentMediaItemId: "0196f0d2-0000-7000-8000-000000000000",
+      candidates: [],
+      truncated: false,
+    })
+  })
+
+  it("projects the persisted media identities and refresh generation", async () => {
+    const client = new MockHavenClient()
+    const catalog = await client.comicChapterCatalogRegisteredGet({
+      sourceId: "mangadex",
+      remoteWorkId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    })
+    expect(catalog.refreshState).toMatchObject({ generation: 1, truncated: false })
+    expect(catalog.chapters).toHaveLength(3)
+    expect(catalog.chapters.map((chapter) => chapter.sourceOrder)).toEqual([0, 1, 2])
+    expect(catalog.chapters.every((chapter) => uuidPattern.test(chapter.mediaItemId))).toBe(true)
+    expect(catalog.chapters.some((chapter) => chapter.availability === "missing")).toBe(false)
+  })
+
   it("rejects manifest access for a non-comic session", async () => {
     const client = new MockHavenClient()
     const session = await client.sessionOpen(request)

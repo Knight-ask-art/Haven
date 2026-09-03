@@ -4,26 +4,40 @@
 //! （契约 §36.1 去重键持久化于 work_source_refs）→ 返回真实 Work/MediaItem 身份。
 //! 幂等：重复导入同一外部条目返回既有身份，不产生重复作品。
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use haven_common::network::{HttpUrlPolicy, parse_http_url};
 use haven_common::{AppError, ErrorKind, UtcMillis};
-use haven_domain::contracts::{EditionRepository, MediaItemRepository, WorkRepository};
-use haven_domain::entities::{Edition, MediaIndex, MediaItem, Resource, Work};
-use haven_domain::enums::{
-    Availability, AvailabilitySource, MediaType, ResourceType, WorkStatus, WorkType,
+use haven_domain::comic_catalog::{
+    ComicChapterAvailability, ComicChapterCatalog, ComicChapterCatalogEntry,
+    ComicChapterCatalogState, ComicChapterSourceStatus,
 };
-use haven_domain::ids::{MediaItemId, ResourceId, SourceId, WorkId};
+use haven_domain::comic_identity::{
+    ChapterSourceIdentity, ChapterSourceRef, EditionProfile, edition_profiles_can_share_container,
+};
+use haven_domain::contracts::{
+    ChapterSourceRepository, EditionProfileRepository, EditionRepository, MediaItemRepository,
+    ResourceRepository, WorkRepository,
+};
+use haven_domain::entities::{Edition, MediaIndex, MediaItem, Resource, ResourceLocator, Work};
+use haven_domain::enums::{
+    Availability, AvailabilitySource, MediaItemStatus, MediaType, ResourceType, WorkStatus,
+    WorkType,
+};
+use haven_domain::ids::{EditionId, MediaItemId, ResourceId, SourceId, WorkId};
 use uuid::Uuid;
 
-use crate::services::ports::{SourceImportPorts, UnitOfWork};
+use crate::services::ports::{
+    ComicChapterRefreshPlan, ComicEditionWrite, SourceImportPorts, UnitOfWork,
+};
 use crate::services::source_registry::SourceRegistryService;
 use crate::wire::ContentCategory;
 
 /// 来源目录条目（application 视角；由 infrastructure 适配器填充）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SourceCatalogEntry {
     pub external_id: String,
     pub title: String,
@@ -50,6 +64,10 @@ pub struct SourceCatalogEntry {
     /// 远端正文的受控身份。此结构只在 Application 内部流转，不能直接进入
     /// 普通 Wire DTO；下载/在线 Session 再由后端根据 source key 解析。
     pub remote: Option<RemoteContentRef>,
+    /// Provider 已经为本次详情请求取得的漫画目录。它只在 Application
+    /// 内部复用，避免 MangaDex 详情导入再次请求同一份 feed；不进入普通
+    /// Wire，也不成为持久化身份事实。
+    pub comic_catalog: Option<ComicChapterCatalog>,
 }
 
 /// 远端正文引用。只保存来源 key 和 Provider 自己的条目标识，不保存 URL、
@@ -82,6 +100,20 @@ pub trait SourceCatalogProvider: Send + Sync {
         endpoint: &str,
         external_id: &str,
     ) -> Result<SourceCatalogEntry, AppError>;
+
+    /// Return a provider-owned comic chapter catalog when the source supports
+    /// chapter listings. The default keeps existing CMS10/OPDS providers
+    /// source-compatible while making the capability explicit instead of
+    /// overloading `SourceCatalogEntry.episodes`.
+    async fn comic_chapter_catalog(
+        &self,
+        source_id: &str,
+        endpoint: &str,
+        external_id: &str,
+    ) -> Result<Option<ComicChapterCatalog>, AppError> {
+        let _ = (source_id, endpoint, external_id);
+        Ok(None)
+    }
     /// 关键词搜索（enrichment 标题匹配用）；来源不支持时返回空集。
     async fn search(
         &self,
@@ -431,6 +463,308 @@ impl SourceImportService {
             .await
     }
 
+    /// Read the current chapter catalog for a fixed comic source.
+    ///
+    /// This is deliberately a read-only provider boundary for the first
+    /// catalog milestone. Persistence/refresh is a separate use case so a
+    /// source response cannot partially mutate Work/Edition/MediaItem state.
+    pub async fn comic_chapter_catalog(
+        &self,
+        source_id: &str,
+        remote_work_id: &str,
+    ) -> Result<ComicChapterCatalog, AppError> {
+        if source_id != "mangadex" {
+            return Err(AppError::new(
+                "SOURCE_CATALOG_UNSUPPORTED",
+                ErrorKind::Unsupported,
+                "该来源暂不支持漫画章节目录",
+                false,
+            ));
+        }
+        validate_remote_candidate_id(source_id, remote_work_id)?;
+        self.catalog
+            .comic_chapter_catalog(source_id, "", remote_work_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::new(
+                    "SOURCE_CATALOG_UNSUPPORTED",
+                    ErrorKind::Unsupported,
+                    "该来源暂不支持漫画章节目录",
+                    false,
+                )
+            })
+    }
+
+    /// Refresh and persist a MangaDex chapter catalog. Network I/O is completed
+    /// before this method builds the synchronous transaction plan; the final
+    /// commit is protected by the catalog generation CAS in UnitOfWork.
+    pub async fn refresh_comic_chapter_catalog(
+        &self,
+        source_id: &str,
+        remote_work_id: &str,
+    ) -> Result<ComicChapterCatalog, AppError> {
+        if source_id != "mangadex" {
+            return Err(AppError::new(
+                "SOURCE_CATALOG_UNSUPPORTED",
+                ErrorKind::Unsupported,
+                "该来源暂不支持漫画章节目录",
+                false,
+            ));
+        }
+        validate_remote_candidate_id(source_id, remote_work_id)?;
+        let work_id = WorkRepository::id_for_source_ref(&*self.ports, source_id, remote_work_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::new(
+                    "WORK_NOT_FOUND",
+                    ErrorKind::NotFound,
+                    "来源作品尚未导入",
+                    false,
+                )
+            })?;
+        let work = WorkRepository::get(&*self.ports, work_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::new(
+                    "WORK_NOT_FOUND",
+                    ErrorKind::NotFound,
+                    "来源作品不存在",
+                    false,
+                )
+            })?;
+        let previous_state =
+            ChapterSourceRepository::refresh_state(&*self.ports, source_id, remote_work_id).await?;
+        let expected_generation = previous_state
+            .as_ref()
+            .map(|state| state.generation)
+            .unwrap_or(0);
+        let catalog = self
+            .comic_chapter_catalog(source_id, remote_work_id)
+            .await?;
+        ensure_catalog_identity(&catalog, source_id, remote_work_id)?;
+        let next_generation = expected_generation.checked_add(1).ok_or_else(|| {
+            AppError::new(
+                "COMIC_CATALOG_GENERATION_INVALID",
+                ErrorKind::Validation,
+                "漫画章节目录 generation 已达到上限",
+                false,
+            )
+        })?;
+
+        let editions: Vec<_> = EditionRepository::list_by_work(&*self.ports, work_id)
+            .await?
+            .into_iter()
+            .filter(|edition| edition.edition_type == MediaType::Comic)
+            .collect();
+        let edition_ids: Vec<EditionId> = editions.iter().map(|edition| edition.id).collect();
+        let mut profiles_by_edition = HashMap::new();
+        for edition in &editions {
+            let profile = EditionProfileRepository::get(&*self.ports, edition.id)
+                .await?
+                .unwrap_or_else(|| EditionProfile::from_language(edition.language.as_deref()));
+            profiles_by_edition.insert(edition.id, profile);
+        }
+        let existing_items =
+            MediaItemRepository::list_by_editions(&*self.ports, &edition_ids).await?;
+        let mut items_by_id: HashMap<MediaItemId, _> = existing_items
+            .into_iter()
+            .map(|item| (item.id, item))
+            .collect();
+        let existing_refs =
+            ChapterSourceRepository::list_for_source_work(&*self.ports, source_id, remote_work_id)
+                .await?;
+        let existing_by_identity: HashMap<ChapterSourceIdentity, ChapterSourceRef> = existing_refs
+            .into_iter()
+            .map(|reference| (reference.identity.clone(), reference))
+            .collect();
+
+        let mut resources_by_id = HashMap::new();
+        let item_ids: Vec<MediaItemId> = items_by_id.keys().copied().collect();
+        for item_id in item_ids {
+            for resource in ResourceRepository::list_by_media_item(&*self.ports, item_id).await? {
+                resources_by_id.insert(resource.id, resource);
+            }
+        }
+
+        let mut edition_writes: Vec<ComicEditionWrite> = editions
+            .into_iter()
+            .map(|edition| ComicEditionWrite {
+                profile: profiles_by_edition
+                    .get(&edition.id)
+                    .cloned()
+                    .unwrap_or_default(),
+                edition,
+            })
+            .collect();
+        let mut updated_items: HashMap<MediaItemId, haven_domain::entities::MediaItem> =
+            HashMap::new();
+        let mut updated_resources: HashMap<ResourceId, Resource> = HashMap::new();
+        let mut chapter_refs =
+            Vec::with_capacity(catalog.chapters.len() + existing_by_identity.len());
+        let mut seen_identities = HashSet::new();
+        let source_id_value = stable_source_id(source_id)?;
+
+        for (source_order, chapter) in catalog.chapters.iter().enumerate() {
+            let media_item_id = if let Some(existing) = existing_by_identity.get(&chapter.identity)
+            {
+                let _item = items_by_id.get(&existing.media_item_id).ok_or_else(|| {
+                    AppError::new(
+                        "DATABASE_ERROR",
+                        ErrorKind::Database,
+                        "章节来源引用指向不存在的媒体条目",
+                        true,
+                    )
+                })?;
+                existing.media_item_id
+            } else {
+                let edition_id =
+                    match find_matching_edition(&chapter.metadata.edition_profile, &edition_writes)
+                    {
+                        Some(edition_id) => edition_id,
+                        None => {
+                            let profile = chapter.metadata.edition_profile.clone();
+                            let edition = new_comic_edition(
+                                &work,
+                                &work.canonical_title,
+                                work.description.clone(),
+                                &profile,
+                                catalog.fetched_at,
+                            );
+                            let edition_id = edition.id;
+                            profiles_by_edition.insert(edition_id, profile.clone());
+                            edition_writes.push(ComicEditionWrite { edition, profile });
+                            edition_id
+                        }
+                    };
+                let item =
+                    new_comic_media_item(edition_id, chapter, source_order, catalog.fetched_at)?;
+                let media_item_id = item.id;
+                items_by_id.insert(media_item_id, item);
+                media_item_id
+            };
+
+            let item = items_by_id.get_mut(&media_item_id).ok_or_else(|| {
+                AppError::new(
+                    "DATABASE_ERROR",
+                    ErrorKind::Database,
+                    "章节刷新生成的媒体条目不存在",
+                    true,
+                )
+            })?;
+            apply_catalog_entry_to_media_item(item, chapter, source_order, catalog.fetched_at)?;
+            updated_items.insert(media_item_id, item.clone());
+
+            let remote_id = comic_remote_id(remote_work_id, &chapter.identity.remote_chapter_id);
+            validate_remote_source_object(source_id, ResourceType::ComicArchive, &remote_id)?;
+            let resource_id = resources_by_id.iter().find_map(|(resource_id, resource)| {
+                source_resource_matches(resource, source_id_value, &remote_id)
+                    .then_some(*resource_id)
+            });
+            let resource = if let Some(resource_id) = resource_id {
+                let resource = resources_by_id.get_mut(&resource_id).ok_or_else(|| {
+                    AppError::new(
+                        "DATABASE_ERROR",
+                        ErrorKind::Database,
+                        "章节来源资源索引不存在",
+                        true,
+                    )
+                })?;
+                apply_catalog_entry_to_resource(resource, chapter, catalog.fetched_at);
+                resource.clone()
+            } else {
+                let resource = new_comic_resource(
+                    media_item_id,
+                    source_id_value,
+                    remote_id,
+                    chapter,
+                    catalog.fetched_at,
+                );
+                resources_by_id.insert(resource.id, resource.clone());
+                resource
+            };
+            updated_resources.insert(resource.id, resource);
+
+            chapter_refs.push(ChapterSourceRef {
+                media_item_id,
+                identity: chapter.identity.clone(),
+                // Keep the source's latest observed profile. The repository
+                // stores it separately from the shared Edition profile so a
+                // later source refresh cannot erase this evidence.
+                metadata: chapter.metadata.clone(),
+                source_order: u32::try_from(source_order).map_err(|_| {
+                    AppError::new(
+                        "COMIC_CATALOG_TOO_LARGE",
+                        ErrorKind::Validation,
+                        "漫画章节目录顺序超出范围",
+                        false,
+                    )
+                })?,
+                availability: chapter.availability.into(),
+                published_at: chapter.published_at.clone(),
+                source_updated_at: chapter.updated_at.clone(),
+                last_seen_generation: Some(next_generation),
+                updated_at: catalog.fetched_at,
+            });
+            seen_identities.insert(chapter.identity.clone());
+        }
+
+        if !catalog.truncated {
+            for existing in existing_by_identity.values() {
+                if seen_identities.contains(&existing.identity) {
+                    continue;
+                }
+                let mut missing = existing.clone();
+                missing.availability = ComicChapterSourceStatus::Missing;
+                missing.updated_at = catalog.fetched_at;
+                chapter_refs.push(missing);
+                let remote_id =
+                    comic_remote_id(remote_work_id, &existing.identity.remote_chapter_id);
+                let resource_ids: Vec<ResourceId> = resources_by_id
+                    .iter()
+                    .filter_map(|(resource_id, resource)| {
+                        source_resource_matches(resource, source_id_value, &remote_id)
+                            .then_some(*resource_id)
+                    })
+                    .collect();
+                for resource_id in resource_ids {
+                    if let Some(resource) = resources_by_id.get_mut(&resource_id) {
+                        resource.availability = Availability::Missing;
+                        resource.availability_source = AvailabilitySource::User;
+                        resource.updated_at = catalog.fetched_at;
+                        updated_resources.insert(resource_id, resource.clone());
+                    }
+                }
+            }
+        }
+
+        let mut items: Vec<_> = updated_items.into_values().collect();
+        items.sort_by_key(|item| item.id.to_string());
+        let mut resources: Vec<_> = updated_resources.into_values().collect();
+        resources.sort_by_key(|resource| resource.id.to_string());
+        let mut refreshed_work = work;
+        refreshed_work.updated_at = catalog.fetched_at;
+        let plan = ComicChapterRefreshPlan {
+            source_key: source_id.to_owned(),
+            remote_work_id: remote_work_id.to_owned(),
+            expected_generation,
+            state: ComicChapterCatalogState {
+                source_key: source_id.to_owned(),
+                remote_work_id: remote_work_id.to_owned(),
+                generation: next_generation,
+                fetched_at: catalog.fetched_at,
+                total: catalog.total,
+                truncated: catalog.truncated,
+            },
+            work: refreshed_work,
+            editions: edition_writes,
+            items,
+            resources,
+            chapter_refs,
+        };
+        self.uow.run_comic_chapter_refresh(&plan)?;
+        Ok(catalog)
+    }
+
     /// Import one M3U entry without ever asking the catalog provider to fetch
     /// the stream.  The playlist endpoint is fetched during search; this
     /// method receives only the opaque title/URL pair from the operation cache
@@ -562,6 +896,15 @@ impl SourceImportService {
                 "来源远端身份无效",
                 true,
             ));
+        }
+        if remote.media_type == MediaType::Comic {
+            let catalog = match entry.comic_catalog.clone() {
+                Some(catalog) => catalog,
+                None => self.comic_chapter_catalog(source_key, external_id).await?,
+            };
+            return self
+                .import_comic_catalog(source_key, external_id, entry, catalog)
+                .await;
         }
         let resource_type = match remote.media_type {
             MediaType::Comic => ResourceType::ComicArchive,
@@ -696,6 +1039,58 @@ impl SourceImportService {
         Ok(ImportedWork {
             work_id: work.id,
             media_item_id: item.id,
+        })
+    }
+
+    async fn import_comic_catalog(
+        &self,
+        source_key: &str,
+        external_id: &str,
+        entry: SourceCatalogEntry,
+        catalog: ComicChapterCatalog,
+    ) -> Result<ImportedWork, AppError> {
+        ensure_catalog_identity(&catalog, source_key, external_id)?;
+        let poster = match entry.pic.as_deref() {
+            Some(url) => match haven_domain::contracts::ImageProxyRepository::register(
+                &*self.ports,
+                source_key,
+                url,
+            )
+            .await
+            {
+                Ok(id) => Some(haven_domain::entities::ArtworkRef {
+                    kind: haven_domain::entities::ArtworkKind::Poster,
+                    uri: format!("haven://artwork/{id}"),
+                    provider: Some(source_key.to_owned()),
+                }),
+                Err(_) => None,
+            },
+            None => None,
+        };
+        let work = new_comic_work(&entry, poster, catalog.fetched_at);
+        let (plan, first_media_item_id) =
+            new_comic_catalog_plan(source_key, external_id, work, entry, catalog)?;
+        if let Err(error) = self.uow.run_comic_chapter_refresh(&plan) {
+            // Two first-time imports may both finish the network request before
+            // either transaction commits. If the other transaction won, return
+            // its authoritative identity instead of exposing a spurious
+            // duplicate-import failure. Refreshes keep their generation CAS
+            // semantics because this recovery is limited to first import.
+            if matches!(
+                error.code().as_str(),
+                "COMIC_CATALOG_GENERATION_CONFLICT" | "SOURCE_REF_CONFLICT"
+            ) {
+                if let Some(existing_work_id) =
+                    WorkRepository::id_for_source_ref(&*self.ports, source_key, external_id).await?
+                {
+                    return self.existing_identity(existing_work_id).await;
+                }
+            }
+            return Err(error);
+        }
+        Ok(ImportedWork {
+            work_id: plan.work.id,
+            media_item_id: first_media_item_id,
         })
     }
 
@@ -983,6 +1378,359 @@ fn derive_media_type(type_name: Option<&str>, episode_count: usize) -> MediaType
     } else {
         MediaType::Series
     }
+}
+
+fn ensure_catalog_identity(
+    catalog: &ComicChapterCatalog,
+    source_key: &str,
+    remote_work_id: &str,
+) -> Result<(), AppError> {
+    if catalog.source_key == source_key && catalog.remote_work_id == remote_work_id {
+        return Ok(());
+    }
+    Err(AppError::new(
+        "SOURCE_UNAVAILABLE",
+        ErrorKind::Network,
+        "来源章节目录身份与请求不一致",
+        true,
+    ))
+}
+
+fn new_comic_work(
+    entry: &SourceCatalogEntry,
+    poster: Option<haven_domain::entities::ArtworkRef>,
+    now: UtcMillis,
+) -> Work {
+    Work {
+        id: WorkId::new(),
+        canonical_title: entry.title.clone(),
+        original_title: None,
+        sort_title: None,
+        description: entry.content.clone(),
+        work_type: WorkType::Standalone,
+        release_year: entry.year,
+        // A multi-language MangaDex catalog does not have one safe Work-level
+        // language. The language facet stays on each Edition profile.
+        language: None,
+        director: entry.director.clone(),
+        actor: entry.actor.clone(),
+        status: WorkStatus::Completed,
+        rating_value: None,
+        rating_scale: None,
+        artwork: haven_domain::entities::ArtworkSet {
+            poster,
+            ..Default::default()
+        },
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn new_comic_edition(
+    work: &Work,
+    title: &str,
+    description: Option<String>,
+    profile: &EditionProfile,
+    now: UtcMillis,
+) -> Edition {
+    Edition {
+        id: EditionId::new(),
+        work_id: work.id,
+        title: title.to_owned(),
+        subtitle: None,
+        edition_type: MediaType::Comic,
+        release_date: None,
+        language: profile.language.as_known().map(str::to_owned),
+        region: None,
+        publisher_or_studio: None,
+        description,
+        artwork: Default::default(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn group_catalog_chapters(catalog: &[ComicChapterCatalogEntry]) -> Vec<ComicEditionGroup> {
+    let mut groups = Vec::new();
+    for (source_order, chapter) in catalog.iter().cloned().enumerate() {
+        if let Some(group) = groups.iter_mut().find(|group: &&mut ComicEditionGroup| {
+            edition_profiles_can_share_container(&group.profile, &chapter.metadata.edition_profile)
+        }) {
+            group.chapters.push((source_order, chapter));
+        } else {
+            groups.push(ComicEditionGroup {
+                profile: chapter.metadata.edition_profile.clone(),
+                chapters: vec![(source_order, chapter)],
+            });
+        }
+    }
+    groups
+}
+
+struct ComicEditionGroup {
+    profile: EditionProfile,
+    chapters: Vec<(usize, ComicChapterCatalogEntry)>,
+}
+
+fn new_comic_catalog_plan(
+    source_key: &str,
+    remote_work_id: &str,
+    work: Work,
+    entry: SourceCatalogEntry,
+    catalog: ComicChapterCatalog,
+) -> Result<(ComicChapterRefreshPlan, MediaItemId), AppError> {
+    let source_id = stable_source_id(source_key)?;
+    let groups = group_catalog_chapters(&catalog.chapters);
+    let mut editions = Vec::with_capacity(groups.len());
+    let mut items = Vec::with_capacity(catalog.chapters.len());
+    let mut resources = Vec::with_capacity(catalog.chapters.len());
+    let mut chapter_refs = Vec::with_capacity(catalog.chapters.len());
+    let mut first_media_item_id = None;
+    let base_title = entry.title;
+    let description = entry.content;
+
+    for group in groups {
+        let edition = new_comic_edition(
+            &work,
+            &base_title,
+            description.clone(),
+            &group.profile,
+            catalog.fetched_at,
+        );
+        let edition_id = edition.id;
+        editions.push(ComicEditionWrite {
+            edition,
+            profile: group.profile.clone(),
+        });
+        for (source_order, chapter) in group.chapters {
+            let item =
+                new_comic_media_item(edition_id, &chapter, source_order, catalog.fetched_at)?;
+            if first_media_item_id.is_none() && chapter.availability.is_readable() {
+                first_media_item_id = Some(item.id);
+            }
+            let remote_id = comic_remote_id(remote_work_id, &chapter.identity.remote_chapter_id);
+            validate_remote_source_object(source_key, ResourceType::ComicArchive, &remote_id)?;
+            let resource =
+                new_comic_resource(item.id, source_id, remote_id, &chapter, catalog.fetched_at);
+            chapter_refs.push(ChapterSourceRef {
+                media_item_id: item.id,
+                identity: chapter.identity,
+                metadata: chapter.metadata,
+                source_order: u32::try_from(source_order).map_err(|_| {
+                    AppError::new(
+                        "COMIC_CATALOG_TOO_LARGE",
+                        ErrorKind::Validation,
+                        "漫画章节目录顺序超出范围",
+                        false,
+                    )
+                })?,
+                availability: chapter.availability.into(),
+                published_at: chapter.published_at,
+                source_updated_at: chapter.updated_at,
+                last_seen_generation: Some(1),
+                updated_at: catalog.fetched_at,
+            });
+            items.push(item);
+            resources.push(resource);
+        }
+    }
+
+    let first_media_item_id =
+        first_media_item_id.ok_or_else(|| source_unavailable("来源作品没有可阅读章节"))?;
+    Ok((
+        ComicChapterRefreshPlan {
+            source_key: source_key.to_owned(),
+            remote_work_id: remote_work_id.to_owned(),
+            expected_generation: 0,
+            state: ComicChapterCatalogState {
+                source_key: source_key.to_owned(),
+                remote_work_id: remote_work_id.to_owned(),
+                generation: 1,
+                fetched_at: catalog.fetched_at,
+                total: catalog.total,
+                truncated: catalog.truncated,
+            },
+            work,
+            editions,
+            items,
+            resources,
+            chapter_refs,
+        },
+        first_media_item_id,
+    ))
+}
+
+fn find_matching_edition(
+    profile: &EditionProfile,
+    editions: &[ComicEditionWrite],
+) -> Option<EditionId> {
+    editions.iter().find_map(|edition| {
+        edition_profiles_can_share_container(profile, &edition.profile)
+            .then_some(edition.edition.id)
+    })
+}
+
+fn new_comic_media_item(
+    edition_id: EditionId,
+    chapter: &ComicChapterCatalogEntry,
+    source_order: usize,
+    now: UtcMillis,
+) -> Result<MediaItem, AppError> {
+    let source_order = u32::try_from(source_order).map_err(|_| {
+        AppError::new(
+            "COMIC_CATALOG_TOO_LARGE",
+            ErrorKind::Validation,
+            "漫画章节目录顺序超出范围",
+            false,
+        )
+    })?;
+    Ok(MediaItem {
+        id: MediaItemId::new(),
+        edition_id,
+        parent_id: None,
+        media_type: MediaType::Comic,
+        title: comic_chapter_title(chapter, source_order),
+        index: comic_media_index(chapter, source_order),
+        duration_ms: None,
+        page_count: chapter.metadata.page_count,
+        chapter_count: None,
+        published_at: chapter.published_at.clone(),
+        status: media_status(chapter.availability),
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+fn apply_catalog_entry_to_media_item(
+    item: &mut haven_domain::entities::MediaItem,
+    chapter: &ComicChapterCatalogEntry,
+    source_order: usize,
+    now: UtcMillis,
+) -> Result<(), AppError> {
+    let source_order = u32::try_from(source_order).map_err(|_| {
+        AppError::new(
+            "COMIC_CATALOG_TOO_LARGE",
+            ErrorKind::Validation,
+            "漫画章节目录顺序超出范围",
+            false,
+        )
+    })?;
+    item.title = comic_chapter_title(chapter, source_order);
+    item.index = comic_media_index(chapter, source_order);
+    item.page_count = chapter.metadata.page_count;
+    item.published_at = chapter.published_at.clone();
+    item.status = media_status(chapter.availability);
+    item.updated_at = now;
+    Ok(())
+}
+
+fn comic_chapter_title(chapter: &ComicChapterCatalogEntry, source_order: u32) -> String {
+    chapter
+        .metadata
+        .title
+        .clone()
+        .filter(|title| !title.trim().is_empty())
+        .or_else(|| {
+            chapter.metadata.chapter_number.map(|number| {
+                if number.fract() == 0.0 {
+                    format!("第 {} 章", number as i64)
+                } else {
+                    format!("第 {number} 章")
+                }
+            })
+        })
+        .unwrap_or_else(|| format!("第 {} 章", source_order.saturating_add(1)))
+}
+
+fn comic_media_index(chapter: &ComicChapterCatalogEntry, source_order: u32) -> MediaIndex {
+    let chapter_number = chapter
+        .metadata
+        .chapter_number
+        .filter(|value| value.is_finite() && value.abs() <= f32::MAX as f64)
+        .map(|value| value as f32)
+        .unwrap_or_else(|| source_order.saturating_add(1) as f32);
+    let volume = chapter
+        .metadata
+        .volume_number
+        .filter(|value| value.is_finite() && value.abs() <= f32::MAX as f64)
+        .map(|value| value as f32);
+    MediaIndex::Chapter {
+        volume,
+        chapter: chapter_number,
+    }
+}
+
+fn media_status(availability: ComicChapterAvailability) -> MediaItemStatus {
+    match availability {
+        ComicChapterAvailability::Available => MediaItemStatus::Available,
+        ComicChapterAvailability::Unknown => MediaItemStatus::Unknown,
+        ComicChapterAvailability::TemporarilyUnavailable
+        | ComicChapterAvailability::ExternalOnly => MediaItemStatus::Unavailable,
+    }
+}
+
+fn resource_availability(availability: ComicChapterAvailability) -> Availability {
+    match availability {
+        ComicChapterAvailability::Available => Availability::Available,
+        ComicChapterAvailability::TemporarilyUnavailable => Availability::TemporarilyUnavailable,
+        ComicChapterAvailability::ExternalOnly => Availability::SourceUnavailable,
+        ComicChapterAvailability::Unknown => Availability::Unknown,
+    }
+}
+
+fn new_comic_resource(
+    media_item_id: MediaItemId,
+    source_id: SourceId,
+    remote_id: String,
+    chapter: &ComicChapterCatalogEntry,
+    now: UtcMillis,
+) -> Resource {
+    Resource {
+        id: ResourceId::new(),
+        media_item_id,
+        resource_type: ResourceType::ComicArchive,
+        source_id: Some(source_id),
+        storage_location_id: None,
+        locator: ResourceLocator::SourceObject {
+            source_id,
+            remote_id,
+        },
+        mime_type: Some("application/vnd.comicbook+zip".to_owned()),
+        size: None,
+        hash: None,
+        availability: resource_availability(chapter.availability),
+        availability_source: AvailabilitySource::User,
+        modified_ms: None,
+        fingerprint_first: None,
+        fingerprint_last: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn apply_catalog_entry_to_resource(
+    resource: &mut Resource,
+    chapter: &ComicChapterCatalogEntry,
+    now: UtcMillis,
+) {
+    resource.availability = resource_availability(chapter.availability);
+    resource.availability_source = AvailabilitySource::User;
+    resource.mime_type = Some("application/vnd.comicbook+zip".to_owned());
+    resource.updated_at = now;
+}
+
+fn source_resource_matches(resource: &Resource, source_id: SourceId, remote_id: &str) -> bool {
+    matches!(
+        &resource.locator,
+        ResourceLocator::SourceObject {
+            source_id: current_source_id,
+            remote_id: current_remote_id,
+        } if *current_source_id == source_id && current_remote_id == remote_id
+    )
+}
+
+fn comic_remote_id(remote_work_id: &str, remote_chapter_id: &str) -> String {
+    format!("{remote_work_id}:{remote_chapter_id}")
 }
 
 /// 从"第01集"/"第0001集"类标签提取集号；去前导零，无数字时退化为序号。
