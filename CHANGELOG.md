@@ -49,6 +49,7 @@
 - 长时间播放、1000 页级 EPUB/漫画的长期内存和稳定性，以及 Downloads Worker 的极限并发、限速、断点恢复和磁盘异常，仍处于用户反馈阶段。
 - TXT、Markdown、PDF、Article 的复杂真实样本兼容性会继续根据用户反馈改进。
 - 某些 Provider 只提供元数据或候选资源，不保证每个条目都有海报、播放地址或下载权限。
+- 影视远程 metadata/source/stream 请求为保证 DNS pinning 的连接目标不可被系统代理改写，使用直连策略（`no_proxy`）；企业代理或 TUN 环境可能因此无法拉取部分来源，属于已知限制。
 - 运行独立 Tauri 程序时不依赖 `localhost:1420`；浏览器 Preview 仅用于 Mock/不可用分支演示。
 
 ### 尚未开放

@@ -2160,7 +2160,7 @@ mod tests {
             ResourceRequest::Subtitle(session_id, track_id)
         );
 
-        for invalid in [
+        for (case, invalid) in [
             format!("haven-resource://session/{session_id}/subtitle/{track_id}?x=1"),
             format!(
                 "haven-resource://session/{session_id}/subtitle/{}",
@@ -2169,9 +2169,15 @@ mod tests {
             format!("haven-resource://session/{session_id}/subtitle/{track_id}/extra"),
             format!("haven-resource://session/{session_id}/subtitle/%2F{track_id}"),
             format!("haven-resource://other/{session_id}/subtitle/{track_id}"),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let uri = invalid.parse::<Uri>().unwrap();
-            assert!(parse_request_resource(&uri).is_err(), "accepted {invalid}");
+            assert!(
+                parse_request_resource(&uri).is_err(),
+                "accepted invalid subtitle URI case {case}"
+            );
         }
     }
 
