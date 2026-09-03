@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-comic-progress-migrate"
+description = "Enables the comic_progress_migrate command without any pre-configured scope."
+commands.allow = ["comic_progress_migrate"]
+
+[[permission]]
+identifier = "deny-comic-progress-migrate"
+description = "Denies the comic_progress_migrate command without any pre-configured scope."
+commands.deny = ["comic_progress_migrate"]

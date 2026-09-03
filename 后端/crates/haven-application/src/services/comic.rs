@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use haven_common::{AppError, ErrorKind};
+use haven_domain::comic_identity::PageIdentity;
 use haven_domain::enums::{MediaType, ResourceType};
 
 use super::session::PreparedSession;
@@ -36,6 +37,9 @@ pub enum PreparedComicPageSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedComicPage {
     pub availability: PreparedComicPageAvailability,
+    /// Provider 生成的持久化页面身份。它只能包含稳定 opaque key 或内容
+    /// fingerprint，不得包含运行时 pageId、grant、URL、路径或归档 entry。
+    pub identity: PageIdentity,
     pub source: PreparedComicPageSource,
 }
 

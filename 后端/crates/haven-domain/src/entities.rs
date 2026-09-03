@@ -258,6 +258,10 @@ pub struct Progress {
     pub percentage: Option<f32>,
     pub last_active_at: UtcMillis,
     pub updated_at: UtcMillis,
+    /// 持久层生成的 opaque CAS token；展示时间 `updated_at` 不能替代它。
+    /// 新建但尚未持久化的写入草稿可以为 None。
+    #[serde(default)]
+    pub revision: Option<String>,
     /// 关键帧（data URL 或本地路径），可选，足迹页优先展示。
     pub keyframe_uri: Option<String>,
 }

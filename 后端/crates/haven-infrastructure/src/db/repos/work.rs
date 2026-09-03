@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use haven_common::AppError;
+use haven_common::{AppError, ErrorKind};
 use haven_domain::contracts::{WorkOrder, WorkRepository};
 use haven_domain::entities::Work;
 use haven_domain::ids::WorkId;
@@ -157,12 +157,27 @@ pub(crate) fn save_source_ref_on_conn(
 ) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO work_source_refs (provider, external_id, work_id) VALUES (?1, ?2, ?3)
-         ON CONFLICT (work_id) DO NOTHING",
+         ON CONFLICT (provider, external_id) DO NOTHING",
         rusqlite::params![provider, external_id, work_id.to_string()],
     )
-    .map_err(map_db_error(
-        "保存来源作品引用失败（外部条目可能已绑定其他作品）",
-    ))?;
+    .map_err(map_db_error("保存来源作品引用失败"))?;
+
+    let existing: String = conn
+        .query_row(
+            "SELECT work_id FROM work_source_refs
+             WHERE provider = ?1 AND external_id = ?2",
+            rusqlite::params![provider, external_id],
+            |row| row.get(0),
+        )
+        .map_err(map_db_error("确认来源作品引用归属失败"))?;
+    if existing != work_id.to_string() {
+        return Err(AppError::new(
+            "SOURCE_REF_CONFLICT",
+            ErrorKind::Conflict,
+            "来源作品已经绑定其他 Work",
+            false,
+        ));
+    }
     Ok(())
 }
 
@@ -599,6 +614,40 @@ mod tests {
         assert_eq!(count, 1, "同 id 应覆盖");
         let read = repo.get(work.id).await.unwrap().unwrap();
         assert_eq!(read.canonical_title, "三体（修订版）");
+    }
+
+    #[tokio::test]
+    async fn one_work_can_keep_multiple_source_refs_and_conflicts_are_explicit() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repo = SqliteWorkRepository::new(db.clone());
+        let first = sample_work();
+        let mut second = sample_work();
+        second.id = WorkId::new();
+        repo.save(&first).await.unwrap();
+        repo.save(&second).await.unwrap();
+
+        repo.save_source_ref("mangadex", "manga-1", first.id)
+            .await
+            .unwrap();
+        repo.save_source_ref("reader-ws", "book-1", first.id)
+            .await
+            .unwrap();
+
+        let count: i64 = db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM work_source_refs WHERE work_id = ?1",
+                rusqlite::params![first.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let error = repo
+            .save_source_ref("mangadex", "manga-1", second.id)
+            .await
+            .expect_err("同一来源身份绑定其他 Work 必须报告冲突");
+        assert_eq!(error.code().as_str(), "SOURCE_REF_CONFLICT");
     }
 
     #[tokio::test]

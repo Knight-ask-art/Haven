@@ -1,6 +1,7 @@
 //! Progress Repository（Sqlite）。
 //!
 //! 规范：DOMAIN_MODEL §28–§30（Locator 是事实来源；percentage 仅 UI 派生值）。
+//! `revision` 是独立的 opaque CAS token，`updated_at` 只负责时间展示与排序。
 //! media_item_id 唯一：同一 MediaItem 只保留一行 Progress，upsert 语义。
 
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use haven_common::AppError;
 use haven_domain::contracts::ProgressRepository;
 use haven_domain::entities::Progress;
 use haven_domain::ids::{EditionId, MediaItemId, ProgressId, WorkId};
+use uuid::Uuid;
 
 use crate::db::Db;
 use crate::db::repos::hierarchy::validate_content_chain;
@@ -29,7 +31,7 @@ impl SqliteProgressRepository {
     }
 }
 
-fn row_to_progress(row: &rusqlite::Row<'_>) -> rusqlite::Result<Progress> {
+pub(crate) fn row_to_progress(row: &rusqlite::Row<'_>) -> rusqlite::Result<Progress> {
     let media_item_id: String = row.get("media_item_id")?;
     let completion: String = row.get("completion")?;
     let percentage: Option<f64> = row.get("percentage")?;
@@ -45,8 +47,17 @@ fn row_to_progress(row: &rusqlite::Row<'_>) -> rusqlite::Result<Progress> {
         )));
     }
 
-    // 018 新增列，老库无此列时兼容为 None
+    // 018 新增列，老库无此列时兼容为 None；034 之后 revision 必须存在。
     let keyframe_uri: Option<String> = row.get::<_, Option<String>>("keyframe_uri").unwrap_or(None);
+    let revision: String = row.get("revision")?;
+    if revision.trim().is_empty() {
+        return Err(rusqlite_err(AppError::new(
+            "PROGRESS_REVISION_MISSING",
+            haven_common::ErrorKind::Database,
+            "Progress 缺少持久化 revision",
+            false,
+        )));
+    }
 
     Ok(Progress {
         id: id_from_row::<ProgressId>(row.get("id")?)?,
@@ -58,6 +69,7 @@ fn row_to_progress(row: &rusqlite::Row<'_>) -> rusqlite::Result<Progress> {
         percentage: percentage.map(|v| v as f32),
         last_active_at: haven_common::UtcMillis(row.get("last_active_at")?),
         updated_at: haven_common::UtcMillis(row.get("updated_at")?),
+        revision: Some(revision),
         keyframe_uri,
     })
 }
@@ -86,7 +98,12 @@ fn rusqlite_err(e: AppError) -> rusqlite::Error {
     )
 }
 
-const SELECT_COLUMNS: &str = "id, work_id, edition_id, media_item_id, locator_json, locator_version, completion, percentage, last_active_at, updated_at, keyframe_uri";
+pub(crate) const SELECT_COLUMNS: &str = "id, work_id, edition_id, media_item_id, locator_json, locator_version, completion, percentage, last_active_at, updated_at, revision, keyframe_uri";
+
+/// 生成不可由展示字段推导的 Progress CAS token。
+pub(crate) fn new_revision() -> String {
+    Uuid::new_v4().to_string()
+}
 
 #[async_trait]
 impl ProgressRepository for SqliteProgressRepository {
@@ -162,6 +179,7 @@ impl ProgressRepository for SqliteProgressRepository {
         let locator_json = locator_to_json(&progress.locator)?;
         let completion = enum_to_db_str(&progress.completion)?;
         let percentage = progress.percentage.map(|v| v as f64);
+        let revision = new_revision();
         let revision = if let Some(expected) = expected_revision {
             conn.query_row(
                 "UPDATE progress SET
@@ -172,16 +190,17 @@ impl ProgressRepository for SqliteProgressRepository {
                      completion = ?6,
                      percentage = ?7,
                      keyframe_uri = ?8,
+                     revision = ?9,
                      last_active_at = CASE
-                         WHEN ?9 <= updated_at THEN updated_at + 1
-                         ELSE ?9
+                         WHEN ?10 <= updated_at THEN updated_at + 1
+                         ELSE ?10
                      END,
                      updated_at = CASE
-                         WHEN ?9 <= updated_at THEN updated_at + 1
-                         ELSE ?9
+                         WHEN ?10 <= updated_at THEN updated_at + 1
+                         ELSE ?10
                      END
-                 WHERE media_item_id = ?3 AND CAST(updated_at AS TEXT) = ?10
-                 RETURNING updated_at",
+                 WHERE media_item_id = ?3 AND revision = ?11
+                 RETURNING revision",
                 rusqlite::params![
                     progress.work_id.to_string(),
                     progress.edition_id.to_string(),
@@ -191,20 +210,20 @@ impl ProgressRepository for SqliteProgressRepository {
                     completion,
                     percentage,
                     progress.keyframe_uri,
+                    revision,
                     progress.updated_at.0,
                     expected,
                 ],
-                |row| row.get::<_, i64>(0),
+                |row| row.get::<_, String>(0),
             )
             .optional()
             .map_err(map_db_error("条件保存 Progress 失败"))?
         } else {
             // 普通保存（save_if_revision(None)）：last_active_at 与 authoritative
             // updated_at 同步单调推进（新活动），保持 REV2/REV2B 语义。
-            let updated_at = save_unconditional(&conn, progress, false)?;
-            Some(updated_at)
+            Some(save_unconditional(&conn, progress, false)?)
         };
-        Ok(revision.map(|value| value.to_string()))
+        Ok(revision)
     }
 
     async fn recent(&self, limit: u32) -> Result<Vec<Progress>, AppError> {
@@ -223,7 +242,10 @@ impl ProgressRepository for SqliteProgressRepository {
 }
 
 /// 校验 progress 内容链与 percentage（save 与 save_if_revision 共用，避免复制）。
-fn validate_progress(conn: &rusqlite::Connection, progress: &Progress) -> Result<(), AppError> {
+pub(crate) fn validate_progress(
+    conn: &rusqlite::Connection,
+    progress: &Progress,
+) -> Result<(), AppError> {
     validate_content_chain(
         conn,
         progress.work_id,
@@ -245,14 +267,14 @@ fn validate_progress(conn: &rusqlite::Connection, progress: &Progress) -> Result
 }
 
 /// 无条件 upsert（INSERT ... ON CONFLICT(media_item_id) DO UPDATE）并返回 authoritative
-/// `updated_at`（单调推进，不回退）。`preserve_last_active`：
+/// opaque `revision`；`updated_at` 仍单调推进且不回退。`preserve_last_active`：
 /// - `true`  → 保留传入 `last_active_at`（max 不回退）——reset/无返回写路径；
 /// - `false` → `last_active_at` 与 authoritative `updated_at` 同步推进（普通保存，新活动）。
 fn save_unconditional(
     conn: &rusqlite::Connection,
     progress: &Progress,
     preserve_last_active: bool,
-) -> Result<i64, AppError> {
+) -> Result<String, AppError> {
     let locator_json = locator_to_json(&progress.locator)?;
     let completion = enum_to_db_str(&progress.completion)?;
     let percentage = progress.percentage.map(|v| v as f64);
@@ -266,11 +288,12 @@ fn save_unconditional(
               THEN progress.updated_at + 1
               ELSE excluded.updated_at END"
     };
+    let revision = new_revision();
     let sql = format!(
         "INSERT INTO progress
             (id, work_id, edition_id, media_item_id, locator_json, locator_version,
-             completion, percentage, last_active_at, updated_at, keyframe_uri)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             completion, percentage, last_active_at, updated_at, revision, keyframe_uri)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(media_item_id) DO UPDATE SET
              work_id = excluded.work_id,
              edition_id = excluded.edition_id,
@@ -279,12 +302,13 @@ fn save_unconditional(
              completion = excluded.completion,
              percentage = excluded.percentage,
              keyframe_uri = excluded.keyframe_uri,
+             revision = excluded.revision,
              last_active_at = {last_active_expr},
              updated_at = CASE
                  WHEN excluded.updated_at <= progress.updated_at THEN progress.updated_at + 1
                  ELSE excluded.updated_at
              END
-         RETURNING updated_at"
+         RETURNING revision"
     );
     conn.query_row(
         &sql,
@@ -299,9 +323,10 @@ fn save_unconditional(
             percentage,
             progress.last_active_at.0,
             progress.updated_at.0,
+            revision,
             progress.keyframe_uri,
         ],
-        |row| row.get::<_, i64>(0),
+        |row| row.get::<_, String>(0),
     )
     .map_err(map_db_error("保存 Progress 失败"))
 }
@@ -358,6 +383,7 @@ mod tests {
             percentage: Some(0.25),
             last_active_at: haven_common::UtcMillis::now(),
             updated_at: haven_common::UtcMillis::now(),
+            revision: None,
             keyframe_uri: None,
         }
     }
@@ -418,7 +444,7 @@ mod tests {
             .await
             .unwrap()
             .expect("首次写入返回 revision");
-        assert_eq!(first, "1000");
+        assert_ne!(first, "1000");
 
         let mut winner = progress.clone();
         winner.updated_at = haven_common::UtcMillis(1_000);
@@ -428,7 +454,7 @@ mod tests {
             .await
             .unwrap()
             .expect("当前 revision 条件写成功");
-        assert_eq!(next, "1001", "同毫秒候选必须由数据库单调推进");
+        assert_ne!(next, first, "每次成功写入都必须生成新的 opaque revision");
 
         let mut stale = progress;
         stale.updated_at = haven_common::UtcMillis(2_000);
@@ -444,6 +470,23 @@ mod tests {
         // R-PROGRESS-CAS-REV2 Important 1：authoritative last_active_at 必须与
         // updated_at 同值单调推进（recent / LastActive 排序依据）。
         assert_eq!(stored.last_active_at.0, stored.updated_at.0);
+    }
+
+    #[tokio::test]
+    async fn revision_is_opaque_and_not_the_display_timestamp() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (w, e, m) = seed_content(&db);
+        let repo = SqliteProgressRepository::new(db);
+        let mut progress = sample_progress(w, e, m);
+        progress.updated_at = haven_common::UtcMillis(1_000);
+
+        let revision = repo
+            .save_if_revision(&progress, None)
+            .await
+            .unwrap()
+            .expect("首次写入返回 revision");
+
+        assert_ne!(revision, "1000", "CAS token 不能复用展示时间戳");
     }
 
     #[tokio::test]
@@ -464,8 +507,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(first, "5000");
-        assert_eq!(second, "5001");
+        assert_ne!(first, "5000");
+        assert_ne!(second, first);
         let stored = repo.get_for_media_item(m).await.unwrap().unwrap();
         assert_eq!(
             stored.updated_at.0, 5_001,
@@ -506,7 +549,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(rev, "10001", "回拨候选必须推进到 当前+1");
+        assert_ne!(rev, "10000", "CAS token 不得退化为展示时间戳");
         let stored = repo.get_for_media_item(m1).await.unwrap().unwrap();
         assert_eq!(stored.updated_at.0, 10_001);
         assert_eq!(stored.last_active_at.0, stored.updated_at.0);
@@ -521,7 +564,7 @@ mod tests {
     /// R-PROGRESS-CAS-REV2 Important 2：真实 barrier 并发——同一文件库两个独立连接，
     /// 各自 Repository 以同一 expected revision 写不同字段；断言恰好一个 Some revision、
     /// 一个 None；**最终行精确绑定到返回 Some 的 winner**（percentage 精确等于该 writer、
-    /// stored updated_at 文本精确等于 Some revision），loser 字段未落库。
+    /// stored revision 精确等于 Some revision），loser 字段未落库。
     #[tokio::test]
     async fn concurrent_conditional_writes_two_connections_exactly_one_wins() {
         use std::sync::Barrier;
@@ -584,10 +627,7 @@ mod tests {
             (None, Some(rev)) => (rev.to_owned(), 0.9f32),
             _ => panic!("并发同 expected 必须恰好一个 Some、一个 None，实际 ra={ra:?} rb={rb:?}"),
         };
-        assert!(
-            winner_rev.parse::<i64>().unwrap() > 1_000,
-            "胜者 revision 必须推进: {winner_rev}"
-        );
+        assert!(!winner_rev.is_empty(), "胜者必须返回 opaque revision");
 
         // 最终行精确绑定到 winner（db_check 连接在线程/repo 释放后打开）。
         let db_check = Arc::new(Db::open(&db_path).unwrap());
@@ -602,11 +642,8 @@ mod tests {
             Some(winner_percentage),
             "最终行 percentage 必须精确等于 winner（loser 字段不得落库）"
         );
-        assert_eq!(
-            stored.updated_at.0.to_string(),
-            winner_rev,
-            "持久化 updated_at 文本必须精确等于 Some revision"
-        );
+        assert_eq!(stored.revision.as_deref(), Some(winner_rev.as_str()));
+        assert!(stored.updated_at.0 > 1_000);
         assert_eq!(stored.last_active_at.0, stored.updated_at.0);
         // 释放检查连接后 TempDir 由正常作用域自动清理。
         drop(repo_check);

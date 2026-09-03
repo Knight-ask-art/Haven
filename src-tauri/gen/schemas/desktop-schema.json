@@ -213,10 +213,52 @@
           "markdownDescription": "Enables the cast_stop command without any pre-configured scope."
         },
         {
+          "description": "Enables the comic_chapter_catalog_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-comic-chapter-catalog-get",
+          "markdownDescription": "Enables the comic_chapter_catalog_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the comic_chapter_catalog_refresh command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-comic-chapter-catalog-refresh",
+          "markdownDescription": "Enables the comic_chapter_catalog_refresh command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the comic_chapter_catalog_registered_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-comic-chapter-catalog-registered-get",
+          "markdownDescription": "Enables the comic_chapter_catalog_registered_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the comic_chapter_source_candidates_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-comic-chapter-source-candidates-get",
+          "markdownDescription": "Enables the comic_chapter_source_candidates_get command without any pre-configured scope."
+        },
+        {
           "description": "Enables the comic_page_manifest_get command without any pre-configured scope.",
           "type": "string",
           "const": "allow-comic-page-manifest-get",
           "markdownDescription": "Enables the comic_page_manifest_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the comic_progress_migrate command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-comic-progress-migrate",
+          "markdownDescription": "Enables the comic_progress_migrate command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the comic_progress_remap command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-comic-progress-remap",
+          "markdownDescription": "Enables the comic_progress_remap command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the comic_progress_revert command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-comic-progress-revert",
+          "markdownDescription": "Enables the comic_progress_revert command without any pre-configured scope."
         },
         {
           "description": "Enables the credential_delete command without any pre-configured scope.",
@@ -729,10 +771,52 @@
           "markdownDescription": "Denies the cast_stop command without any pre-configured scope."
         },
         {
+          "description": "Denies the comic_chapter_catalog_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-comic-chapter-catalog-get",
+          "markdownDescription": "Denies the comic_chapter_catalog_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the comic_chapter_catalog_refresh command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-comic-chapter-catalog-refresh",
+          "markdownDescription": "Denies the comic_chapter_catalog_refresh command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the comic_chapter_catalog_registered_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-comic-chapter-catalog-registered-get",
+          "markdownDescription": "Denies the comic_chapter_catalog_registered_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the comic_chapter_source_candidates_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-comic-chapter-source-candidates-get",
+          "markdownDescription": "Denies the comic_chapter_source_candidates_get command without any pre-configured scope."
+        },
+        {
           "description": "Denies the comic_page_manifest_get command without any pre-configured scope.",
           "type": "string",
           "const": "deny-comic-page-manifest-get",
           "markdownDescription": "Denies the comic_page_manifest_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the comic_progress_migrate command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-comic-progress-migrate",
+          "markdownDescription": "Denies the comic_progress_migrate command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the comic_progress_remap command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-comic-progress-remap",
+          "markdownDescription": "Denies the comic_progress_remap command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the comic_progress_revert command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-comic-progress-revert",
+          "markdownDescription": "Denies the comic_progress_revert command without any pre-configured scope."
         },
         {
           "description": "Denies the credential_delete command without any pre-configured scope.",

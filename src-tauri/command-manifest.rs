@@ -167,6 +167,41 @@ define_commands!(
         commands::comic::comic_page_manifest_get
     ),
     (
+        "comic_chapter_catalog_get",
+        "allow-comic-chapter-catalog-get",
+        commands::comic::comic_chapter_catalog_get
+    ),
+    (
+        "comic_chapter_catalog_registered_get",
+        "allow-comic-chapter-catalog-registered-get",
+        commands::comic::comic_chapter_catalog_registered_get
+    ),
+    (
+        "comic_chapter_catalog_refresh",
+        "allow-comic-chapter-catalog-refresh",
+        commands::comic::comic_chapter_catalog_refresh
+    ),
+    (
+        "comic_chapter_source_candidates_get",
+        "allow-comic-chapter-source-candidates-get",
+        commands::comic::comic_chapter_source_candidates_get
+    ),
+    (
+        "comic_progress_migrate",
+        "allow-comic-progress-migrate",
+        commands::comic::comic_progress_migrate
+    ),
+    (
+        "comic_progress_remap",
+        "allow-comic-progress-remap",
+        commands::comic::comic_progress_remap
+    ),
+    (
+        "comic_progress_revert",
+        "allow-comic-progress-revert",
+        commands::comic::comic_progress_revert
+    ),
+    (
         "reader_toc_get",
         "allow-reader-toc-get",
         commands::reader::reader_toc_get

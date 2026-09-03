@@ -20,6 +20,7 @@ use haven_domain::ids::{MediaItemId, ResourceId, SourceId, StorageLocationId};
 
 use crate::mapper::progress::progress_summary;
 use crate::services::comic::{ComicPageService, PreparedComicPage};
+use crate::services::comic_page_identity::ComicPageIdentityService;
 use crate::services::ports::{
     RemoteByteRange, RemoteSessionBody, RemoteSessionPort, SessionOpenPorts,
 };
@@ -78,6 +79,7 @@ pub enum PreparedSessionSource {
 pub struct SessionService {
     ports: Arc<dyn SessionOpenPorts>,
     comic_pages: ComicPageService,
+    comic_page_identities: Option<ComicPageIdentityService>,
     remote: Option<Arc<dyn RemoteSessionPort>>,
 }
 
@@ -86,6 +88,7 @@ impl SessionService {
         Self {
             ports,
             comic_pages,
+            comic_page_identities: None,
             remote: None,
         }
     }
@@ -101,8 +104,27 @@ impl SessionService {
         Self {
             ports,
             comic_pages,
+            comic_page_identities: None,
             remote: Some(remote),
         }
+    }
+
+    /// Attach the production page-identity synchronizer. Keeping this as an
+    /// explicit composition step lets lightweight Session tests use a provider
+    /// without requiring the migration repositories.
+    pub fn with_comic_page_identity_sync(mut self, synchronizer: ComicPageIdentityService) -> Self {
+        self.comic_page_identities = Some(synchronizer);
+        self
+    }
+
+    /// Re-inspect a prepared Comic session through the controlled provider.
+    /// The returned pages remain server-only facts and are never serialized as
+    /// a caller-supplied identity list.
+    pub async fn inspect_comic_pages(
+        &self,
+        prepared: &PreparedSession,
+    ) -> Result<Vec<PreparedComicPage>, AppError> {
+        self.comic_pages.inspect(prepared).await
     }
 
     /// Fetch one bounded body for a prepared remote Article/PDF session. The
@@ -306,7 +328,13 @@ impl SessionService {
             progress,
         };
         if prepared.engine == SessionEngineDto::Comic {
-            prepared.comic_pages = Some(self.comic_pages.inspect(&prepared).await?);
+            let pages = self.inspect_comic_pages(&prepared).await?;
+            if let Some(synchronizer) = &self.comic_page_identities {
+                synchronizer
+                    .synchronize_prepared_pages(media_item_id, &pages, None)
+                    .await?;
+            }
+            prepared.comic_pages = Some(pages);
         }
         Ok(prepared)
     }
