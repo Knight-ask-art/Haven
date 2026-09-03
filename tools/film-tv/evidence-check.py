@@ -32,6 +32,25 @@ LAYERS = ("local", "ci", "runtime", "release")
 EXECUTION_LAYERS = ("contract", *LAYERS)
 STATUSES = ("not-accepted", "partial", "pass", "fail", "blocked")
 RESULTS = ("pass", "fail", "not-run", "blocked")
+
+
+def configure_console_encoding() -> None:
+    """Keep diagnostics printable on Windows runners with a legacy code page."""
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            # Test harnesses and embedded callers may expose non-standard
+            # streams.  Their owner remains responsible for encoding them.
+            continue
+
+
+configure_console_encoding()
+
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 CI_BLOCKED_RUN_IDS = {"blocked-local-run", "blocked-ci-run"}
@@ -839,7 +858,10 @@ def write_record(path: Path, record: dict[str, Any]) -> None:
         fail(f"生成证据记录前发现敏感数据: {issue}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"证据摘要已写入: {path}")
+    # CI Windows runners may expose cp1252 stdout.  Keep this operational
+    # message ASCII-only; the record itself remains UTF-8 on disk and the
+    # output path is intentionally not echoed into CI logs.
+    print(f"evidence summary written: {path.name}")
 
 
 def execute_layer(matrix: dict[str, Any], layer: str, output: Path | None, timeout_seconds: int) -> int:
