@@ -16,6 +16,13 @@ const browserResult: SessionOpenResultDto = {
   engine: request.engine,
   progress: null,
 }
+const subtitleTrack = {
+  trackId: "0196f0d2-0000-7000-8000-000000000002",
+  label: "中文",
+  language: "zh-CN",
+  format: "srt" as const,
+  contentUri: "haven-resource://session/0196f0d2-0000-7000-8000-000000000001/subtitle/0196f0d2-0000-7000-8000-000000000002",
+}
 const comicRequest = { mediaItemId, engine: "comic" as const }
 const comicResult: SessionOpenResultDto = {
   ...browserResult,
@@ -137,6 +144,60 @@ describe("session gateway", () => {
     const valid = { ...browserResult, contentUri: "haven-resource://session/0196f0d2-0000-7000-8000-000000000001" }
     const sessionOpen = vi.fn<HavenClient["sessionOpen"]>().mockResolvedValue(valid)
     await expect(openSession(request, clientWithSession(sessionOpen))).resolves.toBe(valid)
+  })
+
+  it("accepts subtitle tracks only when their opaque URI is bound to the session", async () => {
+    useTauriRuntime()
+    const result = {
+      ...browserResult,
+      contentUri: "haven-resource://session/0196f0d2-0000-7000-8000-000000000001",
+      subtitleTracks: [subtitleTrack],
+    }
+    const sessionOpen = vi.fn<HavenClient["sessionOpen"]>().mockResolvedValue(result)
+
+    await expect(openSession(request, clientWithSession(sessionOpen))).resolves.toBe(result)
+  })
+
+  it.each([
+    { contentUri: "https://example.test/private.srt", format: "srt" as const },
+    {
+      contentUri: "haven-resource://session/0196f0d2-0000-7000-8000-000000000003/subtitle/0196f0d2-0000-7000-8000-000000000002",
+      format: "srt" as const,
+    },
+    { contentUri: subtitleTrack.contentUri, format: "unknown" as const },
+    { contentUri: subtitleTrack.contentUri, language: undefined },
+  ])("rejects an invalid subtitle track projection %#", async (track) => {
+    useTauriRuntime()
+    const malformedResult = {
+      ...browserResult,
+      contentUri: "haven-resource://session/0196f0d2-0000-7000-8000-000000000001",
+      subtitleTracks: [{ ...subtitleTrack, ...track }],
+    } as unknown as SessionOpenResultDto
+    const sessionOpen = vi.fn<HavenClient["sessionOpen"]>().mockResolvedValue(malformedResult)
+
+    await expect(openSession(request, clientWithSession(sessionOpen)))
+      .rejects.toHaveProperty("code", "SESSION_INVALID_RESPONSE")
+  })
+
+  it("rejects duplicate subtitle identities and tracks on non-playback sessions", async () => {
+    useTauriRuntime()
+    const duplicate = vi.fn<HavenClient["sessionOpen"]>().mockResolvedValue({
+      ...browserResult,
+      contentUri: "haven-resource://session/0196f0d2-0000-7000-8000-000000000001",
+      subtitleTracks: [subtitleTrack, subtitleTrack],
+    })
+    await expect(openSession(request, clientWithSession(duplicate)))
+      .rejects.toHaveProperty("code", "SESSION_INVALID_RESPONSE")
+
+    const readerRequest = { ...request, engine: "reader" as const }
+    const readerWithTracks = vi.fn<HavenClient["sessionOpen"]>().mockResolvedValue({
+      ...browserResult,
+      engine: "reader",
+      contentUri: "haven-resource://session/0196f0d2-0000-7000-8000-000000000001",
+      subtitleTracks: [subtitleTrack],
+    })
+    await expect(openSession(readerRequest, clientWithSession(readerWithTracks)))
+      .rejects.toHaveProperty("code", "SESSION_INVALID_RESPONSE")
   })
 
   it("rejects uppercase production URI scheme and authority", async () => {

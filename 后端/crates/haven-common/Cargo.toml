@@ -4,8 +4,16 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# Explicitly opt-in candidate-only support for the loopback fixture source.
+# Production and release builds keep the default empty feature set, so a
+# localhost/127.0.0.1 media endpoint remains rejected by the normal network
+# policy.  The Tauri candidate enables this feature only for runtime testing.
+film-tv-fixture = []
+
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.20"
+url.workspace = true
 uuid = { version = "1.24.0", features = ["v7", "serde"] }

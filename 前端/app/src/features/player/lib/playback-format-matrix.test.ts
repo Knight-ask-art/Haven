@@ -40,13 +40,13 @@ describe("v0.1.0 WebView2 playback matrix", () => {
     expect(JSON.stringify(hevc)).not.toContain("损坏")
   })
 
-  it("rejects external subtitles and multi-track audio explicitly", () => {
+  it("keeps external subtitles independent from the container decision", () => {
     expect(checkWebView2PlaybackFormat({
       mimeType: "video/mp4",
       videoCodec: "avc1.4d401f",
       audioCodec: "mp4a.40.2",
       hasExternalSubtitles: true,
-    })).toMatchObject({ status: "unsupported", reason: "external_subtitles_not_supported" })
+    })).toMatchObject({ status: "supported", format: { format: "mp4-h264-aac" } })
     expect(checkWebView2PlaybackFormat({
       mimeType: "video/mp4",
       videoCodec: "avc1.4d401f",

@@ -77,10 +77,14 @@ The first release targets Windows local content: video, TXT, Markdown, EPUB,
 PDF, HTML, CBZ, and image directories. See [CHANGELOG.md](CHANGELOG.md) for
 the detailed support matrix, known limitations, and compatibility notes.
 
-Haven does not currently provide external subtitle files, audio-track
-selection, or user-controlled HEVC decoding. OCR/translation/AI, Sync, and
-full local-data deletion require separate foundations and risk reviews. Auto-
-update signing is wired to the Tauri updater, but installable releases are only
+The film/TV optimization branch is adding controlled external subtitles. The
+current implementation covers encoding normalization, track switching, and
+resource lifecycles for SRT/VTT/SBV, but it has not completed the four-layer
+runtime/release acceptance and must not be presented as a `v0.1.0-beta.1`
+release capability. Audio-track selection and user-controlled HEVC decoding
+remain unavailable. OCR/translation/AI, Sync, and full local-data deletion
+require separate foundations and risk reviews. Auto-update signing is wired to
+the Tauri updater, but installable releases are only
 available after the maintainer configures signing secrets and publishes a
 signed GitHub Release. The beta route is `0.1.0-beta.1`; `0.1.0` is reserved for
 the stable release. Long-running playback, very large EPUB/comic libraries,

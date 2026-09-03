@@ -1,0 +1,351 @@
+{
+  "schemaVersion": 1,
+  "product": "Haven",
+  "feature": "film-tv",
+  "branch": "codex/film-tv-optimization",
+  "principle": "构建和部署只能证明制品或部署动作，不得单独证明影视功能可用。",
+  "completionRule": {
+    "capabilityPassRequires": ["local", "ci", "runtime", "release"],
+    "buildIsNotAcceptanceFor": ["local", "ci", "runtime", "release"],
+    "deploymentIsNotAcceptanceFor": ["local", "ci", "runtime", "release"],
+    "allowedStatuses": ["not-accepted", "partial", "pass", "fail", "blocked"]
+  },
+  "layers": {
+    "local": {
+      "purpose": "在开发机上验证类型、契约、协议、状态机和安全边界的确定性检查。",
+      "passRule": "所有声明为本地必需的检查均有本次执行结果，并记录 HEAD SHA 与当前工作树指纹；构建结果单独记录，不得替代功能检查。",
+      "owner": "开发者",
+      "freshness": "每次进入评审前重新执行"
+    },
+    "ci": {
+      "purpose": "在干净 Windows runner 中重复关键影视检查，并留下可下载的运行摘要。",
+      "passRule": "影视专项检查必须是 CI 的独立步骤且退出码为 0；生成器必须在 GITHUB_ACTIONS=true 上下文中写入真实 GitHub Actions run ID 与工作树指纹，最终还要核对 job/artifact 与目标 commit；不能只引用 build/clippy 的结果。",
+      "owner": "CI",
+      "freshness": "每个相关 commit 或 pull request"
+    },
+    "runtime": {
+      "purpose": "使用版本固定、可控、脱敏的测试源验证桌面应用真实调用链和失败恢复。",
+      "passRule": "目标候选应用在指定环境逐项完成场景，并记录候选对象 SHA-256；浏览器 Mock、单元测试和部署成功均不能替代。",
+      "owner": "验收执行人",
+      "freshness": "候选包、关键网络策略或播放器链路变化后重新执行"
+    },
+    "release": {
+      "purpose": "确认候选包、候选配置、运行时结果、迁移兼容和回滚路径，然后单独记录是否启用。",
+      "passRule": "必须引用 local/ci/runtime 证据，记录候选对象与候选制品哈希、可用且已演练的回滚材料和启用状态。构建或部署成功本身不构成 release pass。",
+      "owner": "发布负责人",
+      "freshness": "每个候选发布版本"
+    }
+  },
+  "checks": [
+    {
+      "id": "FTV-LCL-FIXTURE-SOURCE-001",
+      "layers": ["local", "ci"],
+      "kind": "command",
+      "cwd": ".",
+      "argv": ["python", "-B", "tools/film-tv/fixture_server.py", "--check"],
+      "purpose": "启动并自测固定版本 loopback fixture 的 CMS10/M3U、HLS、字幕、Range、失败和重定向输入；不生成 runtime PASS。",
+      "covers": ["source_protocols", "playback_hls", "proxy_security", "subtitles"]
+    },
+    {
+      "id": "FTV-LCL-FE-FIXTURES-001",
+      "layers": ["local", "ci"],
+      "kind": "command",
+      "cwd": "前端/app",
+      "argv": ["npm", "run", "fixtures:check"],
+      "purpose": "实际编译并运行脱敏 IPC fixture guard。",
+      "covers": ["multi_source_search", "source_protocols", "work_identity", "playback_progress", "local_cache", "offline_download"]
+    },
+    {
+      "id": "FTV-LCL-FE-FOCUS-001",
+      "layers": ["local", "ci"],
+      "kind": "command",
+      "cwd": "前端/app",
+      "argv": [
+        "npm", "run", "test", "--", "--run",
+        "src/features/search/ipc/search-gateway.test.ts",
+        "src/features/search/lib/search-runtime-state.test.ts",
+        "src/features/media/lib/edition-mapper.test.ts",
+        "src/features/media/lib/work-detail-mapper.test.ts",
+        "src/features/player/lib/playback-format-matrix.test.ts",
+        "src/features/player/lib/playback-media-error.test.ts",
+        "src/features/player/lib/player-runtime-state.test.ts",
+        "src/features/player/lib/video-progress-controller.test.ts",
+        "src/features/progress/ipc/progress-gateway.test.ts",
+        "src/features/downloads/ipc/download-gateway.test.ts",
+        "src/features/downloads/lib/download-error.test.ts",
+        "src/features/downloads/lib/download-event-state.test.ts",
+        "src/features/downloads/lib/downloads-runtime-state.test.ts",
+        "src/features/settings/lib/source-catalog.test.ts"
+      ],
+      "purpose": "验证影视入口相关的前端状态、映射、播放错误、进度和下载行为。",
+      "covers": ["multi_source_search", "source_protocols", "work_identity", "playback_hls", "playback_progress", "local_cache", "offline_download"]
+    },
+    {
+      "id": "FTV-LCL-FE-SUBTITLE-001",
+      "layers": ["local", "ci"],
+      "kind": "command",
+      "cwd": "前端/app",
+      "argv": [
+        "npm", "run", "test", "--", "--run",
+        "src/features/player/lib/subtitle-converter.test.ts",
+        "src/features/player/lib/subtitle-track-runtime.test.ts",
+        "src/features/player/lib/subtitle-options.test.ts",
+        "src/features/player/lib/playback-format-matrix.test.ts",
+        "src/features/session/ipc/session-gateway.test.ts",
+        "src/features/session/ipc/resource-fetch.test.ts"
+      ],
+      "purpose": "验证字幕 DTO/资源 URI 校验、SRT/VTT/SBV 归一化、HLS/外挂轨道映射、恶意标记隔离、预算和对象 URL 生命周期。",
+      "covers": ["subtitles"]
+    },
+    {
+      "id": "FTV-LCL-RUST-FIXTURES-001",
+      "layers": ["local", "ci"],
+      "kind": "command",
+      "cwd": ".",
+      "argv": ["cargo", "test", "--manifest-path", "后端/Cargo.toml", "-p", "haven-application", "--test", "fixtures_consistency", "--locked"],
+      "purpose": "验证 Rust Wire DTO 与共享 fixture 的反序列化和语义一致性。",
+      "covers": ["multi_source_search", "source_protocols", "work_identity", "playback_progress", "local_cache", "offline_download"]
+    },
+    {
+      "id": "FTV-LCL-RUST-SEARCH-001",
+      "layers": ["local", "ci"],
+      "kind": "command",
+      "cwd": ".",
+      "argv": ["cargo", "test", "--manifest-path", "后端/Cargo.toml", "-p", "haven-application", "--lib", "search_source", "--locked"],
+      "purpose": "验证多源并发、部分失败、取消、终态和候选索引行为。",
+      "covers": ["multi_source_search"]
+    },
+    {
+      "id": "FTV-LCL-RUST-SOURCE-001",
+      "layers": ["local", "ci"],
+      "kind": "command",
+      "cwd": ".",
+      "argv": ["cargo", "test", "--manifest-path", "后端/Cargo.toml", "-p", "haven-application", "--lib", "source_registry", "--locked"],
+      "purpose": "验证来源目录、端点配置、启用状态和来源策略的已有合同。",
+      "covers": ["source_protocols", "proxy_security"]
+    },
+    {
+      "id": "FTV-LCL-COMMON-NETWORK-001",
+      "layers": ["local", "ci"],
+      "kind": "command",
+      "cwd": ".",
+      "argv": ["cargo", "test", "--manifest-path", "后端/Cargo.toml", "-p", "haven-common", "--lib", "network", "--locked"],
+      "purpose": "验证来源端点、媒体流和受控代理共享的 URL、主机、端口及字面量地址策略。",
+      "covers": ["source_protocols", "playback_hls", "proxy_security"]
+    },
+    {
+      "id": "FTV-LCL-RUST-IMPORT-001",
+      "layers": ["local", "ci"],
+      "kind": "command",
+      "cwd": ".",
+      "argv": ["cargo", "test", "--manifest-path", "后端/Cargo.toml", "-p", "haven-application", "--lib", "source_import", "--locked"],
+      "purpose": "验证来源候选、作品身份、集数归一化和媒体资源映射。",
+      "covers": ["source_protocols", "work_identity", "playback_hls"]
+    },
+    {
+      "id": "FTV-LCL-RUST-IMPORT-INTEGRATION-001",
+      "layers": ["local", "ci"],
+      "kind": "command",
+      "cwd": ".",
+      "argv": ["cargo", "test", "--manifest-path", "后端/Cargo.toml", "-p", "haven-application", "--test", "source_import_integration", "--locked"],
+      "purpose": "验证 M3U 成功导入的 Work→Edition→MediaItem→Resource 链、重复导入幂等，以及资源写入失败时整条事务回滚。",
+      "covers": ["source_protocols", "work_identity", "playback_hls"]
+    },
+    {
+      "id": "FTV-LCL-RUST-STREAM-001",
+      "layers": ["local", "ci"],
+      "kind": "command",
+      "cwd": ".",
+      "argv": ["cargo", "test", "--manifest-path", "后端/Cargo.toml", "-p", "haven-application", "--lib", "stream", "--locked"],
+      "purpose": "验证受控流资源类型、MIME 和播放会话输入边界。",
+      "covers": ["playback_hls", "proxy_security"]
+    },
+    {
+      "id": "FTV-LCL-RUST-PROGRESS-001",
+      "layers": ["local", "ci"],
+      "kind": "command",
+      "cwd": ".",
+      "argv": ["cargo", "test", "--manifest-path", "后端/Cargo.toml", "-p", "haven-application", "--lib", "progress", "--locked"],
+      "purpose": "验证进度 CAS、定位器兼容性和保存/读取领域服务。",
+      "covers": ["playback_progress"]
+    },
+    {
+      "id": "FTV-LCL-RUST-DOWNLOAD-001",
+      "layers": ["local", "ci"],
+      "kind": "command",
+      "cwd": ".",
+      "argv": ["cargo", "test", "--manifest-path", "后端/Cargo.toml", "-p", "haven-application", "--lib", "download", "--locked"],
+      "purpose": "验证下载状态机、失败重试、原子完成和来源资源校验。",
+      "covers": ["local_cache", "offline_download", "proxy_security"]
+    },
+    {
+      "id": "FTV-LCL-TAURI-STREAM-001",
+      "layers": ["local", "ci"],
+      "kind": "command",
+      "cwd": ".",
+      "argv": ["cargo", "test", "--manifest-path", "src-tauri/Cargo.toml", "--locked", "stream_registry"],
+      "purpose": "验证播放 grant、owner 绑定、HLS 主机学习和 token 生命周期。",
+      "covers": ["playback_hls", "proxy_security"]
+    },
+    {
+      "id": "FTV-LCL-TAURI-RESOURCE-001",
+      "layers": ["local", "ci"],
+      "kind": "command",
+      "cwd": ".",
+      "argv": ["cargo", "test", "--manifest-path", "src-tauri/Cargo.toml", "--locked", "resource_protocol"],
+      "purpose": "验证 HLS 重写、Range、MIME、CORS、大小限制和受控资源 URI。",
+      "covers": ["playback_hls", "proxy_security", "local_cache"]
+    },
+    {
+      "id": "FTV-LCL-TAURI-PROGRESS-001",
+      "layers": ["local", "ci"],
+      "kind": "command",
+      "cwd": ".",
+      "argv": ["cargo", "test", "--manifest-path", "src-tauri/Cargo.toml", "--locked", "progress_save"],
+      "purpose": "验证 Tauri 进度命令的 ID、CAS 冲突和不写入失败路径。",
+      "covers": ["playback_progress"]
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "multi_source_search",
+      "label": "多源搜索",
+      "acceptanceStatus": "not-accepted",
+      "requiredChecks": {
+        "local": ["FTV-LCL-FE-FIXTURES-001", "FTV-LCL-FE-FOCUS-001", "FTV-LCL-RUST-FIXTURES-001", "FTV-LCL-RUST-SEARCH-001"],
+        "ci": ["FTV-LCL-FE-FIXTURES-001", "FTV-LCL-FE-FOCUS-001", "FTV-LCL-RUST-FIXTURES-001", "FTV-LCL-RUST-SEARCH-001"]
+      },
+      "requiredScenarios": ["FTV-RUN-SEARCH-001", "FTV-RUN-SEARCH-002", "FTV-RUN-SEARCH-003", "FTV-RUN-SEARCH-004", "FTV-REL-SEARCH-001"]
+    },
+    {
+      "id": "source_protocols",
+      "label": "来源协议",
+      "acceptanceStatus": "not-accepted",
+      "requiredChecks": {
+        "local": ["FTV-LCL-FIXTURE-SOURCE-001", "FTV-LCL-FE-FIXTURES-001", "FTV-LCL-FE-FOCUS-001", "FTV-LCL-RUST-FIXTURES-001", "FTV-LCL-RUST-SOURCE-001", "FTV-LCL-COMMON-NETWORK-001", "FTV-LCL-RUST-IMPORT-001", "FTV-LCL-RUST-IMPORT-INTEGRATION-001"],
+        "ci": ["FTV-LCL-FIXTURE-SOURCE-001", "FTV-LCL-FE-FIXTURES-001", "FTV-LCL-FE-FOCUS-001", "FTV-LCL-RUST-FIXTURES-001", "FTV-LCL-RUST-SOURCE-001", "FTV-LCL-COMMON-NETWORK-001", "FTV-LCL-RUST-IMPORT-001", "FTV-LCL-RUST-IMPORT-INTEGRATION-001"]
+      },
+      "requiredScenarios": ["FTV-RUN-SOURCE-001", "FTV-RUN-SOURCE-002", "FTV-RUN-SOURCE-003", "FTV-RUN-SOURCE-004", "FTV-REL-SOURCE-001"]
+    },
+    {
+      "id": "work_identity",
+      "label": "作品身份",
+      "acceptanceStatus": "not-accepted",
+      "requiredChecks": {
+        "local": ["FTV-LCL-FE-FIXTURES-001", "FTV-LCL-FE-FOCUS-001", "FTV-LCL-RUST-FIXTURES-001", "FTV-LCL-RUST-IMPORT-001", "FTV-LCL-RUST-IMPORT-INTEGRATION-001"],
+        "ci": ["FTV-LCL-FE-FIXTURES-001", "FTV-LCL-FE-FOCUS-001", "FTV-LCL-RUST-FIXTURES-001", "FTV-LCL-RUST-IMPORT-001", "FTV-LCL-RUST-IMPORT-INTEGRATION-001"]
+      },
+      "requiredScenarios": ["FTV-RUN-IDENTITY-001", "FTV-RUN-IDENTITY-002", "FTV-RUN-IDENTITY-003", "FTV-REL-IDENTITY-001"]
+    },
+    {
+      "id": "playback_hls",
+      "label": "播放与 HLS",
+      "acceptanceStatus": "not-accepted",
+      "requiredChecks": {
+        "local": ["FTV-LCL-FIXTURE-SOURCE-001", "FTV-LCL-FE-FOCUS-001", "FTV-LCL-RUST-IMPORT-001", "FTV-LCL-RUST-IMPORT-INTEGRATION-001", "FTV-LCL-COMMON-NETWORK-001", "FTV-LCL-RUST-STREAM-001", "FTV-LCL-TAURI-STREAM-001", "FTV-LCL-TAURI-RESOURCE-001"],
+        "ci": ["FTV-LCL-FIXTURE-SOURCE-001", "FTV-LCL-FE-FOCUS-001", "FTV-LCL-RUST-IMPORT-001", "FTV-LCL-RUST-IMPORT-INTEGRATION-001", "FTV-LCL-COMMON-NETWORK-001", "FTV-LCL-RUST-STREAM-001", "FTV-LCL-TAURI-STREAM-001", "FTV-LCL-TAURI-RESOURCE-001"]
+      },
+      "requiredScenarios": ["FTV-RUN-PLAY-001", "FTV-RUN-PLAY-002", "FTV-RUN-PLAY-003", "FTV-RUN-PLAY-004", "FTV-RUN-PLAY-005", "FTV-REL-PLAY-001"]
+    },
+    {
+      "id": "proxy_security",
+      "label": "代理安全",
+      "acceptanceStatus": "not-accepted",
+      "requiredChecks": {
+        "local": ["FTV-LCL-FIXTURE-SOURCE-001", "FTV-LCL-RUST-SOURCE-001", "FTV-LCL-COMMON-NETWORK-001", "FTV-LCL-RUST-STREAM-001", "FTV-LCL-RUST-DOWNLOAD-001", "FTV-LCL-TAURI-STREAM-001", "FTV-LCL-TAURI-RESOURCE-001"],
+        "ci": ["FTV-LCL-FIXTURE-SOURCE-001", "FTV-LCL-RUST-SOURCE-001", "FTV-LCL-COMMON-NETWORK-001", "FTV-LCL-RUST-STREAM-001", "FTV-LCL-RUST-DOWNLOAD-001", "FTV-LCL-TAURI-STREAM-001", "FTV-LCL-TAURI-RESOURCE-001"]
+      },
+      "requiredScenarios": ["FTV-RUN-SEC-001", "FTV-RUN-SEC-002", "FTV-RUN-SEC-003", "FTV-RUN-SEC-004", "FTV-RUN-SEC-005", "FTV-REL-SEC-001"]
+    },
+    {
+      "id": "subtitles",
+      "label": "字幕",
+      "acceptanceStatus": "not-accepted",
+      "requiredChecks": {
+        "local": ["FTV-LCL-FIXTURE-SOURCE-001", "FTV-LCL-FE-SUBTITLE-001"],
+        "ci": ["FTV-LCL-FIXTURE-SOURCE-001", "FTV-LCL-FE-SUBTITLE-001"]
+      },
+      "requiredScenarios": ["FTV-RUN-SUB-001", "FTV-RUN-SUB-002", "FTV-RUN-SUB-003", "FTV-RUN-SUB-004", "FTV-REL-SUB-001"]
+    },
+    {
+      "id": "playback_progress",
+      "label": "播放进度",
+      "acceptanceStatus": "not-accepted",
+      "requiredChecks": {
+        "local": ["FTV-LCL-FE-FIXTURES-001", "FTV-LCL-FE-FOCUS-001", "FTV-LCL-RUST-FIXTURES-001", "FTV-LCL-RUST-PROGRESS-001", "FTV-LCL-TAURI-PROGRESS-001"],
+        "ci": ["FTV-LCL-FE-FIXTURES-001", "FTV-LCL-FE-FOCUS-001", "FTV-LCL-RUST-FIXTURES-001", "FTV-LCL-RUST-PROGRESS-001", "FTV-LCL-TAURI-PROGRESS-001"]
+      },
+      "requiredScenarios": ["FTV-RUN-PROGRESS-001", "FTV-RUN-PROGRESS-002", "FTV-RUN-PROGRESS-003", "FTV-RUN-PROGRESS-004", "FTV-RUN-PROGRESS-005", "FTV-REL-PROGRESS-001"]
+    },
+    {
+      "id": "local_cache",
+      "label": "本地缓存",
+      "acceptanceStatus": "not-accepted",
+      "requiredChecks": {
+        "local": ["FTV-LCL-FE-FIXTURES-001", "FTV-LCL-FE-FOCUS-001", "FTV-LCL-RUST-FIXTURES-001", "FTV-LCL-RUST-DOWNLOAD-001", "FTV-LCL-TAURI-RESOURCE-001"],
+        "ci": ["FTV-LCL-FE-FIXTURES-001", "FTV-LCL-FE-FOCUS-001", "FTV-LCL-RUST-FIXTURES-001", "FTV-LCL-RUST-DOWNLOAD-001", "FTV-LCL-TAURI-RESOURCE-001"]
+      },
+      "requiredScenarios": ["FTV-RUN-CACHE-001", "FTV-RUN-CACHE-002", "FTV-RUN-CACHE-003", "FTV-RUN-CACHE-004", "FTV-REL-CACHE-001"]
+    },
+    {
+      "id": "offline_download",
+      "label": "离线下载",
+      "acceptanceStatus": "not-accepted",
+      "requiredChecks": {
+        "local": ["FTV-LCL-FE-FIXTURES-001", "FTV-LCL-FE-FOCUS-001", "FTV-LCL-RUST-FIXTURES-001", "FTV-LCL-RUST-DOWNLOAD-001"],
+        "ci": ["FTV-LCL-FE-FIXTURES-001", "FTV-LCL-FE-FOCUS-001", "FTV-LCL-RUST-FIXTURES-001", "FTV-LCL-RUST-DOWNLOAD-001"]
+      },
+      "requiredScenarios": ["FTV-RUN-DOWNLOAD-001", "FTV-RUN-DOWNLOAD-002", "FTV-RUN-DOWNLOAD-003", "FTV-RUN-DOWNLOAD-004", "FTV-RUN-DOWNLOAD-005", "FTV-REL-DOWNLOAD-001"]
+    }
+  ],
+  "scenarios": [
+    {"id": "FTV-RUN-SEARCH-001", "layer": "runtime", "capability": "multi_source_search", "name": "多个受控来源成功并按作品身份合并", "requiredObservation": "同一作品只出现一个稳定 Work，保留来源与播放组映射。"},
+    {"id": "FTV-RUN-SEARCH-002", "layer": "runtime", "capability": "multi_source_search", "name": "单来源失败仍返回部分结果", "requiredObservation": "失败源有稳定错误码，成功源结果可继续消费。"},
+    {"id": "FTV-RUN-SEARCH-003", "layer": "runtime", "capability": "multi_source_search", "name": "来源超时和用户取消", "requiredObservation": "底层任务停止或进入明确终态，不能无限等待。"},
+    {"id": "FTV-RUN-SEARCH-004", "layer": "runtime", "capability": "multi_source_search", "name": "空结果、重复启动和事件顺序", "requiredObservation": "空结果与幂等启动可区分，事件 sequence 单调且终态唯一。"},
+    {"id": "FTV-RUN-SOURCE-001", "layer": "runtime", "capability": "source_protocols", "name": "结构化来源协议解析", "requiredObservation": "JSON/CMS10 等协议映射为受控候选，不把原始 URL 当内部身份。"},
+    {"id": "FTV-RUN-SOURCE-002", "layer": "runtime", "capability": "source_protocols", "name": "M3U 播放列表和剧集归一化", "requiredObservation": "分组、集号、标题和资源类型稳定，畸形行被隔离。"},
+    {"id": "FTV-RUN-SOURCE-003", "layer": "runtime", "capability": "source_protocols", "name": "协议漂移与认证失败", "requiredObservation": "格式异常、超时、认证失败分别呈现，不污染其他来源。"},
+    {"id": "FTV-RUN-SOURCE-004", "layer": "runtime", "capability": "source_protocols", "name": "来源配置迁移和禁用", "requiredObservation": "升级后端点不回传到 UI，禁用来源不参与搜索。"},
+    {"id": "FTV-RUN-IDENTITY-001", "layer": "runtime", "capability": "work_identity", "name": "稳定外部 ID 合并同作", "requiredObservation": "稳定外部 ID 优先，来源播放地址作为 Resource 而非 Work 身份。"},
+    {"id": "FTV-RUN-IDENTITY-002", "layer": "runtime", "capability": "work_identity", "name": "同名异作不误合并", "requiredObservation": "年份、类型、外部 ID 冲突时保留不同 Work。"},
+    {"id": "FTV-RUN-IDENTITY-003", "layer": "runtime", "capability": "work_identity", "name": "季集和版本映射", "requiredObservation": "Edition/MediaItem/Resource 层级可追溯，切集不会串资源。"},
+    {"id": "FTV-RUN-PLAY-001", "layer": "runtime", "capability": "playback_hls", "name": "直接视频与 HLS 主清单播放", "requiredObservation": "播放器只消费受控 resource URI，首帧和错误状态可观测。"},
+    {"id": "FTV-RUN-PLAY-002", "layer": "runtime", "capability": "playback_hls", "name": "多级 HLS、相对链接和 URI 属性", "requiredObservation": "子清单、分片、密钥或字幕 URI 都经过受控重写。"},
+    {"id": "FTV-RUN-PLAY-003", "layer": "runtime", "capability": "playback_hls", "name": "Range、切集和来源切换", "requiredObservation": "范围读取、下一集和换源不会复用错误 grant 或进度。"},
+    {"id": "FTV-RUN-PLAY-004", "layer": "runtime", "capability": "playback_hls", "name": "HLS 子资源失败与重试", "requiredObservation": "分片/清单失败显示可恢复状态，关闭会话后 grant 失效。"},
+    {"id": "FTV-RUN-PLAY-005", "layer": "runtime", "capability": "playback_hls", "name": "长播放资源生命周期", "requiredObservation": "无持续增长的 grant、token 或内存，取消和关闭有清理证据。"},
+    {"id": "FTV-RUN-SEC-001", "layer": "runtime", "capability": "proxy_security", "name": "URL 语法、用户信息和端口拒绝", "requiredObservation": "非法 scheme、userinfo、非法端口和畸形 URL 在进入 grant 前拒绝。"},
+    {"id": "FTV-RUN-SEC-002", "layer": "runtime", "capability": "proxy_security", "name": "环回、私网、链路本地和云元数据拒绝", "requiredObservation": "地址分类在初始请求、子资源和下载路径一致执行。"},
+    {"id": "FTV-RUN-SEC-003", "layer": "runtime", "capability": "proxy_security", "name": "逐跳重定向重新校验", "requiredObservation": "重定向到禁止地址或禁止端口不会被跟随。"},
+    {"id": "FTV-RUN-SEC-004", "layer": "runtime", "capability": "proxy_security", "name": "HLS 新主机和 DNS 变化", "requiredObservation": "manifest 学习主机前校验策略，解析地址与实际连接策略一致。"},
+    {"id": "FTV-RUN-SEC-005", "layer": "runtime", "capability": "proxy_security", "name": "凭据、签名 URL 和日志脱敏", "requiredObservation": "UI、事件、错误和证据摘要不包含凭据、Cookie、Authorization、签名 URL 或完整私有路径。"},
+    {"id": "FTV-RUN-SUB-001", "layer": "runtime", "capability": "subtitles", "name": "SRT/VTT 加载和切换", "requiredObservation": "字幕轨道可加载、切换、隐藏，解析失败不阻塞视频。"},
+    {"id": "FTV-RUN-SUB-002", "layer": "runtime", "capability": "subtitles", "name": "ASS/SSA 或 TTML 归一化", "requiredObservation": "支持范围和回退策略明确，时间轴错误可诊断。"},
+    {"id": "FTV-RUN-SUB-003", "layer": "runtime", "capability": "subtitles", "name": "字幕大小、编码和恶意输入预算", "requiredObservation": "超限、坏编码、空 cue 和异常标签被拒绝或安全回退。"},
+    {"id": "FTV-RUN-SUB-004", "layer": "runtime", "capability": "subtitles", "name": "字幕来源与资源生命周期", "requiredObservation": "字幕请求走受控资源管线，关闭/换集时对象 URL 和轨道被清理。"},
+    {"id": "FTV-RUN-PROGRESS-001", "layer": "runtime", "capability": "playback_progress", "name": "播放中保存与读取", "requiredObservation": "位置、集数、版本和 updatedAt 可恢复，revision 只作为 CAS token。"},
+    {"id": "FTV-RUN-PROGRESS-002", "layer": "runtime", "capability": "playback_progress", "name": "关闭 barrier 和重启恢复", "requiredObservation": "正常关闭、崩溃模拟或重启后最后有效进度仍可读。"},
+    {"id": "FTV-RUN-PROGRESS-003", "layer": "runtime", "capability": "playback_progress", "name": "切集、换源和同作版本隔离", "requiredObservation": "集数和 Edition/MediaItem 映射准确，不串写其他版本。"},
+    {"id": "FTV-RUN-PROGRESS-004", "layer": "runtime", "capability": "playback_progress", "name": "CAS 冲突与重复保存", "requiredObservation": "冲突可识别、重试策略明确，重复保存不产生错误回退。"},
+    {"id": "FTV-RUN-PROGRESS-005", "layer": "runtime", "capability": "playback_progress", "name": "Session identity 隔离", "requiredObservation": "不同会话/窗口不会互相读取或覆盖未授权进度。"},
+    {"id": "FTV-RUN-CACHE-001", "layer": "runtime", "capability": "local_cache", "name": "命中、未命中和过期", "requiredObservation": "缓存命中不绕过资源授权，过期后能安全重建。"},
+    {"id": "FTV-RUN-CACHE-002", "layer": "runtime", "capability": "local_cache", "name": "损坏媒体/清单和清理", "requiredObservation": "损坏项被隔离或删除，不影响 Work、进度和其他资源。"},
+    {"id": "FTV-RUN-CACHE-003", "layer": "runtime", "capability": "local_cache", "name": "磁盘空间和原子落盘", "requiredObservation": "空间不足、残留临时文件和中断恢复不会留下伪完成资源。"},
+    {"id": "FTV-RUN-CACHE-004", "layer": "runtime", "capability": "local_cache", "name": "升级与缓存所有权", "requiredObservation": "应用升级/清理只影响可再生缓存，不误删业务事实和离线资源。"},
+    {"id": "FTV-RUN-DOWNLOAD-001", "layer": "runtime", "capability": "offline_download", "name": "远程视频或 HLS 下载闭环", "requiredObservation": "任务由受控 Resource 创建，完成后可从离线资源播放。"},
+    {"id": "FTV-RUN-DOWNLOAD-002", "layer": "runtime", "capability": "offline_download", "name": "暂停、恢复和断点", "requiredObservation": "暂停不丢任务，恢复不重复破坏已有合法片段。"},
+    {"id": "FTV-RUN-DOWNLOAD-003", "layer": "runtime", "capability": "offline_download", "name": "重启中断和失败重试", "requiredObservation": "状态机进入 Interrupted/Failed 后可解释、可恢复或明确终止。"},
+    {"id": "FTV-RUN-DOWNLOAD-004", "layer": "runtime", "capability": "offline_download", "name": "取消、删除记录和离线资源分离", "requiredObservation": "取消任务、删除记录和删除离线文件不会混淆语义。"},
+    {"id": "FTV-RUN-DOWNLOAD-005", "layer": "runtime", "capability": "offline_download", "name": "损坏校验和 HLS 资源图", "requiredObservation": "清单、分片、密钥或封装校验失败时不标记 Completed。"},
+    {"id": "FTV-REL-SEARCH-001", "layer": "release", "capability": "multi_source_search", "name": "候选包搜索回归和回滚", "requiredObservation": "候选包完成运行时搜索回归，并有可验证回滚材料。"},
+    {"id": "FTV-REL-SOURCE-001", "layer": "release", "capability": "source_protocols", "name": "来源配置迁移审计", "requiredObservation": "候选配置版本、脱敏迁移和禁用回滚均有记录。"},
+    {"id": "FTV-REL-IDENTITY-001", "layer": "release", "capability": "work_identity", "name": "作品身份数据兼容", "requiredObservation": "升级/回滚不会重建错误 Work 或丢失来源映射。"},
+    {"id": "FTV-REL-PLAY-001", "layer": "release", "capability": "playback_hls", "name": "候选包真实播放回归", "requiredObservation": "候选包在目标 WebView2 环境验证直接流、HLS、切集和失败恢复。"},
+    {"id": "FTV-REL-SEC-001", "layer": "release", "capability": "proxy_security", "name": "发布配置与网络策略审计", "requiredObservation": "发布配置未扩大来源、端口、重定向或日志信任边界。"},
+    {"id": "FTV-REL-SUB-001", "layer": "release", "capability": "subtitles", "name": "候选包字幕回归", "requiredObservation": "候选包字幕加载、切换、失败回退和资源清理可复现。"},
+    {"id": "FTV-REL-PROGRESS-001", "layer": "release", "capability": "playback_progress", "name": "进度迁移与重启回归", "requiredObservation": "候选包升级、重启、回滚风险和数据兼容已记录。"},
+    {"id": "FTV-REL-CACHE-001", "layer": "release", "capability": "local_cache", "name": "缓存升级回归", "requiredObservation": "候选包升级/清理不删除业务事实和离线资源。"},
+    {"id": "FTV-REL-DOWNLOAD-001", "layer": "release", "capability": "offline_download", "name": "下载候选包回归与回滚", "requiredObservation": "候选包完成暂停、重启、损坏和离线播放回归，并有回滚路径。"}
+  ]
+}

@@ -14,9 +14,11 @@ use haven_application::services::source_import::{
 };
 use haven_application::services::source_registry::SourceRegistryService;
 use haven_common::AppError;
-use haven_domain::contracts::{EditionRepository, MediaItemRepository, ResourceRepository};
+use haven_domain::contracts::{
+    EditionRepository, MediaItemRepository, ResourceRepository, WorkRepository,
+};
 use haven_domain::entities::ResourceLocator;
-use haven_domain::enums::MediaType;
+use haven_domain::enums::{MediaType, ResourceType};
 use haven_infrastructure::Db;
 use haven_infrastructure::db::repos::SqliteRepositories;
 
@@ -27,6 +29,8 @@ const MANGA_REMOTE_ID: &str =
 const ARXIV_ID: &str = "hep-th/9901001";
 const PMCID: &str = "PMC123456";
 const WIKISOURCE_TITLE: &str = "三国演义/第一回";
+const M3U_DEDUPE_KEY: &str = "Fixture Stream\u{1}https://cdn.example.invalid/hls/master.m3u8";
+const M3U_CANDIDATE: &str = "content-candidate-m3u-Fixture%20Stream%01https%3A%2F%2Fcdn.example.invalid%2Fhls%2Fmaster.m3u8";
 
 #[derive(Default)]
 struct FakeCatalog {
@@ -102,6 +106,7 @@ impl SourceCatalogProvider for FakeCatalog {
 }
 
 struct Fixture {
+    db: Arc<Db>,
     service: SourceImportService,
     repos: Arc<SqliteRepositories>,
     registry: SourceRegistryService,
@@ -116,11 +121,14 @@ fn fixture() -> Fixture {
     let catalog = Arc::new(FakeCatalog::default());
     let service = SourceImportService::new(
         import_ports,
-        Arc::new(haven_infrastructure::db::uow::SqliteUnitOfWork::new(db)),
+        Arc::new(haven_infrastructure::db::uow::SqliteUnitOfWork::new(
+            db.clone(),
+        )),
         registry.clone(),
         catalog.clone(),
     );
     Fixture {
+        db,
         service,
         repos,
         registry,
@@ -173,6 +181,59 @@ async fn assert_remote_resource(
     );
 }
 
+async fn assert_m3u_resource(repos: &SqliteRepositories, imported: &ImportedWork) {
+    let editions = repos
+        .list_by_work(imported.work_id)
+        .await
+        .expect("M3U work should have an edition");
+    assert_eq!(editions.len(), 1);
+    assert_eq!(editions[0].edition_type, MediaType::Series);
+
+    let items = repos
+        .list_by_edition(editions[0].id)
+        .await
+        .expect("M3U edition should have a media item");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, imported.media_item_id);
+    assert_eq!(items[0].media_type, MediaType::Episode);
+
+    let resources = repos
+        .list_by_media_item(imported.media_item_id)
+        .await
+        .expect("M3U media item should have a resource");
+    assert_eq!(resources.len(), 1);
+    let resource = &resources[0];
+    assert_eq!(resource.resource_type, ResourceType::HlsStream);
+    assert_eq!(
+        resource.mime_type.as_deref(),
+        Some("application/vnd.apple.mpegurl")
+    );
+    assert_eq!(
+        resource.locator,
+        ResourceLocator::Http {
+            url: "https://cdn.example.invalid/hls/master.m3u8".to_owned(),
+        }
+    );
+}
+
+fn table_count(db: &Db, table: &str) -> i64 {
+    db.with_tx(|conn| {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| {
+            AppError::new(
+                "DATABASE_ERROR",
+                haven_common::ErrorKind::Database,
+                format!("读取 {table} 测试计数失败"),
+                false,
+            )
+            .with_source(error)
+        })
+    })
+    .expect("test table count should succeed")
+}
+
 #[tokio::test]
 async fn content_import_registers_source_object_without_local_content() {
     let fixture = fixture();
@@ -192,6 +253,91 @@ async fn content_import_registers_source_object_without_local_content() {
             .next()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn m3u_import_persists_a_playable_chain_and_is_idempotent() {
+    let fixture = fixture();
+
+    let first = fixture
+        .service
+        .import_candidate(M3U_CANDIDATE)
+        .await
+        .expect("valid M3U candidate should import");
+    let second = fixture
+        .service
+        .import_candidate(M3U_CANDIDATE)
+        .await
+        .expect("repeated M3U candidate should be idempotent");
+
+    assert_eq!(first, second);
+    assert_eq!(
+        fixture
+            .repos
+            .id_for_source_ref("m3u", M3U_DEDUPE_KEY)
+            .await
+            .expect("M3U source ref lookup should succeed"),
+        Some(first.work_id)
+    );
+    assert_eq!(fixture.repos.list(100, 0).await.unwrap().len(), 1);
+    assert_eq!(
+        fixture.catalog.detail_count(),
+        0,
+        "M3U import must not refetch playlist detail"
+    );
+    assert_m3u_resource(&fixture.repos, &first).await;
+}
+
+#[tokio::test]
+async fn m3u_resource_failure_rolls_back_the_entire_import_chain() {
+    let fixture = fixture();
+    fixture
+        .db
+        .with_tx(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER fail_m3u_resource_insert
+                 BEFORE INSERT ON resources
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected M3U resource failure');
+                 END;",
+            )
+            .map_err(|error| {
+                AppError::new(
+                    "DATABASE_ERROR",
+                    haven_common::ErrorKind::Database,
+                    "安装 M3U 资源失败注入器失败",
+                    false,
+                )
+                .with_source(error)
+            })?;
+            Ok(())
+        })
+        .expect("resource failure trigger should install");
+
+    let error = fixture
+        .service
+        .import_candidate(M3U_CANDIDATE)
+        .await
+        .expect_err("injected resource failure should fail the import");
+    assert_eq!(error.code().as_str(), "DATABASE_ERROR");
+
+    assert_eq!(
+        fixture
+            .repos
+            .id_for_source_ref("m3u", M3U_DEDUPE_KEY)
+            .await
+            .expect("M3U source ref lookup should succeed after rollback"),
+        None
+    );
+    for table in [
+        "works",
+        "work_source_refs",
+        "editions",
+        "media_items",
+        "resources",
+    ] {
+        assert_eq!(table_count(&fixture.db, table), 0, "{table} must roll back");
+    }
 }
 
 #[tokio::test]

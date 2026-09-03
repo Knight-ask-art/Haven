@@ -24,7 +24,7 @@ use crate::services::ports::{
     RemoteByteRange, RemoteSessionBody, RemoteSessionPort, SessionOpenPorts,
 };
 use crate::services::source_import::{source_key_for_id, validate_remote_source_object};
-use crate::wire::{ProgressSummaryDto, SessionEngineDto, SessionOpenRequest};
+use crate::wire::{ProgressSummaryDto, SessionEngineDto, SessionOpenRequest, SubtitleFormatDto};
 
 /// A prepared session is server-only state.  In particular, its paths and
 /// resource/storage IDs must never be serialized as IPC fields.
@@ -41,12 +41,24 @@ pub struct PreparedSession {
     pub storage_location_id: Option<StorageLocationId>,
     pub canonical_root: Option<PathBuf>,
     pub canonical_file: Option<PathBuf>,
+    pub subtitle_tracks: Vec<PreparedSubtitleTrack>,
     pub source: PreparedSessionSource,
     pub mime_type: Option<String>,
     pub media_type: MediaType,
     pub resource_type: ResourceType,
     pub comic_pages: Option<Vec<PreparedComicPage>>,
     pub progress: Option<ProgressSummaryDto>,
+}
+
+/// Server-only local subtitle facts. The canonical path is opened only after
+/// the session owner and current storage binding are revalidated by Tauri.
+#[derive(Debug, Clone)]
+pub struct PreparedSubtitleTrack {
+    pub track_id: String,
+    pub label: String,
+    pub language: Option<String>,
+    pub format: SubtitleFormatDto,
+    pub canonical_file: PathBuf,
 }
 
 /// Server-only origin of the prepared session. The remote identity is opaque
@@ -234,6 +246,22 @@ impl SessionService {
             .map(progress_summary)
             .transpose()?;
 
+        let subtitle_tracks = if request.engine == SessionEngineDto::Playback
+            && matches!(
+                media_item.media_type,
+                MediaType::Movie | MediaType::Series | MediaType::Episode
+            ) {
+            match &resolution {
+                ResolvedResource::Local {
+                    canonical_root,
+                    canonical_file,
+                    ..
+                } => discover_local_subtitles(canonical_root, canonical_file),
+                ResolvedResource::Remote { .. } => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
         let (storage_location_id, canonical_root, canonical_file, source) = match resolution {
             ResolvedResource::Local {
                 storage_location_id,
@@ -269,6 +297,7 @@ impl SessionService {
             storage_location_id,
             canonical_root,
             canonical_file,
+            subtitle_tracks,
             mime_type: resource.mime_type,
             media_type: media_item.media_type,
             resource_type: resource.resource_type,
@@ -402,6 +431,136 @@ impl SessionService {
             canonical_root,
             canonical_file,
         })
+    }
+}
+
+const MAX_SUBTITLE_TRACKS: usize = 16;
+const MAX_SUBTITLE_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+fn discover_local_subtitles(root: &Path, media_file: &Path) -> Vec<PreparedSubtitleTrack> {
+    let Some(parent) = media_file.parent() else {
+        return Vec::new();
+    };
+    let Some(media_stem) = media_file.file_stem().and_then(|value| value.to_str()) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(format) = subtitle_format_for_path(&path) else {
+            continue;
+        };
+        let Ok(canonical_file) = std::fs::canonicalize(&path) else {
+            continue;
+        };
+        if canonical_file == media_file
+            || !canonical_file.is_file()
+            || canonical_file.strip_prefix(root).is_err()
+        {
+            continue;
+        }
+        let Ok(metadata) = std::fs::metadata(&canonical_file) else {
+            continue;
+        };
+        if metadata.len() > MAX_SUBTITLE_FILE_BYTES {
+            continue;
+        }
+        let Some(candidate_stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !is_sibling_subtitle_stem(media_stem, candidate_stem) {
+            continue;
+        }
+        candidates.push((
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+            canonical_file,
+            format,
+            subtitle_language(media_stem, candidate_stem),
+        ));
+    }
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+
+    candidates
+        .into_iter()
+        .take(MAX_SUBTITLE_TRACKS)
+        .enumerate()
+        .map(
+            |(index, (_sort_name, canonical_file, format, language))| PreparedSubtitleTrack {
+                track_id: uuid::Uuid::new_v4().to_string(),
+                label: subtitle_label(language.as_deref(), index),
+                language,
+                format,
+                canonical_file,
+            },
+        )
+        .collect()
+}
+
+fn subtitle_format_for_path(path: &Path) -> Option<SubtitleFormatDto> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match extension.as_str() {
+        "srt" => SubtitleFormatDto::Srt,
+        "vtt" | "webvtt" => SubtitleFormatDto::Vtt,
+        "sbv" => SubtitleFormatDto::Sbv,
+        "ass" => SubtitleFormatDto::Ass,
+        "ssa" => SubtitleFormatDto::Ssa,
+        "ttml" => SubtitleFormatDto::Ttml,
+        "dfxp" => SubtitleFormatDto::Dfxp,
+        "sub" => SubtitleFormatDto::Sub,
+        "lrc" => SubtitleFormatDto::Lrc,
+        _ => return None,
+    })
+}
+
+fn is_sibling_subtitle_stem(media_stem: &str, candidate_stem: &str) -> bool {
+    if media_stem.eq_ignore_ascii_case(candidate_stem) {
+        return true;
+    }
+    let media_lower = media_stem.to_ascii_lowercase();
+    let candidate_lower = candidate_stem.to_ascii_lowercase();
+    candidate_lower
+        .strip_prefix(&media_lower)
+        .is_some_and(|suffix| {
+            suffix.starts_with('.') || suffix.starts_with('_') || suffix.starts_with('-')
+        })
+}
+
+fn subtitle_language(media_stem: &str, candidate_stem: &str) -> Option<String> {
+    let suffix = candidate_stem
+        .get(media_stem.len()..)?
+        .trim_start_matches(['.', '_', '-']);
+    let first = suffix.split(['.', '_']).next()?.to_ascii_lowercase();
+    Some(match first.as_str() {
+        "zh" | "zh-cn" | "chs" | "cht" => "zh-CN".to_owned(),
+        "en" | "eng" | "en-us" => "en".to_owned(),
+        "ja" | "jpn" => "ja".to_owned(),
+        "ko" | "kor" => "ko".to_owned(),
+        "fr" | "fra" => "fr".to_owned(),
+        "de" | "deu" => "de".to_owned(),
+        "es" | "spa" => "es".to_owned(),
+        "ru" | "rus" => "ru".to_owned(),
+        _ => return None,
+    })
+}
+
+fn subtitle_label(language: Option<&str>, index: usize) -> String {
+    match language {
+        Some("zh-CN") => "中文".to_owned(),
+        Some("en") => "English".to_owned(),
+        Some("ja") => "日本語".to_owned(),
+        Some("ko") => "한국어".to_owned(),
+        Some("fr") => "Français".to_owned(),
+        Some("de") => "Deutsch".to_owned(),
+        Some("es") => "Español".to_owned(),
+        Some("ru") => "Русский".to_owned(),
+        _ => format!("字幕 {}", index + 1),
     }
 }
 
@@ -831,6 +990,17 @@ mod tests {
     #[tokio::test]
     async fn prepares_local_file_without_path_in_wire_json() {
         let f = fixture(None).await;
+        std::fs::write(
+            f._root.path().join("movie.zh-CN.srt"),
+            "1\n00:00:00,000 --> 00:00:01,000\n你好\n",
+        )
+        .unwrap();
+        std::fs::write(
+            f._root.path().join("movie.en.vtt"),
+            "WEBVTT\n\n00:00.000 --> 00:01.000\nHello\n",
+        )
+        .unwrap();
+        std::fs::write(f._root.path().join("other.srt"), "not selected").unwrap();
         let prepared = f
             .service
             .prepare(SessionOpenRequest {
@@ -839,6 +1009,19 @@ mod tests {
             })
             .await
             .unwrap();
+        assert_eq!(prepared.subtitle_tracks.len(), 2);
+        let languages = prepared
+            .subtitle_tracks
+            .iter()
+            .filter_map(|track| track.language.as_deref())
+            .collect::<Vec<_>>();
+        assert!(languages.contains(&"zh-CN"));
+        assert!(languages.contains(&"en"));
+        assert!(prepared.subtitle_tracks.iter().all(|track| {
+            track
+                .canonical_file
+                .starts_with(prepared.canonical_root.as_ref().unwrap())
+        }));
         let json = serde_json::to_string(&crate::wire::SessionOpenResultDto {
             schema_version: 1,
             session_id: "opaque".into(),
@@ -849,6 +1032,7 @@ mod tests {
             engine: prepared.engine,
             progress: prepared.progress,
             stream_kind: None,
+            subtitle_tracks: None,
         })
         .unwrap();
         assert!(!json.contains("movie.mkv"));

@@ -109,19 +109,22 @@ pub fn run_stream_open(
     // prepare 是异步 DB 操作；命令层用 block_on 收敛（协议处理器同模式）。
     let facts = tauri::async_runtime::block_on(state.stream.prepare(request))
         .map_err(|e| to_error_dto(&e))?;
-    let grant = state.stream_registry.register(
-        crate::stream_registry::StreamGrantFacts {
-            work_id: facts.work_id.clone(),
-            edition_id: facts.edition_id.clone(),
-            media_item_id: facts.media_item_id.clone(),
-            mime_type: facts.mime_type.clone(),
-            is_hls: facts.is_hls,
-            progress: facts.progress.clone(),
-            upstream_url: facts.upstream_url.clone(),
-        },
-        &facts.upstream_url,
-        owner_label,
-    );
+    let grant = state
+        .stream_registry
+        .register(
+            crate::stream_registry::StreamGrantFacts {
+                work_id: facts.work_id.clone(),
+                edition_id: facts.edition_id.clone(),
+                media_item_id: facts.media_item_id.clone(),
+                mime_type: facts.mime_type.clone(),
+                is_hls: facts.is_hls,
+                progress: facts.progress.clone(),
+                upstream_url: facts.upstream_url.clone(),
+            },
+            &facts.upstream_url,
+            owner_label,
+        )
+        .map_err(|e| to_error_dto(&e))?;
     // 历史足迹：远端流打开即记（幂等，同 mediaItem 只一条 last_active_at 刷新）。
     if let Ok(mid) = facts
         .media_item_id
@@ -147,6 +150,7 @@ pub fn run_stream_open(
         } else {
             StreamKindDto::Direct
         }),
+        subtitle_tracks: None,
     })
 }
 

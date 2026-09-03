@@ -11,7 +11,9 @@
     "preview": "vite preview",
     "governance:check": "node scripts/governance-audit.js",
     "fixtures:check": "node scripts/fixtures-check-runner.mjs",
-    "ci:check": "npm run lint && npm run governance:check && npm run test && npm run build"
+    "film-tv:contract": "python ../../tools/film-tv/evidence-check.py --layer contract",
+    "film-tv:local": "python ../../tools/film-tv/evidence-check.py --layer local --output ../../测试/film-tv/evidence/local.json",
+    "ci:check": "npm run lint && npm run governance:check && npm run fixtures:check && npm run film-tv:contract && npm run test && npm run build"
   },
   "dependencies": {
     "@radix-ui/react-slot": "^1.3.3",

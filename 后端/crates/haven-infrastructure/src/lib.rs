@@ -10,6 +10,7 @@ pub mod db;
 pub mod download;
 pub mod epub;
 pub mod error_report;
+mod http_security;
 pub mod metadata_sources;
 pub mod online_sources;
 pub mod opds;

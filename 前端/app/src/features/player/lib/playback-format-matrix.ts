@@ -22,7 +22,6 @@ export type PlaybackFormatRejection =
   | "container_not_supported"
   | "video_codec_not_supported"
   | "audio_codec_not_supported"
-  | "external_subtitles_not_supported"
   | "audio_track_switching_not_supported"
 
 export interface PlaybackFormatDescriptor {
@@ -32,7 +31,7 @@ export interface PlaybackFormatDescriptor {
   videoCodec: string | null | undefined
   /** Codec token for the selected/default audio stream; null means no audio. */
   audioCodec: string | null | undefined
-  /** v0.1.0 does not load an external subtitle resource. */
+  /** External subtitles are selected independently through a controlled <track>. */
   hasExternalSubtitles?: boolean
   /** More than one track would require an unimplemented track chooser. */
   audioTrackCount?: number | null
@@ -56,8 +55,9 @@ export type PlaybackFormatDecision =
 
 /**
  * The exact rows intentionally use H.264/AVC + AAC-LC for MP4 and VP8/VP9 +
- * Opus/Vorbis for WebM. HEVC/H.265, Matroska, external subtitles and audio
- * track switching are outside this first-release contract.
+ * Opus/Vorbis for WebM. HEVC/H.265, Matroska and audio track switching are
+ * outside this first-release contract. External subtitles are an independent
+ * resource capability and do not change the container/codec decision.
  */
 export const WEBVIEW2_PLAYBACK_MATRIX: readonly SupportedPlaybackFormat[] = [
   { format: "mp4-h264-aac", mimeType: "video/mp4", videoCodec: "avc1", audioCodec: "mp4a.40.2" },
@@ -104,10 +104,6 @@ export function checkWebView2PlaybackFormat(
     || (typeof descriptor.audioCodec === "string" && !audioCodec)
   ) {
     return unsupported("empty_descriptor", "视频格式信息为空，当前版本无法安全判断是否支持。")
-  }
-
-  if (descriptor.hasExternalSubtitles) {
-    return unsupported("external_subtitles_not_supported", "当前版本不支持外挂字幕。")
   }
 
   if (descriptor.audioTrackCount !== null && descriptor.audioTrackCount !== undefined) {

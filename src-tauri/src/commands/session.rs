@@ -31,6 +31,7 @@ pub async fn run_session_open(
         engine: prepared.engine,
         progress: prepared.progress.clone(),
         stream_kind: None,
+        subtitle_tracks: None,
     };
     let media_item_id_for_history = prepared.media_item_id.clone();
     let session_id = state
@@ -47,6 +48,10 @@ pub async fn run_session_open(
     }
     let mut result = result;
     result.session_id = session_id.clone();
+    result.subtitle_tracks = state
+        .session_registry
+        .subtitle_tracks(&session_id, owner_webview_label)
+        .map_err(|error| to_error_dto(&error))?;
     if exposes_root_content {
         result.content_uri = Some(crate::session_registry::SessionRegistry::uri(&session_id));
     }

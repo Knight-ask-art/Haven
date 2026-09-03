@@ -8,10 +8,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use haven_common::network::{HttpUrlPolicy, parse_http_url};
 use haven_common::{AppError, ErrorKind, UtcMillis};
-use haven_domain::contracts::{
-    EditionRepository, MediaItemRepository, ResourceRepository, WorkRepository,
-};
+use haven_domain::contracts::{EditionRepository, MediaItemRepository, WorkRepository};
 use haven_domain::entities::{Edition, MediaIndex, MediaItem, Resource, Work};
 use haven_domain::enums::{
     Availability, AvailabilitySource, MediaType, ResourceType, WorkStatus, WorkType,
@@ -473,9 +472,6 @@ impl SourceImportService {
             created_at: now,
             updated_at: now,
         };
-        WorkRepository::save(&*self.ports, &work).await?;
-        WorkRepository::save_source_ref(&*self.ports, M3U_SOURCE_ID, &dedupe_key, work.id).await?;
-
         let media_type = MediaType::Series;
         let edition = Edition {
             id: haven_domain::ids::EditionId::new(),
@@ -492,8 +488,6 @@ impl SourceImportService {
             created_at: now,
             updated_at: now,
         };
-        EditionRepository::save(&*self.ports, &edition).await?;
-
         let item = MediaItem {
             id: MediaItemId::new(),
             edition_id: edition.id,
@@ -512,8 +506,6 @@ impl SourceImportService {
             created_at: now,
             updated_at: now,
         };
-        MediaItemRepository::save(&*self.ports, &item).await?;
-
         let resource = Resource {
             id: ResourceId::new(),
             media_item_id: item.id,
@@ -534,7 +526,18 @@ impl SourceImportService {
             created_at: now,
             updated_at: now,
         };
-        ResourceRepository::save(&*self.ports, &resource).await?;
+        // Keep the M3U path on the same transaction boundary as CMS10 and the
+        // fixed remote providers.  A failed resource insert must not leave a
+        // Work/source-ref pair that makes the next import look idempotently
+        // complete while its playable unit is missing.
+        self.persist_import(
+            M3U_SOURCE_ID,
+            &dedupe_key,
+            &work,
+            &edition,
+            std::slice::from_ref(&item),
+            std::slice::from_ref(&resource),
+        )?;
         Ok(ImportedWork {
             work_id: work.id,
             media_item_id: item.id,
@@ -1088,43 +1091,9 @@ fn decode_candidate_component_with_separator(value: &str) -> Result<String, AppE
 /// `ResourceLocator::Http`. This mirrors the controlled stream gate: the M3U
 /// provider may only create HTTP(S) streams with an unambiguous authority.
 fn validate_m3u_stream_url(url: &str) -> Result<(), AppError> {
-    if url.is_empty() || url.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
-        return Err(invalid_m3u_candidate());
-    }
-    let Some((scheme, remainder)) = url.split_once("://") else {
-        return Err(invalid_m3u_candidate());
-    };
-    if !matches!(scheme, "http" | "https") {
-        return Err(invalid_m3u_candidate());
-    }
-    let authority = remainder
-        .split_once(['/', '?', '#'])
-        .map_or(remainder, |(authority, _)| authority);
-    if authority.is_empty() || authority.contains('@') || authority.ends_with(':') {
-        return Err(invalid_m3u_candidate());
-    }
-
-    let valid = if authority.starts_with('[') {
-        let Some(close) = authority.find(']') else {
-            return Err(invalid_m3u_candidate());
-        };
-        let suffix = &authority[close + 1..];
-        close > 1 && (suffix.is_empty() || valid_m3u_port_suffix(suffix))
-    } else {
-        match authority.split_once(':') {
-            None => true,
-            Some((host, port)) => !host.is_empty() && valid_m3u_port(port),
-        }
-    };
-    valid.then_some(()).ok_or_else(invalid_m3u_candidate)
-}
-
-fn valid_m3u_port_suffix(value: &str) -> bool {
-    value.strip_prefix(':').is_some_and(valid_m3u_port)
-}
-
-fn valid_m3u_port(value: &str) -> bool {
-    !value.is_empty() && value.parse::<u16>().is_ok()
+    parse_http_url(url, HttpUrlPolicy::MediaResource)
+        .map(|_| ())
+        .map_err(|_| invalid_m3u_candidate())
 }
 
 /// Candidate IDs use percent-encoding so a remote URL or title never travels
@@ -1662,7 +1631,7 @@ mod candidate_tests {
         for url in [
             "https://cdn.example/live.m3u8",
             "http://cdn.example:8080/live.m3u?token=opaque",
-            "https://[2001:db8::10]:8443/live.mp4",
+            "https://[2001:4860:4860::8888]:8443/live.mp4",
         ] {
             assert!(
                 validate_m3u_stream_url(url).is_ok(),

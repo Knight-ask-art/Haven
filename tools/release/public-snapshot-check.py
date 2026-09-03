@@ -32,6 +32,10 @@ REQUIRED_FILES = {
     "后端/crates/haven-application/resources/builtin-sources.json",
     "前端/app/src/lib/ipc/generated/wire.ts",
     "contracts/ipc/v1/fixtures/README.md",
+    "contracts/film-tv/README.md",
+    "contracts/film-tv/acceptance-matrix.json",
+    "tools/film-tv/evidence-check.py",
+    "tools/film-tv/evidence-check.test.py",
 }
 FORBIDDEN_ROOT_SEGMENTS = {"docs", "plan", "测试", "参考项目", "logs", "tmp", ".tmp"}
 FORBIDDEN_PUBLIC_PREFIXES = (

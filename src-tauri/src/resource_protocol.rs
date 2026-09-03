@@ -7,6 +7,7 @@
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,6 +19,9 @@ use uuid::Uuid;
 use haven_application::services::ports::{RemoteByteRange, RemoteSessionBody};
 use haven_application::services::{ComicPageBody, PreparedSession, PreparedSessionSource};
 use haven_application::wire::SessionEngineDto;
+#[cfg(test)]
+use haven_common::network::validate_host;
+use haven_common::network::{is_publicly_routable, parse_http_url, HttpUrlPolicy};
 use haven_common::{AppError, ErrorKind};
 use haven_domain::contracts::{ResourceRepository, StorageLocationRepository};
 use haven_domain::entities::{Resource, ResourceLocator, StorageLocation};
@@ -36,6 +40,8 @@ pub(crate) const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_STREAM_BYTES: u64 = 256 * 1024 * 1024;
 /// HLS manifest 文本上限。
 const MAX_MANIFEST_BYTES: usize = 2 * 1024 * 1024;
+/// 字幕是一次性受控读取，不提供 Range，也不允许无限大正文。
+const MAX_SUBTITLE_BYTES: u64 = 8 * 1024 * 1024;
 /// Do not follow an unbounded redirect chain while proxying a stream.
 const MAX_STREAM_REDIRECTS: usize = 3;
 
@@ -184,6 +190,7 @@ pub(crate) enum ResourceUriError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResourceRequest {
     Session(Uuid),
+    Subtitle(Uuid, Uuid),
     ComicPage(Uuid),
     /// 远端流代理（V2-B 实战批次）：grant UUID + 上游目标（空 = 初始 manifest）。
     Stream(Uuid, String),
@@ -251,6 +258,44 @@ fn parse_native_resource(uri: &Uri, authority: &str) -> Result<Uuid, ResourceUri
         return Err(ResourceUriError::InvalidAuthority);
     }
     parse_canonical_resource_id(uri)
+}
+
+fn parse_subtitle_resource_uri(uri: &Uri) -> Result<(Uuid, Uuid), ResourceUriError> {
+    if uri.query().is_some() {
+        return Err(ResourceUriError::InvalidPath);
+    }
+    let mut segments = uri.path().split('/');
+    if segments.next() != Some("") {
+        return Err(ResourceUriError::InvalidPath);
+    }
+    let session = segments.next().ok_or(ResourceUriError::InvalidPath)?;
+    if segments.next() != Some("subtitle") {
+        return Err(ResourceUriError::InvalidPath);
+    }
+    let track = segments.next().ok_or(ResourceUriError::InvalidPath)?;
+    if segments.next().is_some() {
+        return Err(ResourceUriError::InvalidPath);
+    }
+    Ok((
+        parse_canonical_uuid_segment(session)?,
+        parse_canonical_uuid_segment(track)?,
+    ))
+}
+
+fn parse_canonical_uuid_segment(segment: &str) -> Result<Uuid, ResourceUriError> {
+    if segment.is_empty()
+        || segment.contains('\\')
+        || segment.contains('%')
+        || segment == "."
+        || segment == ".."
+    {
+        return Err(ResourceUriError::InvalidPath);
+    }
+    let id = Uuid::parse_str(segment).map_err(|_| ResourceUriError::InvalidSessionId)?;
+    if id.to_string() != segment {
+        return Err(ResourceUriError::InvalidSessionId);
+    }
+    Ok(id)
 }
 
 fn parse_canonical_resource_id(uri: &Uri) -> Result<Uuid, ResourceUriError> {
@@ -322,6 +367,10 @@ pub(crate) fn mime_for_extension(extension: &str) -> &'static str {
         "cbz" => "application/vnd.comicbook+zip",
         "md" | "markdown" => "text/markdown; charset=utf-8",
         "html" | "htm" => "text/html; charset=utf-8",
+        "vtt" | "webvtt" => "text/vtt; charset=utf-8",
+        "srt" | "sbv" | "ass" | "ssa" | "ttml" | "dfxp" | "sub" | "lrc" => {
+            "text/plain; charset=utf-8"
+        }
         "jpg" | "jpeg" => "image/jpeg",
         "png" => "image/png",
         "webp" => "image/webp",
@@ -688,6 +737,35 @@ pub(crate) fn register_resource_protocol<R: tauri::Runtime>(
                                 }
                             }
                         }
+                        ResourceRequest::Subtitle(session_id, track_id) => {
+                            if range.is_some() {
+                                return Ok::<_, AppError>(error_response(
+                                    416,
+                                    false,
+                                    None,
+                                    origin.as_deref(),
+                                ));
+                            }
+                            let snapshot = state
+                                .session_registry
+                                .lookup_for_owner(&session_id.to_string(), &owner_webview_label)?;
+                            tauri::async_runtime::block_on(authorize_session_binding(
+                                state.inner(),
+                                &snapshot,
+                            ))?;
+                            let verified = state.session_registry.revalidate_subtitle(
+                                &session_id.to_string(),
+                                &track_id.to_string(),
+                                &owner_webview_label,
+                            )?;
+                            Ok::<_, AppError>(response_for_subtitle_file(
+                                &method,
+                                verified.file,
+                                &verified.track.canonical_file,
+                                None,
+                                origin.as_deref(),
+                            ))
+                        }
                         ResourceRequest::Stream(grant_id, target) => {
                             if method == Method::HEAD {
                                 return Ok::<_, AppError>(error_response(
@@ -789,7 +867,14 @@ pub(crate) fn register_resource_protocol<R: tauri::Runtime>(
 fn parse_request_resource(uri: &Uri) -> Result<ResourceRequest, ResourceUriError> {
     if uri.scheme_str() == Some("haven-resource") {
         return match uri.authority().map(|authority| authority.as_str()) {
-            Some("session") => parse_canonical_resource_id(uri).map(ResourceRequest::Session),
+            Some("session") => {
+                if uri.path().contains("/subtitle/") {
+                    parse_subtitle_resource_uri(uri)
+                        .map(|(session, track)| ResourceRequest::Subtitle(session, track))
+                } else {
+                    parse_canonical_resource_id(uri).map(ResourceRequest::Session)
+                }
+            }
             Some("comic-page") => parse_canonical_resource_id(uri).map(ResourceRequest::ComicPage),
             Some("artwork") => {
                 parse_artwork_id(uri).map(|(id, variant)| ResourceRequest::Artwork { id, variant })
@@ -805,7 +890,12 @@ fn parse_request_resource(uri: &Uri) -> Result<ResourceRequest, ResourceUriError
     }
     match uri.authority().map(|authority| authority.as_str()) {
         Some("haven-resource.session") => {
-            parse_canonical_resource_id(uri).map(ResourceRequest::Session)
+            if uri.path().contains("/subtitle/") {
+                parse_subtitle_resource_uri(uri)
+                    .map(|(session, track)| ResourceRequest::Subtitle(session, track))
+            } else {
+                parse_canonical_resource_id(uri).map(ResourceRequest::Session)
+            }
         }
         Some("haven-resource.comic-page") => {
             parse_canonical_resource_id(uri).map(ResourceRequest::ComicPage)
@@ -987,6 +1077,46 @@ fn response_for_open_file_with_origin(
     response(status, &headers, body)
 }
 
+fn response_for_subtitle_file(
+    method: &Method,
+    mut file: File,
+    path: &Path,
+    range_header: Option<&str>,
+    origin: Option<&str>,
+) -> Response<Vec<u8>> {
+    if method != Method::GET && method != Method::HEAD {
+        return method_not_allowed_response(origin);
+    }
+    if range_header.is_some() {
+        return error_response(416, false, None, origin);
+    }
+    let total = match file.metadata().map(|metadata| metadata.len()) {
+        Ok(total) => total,
+        Err(_) => return error_response(500, false, None, origin),
+    };
+    if total > MAX_SUBTITLE_BYTES {
+        return error_response(413, false, None, origin);
+    }
+    let body = if *method == Method::HEAD {
+        Vec::new()
+    } else {
+        let mut body = Vec::with_capacity(total as usize);
+        if file.read_to_end(&mut body).is_err() || body.len() as u64 != total {
+            return error_response(500, false, None, origin);
+        }
+        body
+    };
+    let mut headers = vec![
+        ("Content-Length", total.to_string()),
+        ("Content-Type", mime_for_path(path).to_owned()),
+        ("X-Content-Type-Options", "nosniff".to_owned()),
+        ("Cache-Control", "no-store".to_owned()),
+        ("Vary", "Origin".to_owned()),
+    ];
+    push_allowed_origin(&mut headers, origin);
+    response(200, &headers, body)
+}
+
 /// Build a bounded response for an application-provided remote body. URLs and
 /// provider headers are deliberately discarded; only the validated MIME,
 /// length and (for arXiv) content range cross the resource protocol.
@@ -1124,22 +1254,57 @@ fn artwork_response(
 
 // ---------- 远端流代理（V2-B 实战批次；契约 §36.4） ----------
 
-fn stream_http_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(30))
-            // Redirects are followed explicitly in `fetch_stream_response`
-            // after checking the grant's host allowlist at every hop.
-            .redirect(reqwest::redirect::Policy::none())
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .pool_max_idle_per_host(8)
-            .tcp_keepalive(std::time::Duration::from_secs(30))
-            .user_agent(concat!("Haven/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .expect("流代理 HTTP 客户端构建参数合法")
-    })
+/// Resolver choice is production-only by default.  The test fixture variant
+/// is a transport injection: it keeps the production URL policy intact while
+/// allowing a local listener to exercise response/range handling without
+/// making loopback an accepted media destination in release code.
+#[derive(Debug, Clone, Copy)]
+enum StreamResolution {
+    System,
+    #[cfg(test)]
+    Fixture(SocketAddr),
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedStreamTarget {
+    url: String,
+    host: String,
+    dns_name: Option<String>,
+    addresses: Vec<SocketAddr>,
+}
+
+fn stream_http_client(
+    dns_name: Option<&str>,
+    addresses: &[SocketAddr],
+) -> Result<reqwest::Client, AppError> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        // Redirects are followed explicitly in `fetch_stream_response` after
+        // checking the grant's host allowlist and DNS policy at every hop.
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(8)
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        // Do not let ambient HTTP(S)_PROXY settings replace the address set
+        // that was validated and pinned for this request. An explicit proxy
+        // integration needs its own destination policy instead of inheriting
+        // process environment state.
+        .no_proxy();
+    if let Some(dns_name) = dns_name {
+        builder = builder.resolve_to_addrs(dns_name, addresses);
+    }
+    builder
+        .user_agent(concat!("Haven/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|_| {
+            AppError::new(
+                "RESOURCE_UNAVAILABLE",
+                ErrorKind::Network,
+                "流源客户端初始化失败",
+                true,
+            )
+        })
 }
 
 /// 解码测试中的百分号编码（生产 manifest 只使用不编码的 UUID token）。
@@ -1183,21 +1348,13 @@ fn percent_encode(value: &str) -> String {
 /// 相对地址 → 绝对地址。只允许 HTTP(S)，并使用 URL 解析器处理
 /// `../`、查询和 IPv6 authority，避免手工拼接产生跨主机或路径歧义。
 fn absolutize(base_url: &str, target: &str) -> Option<String> {
-    let base = reqwest::Url::parse(base_url).ok()?;
-    if !matches!(base.scheme(), "http" | "https")
-        || !base.username().is_empty()
-        || base.password().is_some()
-    {
-        return None;
-    }
+    let base = parse_http_url(base_url, HttpUrlPolicy::MediaResource)
+        .ok()?
+        .into_url();
     let joined = base.join(target).ok()?;
-    if !matches!(joined.scheme(), "http" | "https")
-        || !joined.username().is_empty()
-        || joined.password().is_some()
-    {
-        return None;
-    }
-    Some(joined.to_string())
+    parse_http_url(joined.as_str(), HttpUrlPolicy::MediaResource)
+        .ok()
+        .map(|safe| safe.as_str().to_owned())
 }
 
 /// 改写 HLS manifest：所有片段/子清单 URI 与 URI="..." 属性都收敛到本会话代理。
@@ -1279,6 +1436,25 @@ async fn serve_stream(
     range_header: Option<&str>,
     origin: Option<&str>,
 ) -> Result<Response<Vec<u8>>, AppError> {
+    serve_stream_with_resolution(
+        inner,
+        grant_id,
+        target_encoded,
+        range_header,
+        origin,
+        StreamResolution::System,
+    )
+    .await
+}
+
+async fn serve_stream_with_resolution(
+    inner: &Arc<StreamGrantInner>,
+    grant_id: &str,
+    target_encoded: &str,
+    range_header: Option<&str>,
+    origin: Option<&str>,
+    resolution: StreamResolution,
+) -> Result<Response<Vec<u8>>, AppError> {
     let upstream = if target_encoded.is_empty() {
         inner.facts.upstream_url.clone()
     } else {
@@ -1292,7 +1468,8 @@ async fn serve_stream(
     if range_header.is_some() && parse_remote_byte_range(range_header).is_err() {
         return Err(invalid_remote_range());
     }
-    let (response, upstream) = fetch_stream_response(inner, upstream, range_header).await?;
+    let (response, upstream) =
+        fetch_stream_response(inner, upstream, range_header, resolution).await?;
 
     let content_type = response
         .headers()
@@ -1562,16 +1739,16 @@ async fn fetch_stream_response(
     inner: &Arc<StreamGrantInner>,
     mut upstream: String,
     range_header: Option<&str>,
+    resolution: StreamResolution,
 ) -> Result<(reqwest::Response, String), AppError> {
     for redirect_count in 0..=MAX_STREAM_REDIRECTS {
-        let Some(host) = crate::stream_registry::host_of(&upstream) else {
-            return Err(policy_denied("流目标必须是 http/https 地址"));
-        };
-        if !inner.host_allowed(&host) {
+        let target = resolve_stream_target(&upstream, resolution).await?;
+        if !inner.host_allowed(&target.host) {
             return Err(policy_denied("流目标主机未被授权"));
         }
 
-        let mut request = stream_http_client().get(&upstream);
+        let client = stream_http_client(target.dns_name.as_deref(), &target.addresses)?;
+        let mut request = client.get(&target.url);
         if let Some(range) = range_header {
             request = request.header("range", range);
         }
@@ -1604,15 +1781,9 @@ async fn fetch_stream_response(
                     true,
                 ));
             };
-            let Some(next) = absolutize(&upstream, location) else {
+            let Some(next) = absolutize(&target.url, location) else {
                 return Err(policy_denied("流源跳转地址不受支持"));
             };
-            let Some(next_host) = crate::stream_registry::host_of(&next) else {
-                return Err(policy_denied("流源跳转地址不受支持"));
-            };
-            if !inner.host_allowed(&next_host) {
-                return Err(policy_denied("流源跳转主机未被授权"));
-            }
             upstream = next;
             continue;
         }
@@ -1632,6 +1803,117 @@ async fn fetch_stream_response(
         "流源跳转次数过多",
         true,
     ))
+}
+
+/// Validate one target, resolve its host, reject unsafe addresses, and return
+/// the exact address set that will be pinned into this request's reqwest
+/// client. Redirects call this function again, so every hop gets a fresh DNS
+/// decision instead of inheriting the previous response's resolution.
+async fn resolve_stream_target(
+    raw_url: &str,
+    resolution: StreamResolution,
+) -> Result<ResolvedStreamTarget, AppError> {
+    let (url, host, dns_name, port) = match resolution {
+        StreamResolution::System => {
+            let safe = parse_http_url(raw_url, HttpUrlPolicy::MediaResource)
+                .map_err(|_| policy_denied("流目标地址不受安全策略允许"))?;
+            let url = safe.as_str().to_owned();
+            let host = safe.host().to_owned();
+            let dns_name = safe
+                .host()
+                .parse::<IpAddr>()
+                .is_err()
+                .then(|| safe.as_url().host_str().unwrap_or(safe.host()).to_owned());
+            let port = safe
+                .as_url()
+                .port_or_known_default()
+                .ok_or_else(|| policy_denied("流目标端口不受安全策略允许"))?;
+            (url, host, dns_name, port)
+        }
+        #[cfg(test)]
+        StreamResolution::Fixture(_) => {
+            if raw_url
+                .chars()
+                .any(|ch| ch.is_control() || ch.is_whitespace())
+            {
+                return Err(policy_denied("测试流目标地址不受安全策略允许"));
+            }
+            let parsed = raw_url
+                .parse::<reqwest::Url>()
+                .map_err(|_| policy_denied("测试流目标地址不受安全策略允许"))?;
+            if !matches!(parsed.scheme(), "http" | "https")
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.fragment().is_some()
+            {
+                return Err(policy_denied("测试流目标地址不受安全策略允许"));
+            }
+            let host = validate_host(
+                parsed
+                    .host_str()
+                    .ok_or_else(|| policy_denied("测试流目标地址不受安全策略允许"))?,
+            )
+            .map_err(|_| policy_denied("测试流目标地址不受安全策略允许"))?;
+            let dns_name = parsed.host_str().unwrap_or(&host).to_owned();
+            let port = parsed
+                .port_or_known_default()
+                .ok_or_else(|| policy_denied("测试流目标端口不受安全策略允许"))?;
+            (parsed.to_string(), host, Some(dns_name), port)
+        }
+    };
+    let addresses = match resolution {
+        StreamResolution::System => match host.parse::<IpAddr>() {
+            Ok(ip) => vec![SocketAddr::new(ip, port)],
+            Err(_) => {
+                resolve_public_addresses(dns_name.as_deref().unwrap_or(host.as_str()), port).await?
+            }
+        },
+        #[cfg(test)]
+        StreamResolution::Fixture(address) => vec![address],
+    };
+    Ok(ResolvedStreamTarget {
+        url,
+        host,
+        dns_name,
+        addresses,
+    })
+}
+
+/// Resolve synchronously in a blocking worker, then fail closed if DNS
+/// returns even one non-public address. The resulting list is pinned with
+/// `resolve_to_addrs` before the HTTP request is sent.
+async fn resolve_public_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, AppError> {
+    let host = host.to_owned();
+    let addresses = tauri::async_runtime::spawn_blocking(move || {
+        (host.as_str(), port)
+            .to_socket_addrs()
+            .map(|items| items.collect::<Vec<_>>())
+    })
+    .await
+    .map_err(|_| {
+        AppError::new(
+            "RESOURCE_UNAVAILABLE",
+            ErrorKind::Network,
+            "流源地址解析失败",
+            true,
+        )
+    })?
+    .map_err(|_| {
+        AppError::new(
+            "RESOURCE_UNAVAILABLE",
+            ErrorKind::Network,
+            "流源地址解析失败",
+            true,
+        )
+    })?;
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|address| !is_publicly_routable(address.ip()))
+    {
+        return Err(policy_denied("流源解析到不受支持的地址"));
+    }
+    Ok(addresses)
 }
 
 fn map_stream_fetch(err: reqwest::Error) -> AppError {
@@ -1855,6 +2137,46 @@ mod tests {
             assert!(
                 parse_comic_page_uri(&invalid).is_err(),
                 "accepted {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn subtitle_uri_requires_two_canonical_uuids_and_no_query() {
+        let session_id = Uuid::new_v4();
+        let track_id = Uuid::new_v4();
+        let native = format!("haven-resource://session/{session_id}/subtitle/{track_id}")
+            .parse::<Uri>()
+            .unwrap();
+        assert_eq!(
+            parse_request_resource(&native).unwrap(),
+            ResourceRequest::Subtitle(session_id, track_id)
+        );
+        let windows = format!("http://haven-resource.session/{session_id}/subtitle/{track_id}")
+            .parse::<Uri>()
+            .unwrap();
+        assert_eq!(
+            parse_request_resource(&windows).unwrap(),
+            ResourceRequest::Subtitle(session_id, track_id)
+        );
+
+        for (case, invalid) in [
+            format!("haven-resource://session/{session_id}/subtitle/{track_id}?x=1"),
+            format!(
+                "haven-resource://session/{session_id}/subtitle/{}",
+                track_id.to_string().to_uppercase()
+            ),
+            format!("haven-resource://session/{session_id}/subtitle/{track_id}/extra"),
+            format!("haven-resource://session/{session_id}/subtitle/%2F{track_id}"),
+            format!("haven-resource://other/{session_id}/subtitle/{track_id}"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let uri = invalid.parse::<Uri>().unwrap();
+            assert!(
+                parse_request_resource(&uri).is_err(),
+                "accepted invalid subtitle URI case {case}"
             );
         }
     }
@@ -2097,7 +2419,11 @@ mod tests {
         assert!(validate_direct_stream_body_len(range, 11).is_err());
     }
 
-    fn spawn_stream_fixture(status: &str, headers: &str, body: &[u8]) -> String {
+    fn spawn_stream_fixture(
+        status: &str,
+        headers: &str,
+        body: &[u8],
+    ) -> (String, std::net::SocketAddr) {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let response = format!(
@@ -2113,7 +2439,10 @@ mod tests {
                 let _ = stream.write_all(&body);
             }
         });
-        format!("http://{address}/video.mp4")
+        (
+            format!("http://stream.example.test:{}/video.mp4", address.port()),
+            address,
+        )
     }
 
     fn direct_stream_facts(url: &str) -> crate::stream_registry::StreamGrantFacts {
@@ -2130,41 +2459,69 @@ mod tests {
 
     #[tokio::test]
     async fn direct_stream_rejects_full_response_to_a_range_request() {
-        let url = spawn_stream_fixture("200 OK", "Content-Type: video/mp4\r\n", b"abc");
+        let (url, address) = spawn_stream_fixture("200 OK", "Content-Type: video/mp4\r\n", b"abc");
         let registry = crate::stream_registry::StreamRegistry::new();
-        let grant = registry.register(direct_stream_facts(&url), &url, "main");
+        let grant = registry
+            .register_fixture(direct_stream_facts(&url), &url, "main")
+            .unwrap();
         let inner = registry.lookup(&grant.to_string(), "main").unwrap();
-        let error = serve_stream(&inner, &grant.to_string(), "", Some("bytes=0-2"), None)
-            .await
-            .unwrap_err();
+        let error = serve_stream_with_resolution(
+            &inner,
+            &grant.to_string(),
+            "",
+            Some("bytes=0-2"),
+            None,
+            StreamResolution::Fixture(address),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.code().as_str(), "RESOURCE_UNAVAILABLE");
     }
 
     #[tokio::test]
     async fn direct_stream_rejects_html_even_when_status_is_success() {
-        let url = spawn_stream_fixture("200 OK", "Content-Type: text/html\r\n", b"<html>");
+        let (url, address) =
+            spawn_stream_fixture("200 OK", "Content-Type: text/html\r\n", b"<html>");
         let registry = crate::stream_registry::StreamRegistry::new();
-        let grant = registry.register(direct_stream_facts(&url), &url, "main");
+        let grant = registry
+            .register_fixture(direct_stream_facts(&url), &url, "main")
+            .unwrap();
         let inner = registry.lookup(&grant.to_string(), "main").unwrap();
-        let error = serve_stream(&inner, &grant.to_string(), "", None, None)
-            .await
-            .unwrap_err();
+        let error = serve_stream_with_resolution(
+            &inner,
+            &grant.to_string(),
+            "",
+            None,
+            None,
+            StreamResolution::Fixture(address),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.code().as_str(), "RESOURCE_UNAVAILABLE");
     }
 
     #[tokio::test]
     async fn direct_stream_accepts_matching_partial_response() {
-        let url = spawn_stream_fixture(
+        let (url, address) = spawn_stream_fixture(
             "206 Partial Content",
             "Content-Type: video/mp4\r\nContent-Range: bytes 0-2/3\r\n",
             b"abc",
         );
         let registry = crate::stream_registry::StreamRegistry::new();
-        let grant = registry.register(direct_stream_facts(&url), &url, "main");
-        let inner = registry.lookup(&grant.to_string(), "main").unwrap();
-        let response = serve_stream(&inner, &grant.to_string(), "", Some("bytes=0-2"), None)
-            .await
+        let grant = registry
+            .register_fixture(direct_stream_facts(&url), &url, "main")
             .unwrap();
+        let inner = registry.lookup(&grant.to_string(), "main").unwrap();
+        let response = serve_stream_with_resolution(
+            &inner,
+            &grant.to_string(),
+            "",
+            Some("bytes=0-2"),
+            None,
+            StreamResolution::Fixture(address),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status().as_u16(), 206);
         assert_eq!(response.body(), b"abc");
         assert_eq!(
@@ -2247,6 +2604,33 @@ mod tests {
         assert_eq!(response.status().as_u16(), 413);
         assert!(response.body().is_empty());
         assert_eq!(response.headers().get("accept-ranges").unwrap(), "bytes");
+    }
+
+    #[test]
+    fn subtitle_response_is_bounded_and_does_not_offer_ranges() {
+        let (_dir, path) = file_with(b"1\n00:00:00,000 --> 00:00:01,000\nhello\n", "srt");
+        let response =
+            response_for_subtitle_file(&Method::GET, File::open(&path).unwrap(), &path, None, None);
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(
+            response.body(),
+            b"1\n00:00:00,000 --> 00:00:01,000\nhello\n"
+        );
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert!(response.headers().get("accept-ranges").is_none());
+
+        let response = response_for_subtitle_file(
+            &Method::GET,
+            File::open(&path).unwrap(),
+            &path,
+            Some("bytes=0-1"),
+            None,
+        );
+        assert_eq!(response.status().as_u16(), 416);
+        assert!(response.body().is_empty());
     }
 
     #[test]
@@ -2385,6 +2769,7 @@ mod tests {
             storage_location_id: Some(storage_id),
             canonical_root: Some(canonical_root.clone()),
             canonical_file: Some(canonical_file),
+            subtitle_tracks: Vec::new(),
             source: PreparedSessionSource::Local,
             mime_type: Some("video/x-matroska".into()),
             media_type: MediaType::Movie,
