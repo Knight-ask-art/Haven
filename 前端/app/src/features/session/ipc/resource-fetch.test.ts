@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import { fetchSessionResource } from "./resource-fetch"
 
 const CONTENT_URI = "haven-resource://session/0196f0d2-0000-7000-8000-000000000001"
+const SUBTITLE_URI = "haven-resource://session/0196f0d2-0000-7000-8000-000000000001/subtitle/0196f0d2-0000-7000-8000-000000000002"
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -31,6 +32,34 @@ describe("fetchSessionResource", () => {
     if (result.kind === "data") {
       expect(Array.from(new Uint8Array(result.bytes))).toEqual([1, 2, 3])
     }
+  })
+
+  it("accepts a canonical subtitle URI and the WebVTT MIME", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(
+      new Uint8Array([87, 69, 66, 86, 84, 84]),
+      { status: 200, headers: { "Content-Type": "text/vtt; charset=utf-8" } },
+    ))
+    vi.stubGlobal("fetch", fetchMock)
+
+    const result = await fetchSessionResource(SUBTITLE_URI)
+
+    expect(result).toMatchObject({ kind: "data", contentType: "text/vtt" })
+    expect(fetchMock).toHaveBeenCalledWith(SUBTITLE_URI, {
+      headers: undefined,
+      signal: undefined,
+    })
+  })
+
+  it("rejects malformed subtitle paths before fetch", async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal("fetch", fetchMock)
+
+    await expect(fetchSessionResource(SUBTITLE_URI + "?x=1")).rejects.toMatchObject({
+      code: "INVALID_ARGUMENT",
+    })
+    await expect(fetchSessionResource("haven-resource://session/0196f0d2-0000-7000-8000-000000000001/subtitle/not-a-uuid"))
+      .rejects.toMatchObject({ code: "INVALID_ARGUMENT" })
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 
   it("sends a validated Range and marks a 206 response partial", async () => {
@@ -74,6 +103,23 @@ describe("fetchSessionResource", () => {
 
     expect(fetchMock).toHaveBeenCalledWith(
       "http://haven-resource.session/0196f0d2-0000-7000-8000-000000000001",
+      { headers: undefined, signal: undefined },
+    )
+  })
+
+  it("uses the WebView2 compatibility URL for subtitle resources too", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(
+      new Uint8Array([1]),
+      { status: 200, headers: { "Content-Type": "text/vtt" } },
+    ))
+    vi.stubGlobal("window", { __TAURI_INTERNALS__: {} })
+    vi.stubGlobal("navigator", { userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" })
+    vi.stubGlobal("fetch", fetchMock)
+
+    await fetchSessionResource(SUBTITLE_URI)
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://haven-resource.session/0196f0d2-0000-7000-8000-000000000001/subtitle/0196f0d2-0000-7000-8000-000000000002",
       { headers: undefined, signal: undefined },
     )
   })

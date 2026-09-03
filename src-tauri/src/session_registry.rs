@@ -13,9 +13,11 @@ use std::time::{Duration, Instant};
 
 use haven_application::services::{
     PreparedComicPage, PreparedComicPageAvailability, PreparedSession, PreparedSessionSource,
+    PreparedSubtitleTrack,
 };
 use haven_application::wire::{
     ComicPageAvailabilityDto, ComicPageDto, ComicPageManifestDto, SessionEngineDto,
+    SubtitleTrackDto,
 };
 use haven_common::{AppError, ErrorKind};
 
@@ -60,6 +62,14 @@ struct ComicGrant {
 #[derive(Debug)]
 pub(crate) struct VerifiedSessionFile {
     pub(crate) prepared: PreparedSession,
+    pub(crate) file: File,
+}
+
+/// A subtitle handle whose session, owner, root containment and track identity
+/// were checked while the registry read lock was held.
+#[derive(Debug)]
+pub(crate) struct VerifiedSubtitleFile {
+    pub(crate) track: PreparedSubtitleTrack,
     pub(crate) file: File,
 }
 
@@ -145,6 +155,45 @@ impl SessionRegistry {
 
     pub(crate) fn uri(id: &str) -> String {
         format!("haven-resource://session/{id}")
+    }
+
+    pub(crate) fn subtitle_uri(session_id: &str, track_id: &str) -> String {
+        format!("haven-resource://session/{session_id}/subtitle/{track_id}")
+    }
+
+    pub(crate) fn subtitle_tracks(
+        &self,
+        id: &str,
+        owner_webview_label: &str,
+    ) -> Result<Option<Vec<SubtitleTrackDto>>, AppError> {
+        let state = self.read_state()?;
+        let record = state
+            .sessions
+            .get(id)
+            .filter(|record| {
+                record.owner_webview_label == owner_webview_label && !record.is_expired()
+            })
+            .ok_or_else(resource_not_found)?;
+        if record.prepared.engine != SessionEngineDto::Playback
+            || record.prepared.subtitle_tracks.is_empty()
+        {
+            return Ok(None);
+        }
+        let mut tracks = Vec::with_capacity(record.prepared.subtitle_tracks.len());
+        for track in &record.prepared.subtitle_tracks {
+            let track_uuid = uuid::Uuid::parse_str(&track.track_id)
+                .ok()
+                .filter(|id| id.to_string() == track.track_id)
+                .ok_or_else(|| policy_denied("字幕轨道身份校验失败"))?;
+            tracks.push(SubtitleTrackDto {
+                track_id: track_uuid.to_string(),
+                label: track.label.clone(),
+                language: track.language.clone(),
+                format: track.format,
+                content_uri: Self::subtitle_uri(id, &track_uuid.to_string()),
+            });
+        }
+        Ok(Some(tracks))
     }
 
     pub(crate) fn comic_page_uri(grant_id: &str) -> String {
@@ -406,6 +455,53 @@ impl SessionRegistry {
         }))
     }
 
+    /// Revalidate one local subtitle track. Database/resource binding is
+    /// checked by the protocol before this registry operation; this method
+    /// owns the owner/session/track/path capability boundary.
+    pub(crate) fn revalidate_subtitle(
+        &self,
+        session_id: &str,
+        track_id: &str,
+        owner_webview_label: &str,
+    ) -> Result<VerifiedSubtitleFile, AppError> {
+        let state = self.read_state()?;
+        let record = state
+            .sessions
+            .get(session_id)
+            .filter(|record| {
+                record.owner_webview_label == owner_webview_label && !record.is_expired()
+            })
+            .ok_or_else(resource_not_found)?;
+        if record.prepared.engine != SessionEngineDto::Playback {
+            return Err(format_unsupported());
+        }
+        let track = record
+            .prepared
+            .subtitle_tracks
+            .iter()
+            .find(|track| track.track_id == track_id)
+            .cloned()
+            .ok_or_else(resource_not_found)?;
+        let Some(prepared_root) = record.prepared.canonical_root.as_deref() else {
+            return Err(resource_not_found());
+        };
+        let root = std::fs::canonicalize(prepared_root).map_err(|_| resource_unavailable())?;
+        let file =
+            std::fs::canonicalize(&track.canonical_file).map_err(|_| resource_unavailable())?;
+        if root != prepared_root
+            || file != track.canonical_file
+            || file.strip_prefix(&root).is_err()
+            || !file.is_file()
+        {
+            return Err(policy_denied("字幕资源路径校验失败"));
+        }
+        let handle = File::open(&file).map_err(|_| resource_unavailable())?;
+        Ok(VerifiedSubtitleFile {
+            track,
+            file: handle,
+        })
+    }
+
     fn read_state(&self) -> Result<RwLockReadGuard<'_, RegistryState>, AppError> {
         self.state.read().map_err(|_| registry_unavailable())
     }
@@ -450,6 +546,7 @@ fn comic_session_snapshot(prepared: &PreparedSession) -> PreparedSession {
         storage_location_id: prepared.storage_location_id,
         canonical_root: prepared.canonical_root.clone(),
         canonical_file: prepared.canonical_file.clone(),
+        subtitle_tracks: prepared.subtitle_tracks.clone(),
         mime_type: prepared.mime_type.clone(),
         media_type: prepared.media_type,
         resource_type: prepared.resource_type,
@@ -537,7 +634,9 @@ mod tests {
     use super::*;
     use haven_application::services::{
         PreparedComicPage, PreparedComicPageAvailability, PreparedComicPageSource,
+        PreparedSubtitleTrack,
     };
+    use haven_application::wire::SubtitleFormatDto;
     use haven_domain::enums::{MediaType, ResourceType};
     use haven_domain::ids::{ResourceId, StorageLocationId};
     use std::io::Read;
@@ -553,6 +652,7 @@ mod tests {
             storage_location_id: Some(StorageLocationId::new()),
             canonical_root: Some(root),
             canonical_file: Some(file),
+            subtitle_tracks: Vec::new(),
             source: PreparedSessionSource::Local,
             mime_type: None,
             media_type: MediaType::Movie,
@@ -657,6 +757,45 @@ mod tests {
         let mut content = Vec::new();
         verified.file.read_to_end(&mut content).unwrap();
         assert_eq!(content, b"video");
+    }
+
+    #[test]
+    fn subtitle_revalidation_is_owner_bound_and_uses_the_registered_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("video.mkv");
+        let subtitle = dir.path().join("video.zh.srt");
+        std::fs::write(&video, b"video").unwrap();
+        std::fs::write(&subtitle, b"1\n00:00:00,000 --> 00:00:01,000\nhello\n").unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let video = std::fs::canonicalize(video).unwrap();
+        let subtitle = std::fs::canonicalize(subtitle).unwrap();
+        let track_id = uuid::Uuid::new_v4().to_string();
+        let mut session = prepared(root.clone(), video);
+        session.subtitle_tracks.push(PreparedSubtitleTrack {
+            track_id: track_id.clone(),
+            label: "中文".into(),
+            language: Some("zh-CN".into()),
+            format: SubtitleFormatDto::Srt,
+            canonical_file: subtitle,
+        });
+        let registry = SessionRegistry::new();
+        let session_id = registry
+            .register(session, "main".into(), "main".into())
+            .unwrap();
+
+        let mut verified = registry
+            .revalidate_subtitle(&session_id, &track_id, "main")
+            .unwrap();
+        let mut body = String::new();
+        verified.file.read_to_string(&mut body).unwrap();
+        assert!(body.contains("hello"));
+        assert!(registry
+            .revalidate_subtitle(&session_id, &track_id, "other")
+            .is_err());
+        assert!(registry
+            .revalidate_subtitle(&session_id, &uuid::Uuid::new_v4().to_string(), "main")
+            .is_err());
+        assert!(root.is_dir());
     }
 
     #[test]

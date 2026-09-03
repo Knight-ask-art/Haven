@@ -21,6 +21,9 @@ import { playbackMediaErrorForActiveSource, type PlaybackMediaErrorView } from "
 import { usePlaybackSettings } from "../lib/usePlaybackSettings"
 import { selectNextEpisodeId } from "../lib/select-next-episode"
 import { isVideoScreenshotShortcut, saveVideoScreenshot } from "../lib/video-screenshot"
+import { fetchSessionResource } from "@/features/session/ipc/resource-fetch"
+import { SubtitleTrackRuntime, type SubtitleTrackAsset } from "../lib/subtitle-track-runtime"
+import { externalSubtitleOption, hlsSubtitleOptions as mapHlsSubtitleOptions, type PlayerSubtitleOption } from "../lib/subtitle-options"
 import { defaultCoverPath } from "@/lib/default-cover"
 import { useNotice } from "@/app/notice-center/notice-context"
 
@@ -195,18 +198,39 @@ export function PlayerPage() {
   const [sessionMarkers, setSessionMarkers] = useState<MarkerDto[]>([])
   const [isBuffering, setIsBuffering] = useState(false)
   const [bufferedRanges, setBufferedRanges] = useState<Array<[number, number]>>([])
+  const [hlsSubtitleOptionList, setHlsSubtitleOptionList] = useState<PlayerSubtitleOption[]>([])
+  const [selectedSubtitleId, setSelectedSubtitleId] = useState<string | null>(null)
+  const [subtitleAsset, setSubtitleAsset] = useState<SubtitleTrackAsset | null>(null)
+  const [subtitleStatus, setSubtitleStatus] = useState<"idle" | "loading" | "ready" | "failed">("idle")
+  const [subtitleError, setSubtitleError] = useState<string | null>(null)
   const lastAudibleVolumeRef = useRef(0.8)
   const playbackRateInitializedRef = useRef(false)
   const bufferingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const watchdogRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const screenshotBusyRef = useRef(false)
   const screenshotAbortRef = useRef<AbortController | null>(null)
+  const subtitleRuntimeRef = useRef<SubtitleTrackRuntime | null>(null)
+  const selectedSubtitleIdRef = useRef<string | null>(null)
+  const hlsRef = useRef<import("hls.js").default | null>(null)
   const lastTimeRef = useRef<number>(0)
   const lastTimeUpdateRef = useRef<number>(Date.now())
   // 持久化播放偏好（localStorage，仅 UI 偏好，符合 AGENTS 约束）
   const PLAYBACK_PREFS_KEY = "haven:ui:playback-prefs"
 
   const hideTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  if (subtitleRuntimeRef.current === null) subtitleRuntimeRef.current = new SubtitleTrackRuntime()
+
+  const sessionSubtitleTracks = state.status === "ready" && sessionView.status === "ready"
+    ? (state.session.subtitleTracks ?? [])
+    : []
+  const activeSessionId = state.status === "ready" && sessionView.status === "ready"
+    ? state.session.sessionId
+    : null
+  const subtitleOptions: PlayerSubtitleOption[] = [
+    ...sessionSubtitleTracks.map(externalSubtitleOption),
+    ...hlsSubtitleOptionList,
+  ]
 
   // 持久化偏好加载
   useEffect(() => {
@@ -373,8 +397,32 @@ export function PlayerPage() {
     screenshotAbortRef.current?.abort()
   }, [])
 
+  // 字幕资源属于当前播放 Session：切集、重开会话或离开播放器时，立即撤销旧请求和 Object URL。
+  useEffect(() => {
+    selectedSubtitleIdRef.current = null
+    subtitleRuntimeRef.current?.clear()
+    setSelectedSubtitleId(null)
+    setSubtitleAsset(null)
+    setSubtitleStatus("idle")
+    setSubtitleError(null)
+    setHlsSubtitleOptionList([])
+    try {
+      if (hlsRef.current) hlsRef.current.subtitleTrack = -1
+    } catch { /* ignore teardown races */ }
+
+    return () => {
+      selectedSubtitleIdRef.current = null
+      subtitleRuntimeRef.current?.clear()
+      try {
+        if (hlsRef.current) hlsRef.current.subtitleTrack = -1
+      } catch { /* ignore teardown races */ }
+    }
+  }, [activeSessionId, mediaItemId, sessionContentUri])
+
   // HLS 远端流经 hls.js；普通 MP4/WebM 远端流和本地资源走原生 src。
   useEffect(() => {
+    hlsRef.current = null
+    setHlsSubtitleOptionList([])
     const video = videoRef.current
     if (!video || !sessionContentUri || streamKind !== "hls") {
       if (video && sessionContentUri && streamKind === "direct") {
@@ -424,6 +472,35 @@ export function PlayerPage() {
               },
             },
           })
+          hlsRef.current = hls
+          const onSubtitleTracksUpdated = (_event: unknown, data: { subtitleTracks: Array<{ id: number; name?: string; lang?: string; forced?: boolean }> }) => {
+            if (destroyed) return
+            const options = mapHlsSubtitleOptions(data.subtitleTracks)
+            setHlsSubtitleOptionList(options)
+            const selected = options.find((option) => option.id === selectedSubtitleIdRef.current)
+            if (selected?.source === "hls") {
+              setSubtitleStatus("loading")
+              setSubtitleError(null)
+            }
+            try {
+              hls!.subtitleTrack = selected?.source === "hls" && selected.hlsIndex !== undefined
+                ? selected.hlsIndex
+                : -1
+            } catch { /* ignore manifest teardown races */ }
+          }
+          const onSubtitleTracksCleared = () => {
+            if (destroyed) return
+            setHlsSubtitleOptionList([])
+            if (selectedSubtitleIdRef.current?.startsWith("hls:")) setSubtitleStatus("loading")
+          }
+          const onSubtitleTrackLoaded = () => {
+            if (destroyed || !selectedSubtitleIdRef.current?.startsWith("hls:")) return
+            setSubtitleStatus("ready")
+            setSubtitleError(null)
+          }
+          hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, onSubtitleTracksUpdated)
+          hls.on(Hls.Events.SUBTITLE_TRACKS_CLEARED, onSubtitleTracksCleared)
+          hls.on(Hls.Events.SUBTITLE_TRACK_LOADED, onSubtitleTrackLoaded)
           hls.loadSource(sessionContentUri)
           hls.attachMedia(video)
           // 暴露最后一次错误细节供 CDP 诊断（不落盘，仅内存）。
@@ -435,6 +512,13 @@ export function PlayerPage() {
             if (destroyed) return
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             ;(window as unknown as Record<string, unknown>).__havenLastHlsError = data
+            if (data.details === "subtitleTrackLoadError" || data.details === "subtitleTrackLoadTimeOut") {
+              if (selectedSubtitleIdRef.current?.startsWith("hls:")) {
+                setSubtitleStatus("failed")
+                setSubtitleError("HLS 字幕加载失败，请稍后重试。")
+              }
+              return
+            }
             // 通用空洞跳过：优先使用 hls.js 提供的 nextStart
             if (data.details === "bufferStalledError") {
               const nextStart = (data as unknown as { nextStart?: number }).nextStart
@@ -523,6 +607,7 @@ export function PlayerPage() {
       })
     return () => {
       destroyed = true
+      if (hlsRef.current === hls) hlsRef.current = null
       hls?.destroy()
     }
   }, [sessionContentUri, streamKind])
@@ -649,6 +734,85 @@ export function PlayerPage() {
     const nextTime = clampVideoSeek(time, videoRef.current.duration)
     videoRef.current.currentTime = nextTime
     setCurrentTime(nextTime)
+  }
+
+  const handleSubtitleChange = (subtitleId: string | null) => {
+    const runtime = subtitleRuntimeRef.current
+    if (runtime === null) return
+
+    if (subtitleId === null) {
+      selectedSubtitleIdRef.current = null
+      runtime.clear()
+      setSelectedSubtitleId(null)
+      setSubtitleAsset(null)
+      setSubtitleStatus("idle")
+      setSubtitleError(null)
+      try {
+        if (hlsRef.current) hlsRef.current.subtitleTrack = -1
+      } catch { /* ignore teardown races */ }
+      return
+    }
+
+    const option = subtitleOptions.find((candidate) => candidate.id === subtitleId)
+    if (!option) return
+
+    selectedSubtitleIdRef.current = option.id
+    setSelectedSubtitleId(option.id)
+    setSubtitleAsset(null)
+    setSubtitleError(null)
+    runtime.clear()
+
+    if (option.source === "hls") {
+      const hls = hlsRef.current
+      if (!hls || option.hlsIndex === undefined) {
+        setSubtitleStatus("failed")
+        setSubtitleError("HLS 字幕尚未准备好，请稍后重试。")
+        return
+      }
+      try {
+        hls.subtitleTrack = option.hlsIndex
+        setSubtitleStatus("loading")
+      } catch {
+        setSubtitleStatus("failed")
+        setSubtitleError("HLS 字幕切换失败，请稍后重试。")
+      }
+      return
+    }
+
+    const track = option.externalTrack
+    if (!track) {
+      setSubtitleStatus("failed")
+      setSubtitleError("字幕轨道信息无效。")
+      return
+    }
+    try {
+      if (hlsRef.current) hlsRef.current.subtitleTrack = -1
+    } catch { /* ignore teardown races */ }
+    setSubtitleStatus("loading")
+    void runtime.load(
+      track,
+      async (contentUri, signal) => {
+        const resource = await fetchSessionResource(contentUri, { signal })
+        if (resource.kind === "empty") throw new Error("empty subtitle resource")
+        return { bytes: resource.bytes, contentType: resource.contentType }
+      },
+    ).then((result) => {
+      if (selectedSubtitleIdRef.current !== option.id) return
+      if (result.status === "stale") return
+      if (result.status === "ready") {
+        setSubtitleAsset(result.asset)
+        setSubtitleStatus("ready")
+        return
+      }
+      setSubtitleAsset(null)
+      setSubtitleStatus("failed")
+      setSubtitleError(result.warnings[0]?.message ?? "字幕加载失败，请稍后重试。")
+    }).catch(() => {
+      if (selectedSubtitleIdRef.current !== option.id) return
+      setSubtitleAsset(null)
+      setSubtitleStatus("failed")
+      setSubtitleError("字幕加载失败，请稍后重试。")
+    })
   }
 
   // 音量切换
@@ -889,7 +1053,18 @@ export function PlayerPage() {
           }}
           className="w-full h-full object-contain cursor-pointer"
           onClick={togglePlay}
-        />
+        >
+          {subtitleAsset && selectedSubtitleId === `external:${subtitleAsset.trackId}` && (
+            <track
+              key={`${subtitleAsset.trackId}:${subtitleAsset.objectUrl}`}
+              kind="subtitles"
+              src={subtitleAsset.objectUrl}
+              srcLang={subtitleAsset.language ?? undefined}
+              label={subtitleAsset.label}
+              default
+            />
+          )}
+        </video>
 
         {sessionView.status === "opening" && (
           <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/45 px-6 text-center text-white">
@@ -971,6 +1146,10 @@ export function PlayerPage() {
           isBookmarkDisabled={!mediaItemId || sessionView.status !== "ready" || isBookmarkPending || (productionMode && !markersLoaded)}
           isBuffering={isBuffering}
           bufferedRanges={bufferedRanges}
+          subtitleOptions={subtitleOptions.map(({ id, label, language }) => ({ id, label, language }))}
+          selectedSubtitleId={selectedSubtitleId}
+          subtitleLoading={subtitleStatus === "loading"}
+          subtitleError={subtitleStatus === "failed" ? subtitleError : null}
           onPlayPause={togglePlay}
           onSeek={handleSeek}
           onVolumeChange={handleVolumeChange}
@@ -981,6 +1160,7 @@ export function PlayerPage() {
           onBack={() => navigate(-1)}
           onOpenEpisodes={drawerEpisodes ? () => setIsSidePanelOpen(!isSidePanelOpen) : undefined}
           onToggleBookmark={toggleVideoBookmark}
+          onSubtitleChange={subtitleOptions.length > 0 ? handleSubtitleChange : undefined}
         />
       </div>
 

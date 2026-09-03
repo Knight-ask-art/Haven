@@ -15,6 +15,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
+use haven_common::network::{HttpUrlPolicy, parse_http_url};
 use haven_common::{AppError, ErrorKind, UtcMillis};
 use haven_domain::contracts::{SettingsRepository, SettingsRow};
 
@@ -694,37 +695,8 @@ fn validate_endpoint(raw: &str) -> Result<Option<String>, AppError> {
             false,
         ));
     }
-    let parsed = url_parse(trimmed)?;
-    if !matches!(parsed.scheme.as_str(), "http" | "https") || parsed.host.is_empty() {
-        return Err(AppError::new(
-            "INVALID_ARGUMENT",
-            ErrorKind::Validation,
-            "端点必须是 http/https 绝对地址",
-            false,
-        ));
-    }
+    parse_http_url(trimmed, HttpUrlPolicy::SourceEndpoint).map_err(|_| invalid_endpoint())?;
     Ok(Some(trimmed.trim_end_matches('/').to_owned()))
-}
-
-struct ParsedEndpoint {
-    scheme: String,
-    host: String,
-}
-
-/// 极简 URL 解析（scheme://host[:port]/...），避免引入完整 URL 解析依赖到 app 层。
-fn url_parse(raw: &str) -> Result<ParsedEndpoint, AppError> {
-    let (scheme, rest) = raw.split_once("://").ok_or_else(invalid_endpoint)?;
-    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..host_end];
-    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    let host = host.split(':').next().unwrap_or(host);
-    if host.is_empty() || host.contains(char::is_whitespace) {
-        return Err(invalid_endpoint());
-    }
-    Ok(ParsedEndpoint {
-        scheme: scheme.to_ascii_lowercase(),
-        host: host.to_ascii_lowercase(),
-    })
 }
 
 fn invalid_endpoint() -> AppError {

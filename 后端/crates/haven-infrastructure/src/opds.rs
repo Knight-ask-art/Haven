@@ -9,6 +9,8 @@
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
+#[cfg(test)]
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -23,6 +25,7 @@ use haven_application::services::search_source::SearchSourceParticipant;
 use haven_application::services::source_import::{
     RemoteContentRef, SourceCatalogEntry, SourceCatalogProvider,
 };
+use haven_common::network::{HttpUrlPolicy, parse_http_url};
 use haven_common::{AppError, ErrorKind};
 
 use tokio::io::AsyncWriteExt;
@@ -30,6 +33,7 @@ use tokio::io::AsyncWriteExt;
 use zip::ZipArchive;
 
 use crate::cms10::{CMS10_SOURCE_ID, Cms10CatalogProvider};
+use crate::http_security::{ResolvedHttpTarget, pin_client_builder, resolve_public_http_target};
 
 /// OPDS 书源内置 ID（必须与 source_registry 内置目录一致）。
 pub const OPDS_SOURCE_GUTENBERG: &str = "opds_gutenberg";
@@ -283,28 +287,21 @@ pub type CredentialResolver = dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future:
 
 #[derive(Clone)]
 pub struct OpdsClient {
-    http: reqwest::Client,
     /// 每个端点的 OpenSearch atom 模板（含 `{searchTerms}`）。二次搜索跳过根目录 + 描述文件 hop。
     search_templates: Arc<Mutex<HashMap<String, String>>>,
     /// 私有源凭据提供方。
     credential_resolver: Option<Arc<CredentialResolver>>,
+    #[cfg(test)]
+    allow_loopback_fixture: bool,
 }
 
 impl OpdsClient {
     pub fn new() -> Result<Self, AppError> {
-        let http = reqwest::Client::builder()
-            .user_agent("haven/0.1")
-            .timeout(std::time::Duration::from_secs(15))
-            // Redirects are followed explicitly in `get_limited_once`.  This
-            // lets the built-in Gutenberg source re-validate every hop instead
-            // of allowing reqwest to visit an arbitrary host first.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| invalid_feed("HTTP 客户端初始化失败"))?;
         Ok(Self {
-            http,
             search_templates: Arc::new(Mutex::new(HashMap::new())),
             credential_resolver: None,
+            #[cfg(test)]
+            allow_loopback_fixture: false,
         })
     }
 
@@ -312,6 +309,39 @@ impl OpdsClient {
     pub fn with_credential_resolver(mut self, resolver: Arc<CredentialResolver>) -> Self {
         self.credential_resolver = Some(resolver);
         self
+    }
+
+    #[cfg(test)]
+    fn with_loopback_fixture(mut self) -> Self {
+        self.allow_loopback_fixture = true;
+        self
+    }
+
+    fn validate_request_url(
+        &self,
+        raw: &str,
+        source_id: Option<&str>,
+    ) -> Result<reqwest::Url, AppError> {
+        #[cfg(test)]
+        if self.allow_loopback_fixture && is_loopback_http_url(raw) {
+            return parse_loopback_fixture_url(raw);
+        }
+        validate_opds_url(raw, source_id)
+    }
+
+    async fn resolve_request_target(
+        &self,
+        current: &reqwest::Url,
+    ) -> Result<ResolvedHttpTarget, AppError> {
+        #[cfg(test)]
+        if self.allow_loopback_fixture {
+            if let Some(target) = loopback_fixture_target(current) {
+                return target;
+            }
+        }
+        resolve_public_http_target(current.as_str(), HttpUrlPolicy::SourceEndpoint)
+            .await
+            .map_err(|_| invalid_feed("目录地址解析不安全"))
     }
 
     async fn get_limited(
@@ -333,13 +363,29 @@ impl OpdsClient {
         url: &str,
         cap: usize,
     ) -> Result<Vec<u8>, AppError> {
-        let mut current = validate_opds_url(url, source_id)?;
+        let origin = self.validate_request_url(url, source_id)?;
+        let mut current = origin.clone();
         for _ in 0..=MAX_REDIRECTS {
-            let mut builder = self.http.get(current.clone());
+            let target = self.resolve_request_target(&current).await?;
+            if source_id.is_some_and(|id| !is_builtin_opds(id))
+                && !same_opds_authority(&origin, &target.url, source_id)
+            {
+                return Err(invalid_feed("目录重定向来源不一致"));
+            }
+            let builder = reqwest::Client::builder()
+                .user_agent("haven/0.1")
+                .timeout(std::time::Duration::from_secs(15))
+                // Redirects are followed explicitly below so every hop gets
+                // a fresh URL policy and DNS decision.
+                .redirect(reqwest::redirect::Policy::none());
+            let client = pin_client_builder(builder, &target)
+                .build()
+                .map_err(|_| invalid_feed("HTTP 客户端初始化失败"))?;
+            let mut builder = client.get(target.url.clone());
             if let (Some(sid), Some(resolver)) = (source_id, &self.credential_resolver) {
                 // Built-in sources are always anonymous.  We still pass the
                 // source key here so redirect policy can be enforced.
-                if !is_builtin_opds(sid) {
+                if !is_builtin_opds(sid) && same_opds_authority(&origin, &target.url, source_id) {
                     if let Some(secret) = resolver(sid).await {
                         // secret 即取即用；reqwest 内部按 header 编码，不落日志。
                         builder = builder.basic_auth::<&str, String>(sid, Some(secret));
@@ -356,10 +402,11 @@ impl OpdsClient {
                     .get(reqwest::header::LOCATION)
                     .and_then(|value| value.to_str().ok())
                     .ok_or_else(|| invalid_feed("目录重定向地址无效"))?;
-                current = current
+                current = target
+                    .url
                     .join(location)
                     .map_err(|_| invalid_feed("目录重定向地址无效"))?;
-                validate_opds_url(current.as_str(), source_id)?;
+                self.validate_request_url(current.as_str(), source_id)?;
                 continue;
             }
             if !resp.status().is_success() {
@@ -449,7 +496,9 @@ impl OpdsClient {
     ) -> Result<String, AppError> {
         if let Some(tpl) = self.cached_template(endpoint) {
             if let Some(url) = Self::apply_template(&tpl, query, endpoint) {
-                return Ok(url);
+                if is_source_url_allowed(source_id, endpoint, &url) {
+                    return Ok(url);
+                }
             }
         }
         // Gutenberg 的 m./www. 镜像在部分网络中的可用性不同；根目录解析
@@ -469,14 +518,17 @@ impl OpdsClient {
         if let Some((_, search_desc)) = feed_links.iter().find(|(rel, _)| rel == "search") {
             let absolute_desc = absolutize(&resolved_endpoint, search_desc)
                 .ok_or_else(|| invalid_feed("搜索描述地址非法"))?;
-            if let Ok(desc) = self
-                .get_limited(source_id, &absolute_desc, 256 * 1024)
-                .await
+            if is_source_url_allowed(source_id, endpoint, &absolute_desc)
+                && let Ok(desc) = self
+                    .get_limited(source_id, &absolute_desc, 256 * 1024)
+                    .await
             {
                 if let Some(tpl) = extract_atom_template(&String::from_utf8_lossy(&desc)) {
                     if let Some(url) = Self::apply_template(&tpl, query, &absolute_desc) {
-                        self.remember_template(endpoint, tpl);
-                        return Ok(url);
+                        if is_source_url_allowed(source_id, endpoint, &url) {
+                            self.remember_template(endpoint, tpl);
+                            return Ok(url);
+                        }
                     }
                 }
             }
@@ -486,14 +538,18 @@ impl OpdsClient {
             .next()
             .filter(|_| is_gutenberg_endpoint(endpoint))
         {
-            return Ok(url);
+            if is_source_url_allowed(source_id, endpoint, &url) {
+                return Ok(url);
+            }
         }
         let sep = if endpoint.contains('?') { '&' } else { '?' };
-        absolutize(
+        let url = absolutize(
             endpoint,
             &format!("{endpoint}{sep}query={}", urlencode(query)),
         )
-        .ok_or_else(|| invalid_feed("搜索地址解析失败"))
+        .filter(|url| is_source_url_allowed(source_id, endpoint, url))
+        .ok_or_else(|| invalid_feed("搜索地址解析失败"))?;
+        Ok(url)
     }
 
     pub async fn search_entries(
@@ -512,7 +568,7 @@ impl OpdsClient {
         }
         let mut last_err: Option<AppError> = None;
         if let Some(entries) = self
-            .try_search_urls(source_id, &urls, limit, &mut last_err)
+            .try_search_urls(source_id, endpoint, &urls, limit, &mut last_err)
             .await
         {
             return Ok(entries);
@@ -524,7 +580,7 @@ impl OpdsClient {
                     .filter(|u| !urls.contains(u))
                     .collect();
                 if let Some(entries) = self
-                    .try_search_urls(source_id, &extras, limit, &mut last_err)
+                    .try_search_urls(source_id, endpoint, &extras, limit, &mut last_err)
                     .await
                 {
                     return Ok(entries);
@@ -537,6 +593,7 @@ impl OpdsClient {
     async fn try_search_urls(
         &self,
         source_id: Option<&str>,
+        source_endpoint: &str,
         urls: &[String],
         limit: u32,
         last_err: &mut Option<AppError>,
@@ -545,7 +602,12 @@ impl OpdsClient {
             match self.get_feed(source_id, url).await {
                 Ok(body) => {
                     let xml = String::from_utf8_lossy(&body);
-                    let mut entries = book_candidates(parse_atom(&xml, url).0);
+                    let mut entries: Vec<OpdsEntry> = book_candidates(parse_atom(&xml, url).0)
+                        .into_iter()
+                        .filter(|entry| {
+                            is_source_url_allowed(source_id, source_endpoint, &entry.entry_id)
+                        })
+                        .collect();
                     if entries.is_empty() {
                         continue;
                     }
@@ -619,25 +681,20 @@ fn extract_atom_template(desc: &str) -> Option<String> {
 }
 
 fn is_gutenberg_endpoint(endpoint: &str) -> bool {
-    endpoint.to_ascii_lowercase().contains("gutenberg.org")
+    reqwest::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| matches!(host.as_str(), "www.gutenberg.org" | "m.gutenberg.org"))
 }
 
 /// 校验 OPDS 请求地址。自定义目录可以访问其已登记的 http(s) 端点；内置
 /// Gutenberg 只允许公开站点的 HTTPS 主机，并且每个手工跟随的重定向都会再次
 /// 进入本函数。请求凭据、端口和片段不会从候选句柄进入网络层。
 fn validate_opds_url(raw: &str, source_id: Option<&str>) -> Result<reqwest::Url, AppError> {
-    let url = reqwest::Url::parse(raw).map_err(|_| invalid_feed("目录地址无效"))?;
-    if !matches!(url.scheme(), "http" | "https")
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(invalid_feed("目录地址不安全"));
-    }
-    let host = url
-        .host_str()
-        .ok_or_else(|| invalid_feed("目录地址缺少主机"))?
-        .to_ascii_lowercase();
+    let safe = parse_http_url(raw, HttpUrlPolicy::SourceEndpoint)
+        .map_err(|_| invalid_feed("目录地址不安全"))?;
+    let host = safe.host().to_owned();
+    let url = safe.into_url();
     if source_id.is_some_and(is_builtin_opds)
         && (url.scheme() != "https"
             // `url::Url::port()` normalizes an explicitly written default
@@ -650,6 +707,49 @@ fn validate_opds_url(raw: &str, source_id: Option<&str>) -> Result<reqwest::Url,
         return Err(invalid_feed("古腾堡目录地址不安全"));
     }
     Ok(url)
+}
+
+fn same_opds_authority(
+    origin: &reqwest::Url,
+    target: &reqwest::Url,
+    source_id: Option<&str>,
+) -> bool {
+    let Some(origin_host) = origin.host_str() else {
+        return false;
+    };
+    let Some(target_host) = target.host_str() else {
+        return false;
+    };
+    let origin_host = origin_host.trim_end_matches('.').to_ascii_lowercase();
+    let target_host = target_host.trim_end_matches('.').to_ascii_lowercase();
+    let same_port = origin.port_or_known_default() == target.port_or_known_default();
+    if !same_port || origin.scheme() != target.scheme() {
+        return false;
+    }
+    if source_id.is_some_and(is_builtin_opds) {
+        matches!(
+            origin_host.as_str(),
+            "www.gutenberg.org" | "m.gutenberg.org"
+        ) && matches!(
+            target_host.as_str(),
+            "www.gutenberg.org" | "m.gutenberg.org"
+        )
+    } else {
+        origin_host == target_host
+    }
+}
+
+/// Feed-discovered URLs remain inside the authority that owns the configured
+/// OPDS source. Gutenberg is the one deliberate two-host exception because
+/// its official mobile and desktop mirrors are interchangeable and anonymous.
+fn is_source_url_allowed(source_id: Option<&str>, origin: &str, candidate: &str) -> bool {
+    let Ok(origin) = validate_opds_url(origin, source_id) else {
+        return false;
+    };
+    let Ok(candidate) = validate_opds_url(candidate, source_id) else {
+        return false;
+    };
+    same_opds_authority(&origin, &candidate, source_id)
 }
 
 /// Return whether the raw URL authority contains an explicit port.  This is
@@ -674,6 +774,47 @@ fn has_explicit_authority_port(raw: &str) -> bool {
         });
     }
     host.contains(':')
+}
+
+#[cfg(test)]
+fn is_loopback_http_url(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    matches!(url.scheme(), "http" | "https")
+        && url
+            .host_str()
+            .and_then(|host| host.parse::<IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback())
+}
+
+#[cfg(test)]
+fn parse_loopback_fixture_url(raw: &str) -> Result<reqwest::Url, AppError> {
+    let url = reqwest::Url::parse(raw).map_err(|_| invalid_feed("测试目录地址无效"))?;
+    if !is_loopback_http_url(raw)
+        || url.username() != ""
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.port_or_known_default().is_none()
+    {
+        return Err(invalid_feed("测试目录地址不安全"));
+    }
+    Ok(url)
+}
+
+#[cfg(test)]
+fn loopback_fixture_target(url: &reqwest::Url) -> Option<Result<ResolvedHttpTarget, AppError>> {
+    let host = url.host_str()?;
+    let ip = host.parse::<IpAddr>().ok()?;
+    if !ip.is_loopback() {
+        return None;
+    }
+    let port = url.port_or_known_default()?;
+    Some(Ok(ResolvedHttpTarget {
+        url: url.clone(),
+        dns_name: None,
+        addresses: vec![SocketAddr::new(ip, port)],
+    }))
 }
 
 fn validate_builtin_gutenberg_url(raw: &str) -> Result<reqwest::Url, AppError> {
@@ -831,7 +972,15 @@ impl SourceCatalogProvider for OpdsCatalogProvider {
                 false,
             ));
         }
-        let _ = endpoint; // external_id 已是绝对条目页地址
+        // A candidate handle may only refer to an entry on the configured
+        // source authority.  Do not let a caller replace the registered
+        // endpoint with an arbitrary public URL; this also keeps custom-source
+        // credentials scoped to their original host.
+        let source_endpoint = validate_opds_url(endpoint, Some(source_id))?;
+        let entry_url = validate_opds_url(external_id, Some(source_id))?;
+        if !same_opds_authority(&source_endpoint, &entry_url, Some(source_id)) {
+            return Err(invalid_feed("目录条目不属于已配置来源"));
+        }
         // 私有源凭据：sourceId 即 profile（`haven:opds:<sourceId>`），detail 走同源 Basic Auth。
         // Built-in source key is passed to the HTTP layer for strict host and
         // redirect validation; `get_limited_once` deliberately skips auth for
@@ -840,7 +989,7 @@ impl SourceCatalogProvider for OpdsCatalogProvider {
             (is_opds_source_id(source_id) || is_custom).then(|| source_id.to_owned());
         let entry = self
             .client
-            .fetch_entry_metadata(source_for_auth.as_deref(), external_id)
+            .fetch_entry_metadata(source_for_auth.as_deref(), entry_url.as_str())
             .await?;
 
         Ok(SourceCatalogEntry {
@@ -1352,6 +1501,36 @@ mod tests {
     }
 
     #[test]
+    fn custom_opds_candidates_stay_on_the_registered_authority() {
+        let source = "custom_catalog123456";
+        assert!(is_source_url_allowed(
+            Some(source),
+            "https://catalog.example.invalid/opds",
+            "https://catalog.example.invalid/books/84.opds"
+        ));
+        assert!(!is_source_url_allowed(
+            Some(source),
+            "https://catalog.example.invalid/opds",
+            "https://other.example.invalid/books/84.opds"
+        ));
+        assert!(!is_source_url_allowed(
+            Some(source),
+            "https://catalog.example.invalid/opds",
+            "https://user:secret@catalog.example.invalid/books/84.opds"
+        ));
+        assert!(is_source_url_allowed(
+            Some(OPDS_SOURCE_GUTENBERG),
+            "https://www.gutenberg.org/ebooks/search.opds",
+            "https://m.gutenberg.org/ebooks/84.opds"
+        ));
+        assert!(!is_source_url_allowed(
+            Some(OPDS_SOURCE_GUTENBERG),
+            "https://www.gutenberg.org/ebooks/search.opds",
+            "https://evil.example.invalid/ebooks/84.opds"
+        ));
+    }
+
+    #[test]
     fn epub_payload_requires_zip_and_mimetype() {
         assert!(validate_epub_payload(b"<html>not an epub</html>").is_err());
 
@@ -1525,6 +1704,7 @@ mod tests {
         let (url, rx) = spawn_auth_echo_server();
         let client = OpdsClient::new()
             .unwrap()
+            .with_loopback_fixture()
             .with_credential_resolver(Arc::new(|source_id: &str| {
                 let matched = source_id == "custom_test123456";
                 Box::pin(async move { matched.then(|| "p@ss:word".to_owned()) })
@@ -1547,6 +1727,7 @@ mod tests {
         let (url, rx) = spawn_auth_echo_server();
         let client = OpdsClient::new()
             .unwrap()
+            .with_loopback_fixture()
             .with_credential_resolver(Arc::new(|_source_id: &str| {
                 Box::pin(async { Some("unused".to_owned()) })
             }));

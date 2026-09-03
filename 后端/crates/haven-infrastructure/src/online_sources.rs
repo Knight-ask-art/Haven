@@ -24,6 +24,7 @@ use haven_application::services::session::{PreparedSession, PreparedSessionSourc
 use haven_application::services::source_import::{
     RemoteContentRef, SourceCatalogEntry, SourceCatalogProvider,
 };
+use haven_common::network::HttpUrlPolicy;
 use haven_common::{AppError, ErrorKind};
 use haven_domain::enums::MediaType;
 use quick_xml::events::Event;
@@ -32,6 +33,8 @@ use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
+
+use crate::http_security::{pin_client_builder, resolve_public_http_target};
 
 const MANGADEX_API: &str = "https://api.mangadex.org";
 const ARXIV_API: &str = "https://export.arxiv.org";
@@ -63,26 +66,11 @@ enum HostPolicy {
 /// Fixed-host HTTP client for import operations. Redirects are disabled in the
 /// reqwest client and followed manually so every target is revalidated.
 #[derive(Clone)]
-pub struct OnlineContentClient {
-    http: reqwest::Client,
-}
+pub struct OnlineContentClient;
 
 impl OnlineContentClient {
     pub fn new() -> Result<Self, AppError> {
-        let http = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .user_agent(USER_AGENT)
-            // The Windows Schannel/WebView2 environment is more reliable for
-            // the fixed public sources when the provider client stays on
-            // HTTP/1.1.  This does not weaken TLS or host validation; it only
-            // avoids an HTTP/2 negotiation failure before a request reaches
-            // the already allow-listed endpoint.
-            .http1_only()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| internal_error("正文来源客户端初始化失败"))?;
-        Ok(Self { http })
+        Ok(Self)
     }
 
     async fn json(&self, url: &str, policy: HostPolicy) -> Result<Value, AppError> {
@@ -118,21 +106,39 @@ impl OnlineContentClient {
     ) -> Result<RemoteHttpResponse, AppError> {
         let mut current = validate_url(url, policy)?;
         for _ in 0..=MAX_REDIRECTS {
-            let mut request = self.http.get(current.clone()).header(
-                reqwest::header::ACCEPT,
-                "application/json,text/plain,application/pdf,image/*,*/*;q=0.1",
-            );
-            if let Some(range) = range {
-                let value = match range.end {
-                    Some(end) => format!("bytes={}-{}", range.start, end),
-                    None => format!("bytes={}-", range.start),
-                };
-                request = request.header(reqwest::header::RANGE, value);
-            }
+            let target =
+                resolve_public_http_target(current.as_str(), HttpUrlPolicy::SourceEndpoint)
+                    .await
+                    .map_err(|_| source_unavailable("正文来源地址解析不安全"))?;
+            let builder = reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                .user_agent(USER_AGENT)
+                // Keep the fixed-source client predictable on Windows while
+                // preserving HTTPS certificate validation.
+                .http1_only()
+                .redirect(reqwest::redirect::Policy::none());
+            let client = pin_client_builder(builder, &target)
+                .build()
+                .map_err(|_| internal_error("正文来源客户端初始化失败"))?;
+            let build_request = || {
+                let mut request = client.get(target.url.clone()).header(
+                    reqwest::header::ACCEPT,
+                    "application/json,text/plain,application/pdf,image/*,*/*;q=0.1",
+                );
+                if let Some(range) = range {
+                    let value = match range.end {
+                        Some(end) => format!("bytes={}-{}", range.start, end),
+                        None => format!("bytes={}-", range.start),
+                    };
+                    request = request.header(reqwest::header::RANGE, value);
+                }
+                request
+            };
             let response = {
                 let mut response = None;
                 for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
-                    match request.send().await {
+                    match build_request().send().await {
                         Ok(candidate) => {
                             let status = candidate.status();
                             if let Some(delay) =
@@ -140,20 +146,6 @@ impl OnlineContentClient {
                             {
                                 drop(candidate);
                                 tokio::time::sleep(delay).await;
-                                // Rebuild the request below.  GET requests have
-                                // no body and therefore do not carry state
-                                // across attempts.
-                                request = self.http.get(current.clone()).header(
-                                    reqwest::header::ACCEPT,
-                                    "application/json,text/plain,application/pdf,image/*,*/*;q=0.1",
-                                );
-                                if let Some(range) = range {
-                                    let value = match range.end {
-                                        Some(end) => format!("bytes={}-{}", range.start, end),
-                                        None => format!("bytes={}-", range.start),
-                                    };
-                                    request = request.header(reqwest::header::RANGE, value);
-                                }
                                 continue;
                             }
                             response = Some(candidate);
@@ -161,20 +153,6 @@ impl OnlineContentClient {
                         }
                         Err(_) if attempt + 1 < MAX_TRANSIENT_ATTEMPTS => {
                             tokio::time::sleep(transient_backoff(attempt)).await;
-                            // Rebuild the request for the next attempt; the
-                            // current request has already been consumed by
-                            // reqwest::RequestBuilder::send.
-                            request = self.http.get(current.clone()).header(
-                                reqwest::header::ACCEPT,
-                                "application/json,text/plain,application/pdf,image/*,*/*;q=0.1",
-                            );
-                            if let Some(range) = range {
-                                let value = match range.end {
-                                    Some(end) => format!("bytes={}-{}", range.start, end),
-                                    None => format!("bytes={}-", range.start),
-                                };
-                                request = request.header(reqwest::header::RANGE, value);
-                            }
                         }
                         Err(_) => break,
                     }

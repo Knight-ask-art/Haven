@@ -11,6 +11,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 e2e = []
+# Runtime-only build mode for the local film/TV acceptance fixture.  This is
+# intentionally opt-in and is not enabled by custom-protocol or release
+# workflows; the default candidate keeps loopback destinations blocked.
+film-tv-fixture = ["haven-common/film-tv-fixture"]
 # Tauri 官方模板约定：只有启用 crate 自身的 custom-protocol feature，
 # tauri::generate_context! 才会使用 frontendDist 内嵌资源而不是 devUrl。
 custom-protocol = ["tauri/custom-protocol"]

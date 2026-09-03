@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use haven_common::network::{HttpUrlPolicy, parse_http_url};
 use haven_common::{AppError, ErrorKind};
 use haven_domain::contracts::{
     EditionRepository, MediaItemRepository, ProgressRepository, ResourceRepository, WorkRepository,
@@ -148,71 +149,16 @@ fn is_hls_stream(resource_type: ResourceType, url: &str) -> bool {
 /// in `services::resource`. A stream grant must never be registered for an
 /// arbitrary locator merely because its resource type looks like a stream.
 ///
-/// This deliberately mirrors the projection's conservative syntax checks:
-/// only lower-case HTTP(S), a non-empty authority, no user-info, and either a
-/// plain host or a bracketed IPv6 host with an optional numeric port. DASH is
-/// intentionally excluded until its player path is complete. This is not a
-/// network policy (redirects and host allowlists are enforced by the Tauri
-/// resource protocol after the grant is created); it is the application-side
-/// fail-closed gate that prevents malformed locators from reaching that layer.
+/// This uses the shared outbound URL policy for scheme, authority, user-info,
+/// literal private addresses, fragment and port validation. Redirects and
+/// DNS pinning remain owned by the Tauri resource protocol after the grant is
+/// created; this is the application-side fail-closed gate that prevents an
+/// invalid locator from reaching that layer.
 fn http_stream_online_readable(resource_type: ResourceType, raw_url: &str) -> bool {
-    if !matches!(
+    matches!(
         resource_type,
         ResourceType::VideoStream | ResourceType::HlsStream
-    ) {
-        return false;
-    }
-
-    // Reject control/whitespace characters before parsing the authority. This
-    // also prevents values containing a hidden newline from being registered
-    // as a stream grant and later interpreted differently by another parser.
-    if raw_url.is_empty()
-        || raw_url
-            .chars()
-            .any(|ch| ch.is_control() || ch.is_whitespace())
-    {
-        return false;
-    }
-
-    let Some((scheme, remainder)) = raw_url.split_once("://") else {
-        return false;
-    };
-    if !matches!(scheme, "http" | "https") {
-        return false;
-    }
-
-    // The authority ends at the first path/query/fragment delimiter. Reject
-    // empty hosts, user-info, and an explicitly empty port.
-    let authority = remainder
-        .split_once(['/', '?', '#'])
-        .map_or(remainder, |(value, _)| value);
-    if authority.is_empty() || authority.contains('@') || authority.ends_with(':') {
-        return false;
-    }
-
-    // Bracketed IPv6 is accepted with an optional numeric port. Unbracketed
-    // IPv6 is rejected as ambiguous; regular hosts likewise accept only an
-    // optional numeric port.
-    if authority.starts_with('[') {
-        let Some(close) = authority.find(']') else {
-            return false;
-        };
-        let suffix = &authority[close + 1..];
-        close > 1 && (suffix.is_empty() || valid_port_suffix(suffix))
-    } else {
-        match authority.split_once(':') {
-            None => true,
-            Some((host, suffix)) => !host.is_empty() && valid_port(suffix),
-        }
-    }
-}
-
-fn valid_port_suffix(suffix: &str) -> bool {
-    suffix.strip_prefix(':').is_some_and(valid_port)
-}
-
-fn valid_port(value: &str) -> bool {
-    !value.is_empty() && value.parse::<u16>().is_ok()
+    ) && parse_http_url(raw_url, HttpUrlPolicy::MediaResource).is_ok()
 }
 
 #[cfg(test)]
@@ -226,7 +172,7 @@ mod tests {
                 "https://stream.example.test/video/index.m3u8?token=opaque",
                 "http://stream.example.test/video/file.mp4",
                 "https://stream.example.test:8443/video/index.m3u8",
-                "https://[2001:db8::10]:8443/video/index.m3u8",
+                "https://[2001:4860:4860::8888]:8443/video/index.m3u8",
             ] {
                 assert!(
                     http_stream_online_readable(resource_type, url),

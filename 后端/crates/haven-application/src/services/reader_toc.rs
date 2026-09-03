@@ -156,6 +156,7 @@ mod tests {
             storage_location_id: Some(StorageLocationId::new()),
             canonical_root: Some("/root".into()),
             canonical_file: Some("/root/book.epub".into()),
+            subtitle_tracks: Vec::new(),
             source: super::super::session::PreparedSessionSource::Local,
             mime_type: Some("application/epub+zip".into()),
             media_type,

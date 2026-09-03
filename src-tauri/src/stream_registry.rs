@@ -9,6 +9,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use haven_common::network::{parse_http_url, validate_host, HttpUrlPolicy};
+use haven_common::{AppError, ErrorKind};
 use uuid::Uuid;
 
 use haven_application::wire::ProgressSummaryDto;
@@ -69,11 +71,10 @@ impl StreamGrantInner {
             // `rewrite_hls_manifest` supplies normalized hosts from `host_of`,
             // but keep this method defensive because it is the registry's
             // security boundary and is also exercised directly by tests.
-            if host.is_empty()
-                || host.chars().any(|ch| ch.is_control() || ch.is_whitespace())
-                || host == self.initial_host
-                || !allowed.insert(host.clone())
-            {
+            let Ok(host) = validate_host(&host) else {
+                continue;
+            };
+            if host == self.initial_host || !allowed.insert(host.clone()) {
                 continue;
             }
             order.push_back(host);
@@ -152,13 +153,109 @@ impl StreamRegistry {
     }
 
     /// 注册新 grant；返回不透明 UUID。
-    pub fn register(&self, facts: StreamGrantFacts, upstream_url: &str, owner_label: &str) -> Uuid {
-        let grant = Uuid::new_v4();
-        let initial_host = host_of(upstream_url).unwrap_or_default();
-        let mut hosts = HashSet::new();
-        if !initial_host.is_empty() {
-            hosts.insert(initial_host.clone());
+    pub fn register(
+        &self,
+        facts: StreamGrantFacts,
+        upstream_url: &str,
+        owner_label: &str,
+    ) -> Result<Uuid, AppError> {
+        if facts.upstream_url != upstream_url {
+            return Err(AppError::new(
+                "SECURITY_POLICY_DENIED",
+                ErrorKind::Security,
+                "流目标事实与授权地址不一致",
+                false,
+            ));
         }
+        let initial_host = host_of(upstream_url).ok_or_else(|| {
+            AppError::new(
+                "SECURITY_POLICY_DENIED",
+                ErrorKind::Security,
+                "流目标地址不受安全策略允许",
+                false,
+            )
+        })?;
+        Ok(self.insert_grant(facts, initial_host, owner_label))
+    }
+
+    /// Test-only transport injection for the local HTTP fixture. The fixture
+    /// still has to use an HTTP(S) URL with a safe host, but may select a
+    /// random listener port; production registration keeps the common-port
+    /// policy from `haven-common`.
+    #[cfg(test)]
+    pub(crate) fn register_fixture(
+        &self,
+        facts: StreamGrantFacts,
+        upstream_url: &str,
+        owner_label: &str,
+    ) -> Result<Uuid, AppError> {
+        if facts.upstream_url != upstream_url {
+            return Err(AppError::new(
+                "SECURITY_POLICY_DENIED",
+                ErrorKind::Security,
+                "测试流目标事实与授权地址不一致",
+                false,
+            ));
+        }
+        if upstream_url
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+        {
+            return Err(AppError::new(
+                "SECURITY_POLICY_DENIED",
+                ErrorKind::Security,
+                "测试流目标地址不受安全策略允许",
+                false,
+            ));
+        }
+        let parsed = upstream_url.parse::<reqwest::Url>().map_err(|_| {
+            AppError::new(
+                "SECURITY_POLICY_DENIED",
+                ErrorKind::Security,
+                "测试流目标地址不受安全策略允许",
+                false,
+            )
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(AppError::new(
+                "SECURITY_POLICY_DENIED",
+                ErrorKind::Security,
+                "测试流目标地址不受安全策略允许",
+                false,
+            ));
+        }
+        let initial_host = validate_host(parsed.host_str().ok_or_else(|| {
+            AppError::new(
+                "SECURITY_POLICY_DENIED",
+                ErrorKind::Security,
+                "测试流目标地址不受安全策略允许",
+                false,
+            )
+        })?)
+        .map_err(|_| {
+            AppError::new(
+                "SECURITY_POLICY_DENIED",
+                ErrorKind::Security,
+                "测试流目标地址不受安全策略允许",
+                false,
+            )
+        })?;
+        Ok(self.insert_grant(facts, initial_host, owner_label))
+    }
+
+    fn insert_grant(
+        &self,
+        facts: StreamGrantFacts,
+        initial_host: String,
+        owner_label: &str,
+    ) -> Uuid {
+        let grant = Uuid::new_v4();
+        let mut hosts = HashSet::new();
+        hosts.insert(initial_host.clone());
         let inner = Arc::new(StreamGrantInner {
             facts,
             owner_label: owner_label.to_owned(),
@@ -210,29 +307,16 @@ impl StreamRegistry {
 
 /// 从 URL 提取小写 host。
 pub(crate) fn host_of(url: &str) -> Option<String> {
-    if url.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
-        return None;
-    }
-    let parsed = url.parse::<reqwest::Url>().ok()?;
-    if !matches!(parsed.scheme(), "http" | "https")
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-    {
-        return None;
-    }
-    parsed.host_str().map(|host| {
-        host.strip_prefix('[')
-            .and_then(|value| value.strip_suffix(']'))
-            .unwrap_or(host)
-            .to_ascii_lowercase()
-    })
+    parse_http_url(url, HttpUrlPolicy::MediaResource)
+        .ok()
+        .map(|safe| safe.host().to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn facts() -> StreamGrantFacts {
+    fn facts(upstream_url: &str) -> StreamGrantFacts {
         StreamGrantFacts {
             work_id: "w".into(),
             edition_id: "e".into(),
@@ -240,14 +324,20 @@ mod tests {
             mime_type: Some("application/vnd.apple.mpegurl".into()),
             is_hls: true,
             progress: None,
-            upstream_url: "https://cdn.example.com/a/index.m3u8".into(),
+            upstream_url: upstream_url.into(),
         }
     }
 
     #[test]
     fn register_lookup_revoke_by_owner() {
         let registry = StreamRegistry::new();
-        let grant = registry.register(facts(), "https://cdn.example.com/a/index.m3u8", "main");
+        let grant = registry
+            .register(
+                facts("https://cdn.example.com/a/index.m3u8"),
+                "https://cdn.example.com/a/index.m3u8",
+                "main",
+            )
+            .unwrap();
         let id = grant.to_string();
         assert!(registry.lookup(&id, "main").is_some());
         assert!(registry.lookup(&id, "other").is_none(), "跨窗口拒绝");
@@ -257,9 +347,31 @@ mod tests {
     }
 
     #[test]
+    fn registration_rejects_unsafe_initial_targets() {
+        let registry = StreamRegistry::new();
+        for url in [
+            "http://127.0.0.1/video.mp4",
+            "http://10.0.0.1/video.mp4",
+            "http://169.254.169.254/latest/meta-data",
+            "https://[::1]/video.mp4",
+            "https://media.internal/video.mp4",
+            "https://cdn.example.com:12345/video.mp4",
+        ] {
+            let error = registry.register(facts(url), url, "main").unwrap_err();
+            assert_eq!(error.code().as_str(), "SECURITY_POLICY_DENIED", "{url}");
+        }
+    }
+
+    #[test]
     fn hosts_learned_via_manifest_are_authorized_others_denied() {
         let registry = StreamRegistry::new();
-        let grant = registry.register(facts(), "https://cdn.example.com/a.m3u8", "main");
+        let grant = registry
+            .register(
+                facts("https://cdn.example.com/a.m3u8"),
+                "https://cdn.example.com/a.m3u8",
+                "main",
+            )
+            .unwrap();
         let inner = registry.lookup(&grant.to_string(), "main").unwrap();
         assert!(inner.host_allowed("cdn.example.com"));
         assert!(
@@ -268,12 +380,28 @@ mod tests {
         );
         inner.learn_hosts(["seg.other-cdn.net"]);
         assert!(inner.host_allowed("seg.other-cdn.net"));
+        inner.learn_hosts([
+            "127.0.0.1",
+            "10.0.0.1",
+            "169.254.169.254",
+            "localhost",
+            "media.internal",
+            "2001:db8::1",
+        ]);
+        assert!(!inner.host_allowed("127.0.0.1"));
+        assert!(!inner.host_allowed("media.internal"));
     }
 
     #[test]
     fn learned_hosts_are_bounded_and_evict_oldest_non_initial_host() {
         let registry = StreamRegistry::new();
-        let grant = registry.register(facts(), "https://cdn.example.com/a.m3u8", "main");
+        let grant = registry
+            .register(
+                facts("https://cdn.example.com/a.m3u8"),
+                "https://cdn.example.com/a.m3u8",
+                "main",
+            )
+            .unwrap();
         let inner = registry.lookup(&grant.to_string(), "main").unwrap();
 
         inner.learn_hosts(
@@ -296,8 +424,8 @@ mod tests {
         assert_eq!(host_of("ftp://x/y"), None);
         assert_eq!(host_of("not-a-url"), None);
         assert_eq!(
-            host_of("https://[2001:DB8::10]:8443/a/x.ts").as_deref(),
-            Some("2001:db8::10")
+            host_of("https://[2001:4860:4860::8888]:8443/a/x.ts").as_deref(),
+            Some("2001:4860:4860::8888")
         );
         assert_eq!(host_of("https://user:secret@cdn.example.com/a"), None);
         assert_eq!(host_of("https://cdn.example.com/a\n.ts"), None);
@@ -306,7 +434,13 @@ mod tests {
     #[test]
     fn target_tokens_are_opaque_and_owner_bound() {
         let registry = StreamRegistry::new();
-        let grant = registry.register(facts(), "https://cdn.example.com/a.m3u8", "main");
+        let grant = registry
+            .register(
+                facts("https://cdn.example.com/a.m3u8"),
+                "https://cdn.example.com/a.m3u8",
+                "main",
+            )
+            .unwrap();
         let inner = registry.lookup(&grant.to_string(), "main").unwrap();
         let token = inner.register_target("https://cdn.example.com/seg-01.ts");
         assert_eq!(token.len(), 36);
@@ -321,7 +455,13 @@ mod tests {
     #[test]
     fn target_tokens_evict_in_insertion_order() {
         let registry = StreamRegistry::new();
-        let grant = registry.register(facts(), "https://cdn.example.com/a.m3u8", "main");
+        let grant = registry
+            .register(
+                facts("https://cdn.example.com/a.m3u8"),
+                "https://cdn.example.com/a.m3u8",
+                "main",
+            )
+            .unwrap();
         let inner = registry.lookup(&grant.to_string(), "main").unwrap();
         let first = inner.register_target("https://cdn.example.com/first.ts");
         let second = inner.register_target("https://cdn.example.com/second.ts");
@@ -342,7 +482,13 @@ mod tests {
     #[test]
     fn repeated_target_reuses_token_and_refreshes_eviction_order() {
         let registry = StreamRegistry::new();
-        let grant = registry.register(facts(), "https://cdn.example.com/a.m3u8", "main");
+        let grant = registry
+            .register(
+                facts("https://cdn.example.com/a.m3u8"),
+                "https://cdn.example.com/a.m3u8",
+                "main",
+            )
+            .unwrap();
         let inner = registry.lookup(&grant.to_string(), "main").unwrap();
         let repeated = "https://cdn.example.com/repeated.ts";
         let first = inner.register_target(repeated);

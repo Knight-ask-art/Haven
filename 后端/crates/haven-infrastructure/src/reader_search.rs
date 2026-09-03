@@ -683,6 +683,7 @@ mod tests {
             storage_location_id: Some(StorageLocationId::new()),
             canonical_root: Some(std::fs::canonicalize(root).unwrap()),
             canonical_file: Some(std::fs::canonicalize(file).unwrap()),
+            subtitle_tracks: Vec::new(),
             source: PreparedSessionSource::Local,
             mime_type: Some(mime.into()),
             media_type: MediaType::Book,

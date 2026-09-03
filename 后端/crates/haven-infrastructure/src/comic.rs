@@ -608,6 +608,7 @@ mod tests {
             storage_location_id: Some(StorageLocationId::new()),
             canonical_root: Some(fs::canonicalize(root).unwrap()),
             canonical_file: Some(fs::canonicalize(source).unwrap()),
+            subtitle_tracks: Vec::new(),
             source: haven_application::services::session::PreparedSessionSource::Local,
             mime_type: None,
             media_type: MediaType::Comic,
