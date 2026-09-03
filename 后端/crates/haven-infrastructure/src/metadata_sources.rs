@@ -15,14 +15,18 @@ use haven_application::services::source_registry::SourceRegistryService;
 use haven_application::wire::{
     ContentCategory, ExternalIdDto, ExternalIdProviderDto, MediaTypeDto, QueryCategory, WorkCardDto,
 };
+use haven_common::network::{HttpUrlPolicy, parse_http_url};
 use haven_common::{AppError, ErrorKind};
 use quick_xml::events::Event;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::http_security::{pin_client_builder, resolve_public_http_target};
+
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(1_500);
+const MAX_REDIRECTS: usize = 3;
 const SOURCE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 const TVMAZE_URL: &str = "https://api.tvmaze.com/search/shows";
@@ -154,6 +158,27 @@ impl MetadataSourceKind {
         }
     }
 
+    /// The fixed authority for this built-in metadata provider. The source
+    /// constants are the provider trust boundary, so a redirect must remain
+    /// on this exact HTTPS host. User-configured M3U uses the separate generic
+    /// public-URL path.
+    fn fixed_host(self) -> &'static str {
+        match self {
+            Self::Tvmaze => "api.tvmaze.com",
+            Self::Bangumi => "api.bgm.tv",
+            Self::Anilist => "graphql.anilist.co",
+            Self::Itunes => "itunes.apple.com",
+            Self::Gutenberg => "www.gutenberg.org",
+            Self::InternetArchive => "archive.org",
+            Self::Mangadex => "api.mangadex.org",
+            Self::Arxiv => "export.arxiv.org",
+            Self::EuropePmc => "www.ebi.ac.uk",
+            Self::Wikisource => "zh.wikisource.org",
+            Self::Crossref => "api.crossref.org",
+            Self::Openalex => "api.openalex.org",
+        }
+    }
+
     fn supports_category(self, category: Option<QueryCategory>) -> bool {
         match self {
             Self::Bangumi | Self::Anilist => matches!(
@@ -215,89 +240,149 @@ fn provider_supports_category(source_id: &str, category: &str) -> bool {
 }
 
 /// 固定 API 的共享客户端。每个来源仍使用自己的固定 URL；共享仅限传输层配置。
-#[derive(Clone)]
-pub struct MetadataClient {
-    http: reqwest::Client,
-}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MetadataClient;
 
 impl MetadataClient {
     pub fn new() -> Result<Self, AppError> {
-        let http = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            // Windows 代理/TUN 环境下 Open Library 的 HTTP/2 ALPN 偶发在 TLS
-            // 握手后被重置；固定使用 HTTP/1.1 仍保留 HTTPS 与证书校验。
-            .http1_only()
-            // 部分公开资料站（例如 Open Library）会在 TLS/边缘层拒绝非浏览器
-            // UA；这是后端固定策略，不接受 Provider 或前端注入 Header。
-            .user_agent(SOURCE_USER_AGENT)
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() >= 3 {
-                    return attempt.stop();
-                }
-                if matches!(attempt.url().scheme(), "http" | "https") {
-                    attempt.follow()
-                } else {
-                    attempt.stop()
-                }
-            }))
-            .build()
-            .map_err(|_| internal_error("元数据来源客户端初始化失败"))?;
-        Ok(Self { http })
+        Ok(Self)
     }
 
-    async fn get_json(&self, request: reqwest::RequestBuilder) -> Result<Value, AppError> {
+    async fn get_json(&self, url: &str, source: MetadataSourceKind) -> Result<Value, AppError> {
         let body = self
-            .send_limited(request.header("Accept", "application/json"))
+            .send_limited(
+                reqwest::Method::GET,
+                url,
+                None,
+                "application/json",
+                Some(source),
+            )
             .await?;
         serde_json::from_slice(&body).map_err(|_| source_unavailable("来源返回了无效 JSON"))
     }
 
     async fn post_json(
         &self,
-        request: reqwest::RequestBuilder,
+        url: &str,
         payload: &Value,
+        source: MetadataSourceKind,
     ) -> Result<Value, AppError> {
-        self.get_json(request.json(payload)).await
+        let body = self
+            .send_limited(
+                reqwest::Method::POST,
+                url,
+                Some(payload),
+                "application/json",
+                Some(source),
+            )
+            .await?;
+        serde_json::from_slice(&body).map_err(|_| source_unavailable("来源返回了无效 JSON"))
     }
 
-    async fn get_text(&self, request: reqwest::RequestBuilder) -> Result<String, AppError> {
+    async fn get_text(&self, url: &str, source: MetadataSourceKind) -> Result<String, AppError> {
         let body = self
-            .send_limited(request.header(
-                "Accept",
+            .send_limited(
+                reqwest::Method::GET,
+                url,
+                None,
                 "application/atom+xml,application/xml,text/plain;q=0.9,*/*;q=0.1",
-            ))
+                Some(source),
+            )
             .await?;
         String::from_utf8(body).map_err(|_| source_unavailable("来源返回了无法读取的文本"))
     }
 
-    async fn send_limited(&self, request: reqwest::RequestBuilder) -> Result<Vec<u8>, AppError> {
-        let response = request
-            .send()
-            .await
-            .map_err(|_| source_unavailable("来源服务暂时不可达"))?;
-        if !response.status().is_success() {
-            return Err(source_unavailable("来源服务返回异常状态"));
-        }
-        if response
-            .content_length()
-            .is_some_and(|len| len as usize > MAX_BODY_BYTES)
-        {
-            return Err(source_unavailable("来源响应超出大小上限"));
-        }
-        let mut body = Vec::with_capacity(64 * 1024);
-        let mut response = response;
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| source_unavailable("来源响应读取中断"))?
-        {
-            if body.len() + chunk.len() > MAX_BODY_BYTES {
+    async fn send_limited(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        payload: Option<&Value>,
+        accept: &str,
+        fixed_source: Option<MetadataSourceKind>,
+    ) -> Result<Vec<u8>, AppError> {
+        let mut current = match fixed_source {
+            Some(source) => validate_fixed_metadata_url(url, source)?,
+            None => parse_http_url(url, HttpUrlPolicy::SourceEndpoint)
+                .map_err(|_| source_unavailable("来源地址不安全"))?
+                .into_url(),
+        };
+        for _ in 0..=MAX_REDIRECTS {
+            if let Some(source) = fixed_source {
+                // Re-check the complete URL after every join. This preserves
+                // the fixed provider authority even if a redirect is an
+                // otherwise valid public HTTP(S) URL.
+                validate_fixed_metadata_url(current.as_str(), source)?;
+            }
+            let target =
+                resolve_public_http_target(current.as_str(), HttpUrlPolicy::SourceEndpoint)
+                    .await
+                    .map_err(|_| source_unavailable("来源地址解析不安全"))?;
+            let builder = reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                // Keep the fixed-source client predictable on Windows while
+                // preserving HTTPS certificate validation.
+                .http1_only()
+                .redirect(reqwest::redirect::Policy::none())
+                .user_agent(SOURCE_USER_AGENT);
+            let client = pin_client_builder(builder, &target)
+                .build()
+                .map_err(|_| internal_error("元数据来源客户端初始化失败"))?;
+            let mut request = client
+                .request(method.clone(), target.url.clone())
+                .header("Accept", accept);
+            if let Some(payload) = payload {
+                request = request.json(payload);
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|_| source_unavailable("来源服务暂时不可达"))?;
+            if response.status().is_redirection() {
+                // Only GET source reads are safe to replay. The sole POST
+                // provider (AniList) must fail closed on a redirect rather
+                // than sending its JSON body to another authority.
+                if method != reqwest::Method::GET {
+                    return Err(source_unavailable("来源请求重定向不受支持"));
+                }
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| source_unavailable("来源重定向地址无效"))?;
+                current = target
+                    .url
+                    .join(location)
+                    .map_err(|_| source_unavailable("来源重定向地址无效"))?;
+                if let Some(source) = fixed_source {
+                    validate_fixed_metadata_url(current.as_str(), source)?;
+                }
+                continue;
+            }
+            if !response.status().is_success() {
+                return Err(source_unavailable("来源服务返回异常状态"));
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > MAX_BODY_BYTES as u64)
+            {
                 return Err(source_unavailable("来源响应超出大小上限"));
             }
-            body.extend_from_slice(chunk.as_ref());
+            let mut body = Vec::with_capacity(64 * 1024);
+            let mut response = response;
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| source_unavailable("来源响应读取中断"))?
+            {
+                if body.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
+                    return Err(source_unavailable("来源响应超出大小上限"));
+                }
+                body.extend_from_slice(chunk.as_ref());
+            }
+            return Ok(body);
         }
-        Ok(body)
+        Err(source_unavailable("来源重定向次数过多"))
     }
 
     async fn search(
@@ -324,7 +409,7 @@ impl MetadataClient {
 
     async fn search_tvmaze(&self, query: &str, limit: u32) -> Result<Vec<WorkCardDto>, AppError> {
         let url = format!("{TVMAZE_URL}?q={}", urlencode(query));
-        let value = self.get_json(self.http.get(url)).await?;
+        let value = self.get_json(&url, MetadataSourceKind::Tvmaze).await?;
         let items = value
             .as_array()
             .ok_or_else(|| source_unavailable("TVMaze 返回结构异常"))?;
@@ -359,7 +444,7 @@ impl MetadataClient {
             "filter": { "type": [1, 2] }
         });
         let value = self
-            .post_json(self.http.post(BANGUMI_URL), &payload)
+            .post_json(BANGUMI_URL, &payload, MetadataSourceKind::Bangumi)
             .await?;
         let items = value
             .get("data")
@@ -412,7 +497,10 @@ impl MetadataClient {
                 "query": QUERY,
                 "variables": { "search": query, "type": media_type, "perPage": limit }
             });
-            let value = match self.post_json(self.http.post(ANILIST_URL), &payload).await {
+            let value = match self
+                .post_json(ANILIST_URL, &payload, MetadataSourceKind::Anilist)
+                .await
+            {
                 Ok(value) => {
                     succeeded = true;
                     value
@@ -485,7 +573,7 @@ impl MetadataClient {
             "{ITUNES_URL}?term={}&media=tvShow&entity=tvSeason&country=us&limit={limit}",
             urlencode(query)
         );
-        let value = self.get_json(self.http.get(url)).await?;
+        let value = self.get_json(&url, MetadataSourceKind::Itunes).await?;
         let items = value
             .get("results")
             .and_then(Value::as_array)
@@ -523,7 +611,7 @@ impl MetadataClient {
         limit: u32,
     ) -> Result<Vec<WorkCardDto>, AppError> {
         let url = format!("{GUTENBERG_OPDS_URL}/?query={}", urlencode(query));
-        let xml = self.get_text(self.http.get(url)).await?;
+        let xml = self.get_text(&url, MetadataSourceKind::Gutenberg).await?;
         Ok(parse_atom_titles(&xml)
             .iter()
             .filter_map(|(id, title)| {
@@ -558,7 +646,9 @@ impl MetadataClient {
             "{INTERNET_ARCHIVE_URL}?q={}&fl%5B%5D=identifier&fl%5B%5D=title&fl%5B%5D=description&fl%5B%5D=year&rows={limit}&page=1&output=json",
             urlencode(&archive_query)
         );
-        let value = self.get_json(self.http.get(url)).await?;
+        let value = self
+            .get_json(&url, MetadataSourceKind::InternetArchive)
+            .await?;
         let items = value
             .get("response")
             .and_then(|response| response.get("docs"))
@@ -588,7 +678,7 @@ impl MetadataClient {
             "{MANGADEX_URL}?title={}&limit={limit}&includes[]=cover_art",
             urlencode(query)
         );
-        let value = self.get_json(self.http.get(url)).await?;
+        let value = self.get_json(&url, MetadataSourceKind::Mangadex).await?;
         let items = value
             .get("data")
             .and_then(Value::as_array)
@@ -621,7 +711,7 @@ impl MetadataClient {
             "{ARXIV_URL}?search_query=all:{}&start=0&max_results={limit}",
             urlencode(query)
         );
-        let xml = self.get_text(self.http.get(url)).await?;
+        let xml = self.get_text(&url, MetadataSourceKind::Arxiv).await?;
         let entries = parse_arxiv_entries(&xml);
         Ok(entries
             .into_iter()
@@ -652,7 +742,7 @@ impl MetadataClient {
             "{EUROPE_PMC_URL}?query={}%20AND%20OPEN_ACCESS:Y&format=json&resultType=core&pageSize={limit}",
             urlencode(query)
         );
-        let value = self.get_json(self.http.get(url)).await?;
+        let value = self.get_json(&url, MetadataSourceKind::EuropePmc).await?;
         let items = value
             .get("resultList")
             .and_then(|v| v.get("result"))
@@ -695,7 +785,7 @@ impl MetadataClient {
             "{WIKISOURCE_URL}?action=query&list=search&srsearch={}&srlimit={limit}&format=json&formatversion=2",
             urlencode(query)
         );
-        let value = self.get_json(self.http.get(url)).await?;
+        let value = self.get_json(&url, MetadataSourceKind::Wikisource).await?;
         let items = value
             .get("query")
             .and_then(|v| v.get("search"))
@@ -723,7 +813,7 @@ impl MetadataClient {
 
     async fn search_crossref(&self, query: &str, limit: u32) -> Result<Vec<WorkCardDto>, AppError> {
         let url = format!("{CROSSREF_URL}?query={}&rows={limit}", urlencode(query));
-        let value = self.get_json(self.http.get(url)).await?;
+        let value = self.get_json(&url, MetadataSourceKind::Crossref).await?;
         let items = value
             .get("message")
             .and_then(|v| v.get("items"))
@@ -762,7 +852,7 @@ impl MetadataClient {
             "{OPENALEX_URL}?search={}&per-page={limit}",
             urlencode(query)
         );
-        let value = self.get_json(self.http.get(url)).await?;
+        let value = self.get_json(&url, MetadataSourceKind::Openalex).await?;
         let items = value
             .get("results")
             .and_then(Value::as_array)
@@ -789,8 +879,60 @@ impl MetadataClient {
     }
 
     async fn fetch_limited_url(&self, url: &str) -> Result<Vec<u8>, AppError> {
-        self.send_limited(self.http.get(url)).await
+        self.send_limited(
+            reqwest::Method::GET,
+            url,
+            None,
+            "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain;q=0.9,*/*;q=0.1",
+            None,
+        )
+        .await
     }
+}
+
+/// Validate a built-in Provider URL before resolving or sending it. The
+/// shared URL policy handles generic syntax and public-address classes; this
+/// second policy keeps each fixed Provider on its exact HTTPS authority and
+/// rejects explicit ports, including an explicitly written default `:443`.
+fn validate_fixed_metadata_url(
+    raw: &str,
+    source: MetadataSourceKind,
+) -> Result<reqwest::Url, AppError> {
+    let safe = parse_http_url(raw, HttpUrlPolicy::SourceEndpoint)
+        .map_err(|_| source_unavailable("来源地址不安全"))?;
+    let host = safe.host().to_owned();
+    let url = safe.into_url();
+    if url.scheme() != "https"
+        || url.port().is_some()
+        || has_explicit_authority_port(raw)
+        || host != source.fixed_host()
+    {
+        return Err(source_unavailable("固定来源地址不安全"));
+    }
+    Ok(url)
+}
+
+/// `url::Url` normalizes an explicit default port away from `Url::port()`;
+/// fixed Provider policies still need to distinguish `https://host` from
+/// `https://host:443` so an upstream change cannot widen the authority.
+fn has_explicit_authority_port(raw: &str) -> bool {
+    let Some((_, after_scheme)) = raw.split_once("://") else {
+        return false;
+    };
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if host.starts_with('[') {
+        return host.find(']').is_some_and(|end| {
+            host.get(end + 1..)
+                .is_some_and(|tail| tail.starts_with(':'))
+        });
+    }
+    host.contains(':')
 }
 
 /// 固定 API 来源参与者工厂。每个条目都有真实搜索实现并由 Composition Root 注册。
@@ -923,7 +1065,7 @@ fn parse_m3u_entries(text: &str) -> Vec<M3uEntry> {
             pending = Some((title, attribute(line, "group-title")));
         } else if !line.starts_with('#') {
             if let Some((title, group)) = pending.take() {
-                if line.starts_with("http://") || line.starts_with("https://") {
+                if parse_http_url(line, HttpUrlPolicy::MediaResource).is_ok() {
                     entries.push(M3uEntry {
                         title,
                         url: line.to_owned(),
@@ -1290,6 +1432,28 @@ mod tests {
     }
 
     #[test]
+    fn fixed_metadata_urls_stay_on_their_provider_authority() {
+        for source in METADATA_SOURCE_KINDS {
+            let url = format!("https://{}/health", source.fixed_host());
+            assert!(
+                validate_fixed_metadata_url(&url, source).is_ok(),
+                "fixed provider URL rejected: {url}"
+            );
+        }
+        for url in [
+            "http://api.tvmaze.com/search/shows",
+            "https://api.tvmaze.com:443/search/shows",
+            "https://api.tvmaze.com:8443/search/shows",
+            "https://evil.example/search/shows",
+        ] {
+            assert!(
+                validate_fixed_metadata_url(url, MetadataSourceKind::Tvmaze).is_err(),
+                "unsafe fixed provider URL accepted: {url}"
+            );
+        }
+    }
+
+    #[test]
     fn builtin_catalog_has_a_registered_search_path_for_every_entry() {
         validate_builtin_search_coverage().expect("内置来源必须全部绑定真实搜索参与者");
     }
@@ -1312,7 +1476,7 @@ mod tests {
     #[test]
     fn parses_m3u_only_pairs_and_filters_non_http() {
         let entries = parse_m3u_entries(
-            "#EXTM3U\n#EXTINF:-1 tvg-name=\"News\" group-title=\"Live\",News\nhttps://cdn.example/news.m3u8\n#EXTINF:-1,Offline\nfile:///tmp/nope\n",
+            "#EXTM3U\n#EXTINF:-1 tvg-name=\"News\" group-title=\"Live\",News\nhttps://cdn.example/news.m3u8\n#EXTINF:-1,Offline\nfile:///tmp/nope\n#EXTINF:-1,LAN\nhttp://127.0.0.1:8080/live.m3u8\n",
         );
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].title, "News");

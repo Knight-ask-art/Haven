@@ -19,8 +19,11 @@ use haven_application::services::CMS10_CANDIDATE_PREFIX;
 use haven_application::services::SourceRegistryService;
 use haven_application::services::search_source::SearchSourceParticipant;
 use haven_application::wire::WorkCardDto;
+use haven_common::network::{HttpUrlPolicy, parse_http_url};
 use haven_common::{AppError, ErrorKind};
 use serde::Deserialize;
+
+use crate::http_security::{pin_client_builder, resolve_public_http_target};
 
 pub const CMS10_SOURCE_ID: &str = "cms10";
 
@@ -73,6 +76,8 @@ struct Cms10RawItem {
 
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_REDIRECTS: usize = 3;
 
 impl TryFrom<Cms10RawItem> for Cms10Entry {
     type Error = AppError;
@@ -232,47 +237,81 @@ fn source_unavailable(message: &'static str) -> AppError {
 }
 
 /// CMS10 HTTP 客户端。
-pub struct Cms10Client {
-    http: reqwest::Client,
-}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Cms10Client;
 
 impl Cms10Client {
     pub fn new() -> Result<Self, AppError> {
-        let http = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .user_agent(concat!("Haven/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|e| {
-                AppError::new(
-                    "INTERNAL_ERROR",
-                    ErrorKind::Internal,
-                    "HTTP 客户端初始化失败",
-                    false,
-                )
-                .with_source(e)
-            })?;
-        Ok(Self { http })
+        Ok(Self)
     }
 
-    async fn fetch_entries(
+    async fn fetch_limited(
         &self,
-        endpoint: &str,
-        query: &str,
+        method: reqwest::Method,
+        url: &str,
+        payload: Option<&serde_json::Value>,
     ) -> Result<Vec<Cms10Entry>, AppError> {
-        // 查询串必须是 ? 参数（MacCMS 路由按 query 分发 ac）；拼进路径会被站点忽略，
-        // 导致搜索不过滤、详情缺 vod_play_url（实战验收发现的回归）。
-        let url = format!("{}?ac=videolist&{}", endpoint.trim_end_matches('/'), query);
-        let response = self.http.get(&url).send().await.map_err(map_network_err)?;
-        if !response.status().is_success() {
-            return Err(source_unavailable("采集站返回非成功状态"));
+        let mut current = parse_http_url(url, HttpUrlPolicy::SourceEndpoint)
+            .map_err(|_| source_unavailable("采集站地址不安全"))?
+            .into_url();
+        for _ in 0..=MAX_REDIRECTS {
+            let target =
+                resolve_public_http_target(current.as_str(), HttpUrlPolicy::SourceEndpoint)
+                    .await
+                    .map_err(|_| source_unavailable("采集站地址解析不安全"))?;
+            let builder = reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                .http1_only()
+                .redirect(reqwest::redirect::Policy::none())
+                .user_agent(concat!("Haven/", env!("CARGO_PKG_VERSION")));
+            let client = pin_client_builder(builder, &target)
+                .build()
+                .map_err(|_| source_unavailable("采集站客户端初始化失败"))?;
+            let mut request = client.request(method.clone(), target.url.clone());
+            if let Some(payload) = payload {
+                request = request.json(payload);
+            }
+            let response = request.send().await.map_err(map_network_err)?;
+            if response.status().is_redirection() {
+                // The CMS10 path is GET-only. Refusing to replay another method
+                // avoids silently changing its semantics at a redirect target.
+                if method != reqwest::Method::GET {
+                    return Err(source_unavailable("采集站请求重定向不受支持"));
+                }
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| source_unavailable("采集站重定向地址无效"))?;
+                current = target
+                    .url
+                    .join(location)
+                    .map_err(|_| source_unavailable("采集站重定向地址无效"))?;
+                continue;
+            }
+            if !response.status().is_success() {
+                return Err(source_unavailable("采集站返回非成功状态"));
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > MAX_BODY_BYTES as u64)
+            {
+                return Err(source_unavailable("采集站响应超出大小上限"));
+            }
+            let mut bytes = Vec::with_capacity(64 * 1024);
+            let mut response = response;
+            while let Some(chunk) = response.chunk().await.map_err(map_network_err)? {
+                if bytes.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
+                    return Err(source_unavailable("采集站响应超出大小上限"));
+                }
+                bytes.extend_from_slice(chunk.as_ref());
+            }
+            let parsed: Cms10Response = serde_json::from_slice(&bytes)
+                .map_err(|_| source_unavailable("采集站响应不是有效 CMS10 JSON"))?;
+            return parsed.list.into_iter().map(Cms10Entry::try_from).collect();
         }
-        let bytes = response.bytes().await.map_err(map_network_err)?;
-        if bytes.len() > MAX_BODY_BYTES {
-            return Err(source_unavailable("采集站响应超出大小上限"));
-        }
-        let parsed: Cms10Response = serde_json::from_slice(&bytes)
-            .map_err(|_| source_unavailable("采集站响应不是有效 CMS10 JSON"))?;
-        parsed.list.into_iter().map(Cms10Entry::try_from).collect()
+        Err(source_unavailable("采集站重定向次数过多"))
     }
 
     /// 关键词搜索（按 limit 截断）。
@@ -282,9 +321,9 @@ impl Cms10Client {
         query: &str,
         limit: u32,
     ) -> Result<Vec<Cms10Entry>, AppError> {
-        let encoded = urlencode(query);
+        let url = build_cms10_url(endpoint, "wd", query)?;
         let mut entries = self
-            .fetch_entries(endpoint, &format!("wd={encoded}"))
+            .fetch_limited(reqwest::Method::GET, url.as_str(), None)
             .await?;
         entries.truncate(limit as usize);
         Ok(entries)
@@ -292,8 +331,9 @@ impl Cms10Client {
 
     /// 按 vod_id 取详情（含播放组）。
     pub async fn detail(&self, endpoint: &str, vod_id: &str) -> Result<Cms10Entry, AppError> {
+        let url = build_cms10_url(endpoint, "ids", vod_id)?;
         let mut entries = self
-            .fetch_entries(endpoint, &format!("ids={}", urlencode(vod_id)))
+            .fetch_limited(reqwest::Method::GET, url.as_str(), None)
             .await?;
         entries
             .pop()
@@ -313,18 +353,33 @@ fn map_network_err(err: reqwest::Error) -> AppError {
     source_unavailable(kind)
 }
 
-/// 极简百分号编码（查询值足够用；空格 → %20）。
-fn urlencode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*byte as char)
-            }
-            other => out.push_str(&format!("%{other:02X}")),
-        }
+/// CMS10 查询参数始终通过 URL API 写入，避免 endpoint 中已有 query 时
+/// 生成第二个 `?`，也避免把用户输入拼进路径或解释成额外参数。
+fn build_cms10_url(endpoint: &str, key: &str, value: &str) -> Result<reqwest::Url, AppError> {
+    if !matches!(key, "wd" | "ids") {
+        return Err(AppError::new(
+            "INVALID_ARGUMENT",
+            ErrorKind::Validation,
+            "CMS10 查询参数非法",
+            false,
+        ));
     }
-    out
+    let mut url = parse_http_url(endpoint, HttpUrlPolicy::SourceEndpoint)
+        .map_err(|_| {
+            AppError::new(
+                "INVALID_ARGUMENT",
+                ErrorKind::Validation,
+                "采集站端点非法",
+                false,
+            )
+        })?
+        .into_url();
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("ac", "videolist");
+        query.append_pair(key, value);
+    }
+    Ok(url)
 }
 
 /// CMS10 目录适配器：把 Cms10Client 适配为 application 的 SourceCatalogProvider。
@@ -505,8 +560,17 @@ mod tests {
     }
 
     #[test]
-    fn urlencode_matches_query_expectations() {
-        assert_eq!(urlencode("庆余年"), "%E5%BA%86%E4%BD%99%E5%B9%B4");
-        assert_eq!(urlencode("abc-1"), "abc-1");
+    fn cms10_query_is_encoded_without_path_concatenation() {
+        let url = build_cms10_url(
+            "https://media.example.invalid/api.php?token=opaque",
+            "wd",
+            "庆余年",
+        )
+        .unwrap();
+        assert_eq!(url.path(), "/api.php");
+        let query = url.query().unwrap();
+        assert!(query.contains("ac=videolist"));
+        assert!(query.contains("wd=%E5%BA%86%E4%BD%99%E5%B9%B4"));
+        assert!(query.contains("token=opaque"));
     }
 }

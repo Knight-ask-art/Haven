@@ -2,7 +2,7 @@ import React, { useState } from "react"
 import { 
   Play, Pause, ArrowLeft, Volume2, VolumeX,
   Maximize, Minimize, Layers, SkipForward, SkipBack,
-  Bookmark, Check
+  Bookmark, Captions, Check
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 
@@ -23,6 +23,10 @@ interface VideoControlsProps {
   isBookmarkDisabled: boolean
   isBuffering?: boolean
   bufferedRanges?: Array<[number, number]>
+  subtitleOptions?: VideoSubtitleOption[]
+  selectedSubtitleId?: string | null
+  subtitleLoading?: boolean
+  subtitleError?: string | null
   onPlayPause: () => void
   onSeek: (time: number) => void
   onVolumeChange: (vol: number) => void
@@ -35,6 +39,13 @@ interface VideoControlsProps {
   onToggleBookmark: () => void
   onNextEpisode?: () => void
   onPrevEpisode?: () => void
+  onSubtitleChange?: (subtitleId: string | null) => void
+}
+
+export interface VideoSubtitleOption {
+  id: string
+  label: string
+  language: string | null
 }
 
 function formatTime(seconds: number): string {
@@ -66,6 +77,10 @@ export function VideoControls({
   isBookmarkDisabled,
   isBuffering = false,
   bufferedRanges = [],
+  subtitleOptions = [],
+  selectedSubtitleId = null,
+  subtitleLoading = false,
+  subtitleError = null,
   onPlayPause,
   onSeek,
   onVolumeChange,
@@ -77,10 +92,12 @@ export function VideoControls({
   onOpenEpisodes,
   onToggleBookmark,
   onNextEpisode,
-  onPrevEpisode
+  onPrevEpisode,
+  onSubtitleChange,
 }: VideoControlsProps) {
   const [showSpeedMenu, setShowSpeedMenu] = useState(false)
   const [showQualityMenu, setShowQualityMenu] = useState(false)
+  const [showSubtitleMenu, setShowSubtitleMenu] = useState(false)
   const [isHoveringProgress, setIsHoveringProgress] = useState(false)
   const [hoverTime, setHoverTime] = useState<number | null>(null)
   const [hoverPosition, setHoverPosition] = useState<number>(0)
@@ -305,7 +322,7 @@ export function VideoControls({
             </div>
           </div>
 
-          {/* 右侧：无底色控制按钮组 (选集、倍速、画质、全屏) */}
+          {/* 右侧：无底色控制按钮组 (书签、选集、字幕、倍速、画质、全屏) */}
           <div className="flex items-center gap-1.5 relative shrink-0">
             <button
               type="button"
@@ -337,10 +354,90 @@ export function VideoControls({
               >
                 <Layers className="w-5 h-5" />
                 <span>选集</span>
-              </button>
+                </button>
+              )}
+
+            {/* 字幕选择器：外挂字幕和 HLS 字幕共用一个用户入口。 */}
+            {onSubtitleChange && (subtitleOptions.length > 0 || subtitleLoading || subtitleError) && (
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setShowSubtitleMenu(!showSubtitleMenu)}
+                  aria-label="字幕"
+                  aria-haspopup="menu"
+                  aria-expanded={showSubtitleMenu}
+                  className={cn(
+                    "h-10 px-[10px] rounded-full flex items-center justify-center gap-1.5 text-sm font-semibold tracking-wide transition-all cursor-pointer select-none",
+                    "bg-transparent hover:bg-white/10 text-white border border-transparent",
+                    "hover:scale-105 active:scale-95",
+                  )}
+                  title={subtitleError ?? (subtitleLoading ? "正在加载字幕" : "字幕")}
+                >
+                  <Captions className="w-5 h-5" />
+                  <span className="hidden sm:inline">字幕</span>
+                </button>
+
+                {showSubtitleMenu && (
+                  <div
+                    role="menu"
+                    aria-label="字幕轨道"
+                    className="absolute bottom-full right-0 mb-3 w-[190px] p-1.5 rounded-2xl bg-zinc-900/90 backdrop-blur-2xl border border-white/15 text-white flex flex-col gap-0.5 shadow-2xl z-50 animate-in fade-in zoom-in-95 duration-150"
+                  >
+                    <button
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={selectedSubtitleId === null}
+                      onClick={() => {
+                        onSubtitleChange(null)
+                        setShowSubtitleMenu(false)
+                      }}
+                      className={cn(
+                        "flex items-center justify-between px-3 py-[8px] rounded-xl text-xs font-semibold transition-all cursor-pointer text-left",
+                        selectedSubtitleId === null
+                          ? "bg-white/20 text-white font-bold"
+                          : "text-white/80 hover:bg-white/10 hover:text-white",
+                      )}
+                    >
+                      <span>关闭字幕</span>
+                      {selectedSubtitleId === null && <Check className="w-3.5 h-3.5 text-white" />}
+                    </button>
+
+                    {subtitleLoading && (
+                      <div className="px-3 py-2 text-xs text-white/60">正在加载字幕…</div>
+                    )}
+                    {subtitleError && (
+                      <div role="alert" className="px-3 py-2 text-xs leading-5 text-red-300">
+                        {subtitleError}
+                      </div>
+                    )}
+
+                    {subtitleOptions.map((option) => (
+                      <button
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={selectedSubtitleId === option.id}
+                        key={option.id}
+                        onClick={() => {
+                          onSubtitleChange(option.id)
+                          setShowSubtitleMenu(false)
+                        }}
+                        className={cn(
+                          "flex items-center justify-between px-3 py-[8px] rounded-xl text-xs font-semibold transition-all cursor-pointer text-left",
+                          selectedSubtitleId === option.id
+                            ? "bg-white/20 text-white font-bold"
+                            : "text-white/80 hover:bg-white/10 hover:text-white",
+                        )}
+                      >
+                        <span className="truncate pr-2">{option.label}</span>
+                        {selectedSubtitleId === option.id && <Check className="w-3.5 h-3.5 shrink-0 text-white" />}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
             )}
 
-             {/* 倍速选择器 */}
+            {/* 倍速选择器 */}
             <div className="relative">
               <button
                 onClick={() => setShowSpeedMenu(!showSpeedMenu)}

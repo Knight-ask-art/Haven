@@ -17,6 +17,64 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  film-tv-evidence:
+    name: Film/TV local and CI evidence
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Configure ASCII Cargo target directory
+        shell: pwsh
+        run: |
+          $temp = Join-Path $env:RUNNER_TEMP "haven-film-tv-temp"
+          New-Item -ItemType Directory -Force -Path $temp | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$env:RUNNER_TEMP/haven-film-tv-target"
+          Add-Content -Path $env:GITHUB_ENV -Value "TEMP=$temp"
+          Add-Content -Path $env:GITHUB_ENV -Value "TMP=$temp"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: 前端/app/package-lock.json
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.x"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+
+      - name: Install frontend dependencies
+        working-directory: 前端/app
+        run: npm ci --no-audit --no-fund
+
+      - name: Test film/TV evidence checker
+        run: python tools/film-tv/evidence-check.test.py
+
+      - name: Run film/TV CI evidence checks
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python tools/film-tv/evidence-check.py --layer ci --output "$env:RUNNER_TEMP/film-tv-ci-evidence.json"
+
+      - name: Upload film/TV CI evidence summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: film-tv-ci-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/film-tv-ci-evidence.json
+          if-no-files-found: error
+
   build-and-check:
     name: Public build and release checks
     runs-on: windows-latest
@@ -24,6 +82,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Configure ASCII Cargo target directory
         # Keep native build outputs outside the Chinese checkout path. Some
@@ -74,6 +134,10 @@ jobs:
       - name: Frontend governance
         working-directory: 前端/app
         run: npm run governance:check
+
+      - name: Film/TV fixture contract
+        working-directory: 前端/app
+        run: npm run fixtures:check
 
       - name: Frontend tests
         working-directory: 前端/app

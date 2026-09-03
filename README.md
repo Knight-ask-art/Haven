@@ -73,7 +73,7 @@ Rust + SQLite 是持久化事实源。前端的 Mock 只在显式浏览器开发
 
 目前支持的 Windows 本地内容核心有：视频、TXT、Markdown、EPUB、PDF、HTML、CBZ 和图片目录。支持范围、已知限制和升级说明请参阅[公开变更记录](CHANGELOG.md)。
 
-当前明确不提供：外挂字幕、音轨切换、HEVC 控制；OCR/翻译/AI、Sync 和“清除全部本地数据”需要独立 Foundation/风险评审后再开放。自动更新在签名 Release 正式发布前保持不可用。
+影视优化分支正在接入受控外挂字幕：当前实现覆盖 SRT/VTT/SBV 的编码归一化、轨道切换与资源生命周期，但尚未完成 runtime/release 四层验收，不能宣称已进入 `v0.1.0-beta.1` 发布能力。音轨切换和 HEVC 控制仍未开放；OCR/翻译/AI、Sync 和“清除全部本地数据”需要独立 Foundation/风险评审后再开放。自动更新在签名 Release 正式发布前保持不可用。
 
 ## Quick start (Windows)
 
@@ -106,7 +106,10 @@ cargo build --locked --features custom-protocol
 cd 前端/app
 npm run ci:check
 
-cd ../../后端
+cd ../..
+python tools/film-tv/evidence-check.py --layer contract
+
+cd 后端
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace
@@ -133,6 +136,7 @@ Tauri 桌面版本已经接入固定的 HTTPS GitHub Release 检查链；在维�
 - [内置来源能力表](SOURCES.md)
 - [CMS10 用户配置说明](CMS10_USER_CONFIG.md)
 - [第三方许可说明](THIRD_PARTY_NOTICES.md)
+- [影视四层验收合同](contracts/film-tv/README.md)
 
 ## License
 

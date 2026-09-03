@@ -80,7 +80,7 @@ pub use search_source::{
     DEFAULT_LIMIT_PER_SOURCE, MAX_LIMIT_PER_SOURCE, MAX_QUERY_LEN, SearchCancelOutcome,
     SearchEventSink, SearchSourceParticipant, SearchSourceService,
 };
-pub use session::{PreparedSession, PreparedSessionSource, SessionService};
+pub use session::{PreparedSession, PreparedSessionSource, PreparedSubtitleTrack, SessionService};
 pub use settings::{
     SettingsService, SettingsSnapshot, SettingsTxPorts, SettingsUoW, SettingsUpdateResult,
 };

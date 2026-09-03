@@ -17,5 +17,6 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+url = "2.5.8"
 
 # 许可证为 PO 决策项（DECISIONS.md），公开发布前锁定。

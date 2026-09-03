@@ -777,6 +777,35 @@ pub struct SessionOpenRequest {
     pub engine: SessionEngineDto,
 }
 
+/// 字幕格式是受控的解析提示，不是文件名或路径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum SubtitleFormatDto {
+    Srt,
+    Vtt,
+    Sbv,
+    Ass,
+    Ssa,
+    Ttml,
+    Dfxp,
+    Sub,
+    Lrc,
+    Unknown,
+}
+
+/// Session 内可消费的字幕轨道。路径、来源 URL 和凭据永不进入 Wire。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct SubtitleTrackDto {
+    pub track_id: String,
+    pub label: String,
+    pub language: Option<String>,
+    pub format: SubtitleFormatDto,
+    pub content_uri: String,
+}
+
 /// 打开消费 Session 的安全响应。受控内容 URI 由 Tauri registry 签发。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -797,6 +826,10 @@ pub struct SessionOpenResultDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub stream_kind: Option<StreamKindDto>,
+    /// 与本地视频同目录且仍在存储根内的受控外挂字幕；旧客户端可省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub subtitle_tracks: Option<Vec<SubtitleTrackDto>>,
 }
 
 /// 关闭消费 Session 的请求（幂等撤销；sessionId 为不透明 UUID token）。

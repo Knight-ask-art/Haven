@@ -1,6 +1,6 @@
 import { HavenError } from "@/lib/ipc/errors"
 import { isTauriRuntime } from "@/lib/ipc/runtime.js"
-import { SESSION_URI_PATTERN } from "./session-gateway"
+import { SESSION_URI_PATTERN, SUBTITLE_URI_PATTERN } from "./session-gateway"
 
 const BYTE_RANGE_PATTERN = /^bytes=(\d*)-(\d*)$/
 const ALLOWED_CONTENT_TYPES = new Set([
@@ -16,6 +16,7 @@ const ALLOWED_CONTENT_TYPES = new Set([
   "text/plain",
   "text/markdown",
   "text/html",
+  "text/vtt",
   "video/mp4",
   "video/webm",
   "video/x-matroska",
@@ -98,7 +99,7 @@ export async function fetchSessionResource(
   contentUri: string,
   options: ResourceFetchOptions = {},
 ): Promise<ResourceFetchResult> {
-  if (!SESSION_URI_PATTERN.test(contentUri)) {
+  if (!SESSION_URI_PATTERN.test(contentUri) && !SUBTITLE_URI_PATTERN.test(contentUri)) {
     throw resourceError("INVALID_ARGUMENT", "资源地址无效")
   }
   if (options.range !== undefined && !isValidByteRange(options.range)) {

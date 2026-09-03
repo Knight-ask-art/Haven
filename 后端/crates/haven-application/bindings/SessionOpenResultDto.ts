@@ -2,6 +2,7 @@
 import type { ProgressSummaryDto } from "./ProgressSummaryDto";
 import type { SessionEngineDto } from "./SessionEngineDto";
 import type { StreamKindDto } from "./StreamKindDto";
+import type { SubtitleTrackDto } from "./SubtitleTrackDto";
 
 /**
  * 打开消费 Session 的安全响应。受控内容 URI 由 Tauri registry 签发。
@@ -15,4 +16,8 @@ contentUri: string | null, workId: string, editionId: string, mediaItemId: strin
  * 受控播放流的安全类型提示。旧客户端可省略；`hls` 由播放器交给
  * hls.js，`direct` 使用浏览器原生 `<video>`，不暴露上游 MIME/URL。
  */
-streamKind?: StreamKindDto, };
+streamKind?: StreamKindDto, 
+/**
+ * 与本地视频同目录且仍在存储根内的受控外挂字幕；旧客户端可省略。
+ */
+subtitleTracks?: Array<SubtitleTrackDto>, };

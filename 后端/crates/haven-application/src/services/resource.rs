@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use haven_common::network::{HttpUrlPolicy, parse_http_url};
 use haven_common::{AppError, ErrorKind};
 use haven_domain::contracts::{MediaItemRepository, ResourceRepository, StorageLocationRepository};
 use haven_domain::entities::{Resource, ResourceLocator};
@@ -260,71 +261,13 @@ fn online_readable_locator(
 /// capability projection deliberately narrow: only the implemented HTTP video
 /// and HLS resource kinds may opt in. DASH remains an explicit domain enum but
 /// is unavailable until a complete player path is implemented. The URL must
-/// also have a conventional HTTP(S) authority.
+/// also pass the shared outbound HTTP URL policy.
 /// The URL itself never crosses the resource-summary wire boundary.
 pub(crate) fn http_stream_online_readable(resource_type: ResourceType, raw_url: &str) -> bool {
-    if !matches!(
+    matches!(
         resource_type,
         ResourceType::VideoStream | ResourceType::HlsStream
-    ) {
-        return false;
-    }
-
-    // Reject control/whitespace characters before looking at the authority so
-    // malformed values cannot be mistaken for a valid stream locator.
-    if raw_url.is_empty()
-        || raw_url
-            .chars()
-            .any(|ch| ch.is_control() || ch.is_whitespace())
-    {
-        return false;
-    }
-
-    let Some((scheme, remainder)) = raw_url.split_once("://") else {
-        return false;
-    };
-    if !matches!(scheme, "http" | "https") {
-        return false;
-    }
-
-    // The authority ends at the first path/query/fragment delimiter.  A host
-    // is required; user-info and an explicitly empty port are rejected here so
-    // this helper cannot bless a malformed or ambiguous stream URL.
-    let authority = remainder
-        .split_once(['/', '?', '#'])
-        .map_or(remainder, |(value, _)| value);
-    if authority.is_empty() || authority.contains('@') || authority.ends_with(':') {
-        return false;
-    }
-
-    // Bracketed IPv6 authorities are accepted when non-empty, with an optional
-    // numeric port.  Regular hosts likewise accept an optional numeric port;
-    // unbracketed IPv6 (multiple colons) is rejected as ambiguous.  This is a
-    // capability check only; the stream/session layer performs its own source
-    // and redirect policy validation before any network request.
-    if authority.starts_with('[') {
-        let Some(close) = authority.find(']') else {
-            return false;
-        };
-        if close <= 1 {
-            return false;
-        }
-        let suffix = &authority[close + 1..];
-        suffix.is_empty() || valid_port_suffix(suffix)
-    } else {
-        match authority.split_once(':') {
-            None => true,
-            Some((host, suffix)) => !host.is_empty() && valid_port(suffix),
-        }
-    }
-}
-
-fn valid_port_suffix(suffix: &str) -> bool {
-    suffix.strip_prefix(':').is_some_and(valid_port)
-}
-
-fn valid_port(value: &str) -> bool {
-    !value.is_empty() && value.parse::<u16>().is_ok()
+    ) && parse_http_url(raw_url, HttpUrlPolicy::MediaResource).is_ok()
 }
 
 fn is_stream_resource(resource_type: ResourceType) -> bool {
@@ -796,7 +739,7 @@ mod tests {
             ));
             assert!(http_stream_online_readable(
                 resource_type,
-                "https://[2001:db8::10]:8443/video/index.m3u8"
+                "https://[2001:4860:4860::8888]:8443/video/index.m3u8"
             ));
         }
 
