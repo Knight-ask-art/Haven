@@ -106,8 +106,8 @@ pub async fn comic_chapter_source_candidates_get(
     .await
 }
 
-/// 显式执行一次跨来源章节进度迁移。匹配证据不足时也允许最佳努力应用，
-/// 但结果必须携带低置信度和可撤销快照。
+/// 显式执行一次跨来源章节进度迁移。低置信度匹配只有在请求明确允许最佳
+/// 努力时才会应用；应用结果必须携带低置信度和可撤销快照。
 pub async fn run_comic_progress_migrate(
     state: &AppState,
     request: ComicProgressMigrationRequestDto,
@@ -536,6 +536,7 @@ mod tests {
                     remote_work_id: target.remote_work_id,
                     remote_chapter_id: target.remote_chapter_id,
                 },
+                allow_best_effort: false,
                 allow_target_overwrite: false,
             },
         )
@@ -621,6 +622,7 @@ mod tests {
                     remote_work_id: "work-b".into(),
                     remote_chapter_id: "chapter-b".into(),
                 },
+                allow_best_effort: false,
                 allow_target_overwrite: false,
             },
         )

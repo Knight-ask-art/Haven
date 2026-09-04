@@ -83,6 +83,7 @@ describe("comic progress migration wire guards", () => {
     const request: ComicProgressMigrationRequestDto = {
       source,
       target,
+      allowBestEffort: false,
       allowTargetOverwrite: false,
     }
     expect(isComicProgressMigrationRequestDto(request)).toBe(true)
@@ -95,6 +96,7 @@ describe("comic progress migration wire guards", () => {
     expect(isComicProgressMigrationRequestDto({
       source: { ...source, remoteChapterId: "https://example.invalid/chapter" },
       target,
+      allowBestEffort: false,
       allowTargetOverwrite: false,
     })).toBe(false)
 
@@ -155,6 +157,7 @@ describe("comic progress migration gateways", () => {
     const request: ComicProgressMigrationRequestDto = {
       source,
       target,
+      allowBestEffort: false,
       allowTargetOverwrite: false,
     }
 
@@ -180,6 +183,7 @@ describe("comic progress migration gateways", () => {
     await expect(migrateComicProgress({
       source,
       target,
+      allowBestEffort: false,
       allowTargetOverwrite: false,
     }, { comicProgressMigrate })).rejects.toMatchObject({
       code: "COMIC_PROGRESS_MIGRATION_INVALID_RESPONSE",

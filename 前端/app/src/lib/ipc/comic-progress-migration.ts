@@ -72,9 +72,10 @@ export function isComicProgressMigrationRequestDto(
   value: unknown,
 ): value is ComicProgressMigrationRequestDto {
   return isRecord(value)
-    && hasExactKeys(value, ["source", "target", "allowTargetOverwrite"])
+    && hasExactKeys(value, ["source", "target", "allowBestEffort", "allowTargetOverwrite"])
     && isSourceIdentity(value.source)
     && isSourceIdentity(value.target)
+    && typeof value.allowBestEffort === "boolean"
     && typeof value.allowTargetOverwrite === "boolean"
 }
 

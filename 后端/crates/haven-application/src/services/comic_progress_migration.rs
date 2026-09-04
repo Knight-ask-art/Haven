@@ -1,7 +1,8 @@
 //! 漫画章节换源与页面变化的进度迁移用例。
 //!
 //! 规则：
-//! - 章节身份先经过领域比较，只有 `OneTime` 才执行跨 MediaItem 迁移；
+//! - 章节身份先经过领域比较，`OneTime` 直接执行跨 MediaItem 迁移，
+//!   `Suggested` 只有显式允许最佳努力时才执行；
 //! - 页面数量/顺序变化允许最佳努力定位，结果始终保留策略、置信度和快照；
 //! - 目标已有进度默认不覆盖，显式允许后仍必须以目标 revision 做 CAS；
 //! - 运行时 pageId、grant、URL、归档 entry 不参与输入，也不会写入快照。
@@ -41,6 +42,8 @@ use crate::wire::{
 pub struct ComicProgressMigrationRequest {
     pub source: ChapterSourceIdentity,
     pub target: ChapterSourceIdentity,
+    /// 允许低置信度元数据匹配执行可撤销的最佳努力迁移。
+    pub allow_best_effort: bool,
     /// 只有用户明确选择覆盖目标现有进度时才设为 true。
     pub allow_target_overwrite: bool,
 }
@@ -95,6 +98,7 @@ impl ComicProgressMigrationService {
         let request = ComicProgressMigrationRequest {
             source: source_identity_to_domain(request.source)?,
             target: source_identity_to_domain(request.target)?,
+            allow_best_effort: request.allow_best_effort,
             allow_target_overwrite: request.allow_target_overwrite,
         };
         migration_result_to_dto(self.migrate(request).await?)
@@ -294,11 +298,21 @@ impl ComicProgressMigrationService {
                     applied_revision: None,
                 });
             }
+            ProgressMigrationMode::Suggested if !request.allow_best_effort => {
+                return Ok(ComicProgressMigrationResult {
+                    status: ComicProgressMigrationStatus::Suggested,
+                    match_result: Some(match_result),
+                    page_migration: no_page,
+                    snapshot_id: None,
+                    applied_revision: None,
+                });
+            }
             // `Shared` across two MediaItems still needs a one-time bridge until
             // the caller has explicitly converged both source refs onto one
-            // MediaItem. `Suggested` is deliberately best-effort here: the
-            // snapshot/rollback and CAS make weak evidence reversible without
-            // pretending that it proves exact content identity.
+            // MediaItem. `Suggested` is allowed only when the caller has opted
+            // into best-effort behavior; the snapshot/rollback and CAS make weak
+            // evidence reversible without pretending that it proves exact
+            // content identity.
             ProgressMigrationMode::Shared
             | ProgressMigrationMode::OneTime
             | ProgressMigrationMode::Suggested => {}
@@ -1139,6 +1153,7 @@ mod tests {
             .migrate(ComicProgressMigrationRequest {
                 source,
                 target,
+                allow_best_effort: false,
                 allow_target_overwrite: false,
             })
             .await
@@ -1239,6 +1254,7 @@ mod tests {
             .migrate(ComicProgressMigrationRequest {
                 source,
                 target,
+                allow_best_effort: false,
                 allow_target_overwrite: false,
             })
             .await
@@ -1260,7 +1276,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn weak_chapter_match_uses_page_count_fallback_and_keeps_snapshot() {
+    async fn weak_chapter_match_requires_explicit_best_effort_confirmation() {
         let (
             repositories,
             source,
@@ -1296,6 +1312,63 @@ mod tests {
             .migrate(ComicProgressMigrationRequest {
                 source,
                 target,
+                allow_best_effort: false,
+                allow_target_overwrite: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.status, ComicProgressMigrationStatus::Suggested);
+        assert_eq!(result.page_migration.target_page_index, None);
+        assert!(result.snapshot_id.is_none());
+        assert!(result.applied_revision.is_none());
+        assert!(
+            repositories
+                .progress
+                .get_for_media_item(target_media)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn weak_chapter_match_uses_page_count_fallback_and_keeps_snapshot_when_confirmed() {
+        let (
+            repositories,
+            source,
+            target,
+            work_id,
+            source_edition,
+            _target_edition,
+            source_media,
+            target_media,
+        ) = seed_fixture().await;
+        let (service, repositories) = configure_fixture(
+            repositories,
+            source.clone(),
+            target.clone(),
+            work_id,
+            source_edition,
+            source_media,
+            target_media,
+        )
+        .await;
+        repositories
+            .page_identity
+            .replace(source_media, &[], UtcMillis(3))
+            .await
+            .unwrap();
+        repositories
+            .page_identity
+            .replace(target_media, &[], UtcMillis(3))
+            .await
+            .unwrap();
+
+        let result = service
+            .migrate(ComicProgressMigrationRequest {
+                source,
+                target,
+                allow_best_effort: true,
                 allow_target_overwrite: false,
             })
             .await
@@ -1362,6 +1435,7 @@ mod tests {
             .migrate(ComicProgressMigrationRequest {
                 source,
                 target,
+                allow_best_effort: false,
                 allow_target_overwrite: false,
             })
             .await
@@ -1450,6 +1524,7 @@ mod tests {
             .migrate(ComicProgressMigrationRequest {
                 source,
                 target: unrelated_target,
+                allow_best_effort: false,
                 allow_target_overwrite: false,
             })
             .await
@@ -1564,6 +1639,7 @@ mod tests {
                     remote_work_id: target.remote_work_id,
                     remote_chapter_id: target.remote_chapter_id,
                 },
+                allow_best_effort: false,
                 allow_target_overwrite: false,
             })
             .await
