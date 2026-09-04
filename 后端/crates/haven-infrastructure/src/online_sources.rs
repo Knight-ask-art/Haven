@@ -1217,7 +1217,7 @@ fn consume_mangadex_feed_page(
     }
 
     if next_offset >= MAX_MANGA_CHAPTERS {
-        coverage.truncated = coverage
+        coverage.truncated |= coverage
             .total
             .map(|reported_total| reported_total as usize > next_offset)
             .unwrap_or(true);
@@ -1229,7 +1229,7 @@ fn consume_mangadex_feed_page(
     if raw_len == 0 {
         // An empty page with no total is not proof that the preceding pages
         // were a complete snapshot; preserve existing chapters as-is.
-        coverage.truncated = coverage
+        coverage.truncated |= coverage
             .total
             .map(|reported_total| reported_total as usize > next_offset)
             .unwrap_or(true);
@@ -1296,7 +1296,7 @@ fn readable_mangadex_chapter(chapter: &Value) -> Option<(String, String)> {
     parsed
         .availability
         .is_readable()
-        .then(|| (parsed.identity.remote_chapter_id, label))
+        .then_some((parsed.identity.remote_chapter_id, label))
 }
 
 fn mangadex_chapter_label(chapter: &ComicChapterCatalogEntry) -> String {
@@ -2065,6 +2065,32 @@ mod tests {
         })
     }
 
+    fn feed_chapter_for_index(index: usize) -> Value {
+        let id = format!("{index:08x}-0000-4000-8000-{index:012x}");
+        let number = index.to_string();
+        feed_chapter(&id, &number)
+    }
+
+    fn consume_valid_mangadex_prefix(
+        coverage: &mut MangadexFeedCoverage,
+        manga_id: &str,
+        end: usize,
+    ) {
+        for offset in (0..end).step_by(MANGADEX_FEED_PAGE_LIMIT) {
+            let page = (offset..offset + MANGADEX_FEED_PAGE_LIMIT)
+                .map(feed_chapter_for_index)
+                .collect::<Vec<_>>();
+            let outcome = consume_mangadex_feed_page(
+                coverage,
+                manga_id,
+                &page,
+                Some(MAX_MANGA_CHAPTERS as u32),
+                offset,
+            );
+            let _ = outcome;
+        }
+    }
+
     #[test]
     fn mangadex_feed_coverage_merges_multiple_pages_in_provider_order() {
         let manga_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -2169,6 +2195,93 @@ mod tests {
         );
         assert!(outcome.stop);
         assert!(contradictory_total.truncated);
+    }
+
+    #[test]
+    fn mangadex_feed_coverage_keeps_exact_five_hundred_chapter_boundary_complete() {
+        let manga_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut coverage = MangadexFeedCoverage::default();
+        consume_valid_mangadex_prefix(&mut coverage, manga_id, MAX_MANGA_CHAPTERS);
+
+        assert_eq!(coverage.chapters.len(), MAX_MANGA_CHAPTERS);
+        assert_eq!(coverage.total, Some(MAX_MANGA_CHAPTERS as u32));
+        assert!(!coverage.truncated);
+    }
+
+    #[test]
+    fn mangadex_feed_coverage_marks_chapters_beyond_the_safety_cap_as_truncated() {
+        let manga_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut coverage = MangadexFeedCoverage::default();
+        consume_valid_mangadex_prefix(&mut coverage, manga_id, 400);
+
+        assert!(
+            consume_mangadex_feed_page(
+                &mut coverage,
+                manga_id,
+                &(400..500).map(feed_chapter_for_index).collect::<Vec<_>>(),
+                Some((MAX_MANGA_CHAPTERS + 1) as u32),
+                400,
+            )
+            .stop
+        );
+        assert!(coverage.truncated);
+    }
+
+    #[test]
+    fn mangadex_feed_coverage_preserves_malformed_last_page_signal_at_cap() {
+        let manga_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut coverage = MangadexFeedCoverage::default();
+        consume_valid_mangadex_prefix(&mut coverage, manga_id, 400);
+        let mut final_page = (400..499).map(feed_chapter_for_index).collect::<Vec<_>>();
+        final_page.push(serde_json::json!({
+            "id": "not-a-mangadex-uuid",
+            "attributes": {"chapter": "499", "pages": 8}
+        }));
+
+        let outcome = consume_mangadex_feed_page(
+            &mut coverage,
+            manga_id,
+            &final_page,
+            Some(MAX_MANGA_CHAPTERS as u32),
+            400,
+        );
+        assert!(outcome.stop);
+        assert_eq!(coverage.chapters.len(), 499);
+        assert!(coverage.truncated);
+    }
+
+    #[test]
+    fn mangadex_feed_coverage_preserves_duplicate_last_page_signal_at_cap() {
+        let manga_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut coverage = MangadexFeedCoverage::default();
+        consume_valid_mangadex_prefix(&mut coverage, manga_id, 400);
+        let mut final_page = (400..499).map(feed_chapter_for_index).collect::<Vec<_>>();
+        final_page.push(feed_chapter_for_index(0));
+
+        let outcome = consume_mangadex_feed_page(
+            &mut coverage,
+            manga_id,
+            &final_page,
+            Some(MAX_MANGA_CHAPTERS as u32),
+            400,
+        );
+        assert!(outcome.stop);
+        assert_eq!(coverage.chapters.len(), 499);
+        assert!(coverage.truncated);
+    }
+
+    #[test]
+    fn mangadex_feed_coverage_preserves_contradictory_total_at_cap() {
+        let manga_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut coverage = MangadexFeedCoverage::default();
+        consume_valid_mangadex_prefix(&mut coverage, manga_id, 400);
+        let final_page = (400..500).map(feed_chapter_for_index).collect::<Vec<_>>();
+
+        let outcome =
+            consume_mangadex_feed_page(&mut coverage, manga_id, &final_page, Some(499), 400);
+        assert!(outcome.stop);
+        assert_eq!(coverage.chapters.len(), 500);
+        assert!(coverage.truncated);
     }
 
     #[test]

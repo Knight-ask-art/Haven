@@ -377,12 +377,7 @@ impl ComicProgressMigrationRepository for SqliteComicProgressMigrationRepository
             .ok_or_else(|| internal_error("迁移进度写入后无法读取权威状态"))?;
         let mut stored = snapshot.clone();
         stored.old_progress = source;
-        stored.old_target_progress =
-            if snapshot.source_media_item_id == snapshot.target_media_item_id {
-                target_before
-            } else {
-                target_before
-            };
+        stored.old_target_progress = target_before;
         stored.new_progress = authoritative;
         stored.applied_revision = Some(applied_revision.clone());
         stored.state = ProgressMigrationState::Applied;

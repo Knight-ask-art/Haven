@@ -72,6 +72,7 @@ const noProgressResult: ComicProgressMigrationResultDto = {
 
 const nonAppliedStatuses: Array<ComicProgressMigrationResultDto["status"]> = [
   "unchanged",
+  "not_applicable",
   "shared_content",
   "suggested",
   "target_progress_preserved",

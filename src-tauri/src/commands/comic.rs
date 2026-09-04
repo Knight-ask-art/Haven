@@ -370,9 +370,9 @@ mod tests {
             .replace(
                 source_media_item_id,
                 &[
-                    PageIdentity::stable("page-a"),
-                    PageIdentity::stable("removed"),
-                    PageIdentity::stable("page-c"),
+                    PageIdentity::stable("page-a").with_fingerprint("page-a-content"),
+                    PageIdentity::stable("removed").with_fingerprint("removed-content"),
+                    PageIdentity::stable("page-c").with_fingerprint("page-c-content"),
                 ],
                 haven_common::UtcMillis(2),
             )
@@ -384,9 +384,9 @@ mod tests {
             .replace(
                 target_media_item_id,
                 &[
-                    PageIdentity::stable("page-a"),
-                    PageIdentity::stable("page-c"),
-                    PageIdentity::stable("page-d"),
+                    PageIdentity::stable("page-a").with_fingerprint("page-a-content"),
+                    PageIdentity::stable("page-c").with_fingerprint("page-c-content"),
+                    PageIdentity::stable("page-d").with_fingerprint("page-d-content"),
                 ],
                 haven_common::UtcMillis(2),
             )

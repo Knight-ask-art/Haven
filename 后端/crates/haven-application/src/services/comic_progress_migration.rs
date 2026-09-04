@@ -15,7 +15,8 @@ use haven_domain::comic_identity::{
     ChapterEvidence, ChapterMatch, ChapterMatchKind, ChapterSourceIdentity,
     ComicProgressMigrationSnapshot, MatchConfidence, PageIdentity, PageMappingConfidence,
     PageMappingStrategy, PageMigration, ProgressMigrationMode, ProgressMigrationState,
-    compare_chapters, has_opaque_control_character, migrate_page_index,
+    compare_chapters, compare_chapters_within_media_item, has_opaque_control_character,
+    migrate_page_index,
 };
 use haven_domain::contracts::{
     ChapterSourceRepository, ComicPageIdentityRepository, ComicProgressMigrationRepository,
@@ -62,6 +63,7 @@ pub struct ComicPageProgressRemapRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComicProgressMigrationStatus {
     Unchanged,
+    NotApplicable,
     Applied,
     SharedContent,
     Suggested,
@@ -160,14 +162,25 @@ impl ComicProgressMigrationService {
                         pages_by_media_item.insert(item.id, pages.clone());
                         pages
                     };
-                    let match_result = compare_chapters(
-                        &source_ref.identity,
-                        &source_ref.metadata,
-                        &current_pages,
-                        &reference.identity,
-                        &reference.metadata,
-                        &pages,
-                    );
+                    let match_result = if source_ref.media_item_id == reference.media_item_id {
+                        compare_chapters_within_media_item(
+                            &source_ref.identity,
+                            &source_ref.metadata,
+                            &current_pages,
+                            &reference.identity,
+                            &reference.metadata,
+                            &pages,
+                        )
+                    } else {
+                        compare_chapters(
+                            &source_ref.identity,
+                            &source_ref.metadata,
+                            &current_pages,
+                            &reference.identity,
+                            &reference.metadata,
+                            &pages,
+                        )
+                    };
                     matched_candidates.push((reference, match_result));
                     if matched_candidates.len() > MAX_SOURCE_CANDIDATES {
                         truncated = true;
@@ -247,14 +260,14 @@ impl ComicProgressMigrationService {
         ensure_comic_media_item(&source_item)?;
         let source_edition = EditionRepository::get(&*self.ports, source_item.edition_id)
             .await?
-            .ok_or_else(|| edition_not_found())?;
+            .ok_or_else(edition_not_found)?;
         let target_item = MediaItemRepository::get(&*self.ports, target_ref.media_item_id)
             .await?
             .ok_or_else(|| media_item_not_found("目标漫画媒体条目不存在"))?;
         ensure_comic_media_item(&target_item)?;
         let target_edition = EditionRepository::get(&*self.ports, target_item.edition_id)
             .await?
-            .ok_or_else(|| edition_not_found())?;
+            .ok_or_else(edition_not_found)?;
         if source_edition.work_id != target_edition.work_id {
             return Err(comic_work_mismatch());
         }
@@ -262,14 +275,25 @@ impl ComicProgressMigrationService {
             ComicPageIdentityRepository::list(&*self.ports, source_ref.media_item_id).await?;
         let target_page_identities =
             ComicPageIdentityRepository::list(&*self.ports, target_ref.media_item_id).await?;
-        let match_result = compare_chapters(
-            &source_ref.identity,
-            &source_ref.metadata,
-            &source_page_identities,
-            &target_ref.identity,
-            &target_ref.metadata,
-            &target_page_identities,
-        );
+        let match_result = if source_ref.media_item_id == target_ref.media_item_id {
+            compare_chapters_within_media_item(
+                &source_ref.identity,
+                &source_ref.metadata,
+                &source_page_identities,
+                &target_ref.identity,
+                &target_ref.metadata,
+                &target_page_identities,
+            )
+        } else {
+            compare_chapters(
+                &source_ref.identity,
+                &source_ref.metadata,
+                &source_page_identities,
+                &target_ref.identity,
+                &target_ref.metadata,
+                &target_page_identities,
+            )
+        };
         let no_page = PageMigration {
             target_page_index: None,
             confidence: PageMappingConfidence::Low,
@@ -291,7 +315,7 @@ impl ComicProgressMigrationService {
             }
             ProgressMigrationMode::None => {
                 return Ok(ComicProgressMigrationResult {
-                    status: ComicProgressMigrationStatus::Suggested,
+                    status: ComicProgressMigrationStatus::NotApplicable,
                     match_result: Some(match_result),
                     page_migration: no_page,
                     snapshot_id: None,
@@ -440,7 +464,7 @@ impl ComicProgressMigrationService {
         ensure_comic_media_item(&item)?;
         let edition = EditionRepository::get(&*self.ports, item.edition_id)
             .await?
-            .ok_or_else(|| edition_not_found())?;
+            .ok_or_else(edition_not_found)?;
         let source_progress = ProgressRepository::get_for_media_item(&*self.ports, item.id).await?;
         let Some(source_progress) = source_progress else {
             return Ok(ComicProgressMigrationResult {
@@ -749,6 +773,9 @@ pub fn migration_result_to_dto(
 fn migration_status_to_dto(value: ComicProgressMigrationStatus) -> ComicProgressMigrationStatusDto {
     match value {
         ComicProgressMigrationStatus::Unchanged => ComicProgressMigrationStatusDto::Unchanged,
+        ComicProgressMigrationStatus::NotApplicable => {
+            ComicProgressMigrationStatusDto::NotApplicable
+        }
         ComicProgressMigrationStatus::Applied => ComicProgressMigrationStatusDto::Applied,
         ComicProgressMigrationStatus::SharedContent => {
             ComicProgressMigrationStatusDto::SharedContent
@@ -810,6 +837,10 @@ fn chapter_evidence_to_dto(value: ChapterEvidence) -> Result<ComicChapterEvidenc
         ChapterEvidence::AuthoritativeContentKey => {
             (ComicChapterEvidenceKindDto::AuthoritativeContentKey, None)
         }
+        ChapterEvidence::ConflictingAuthoritativeContentKey => (
+            ComicChapterEvidenceKindDto::ConflictingAuthoritativeContentKey,
+            None,
+        ),
         ChapterEvidence::EditionCompatible => {
             (ComicChapterEvidenceKindDto::EditionCompatible, None)
         }
@@ -920,7 +951,8 @@ fn revision_conflict() -> AppError {
 mod tests {
     use super::*;
     use haven_domain::comic_identity::{
-        ChapterSourceRef, ComicChapterMetadata, PageMappingConfidence, PageMappingStrategy,
+        ChapterSourceRef, ComicChapterMetadata, IdentityFacet, PageMappingConfidence,
+        PageMappingStrategy,
     };
     use haven_domain::contracts::{
         ChapterSourceRepository, ComicPageIdentityRepository, EditionRepository,
@@ -1080,9 +1112,9 @@ mod tests {
             .replace(
                 source_media,
                 &[
-                    PageIdentity::stable("a"),
-                    PageIdentity::stable("removed"),
-                    PageIdentity::stable("c"),
+                    PageIdentity::stable("a").with_fingerprint("page-a"),
+                    PageIdentity::stable("removed").with_fingerprint("page-removed"),
+                    PageIdentity::stable("c").with_fingerprint("page-c"),
                 ],
                 UtcMillis(2),
             )
@@ -1093,9 +1125,9 @@ mod tests {
             .replace(
                 target_media,
                 &[
-                    PageIdentity::stable("a"),
-                    PageIdentity::stable("c"),
-                    PageIdentity::stable("d"),
+                    PageIdentity::stable("a").with_fingerprint("page-a"),
+                    PageIdentity::stable("c").with_fingerprint("page-c"),
+                    PageIdentity::stable("d").with_fingerprint("page-d"),
                 ],
                 UtcMillis(2),
             )
@@ -1453,6 +1485,70 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_chapter_match_is_not_reported_as_suggested() {
+        let (
+            repositories,
+            source,
+            target,
+            work_id,
+            source_edition,
+            _target_edition,
+            source_media,
+            target_media,
+        ) = seed_fixture().await;
+        let (service, repositories) = configure_fixture(
+            repositories,
+            source.clone(),
+            target.clone(),
+            work_id,
+            source_edition,
+            source_media,
+            target_media,
+        )
+        .await;
+
+        let mut source_ref = repositories
+            .chapter_source
+            .get(&source)
+            .await
+            .unwrap()
+            .unwrap();
+        source_ref.metadata.edition_profile.language = IdentityFacet::known("zh-CN");
+        repositories.chapter_source.save(&source_ref).await.unwrap();
+        let mut target_ref = repositories
+            .chapter_source
+            .get(&target)
+            .await
+            .unwrap()
+            .unwrap();
+        target_ref.metadata.edition_profile.language = IdentityFacet::known("ja");
+        repositories.chapter_source.save(&target_ref).await.unwrap();
+
+        let result = service
+            .migrate(ComicProgressMigrationRequest {
+                source,
+                target,
+                allow_best_effort: true,
+                allow_target_overwrite: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.status, ComicProgressMigrationStatus::NotApplicable);
+        assert_eq!(
+            result.match_result.as_ref().map(|matched| matched.kind),
+            Some(ChapterMatchKind::Unrelated)
+        );
+        assert!(
+            repositories
+                .progress
+                .get_for_media_item(target_media)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

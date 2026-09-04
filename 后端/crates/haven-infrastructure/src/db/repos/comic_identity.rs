@@ -911,27 +911,28 @@ mod tests {
         let other_edition = EditionId::new();
         let other_media = MediaItemId::new();
         let work_id = WorkId::new();
-        let conn = db.lock();
-        conn.execute(
-            "INSERT INTO works (id, canonical_title, work_type, status, created_at, updated_at)
-             VALUES (?1, '第二作品', 'fiction', 'completed', 1, 1)",
-            rusqlite::params![work_id.to_string()],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO editions (id, work_id, title, edition_type, created_at, updated_at)
-             VALUES (?1, ?2, '另一版', 'comic', 1, 1)",
-            rusqlite::params![other_edition.to_string(), work_id.to_string()],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO media_items
-                (id, edition_id, media_type, title, category, status, created_at, updated_at)
-             VALUES (?1, ?2, 'comic', '另一话', 'comic', 'available', 1, 1)",
-            rusqlite::params![other_media.to_string(), other_edition.to_string()],
-        )
-        .unwrap();
-        drop(conn);
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO works (id, canonical_title, work_type, status, created_at, updated_at)
+                 VALUES (?1, '第二作品', 'fiction', 'completed', 1, 1)",
+                rusqlite::params![work_id.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO editions (id, work_id, title, edition_type, created_at, updated_at)
+                 VALUES (?1, ?2, '另一版', 'comic', 1, 1)",
+                rusqlite::params![other_edition.to_string(), work_id.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO media_items
+                    (id, edition_id, media_type, title, category, status, created_at, updated_at)
+                 VALUES (?1, ?2, 'comic', '另一话', 'comic', 'available', 1, 1)",
+                rusqlite::params![other_media.to_string(), other_edition.to_string()],
+            )
+            .unwrap();
+        }
         let repo = SqliteChapterSourceRepository::new(db);
         let base = ChapterSourceRef {
             media_item_id,

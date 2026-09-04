@@ -16,7 +16,8 @@ use haven_domain::comic_catalog::{
     ComicChapterCatalogState, ComicChapterSourceStatus,
 };
 use haven_domain::comic_identity::{
-    ChapterSourceIdentity, ChapterSourceRef, EditionProfile, edition_profiles_can_share_container,
+    ChapterSourceIdentity, ChapterSourceRef, ColorMode, EditionProfile, IdentityFacet,
+    ScanGroupFacet, edition_profiles_can_share_container,
 };
 use haven_domain::contracts::{
     ChapterSourceRepository, EditionProfileRepository, EditionRepository, MediaItemRepository,
@@ -1452,19 +1453,110 @@ fn new_comic_edition(
 
 fn group_catalog_chapters(catalog: &[ComicChapterCatalogEntry]) -> Vec<ComicEditionGroup> {
     let mut groups = Vec::new();
+
+    // Real content lines establish the partition first. A MirrorLabel has no
+    // content identity and must not claim the first group it happens to see;
+    // delaying those observations makes the result independent of provider
+    // response order.
+    let mut mirror_chapters = Vec::new();
     for (source_order, chapter) in catalog.iter().cloned().enumerate() {
-        if let Some(group) = groups.iter_mut().find(|group: &&mut ComicEditionGroup| {
-            edition_profiles_can_share_container(&group.profile, &chapter.metadata.edition_profile)
-        }) {
+        if matches!(
+            chapter.metadata.edition_profile.scan_group,
+            ScanGroupFacet::MirrorLabel(_)
+        ) {
+            mirror_chapters.push((source_order, chapter));
+        } else {
+            add_chapter_to_edition_group(&mut groups, source_order, chapter);
+        }
+    }
+
+    for (source_order, chapter) in mirror_chapters {
+        // A mirror label can join one compatible group, but it is never
+        // allowed to make two groups compatible with each other. If several
+        // real groups are otherwise compatible, choose by canonical profile
+        // order rather than input order so the assignment is deterministic.
+        let candidate_profile = chapter.metadata.edition_profile.clone();
+        let group_index = groups
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| group_accepts_profile(group, &candidate_profile))
+            .min_by_key(|(_, group)| edition_profile_order_key(&group.profile))
+            .map(|(index, _)| index);
+        if let Some(group_index) = group_index {
+            let group = &mut groups[group_index];
             group.chapters.push((source_order, chapter));
+            if matches!(group.profile.scan_group, ScanGroupFacet::MirrorLabel(_)) {
+                group.profile = candidate_profile;
+            }
         } else {
             groups.push(ComicEditionGroup {
-                profile: chapter.metadata.edition_profile.clone(),
+                profile: candidate_profile,
                 chapters: vec![(source_order, chapter)],
             });
         }
     }
+
     groups
+}
+
+fn add_chapter_to_edition_group(
+    groups: &mut Vec<ComicEditionGroup>,
+    source_order: usize,
+    chapter: ComicChapterCatalogEntry,
+) {
+    if let Some(group) = groups
+        .iter_mut()
+        .find(|group| group_accepts_profile(group, &chapter.metadata.edition_profile))
+    {
+        group.chapters.push((source_order, chapter));
+    } else {
+        groups.push(ComicEditionGroup {
+            profile: chapter.metadata.edition_profile.clone(),
+            chapters: vec![(source_order, chapter)],
+        });
+    }
+}
+
+fn group_accepts_profile(group: &ComicEditionGroup, candidate: &EditionProfile) -> bool {
+    group.chapters.iter().all(|(_, chapter)| {
+        edition_profiles_can_share_container(&chapter.metadata.edition_profile, candidate)
+    })
+}
+
+fn edition_profile_order_key(profile: &EditionProfile) -> String {
+    format!(
+        "{}\0{}\0{}\0{}",
+        identity_facet_order_key(&profile.language),
+        identity_facet_order_key(&profile.translation_line),
+        scan_group_order_key(&profile.scan_group),
+        color_mode_order_key(profile.color_mode),
+    )
+}
+
+fn identity_facet_order_key(value: &IdentityFacet) -> String {
+    match value {
+        IdentityFacet::Known(value) => format!("0:{value}"),
+        IdentityFacet::Unknown => "1:".to_owned(),
+        IdentityFacet::NotApplicable => "2:".to_owned(),
+    }
+}
+
+fn scan_group_order_key(value: &ScanGroupFacet) -> String {
+    match value {
+        ScanGroupFacet::ContentLine(value) => format!("0:{value}"),
+        ScanGroupFacet::MirrorLabel(value) => format!("1:{value}"),
+        ScanGroupFacet::Unknown => "2:".to_owned(),
+        ScanGroupFacet::NotApplicable => "3:".to_owned(),
+    }
+}
+
+fn color_mode_order_key(value: ColorMode) -> &'static str {
+    match value {
+        ColorMode::FullColor => "0",
+        ColorMode::Grayscale => "1",
+        ColorMode::Mixed => "2",
+        ColorMode::Unknown => "3",
+    }
 }
 
 struct ComicEditionGroup {
@@ -2213,6 +2305,104 @@ fn category_of(media_type: MediaType) -> ContentCategory {
 #[cfg(test)]
 mod candidate_tests {
     use super::*;
+    use haven_domain::comic_identity::ComicChapterMetadata;
+
+    fn comic_chapter(id: &str, scan_group: ScanGroupFacet) -> ComicChapterCatalogEntry {
+        ComicChapterCatalogEntry {
+            identity: ChapterSourceIdentity::new("test", "work", id).unwrap(),
+            metadata: ComicChapterMetadata {
+                edition_profile: EditionProfile {
+                    language: IdentityFacet::known("zh-CN"),
+                    translation_line: IdentityFacet::known("line-a"),
+                    scan_group,
+                    color_mode: ColorMode::Grayscale,
+                },
+                chapter_number: Some(1.0),
+                volume_number: None,
+                title: Some("第一章".into()),
+                page_count: Some(3),
+                authoritative_content_key: None,
+            },
+            availability: ComicChapterAvailability::Available,
+            published_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn group_signature(groups: &[ComicEditionGroup]) -> Vec<(Vec<String>, usize)> {
+        let mut signature = groups
+            .iter()
+            .map(|group| {
+                let mut content_lines = group
+                    .chapters
+                    .iter()
+                    .filter_map(
+                        |(_, chapter)| match &chapter.metadata.edition_profile.scan_group {
+                            ScanGroupFacet::ContentLine(value) => Some(value.clone()),
+                            ScanGroupFacet::Unknown
+                            | ScanGroupFacet::MirrorLabel(_)
+                            | ScanGroupFacet::NotApplicable => None,
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                content_lines.sort();
+                let mirror_count = group
+                    .chapters
+                    .iter()
+                    .filter(|(_, chapter)| {
+                        matches!(
+                            chapter.metadata.edition_profile.scan_group,
+                            ScanGroupFacet::MirrorLabel(_)
+                        )
+                    })
+                    .count();
+                (content_lines, mirror_count)
+            })
+            .collect::<Vec<_>>();
+        signature.sort();
+        signature
+    }
+
+    #[test]
+    fn mirror_labels_do_not_bridge_real_scan_groups_or_depend_on_input_order() {
+        let mirror = comic_chapter("mirror", ScanGroupFacet::mirror_label("mirror-site"));
+        let scan_a = comic_chapter("scan-a", ScanGroupFacet::content_line("scan-a"));
+        let scan_b = comic_chapter("scan-b", ScanGroupFacet::content_line("scan-b"));
+        let catalogs = [
+            vec![mirror.clone(), scan_a.clone(), scan_b.clone()],
+            vec![scan_a.clone(), mirror.clone(), scan_b.clone()],
+            vec![scan_b.clone(), mirror.clone(), scan_a.clone()],
+        ];
+
+        let expected = vec![
+            (vec!["scan-a".to_owned()], 1),
+            (vec!["scan-b".to_owned()], 0),
+        ];
+        for catalog in catalogs {
+            let groups = group_catalog_chapters(&catalog);
+            assert_eq!(groups.len(), 2);
+            assert_eq!(group_signature(&groups), expected);
+            assert!(groups.iter().all(|group| {
+                group
+                    .chapters
+                    .iter()
+                    .filter(|(_, chapter)| {
+                        matches!(
+                            chapter.metadata.edition_profile.scan_group,
+                            ScanGroupFacet::ContentLine(_)
+                        )
+                    })
+                    .count()
+                    <= 1
+            }));
+            assert!(groups.iter().any(|group| {
+                matches!(
+                    group.profile.scan_group,
+                    ScanGroupFacet::ContentLine(ref value) if value == "scan-a"
+                )
+            }));
+        }
+    }
 
     #[test]
     fn opaque_candidate_component_roundtrips_url_without_control_bytes() {

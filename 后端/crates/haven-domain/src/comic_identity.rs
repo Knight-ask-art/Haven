@@ -79,19 +79,14 @@ impl ScanGroupFacet {
 }
 
 /// 漫画内容本身的颜色版本，不包括阅读器的运行时灰度显示滤镜。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ColorMode {
+    #[default]
     Unknown,
     FullColor,
     Grayscale,
     Mixed,
-}
-
-impl Default for ColorMode {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 /// Edition 的内容画像。
@@ -390,7 +385,7 @@ impl ChapterSourceIdentity {
 }
 
 /// 章节的可比较元数据。章节号和标题只参与辅助匹配，不是主键。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct ComicChapterMetadata {
     pub edition_profile: EditionProfile,
@@ -399,19 +394,6 @@ pub struct ComicChapterMetadata {
     pub title: Option<String>,
     pub page_count: Option<u32>,
     pub authoritative_content_key: Option<String>,
-}
-
-impl Default for ComicChapterMetadata {
-    fn default() -> Self {
-        Self {
-            edition_profile: EditionProfile::default(),
-            chapter_number: None,
-            volume_number: None,
-            title: None,
-            page_count: None,
-            authoritative_content_key: None,
-        }
-    }
 }
 
 /// 页面身份只保留 provider 稳定 key 或内容指纹；不包含 pageId/grant/URL。
@@ -494,6 +476,7 @@ pub enum ProgressMigrationState {
 pub enum ChapterEvidence {
     SameRemoteIdentity,
     AuthoritativeContentKey,
+    ConflictingAuthoritativeContentKey,
     EditionCompatible,
     EditionConflict,
     ExactPageIdentity { matched: usize },
@@ -523,6 +506,50 @@ pub fn compare_chapters(
     right: &ComicChapterMetadata,
     right_pages: &[PageIdentity],
 ) -> ChapterMatch {
+    compare_chapters_with_page_scope(
+        left_identity,
+        left,
+        left_pages,
+        right_identity,
+        right,
+        right_pages,
+        false,
+    )
+}
+
+/// 比较同一个 `MediaItem` 内的两个章节来源观察。
+///
+/// 同一条持久化页面序列中的 provider stable key 可以用于识别插页、删页
+/// 和重排；跨 `MediaItem` 时必须由调用方使用 `compare_chapters`，此时 stable
+/// key 不会单独成为内容证据。
+pub fn compare_chapters_within_media_item(
+    left_identity: &ChapterSourceIdentity,
+    left: &ComicChapterMetadata,
+    left_pages: &[PageIdentity],
+    right_identity: &ChapterSourceIdentity,
+    right: &ComicChapterMetadata,
+    right_pages: &[PageIdentity],
+) -> ChapterMatch {
+    compare_chapters_with_page_scope(
+        left_identity,
+        left,
+        left_pages,
+        right_identity,
+        right,
+        right_pages,
+        true,
+    )
+}
+
+fn compare_chapters_with_page_scope(
+    left_identity: &ChapterSourceIdentity,
+    left: &ComicChapterMetadata,
+    left_pages: &[PageIdentity],
+    right_identity: &ChapterSourceIdentity,
+    right: &ComicChapterMetadata,
+    right_pages: &[PageIdentity],
+    allow_stable_page_identity: bool,
+) -> ChapterMatch {
     if left_identity == right_identity {
         return ChapterMatch {
             kind: ChapterMatchKind::SameRemoteChapter,
@@ -543,21 +570,34 @@ pub fn compare_chapters(
     }
 
     let mut evidence = vec![ChapterEvidence::EditionCompatible];
-    if same_non_empty_opaque(
+    let authoritative_key_conflict = match (
         left.authoritative_content_key.as_deref(),
         right.authoritative_content_key.as_deref(),
     ) {
-        evidence.push(ChapterEvidence::AuthoritativeContentKey);
-        return ChapterMatch {
-            kind: ChapterMatchKind::SameContent,
-            confidence: MatchConfidence::High,
-            progress_migration: ProgressMigrationMode::Shared,
-            evidence,
-        };
-    }
+        (Some(left_key), Some(right_key))
+            if !left_key.is_empty() && !right_key.is_empty() && left_key == right_key =>
+        {
+            evidence.push(ChapterEvidence::AuthoritativeContentKey);
+            return ChapterMatch {
+                kind: ChapterMatchKind::SameContent,
+                confidence: MatchConfidence::High,
+                progress_migration: ProgressMigrationMode::Shared,
+                evidence,
+            };
+        }
+        (Some(left_key), Some(right_key))
+            if !left_key.is_empty() && !right_key.is_empty() && left_key != right_key =>
+        {
+            evidence.push(ChapterEvidence::ConflictingAuthoritativeContentKey);
+            true
+        }
+        _ => false,
+    };
 
-    let page_matches = count_page_identity_matches(left_pages, right_pages);
-    if !left_pages.is_empty()
+    let page_matches =
+        count_page_identity_matches(left_pages, right_pages, allow_stable_page_identity);
+    if !authoritative_key_conflict
+        && !left_pages.is_empty()
         && left_pages.len() == right_pages.len()
         && page_matches == left_pages.len()
     {
@@ -582,6 +622,15 @@ pub fn compare_chapters(
         evidence.push(ChapterEvidence::MatchingChapterMetadata);
     } else {
         evidence.push(ChapterEvidence::WeakChapterMetadata);
+    }
+
+    if authoritative_key_conflict {
+        return ChapterMatch {
+            kind: ChapterMatchKind::Candidate,
+            confidence: MatchConfidence::Low,
+            progress_migration: ProgressMigrationMode::Suggested,
+            evidence,
+        };
     }
 
     if page_matches > 0 && metadata_matches {
@@ -629,15 +678,19 @@ fn matching_chapter_metadata(left: &ComicChapterMetadata, right: &ComicChapterMe
     (chapter_matches && volume_matches) || (title_matches && page_count_matches)
 }
 
-fn count_page_identity_matches(left: &[PageIdentity], right: &[PageIdentity]) -> usize {
+fn count_page_identity_matches(
+    left: &[PageIdentity],
+    right: &[PageIdentity],
+    allow_stable_page_identity: bool,
+) -> usize {
     let mut used = vec![false; right.len()];
     let mut matched = 0;
     for left_page in left {
-        if let Some((index, _)) = right
-            .iter()
-            .enumerate()
-            .find(|(index, right_page)| !used[*index] && page_identity_match(left_page, right_page))
-        {
+        if let Some((index, _)) = right.iter().enumerate().find(|(index, right_page)| {
+            !used[*index]
+                && page_identity_match(left_page, right_page, allow_stable_page_identity)
+                    == PageIdentityMatch::Match
+        }) {
             used[index] = true;
             matched += 1;
         }
@@ -645,8 +698,19 @@ fn count_page_identity_matches(left: &[PageIdentity], right: &[PageIdentity]) ->
     matched
 }
 
-fn page_identity_match(left: &PageIdentity, right: &PageIdentity) -> bool {
-    let stable_match = matches!(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageIdentityMatch {
+    Match,
+    Conflict,
+    NoMatch,
+}
+
+fn page_identity_match(
+    left: &PageIdentity,
+    right: &PageIdentity,
+    allow_stable_page_identity: bool,
+) -> PageIdentityMatch {
+    let stable_equal = matches!(
         (left.stable_key.as_deref(), right.stable_key.as_deref()),
         (Some(left), Some(right)) if left == right
     );
@@ -654,7 +718,18 @@ fn page_identity_match(left: &PageIdentity, right: &PageIdentity) -> bool {
         (left.fingerprint.as_deref(), right.fingerprint.as_deref()),
         (Some(left), Some(right)) if left == right
     );
-    stable_match || fingerprint_match
+    let fingerprint_conflict = matches!(
+        (left.fingerprint.as_deref(), right.fingerprint.as_deref()),
+        (Some(left), Some(right)) if left != right
+    );
+
+    if stable_equal && fingerprint_conflict {
+        PageIdentityMatch::Conflict
+    } else if (allow_stable_page_identity && stable_equal) || fingerprint_match {
+        PageIdentityMatch::Match
+    } else {
+        PageIdentityMatch::NoMatch
+    }
 }
 
 /// 页面迁移的置信度。低置信度也可以自动恢复，但必须显示原因并保留撤销快照。
@@ -778,7 +853,9 @@ fn unique_page_match(
             .iter()
             .enumerate()
             .filter_map(|(index, candidate)| {
-                (candidate.stable_key.as_deref() == Some(key)).then_some(index)
+                (candidate.stable_key.as_deref() == Some(key)
+                    && page_identity_match(page, candidate, true) == PageIdentityMatch::Match)
+                    .then_some(index)
             })
             .collect();
         if matches.len() == 1 {
@@ -796,7 +873,9 @@ fn unique_page_match(
             .iter()
             .enumerate()
             .filter_map(|(index, candidate)| {
-                (candidate.fingerprint.as_deref() == Some(fingerprint)).then_some(index)
+                (candidate.fingerprint.as_deref() == Some(fingerprint)
+                    && page_identity_match(page, candidate, true) == PageIdentityMatch::Match)
+                    .then_some(index)
             })
             .collect();
         if matches.len() == 1 {
@@ -836,10 +915,6 @@ fn proportional_index(old_index: usize, old_len: usize, new_len: usize) -> usize
     }
     let ratio = old_index as f64 / (old_len - 1) as f64;
     (ratio * (new_len - 1) as f64).round() as usize
-}
-
-fn same_non_empty_opaque(left: Option<&str>, right: Option<&str>) -> bool {
-    matches!((left, right), (Some(left), Some(right)) if !left.is_empty() && left == right)
 }
 
 fn normalize_label(value: &str) -> String {
@@ -1042,6 +1117,98 @@ mod tests {
         assert_eq!(result.kind, ChapterMatchKind::SameContent);
         assert_eq!(result.progress_migration, ProgressMigrationMode::Shared);
         assert_eq!(result.confidence, MatchConfidence::High);
+    }
+
+    #[test]
+    fn stable_page_names_are_not_cross_media_content_evidence() {
+        let left = chapter_metadata(EditionProfile::default());
+        let right = chapter_metadata(EditionProfile::default());
+        let pages = vec![PageIdentity::stable("001.jpg")];
+
+        let result = compare_chapters(
+            &source_chapter("chapter-a"),
+            &left,
+            &pages,
+            &source_chapter("chapter-b"),
+            &right,
+            &pages,
+        );
+
+        assert_eq!(result.kind, ChapterMatchKind::Candidate);
+        assert_eq!(result.confidence, MatchConfidence::Low);
+        assert_eq!(result.progress_migration, ProgressMigrationMode::Suggested);
+    }
+
+    #[test]
+    fn stable_page_names_can_match_within_one_media_item() {
+        let left = chapter_metadata(EditionProfile::default());
+        let right = chapter_metadata(EditionProfile::default());
+        let pages = vec![PageIdentity::stable("001.jpg")];
+
+        let result = compare_chapters_within_media_item(
+            &source_chapter("chapter-a"),
+            &left,
+            &pages,
+            &source_chapter("chapter-b"),
+            &right,
+            &pages,
+        );
+
+        assert_eq!(result.kind, ChapterMatchKind::SameContent);
+        assert_eq!(result.confidence, MatchConfidence::High);
+        assert_eq!(result.progress_migration, ProgressMigrationMode::Shared);
+    }
+
+    #[test]
+    fn stable_and_fingerprint_conflicts_are_not_page_matches() {
+        let old = vec![PageIdentity::stable("001.jpg").with_fingerprint("old")];
+        let new = vec![PageIdentity::stable("001.jpg").with_fingerprint("new")];
+
+        let migrated = migrate_page_index(&old, &new, 0);
+        assert_eq!(migrated.strategy, PageMappingStrategy::ProportionalFallback);
+        assert_eq!(migrated.confidence, PageMappingConfidence::Low);
+
+        let result = compare_chapters_within_media_item(
+            &source_chapter("chapter-a"),
+            &ComicChapterMetadata::default(),
+            &old,
+            &source_chapter("chapter-b"),
+            &ComicChapterMetadata::default(),
+            &new,
+        );
+        assert_eq!(result.kind, ChapterMatchKind::Candidate);
+        assert_ne!(result.progress_migration, ProgressMigrationMode::Shared);
+    }
+
+    #[test]
+    fn conflicting_authoritative_content_keys_require_best_effort() {
+        let left = ComicChapterMetadata {
+            authoritative_content_key: Some("content-a".into()),
+            ..Default::default()
+        };
+        let right = ComicChapterMetadata {
+            authoritative_content_key: Some("content-b".into()),
+            ..Default::default()
+        };
+        let pages = vec![PageIdentity::fingerprint("same-page")];
+
+        let result = compare_chapters(
+            &source_chapter("chapter-a"),
+            &left,
+            &pages,
+            &source_chapter("chapter-b"),
+            &right,
+            &pages,
+        );
+
+        assert_eq!(result.kind, ChapterMatchKind::Candidate);
+        assert_eq!(result.confidence, MatchConfidence::Low);
+        assert_eq!(result.progress_migration, ProgressMigrationMode::Suggested);
+        assert!(
+            result
+                .evidence
+                .contains(&ChapterEvidence::ConflictingAuthoritativeContentKey)
+        );
     }
 
     #[test]

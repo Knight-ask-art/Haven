@@ -1883,6 +1883,7 @@ pub struct ComicPageProgressRemapRequestDto {
 #[ts(export, rename_all = "snake_case")]
 pub enum ComicProgressMigrationStatusDto {
     Unchanged,
+    NotApplicable,
     Applied,
     SharedContent,
     Suggested,
@@ -1927,6 +1928,7 @@ pub enum ComicProgressMigrationModeDto {
 pub enum ComicChapterEvidenceKindDto {
     SameRemoteIdentity,
     AuthoritativeContentKey,
+    ConflictingAuthoritativeContentKey,
     EditionCompatible,
     EditionConflict,
     ExactPageIdentity,
