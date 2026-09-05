@@ -9,7 +9,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use haven_common::network::{parse_http_url, validate_host, HttpUrlPolicy};
+#[cfg(test)]
+use haven_common::network::validate_host;
+use haven_common::network::{parse_http_url, HttpUrlPolicy};
 use haven_common::{AppError, ErrorKind};
 use uuid::Uuid;
 
@@ -32,64 +34,90 @@ pub struct StreamGrantInner {
     pub facts: StreamGrantFacts,
     pub owner_label: String,
     initial_host: String,
-    allowed_hosts: Mutex<HashSet<String>>,
-    /// Opaque tokens for HLS manifest targets.  The browser receives only the
-    /// token in the proxy URI; the real upstream URL remains in this
-    /// owner-bound registry entry.
-    targets: Mutex<HashMap<String, (String, String)>>,
-    /// Insertion order for `targets`. `HashMap` iteration order is deliberately
-    /// unspecified, so it cannot be used to implement the bounded eviction
-    /// policy safely.
-    target_order: Mutex<VecDeque<String>>,
-    /// Manifest hosts learned after the initial request. Keep their insertion
-    /// order separately so a hostile manifest cannot grow this set without
-    /// bound. The initial host is retained independently and never evicted.
-    host_order: Mutex<VecDeque<String>>,
+    stream_state: Mutex<StreamTargetState>,
     created_at: Instant,
+}
+
+#[derive(Default)]
+struct StreamTargetState {
+    targets: HashMap<String, RegisteredTarget>,
+    manifest_versions: HashMap<String, VecDeque<String>>,
+}
+
+struct RegisteredTarget {
+    manifest_key: String,
+    version: String,
+    target: String,
+    host: String,
 }
 
 // A single long-form VOD manifest can legitimately contain thousands of
 // unique segment references. Keep the bound finite while ensuring one
 // manifest cannot invalidate references already handed to the player.
 const TARGET_CAP: usize = 4096;
-// Keep learned hosts aligned with target tokens. Evicting a host while its
-// opaque target tokens remain valid breaks an already-issued HLS manifest.
-const LEARNED_HOST_CAP: usize = TARGET_CAP;
+// Keep the current manifest plus one retired generation so requests already
+// dispatched by the player have a bounded grace period.
+const MANIFEST_VERSION_GRACE: usize = 2;
 
 impl StreamGrantInner {
-    /// Snapshot target state before rewriting one manifest. The complete
-    /// manifest is one lifecycle unit: failed reservations must not leave a
-    /// partially registered set of references behind.
-    pub(crate) fn target_snapshot(
+    /// Atomically replace one manifest slot. Candidates are prepared privately
+    /// by the request; capacity failure leaves every committed manifest intact.
+    pub(crate) fn commit_manifest(
         &self,
-    ) -> (
-        std::collections::HashMap<String, (String, String)>,
-        std::collections::VecDeque<String>,
-    ) {
-        let targets = self
-            .targets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let order = self
-            .target_order
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        (targets, order)
-    }
+        manifest_key: &str,
+        version: &str,
+        candidates: &[(String, String)],
+    ) -> bool {
+        let Some(validated) = candidates
+            .iter()
+            .map(|(token, target)| {
+                host_of(target).map(|host| (token.clone(), target.clone(), host))
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
 
-    pub(crate) fn restore_target_snapshot(
-        &self,
-        snapshot: (
-            std::collections::HashMap<String, (String, String)>,
-            std::collections::VecDeque<String>,
-        ),
-    ) {
-        let mut targets = self.targets.lock().unwrap_or_else(|e| e.into_inner());
-        let mut order = self.target_order.lock().unwrap_or_else(|e| e.into_inner());
-        *targets = snapshot.0;
-        *order = snapshot.1;
+        let mut state = self.stream_state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut versions = state
+            .manifest_versions
+            .get(manifest_key)
+            .cloned()
+            .unwrap_or_default();
+        versions.push_back(version.to_owned());
+        let mut retired = HashSet::new();
+        while versions.len() > MANIFEST_VERSION_GRACE {
+            if let Some(value) = versions.pop_front() {
+                retired.insert(value);
+            }
+        }
+        let retained = state
+            .targets
+            .values()
+            .filter(|entry| entry.manifest_key != manifest_key || !retired.contains(&entry.version))
+            .count();
+        if retained.saturating_add(validated.len()) > TARGET_CAP {
+            return false;
+        }
+
+        state.targets.retain(|_, entry| {
+            entry.manifest_key != manifest_key || !retired.contains(&entry.version)
+        });
+        for (token, target, host) in validated {
+            state.targets.insert(
+                token,
+                RegisteredTarget {
+                    manifest_key: manifest_key.to_owned(),
+                    version: version.to_owned(),
+                    target,
+                    host,
+                },
+            );
+        }
+        state
+            .manifest_versions
+            .insert(manifest_key.to_owned(), versions);
+        true
     }
 
     /// 目标主机是否被授权（初始主机或 manifest 学习到的主机）。
@@ -97,71 +125,24 @@ impl StreamGrantInner {
         if host == self.initial_host {
             return true;
         }
-        self.allowed_hosts
+        self.stream_state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(host)
-    }
-
-    /// 学习（收敛）manifest 中出现的主机。
-    pub fn learn_hosts(&self, hosts: impl IntoIterator<Item = impl Into<String>>) {
-        let mut allowed = self.allowed_hosts.lock().unwrap_or_else(|e| e.into_inner());
-        let mut order = self.host_order.lock().unwrap_or_else(|e| e.into_inner());
-        for host in hosts.into_iter().map(Into::into) {
-            // `rewrite_hls_manifest` supplies normalized hosts from `host_of`,
-            // but keep this method defensive because it is the registry's
-            // security boundary and is also exercised directly by tests.
-            let Ok(host) = validate_host(&host) else {
-                continue;
-            };
-            if host == self.initial_host || !allowed.insert(host.clone()) {
-                continue;
-            }
-            order.push_back(host);
-            while order.len() > LEARNED_HOST_CAP {
-                let Some(oldest) = order.pop_front() else {
-                    break;
-                };
-                allowed.remove(&oldest);
-            }
-        }
-    }
-
-    /// Register one validated absolute target and return an opaque UUID token.
-    /// Tokens are retained for the lifetime of the grant. A manifest is sent
-    /// to the player as a complete snapshot, so evicting individual entries
-    /// would invalidate references that are already visible to the player.
-    pub fn register_target(&self, manifest_version: &str, target: &str) -> String {
-        let mut targets = self.targets.lock().unwrap_or_else(|e| e.into_inner());
-        let mut order = self.target_order.lock().unwrap_or_else(|e| e.into_inner());
-
-        if let Some(token) = targets.iter().find_map(|(token, (version, value))| {
-            (version == manifest_version && value == target).then(|| token.clone())
-        }) {
-            return token;
-        }
-
-        let token = Uuid::new_v4().to_string();
-        if targets.len() >= TARGET_CAP {
-            return String::new();
-        }
-        targets.insert(
-            token.clone(),
-            (manifest_version.to_owned(), target.to_owned()),
-        );
-        order.push_back(token.clone());
-        token
+            .targets
+            .values()
+            .any(|entry| entry.host == host)
     }
 
     /// Resolve a browser-provided target token.  Callers must still apply the
     /// grant's host policy to the resolved URL before issuing a request.
     pub fn resolve_target(&self, manifest_version: &str, token: &str) -> Option<String> {
-        self.targets
+        self.stream_state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .targets
             .get(token)
-            .filter(|(version, _)| version == manifest_version)
-            .map(|(_, target)| target.clone())
+            .filter(|entry| entry.version == manifest_version)
+            .map(|entry| entry.target.clone())
     }
 }
 
@@ -280,16 +261,11 @@ impl StreamRegistry {
         owner_label: &str,
     ) -> Uuid {
         let grant = Uuid::new_v4();
-        let mut hosts = HashSet::new();
-        hosts.insert(initial_host.clone());
         let inner = Arc::new(StreamGrantInner {
             facts,
             owner_label: owner_label.to_owned(),
             initial_host,
-            allowed_hosts: Mutex::new(hosts),
-            targets: Mutex::new(HashMap::new()),
-            target_order: Mutex::new(VecDeque::new()),
-            host_order: Mutex::new(VecDeque::new()),
+            stream_state: Mutex::new(StreamTargetState::default()),
             created_at: Instant::now(),
         });
         let mut grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
@@ -389,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn hosts_learned_via_manifest_are_authorized_others_denied() {
+    fn committed_manifest_hosts_are_authorized_others_denied() {
         let registry = StreamRegistry::new();
         let grant = registry
             .register(
@@ -404,22 +380,25 @@ mod tests {
             !inner.host_allowed("seg.other-cdn.net"),
             "未学习主机默认拒绝"
         );
-        inner.learn_hosts(["seg.other-cdn.net"]);
+        assert!(inner.commit_manifest(
+            "https://cdn.example.com/video.m3u8",
+            "v1",
+            &[(
+                "token-1".into(),
+                "https://seg.other-cdn.net/segment.ts".into()
+            )],
+        ));
         assert!(inner.host_allowed("seg.other-cdn.net"));
-        inner.learn_hosts([
-            "127.0.0.1",
-            "10.0.0.1",
-            "169.254.169.254",
-            "localhost",
-            "media.internal",
-            "2001:db8::1",
-        ]);
+        assert!(!inner.commit_manifest(
+            "https://cdn.example.com/unsafe.m3u8",
+            "v1",
+            &[("unsafe".into(), "http://127.0.0.1/segment.ts".into())],
+        ));
         assert!(!inner.host_allowed("127.0.0.1"));
-        assert!(!inner.host_allowed("media.internal"));
     }
 
     #[test]
-    fn learned_hosts_are_bounded_and_evict_oldest_non_initial_host() {
+    fn repeated_manifest_refresh_reclaims_retired_versions() {
         let registry = StreamRegistry::new();
         let grant = registry
             .register(
@@ -430,15 +409,29 @@ mod tests {
             .unwrap();
         let inner = registry.lookup(&grant.to_string(), "main").unwrap();
 
-        inner.learn_hosts(
-            (0..(LEARNED_HOST_CAP + 2)).map(|index| format!("segment-{index}.example.net")),
-        );
-
-        assert!(inner.host_allowed("cdn.example.com"), "初始主机不能被淘汰");
-        assert!(!inner.host_allowed("segment-0.example.net"));
-        assert!(!inner.host_allowed("segment-1.example.net"));
-        assert!(inner.host_allowed("segment-2.example.net"));
-        assert!(inner.host_allowed("segment-65.example.net"));
+        let mut previous: Option<(String, String)> = None;
+        for refresh in 0..1_000 {
+            let version = format!("v{refresh}");
+            let candidates = (0..6)
+                .map(|segment| {
+                    (
+                        format!("t-{refresh}-{segment}"),
+                        format!("https://cdn.example.com/segment-{}.ts", refresh + segment),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert!(inner.commit_manifest(
+                "https://cdn.example.com/live.m3u8",
+                &version,
+                &candidates
+            ));
+            if let Some((old_version, old_token)) = previous.take() {
+                assert!(inner.resolve_target(&old_version, &old_token).is_some());
+            }
+            previous = Some((version, candidates[0].0.clone()));
+        }
+        let state = inner.stream_state.lock().unwrap();
+        assert_eq!(state.targets.len(), 12);
     }
 
     #[test]
@@ -468,7 +461,12 @@ mod tests {
             )
             .unwrap();
         let inner = registry.lookup(&grant.to_string(), "main").unwrap();
-        let token = inner.register_target("v1", "https://cdn.example.com/seg-01.ts");
+        let token = Uuid::new_v4().to_string();
+        assert!(inner.commit_manifest(
+            "https://cdn.example.com/a.m3u8",
+            "v1",
+            &[(token.clone(), "https://cdn.example.com/seg-01.ts".into())],
+        ));
         assert_eq!(token.len(), 36);
         assert!(!token.contains("://"));
         assert_eq!(
@@ -480,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn target_tokens_remain_valid_until_budget_is_exhausted() {
+    fn failed_manifest_commit_does_not_damage_another_manifest() {
         let registry = StreamRegistry::new();
         let grant = registry
             .register(
@@ -490,47 +488,35 @@ mod tests {
             )
             .unwrap();
         let inner = registry.lookup(&grant.to_string(), "main").unwrap();
-        let first = inner.register_target("v1", "https://cdn.example.com/first.ts");
-        let second = inner.register_target("v1", "https://cdn.example.com/second.ts");
+        let existing = (0..TARGET_CAP - 1)
+            .map(|index| {
+                (
+                    format!("base-{index}"),
+                    format!("https://cdn.example.com/base-{index}.ts"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(inner.commit_manifest("base", "v1", &existing));
 
-        for index in 0..TARGET_CAP - 2 {
-            assert!(!inner
-                .register_target("v1", &format!("https://cdn.example.com/segment-{index}.ts"))
-                .is_empty());
-        }
-
-        assert!(inner.resolve_target("v1", &first).is_some());
-        assert!(inner.resolve_target("v1", &second).is_some());
-        assert!(inner
-            .register_target("v1", "https://cdn.example.com/over-budget.ts")
-            .is_empty());
-        let last = inner.register_target("v1", "https://cdn.example.com/last.ts");
-        assert!(last.is_empty());
-    }
-
-    #[test]
-    fn repeated_target_reuses_token_and_refreshes_eviction_order() {
-        let registry = StreamRegistry::new();
-        let grant = registry
-            .register(
-                facts("https://cdn.example.com/a.m3u8"),
-                "https://cdn.example.com/a.m3u8",
-                "main",
-            )
-            .unwrap();
-        let inner = registry.lookup(&grant.to_string(), "main").unwrap();
-        let repeated = "https://cdn.example.com/repeated.ts";
-        let first = inner.register_target("v1", repeated);
-
-        for index in 0..TARGET_CAP - 2 {
-            inner.register_target("v1", &format!("https://cdn.example.com/segment-{index}.ts"));
-        }
-        let refreshed = inner.register_target("v1", repeated);
-        assert_eq!(refreshed, first);
-
-        assert!(!inner
-            .register_target("v1", "https://cdn.example.com/last.ts")
-            .is_empty());
-        assert!(inner.resolve_target("v1", &first).is_some());
+        let successful_token = "successful-token".to_owned();
+        assert!(inner.commit_manifest(
+            "video",
+            "v1",
+            &[(
+                successful_token.clone(),
+                "https://video.example.net/segment.ts".into()
+            )],
+        ));
+        assert!(!inner.commit_manifest(
+            "audio",
+            "v1",
+            &[(
+                "overflow".into(),
+                "https://audio.example.net/segment.aac".into()
+            )],
+        ));
+        assert!(inner.resolve_target("v1", &successful_token).is_some());
+        assert!(inner.host_allowed("video.example.net"));
+        assert!(!inner.host_allowed("audio.example.net"));
     }
 }

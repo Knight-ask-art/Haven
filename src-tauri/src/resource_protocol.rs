@@ -1382,31 +1382,21 @@ fn absolutize(base_url: &str, target: &str) -> Option<String> {
 }
 
 /// 改写 HLS manifest：所有片段/子清单 URI 与 URI="..." 属性都收敛到本会话代理。
-/// 返回改写后的文本与需要学习的主机列表。
+/// 注册回调只构造请求私有候选；调用方在完整改写后原子提交。
 fn rewrite_hls_manifest(
     body: &str,
     manifest_base: &str,
     grant_id: &str,
     manifest_version: &str,
     register_target: &mut dyn FnMut(&str) -> String,
-) -> Option<(String, Vec<String>)> {
-    let mut hosts: Vec<String> = Vec::new();
-    let mut over_budget = false;
+) -> Option<String> {
     let mut proxy_for = |raw: &str| -> Option<String> {
         let raw = raw.trim();
         if raw.is_empty() {
             return None;
         }
         let absolute = absolutize(manifest_base, raw)?;
-        let host = crate::stream_registry::host_of(&absolute)?;
-        if !hosts.contains(&host) {
-            hosts.push(host);
-        }
         let token = register_target(&absolute);
-        if token.is_empty() {
-            over_budget = true;
-            return None;
-        }
         Some(format!(
             "http://haven-resource.stream/{grant_id}?u={}&v={manifest_version}",
             percent_encode(&token),
@@ -1435,7 +1425,7 @@ fn rewrite_hls_manifest(
             rewritten.push('\n');
         }
     }
-    (!over_budget).then_some((rewritten, hosts))
+    Some(rewritten)
 }
 
 fn rewrite_hls_uri_attributes(
@@ -1530,20 +1520,31 @@ async fn serve_stream_with_resolution(
             return Err(resource_unavailable());
         }
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        let target_snapshot = inner.target_snapshot();
         let manifest_version = Uuid::new_v4().to_string();
-        let mut register_target = |target: &str| inner.register_target(&manifest_version, target);
-        let Some((rewritten, learned)) = rewrite_hls_manifest(
+        let mut candidates = Vec::new();
+        let mut tokens_by_target: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut register_target = |target: &str| {
+            if let Some(token) = tokens_by_target.get(target) {
+                return token.clone();
+            }
+            let token = Uuid::new_v4().to_string();
+            tokens_by_target.insert(target.to_owned(), token.clone());
+            candidates.push((token.clone(), target.to_owned()));
+            token
+        };
+        let Some(rewritten) = rewrite_hls_manifest(
             &text,
             &upstream,
             grant_id,
             &manifest_version,
             &mut register_target,
         ) else {
-            inner.restore_target_snapshot(target_snapshot);
             return Err(resource_unavailable());
         };
-        inner.learn_hosts(learned);
+        if !inner.commit_manifest(&upstream, &manifest_version, &candidates) {
+            return Err(resource_unavailable());
+        }
         let mut headers = vec![
             ("Content-Length", rewritten.len().to_string()),
             ("Content-Type", "application/vnd.apple.mpegurl".to_owned()),
@@ -2051,7 +2052,7 @@ mod tests {
             targets.insert(token.clone(), target.to_owned());
             token
         };
-        let (rewritten, hosts) = rewrite_hls_manifest(
+        let rewritten = rewrite_hls_manifest(
             manifest,
             "https://cdn.example.com/a/index.m3u8",
             "00000000-0000-0000-0000-000000000001",
@@ -2086,9 +2087,6 @@ mod tests {
         assert!(rewritten.contains(
             "URI=\"http://haven-resource.stream/00000000-0000-0000-0000-000000000001?u="
         ));
-        // 学习主机包含初始 CDN 与绝对地址的另一个 CDN。
-        assert!(hosts.contains(&"cdn.example.com".to_owned()));
-        assert!(hosts.contains(&"other-cdn.example.net".to_owned()));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useNavigate, useParams, useSearchParams } from "react-router"
 import {
   ArrowLeft,
@@ -10,6 +10,7 @@ import {
   X,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { canLoadLibraryNextPage } from "../lib/library-runtime-state"
 import { acceptLibraryCursor, getLibraryBrowsePage } from "../ipc/gateway"
 import { isTauriRuntime } from "@/lib/ipc/runtime"
 import { onFavoriteChanged, onLibraryChanged } from "@/lib/ipc/events"
@@ -203,6 +204,7 @@ export function LibraryBrowsePage() {
   const [browseItems, setBrowseItems] = useState<LibraryMediaItemData[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [isLoadingMore, setIsLoadingMore] = useState(false)
+  const [isFirstPagePending, setIsFirstPagePending] = useState(true)
   const [loadError, setLoadError] = useState<HavenError | null>(null)
   const [partialError, setPartialError] = useState<HavenError | null>(null)
   const [nextCursor, setNextCursor] = useState<string | null>(null)
@@ -211,31 +213,39 @@ export function LibraryBrowsePage() {
   const seenCursorsRef = useRef(new Set<string>())
   const browseItemsRef = useRef<LibraryMediaItemData[]>([])
   const queryGenerationRef = useRef(0)
-  const listQuery = {
+  const activeQueryKeyRef = useRef("")
+  const cursorQueryKeyRef = useRef<string | null>(null)
+  const browseRequestKey = searchParams.toString()
+  const listQuery = useMemo(() => ({
     category: categoryKey === "document" ? "periodical" : categoryKey,
     query: searchParams.get("q") ?? "",
     sort: searchParams.get("sort") === "年份最新" ? "release_date" : searchParams.get("sort") === "评分最高" ? "rating" : "recently_added",
-  } as const
-  const browseRequestKey = searchParams.toString()
+  } as const), [categoryKey, searchParams])
+  const queryKey = `${categoryKey}\u0000${browseRequestKey}\u0000${reloadToken}`
 
   useEffect(() => {
     const generation = ++queryGenerationRef.current
+    activeQueryKeyRef.current = queryKey
+    cursorQueryKeyRef.current = null
+    seenCursorsRef.current = new Set<string>()
     let cancelled = false
     const hadData = browseItemsRef.current.length > 0
     setIsLoading(!hadData)
     setIsLoadingMore(false)
+    setIsFirstPagePending(true)
     setLoadError(null)
     setPartialError(null)
-    if (!hadData) setNextCursor(null)
+    setNextCursor(null)
     getLibraryBrowsePage(null, listQuery)
       .then((page) => {
         if (cancelled || queryGenerationRef.current !== generation) return
         browseItemsRef.current = page.items
         setBrowseItems(page.items)
-        seenCursorsRef.current = new Set<string>()
         setNextCursor(acceptLibraryCursor(seenCursorsRef.current, page.nextCursor))
+        cursorQueryKeyRef.current = queryKey
         setTotal(page.total)
         setIsLoading(false)
+        setIsFirstPagePending(false)
       })
       .catch((error: unknown) => {
         if (cancelled || queryGenerationRef.current !== generation) return
@@ -247,11 +257,12 @@ export function LibraryBrowsePage() {
           setPartialError(toHavenError(error))
         }
         setIsLoading(false)
+        setIsFirstPagePending(false)
       })
     return () => {
       cancelled = true
     }
-  }, [browseRequestKey, categoryKey, reloadToken])
+  }, [browseRequestKey, categoryKey, listQuery, queryKey, reloadToken])
 
   const reloadFirstPage = () => setReloadToken((value) => value + 1)
 
@@ -394,15 +405,26 @@ export function LibraryBrowsePage() {
     partial: partialError !== null,
   })
 
-  const loadMore = async () => {
-    if (!nextCursor || isLoadingMore) return
+  const loadMore = useCallback(async () => {
+    if (!canLoadLibraryNextPage({
+      nextCursor,
+      isLoadingMore,
+      isFirstPagePending,
+      cursorQueryKey: cursorQueryKeyRef.current,
+      activeQueryKey: queryKey,
+      partialError: false,
+    })) return
     const generation = queryGenerationRef.current
+    const requestQueryKey = queryKey
     const requestCursor = nextCursor
     setIsLoadingMore(true)
     setPartialError(null)
     try {
       const page = await getLibraryBrowsePage(requestCursor, listQuery)
-      if (queryGenerationRef.current !== generation) return
+      if (
+        queryGenerationRef.current !== generation
+        || activeQueryKeyRef.current !== requestQueryKey
+      ) return
       setBrowseItems((current) => {
         const merged = [...current, ...page.items]
         browseItemsRef.current = merged
@@ -417,19 +439,37 @@ export function LibraryBrowsePage() {
       }
       setTotal(page.total)
     } catch (error) {
-      if (queryGenerationRef.current === generation) setPartialError(toHavenError(error))
+      if (
+        queryGenerationRef.current === generation
+        && activeQueryKeyRef.current === requestQueryKey
+      ) setPartialError(toHavenError(error))
     } finally {
-      if (queryGenerationRef.current === generation) setIsLoadingMore(false)
+      if (
+        queryGenerationRef.current === generation
+        && activeQueryKeyRef.current === requestQueryKey
+      ) setIsLoadingMore(false)
     }
-  }
+  }, [isFirstPagePending, isLoadingMore, listQuery, nextCursor, queryKey])
 
   // Year/initial filters are projections over the typed page DTO. Consume the
   // cursor chain while such a filter is active so a match cannot be hidden on
   // a later page or make the empty state suppress the remaining cursor.
   useEffect(() => {
-    if (activeFilterCount === 0 || !nextCursor || isLoadingMore || isLoading) return
+    if (
+      activeFilterCount === 0
+      || !nextCursor
+      || isLoading
+      || !canLoadLibraryNextPage({
+        nextCursor,
+        isLoadingMore,
+        isFirstPagePending,
+        cursorQueryKey: cursorQueryKeyRef.current,
+        activeQueryKey: queryKey,
+        partialError: partialError !== null,
+      })
+    ) return
     void loadMore()
-  }, [activeFilterCount, isLoading, isLoadingMore, nextCursor])
+  }, [activeFilterCount, isFirstPagePending, isLoading, isLoadingMore, loadMore, nextCursor, partialError, queryKey])
 
   const updateFilter = (key: string, value: string) => {
     setFilters((current) => {
