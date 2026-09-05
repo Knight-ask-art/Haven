@@ -247,7 +247,10 @@ impl DownloadRepository for SqliteDownloadRepository {
             .map_err(map_db_error("查询已完成下载任务失败"))?;
         let mut rows = stmt
             .query_map(
-                rusqlite::params![source_resource_id.to_string(), target_storage_id.to_string()],
+                rusqlite::params![
+                    source_resource_id.to_string(),
+                    target_storage_id.to_string()
+                ],
                 row_to_download_task,
             )
             .map_err(map_db_error("查询已完成下载任务失败"))?;

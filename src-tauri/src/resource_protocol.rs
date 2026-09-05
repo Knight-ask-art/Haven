@@ -193,7 +193,7 @@ enum ResourceRequest {
     Subtitle(Uuid, Uuid),
     ComicPage(Uuid),
     /// 远端流代理（V2-B 实战批次）：grant UUID + 上游目标（空 = 初始 manifest）。
-    Stream(Uuid, String),
+    Stream(Uuid, String, String),
     /// 受控图片资源：image_proxy 注册的 opaque id + 只允许的列表变体。
     Artwork {
         id: String,
@@ -766,7 +766,7 @@ pub(crate) fn register_resource_protocol<R: tauri::Runtime>(
                                 origin.as_deref(),
                             ))
                         }
-                        ResourceRequest::Stream(grant_id, target) => {
+                        ResourceRequest::Stream(grant_id, target, manifest_version) => {
                             if method == Method::HEAD {
                                 return Ok::<_, AppError>(error_response(
                                     405,
@@ -790,6 +790,7 @@ pub(crate) fn register_resource_protocol<R: tauri::Runtime>(
                                 &inner,
                                 &grant_id.to_string(),
                                 target.as_str(),
+                                manifest_version.as_str(),
                                 range.as_deref(),
                                 origin.as_deref(),
                             )) {
@@ -879,9 +880,8 @@ fn parse_request_resource(uri: &Uri) -> Result<ResourceRequest, ResourceUriError
             Some("artwork") => {
                 parse_artwork_id(uri).map(|(id, variant)| ResourceRequest::Artwork { id, variant })
             }
-            Some("stream") => {
-                parse_stream_request(uri).map(|(id, target)| ResourceRequest::Stream(id, target))
-            }
+            Some("stream") => parse_stream_request(uri)
+                .map(|(id, target, version)| ResourceRequest::Stream(id, target, version)),
             _ => Err(ResourceUriError::InvalidAuthority),
         };
     }
@@ -903,42 +903,55 @@ fn parse_request_resource(uri: &Uri) -> Result<ResourceRequest, ResourceUriError
         Some("haven-resource.artwork") => {
             parse_artwork_id(uri).map(|(id, variant)| ResourceRequest::Artwork { id, variant })
         }
-        Some("haven-resource.stream") => {
-            parse_stream_request(uri).map(|(id, target)| ResourceRequest::Stream(id, target))
-        }
+        Some("haven-resource.stream") => parse_stream_request(uri)
+            .map(|(id, target, version)| ResourceRequest::Stream(id, target, version)),
         _ => Err(ResourceUriError::InvalidAuthority),
     }
 }
 
-/// 解析流代理请求：路径为 canonical grant UUID；query 必须恰好携带一个 `u` 参数
-/// （上游目标，由 manifest 改写阶段生成），禁止 fragment。
-fn parse_stream_request(uri: &Uri) -> Result<(Uuid, String), ResourceUriError> {
+/// 解析流代理请求：初始清单无 query；清单引用必须同时携带 `u` token 和
+/// `v` manifest version，二者共同绑定一次清单改写生命周期。
+fn parse_stream_request(uri: &Uri) -> Result<(Uuid, String, String), ResourceUriError> {
     if uri.query().is_none() {
         // 无 u 参数 = 拉取初始 manifest（upstream URL 在 grant 事实中）。
         let id = parse_stream_grant_path(uri)?;
-        return Ok((id, String::new()));
+        return Ok((id, String::new(), String::new()));
     }
     let query = uri.query().unwrap_or_default();
     let mut pairs = query.split('&');
-    let (key, value) = pairs
+    let first = pairs
         .next()
         .and_then(|pair| pair.split_once('='))
         .ok_or(ResourceUriError::InvalidPath)?;
-    if key != "u" || pairs.next().is_some() || value.is_empty() {
+    let second = pairs
+        .next()
+        .and_then(|pair| pair.split_once('='))
+        .ok_or(ResourceUriError::InvalidPath)?;
+    if first.0 != "u"
+        || second.0 != "v"
+        || pairs.next().is_some()
+        || first.1.is_empty()
+        || second.1.is_empty()
+    {
         return Err(ResourceUriError::InvalidPath);
     }
     // Manifest rewrites carry only UUID tokens. Reject percent-encoded values
     // (in particular a URL) and require the canonical UUID representation.
-    if value.contains('%')
-        || Uuid::parse_str(value).is_err()
-        || Uuid::parse_str(value)
+    if first.1.contains('%')
+        || second.1.contains('%')
+        || Uuid::parse_str(first.1).is_err()
+        || Uuid::parse_str(first.1)
             .ok()
-            .is_some_and(|id| id.to_string() != value)
+            .is_some_and(|id| id.to_string() != first.1)
+        || Uuid::parse_str(second.1).is_err()
+        || Uuid::parse_str(second.1)
+            .ok()
+            .is_some_and(|id| id.to_string() != second.1)
     {
         return Err(ResourceUriError::InvalidPath);
     }
     let id = parse_stream_grant_path_without_query(uri)?;
-    Ok((id, value.to_owned()))
+    Ok((id, first.1.to_owned(), second.1.to_owned()))
 }
 
 fn parse_stream_grant_path(uri: &Uri) -> Result<Uuid, ResourceUriError> {
@@ -1374,6 +1387,7 @@ fn rewrite_hls_manifest(
     body: &str,
     manifest_base: &str,
     grant_id: &str,
+    manifest_version: &str,
     register_target: &mut dyn FnMut(&str) -> String,
 ) -> Option<(String, Vec<String>)> {
     let mut hosts: Vec<String> = Vec::new();
@@ -1394,8 +1408,8 @@ fn rewrite_hls_manifest(
             return None;
         }
         Some(format!(
-            "http://haven-resource.stream/{grant_id}?u={}",
-            percent_encode(&token)
+            "http://haven-resource.stream/{grant_id}?u={}&v={manifest_version}",
+            percent_encode(&token),
         ))
     };
     let mut rewritten = String::with_capacity(body.len());
@@ -1449,6 +1463,7 @@ async fn serve_stream(
     inner: &Arc<StreamGrantInner>,
     grant_id: &str,
     target_encoded: &str,
+    manifest_version: &str,
     range_header: Option<&str>,
     origin: Option<&str>,
 ) -> Result<Response<Vec<u8>>, AppError> {
@@ -1456,6 +1471,7 @@ async fn serve_stream(
         inner,
         grant_id,
         target_encoded,
+        manifest_version,
         range_header,
         origin,
         StreamResolution::System,
@@ -1467,6 +1483,7 @@ async fn serve_stream_with_resolution(
     inner: &Arc<StreamGrantInner>,
     grant_id: &str,
     target_encoded: &str,
+    manifest_version: &str,
     range_header: Option<&str>,
     origin: Option<&str>,
     resolution: StreamResolution,
@@ -1475,7 +1492,7 @@ async fn serve_stream_with_resolution(
         inner.facts.upstream_url.clone()
     } else {
         inner
-            .resolve_target(target_encoded)
+            .resolve_target(manifest_version, target_encoded)
             .ok_or_else(|| policy_denied("流目标令牌已失效"))?
     };
     // Reject malformed/multi-range requests before contacting the upstream.
@@ -1514,10 +1531,15 @@ async fn serve_stream_with_resolution(
         }
         let text = String::from_utf8_lossy(&bytes).into_owned();
         let target_snapshot = inner.target_snapshot();
-        let mut register_target = |target: &str| inner.register_target(target);
-        let Some((rewritten, learned)) =
-            rewrite_hls_manifest(&text, &upstream, grant_id, &mut register_target)
-        else {
+        let manifest_version = Uuid::new_v4().to_string();
+        let mut register_target = |target: &str| inner.register_target(&manifest_version, target);
+        let Some((rewritten, learned)) = rewrite_hls_manifest(
+            &text,
+            &upstream,
+            grant_id,
+            &manifest_version,
+            &mut register_target,
+        ) else {
             inner.restore_target_snapshot(target_snapshot);
             return Err(resource_unavailable());
         };
@@ -2023,6 +2045,7 @@ mod tests {
     fn hls_manifest_rewrites_segments_and_uri_attrs_to_proxy() {
         let manifest = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MAP:URI=\"init.mp4\"\nseg0.ts\nhttps://other-cdn.example.net/abs.ts\n";
         let mut targets = std::collections::HashMap::new();
+        let manifest_version = Uuid::new_v4().to_string();
         let mut register_target = |target: &str| {
             let token = Uuid::new_v4().to_string();
             targets.insert(token.clone(), target.to_owned());
@@ -2032,6 +2055,7 @@ mod tests {
             manifest,
             "https://cdn.example.com/a/index.m3u8",
             "00000000-0000-0000-0000-000000000001",
+            &manifest_version,
             &mut register_target,
         )
         .expect("fixture manifest must fit target budget");
@@ -2043,7 +2067,16 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("http://haven-resource.stream/"))
             .expect("改写后必须保留片段代理行");
-        let target_token = percent_decode(seg_line.split_once("?u=").unwrap().1).unwrap();
+        let target_token = percent_decode(
+            seg_line
+                .split_once("?u=")
+                .unwrap()
+                .1
+                .split_once("&v=")
+                .unwrap()
+                .0,
+        )
+        .unwrap();
         assert!(!target_token.contains("://"));
         assert_eq!(
             targets.get(&target_token).map(String::as_str),
@@ -2102,22 +2135,25 @@ mod tests {
     fn stream_query_requires_single_u_param() {
         let base = format!("http://haven-resource.stream/{}", Uuid::new_v4());
         let target_token = Uuid::new_v4().to_string();
-        let with_u = format!("{base}?u={target_token}");
+        let version = Uuid::new_v4();
+        let with_u = format!("{base}?u={target_token}&v={version}");
         let parsed = with_u.parse::<Uri>().unwrap();
         // u 值是服务端注册的 opaque token；真实 URL 不进入 URI。
-        let (_, target) = parse_stream_request(&parsed).unwrap();
+        let (_, target, parsed_version) = parse_stream_request(&parsed).unwrap();
         assert_eq!(target, target_token);
+        assert_eq!(parsed_version, version.to_string());
 
         let raw_url = format!("{base}?u=https%3A%2F%2Fcdn.example.com%2Fa.ts");
         let parsed = raw_url.parse::<Uri>().unwrap();
         assert!(parse_stream_request(&parsed).is_err());
 
         let no_query = base.parse::<Uri>().unwrap();
-        let (id, empty) = parse_stream_request(&no_query).unwrap();
+        let (id, empty, version) = parse_stream_request(&no_query).unwrap();
         assert!(empty.is_empty());
+        assert!(version.is_empty());
         assert_eq!(
             parse_request_resource(&no_query).unwrap(),
-            ResourceRequest::Stream(id, String::new())
+            ResourceRequest::Stream(id, String::new(), String::new())
         );
 
         let extra = format!("{base}?u=a&b=c").parse::<Uri>().unwrap();
@@ -2528,6 +2564,7 @@ mod tests {
             &inner,
             &grant.to_string(),
             "",
+            "",
             Some("bytes=0-2"),
             None,
             StreamResolution::Fixture(address),
@@ -2549,6 +2586,7 @@ mod tests {
         let error = serve_stream_with_resolution(
             &inner,
             &grant.to_string(),
+            "",
             "",
             None,
             None,
@@ -2574,6 +2612,7 @@ mod tests {
         let response = serve_stream_with_resolution(
             &inner,
             &grant.to_string(),
+            "",
             "",
             Some("bytes=0-2"),
             None,

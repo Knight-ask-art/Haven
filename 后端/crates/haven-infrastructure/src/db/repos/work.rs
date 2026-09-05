@@ -322,10 +322,7 @@ impl WorkRepository for SqliteWorkRepository {
                     "",
                     "w.release_year IS NULL, w.release_year DESC, w.created_at DESC",
                 ),
-                WorkOrder::Rating => (
-                    "",
-                    "w.rating_value IS NULL, w.rating_value DESC, w.id DESC",
-                ),
+                WorkOrder::Rating => ("", "w.rating_value IS NULL, w.rating_value DESC, w.id DESC"),
             }
         };
         // FTS 键集分页走 list_filtered_fts（(rank,id) 游标）；本方法保持 offset 分页兼容。

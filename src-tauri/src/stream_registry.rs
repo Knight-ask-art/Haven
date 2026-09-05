@@ -36,7 +36,7 @@ pub struct StreamGrantInner {
     /// Opaque tokens for HLS manifest targets.  The browser receives only the
     /// token in the proxy URI; the real upstream URL remains in this
     /// owner-bound registry entry.
-    targets: Mutex<HashMap<String, String>>,
+    targets: Mutex<HashMap<String, (String, String)>>,
     /// Insertion order for `targets`. `HashMap` iteration order is deliberately
     /// unspecified, so it cannot be used to implement the bounded eviction
     /// policy safely.
@@ -63,7 +63,7 @@ impl StreamGrantInner {
     pub(crate) fn target_snapshot(
         &self,
     ) -> (
-        std::collections::HashMap<String, String>,
+        std::collections::HashMap<String, (String, String)>,
         std::collections::VecDeque<String>,
     ) {
         let targets = self
@@ -82,7 +82,7 @@ impl StreamGrantInner {
     pub(crate) fn restore_target_snapshot(
         &self,
         snapshot: (
-            std::collections::HashMap<String, String>,
+            std::collections::HashMap<String, (String, String)>,
             std::collections::VecDeque<String>,
         ),
     ) {
@@ -131,14 +131,13 @@ impl StreamGrantInner {
     /// Tokens are retained for the lifetime of the grant. A manifest is sent
     /// to the player as a complete snapshot, so evicting individual entries
     /// would invalidate references that are already visible to the player.
-    pub fn register_target(&self, target: &str) -> String {
+    pub fn register_target(&self, manifest_version: &str, target: &str) -> String {
         let mut targets = self.targets.lock().unwrap_or_else(|e| e.into_inner());
         let mut order = self.target_order.lock().unwrap_or_else(|e| e.into_inner());
 
-        if let Some(token) = targets
-            .iter()
-            .find_map(|(token, value)| (value == target).then(|| token.clone()))
-        {
+        if let Some(token) = targets.iter().find_map(|(token, (version, value))| {
+            (version == manifest_version && value == target).then(|| token.clone())
+        }) {
             return token;
         }
 
@@ -146,19 +145,23 @@ impl StreamGrantInner {
         if targets.len() >= TARGET_CAP {
             return String::new();
         }
-        targets.insert(token.clone(), target.to_owned());
+        targets.insert(
+            token.clone(),
+            (manifest_version.to_owned(), target.to_owned()),
+        );
         order.push_back(token.clone());
         token
     }
 
     /// Resolve a browser-provided target token.  Callers must still apply the
     /// grant's host policy to the resolved URL before issuing a request.
-    pub fn resolve_target(&self, token: &str) -> Option<String> {
+    pub fn resolve_target(&self, manifest_version: &str, token: &str) -> Option<String> {
         self.targets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(token)
-            .cloned()
+            .filter(|(version, _)| version == manifest_version)
+            .map(|(_, target)| target.clone())
     }
 }
 
@@ -465,13 +468,14 @@ mod tests {
             )
             .unwrap();
         let inner = registry.lookup(&grant.to_string(), "main").unwrap();
-        let token = inner.register_target("https://cdn.example.com/seg-01.ts");
+        let token = inner.register_target("v1", "https://cdn.example.com/seg-01.ts");
         assert_eq!(token.len(), 36);
         assert!(!token.contains("://"));
         assert_eq!(
-            inner.resolve_target(&token).as_deref(),
+            inner.resolve_target("v1", &token).as_deref(),
             Some("https://cdn.example.com/seg-01.ts")
         );
+        assert!(inner.resolve_target("other-version", &token).is_none());
         assert!(registry.lookup(&grant.to_string(), "other").is_none());
     }
 
@@ -486,21 +490,21 @@ mod tests {
             )
             .unwrap();
         let inner = registry.lookup(&grant.to_string(), "main").unwrap();
-        let first = inner.register_target("https://cdn.example.com/first.ts");
-        let second = inner.register_target("https://cdn.example.com/second.ts");
+        let first = inner.register_target("v1", "https://cdn.example.com/first.ts");
+        let second = inner.register_target("v1", "https://cdn.example.com/second.ts");
 
         for index in 0..TARGET_CAP - 2 {
             assert!(!inner
-                .register_target(&format!("https://cdn.example.com/segment-{index}.ts"))
+                .register_target("v1", &format!("https://cdn.example.com/segment-{index}.ts"))
                 .is_empty());
         }
 
-        assert!(inner.resolve_target(&first).is_some());
-        assert!(inner.resolve_target(&second).is_some());
+        assert!(inner.resolve_target("v1", &first).is_some());
+        assert!(inner.resolve_target("v1", &second).is_some());
         assert!(inner
-            .register_target("https://cdn.example.com/over-budget.ts")
+            .register_target("v1", "https://cdn.example.com/over-budget.ts")
             .is_empty());
-        let last = inner.register_target("https://cdn.example.com/last.ts");
+        let last = inner.register_target("v1", "https://cdn.example.com/last.ts");
         assert!(last.is_empty());
     }
 
@@ -516,17 +520,17 @@ mod tests {
             .unwrap();
         let inner = registry.lookup(&grant.to_string(), "main").unwrap();
         let repeated = "https://cdn.example.com/repeated.ts";
-        let first = inner.register_target(repeated);
+        let first = inner.register_target("v1", repeated);
 
         for index in 0..TARGET_CAP - 2 {
-            inner.register_target(&format!("https://cdn.example.com/segment-{index}.ts"));
+            inner.register_target("v1", &format!("https://cdn.example.com/segment-{index}.ts"));
         }
-        let refreshed = inner.register_target(repeated);
+        let refreshed = inner.register_target("v1", repeated);
         assert_eq!(refreshed, first);
 
         assert!(!inner
-            .register_target("https://cdn.example.com/last.ts")
+            .register_target("v1", "https://cdn.example.com/last.ts")
             .is_empty());
-        assert!(inner.resolve_target(&first).is_some());
+        assert!(inner.resolve_target("v1", &first).is_some());
     }
 }

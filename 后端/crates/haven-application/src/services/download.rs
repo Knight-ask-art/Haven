@@ -228,9 +228,13 @@ impl DownloadService {
             .await?
         {
             if let Some(offline_resource_id) = existing.offline_resource_id {
-                if let Some(offline_resource) = self.ports.as_resource().get(offline_resource_id).await?
+                if let Some(offline_resource) =
+                    self.ports.as_resource().get(offline_resource_id).await?
                     && offline_resource.availability == Availability::OfflineAvailable
-                    && self.offline_files.is_available(&storage, &offline_resource).await?
+                    && self
+                        .offline_files
+                        .is_available(&storage, &offline_resource)
+                        .await?
                 {
                     return self.to_dto(existing).await;
                 }
