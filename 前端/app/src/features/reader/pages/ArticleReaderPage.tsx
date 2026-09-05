@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
+import { Children, createElement, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import type { KeyboardEvent, ReactNode } from "react"
 import { useNavigate, useParams } from "react-router"
 import {
@@ -844,6 +844,31 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
     return parts
   }
 
+  const renderHighlightedChildren = (children: ReactNode, blockId: string): ReactNode[] =>
+    Children.toArray(children).flatMap((child) => (
+      typeof child === "string" ? renderHighlightedText(child, blockId) : [child]
+    ))
+
+  const renderSanitizedHtml = (html: string, blockId: string): ReactNode => {
+    const root = new DOMParser().parseFromString(html, "text/html").body
+    const allowed = new Set(["a", "blockquote", "br", "code", "em", "h1", "h2", "h3", "h4", "li", "ol", "p", "pre", "strong", "ul"])
+    const renderNode = (node: Node, key: string): ReactNode => {
+      if (node.nodeType === Node.TEXT_NODE) return renderHighlightedText(node.textContent ?? "", blockId)
+      if (node.nodeType !== Node.ELEMENT_NODE) return null
+      const element = node as HTMLElement
+      const tag = element.tagName.toLowerCase()
+      if (!allowed.has(tag)) return renderHighlightedChildren(element.textContent ?? "", blockId)
+      const props: Record<string, string> = { key }
+      for (const attribute of Array.from(element.attributes)) {
+        if (["href", "title", "target", "rel", "class"].includes(attribute.name)) {
+          props[attribute.name === "class" ? "className" : attribute.name] = attribute.value
+        }
+      }
+      return createElement(tag, props, Array.from(element.childNodes).map((child, index) => renderNode(child, `${key}-${index}`)))
+    }
+    return Array.from(root.childNodes).map((node, index) => renderNode(node, `html-${index}`))
+  }
+
   return (
     <div className={cn("min-h-[100dvh] overflow-x-hidden transition-colors duration-500", themeClass)}>
       <header className={cn(
@@ -941,9 +966,9 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
             <div className="mt-14 space-y-[64px]">
               {articleDocument.format === "html" && articleDocument.sanitizedHtml ? (
                 <div
+                  data-article-block-id={articleSections[0]?.paragraphs[0]?.id ?? "article-body"}
                   className="article-html space-y-7 leading-[inherit] [&_a]:underline [&_blockquote]:my-8 [&_blockquote]:border-l-2 [&_blockquote]:border-primary/65 [&_blockquote]:py-2 [&_blockquote]:pl-6 [&_code]:rounded [&_code]:bg-black/[0.06] [&_code]:px-1 [&_pre]:overflow-x-auto [&_pre]:rounded-xl [&_pre]:bg-black/[0.06] [&_pre]:p-4 [&_ul]:list-disc [&_ul]:pl-6 [&_ol]:list-decimal [&_ol]:pl-6"
-                  dangerouslySetInnerHTML={{ __html: articleDocument.sanitizedHtml }}
-                />
+                >{renderSanitizedHtml(articleDocument.sanitizedHtml, articleSections[0]?.paragraphs[0]?.id ?? "article-body")}</div>
               ) : articleSections.map((section, sectionIndex) => (
                 <section key={section.id} className="scroll-mt-28">
                   {sectionIndex > 0 && (
@@ -961,7 +986,10 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
                       {articleDocument.format === "markdown" ? (
                         <ReactMarkdown
                           components={{
-                            a: ({ children }) => <span className="underline decoration-current/40 underline-offset-4">{children}</span>,
+                            p: ({ children }) => <p>{renderHighlightedChildren(children, paragraph.id)}</p>,
+                            strong: ({ children }) => <strong>{renderHighlightedChildren(children, paragraph.id)}</strong>,
+                            em: ({ children }) => <em>{renderHighlightedChildren(children, paragraph.id)}</em>,
+                            a: ({ children }) => <span className="underline decoration-current/40 underline-offset-4">{renderHighlightedChildren(children, paragraph.id)}</span>,
                             img: () => <span className="opacity-55">[图片已隐藏]</span>,
                           }}
                         >

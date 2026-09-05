@@ -91,10 +91,9 @@ impl StreamGrantInner {
     }
 
     /// Register one validated absolute target and return an opaque UUID token.
-    /// The token is intentionally independent of the target contents so a
-    /// browser-visible manifest cannot disclose the upstream URL. Reuse an
-    /// existing token for repeated URIs so a manifest with repeated segments
-    /// cannot consume the bounded target table unnecessarily.
+    /// Tokens are retained for the lifetime of the grant. A manifest is sent
+    /// to the player as a complete snapshot, so evicting individual entries
+    /// would invalidate references that are already visible to the player.
     pub fn register_target(&self, target: &str) -> String {
         let mut targets = self.targets.lock().unwrap_or_else(|e| e.into_inner());
         let mut order = self.target_order.lock().unwrap_or_else(|e| e.into_inner());
@@ -103,28 +102,12 @@ impl StreamGrantInner {
             .iter()
             .find_map(|(token, value)| (value == target).then(|| token.clone()))
         {
-            // Refresh the insertion order as a small LRU rule. A target that
-            // remains referenced by a later manifest should outlive stale
-            // targets when the table reaches its cap.
-            if let Some(position) = order.iter().position(|item| item == &token) {
-                order.remove(position);
-            }
-            order.push_back(token.clone());
             return token;
         }
 
         let token = Uuid::new_v4().to_string();
-        while targets.len() >= TARGET_CAP {
-            let Some(oldest) = order.pop_front() else {
-                // The order list is an internal invariant. If it is ever
-                // damaged, fail closed by removing one actual target rather
-                // than allowing an unbounded map to grow.
-                if let Some(oldest) = targets.keys().next().cloned() {
-                    targets.remove(&oldest);
-                }
-                break;
-            };
-            targets.remove(&oldest);
+        if targets.len() >= TARGET_CAP {
+            return String::new();
         }
         targets.insert(token.clone(), target.to_owned());
         order.push_back(token.clone());
@@ -456,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn target_tokens_evict_in_insertion_order() {
+    fn target_tokens_remain_valid_until_budget_is_exhausted() {
         let registry = StreamRegistry::new();
         let grant = registry
             .register(
@@ -469,17 +452,19 @@ mod tests {
         let first = inner.register_target("https://cdn.example.com/first.ts");
         let second = inner.register_target("https://cdn.example.com/second.ts");
 
-        for index in 0..TARGET_CAP {
-            inner.register_target(&format!("https://cdn.example.com/segment-{index}.ts"));
+        for index in 0..TARGET_CAP - 2 {
+            assert!(!inner
+                .register_target(&format!("https://cdn.example.com/segment-{index}.ts"))
+                .is_empty());
         }
 
-        assert_eq!(inner.resolve_target(&first), None, "最早令牌应先淘汰");
-        assert_eq!(inner.resolve_target(&second), None, "第二早令牌也应被淘汰");
+        assert!(inner.resolve_target(&first).is_some());
+        assert!(inner.resolve_target(&second).is_some());
+        assert!(inner
+            .register_target("https://cdn.example.com/over-budget.ts")
+            .is_empty());
         let last = inner.register_target("https://cdn.example.com/last.ts");
-        assert_eq!(
-            inner.resolve_target(&last).as_deref(),
-            Some("https://cdn.example.com/last.ts")
-        );
+        assert!(last.is_empty());
     }
 
     #[test]
@@ -496,13 +481,13 @@ mod tests {
         let repeated = "https://cdn.example.com/repeated.ts";
         let first = inner.register_target(repeated);
 
-        for index in 0..TARGET_CAP - 1 {
+        for index in 0..TARGET_CAP - 2 {
             inner.register_target(&format!("https://cdn.example.com/segment-{index}.ts"));
         }
         let refreshed = inner.register_target(repeated);
         assert_eq!(refreshed, first);
 
-        inner.register_target("https://cdn.example.com/evict-oldest.ts");
+        assert!(!inner.register_target("https://cdn.example.com/last.ts").is_empty());
         assert!(inner.resolve_target(&first).is_some());
     }
 }

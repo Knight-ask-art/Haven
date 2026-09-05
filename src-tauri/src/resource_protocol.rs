@@ -1364,8 +1364,9 @@ fn rewrite_hls_manifest(
     manifest_base: &str,
     grant_id: &str,
     register_target: &mut dyn FnMut(&str) -> String,
-) -> (String, Vec<String>) {
+) -> Option<(String, Vec<String>)> {
     let mut hosts: Vec<String> = Vec::new();
+    let mut over_budget = false;
     let mut proxy_for = |raw: &str| -> Option<String> {
         let raw = raw.trim();
         if raw.is_empty() {
@@ -1377,6 +1378,10 @@ fn rewrite_hls_manifest(
             hosts.push(host);
         }
         let token = register_target(&absolute);
+        if token.is_empty() {
+            over_budget = true;
+            return None;
+        }
         Some(format!(
             "http://haven-resource.stream/{grant_id}?u={}",
             percent_encode(&token)
@@ -1405,7 +1410,7 @@ fn rewrite_hls_manifest(
             rewritten.push('\n');
         }
     }
-    (rewritten, hosts)
+    (!over_budget).then_some((rewritten, hosts))
 }
 
 fn rewrite_hls_uri_attributes(
@@ -1487,8 +1492,11 @@ async fn serve_stream_with_resolution(
         }
         let text = String::from_utf8_lossy(&bytes).into_owned();
         let mut register_target = |target: &str| inner.register_target(target);
-        let (rewritten, learned) =
-            rewrite_hls_manifest(&text, &upstream, grant_id, &mut register_target);
+        let Some((rewritten, learned)) =
+            rewrite_hls_manifest(&text, &upstream, grant_id, &mut register_target)
+        else {
+            return Err(resource_unavailable());
+        };
         inner.learn_hosts(learned);
         let mut headers = vec![
             ("Content-Length", rewritten.len().to_string()),
@@ -1987,7 +1995,8 @@ mod tests {
             "https://cdn.example.com/a/index.m3u8",
             "00000000-0000-0000-0000-000000000001",
             &mut register_target,
-        );
+        )
+        .expect("fixture manifest must fit target budget");
         assert!(rewritten.contains("#EXTM3U"));
         // 相对片段 → 代理 URL（u 仅携带 opaque token，不是远端 URL）。
         assert!(rewritten
