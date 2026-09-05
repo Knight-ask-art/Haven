@@ -231,6 +231,31 @@ impl DownloadRepository for SqliteDownloadRepository {
             .map_err(map_db_error("查询现有下载任务失败"))
     }
 
+    async fn find_completed(
+        &self,
+        source_resource_id: ResourceId,
+        target_storage_id: StorageLocationId,
+    ) -> Result<Option<DownloadTask>, AppError> {
+        let conn = self.db.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {SELECT_COLUMNS} FROM download_tasks
+                 WHERE source_resource_id = ?1 AND target_storage_id = ?2
+                   AND state = 'completed'
+                 ORDER BY created_at DESC LIMIT 1"
+            ))
+            .map_err(map_db_error("查询已完成下载任务失败"))?;
+        let mut rows = stmt
+            .query_map(
+                rusqlite::params![source_resource_id.to_string(), target_storage_id.to_string()],
+                row_to_download_task,
+            )
+            .map_err(map_db_error("查询已完成下载任务失败"))?;
+        rows.next()
+            .transpose()
+            .map_err(map_db_error("查询已完成下载任务失败"))
+    }
+
     async fn delete_terminal(&self, id: DownloadTaskId) -> Result<bool, AppError> {
         let conn = self.db.lock();
         let affected = conn

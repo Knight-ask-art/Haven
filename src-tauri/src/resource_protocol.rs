@@ -1035,6 +1035,17 @@ fn response_for_open_file_with_origin(
         Ok(range) => range,
         Err(_) => return error_response(416, true, Some(format!("bytes */{total}")), origin),
     };
+    let range = range.map(|mut range| {
+        if range_header.is_some_and(|header| header.trim_end().ends_with('-'))
+            && range.len() > MAX_RESPONSE_BYTES
+        {
+            range.end = range
+                .start
+                .saturating_add(MAX_RESPONSE_BYTES.saturating_sub(1))
+                .min(total.saturating_sub(1));
+        }
+        range
+    });
     let (status, start, content_length) = match range {
         Some(range) => (206, range.start, range.len()),
         None => (200, 0, total),
@@ -1473,8 +1484,19 @@ async fn serve_stream_with_resolution(
     if range_header.is_some() && parse_remote_byte_range(range_header).is_err() {
         return Err(invalid_remote_range());
     }
+    let requested_range =
+        range_header.and_then(|header| parse_remote_byte_range(Some(header)).ok().flatten());
+    let bounded_range_header = requested_range.and_then(|range| {
+        range.end.is_none().then(|| {
+            let end = range
+                .start
+                .saturating_add(MAX_STREAM_BYTES.saturating_sub(1));
+            format!("bytes={}-{}", range.start, end)
+        })
+    });
+    let upstream_range_header = bounded_range_header.as_deref().or(range_header);
     let (response, upstream) =
-        fetch_stream_response(inner, upstream, range_header, resolution).await?;
+        fetch_stream_response(inner, upstream, upstream_range_header, resolution).await?;
 
     let content_type = response
         .headers()
@@ -1491,10 +1513,12 @@ async fn serve_stream_with_resolution(
             return Err(resource_unavailable());
         }
         let text = String::from_utf8_lossy(&bytes).into_owned();
+        let target_snapshot = inner.target_snapshot();
         let mut register_target = |target: &str| inner.register_target(target);
         let Some((rewritten, learned)) =
             rewrite_hls_manifest(&text, &upstream, grant_id, &mut register_target)
         else {
+            inner.restore_target_snapshot(target_snapshot);
             return Err(resource_unavailable());
         };
         inner.learn_hosts(learned);
@@ -1525,8 +1549,6 @@ async fn serve_stream_with_resolution(
                 .split(',')
                 .any(|part| part.trim().eq_ignore_ascii_case("bytes"))
         });
-    let requested_range =
-        range_header.and_then(|header| parse_remote_byte_range(Some(header)).ok().flatten());
     validate_direct_stream_headers_with_hls(
         upstream_status,
         content_type.as_deref(),
@@ -1633,6 +1655,7 @@ fn is_video_mime_base(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"!#$&^_.+-".contains(&byte))
 }
 
+#[cfg(test)]
 fn validate_direct_stream_headers(
     status: u16,
     content_type: Option<&str>,
@@ -1674,7 +1697,7 @@ fn validate_direct_stream_headers_with_hls(
     });
     let mime_is_hls_media = mime_base
         .is_some_and(|value| is_audio_mime_base(value) || value.eq_ignore_ascii_case("text/vtt"));
-    if !mime_is_empty && !mime_is_video && !(allow_hls_media && mime_is_hls_media) {
+    if !(mime_is_empty || mime_is_video || (allow_hls_media && mime_is_hls_media)) {
         return Err(resource_unavailable());
     }
 
@@ -2640,6 +2663,31 @@ mod tests {
         assert_eq!(response.status().as_u16(), 413);
         assert!(response.body().is_empty());
         assert_eq!(response.headers().get("accept-ranges").unwrap(), "bytes");
+    }
+
+    #[test]
+    fn open_range_on_large_file_is_bounded_and_keeps_content_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.mp4");
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_RESPONSE_BYTES + 1024).unwrap();
+        let response = response_for_open_file(
+            &Method::GET,
+            File::open(&path).unwrap(),
+            &path,
+            Some("bytes=0-"),
+        );
+        assert_eq!(response.status().as_u16(), 206);
+        assert_eq!(response.body().len() as u64, MAX_RESPONSE_BYTES);
+        assert_eq!(
+            response.headers().get("content-range").unwrap(),
+            format!(
+                "bytes 0-{}/{}",
+                MAX_RESPONSE_BYTES - 1,
+                MAX_RESPONSE_BYTES + 1024
+            )
+            .as_str()
+        );
     }
 
     #[test]

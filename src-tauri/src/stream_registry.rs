@@ -52,9 +52,46 @@ pub struct StreamGrantInner {
 // unique segment references. Keep the bound finite while ensuring one
 // manifest cannot invalidate references already handed to the player.
 const TARGET_CAP: usize = 4096;
-const LEARNED_HOST_CAP: usize = 64;
+// Keep learned hosts aligned with target tokens. Evicting a host while its
+// opaque target tokens remain valid breaks an already-issued HLS manifest.
+const LEARNED_HOST_CAP: usize = TARGET_CAP;
 
 impl StreamGrantInner {
+    /// Snapshot target state before rewriting one manifest. The complete
+    /// manifest is one lifecycle unit: failed reservations must not leave a
+    /// partially registered set of references behind.
+    pub(crate) fn target_snapshot(
+        &self,
+    ) -> (
+        std::collections::HashMap<String, String>,
+        std::collections::VecDeque<String>,
+    ) {
+        let targets = self
+            .targets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let order = self
+            .target_order
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        (targets, order)
+    }
+
+    pub(crate) fn restore_target_snapshot(
+        &self,
+        snapshot: (
+            std::collections::HashMap<String, String>,
+            std::collections::VecDeque<String>,
+        ),
+    ) {
+        let mut targets = self.targets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut order = self.target_order.lock().unwrap_or_else(|e| e.into_inner());
+        *targets = snapshot.0;
+        *order = snapshot.1;
+    }
+
     /// 目标主机是否被授权（初始主机或 manifest 学习到的主机）。
     pub fn host_allowed(&self, host: &str) -> bool {
         if host == self.initial_host {

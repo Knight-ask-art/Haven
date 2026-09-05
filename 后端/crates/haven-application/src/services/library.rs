@@ -43,6 +43,7 @@ impl LibraryService {
             LibraryListSort::Title => haven_domain::contracts::WorkOrder::Title,
             LibraryListSort::LastActive => haven_domain::contracts::WorkOrder::LastActive,
             LibraryListSort::ReleaseDate => haven_domain::contracts::WorkOrder::ReleaseDate,
+            LibraryListSort::Rating => haven_domain::contracts::WorkOrder::Rating,
         };
         let category = domain_category(request.category);
         let media_types: Option<Vec<haven_domain::enums::MediaType>> = request

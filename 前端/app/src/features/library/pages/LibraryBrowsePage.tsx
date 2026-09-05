@@ -210,23 +210,26 @@ export function LibraryBrowsePage() {
   const [reloadToken, setReloadToken] = useState(0)
   const seenCursorsRef = useRef(new Set<string>())
   const browseItemsRef = useRef<LibraryMediaItemData[]>([])
+  const queryGenerationRef = useRef(0)
   const listQuery = {
     category: categoryKey === "document" ? "periodical" : categoryKey,
     query: searchParams.get("q") ?? "",
-    sort: searchParams.get("sort") === "年份最新" ? "release_date" : searchParams.get("sort") === "评分最高" ? "last_active" : "recently_added",
+    sort: searchParams.get("sort") === "年份最新" ? "release_date" : searchParams.get("sort") === "评分最高" ? "rating" : "recently_added",
   } as const
   const browseRequestKey = searchParams.toString()
 
   useEffect(() => {
+    const generation = ++queryGenerationRef.current
     let cancelled = false
     const hadData = browseItemsRef.current.length > 0
     setIsLoading(!hadData)
+    setIsLoadingMore(false)
     setLoadError(null)
     setPartialError(null)
     if (!hadData) setNextCursor(null)
     getLibraryBrowsePage(null, listQuery)
       .then((page) => {
-        if (cancelled) return
+        if (cancelled || queryGenerationRef.current !== generation) return
         browseItemsRef.current = page.items
         setBrowseItems(page.items)
         seenCursorsRef.current = new Set<string>()
@@ -235,7 +238,7 @@ export function LibraryBrowsePage() {
         setIsLoading(false)
       })
       .catch((error: unknown) => {
-        if (cancelled) return
+        if (cancelled || queryGenerationRef.current !== generation) return
         if (!hadData) {
           browseItemsRef.current = []
           setBrowseItems([])
@@ -393,10 +396,13 @@ export function LibraryBrowsePage() {
 
   const loadMore = async () => {
     if (!nextCursor || isLoadingMore) return
+    const generation = queryGenerationRef.current
+    const requestCursor = nextCursor
     setIsLoadingMore(true)
     setPartialError(null)
     try {
-      const page = await getLibraryBrowsePage(nextCursor, listQuery)
+      const page = await getLibraryBrowsePage(requestCursor, listQuery)
+      if (queryGenerationRef.current !== generation) return
       setBrowseItems((current) => {
         const merged = [...current, ...page.items]
         browseItemsRef.current = merged
@@ -411,11 +417,19 @@ export function LibraryBrowsePage() {
       }
       setTotal(page.total)
     } catch (error) {
-      setPartialError(toHavenError(error))
+      if (queryGenerationRef.current === generation) setPartialError(toHavenError(error))
     } finally {
-      setIsLoadingMore(false)
+      if (queryGenerationRef.current === generation) setIsLoadingMore(false)
     }
   }
+
+  // Year/initial filters are projections over the typed page DTO. Consume the
+  // cursor chain while such a filter is active so a match cannot be hidden on
+  // a later page or make the empty state suppress the remaining cursor.
+  useEffect(() => {
+    if (activeFilterCount === 0 || !nextCursor || isLoadingMore || isLoading) return
+    void loadMore()
+  }, [activeFilterCount, isLoading, isLoadingMore, nextCursor])
 
   const updateFilter = (key: string, value: string) => {
     setFilters((current) => {
@@ -615,6 +629,16 @@ export function LibraryBrowsePage() {
               >
                 重置所有筛选
               </button>
+              {nextCursor && (
+                <button
+                  type="button"
+                  onClick={loadMore}
+                  disabled={isLoadingMore}
+                  className="mt-3 rounded-full border border-border px-5 py-[10px] text-xs font-bold text-foreground disabled:opacity-50"
+                >
+                  {isLoadingMore ? "正在查找…" : "继续查找后续内容"}
+                </button>
+              )}
             </div>
           ) : (
             <>

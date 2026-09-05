@@ -25,6 +25,7 @@ pub enum WorkOrder {
     Title,
     LastActive,
     ReleaseDate,
+    Rating,
 }
 
 #[async_trait]
@@ -420,6 +421,12 @@ pub trait DownloadRepository {
     async fn list(&self, limit: u32) -> Result<Vec<DownloadTask>, AppError>;
     /// 查找同一来源和目标的可复用任务；失败/取消任务允许重新创建。
     async fn find_active(
+        &self,
+        source_resource_id: ResourceId,
+        target_storage_id: StorageLocationId,
+    ) -> Result<Option<DownloadTask>, AppError>;
+    /// 查找同一来源和目标的最近完成任务；由应用层再次校验离线文件是否仍有效。
+    async fn find_completed(
         &self,
         source_resource_id: ResourceId,
         target_storage_id: StorageLocationId,

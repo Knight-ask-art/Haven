@@ -559,15 +559,12 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
     if (!contentReady || !articleDocument || sessionView.status !== "ready" || state.status !== "ready") return
     const restored = restoreArticleProgress(state.session, restoredProgressRef)
     if (!restored) return
-    const restoredBlockId = restored.blockId
     const maxScroll = document.documentElement.scrollHeight - window.innerHeight
     if (maxScroll <= 0) return
-    // A heading is only a coarse anchor; progression preserves the position
-    // within a long section and remains valid when the layout changes.
-    const heading = restoredBlockId ? document.getElementById(restoredBlockId) : null
-    const headingTop = heading?.getBoundingClientRect().top ?? 0
-    const target = heading ? Math.max(0, headingTop + window.scrollY) : restored.progression * maxScroll
-    window.scrollTo({ top: Math.min(maxScroll, target + restored.progression * Math.max(0, maxScroll - target)) })
+    // `progression` is the whole-document ratio. A block id is only a coarse
+    // activity label, not a second coordinate; applying both double-counts
+    // the remaining distance (p * (2 - p)).
+    window.scrollTo({ top: Math.min(maxScroll, Math.max(0, restored.progression * maxScroll)) })
   }, [articleDocument, contentReady, outline, sessionView.status, state, sessionContentUri])
 
   useEffect(() => {
@@ -851,22 +848,23 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
 
   const renderSanitizedHtml = (html: string, blockId: string): ReactNode => {
     const root = new DOMParser().parseFromString(html, "text/html").body
-    const allowed = new Set(["a", "blockquote", "br", "code", "em", "h1", "h2", "h3", "h4", "li", "ol", "p", "pre", "strong", "ul"])
-    const renderNode = (node: Node, key: string): ReactNode => {
-      if (node.nodeType === Node.TEXT_NODE) return renderHighlightedText(node.textContent ?? "", blockId)
+    const allowed = new Set(["a", "article", "blockquote", "br", "code", "dd", "div", "dl", "dt", "em", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "ol", "p", "pre", "section", "strong", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul"])
+    const renderNode = (node: Node, key: string, inheritedBlockId: string): ReactNode => {
+      if (node.nodeType === Node.TEXT_NODE) return renderHighlightedText(node.textContent ?? "", inheritedBlockId)
       if (node.nodeType !== Node.ELEMENT_NODE) return null
       const element = node as HTMLElement
       const tag = element.tagName.toLowerCase()
-      if (!allowed.has(tag)) return renderHighlightedChildren(element.textContent ?? "", blockId)
+      if (!allowed.has(tag)) return Array.from(element.childNodes).map((child, index) => renderNode(child, `${key}-${index}`, inheritedBlockId))
+      const currentBlockId = element.dataset.articleBlockId ?? inheritedBlockId
       const props: Record<string, string> = { key }
       for (const attribute of Array.from(element.attributes)) {
-        if (["href", "title", "target", "rel", "class"].includes(attribute.name)) {
+        if (["class", "id", "title", "data-article-block-id"].includes(attribute.name)) {
           props[attribute.name === "class" ? "className" : attribute.name] = attribute.value
         }
       }
-      return createElement(tag, props, Array.from(element.childNodes).map((child, index) => renderNode(child, `${key}-${index}`)))
+      return createElement(tag, props, Array.from(element.childNodes).map((child, index) => renderNode(child, `${key}-${index}`, currentBlockId)))
     }
-    return Array.from(root.childNodes).map((node, index) => renderNode(node, `html-${index}`))
+    return Array.from(root.childNodes).map((node, index) => renderNode(node, `html-${index}`, blockId))
   }
 
   return (
@@ -966,9 +964,8 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
             <div className="mt-14 space-y-[64px]">
               {articleDocument.format === "html" && articleDocument.sanitizedHtml ? (
                 <div
-                  data-article-block-id={articleSections[0]?.paragraphs[0]?.id ?? "article-body"}
                   className="article-html space-y-7 leading-[inherit] [&_a]:underline [&_blockquote]:my-8 [&_blockquote]:border-l-2 [&_blockquote]:border-primary/65 [&_blockquote]:py-2 [&_blockquote]:pl-6 [&_code]:rounded [&_code]:bg-black/[0.06] [&_code]:px-1 [&_pre]:overflow-x-auto [&_pre]:rounded-xl [&_pre]:bg-black/[0.06] [&_pre]:p-4 [&_ul]:list-disc [&_ul]:pl-6 [&_ol]:list-decimal [&_ol]:pl-6"
-                >{renderSanitizedHtml(articleDocument.sanitizedHtml, articleSections[0]?.paragraphs[0]?.id ?? "article-body")}</div>
+                >{renderSanitizedHtml(articleDocument.sanitizedHtml, "article-body")}</div>
               ) : articleSections.map((section, sectionIndex) => (
                 <section key={section.id} className="scroll-mt-28">
                   {sectionIndex > 0 && (
