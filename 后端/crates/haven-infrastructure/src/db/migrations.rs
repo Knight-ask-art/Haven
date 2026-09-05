@@ -125,6 +125,38 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "028_work_relations",
         include_str!("../../../../migrations/028_work_relations.sql"),
     ),
+    (
+        "029_multi_source_work_refs",
+        include_str!("../../../../migrations/029_multi_source_work_refs.sql"),
+    ),
+    (
+        "030_edition_profiles",
+        include_str!("../../../../migrations/030_edition_profiles.sql"),
+    ),
+    (
+        "031_comic_chapter_and_page_identity",
+        include_str!("../../../../migrations/031_comic_chapter_and_page_identity.sql"),
+    ),
+    (
+        "032_comic_progress_migration_snapshots",
+        include_str!("../../../../migrations/032_comic_progress_migration_snapshots.sql"),
+    ),
+    (
+        "033_comic_chapter_catalog_refresh",
+        include_str!("../../../../migrations/033_comic_chapter_catalog_refresh.sql"),
+    ),
+    (
+        "034_progress_opaque_revision",
+        include_str!("../../../../migrations/034_progress_opaque_revision.sql"),
+    ),
+    (
+        "035_comic_page_identity_revision",
+        include_str!("../../../../migrations/035_comic_page_identity_revision.sql"),
+    ),
+    (
+        "036_comic_chapter_profile_observation",
+        include_str!("../../../../migrations/036_comic_chapter_profile_observation.sql"),
+    ),
 ];
 
 pub fn run(conn: &mut Connection) -> Result<(), AppError> {
@@ -604,6 +636,358 @@ mod tests {
                 .iter()
                 .any(|column| column == "normalized_host")
         );
+
+        let comic_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN (
+                     'edition_profiles',
+                     'comic_chapter_source_refs',
+                     'comic_page_identities',
+                     'comic_page_identity_states',
+                     'comic_progress_migration_snapshots',
+                     'comic_chapter_catalog_states'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(comic_tables, 6, "漫画身份和迁移表必须全部建立");
+        let chapter_columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(comic_chapter_source_refs)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            chapter_columns
+                .iter()
+                .any(|column| column == "observed_edition_profile")
+        );
+    }
+
+    #[test]
+    fn migration_034_backfills_opaque_progress_revisions() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // 该测试需要在 034 尚未应用时插入旧 Progress，避免 034 已经
+        // 运行后再断言 backfill 失去意义；035 位于其后。
+        apply_legacy_through(&mut conn, MIGRATIONS.len() - 3);
+        let work_id = "0196f0d2-0000-7000-8000-00000000f401";
+        let edition_id = "0196f0d2-0000-7000-8000-00000000f402";
+        let media_item_id = "0196f0d2-0000-7000-8000-00000000f403";
+        conn.execute(
+            "INSERT INTO works (id, canonical_title, work_type, status, created_at, updated_at)
+             VALUES (?1, '旧进度作品', 'fiction', 'completed', 1, 1)",
+            params![work_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO editions (id, work_id, title, edition_type, created_at, updated_at)
+             VALUES (?1, ?2, '漫画版', 'comic', 1, 1)",
+            params![edition_id, work_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO media_items
+                (id, edition_id, media_type, title, category, chapter, page_count,
+                 status, created_at, updated_at)
+             VALUES (?1, ?2, 'comic', '第 1 话', 'comic', 1, 4, 'available', 1, 1)",
+            params![media_item_id, edition_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO progress
+                (id, work_id, edition_id, media_item_id, locator_json, locator_version,
+                 completion, percentage, last_active_at, updated_at)
+             VALUES ('0196f0d2-0000-7000-8000-00000000f404', ?1, ?2, ?3, '{}', 1,
+                     'in_progress', 0.25, 1234, 1234)",
+            params![work_id, edition_id, media_item_id],
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+        let (revision, updated_at): (String, i64) = conn
+            .query_row(
+                "SELECT revision, updated_at FROM progress WHERE media_item_id = ?1",
+                params![media_item_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(revision.starts_with("legacy-"));
+        assert_ne!(revision, updated_at.to_string());
+        assert_eq!(updated_at, 1234, "迁移不得修改展示时间");
+    }
+
+    #[test]
+    fn migration_035_backfills_page_identity_revisions_without_rewriting_pages() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_legacy_through(&mut conn, MIGRATIONS.len() - 2);
+        let work_id = "0196f0d2-0000-7000-8000-00000000f411";
+        let edition_id = "0196f0d2-0000-7000-8000-00000000f412";
+        let media_item_id = "0196f0d2-0000-7000-8000-00000000f413";
+        conn.execute(
+            "INSERT INTO works (id, canonical_title, work_type, status, created_at, updated_at)
+             VALUES (?1, '旧页面观察作品', 'fiction', 'completed', 1, 1)",
+            params![work_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO editions (id, work_id, title, edition_type, created_at, updated_at)
+             VALUES (?1, ?2, '漫画版', 'comic', 1, 1)",
+            params![edition_id, work_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO media_items
+                (id, edition_id, media_type, title, category, chapter, page_count,
+                 status, created_at, updated_at)
+             VALUES (?1, ?2, 'comic', '第 1 话', 'comic', 1, 2, 'available', 1, 1)",
+            params![media_item_id, edition_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO comic_page_identities
+                (media_item_id, page_index, stable_key, fingerprint, updated_at)
+             VALUES (?1, 0, 'legacy-page-0', NULL, 4321),
+                    (?1, 1, NULL, 'legacy-fingerprint-1', 4322)",
+            params![media_item_id],
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+        let (revision, updated_at): (String, i64) = conn
+            .query_row(
+                "SELECT revision, updated_at
+                 FROM comic_page_identity_states WHERE media_item_id = ?1",
+                params![media_item_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(revision.starts_with("legacy-"));
+        assert_eq!(updated_at, 4322);
+        let pages: Vec<(i64, Option<String>, Option<String>)> = conn
+            .prepare(
+                "SELECT page_index, stable_key, fingerprint
+                 FROM comic_page_identities WHERE media_item_id = ?1 ORDER BY page_index",
+            )
+            .unwrap()
+            .query_map(params![media_item_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            pages,
+            vec![
+                (0, Some("legacy-page-0".into()), None),
+                (1, None, Some("legacy-fingerprint-1".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn migration_036_adds_source_profile_observation_without_rewriting_legacy_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // Build a legacy chapter-source row before 036. Its profile observation
+        // must remain NULL so Repository reads can use the historical Edition
+        // projection without pretending it was a source-level observation.
+        apply_legacy_through(&mut conn, MIGRATIONS.len() - 1);
+        let work_id = "0196f0d2-0000-7000-8000-00000000f421";
+        let edition_id = "0196f0d2-0000-7000-8000-00000000f422";
+        let media_item_id = "0196f0d2-0000-7000-8000-00000000f423";
+        conn.execute(
+            "INSERT INTO works (id, canonical_title, work_type, status, created_at, updated_at)
+             VALUES (?1, '旧来源画像作品', 'fiction', 'completed', 1, 1)",
+            params![work_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO editions (id, work_id, title, edition_type, created_at, updated_at)
+             VALUES (?1, ?2, '漫画版', 'comic', 1, 1)",
+            params![edition_id, work_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO media_items
+                (id, edition_id, media_type, title, category, chapter, page_count,
+                 status, created_at, updated_at)
+             VALUES (?1, ?2, 'comic', '第 1 话', 'comic', 1, 2, 'available', 1, 1)",
+            params![media_item_id, edition_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO comic_chapter_source_refs
+                (source_key, remote_work_id, remote_chapter_id, media_item_id,
+                 chapter_number, page_count, updated_at)
+             VALUES ('legacy-source', 'legacy-work', 'legacy-chapter', ?1, 1, 2, 7)",
+            params![media_item_id],
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+        let observed: Option<String> = conn
+            .query_row(
+                "SELECT observed_edition_profile
+                 FROM comic_chapter_source_refs
+                 WHERE source_key = 'legacy-source'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(observed.is_none(), "036 不得伪造旧来源的历史画像观察");
+    }
+
+    #[test]
+    fn multi_source_work_refs_allow_many_sources_per_work() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_legacy_through(&mut conn, 28);
+        let now = haven_common::UtcMillis::now().0;
+        conn.execute(
+            "INSERT INTO works (id, canonical_title, work_type, status, created_at, updated_at)
+             VALUES ('0196f0d2-0000-7000-8000-000000000a01', '作品 A', 'fiction', 'completed', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO works (id, canonical_title, work_type, status, created_at, updated_at)
+             VALUES ('0196f0d2-0000-7000-8000-000000000a02', '作品 B', 'fiction', 'completed', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        // Legacy 014 只能先放一条引用；029 必须保留它并解除 work_id 单主键限制。
+        conn.execute(
+            "INSERT INTO work_source_refs (provider, external_id, work_id)
+             VALUES ('legacy-source', 'legacy-work', '0196f0d2-0000-7000-8000-000000000a01')",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO work_source_refs (provider, external_id, work_id)
+             VALUES ('second-source', 'second-work', '0196f0d2-0000-7000-8000-000000000a01')",
+            [],
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM work_source_refs WHERE work_id = '0196f0d2-0000-7000-8000-000000000a01'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "一个 Work 必须保留多个来源引用");
+
+        let conflict = conn.execute(
+            "INSERT INTO work_source_refs (provider, external_id, work_id)
+             VALUES ('legacy-source', 'legacy-work', '0196f0d2-0000-7000-8000-000000000a02')",
+            [],
+        );
+        assert!(
+            conflict
+                .expect_err("同一来源远端作品不得绑定两个 Work")
+                .to_string()
+                .contains("UNIQUE"),
+            "唯一约束必须落在来源身份，而不是 work_id"
+        );
+
+        conn.execute(
+            "DELETE FROM works WHERE id = '0196f0d2-0000-7000-8000-000000000a01'",
+            [],
+        )
+        .unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM work_source_refs WHERE work_id = '0196f0d2-0000-7000-8000-000000000a01'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0, "删除 Work 仍应级联清理全部来源引用");
+    }
+
+    #[test]
+    fn legacy_028_upgrade_preserves_source_ref_and_builds_comic_schema() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_legacy_through(&mut conn, 28);
+        let now = haven_common::UtcMillis::now().0;
+        let work_id = "0196f0d2-0000-7000-8000-000000000b01";
+        let edition_id = "0196f0d2-0000-7000-8000-000000000b02";
+        let media_item_id = "0196f0d2-0000-7000-8000-000000000b03";
+        conn.execute(
+            "INSERT INTO works (id, canonical_title, work_type, status, created_at, updated_at)
+             VALUES (?1, '迁移漫画作品', 'fiction', 'completed', ?2, ?2)",
+            params![work_id, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO editions (id, work_id, title, edition_type, language, created_at, updated_at)
+             VALUES (?1, ?2, '中文漫画版', 'comic', 'zh-cn', ?3, ?3)",
+            params![edition_id, work_id, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO media_items
+                (id, edition_id, media_type, title, category, chapter, page_count,
+                 status, created_at, updated_at)
+             VALUES (?1, ?2, 'comic', '第 1 话', 'comic', 1.0, 3, 'available', ?3, ?3)",
+            params![media_item_id, edition_id, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO work_source_refs (provider, external_id, work_id)
+             VALUES ('legacy-source', 'legacy-manga', ?1)",
+            params![work_id],
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+
+        let stored_work: String = conn
+            .query_row(
+                "SELECT work_id FROM work_source_refs
+                 WHERE provider = 'legacy-source' AND external_id = 'legacy-manga'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_work, work_id, "029 不得丢失旧来源引用");
+
+        for table in [
+            "edition_profiles",
+            "comic_chapter_source_refs",
+            "comic_page_identities",
+            "comic_page_identity_states",
+            "comic_progress_migration_snapshots",
+            "comic_chapter_catalog_states",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "缺少迁移表 {table}");
+        }
+
+        let work_id_primary_key: i64 = conn
+            .query_row(
+                "SELECT pk FROM pragma_table_info('work_source_refs') WHERE name = 'work_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(work_id_primary_key, 0, "029 必须移除 work_id 单列主键");
+        let schema_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(schema_count as usize, MIGRATIONS.len());
     }
 
     #[test]

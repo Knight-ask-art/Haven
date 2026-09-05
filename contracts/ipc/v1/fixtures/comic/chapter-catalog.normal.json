@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 1,
+  "sourceId": "mangadex",
+  "remoteWorkId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  "fetchedAt": "2026-09-04T00:00:00Z",
+  "total": 3,
+  "truncated": false,
+  "chapters": [
+    {
+      "remoteChapterId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      "chapterNumber": 12.5,
+      "volumeNumber": 2,
+      "title": "幕间",
+      "pageCount": 24,
+      "publishedAt": "2026-08-01T00:00:00Z",
+      "updatedAt": "2026-08-02T00:00:00Z",
+      "availability": "available",
+      "editionProfile": {
+        "language": "zh-hk",
+        "languageKind": "known",
+        "translationLine": null,
+        "translationLineKind": "unknown",
+        "scanGroup": "Fixture Scan Group",
+        "scanGroupKind": "content_line",
+        "colorMode": "unknown"
+      }
+    },
+    {
+      "remoteChapterId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      "chapterNumber": 13,
+      "volumeNumber": null,
+      "title": "暂不可用章节",
+      "pageCount": 0,
+      "publishedAt": null,
+      "updatedAt": null,
+      "availability": "temporarily_unavailable",
+      "editionProfile": {
+        "language": null,
+        "languageKind": "unknown",
+        "translationLine": null,
+        "translationLineKind": "unknown",
+        "scanGroup": null,
+        "scanGroupKind": "unknown",
+        "colorMode": "unknown"
+      }
+    },
+    {
+      "remoteChapterId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      "chapterNumber": 14,
+      "volumeNumber": null,
+      "title": "外部章节",
+      "pageCount": null,
+      "publishedAt": null,
+      "updatedAt": null,
+      "availability": "external_only",
+      "editionProfile": {
+        "language": "en",
+        "languageKind": "known",
+        "translationLine": null,
+        "translationLineKind": "not_applicable",
+        "scanGroup": "Mirror label",
+        "scanGroupKind": "mirror_label",
+        "colorMode": "grayscale"
+      }
+    }
+  ]
+}

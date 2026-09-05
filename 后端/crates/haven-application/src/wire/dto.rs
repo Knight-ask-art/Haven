@@ -1636,6 +1636,385 @@ pub struct EditionGetRequest {
     pub edition_id: String,
 }
 
+/// 漫画章节目录的来源可用性。不可用章节也会进入只读目录投影，供刷新层
+/// 区分暂时不可用、外部跳转和字段不完整，而不是被前端误认为已删除。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum ComicChapterAvailabilityDto {
+    Available,
+    TemporarilyUnavailable,
+    ExternalOnly,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum ComicEditionFacetKindDto {
+    Unknown,
+    Known,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum ComicScanGroupKindDto {
+    Unknown,
+    ContentLine,
+    MirrorLabel,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum ComicColorModeDto {
+    Unknown,
+    FullColor,
+    Grayscale,
+    Mixed,
+}
+
+/// 章节目录中用于展示 Edition 区分依据的安全画像。
+///
+/// 只投影已清洗的标签和语义 kind；不投影 URL、pageId、grant、请求头或
+/// provider 内部页面定位。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicEditionProfileDto {
+    pub language: Option<String>,
+    pub language_kind: ComicEditionFacetKindDto,
+    pub translation_line: Option<String>,
+    pub translation_line_kind: ComicEditionFacetKindDto,
+    pub scan_group: Option<String>,
+    pub scan_group_kind: ComicScanGroupKindDto,
+    pub color_mode: ComicColorModeDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicChapterCatalogItemDto {
+    /// Provider 章节 ID 作为 opaque identity 返回；所有消费命令仍由后端复核。
+    pub remote_chapter_id: String,
+    pub chapter_number: Option<f64>,
+    pub volume_number: Option<f64>,
+    pub title: Option<String>,
+    pub page_count: Option<u32>,
+    pub published_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub availability: ComicChapterAvailabilityDto,
+    pub edition_profile: ComicEditionProfileDto,
+}
+
+/// 获取一个来源作品当前章节目录的只读请求。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicChapterCatalogGetRequest {
+    pub source_id: String,
+    pub remote_work_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicChapterCatalogDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub source_id: String,
+    pub remote_work_id: String,
+    pub fetched_at: String,
+    pub total: Option<u32>,
+    pub truncated: bool,
+    pub chapters: Vec<ComicChapterCatalogItemDto>,
+}
+
+/// 已登记章节的来源状态。`Missing` 只表示最近一次完整刷新没有再次看到
+/// 该章节；MediaItem、Progress、Marker、History 仍然保留。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum ComicChapterSourceStatusDto {
+    Available,
+    TemporarilyUnavailable,
+    ExternalOnly,
+    Unknown,
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicChapterCatalogRefreshStateDto {
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub fetched_at: String,
+    pub total: Option<u32>,
+    pub truncated: bool,
+}
+
+/// SQLite 中已经登记的章节安全投影。
+///
+/// 与 Provider 观察目录分开建模：这里返回 Haven `mediaItemId` 和已持久化的
+/// 来源状态，供章节列表、换源和进度迁移使用；内部 Resource locator、URL、
+/// pageId、grant、请求头和 authoritative content key 永不进入 Wire。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicRegisteredChapterCatalogItemDto {
+    pub media_item_id: String,
+    pub source_id: String,
+    pub remote_work_id: String,
+    pub remote_chapter_id: String,
+    pub chapter_number: Option<f64>,
+    pub volume_number: Option<f64>,
+    pub title: Option<String>,
+    pub page_count: Option<u32>,
+    pub source_order: u32,
+    pub availability: ComicChapterSourceStatusDto,
+    pub published_at: Option<String>,
+    pub source_updated_at: Option<String>,
+    #[ts(type = "number | null")]
+    pub last_seen_generation: Option<u64>,
+    pub edition_profile: ComicEditionProfileDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicRegisteredChapterCatalogDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub source_id: String,
+    pub remote_work_id: String,
+    pub refresh_state: Option<ComicChapterCatalogRefreshStateDto>,
+    pub chapters: Vec<ComicRegisteredChapterCatalogItemDto>,
+}
+
+/// 获取当前章节已经登记的其他来源候选。请求中的来源身份必须先在
+/// SQLite 中解析，前端不能用它直接构造 Provider URL 或资源定位器。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicChapterSourceCandidatesGetRequestDto {
+    pub source: ComicChapterSourceIdentityDto,
+}
+
+/// 一个来源章节候选的安全展示投影。`matchResult` 是后端比较出的证据，
+/// 不允许前端自行以标题、章节号或页数写回数据库。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicChapterSourceCandidateDto {
+    pub source: ComicChapterSourceIdentityDto,
+    pub media_item_id: String,
+    pub chapter_number: Option<f64>,
+    pub volume_number: Option<f64>,
+    pub title: Option<String>,
+    pub page_count: Option<u32>,
+    pub source_order: u32,
+    pub availability: ComicChapterSourceStatusDto,
+    pub published_at: Option<String>,
+    pub source_updated_at: Option<String>,
+    #[ts(type = "number | null")]
+    pub last_seen_generation: Option<u64>,
+    pub edition_profile: ComicEditionProfileDto,
+    pub match_result: ComicChapterMatchDto,
+}
+
+/// 当前来源章节的候选集合。候选按后端证据排序，`truncated=true` 表示
+/// Work 下的来源引用超过本次安全返回上限；它不是“没有更多章节”的判断。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicChapterSourceCandidatesDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub source: ComicChapterSourceIdentityDto,
+    pub current_media_item_id: String,
+    pub candidates: Vec<ComicChapterSourceCandidateDto>,
+    pub truncated: bool,
+}
+
+/// 一个章节在某个来源上的 opaque 身份。来源/作品/章节 ID 由后端重新校验，
+/// 不表示 URL、资源路径或运行时 pageId。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicChapterSourceIdentityDto {
+    pub source_id: String,
+    pub remote_work_id: String,
+    pub remote_chapter_id: String,
+}
+
+/// 跨来源章节迁移请求。低置信度 `Suggested` 匹配只有在用户或应用策略明确
+/// 允许最佳努力迁移时才会写入；目标已有进度默认保留，只有用户明确选择覆盖
+/// 时才允许 `allowTargetOverwrite=true`；源/目标 revision 仍由后端在原子事务中校验。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicProgressMigrationRequestDto {
+    pub source: ComicChapterSourceIdentityDto,
+    pub target: ComicChapterSourceIdentityDto,
+    /// 允许低置信度元数据匹配执行可撤销的最佳努力迁移。
+    pub allow_best_effort: bool,
+    /// 只有用户明确选择覆盖目标现有进度时才设为 true。
+    pub allow_target_overwrite: bool,
+}
+
+/// 重新检查 owner-bound Comic Session 的页面序列并迁移进度。
+///
+/// 页面身份必须由后端重新 inspect 生成；前端不能提交旧/新页面身份，
+/// 也不能把运行时 pageId、grant、URL 或路径伪装成迁移证据。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicPageProgressRemapRequestDto {
+    pub session_id: String,
+    pub expected_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum ComicProgressMigrationStatusDto {
+    Unchanged,
+    NotApplicable,
+    Applied,
+    SharedContent,
+    Suggested,
+    NoSourceProgress,
+    TargetProgressPreserved,
+    NoTargetPage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum ComicChapterMatchKindDto {
+    SameRemoteChapter,
+    SameContent,
+    SameLogicalChapterVariant,
+    Candidate,
+    Unrelated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum ComicMatchConfidenceDto {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum ComicProgressMigrationModeDto {
+    Shared,
+    OneTime,
+    Suggested,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum ComicChapterEvidenceKindDto {
+    SameRemoteIdentity,
+    AuthoritativeContentKey,
+    ConflictingAuthoritativeContentKey,
+    EditionCompatible,
+    EditionConflict,
+    ExactPageIdentity,
+    PartialPageIdentity,
+    MatchingChapterMetadata,
+    WeakChapterMetadata,
+}
+
+/// 证据保持为闭合 kind + 可选计数，避免把 Domain enum 的内部表示直接暴露给 IPC。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicChapterEvidenceDto {
+    pub kind: ComicChapterEvidenceKindDto,
+    pub matched: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicChapterMatchDto {
+    pub kind: ComicChapterMatchKindDto,
+    pub confidence: ComicMatchConfidenceDto,
+    pub progress_migration: ComicProgressMigrationModeDto,
+    pub evidence: Vec<ComicChapterEvidenceDto>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum ComicPageMappingConfidenceDto {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum ComicPageMappingStrategyDto {
+    StableKey,
+    ContentFingerprint,
+    ReorderedAnchor,
+    NearestSurvivingPage,
+    ProportionalFallback,
+    NoTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicPageMigrationDto {
+    pub target_page_index: Option<u32>,
+    pub confidence: ComicPageMappingConfidenceDto,
+    pub strategy: ComicPageMappingStrategyDto,
+    pub reversible: bool,
+}
+
+/// 章节换源/页面重定位的统一结果。低置信度自动迁移也必须带 snapshotId，
+/// 以便用户在目标进度未被后续写入时撤销。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicProgressMigrationResultDto {
+    pub status: ComicProgressMigrationStatusDto,
+    pub match_result: Option<ComicChapterMatchDto>,
+    pub page_migration: ComicPageMigrationDto,
+    pub snapshot_id: Option<String>,
+    pub applied_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicProgressMigrationRevertRequestDto {
+    pub migration_id: String,
+    pub expected_applied_revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicProgressMigrationRevertResultDto {
+    pub reverted: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, rename_all = "camelCase")]

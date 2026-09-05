@@ -14,16 +14,25 @@ use haven_application::services::source_import::{
 };
 use haven_application::services::source_registry::SourceRegistryService;
 use haven_common::AppError;
-use haven_domain::contracts::{
-    EditionRepository, MediaItemRepository, ResourceRepository, WorkRepository,
+use haven_common::UtcMillis;
+use haven_domain::comic_catalog::{
+    ComicChapterAvailability, ComicChapterCatalog, ComicChapterCatalogEntry,
 };
-use haven_domain::entities::ResourceLocator;
-use haven_domain::enums::{MediaType, ResourceType};
+use haven_domain::comic_identity::{ChapterSourceIdentity, ComicChapterMetadata};
+use haven_domain::contracts::{
+    ChapterSourceRepository, EditionRepository, MediaItemRepository, ProgressRepository,
+    ResourceRepository, WorkRepository,
+};
+use haven_domain::entities::{Edition, MediaIndex, MediaItem, Progress, ResourceLocator};
+use haven_domain::enums::{CompletionState, MediaType, ResourceType};
+use haven_domain::ids::{EditionId, MediaItemId, ProgressId};
+use haven_domain::locator::{ComicLocator, Locator};
 use haven_infrastructure::Db;
 use haven_infrastructure::db::repos::SqliteRepositories;
 
 const MANGA_ID: &str = "00000000-0000-0000-0000-000000000001";
 const MANGA_CHAPTER_ID: &str = "00000000-0000-0000-0000-000000000002";
+const MANGA_CHAPTER_ID_2: &str = "00000000-0000-0000-0000-000000000003";
 const MANGA_REMOTE_ID: &str =
     "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002";
 const ARXIV_ID: &str = "hep-th/9901001";
@@ -35,6 +44,8 @@ const M3U_CANDIDATE: &str = "content-candidate-m3u-Fixture%20Stream%01https%3A%2
 #[derive(Default)]
 struct FakeCatalog {
     detail_calls: Mutex<Vec<(String, String, String)>>,
+    comic_catalog: Mutex<Option<ComicChapterCatalog>>,
+    comic_catalog_calls: Mutex<usize>,
 }
 
 impl FakeCatalog {
@@ -43,6 +54,20 @@ impl FakeCatalog {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len()
+    }
+
+    fn set_comic_catalog(&self, catalog: ComicChapterCatalog) {
+        *self
+            .comic_catalog
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(catalog);
+    }
+
+    fn comic_catalog_count(&self) -> usize {
+        *self
+            .comic_catalog_calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -101,8 +126,80 @@ impl SourceCatalogProvider for FakeCatalog {
                 media_type,
                 mime_type: Some(mime_type.to_owned()),
             }),
+            comic_catalog: None,
         })
     }
+
+    async fn comic_chapter_catalog(
+        &self,
+        source_id: &str,
+        _endpoint: &str,
+        external_id: &str,
+    ) -> Result<Option<ComicChapterCatalog>, AppError> {
+        if source_id != "mangadex" {
+            return Ok(None);
+        }
+        *self
+            .comic_catalog_calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+        if let Some(catalog) = self
+            .comic_catalog
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            return Ok(Some(catalog));
+        }
+        Ok(Some(
+            ComicChapterCatalog::new(
+                source_id,
+                external_id,
+                vec![ComicChapterCatalogEntry {
+                    identity: ChapterSourceIdentity::new(source_id, external_id, MANGA_CHAPTER_ID)
+                        .unwrap(),
+                    metadata: ComicChapterMetadata {
+                        chapter_number: Some(1.0),
+                        title: Some("第一话".to_owned()),
+                        page_count: Some(2),
+                        ..Default::default()
+                    },
+                    availability: ComicChapterAvailability::Available,
+                    published_at: None,
+                    updated_at: None,
+                }],
+                UtcMillis::now(),
+            )
+            .unwrap(),
+        ))
+    }
+}
+
+fn manga_catalog(chapters: Vec<(&str, f64)>, truncated: bool) -> ComicChapterCatalog {
+    let entries: Vec<ComicChapterCatalogEntry> = chapters
+        .into_iter()
+        .map(|(chapter_id, number)| ComicChapterCatalogEntry {
+            identity: ChapterSourceIdentity::new("mangadex", MANGA_ID, chapter_id).unwrap(),
+            metadata: ComicChapterMetadata {
+                chapter_number: Some(number),
+                title: Some(format!("第 {number} 话")),
+                page_count: Some(2),
+                ..Default::default()
+            },
+            availability: ComicChapterAvailability::Available,
+            published_at: None,
+            updated_at: None,
+        })
+        .collect();
+    ComicChapterCatalog::new_with_coverage(
+        "mangadex",
+        MANGA_ID,
+        entries.clone(),
+        UtcMillis::now(),
+        Some(entries.len() as u32),
+        truncated,
+    )
+    .unwrap()
 }
 
 struct Fixture {
@@ -247,11 +344,392 @@ async fn content_import_registers_source_object_without_local_content() {
 
     assert_remote_resource(&fixture.repos, &imported, "mangadex", MANGA_REMOTE_ID).await;
     assert_eq!(fixture.catalog.detail_count(), 1);
+    assert_eq!(
+        fixture.catalog.comic_catalog_count(),
+        1,
+        "漫画详情导入应复用已取得的目录，不重复请求 feed"
+    );
     assert!(
         fs::read_dir(temp.path())
             .expect("temporary directory should read")
             .next()
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn comic_refresh_reuses_media_item_and_progress_across_missing_and_reappearance() {
+    let fixture = fixture();
+    let imported = fixture
+        .service
+        .import_content_candidate("mangadex", MANGA_ID)
+        .await
+        .expect("initial comic import should succeed");
+    let edition = fixture
+        .repos
+        .list_by_work(imported.work_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    fixture
+        .repos
+        .progress
+        .save(&Progress {
+            id: ProgressId::new(),
+            work_id: imported.work_id,
+            edition_id: edition.id,
+            media_item_id: imported.media_item_id,
+            locator: Locator::Comic(ComicLocator {
+                chapter_item_id: imported.media_item_id,
+                page_index: 1,
+                page_progression: Some(0.5),
+            }),
+            completion: CompletionState::InProgress,
+            percentage: Some(0.75),
+            last_active_at: UtcMillis(10),
+            updated_at: UtcMillis(10),
+            revision: None,
+            keyframe_uri: None,
+        })
+        .await
+        .unwrap();
+
+    fixture
+        .catalog
+        .set_comic_catalog(manga_catalog(vec![], false));
+    fixture
+        .service
+        .refresh_comic_chapter_catalog("mangadex", MANGA_ID)
+        .await
+        .expect("complete empty refresh should reconcile missing chapter");
+    let missing = fixture
+        .repos
+        .chapter_source
+        .list_for_source_work("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    assert_eq!(missing.len(), 1);
+    assert!(matches!(
+        missing[0].availability,
+        haven_domain::comic_catalog::ComicChapterSourceStatus::Missing
+    ));
+    assert_eq!(missing[0].media_item_id, imported.media_item_id);
+    let missing_resource = fixture
+        .repos
+        .list_by_media_item(imported.media_item_id)
+        .await
+        .unwrap();
+    assert_eq!(missing_resource.len(), 1);
+    assert_eq!(
+        missing_resource[0].availability,
+        haven_domain::enums::Availability::Missing
+    );
+    assert!(
+        fixture
+            .repos
+            .progress
+            .get_for_media_item(imported.media_item_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "章节暂时消失不得删除 Progress"
+    );
+
+    fixture.catalog.set_comic_catalog(manga_catalog(
+        vec![(MANGA_CHAPTER_ID, 1.0), (MANGA_CHAPTER_ID_2, 2.0)],
+        false,
+    ));
+    fixture
+        .service
+        .refresh_comic_chapter_catalog("mangadex", MANGA_ID)
+        .await
+        .expect("reappearing chapter and new chapter should refresh");
+    let refs = fixture
+        .repos
+        .chapter_source
+        .list_for_source_work("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    assert_eq!(refs.len(), 2);
+    assert_eq!(
+        fixture
+            .repos
+            .list_by_work(imported.work_id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "相同未知 Edition 画像的章节应复用容器，unknown 不能导致每章新建 Edition"
+    );
+    assert_eq!(refs[0].media_item_id, imported.media_item_id);
+    assert!(refs.iter().any(|reference| {
+        reference.identity.remote_chapter_id == MANGA_CHAPTER_ID_2
+            && reference.media_item_id != imported.media_item_id
+    }));
+    assert!(refs.iter().all(|reference| {
+        matches!(
+            reference.availability,
+            haven_domain::comic_catalog::ComicChapterSourceStatus::Available
+        )
+    }));
+    let progress = fixture
+        .repos
+        .progress
+        .get_for_media_item(imported.media_item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        progress.locator,
+        Locator::Comic(ComicLocator {
+            chapter_item_id: imported.media_item_id,
+            page_index: 1,
+            page_progression: Some(0.5),
+        })
+    );
+}
+
+#[tokio::test]
+async fn comic_refresh_ignores_non_comic_editions_on_the_same_work() {
+    let fixture = fixture();
+    let imported = fixture
+        .service
+        .import_content_candidate("mangadex", MANGA_ID)
+        .await
+        .expect("initial comic import should succeed");
+
+    let movie_edition = Edition {
+        id: EditionId::new(),
+        work_id: imported.work_id,
+        title: "同作品电影版".to_owned(),
+        subtitle: None,
+        edition_type: MediaType::Movie,
+        release_date: None,
+        language: None,
+        region: None,
+        publisher_or_studio: None,
+        description: None,
+        artwork: Default::default(),
+        created_at: UtcMillis(0),
+        updated_at: UtcMillis(0),
+    };
+    let movie_item = MediaItem {
+        id: MediaItemId::new(),
+        edition_id: movie_edition.id,
+        parent_id: None,
+        media_type: MediaType::Movie,
+        title: "电影正文".to_owned(),
+        index: MediaIndex::Movie,
+        duration_ms: Some(90_000),
+        page_count: None,
+        chapter_count: None,
+        published_at: None,
+        status: haven_domain::enums::MediaItemStatus::Available,
+        created_at: UtcMillis(0),
+        updated_at: UtcMillis(0),
+    };
+    fixture.repos.edition.save(&movie_edition).await.unwrap();
+    fixture.repos.media_item.save(&movie_item).await.unwrap();
+
+    fixture.catalog.set_comic_catalog(manga_catalog(
+        vec![(MANGA_CHAPTER_ID, 1.0), (MANGA_CHAPTER_ID_2, 2.0)],
+        false,
+    ));
+    fixture
+        .service
+        .refresh_comic_chapter_catalog("mangadex", MANGA_ID)
+        .await
+        .expect("漫画刷新不应被同 Work 下的电影 Edition 阻塞");
+
+    let references = fixture
+        .repos
+        .chapter_source
+        .list_for_source_work("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    let new_reference = references
+        .iter()
+        .find(|reference| reference.identity.remote_chapter_id == MANGA_CHAPTER_ID_2)
+        .expect("刷新应登记新增漫画章节");
+    let new_item = fixture
+        .repos
+        .media_item
+        .get(new_reference.media_item_id)
+        .await
+        .unwrap()
+        .expect("新增漫画章节应有 MediaItem");
+    let new_edition = fixture
+        .repos
+        .edition
+        .get(new_item.edition_id)
+        .await
+        .unwrap()
+        .expect("新增漫画章节应有 Edition");
+
+    assert_eq!(new_item.media_type, MediaType::Comic);
+    assert_eq!(new_edition.edition_type, MediaType::Comic);
+    assert_eq!(
+        fixture
+            .repos
+            .media_item
+            .list_by_edition(movie_edition.id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "漫画刷新计划不得纳入电影 Edition 的 MediaItem"
+    );
+}
+
+#[tokio::test]
+async fn truncated_comic_refresh_does_not_mark_omitted_chapters_missing() {
+    let fixture = fixture();
+    let imported = fixture
+        .service
+        .import_content_candidate("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    fixture
+        .catalog
+        .set_comic_catalog(manga_catalog(vec![], true));
+    fixture
+        .service
+        .refresh_comic_chapter_catalog("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    let references = fixture
+        .repos
+        .chapter_source
+        .list_for_source_work("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0].media_item_id, imported.media_item_id);
+    assert!(matches!(
+        references[0].availability,
+        haven_domain::comic_catalog::ComicChapterSourceStatus::Available
+    ));
+}
+
+#[tokio::test]
+async fn comic_refresh_reorders_chapters_without_replacing_media_items() {
+    let fixture = fixture();
+    let imported = fixture
+        .service
+        .import_content_candidate("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+
+    fixture.catalog.set_comic_catalog(manga_catalog(
+        vec![(MANGA_CHAPTER_ID_2, 2.0), (MANGA_CHAPTER_ID, 1.0)],
+        false,
+    ));
+    fixture
+        .service
+        .refresh_comic_chapter_catalog("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    let first = fixture
+        .repos
+        .chapter_source
+        .list_for_source_work("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    assert_eq!(first[0].identity.remote_chapter_id, MANGA_CHAPTER_ID_2);
+    assert_eq!(first[0].source_order, 0);
+    assert_eq!(first[1].identity.remote_chapter_id, MANGA_CHAPTER_ID);
+    assert_eq!(first[1].source_order, 1);
+    let chapter_one_item = first[1].media_item_id;
+    let chapter_two_item = first[0].media_item_id;
+    assert_eq!(chapter_one_item, imported.media_item_id);
+
+    fixture.catalog.set_comic_catalog(manga_catalog(
+        vec![(MANGA_CHAPTER_ID, 1.0), (MANGA_CHAPTER_ID_2, 2.0)],
+        false,
+    ));
+    fixture
+        .service
+        .refresh_comic_chapter_catalog("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    let second = fixture
+        .repos
+        .chapter_source
+        .list_for_source_work("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    assert_eq!(second[0].identity.remote_chapter_id, MANGA_CHAPTER_ID);
+    assert_eq!(second[0].source_order, 0);
+    assert_eq!(second[0].media_item_id, chapter_one_item);
+    assert_eq!(second[1].identity.remote_chapter_id, MANGA_CHAPTER_ID_2);
+    assert_eq!(second[1].source_order, 1);
+    assert_eq!(second[1].media_item_id, chapter_two_item);
+}
+
+#[tokio::test]
+async fn temporarily_unavailable_chapter_recovers_without_changing_identity() {
+    let fixture = fixture();
+    let imported = fixture
+        .service
+        .import_content_candidate("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+
+    let mut unavailable = manga_catalog(vec![(MANGA_CHAPTER_ID, 1.0)], false);
+    unavailable.chapters[0].availability = ComicChapterAvailability::TemporarilyUnavailable;
+    fixture.catalog.set_comic_catalog(unavailable);
+    fixture
+        .service
+        .refresh_comic_chapter_catalog("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    let unavailable_ref = fixture
+        .repos
+        .chapter_source
+        .list_for_source_work("mangadex", MANGA_ID)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(unavailable_ref.media_item_id, imported.media_item_id);
+    assert_eq!(
+        unavailable_ref.availability,
+        haven_domain::comic_catalog::ComicChapterSourceStatus::TemporarilyUnavailable
+    );
+    let unavailable_item = fixture
+        .repos
+        .media_item
+        .get(imported.media_item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unavailable_item.status,
+        haven_domain::enums::MediaItemStatus::Unavailable
+    );
+
+    fixture
+        .catalog
+        .set_comic_catalog(manga_catalog(vec![(MANGA_CHAPTER_ID, 1.0)], false));
+    fixture
+        .service
+        .refresh_comic_chapter_catalog("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    let recovered = fixture
+        .repos
+        .chapter_source
+        .list_for_source_work("mangadex", MANGA_ID)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(recovered.media_item_id, imported.media_item_id);
+    assert_eq!(
+        recovered.availability,
+        haven_domain::comic_catalog::ComicChapterSourceStatus::Available
     );
 }
 

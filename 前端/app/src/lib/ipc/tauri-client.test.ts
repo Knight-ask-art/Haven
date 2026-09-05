@@ -1,5 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
-import type { ComicPageManifestGetRequest, ProgressSaveRequest, ReaderTocGetRequest } from "./generated/wire"
+import type {
+  ComicChapterCatalogGetRequest,
+  ComicRegisteredChapterCatalogDto,
+  ComicChapterSourceCandidatesGetRequestDto,
+  ComicProgressMigrationRequestDto,
+  ComicPageProgressRemapRequestDto,
+  ComicProgressMigrationRevertRequestDto,
+  ComicPageManifestGetRequest,
+  ProgressSaveRequest,
+  ReaderTocGetRequest,
+} from "./generated/wire"
 import type { SettingsUpdateRequest } from "./settings-wire"
 
 const { invoke, check } = vi.hoisted(() => ({ invoke: vi.fn(), check: vi.fn() }))
@@ -45,6 +55,162 @@ describe("TauriHavenClient comic_page_manifest_get", () => {
 
     await expect(new TauriHavenClient().comicPageManifestGet(request)).resolves.toBe(manifest)
     expect(invoke).toHaveBeenCalledWith("comic_page_manifest_get", { request })
+  })
+})
+
+describe("TauriHavenClient comic_chapter_catalog_get", () => {
+  it("maps the source/work request under the command request argument", async () => {
+    const request: ComicChapterCatalogGetRequest = {
+      sourceId: "mangadex",
+      remoteWorkId: "aaaaaaaa-aaaa-4aaa-8000-aaaaaaaaaaaa",
+    }
+    const catalog = {
+      schemaVersion: 1,
+      sourceId: request.sourceId,
+      remoteWorkId: request.remoteWorkId,
+      fetchedAt: "2026-09-04T00:00:00Z",
+      total: 0,
+      truncated: false,
+      chapters: [],
+    } as const
+    invoke.mockResolvedValueOnce(catalog)
+
+    await expect(new TauriHavenClient().comicChapterCatalogGet(request)).resolves.toBe(catalog)
+    expect(invoke).toHaveBeenCalledWith("comic_chapter_catalog_get", { request })
+  })
+})
+
+describe("TauriHavenClient comic_chapter_catalog_registered_get", () => {
+  it("maps the persisted catalog request under the command request argument", async () => {
+    const request: ComicChapterCatalogGetRequest = {
+      sourceId: "mangadex",
+      remoteWorkId: "aaaaaaaa-aaaa-4aaa-8000-aaaaaaaaaaaa",
+    }
+    const catalog: ComicRegisteredChapterCatalogDto = {
+      schemaVersion: 1,
+      sourceId: request.sourceId,
+      remoteWorkId: request.remoteWorkId,
+      refreshState: null,
+      chapters: [],
+    }
+    invoke.mockResolvedValueOnce(catalog)
+
+    await expect(new TauriHavenClient().comicChapterCatalogRegisteredGet(request)).resolves.toBe(catalog)
+    expect(invoke).toHaveBeenCalledWith("comic_chapter_catalog_registered_get", { request })
+  })
+})
+
+describe("TauriHavenClient comic_chapter_catalog_refresh", () => {
+  it("maps the explicit refresh request under the command request argument", async () => {
+    const request: ComicChapterCatalogGetRequest = {
+      sourceId: "mangadex",
+      remoteWorkId: "aaaaaaaa-aaaa-4aaa-8000-aaaaaaaaaaaa",
+    }
+    const catalog = {
+      schemaVersion: 1,
+      sourceId: request.sourceId,
+      remoteWorkId: request.remoteWorkId,
+      fetchedAt: "2026-09-04T00:00:00Z",
+      total: 0,
+      truncated: false,
+      chapters: [],
+    } as const
+    invoke.mockResolvedValueOnce(catalog)
+
+    await expect(new TauriHavenClient().comicChapterCatalogRefresh(request)).resolves.toBe(catalog)
+    expect(invoke).toHaveBeenCalledWith("comic_chapter_catalog_refresh", { request })
+  })
+})
+
+describe("TauriHavenClient comic_chapter_source_candidates_get", () => {
+  it("passes the opaque source identity under the command request argument", async () => {
+    const request: ComicChapterSourceCandidatesGetRequestDto = {
+      source: {
+        sourceId: "mangadex",
+        remoteWorkId: "aaaaaaaa-aaaa-4aaa-8000-aaaaaaaaaaaa",
+        remoteChapterId: "bbbbbbbb-bbbb-4bbb-8000-bbbbbbbbbbbb",
+      },
+    }
+    const result = {
+      schemaVersion: 1,
+      source: request.source,
+      currentMediaItemId: "cccccccc-cccc-4ccc-8000-cccccccccccc",
+      candidates: [],
+      truncated: false,
+    } as const
+    invoke.mockResolvedValueOnce(result)
+
+    await expect(new TauriHavenClient().comicChapterSourceCandidatesGet(request)).resolves.toBe(result)
+    expect(invoke).toHaveBeenCalledWith("comic_chapter_source_candidates_get", { request })
+  })
+})
+
+describe("TauriHavenClient comic progress migration", () => {
+  const source = {
+    sourceId: "mangadex",
+    remoteWorkId: "aaaaaaaa-aaaa-4aaa-8000-aaaaaaaaaaaa",
+    remoteChapterId: "bbbbbbbb-bbbb-4bbb-8000-bbbbbbbbbbbb",
+  }
+  const target = {
+    sourceId: "reader-ws",
+    remoteWorkId: "reader-work-12",
+    remoteChapterId: "reader-chapter-12",
+  }
+
+  it("passes the migration request under the command request argument", async () => {
+    const request: ComicProgressMigrationRequestDto = {
+      source,
+      target,
+      allowBestEffort: false,
+      allowTargetOverwrite: false,
+    }
+    const result = {
+      status: "applied",
+      matchResult: null,
+      pageMigration: {
+        targetPageIndex: 1,
+        confidence: "high",
+        strategy: "stable_key",
+        reversible: true,
+      },
+      snapshotId: "dddddddd-dddd-4ddd-8000-dddddddddddd",
+      appliedRevision: "456",
+    } as const
+    invoke.mockResolvedValueOnce(result)
+
+    await expect(new TauriHavenClient().comicProgressMigrate(request)).resolves.toBe(result)
+    expect(invoke).toHaveBeenCalledWith("comic_progress_migrate", { request })
+  })
+
+  it("passes page remap and CAS-protected revert requests without reshaping them", async () => {
+    const remap: ComicPageProgressRemapRequestDto = {
+      sessionId: "cccccccc-cccc-4ccc-8000-cccccccccccc",
+      expectedRevision: "123",
+    }
+    const migrationResult = {
+      status: "no_source_progress",
+      matchResult: null,
+      pageMigration: {
+        targetPageIndex: null,
+        confidence: "low",
+        strategy: "no_target",
+        reversible: true,
+      },
+      snapshotId: null,
+      appliedRevision: null,
+    } as const
+    invoke.mockResolvedValueOnce(migrationResult)
+    await expect(new TauriHavenClient().comicProgressRemap(remap)).resolves.toBe(migrationResult)
+    expect(invoke).toHaveBeenLastCalledWith("comic_progress_remap", { request: remap })
+
+    const revert: ComicProgressMigrationRevertRequestDto = {
+      migrationId: "dddddddd-dddd-4ddd-8000-dddddddddddd",
+      expectedAppliedRevision: "456",
+    }
+    const revertResult = { reverted: true } as const
+    invoke.mockResolvedValueOnce(revertResult)
+    await expect(new TauriHavenClient().comicProgressRevert(revert)).resolves.toBe(revertResult)
+    expect(invoke).toHaveBeenLastCalledWith("comic_progress_revert", { request: revert })
   })
 })
 

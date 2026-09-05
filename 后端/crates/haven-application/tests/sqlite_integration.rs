@@ -647,6 +647,7 @@ async fn seed_work_two_progress(repos: &SqliteRepositories) {
                 percentage: Some(0.5),
                 last_active_at: haven_common::UtcMillis(now.0 + n),
                 updated_at: haven_common::UtcMillis(now.0 + n),
+                revision: None,
                 keyframe_uri: None,
             })
             .await

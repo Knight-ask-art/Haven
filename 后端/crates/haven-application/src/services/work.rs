@@ -1013,6 +1013,7 @@ mod tests {
                 percentage: Some(0.25),
                 last_active_at: haven_common::UtcMillis(1),
                 updated_at: haven_common::UtcMillis(1),
+                revision: None,
                 keyframe_uri: None,
             })
             .await

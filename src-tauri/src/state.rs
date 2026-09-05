@@ -12,6 +12,9 @@ use tauri::Emitter;
 use haven_application::services::cache::CacheService;
 use haven_application::services::cast::{CastGrantRegistry, CastService};
 use haven_application::services::comic::ComicPageService;
+use haven_application::services::comic_catalog::ComicCatalogService;
+use haven_application::services::comic_page_identity::ComicPageIdentityService;
+use haven_application::services::comic_progress_migration::ComicProgressMigrationService;
 use haven_application::services::credential_access::CredentialAccessService;
 use haven_application::services::download::DownloadService;
 use haven_application::services::download_batch::DownloadBatchService;
@@ -90,6 +93,12 @@ pub struct AppState {
     pub work: WorkService,
     pub resource: ResourceService,
     pub comic_pages: ComicPageService,
+    /// 漫画章节目录只读服务；刷新持久化仍由独立用例负责。
+    pub comic_catalog: ComicCatalogService,
+    /// 漫画章节换源与页面变化的进度迁移服务；所有写入走 CAS + 可撤销快照。
+    pub comic_progress_migration: ComicProgressMigrationService,
+    /// 从后端 Prepared Page facts 同步稳定身份并触发页面进度重定位。
+    pub comic_page_identity: ComicPageIdentityService,
     pub session: SessionService,
     pub history: HistoryService,
     pub marker: MarkerService,
@@ -270,8 +279,12 @@ impl AppState {
             opds_catalog.clone(),
             online_catalog.clone(),
         ));
+        let comic_progress_migration = ComicProgressMigrationService::new(repos.clone());
+        let comic_page_identity =
+            ComicPageIdentityService::new(repos.clone(), comic_progress_migration.clone());
         let session =
-            SessionService::new_with_remote(repos.clone(), comic_pages.clone(), remote_session);
+            SessionService::new_with_remote(repos.clone(), comic_pages.clone(), remote_session)
+                .with_comic_page_identity_sync(comic_page_identity.clone());
         let online_catalog_source: Arc<dyn haven_application::services::SourceCatalogProvider> =
             online_catalog.clone();
         let remote_acquisition = Arc::new(
@@ -307,6 +320,9 @@ impl AppState {
             source_registry.clone(),
             catalog_router.clone(),
         );
+        let registered_chapters: Arc<dyn haven_domain::contracts::ChapterSourceRepository> =
+            repos.clone();
+        let comic_catalog = ComicCatalogService::new(source_import.clone(), registered_chapters);
         // V2-F（契约 §36.8）：enrichment 流水线 + 扫描 Completed 钩子。
         let enrich_ports: Arc<dyn haven_application::services::ports::EnrichmentPorts> =
             repos.clone();
@@ -436,6 +452,9 @@ impl AppState {
             work: WorkService::new(repos.clone()),
             resource: ResourceService::new(repos),
             comic_pages,
+            comic_catalog,
+            comic_progress_migration,
+            comic_page_identity,
             session,
             history,
             marker,

@@ -42,6 +42,16 @@ import type {
   DownloadTaskDto,
   EditionDetailDto,
   EditionGetRequest,
+  ComicChapterCatalogGetRequest,
+  ComicChapterCatalogDto,
+  ComicRegisteredChapterCatalogDto,
+  ComicChapterSourceCandidatesDto,
+  ComicChapterSourceCandidatesGetRequestDto,
+  ComicProgressMigrationRequestDto,
+  ComicProgressMigrationResultDto,
+  ComicPageProgressRemapRequestDto,
+  ComicProgressMigrationRevertRequestDto,
+  ComicProgressMigrationRevertResultDto,
   ComicPageManifestGetRequest,
   ComicPageManifestDto,
   ReaderTocGetRequest,
@@ -126,6 +136,23 @@ export interface HavenClient {
   editionGet(request: EditionGetRequest): Promise<EditionDetailDto>;
   resourceListByMediaItem(request: ResourceListByMediaItemRequest): Promise<ResourceListDto>;
   sessionOpen(request: SessionOpenRequest): Promise<SessionOpenResultDto>;
+  comicChapterCatalogGet(request: ComicChapterCatalogGetRequest): Promise<ComicChapterCatalogDto>;
+  comicChapterCatalogRegisteredGet(
+    request: ComicChapterCatalogGetRequest,
+  ): Promise<ComicRegisteredChapterCatalogDto>;
+  comicChapterCatalogRefresh(request: ComicChapterCatalogGetRequest): Promise<ComicChapterCatalogDto>;
+  comicChapterSourceCandidatesGet(
+    request: ComicChapterSourceCandidatesGetRequestDto,
+  ): Promise<ComicChapterSourceCandidatesDto>;
+  comicProgressMigrate(
+    request: ComicProgressMigrationRequestDto,
+  ): Promise<ComicProgressMigrationResultDto>;
+  comicProgressRemap(
+    request: ComicPageProgressRemapRequestDto,
+  ): Promise<ComicProgressMigrationResultDto>;
+  comicProgressRevert(
+    request: ComicProgressMigrationRevertRequestDto,
+  ): Promise<ComicProgressMigrationRevertResultDto>;
   comicPageManifestGet(request: ComicPageManifestGetRequest): Promise<ComicPageManifestDto>;
   readerTocGet(request: ReaderTocGetRequest): Promise<ReaderTocResultDto>;
   readerSearch(request: ReaderSearchRequest): Promise<ReaderSearchResultDto>;
