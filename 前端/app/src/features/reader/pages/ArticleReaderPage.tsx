@@ -560,15 +560,14 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
     const restored = restoreArticleProgress(state.session, restoredProgressRef)
     if (!restored) return
     const restoredBlockId = restored.blockId
-    if (restoredBlockId && outline.some((item) => item.id === restoredBlockId)) {
-      const frame = requestAnimationFrame(() => {
-        document.getElementById(restoredBlockId)?.scrollIntoView({ block: "start" })
-      })
-      return () => cancelAnimationFrame(frame)
-    }
     const maxScroll = document.documentElement.scrollHeight - window.innerHeight
     if (maxScroll <= 0) return
-    window.scrollTo({ top: Math.min(maxScroll, restored.progression * maxScroll) })
+    // A heading is only a coarse anchor; progression preserves the position
+    // within a long section and remains valid when the layout changes.
+    const heading = restoredBlockId ? document.getElementById(restoredBlockId) : null
+    const headingTop = heading?.getBoundingClientRect().top ?? 0
+    const target = heading ? Math.max(0, headingTop + window.scrollY) : restored.progression * maxScroll
+    window.scrollTo({ top: Math.min(maxScroll, target + restored.progression * Math.max(0, maxScroll - target)) })
   }, [articleDocument, contentReady, outline, sessionView.status, state, sessionContentUri])
 
   useEffect(() => {
@@ -1038,7 +1037,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
 
       {selectionPosition && (
         <div style={{ left: selectionPosition.x, top: selectionPosition.y }} className="fixed z-[70] flex -translate-x-1/2 -translate-y-full items-center gap-1 rounded-full border border-white/15 bg-[#1c1c1e]/95 px-[8px] py-1.5 text-xs font-semibold text-white shadow-2xl backdrop-blur-xl">
-          <button type="button" onClick={addHighlight} className="flex items-center gap-1 rounded-full px-[10px] py-1.5 hover:bg-white/15"><Highlighter className="h-3.5 w-3.5 text-amber-300" />划线</button>
+          <button type="button" onClick={addHighlight} disabled={articleDocument?.format !== "text"} title={articleDocument?.format === "text" ? undefined : "当前格式暂不支持正文划线"} className="flex items-center gap-1 rounded-full px-[10px] py-1.5 hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-40"><Highlighter className="h-3.5 w-3.5 text-amber-300" />划线</button>
           {demoRuntime && <button type="button" onClick={askAboutSelection} className="flex items-center gap-1 rounded-full px-[10px] py-1.5 text-amber-200 hover:bg-white/15"><Sparkles className="h-3.5 w-3.5" />问 AI</button>}
         </div>
       )}

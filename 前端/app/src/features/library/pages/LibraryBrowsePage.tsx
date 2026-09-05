@@ -210,6 +210,12 @@ export function LibraryBrowsePage() {
   const [reloadToken, setReloadToken] = useState(0)
   const seenCursorsRef = useRef(new Set<string>())
   const browseItemsRef = useRef<LibraryMediaItemData[]>([])
+  const listQuery = {
+    category: categoryKey === "document" ? "periodical" : categoryKey,
+    query: searchParams.get("q") ?? "",
+    sort: searchParams.get("sort") === "年份最新" ? "release_date" : searchParams.get("sort") === "评分最高" ? "last_active" : "recently_added",
+  } as const
+  const browseRequestKey = searchParams.toString()
 
   useEffect(() => {
     let cancelled = false
@@ -218,7 +224,7 @@ export function LibraryBrowsePage() {
     setLoadError(null)
     setPartialError(null)
     if (!hadData) setNextCursor(null)
-    getLibraryBrowsePage()
+    getLibraryBrowsePage(null, listQuery)
       .then((page) => {
         if (cancelled) return
         browseItemsRef.current = page.items
@@ -242,7 +248,7 @@ export function LibraryBrowsePage() {
     return () => {
       cancelled = true
     }
-  }, [reloadToken])
+  }, [browseRequestKey, categoryKey, reloadToken])
 
   const reloadFirstPage = () => setReloadToken((value) => value + 1)
 
@@ -390,7 +396,7 @@ export function LibraryBrowsePage() {
     setIsLoadingMore(true)
     setPartialError(null)
     try {
-      const page = await getLibraryBrowsePage(nextCursor)
+      const page = await getLibraryBrowsePage(nextCursor, listQuery)
       setBrowseItems((current) => {
         const merged = [...current, ...page.items]
         browseItemsRef.current = merged

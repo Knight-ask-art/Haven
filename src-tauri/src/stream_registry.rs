@@ -48,7 +48,10 @@ pub struct StreamGrantInner {
     created_at: Instant,
 }
 
-const TARGET_CAP: usize = 512;
+// A single long-form VOD manifest can legitimately contain thousands of
+// unique segment references. Keep the bound finite while ensuring one
+// manifest cannot invalidate references already handed to the player.
+const TARGET_CAP: usize = 4096;
 const LEARNED_HOST_CAP: usize = 64;
 
 impl StreamGrantInner {

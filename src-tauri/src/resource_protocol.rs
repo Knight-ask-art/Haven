@@ -1476,7 +1476,6 @@ async fn serve_stream_with_resolution(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let upstream_total = response.content_length();
     let is_manifest = (target_encoded.is_empty() && inner.facts.is_hls)
         || is_hls_manifest_mime(content_type.as_deref())
         || is_hls_manifest_url(&upstream);
@@ -1526,9 +1525,6 @@ async fn serve_stream_with_resolution(
         requested_range,
         upstream_content_range,
     )?;
-    if upstream_total.is_some_and(|total| total > MAX_STREAM_BYTES) {
-        return Err(resource_unavailable());
-    }
     let bytes = read_stream_body_bounded(response, MAX_STREAM_BYTES).await?;
     if bytes.is_empty() {
         return Err(resource_unavailable());
@@ -1605,7 +1601,10 @@ fn canonical_direct_stream_mime(value: Option<&str>) -> String {
     let Some(base) = base else {
         return "video/mp4".to_owned();
     };
-    if base.eq_ignore_ascii_case("application/octet-stream") {
+    if base.eq_ignore_ascii_case("application/octet-stream")
+        || is_audio_mime_base(base)
+        || base.eq_ignore_ascii_case("text/vtt")
+    {
         return "application/octet-stream".to_owned();
     }
     if is_video_mime_base(base) {
@@ -1646,7 +1645,10 @@ fn validate_direct_stream_headers(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .is_some_and(|value| {
-            is_video_mime_base(value) || value.eq_ignore_ascii_case("application/octet-stream")
+            is_video_mime_base(value)
+                || is_audio_mime_base(value)
+                || value.eq_ignore_ascii_case("text/vtt")
+                || value.eq_ignore_ascii_case("application/octet-stream")
         });
     if !mime_is_empty && !mime_is_video {
         return Err(resource_unavailable());
@@ -1655,8 +1657,7 @@ fn validate_direct_stream_headers(
     match (status, requested_range, content_range) {
         (200, None, None) => Ok(()),
         (206, Some(requested), Some(actual)) => {
-            if actual.total > MAX_STREAM_BYTES
-                || actual.start != requested.start
+            if actual.start != requested.start
                 || requested.end.is_some_and(|end| actual.end != end)
             {
                 return Err(resource_unavailable());
@@ -1667,6 +1668,17 @@ fn validate_direct_stream_headers(
         // partial response without a requested range is equally ambiguous.
         _ => Err(resource_unavailable()),
     }
+}
+
+fn is_audio_mime_base(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let Some(subtype) = lower.strip_prefix("audio/") else {
+        return false;
+    };
+    !subtype.is_empty()
+        && subtype
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$&^_.+-".contains(&byte))
 }
 
 fn validate_direct_stream_body_len(

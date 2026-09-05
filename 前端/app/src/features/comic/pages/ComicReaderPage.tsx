@@ -1377,6 +1377,16 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                   type="button"
                   onClick={() => {
                     setCurrentPage(pageNum)
+                    if (viewMode === "strip") {
+                      setStripWindow(getStripWindowForPage(pageNum))
+                      window.setTimeout(() => {
+                        const container = stripScrollRef.current
+                        if (container) container.scrollTo({
+                          top: getStripPageOffset(pageNum) - container.clientHeight / 2 + getStripPageHeight(pageNum) / 2,
+                          behavior: "smooth",
+                        })
+                      }, 0)
+                    }
                     setIsDrawerOpen(false)
                   }}
                   className={cn(
