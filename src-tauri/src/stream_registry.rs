@@ -487,7 +487,9 @@ mod tests {
         let refreshed = inner.register_target(repeated);
         assert_eq!(refreshed, first);
 
-        assert!(!inner.register_target("https://cdn.example.com/last.ts").is_empty());
+        assert!(!inner
+            .register_target("https://cdn.example.com/last.ts")
+            .is_empty());
         assert!(inner.resolve_target(&first).is_some());
     }
 }

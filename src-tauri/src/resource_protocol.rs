@@ -1527,11 +1527,12 @@ async fn serve_stream_with_resolution(
         });
     let requested_range =
         range_header.and_then(|header| parse_remote_byte_range(Some(header)).ok().flatten());
-    validate_direct_stream_headers(
+    validate_direct_stream_headers_with_hls(
         upstream_status,
         content_type.as_deref(),
         requested_range,
         upstream_content_range,
+        inner.facts.is_hls,
     )?;
     let bytes = read_stream_body_bounded(response, MAX_STREAM_BYTES).await?;
     if bytes.is_empty() {
@@ -1638,6 +1639,22 @@ fn validate_direct_stream_headers(
     requested_range: Option<RemoteByteRange>,
     content_range: Option<StreamContentRange>,
 ) -> Result<(), AppError> {
+    validate_direct_stream_headers_with_hls(
+        status,
+        content_type,
+        requested_range,
+        content_range,
+        false,
+    )
+}
+
+fn validate_direct_stream_headers_with_hls(
+    status: u16,
+    content_type: Option<&str>,
+    requested_range: Option<RemoteByteRange>,
+    content_range: Option<StreamContentRange>,
+    allow_hls_media: bool,
+) -> Result<(), AppError> {
     let mime_is_empty = content_type
         .map(|value| {
             value
@@ -1648,25 +1665,23 @@ fn validate_direct_stream_headers(
                 .is_empty()
         })
         .unwrap_or(true);
-    let mime_is_video = content_type
+    let mime_base = content_type
         .and_then(|value| value.split(';').next())
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_some_and(|value| {
-            is_video_mime_base(value)
-                || is_audio_mime_base(value)
-                || value.eq_ignore_ascii_case("text/vtt")
-                || value.eq_ignore_ascii_case("application/octet-stream")
-        });
-    if !mime_is_empty && !mime_is_video {
+        .filter(|value| !value.is_empty());
+    let mime_is_video = mime_base.is_some_and(|value| {
+        is_video_mime_base(value) || value.eq_ignore_ascii_case("application/octet-stream")
+    });
+    let mime_is_hls_media = mime_base
+        .is_some_and(|value| is_audio_mime_base(value) || value.eq_ignore_ascii_case("text/vtt"));
+    if !mime_is_empty && !mime_is_video && !(allow_hls_media && mime_is_hls_media) {
         return Err(resource_unavailable());
     }
 
     match (status, requested_range, content_range) {
         (200, None, None) => Ok(()),
         (206, Some(requested), Some(actual)) => {
-            if actual.start != requested.start
-                || requested.end.is_some_and(|end| actual.end != end)
+            if actual.start != requested.start || requested.end.is_some_and(|end| actual.end != end)
             {
                 return Err(resource_unavailable());
             }
