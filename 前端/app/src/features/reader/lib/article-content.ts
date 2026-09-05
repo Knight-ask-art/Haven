@@ -73,6 +73,9 @@ const HTML_SANITIZE_CONFIG: Config = {
   RETURN_TRUSTED_TYPE: false,
 }
 
+export const ARTICLE_HTML_BLOCK_TAGS = ["h1", "h2", "h3", "h4", "h5", "h6", "p", "blockquote", "li", "td", "th"] as const
+const ARTICLE_HTML_PARAGRAPH_TAGS = ARTICLE_HTML_BLOCK_TAGS.slice(6)
+
 /**
  * Sanitize untrusted local HTML before it enters the WebView DOM.  The
  * allowlist intentionally excludes every resource-bearing attribute/tag, so
@@ -89,7 +92,7 @@ function plainTextFromHtml(html: string): string {
   const template = document.createElement("template")
   template.innerHTML = html
   const lines: string[] = []
-  for (const element of template.content.querySelectorAll("h1,h2,h3,h4,h5,h6,p,blockquote,li")) {
+  for (const element of template.content.querySelectorAll(ARTICLE_HTML_BLOCK_TAGS.join(","))) {
     const text = element.textContent?.replace(/\s+/g, " ").trim()
     if (!text) continue
     if (/^h[1-6]$/i.test(element.tagName)) {
@@ -107,7 +110,10 @@ function addStableHtmlBlockIds(html: string, documentModel: ArticleDocument): st
   const template = document.createElement("template")
   template.innerHTML = html
   const headings = Array.from(template.content.querySelectorAll("h1,h2,h3,h4,h5,h6"))
-  const blocks = Array.from(template.content.querySelectorAll("p,blockquote"))
+  // Keep this order identical to plainTextFromHtml. List items and table cells
+  // are paragraphs in the article model too; omitting them shifts every later
+  // marker onto the wrong DOM block.
+  const blocks = Array.from(template.content.querySelectorAll(ARTICLE_HTML_PARAGRAPH_TAGS.join(",")))
   const sections = documentModel.sections
   headings.forEach((heading, index) => {
     const section = sections[index]

@@ -31,7 +31,7 @@ use haven_infrastructure::artwork_cache::{ArtworkResponse, ArtworkVariant};
 
 use crate::session_registry::VerifiedSession;
 use crate::state::AppState;
-use crate::stream_registry::StreamGrantInner;
+use crate::stream_registry::{manifest_identity, StreamGrantInner};
 
 /// Maximum number of bytes read into one response body.
 pub(crate) const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
@@ -1502,6 +1502,7 @@ async fn serve_stream_with_resolution(
         })
     });
     let upstream_range_header = bounded_range_header.as_deref().or(range_header);
+    let manifest_identity_source = upstream.clone();
     let (response, upstream) =
         fetch_stream_response(inner, upstream, upstream_range_header, resolution).await?;
 
@@ -1542,7 +1543,10 @@ async fn serve_stream_with_resolution(
         ) else {
             return Err(resource_unavailable());
         };
-        if !inner.commit_manifest(&upstream, &manifest_version, &candidates) {
+        let Some(manifest_key) = manifest_identity(&manifest_identity_source) else {
+            return Err(resource_unavailable());
+        };
+        if !inner.commit_manifest(&manifest_key, &manifest_version, &candidates) {
             return Err(resource_unavailable());
         }
         let mut headers = vec![

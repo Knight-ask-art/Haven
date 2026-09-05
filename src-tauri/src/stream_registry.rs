@@ -314,6 +314,19 @@ pub(crate) fn host_of(url: &str) -> Option<String> {
         .map(|safe| safe.host().to_owned())
 }
 
+/// Signed query parameters and fragments identify a fetch authorization, not
+/// a different logical HLS playlist. Redirects may change those parameters on
+/// every refresh, so use the stable HTTP URL components as the manifest slot.
+pub(crate) fn manifest_identity(url: &str) -> Option<String> {
+    let mut parsed = reqwest::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return None;
+    }
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Some(parsed.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,6 +461,81 @@ mod tests {
         );
         assert_eq!(host_of("https://user:secret@cdn.example.com/a"), None);
         assert_eq!(host_of("https://cdn.example.com/a\n.ts"), None);
+    }
+
+    #[test]
+    fn manifest_identity_ignores_rotating_signature_and_fragment() {
+        assert_eq!(
+            manifest_identity("https://cdn.example.com/live/index.m3u8?sig=one&expires=1#x"),
+            Some("https://cdn.example.com/live/index.m3u8".into())
+        );
+        assert_eq!(
+            manifest_identity("https://cdn.example.com/live/index.m3u8?sig=two&expires=2"),
+            manifest_identity("https://cdn.example.com/live/index.m3u8?sig=one&expires=1")
+        );
+    }
+
+    #[test]
+    fn concurrent_manifest_commit_has_isolated_atomic_result() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let registry = StreamRegistry::new();
+        let grant = registry
+            .register(
+                facts("https://cdn.example.com/a.m3u8"),
+                "https://cdn.example.com/a.m3u8",
+                "main",
+            )
+            .unwrap();
+        let inner = registry.lookup(&grant.to_string(), "main").unwrap();
+        let existing = (0..TARGET_CAP - 1)
+            .map(|index| {
+                (
+                    format!("base-{index}"),
+                    format!("https://cdn.example.com/base-{index}.ts"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(inner.commit_manifest("base", "v1", &existing));
+
+        let barrier = Arc::new(Barrier::new(2));
+        let left = Arc::clone(&inner);
+        let left_barrier = Arc::clone(&barrier);
+        let left_thread = thread::spawn(move || {
+            left_barrier.wait();
+            left.commit_manifest(
+                "video",
+                "video-v1",
+                &[(
+                    "video-token".into(),
+                    "https://video.example.net/v.ts".into(),
+                )],
+            )
+        });
+        let right = Arc::clone(&inner);
+        let right_barrier = Arc::clone(&barrier);
+        let right_thread = thread::spawn(move || {
+            right_barrier.wait();
+            right.commit_manifest(
+                "audio",
+                "audio-v1",
+                &[(
+                    "audio-token".into(),
+                    "https://audio.example.net/a.ts".into(),
+                )],
+            )
+        });
+        let left_ok = left_thread.join().unwrap();
+        let right_ok = right_thread.join().unwrap();
+        assert_eq!(left_ok as u8 + right_ok as u8, 1);
+        if left_ok {
+            assert!(inner.resolve_target("video-v1", "video-token").is_some());
+            assert!(inner.host_allowed("video.example.net"));
+        } else {
+            assert!(inner.resolve_target("audio-v1", "audio-token").is_some());
+            assert!(inner.host_allowed("audio.example.net"));
+        }
     }
 
     #[test]
