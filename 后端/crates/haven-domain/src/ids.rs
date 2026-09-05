@@ -83,6 +83,7 @@ id_type!(PersonId, "人物 ID");
 id_type!(CollectionId, "收藏集 ID");
 id_type!(MetadataRecordId, "元数据记录 ID");
 id_type!(ProgressId, "进度 ID");
+id_type!(ComicProgressMigrationId, "漫画进度迁移 ID");
 
 /// 指向系统凭据存储的引用（不存明文凭据本身）。
 ///

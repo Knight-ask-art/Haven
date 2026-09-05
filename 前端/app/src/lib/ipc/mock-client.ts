@@ -59,6 +59,16 @@ import type {
   DownloadTaskActionRequest,
   DownloadTaskDto,
   DownloadStateDto,
+  ComicChapterCatalogGetRequest,
+  ComicChapterCatalogDto,
+  ComicRegisteredChapterCatalogDto,
+  ComicChapterSourceCandidatesGetRequestDto,
+  ComicChapterSourceCandidatesDto,
+  ComicProgressMigrationRequestDto,
+  ComicProgressMigrationResultDto,
+  ComicPageProgressRemapRequestDto,
+  ComicProgressMigrationRevertRequestDto,
+  ComicProgressMigrationRevertResultDto,
   ComicPageManifestGetRequest,
   ComicPageManifestDto,
   ReaderTocGetRequest,
@@ -144,6 +154,7 @@ import scanAlreadyRunning from "../../../../../contracts/ipc/v1/fixtures/scan/al
 import workGetNormal from "../../../../../contracts/ipc/v1/fixtures/work/get.normal.json" with { type: "json" };
 import workGetNotFound from "../../../../../contracts/ipc/v1/fixtures/work/get.error-work-not-found.json" with { type: "json" };
 import resourceMixedAvailability from "../../../../../contracts/ipc/v1/fixtures/resource/list.mixed-availability.json" with { type: "json" };
+import comicCatalogNormal from "../../../../../contracts/ipc/v1/fixtures/comic/chapter-catalog.normal.json" with { type: "json" };
 import settingsGeneralDefault from "../../../../../contracts/ipc/v1/fixtures/settings/general.default.json" with { type: "json" };
 import settingsAppearanceDefault from "../../../../../contracts/ipc/v1/fixtures/settings/appearance.default.json" with { type: "json" };
 import settingsGeneralSaved from "../../../../../contracts/ipc/v1/fixtures/settings/general.saved.json" with { type: "json" };
@@ -475,6 +486,121 @@ export class MockHavenClient implements HavenClient {
     };
     this.comicManifests.set(request.sessionId, manifest);
     return manifest;
+  }
+
+  async comicChapterCatalogGet(
+    request: ComicChapterCatalogGetRequest,
+  ): Promise<ComicChapterCatalogDto> {
+    const catalog = comicCatalogNormal as ComicChapterCatalogDto;
+    if (request.sourceId !== catalog.sourceId || request.remoteWorkId !== catalog.remoteWorkId) {
+      throw new HavenError({
+        code: "RESOURCE_NOT_FOUND",
+        userMessage: "漫画来源作品不存在",
+        retryable: false,
+      });
+    }
+    return catalog;
+  }
+
+  async comicChapterCatalogRegisteredGet(
+    request: ComicChapterCatalogGetRequest,
+  ): Promise<ComicRegisteredChapterCatalogDto> {
+    const catalog = comicCatalogNormal as ComicChapterCatalogDto;
+    if (request.sourceId !== catalog.sourceId || request.remoteWorkId !== catalog.remoteWorkId) {
+      throw new HavenError({
+        code: "RESOURCE_NOT_FOUND",
+        userMessage: "漫画来源作品不存在",
+        retryable: false,
+      });
+    }
+    return {
+      schemaVersion: 1,
+      sourceId: catalog.sourceId,
+      remoteWorkId: catalog.remoteWorkId,
+      refreshState: {
+        generation: 1,
+        fetchedAt: catalog.fetchedAt,
+        total: catalog.total,
+        truncated: catalog.truncated,
+      },
+      chapters: catalog.chapters.map((chapter, sourceOrder) => ({
+        mediaItemId: `eeeeeeee-eeee-4eee-8eee-${String(sourceOrder + 1).padStart(12, "0")}`,
+        sourceId: catalog.sourceId,
+        remoteWorkId: catalog.remoteWorkId,
+        remoteChapterId: chapter.remoteChapterId,
+        chapterNumber: chapter.chapterNumber,
+        volumeNumber: chapter.volumeNumber,
+        title: chapter.title,
+        pageCount: chapter.pageCount,
+        sourceOrder,
+        availability: chapter.availability,
+        publishedAt: chapter.publishedAt,
+        sourceUpdatedAt: chapter.updatedAt,
+        lastSeenGeneration: 1,
+        editionProfile: chapter.editionProfile,
+      })),
+    };
+  }
+
+  async comicChapterCatalogRefresh(
+    request: ComicChapterCatalogGetRequest,
+  ): Promise<ComicChapterCatalogDto> {
+    return this.comicChapterCatalogGet(request);
+  }
+
+  /** Browser Demo 没有持久化的来源引用图谱；返回明确的空候选投影。 */
+  async comicChapterSourceCandidatesGet(
+    request: ComicChapterSourceCandidatesGetRequestDto,
+  ): Promise<ComicChapterSourceCandidatesDto> {
+    return {
+      schemaVersion: 1,
+      source: request.source,
+      currentMediaItemId: RESOURCE_FIXTURE_MEDIA_ITEM_ID,
+      candidates: [],
+      truncated: false,
+    };
+  }
+
+  /** Browser Demo 没有持久化的漫画章节进度；返回真实的“无源进度”终态，
+   * 避免伪造已经应用的迁移或快照。 */
+  async comicProgressMigrate(
+    _request: ComicProgressMigrationRequestDto,
+  ): Promise<ComicProgressMigrationResultDto> {
+    return {
+      status: "no_source_progress",
+      matchResult: null,
+      pageMigration: {
+        targetPageIndex: null,
+        confidence: "low",
+        strategy: "no_target",
+        reversible: true,
+      },
+      snapshotId: null,
+      appliedRevision: null,
+    };
+  }
+
+  async comicProgressRemap(
+    _request: ComicPageProgressRemapRequestDto,
+  ): Promise<ComicProgressMigrationResultDto> {
+    return {
+      status: "no_source_progress",
+      matchResult: null,
+      pageMigration: {
+        targetPageIndex: null,
+        confidence: "low",
+        strategy: "no_target",
+        reversible: true,
+      },
+      snapshotId: null,
+      appliedRevision: null,
+    };
+  }
+
+  async comicProgressRevert(
+    _request: ComicProgressMigrationRevertRequestDto,
+  ): Promise<ComicProgressMigrationRevertResultDto> {
+    return { reverted: false };
   }
 
   async readerTocGet(request: ReaderTocGetRequest): Promise<ReaderTocResultDto> {

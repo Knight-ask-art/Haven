@@ -556,6 +556,7 @@ mod tests {
             percentage: Some(0.5),
             last_active_at: UtcMillis(1_700_000_000_000),
             updated_at: UtcMillis(1_700_000_000_000),
+            revision: Some("opaque-revision".into()),
             keyframe_uri: None,
         }
     }

@@ -108,6 +108,7 @@ impl ProgressService {
             percentage,
             last_active_at: updated_at,
             updated_at,
+            revision: None,
             keyframe_uri,
         };
         let revision = ProgressRepository::save_if_revision(
@@ -169,14 +170,6 @@ fn parse_id(s: &str) -> Result<MediaItemId, AppError> {
             false,
         )
     })
-}
-
-/// **仅测试 helper**：由本地 `updated_at` 派生 revision 文本，供测试 mock 与断言使用。
-/// 生产 revision 由数据库在 `save_if_revision` 条件写内返回（authoritative），
-/// Service 不自行派生。
-#[cfg(test)]
-fn revision_of(progress: &Progress) -> String {
-    progress.updated_at.0.to_string()
 }
 
 /// 从 Locator 派生 percentage（DOMAIN_MODEL §30）。无法派生时返回 None。
@@ -294,6 +287,7 @@ mod tests {
         items: Vec<MediaItem>,
         editions: Vec<Edition>,
         saved: std::sync::Mutex<Option<Progress>>,
+        revision_counter: std::sync::Mutex<u32>,
     }
 
     fn mem_ports(media_type: MediaType, duration_ms: Option<u64>) -> (MemPorts, MediaItemId) {
@@ -332,6 +326,7 @@ mod tests {
                 updated_at: haven_common::UtcMillis(1),
             }],
             saved: std::sync::Mutex::new(None),
+            revision_counter: std::sync::Mutex::new(0),
         };
         (ports, media_item_id)
     }
@@ -395,8 +390,10 @@ mod tests {
         ) -> Result<Option<String>, AppError> {
             let mut guard = self.saved.lock().unwrap();
             if let Some(expected) = expected_revision {
-                let current = guard.as_ref().map(revision_of);
-                if current.as_deref() != Some(expected) {
+                let current = guard
+                    .as_ref()
+                    .and_then(|progress| progress.revision.as_deref());
+                if current != Some(expected) {
                     return Ok(None);
                 }
             }
@@ -407,7 +404,10 @@ mod tests {
                     stored.updated_at = haven_common::UtcMillis(current.updated_at.0 + 1);
                 }
             }
-            let revision = revision_of(&stored);
+            let mut counter = self.revision_counter.lock().unwrap();
+            *counter += 1;
+            let revision = format!("mock-progress-revision-{}", *counter);
+            stored.revision = Some(revision.clone());
             *guard = Some(stored);
             Ok(Some(revision))
         }
@@ -510,33 +510,5 @@ mod tests {
     fn parse_id_rules() {
         assert!(parse_id("not-a-uuid").is_err());
         assert!(parse_id("00000000-0000-0000-0000-000000000001").is_ok());
-    }
-
-    #[test]
-    fn revision_is_monotonic_under_same_millisecond() {
-        let a = haven_common::UtcMillis(1_000);
-        let b = haven_common::UtcMillis(a.0 + 1);
-        assert_ne!(
-            revision_of(&sample_progress_with(a)),
-            revision_of(&sample_progress_with(b))
-        );
-    }
-
-    fn sample_progress_with(updated_at: haven_common::UtcMillis) -> Progress {
-        Progress {
-            id: ProgressId::new(),
-            work_id: WorkId::new(),
-            edition_id: EditionId::new(),
-            media_item_id: MediaItemId::new(),
-            locator: Locator::Video(haven_domain::locator::VideoLocator {
-                media_item_id: MediaItemId::new(),
-                position_ms: 0,
-            }),
-            completion: CompletionState::NotStarted,
-            percentage: None,
-            last_active_at: updated_at,
-            updated_at,
-            keyframe_uri: None,
-        }
     }
 }

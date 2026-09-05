@@ -423,6 +423,7 @@ impl haven_application::services::SourceCatalogProvider for Cms10CatalogProvider
             local_file: None,
             media_type: None,
             remote: None,
+            comic_catalog: None,
         })
     }
 
@@ -457,6 +458,7 @@ impl haven_application::services::SourceCatalogProvider for Cms10CatalogProvider
                 local_file: None,
                 media_type: None,
                 remote: None,
+                comic_catalog: None,
             })
             .collect())
     }

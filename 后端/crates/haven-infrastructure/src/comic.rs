@@ -11,6 +11,7 @@ use haven_application::services::{
     PreparedComicPageAvailability, PreparedComicPageSource, PreparedSession,
 };
 use haven_common::{AppError, ErrorKind};
+use haven_domain::comic_identity::PageIdentity;
 use haven_domain::enums::ResourceType;
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
@@ -95,23 +96,10 @@ impl LocalComicPageProvider {
             if exceeds_ratio(uncompressed_size, compressed_size) {
                 return Err(policy_denied("漫画归档压缩比超过安全限制"));
             }
-            let availability = if uncompressed_size == 0 || uncompressed_size > MAX_COMIC_PAGE_BYTES
-            {
-                PreparedComicPageAvailability::Unavailable
-            } else {
-                let mut prefix = [0u8; 12];
-                let prefix_len = entry.read(&mut prefix).ok();
-                if prefix_len
-                    .and_then(|len| sniff_image(&prefix[..len]))
-                    .is_some()
-                {
-                    PreparedComicPageAvailability::Ready
-                } else {
-                    PreparedComicPageAvailability::Unavailable
-                }
-            };
+            let (availability, fingerprint) = inspect_archive_image(&mut entry, uncompressed_size)?;
             pages.push(PreparedComicPage {
                 availability,
+                identity: page_identity_for_provider("local", &normalized_name, fingerprint),
                 source: PreparedComicPageSource::ArchiveEntry {
                     entry_index: u32::try_from(index)
                         .map_err(|_| policy_denied("漫画归档条目数超过安全限制"))?,
@@ -188,6 +176,11 @@ impl LocalComicPageProvider {
             };
             pages.push(PreparedComicPage {
                 availability,
+                identity: page_identity_for_provider(
+                    "local",
+                    &name,
+                    (availability == PreparedComicPageAvailability::Ready).then_some(sha256),
+                ),
                 source: PreparedComicPageSource::DirectoryFile {
                     relative_name: name,
                     expected_size: size,
@@ -485,6 +478,68 @@ fn read_bounded_image(
     }
     let mime_type = sniff_image(&bytes).ok_or_else(unsupported_archive)?;
     Ok(ComicPageBody { mime_type, bytes })
+}
+
+/// Inspect a supported archive image and calculate a bounded streaming
+/// fingerprint without retaining the page bytes in the prepared session.
+fn inspect_archive_image(
+    reader: &mut impl Read,
+    declared_size: u64,
+) -> Result<(PreparedComicPageAvailability, Option<[u8; 32]>), AppError> {
+    if declared_size == 0 || declared_size > MAX_COMIC_PAGE_BYTES {
+        return Ok((PreparedComicPageAvailability::Unavailable, None));
+    }
+
+    let mut prefix = [0u8; 12];
+    let prefix_len = reader
+        .read(&mut prefix)
+        .map_err(|_| unsupported_archive())?;
+    if sniff_image(&prefix[..prefix_len]).is_none() {
+        return Ok((PreparedComicPageAvailability::Unavailable, None));
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(declared_size.to_le_bytes());
+    hasher.update(&prefix[..prefix_len]);
+    let mut remaining = declared_size.saturating_sub(prefix_len as u64);
+    let mut buffer = [0u8; HASH_BUFFER_BYTES];
+    while remaining > 0 {
+        let chunk_len = usize::try_from(remaining.min(HASH_BUFFER_BYTES as u64))
+            .map_err(|_| unsupported_archive())?;
+        reader
+            .read_exact(&mut buffer[..chunk_len])
+            .map_err(|_| unsupported_archive())?;
+        hasher.update(&buffer[..chunk_len]);
+        remaining -= chunk_len as u64;
+    }
+    Ok((
+        PreparedComicPageAvailability::Ready,
+        Some(hasher.finalize().into()),
+    ))
+}
+
+/// Convert provider-local names into opaque, non-path page keys. The provider
+/// namespace prevents a generic name such as `page-001.jpg` from becoming
+/// false cross-source evidence; the optional content fingerprint remains
+/// provider-independent so identical local bytes can still be matched.
+pub(crate) fn page_identity_for_provider(
+    provider: &str,
+    stable_name: &str,
+    fingerprint: Option<[u8; 32]>,
+) -> PageIdentity {
+    let mut hasher = Sha256::new();
+    hasher.update(b"haven-comic-page-key-v1\0");
+    hasher.update(provider.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(stable_name.as_bytes());
+    PageIdentity {
+        stable_key: Some(format!("key:sha256:{}", hex_digest(&hasher.finalize()))),
+        fingerprint: fingerprint.map(|value| format!("sha256:{}", hex_digest(&value))),
+    }
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn file_sha256(path: &Path, size: u64) -> Result<[u8; 32], AppError> {

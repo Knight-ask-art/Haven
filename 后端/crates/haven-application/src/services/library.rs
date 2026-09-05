@@ -497,7 +497,7 @@ mod tests {
             progress: &Progress,
             _expected_revision: Option<&str>,
         ) -> Result<Option<String>, AppError> {
-            Ok(Some(progress.updated_at.0.to_string()))
+            Ok(progress.revision.clone())
         }
         async fn recent(&self, _limit: u32) -> Result<Vec<Progress>, AppError> {
             Ok(self.progress.clone())

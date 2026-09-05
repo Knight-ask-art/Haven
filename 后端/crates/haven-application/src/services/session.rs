@@ -20,6 +20,7 @@ use haven_domain::ids::{MediaItemId, ResourceId, SourceId, StorageLocationId};
 
 use crate::mapper::progress::progress_summary;
 use crate::services::comic::{ComicPageService, PreparedComicPage};
+use crate::services::comic_page_identity::ComicPageIdentityService;
 use crate::services::ports::{
     RemoteByteRange, RemoteSessionBody, RemoteSessionPort, SessionOpenPorts,
 };
@@ -78,6 +79,7 @@ pub enum PreparedSessionSource {
 pub struct SessionService {
     ports: Arc<dyn SessionOpenPorts>,
     comic_pages: ComicPageService,
+    comic_page_identities: Option<ComicPageIdentityService>,
     remote: Option<Arc<dyn RemoteSessionPort>>,
 }
 
@@ -86,6 +88,7 @@ impl SessionService {
         Self {
             ports,
             comic_pages,
+            comic_page_identities: None,
             remote: None,
         }
     }
@@ -101,8 +104,27 @@ impl SessionService {
         Self {
             ports,
             comic_pages,
+            comic_page_identities: None,
             remote: Some(remote),
         }
+    }
+
+    /// Attach the production page-identity synchronizer. Keeping this as an
+    /// explicit composition step lets lightweight Session tests use a provider
+    /// without requiring the migration repositories.
+    pub fn with_comic_page_identity_sync(mut self, synchronizer: ComicPageIdentityService) -> Self {
+        self.comic_page_identities = Some(synchronizer);
+        self
+    }
+
+    /// Re-inspect a prepared Comic session through the controlled provider.
+    /// The returned pages remain server-only facts and are never serialized as
+    /// a caller-supplied identity list.
+    pub async fn inspect_comic_pages(
+        &self,
+        prepared: &PreparedSession,
+    ) -> Result<Vec<PreparedComicPage>, AppError> {
+        self.comic_pages.inspect(prepared).await
     }
 
     /// Fetch one bounded body for a prepared remote Article/PDF session. The
@@ -306,7 +328,23 @@ impl SessionService {
             progress,
         };
         if prepared.engine == SessionEngineDto::Comic {
-            prepared.comic_pages = Some(self.comic_pages.inspect(&prepared).await?);
+            let pages = self.inspect_comic_pages(&prepared).await?;
+            if let Some(synchronizer) = &self.comic_page_identities {
+                synchronizer
+                    .synchronize_prepared_pages(media_item_id, &pages, None)
+                    .await?;
+                // Page identity synchronization may remap Progress and issue a
+                // new revision. Re-read after the write so both the IPC result
+                // and the registered session expose the state that will be
+                // used by the reader, rather than the pre-inspection snapshot.
+                prepared.progress =
+                    ProgressRepository::get_for_media_item(&*self.ports, media_item_id)
+                        .await?
+                        .as_ref()
+                        .map(progress_summary)
+                        .transpose()?;
+            }
+            prepared.comic_pages = Some(pages);
         }
         Ok(prepared)
     }
@@ -834,16 +872,20 @@ fn is_comic_archive_mime(mime: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use haven_common::UtcMillis;
     use haven_domain::contracts::{
-        EditionRepository, MediaItemRepository, ResourceRepository, StorageLocationRepository,
-        WorkRepository,
+        ComicPageIdentityRepository, EditionRepository, MediaItemRepository, ProgressRepository,
+        ResourceRepository, StorageLocationRepository, WorkRepository,
     };
-    use haven_domain::entities::{Edition, MediaIndex, MediaItem, Resource, StorageLocation, Work};
+    use haven_domain::entities::{
+        Edition, MediaIndex, MediaItem, Progress, Resource, StorageLocation, Work,
+    };
     use haven_domain::enums::{
-        AvailabilitySource, MediaItemStatus, ResourceType, StorageProviderType, WorkStatus,
-        WorkType,
+        AvailabilitySource, CompletionState, MediaItemStatus, ResourceType, StorageProviderType,
+        WorkStatus, WorkType,
     };
-    use haven_domain::ids::{EditionId, WorkId};
+    use haven_domain::ids::{EditionId, ProgressId, WorkId};
+    use haven_domain::locator::{ComicLocator, Locator};
     use haven_infrastructure::Db;
     use haven_infrastructure::db::repos::SqliteRepositories;
     use tempfile::TempDir;
@@ -856,7 +898,16 @@ mod tests {
             &self,
             _session: &PreparedSession,
         ) -> Result<Vec<crate::services::comic::PreparedComicPage>, AppError> {
-            Ok(Vec::new())
+            Ok(["intro", "a", "b", "c"]
+                .into_iter()
+                .map(|page_name| PreparedComicPage {
+                    availability: crate::services::comic::PreparedComicPageAvailability::Ready,
+                    identity: haven_domain::comic_identity::PageIdentity::stable(page_name),
+                    source: crate::services::comic::PreparedComicPageSource::RemotePage {
+                        page_name: page_name.to_owned(),
+                    },
+                })
+                .collect())
         }
 
         fn read_page(
@@ -1376,6 +1427,102 @@ mod tests {
             prepared.canonical_file,
             Some(std::fs::canonicalize(chapter).unwrap())
         );
+    }
+
+    #[tokio::test]
+    async fn comic_prepare_returns_progress_after_page_identity_remap() {
+        let f = fixture(None).await;
+        let mut item = MediaItemRepository::get(&*f.repos, f.item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        item.media_type = MediaType::Comic;
+        item.page_count = Some(4);
+        f.repos.media_item.save(&item).await.unwrap();
+
+        let chapter = f._root.path().join("chapter");
+        std::fs::create_dir(&chapter).unwrap();
+        let mut resource = ResourceRepository::list_by_media_item(&*f.repos, f.item_id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        resource.resource_type = ResourceType::ImageSequence;
+        resource.locator = ResourceLocator::LocalPath {
+            path: "chapter".into(),
+        };
+        resource.mime_type = None;
+        f.repos.resource.save(&resource).await.unwrap();
+
+        let edition = EditionRepository::get(&*f.repos, item.edition_id)
+            .await
+            .unwrap()
+            .unwrap();
+        f.repos
+            .progress
+            .save_if_revision(
+                &Progress {
+                    id: ProgressId::new(),
+                    work_id: edition.work_id,
+                    edition_id: item.edition_id,
+                    media_item_id: item.id,
+                    locator: Locator::Comic(ComicLocator {
+                        chapter_item_id: item.id,
+                        page_index: 1,
+                        page_progression: Some(0.5),
+                    }),
+                    completion: CompletionState::InProgress,
+                    percentage: Some(0.5),
+                    last_active_at: UtcMillis(10),
+                    updated_at: UtcMillis(10),
+                    revision: None,
+                    keyframe_uri: None,
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        f.repos
+            .page_identity
+            .replace(
+                item.id,
+                &[
+                    haven_domain::comic_identity::PageIdentity::stable("a"),
+                    haven_domain::comic_identity::PageIdentity::stable("b"),
+                    haven_domain::comic_identity::PageIdentity::stable("c"),
+                ],
+                UtcMillis(11),
+            )
+            .await
+            .unwrap();
+
+        let service = f
+            .service
+            .with_comic_page_identity_sync(ComicPageIdentityService::new(
+                f.repos.clone(),
+                crate::services::comic_progress_migration::ComicProgressMigrationService::new(
+                    f.repos.clone(),
+                ),
+            ));
+        let prepared = service
+            .prepare(SessionOpenRequest {
+                media_item_id: item.id.to_string(),
+                engine: SessionEngineDto::Comic,
+            })
+            .await
+            .unwrap();
+
+        let summary = prepared.progress.expect("漫画会话应返回进度摘要");
+        assert!(matches!(
+            summary.locator,
+            crate::wire::LocatorDto::Comic(crate::wire::ComicLocatorDto { page_index: 2, .. })
+        ));
+        let stored = ProgressRepository::get_for_media_item(&*f.repos, item.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.revision, stored.revision.unwrap());
     }
 
     #[tokio::test]

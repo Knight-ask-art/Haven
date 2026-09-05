@@ -250,6 +250,7 @@ mod tests {
                 local_file: None,
                 media_type: None,
                 remote: None,
+                comic_catalog: None,
             })
         }
 
@@ -274,6 +275,7 @@ mod tests {
                     local_file: None,
                     media_type: None,
                     remote: None,
+                    comic_catalog: None,
                 }])
             } else {
                 Ok(Vec::new())

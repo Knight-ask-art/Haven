@@ -5,6 +5,7 @@
 //! 显式下载和 Remote Session 才分别调用 `RemoteAcquisitionPort` 与
 //! `RemoteSessionPort`，后者由 `haven-resource` 协议按需消费。
 
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
@@ -25,7 +26,13 @@ use haven_application::services::source_import::{
     RemoteContentRef, SourceCatalogEntry, SourceCatalogProvider,
 };
 use haven_common::network::HttpUrlPolicy;
-use haven_common::{AppError, ErrorKind};
+use haven_common::{AppError, ErrorKind, UtcMillis};
+use haven_domain::comic_catalog::{
+    ComicChapterAvailability, ComicChapterCatalog, ComicChapterCatalogEntry,
+};
+use haven_domain::comic_identity::{
+    ChapterSourceIdentity, ComicChapterMetadata, EditionProfile, IdentityFacet, ScanGroupFacet,
+};
 use haven_domain::enums::MediaType;
 use quick_xml::events::Event;
 use serde_json::Value;
@@ -34,6 +41,7 @@ use uuid::Uuid;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
+use crate::comic::page_identity_for_provider;
 use crate::http_security::{pin_client_builder, resolve_public_http_target};
 
 const MANGADEX_API: &str = "https://api.mangadex.org";
@@ -48,6 +56,8 @@ const MAX_HTML_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MANGA_PAGES: usize = 500;
 const MAX_MANGA_PAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_MANGA_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+const MAX_MANGA_CHAPTERS: usize = 500;
+const MANGADEX_FEED_PAGE_LIMIT: usize = 100;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_TRANSIENT_ATTEMPTS: usize = 3;
@@ -320,56 +330,83 @@ impl OnlineCatalogProvider {
         let description = localized_value(attrs.get("description")).map(|v| clean_text(&v));
         let pic = manga_cover_url(manga_id, data);
 
-        // 选择最近的可读章节。官方/已删除章节常见 pages=0 或 externalUrl；
-        // 这些条目跳过后继续尝试有限数量的其它章节。先偏好中文/英文，
-        // 再用无语言过滤的受控 fallback 覆盖只有日文、韩文或其它语言的作品。
-        // 不能因为首个语言筛选为空，就把一个实际可读的作品误报为不可用。
-        let feed_urls = [
-            format!(
-                // MangaDex accepts ISO-639-1 language codes (and optional
-                // two-letter region suffixes).  `zh-hans` is not a valid
-                // value for this endpoint (it is a four-letter script tag),
-                // so sending it makes the whole request fail with HTTP 400
-                // before the fallback feed can run.  Keep the preferred
-                // Chinese/English set within the API's validation grammar;
-                // the second request below still covers every language.
-                "{MANGADEX_API}/manga/{manga_id}/feed?translatedLanguage[]=zh&translatedLanguage[]=zh-hk&translatedLanguage[]=zh-tw&translatedLanguage[]=en&order[chapter]=desc&limit=20"
-            ),
-            format!("{MANGADEX_API}/manga/{manga_id}/feed?order[chapter]=desc&limit=20"),
-        ];
-        for feed_url in feed_urls {
+        // 目录和详情共用同一条有界 feed 链路。不可用/未知章节会保留在目录中，
+        // 但单条详情只选择已由 feed 明确确认页数的章节作为首个 MediaItem。
+        let catalog = self.fetch_mangadex_chapter_catalog(manga_id).await?;
+        let Some(chapter) = catalog.readable_chapters().next() else {
+            return Err(source_unavailable("MangaDex 暂时没有可阅读章节"));
+        };
+        let chapter_id = &chapter.identity.remote_chapter_id;
+        let chapter_label = mangadex_chapter_label(chapter);
+        Ok(SourceCatalogEntry {
+            external_id: manga_id.to_owned(),
+            title,
+            year,
+            type_name: Some("漫画".to_owned()),
+            pic,
+            episodes: Vec::new(),
+            content: description.or_else(|| Some(format!("MangaDex {chapter_label}"))),
+            director: None,
+            actor: None,
+            local_file: None,
+            media_type: Some(MediaType::Comic),
+            remote: Some(RemoteContentRef {
+                source_key: "mangadex".to_owned(),
+                remote_id: format!("{manga_id}:{chapter_id}"),
+                media_type: MediaType::Comic,
+                mime_type: Some("application/vnd.comicbook+zip".to_owned()),
+            }),
+            comic_catalog: Some(catalog),
+        })
+    }
+
+    async fn fetch_mangadex_chapter_catalog(
+        &self,
+        manga_id: &str,
+    ) -> Result<ComicChapterCatalog, AppError> {
+        // The catalog is a multi-language source view. A preferred-language
+        // filter would silently hide other editions and make a successful
+        // response look like a complete snapshot, so filtering is left to a
+        // later explicit application query instead of this provider default.
+        let prefix = format!(
+            "{MANGADEX_API}/manga/{manga_id}/feed?order[chapter]=desc&includes[]=scanlation_group"
+        );
+        let mut offset = 0usize;
+        let mut coverage = MangadexFeedCoverage::default();
+        loop {
+            let feed_url = format!("{prefix}&limit={MANGADEX_FEED_PAGE_LIMIT}&offset={offset}");
             let feed = self.client.json(&feed_url, HostPolicy::MangadexApi).await?;
-            let chapters = feed
+            let reported_total = feed
+                .get("total")
+                .and_then(Value::as_u64)
+                .map(|value| u32::try_from(value).unwrap_or(u32::MAX));
+            let raw_chapters = feed
                 .get("data")
                 .and_then(Value::as_array)
                 .ok_or_else(|| source_unavailable("MangaDex 章节列表结构异常"))?;
-            if let Some((chapter_id, chapter_label)) =
-                chapters.iter().take(20).find_map(readable_mangadex_chapter)
-            {
-                return Ok(SourceCatalogEntry {
-                    external_id: manga_id.to_owned(),
-                    title,
-                    year,
-                    type_name: Some("漫画".to_owned()),
-                    pic,
-                    episodes: Vec::new(),
-                    content: description
-                        .clone()
-                        .or_else(|| Some(format!("MangaDex 第 {chapter_label} 章"))),
-                    director: None,
-                    actor: None,
-                    local_file: None,
-                    media_type: Some(MediaType::Comic),
-                    remote: Some(RemoteContentRef {
-                        source_key: "mangadex".to_owned(),
-                        remote_id: format!("{manga_id}:{chapter_id}"),
-                        media_type: MediaType::Comic,
-                        mime_type: Some("application/vnd.comicbook+zip".to_owned()),
-                    }),
-                });
+            let page = consume_mangadex_feed_page(
+                &mut coverage,
+                manga_id,
+                raw_chapters,
+                reported_total,
+                offset,
+            );
+            if page.stop {
+                break;
             }
+            offset = page.next_offset;
         }
-        Err(source_unavailable("MangaDex 暂时没有可阅读章节"))
+
+        coverage.chapters.truncate(MAX_MANGA_CHAPTERS);
+        ComicChapterCatalog::new_with_coverage(
+            "mangadex",
+            manga_id,
+            coverage.chapters,
+            UtcMillis::now(),
+            coverage.total,
+            coverage.truncated,
+        )
+        .ok_or_else(|| source_unavailable("MangaDex 章节目录身份无效"))
     }
 
     async fn download_mangadex_chapter(
@@ -477,6 +514,7 @@ impl OnlineCatalogProvider {
                 media_type: MediaType::Article,
                 mime_type: Some("application/pdf".to_owned()),
             }),
+            comic_catalog: None,
         })
     }
 
@@ -502,6 +540,7 @@ impl OnlineCatalogProvider {
                 media_type: MediaType::Article,
                 mime_type: Some("text/html; charset=utf-8".to_owned()),
             }),
+            comic_catalog: None,
         })
     }
 
@@ -525,6 +564,7 @@ impl OnlineCatalogProvider {
                 media_type: MediaType::Article,
                 mime_type: Some("text/html; charset=utf-8".to_owned()),
             }),
+            comic_catalog: None,
         })
     }
 
@@ -643,6 +683,21 @@ impl SourceCatalogProvider for OnlineCatalogProvider {
             _ => Err(invalid_argument("未知在线正文来源")),
         }
     }
+
+    async fn comic_chapter_catalog(
+        &self,
+        source_id: &str,
+        _endpoint: &str,
+        external_id: &str,
+    ) -> Result<Option<ComicChapterCatalog>, AppError> {
+        if source_id != "mangadex" {
+            return Ok(None);
+        }
+        validate_mangadex_id(external_id)?;
+        Ok(Some(
+            self.fetch_mangadex_chapter_catalog(external_id).await?,
+        ))
+    }
 }
 
 #[async_trait]
@@ -695,6 +750,7 @@ impl RemoteComicPageProvider for OnlineCatalogProvider {
             .into_iter()
             .map(|page_name| PreparedComicPage {
                 availability: PreparedComicPageAvailability::Ready,
+                identity: page_identity_for_provider("mangadex", &page_name, None),
                 source: PreparedComicPageSource::RemotePage { page_name },
             })
             .collect())
@@ -1048,35 +1104,275 @@ fn validate_page_name(value: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Return a chapter identity only when the MangaDex feed entry is safe to
-/// hand to the At-Home manifest endpoint.  The feed's `pages` field is
-/// optional across API versions; an absent value is not treated as zero because
-/// the manifest itself is the authoritative page-count check.
-fn readable_mangadex_chapter(chapter: &Value) -> Option<(String, String)> {
+/// Parse one MangaDex feed entry into the safe chapter catalog model.
+///
+/// The feed is allowed to contain unavailable, external-only and incomplete
+/// entries. Keeping those entries is important for refresh semantics: a
+/// chapter that temporarily disappears must not be mistaken for a new chapter
+/// when it reappears. Only malformed identities are dropped at this boundary.
+fn parse_mangadex_chapter(manga_id: &str, chapter: &Value) -> Option<ComicChapterCatalogEntry> {
     let chapter_id = chapter.get("id").and_then(Value::as_str)?;
+    validate_uuid_like(chapter_id, "MangaDex 章节标识").ok()?;
     let chapter_attrs = chapter.get("attributes")?;
-    if chapter_attrs
+    let translated_language = chapter_attrs
+        .get("translatedLanguage")
+        .and_then(Value::as_str)
+        .map(IdentityFacet::known)
+        .unwrap_or_else(IdentityFacet::unknown);
+    let scan_group = manga_scan_group(chapter);
+    let page_count = chapter_attrs
+        .get("pages")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    let chapter_number = parse_mangadex_number(chapter_attrs.get("chapter"));
+    let volume_number = parse_mangadex_number(chapter_attrs.get("volume"));
+    let title = safe_mangadex_text(chapter_attrs.get("title"));
+    let published_at = safe_mangadex_timestamp(chapter_attrs.get("publishAt"));
+    let updated_at = safe_mangadex_timestamp(chapter_attrs.get("updatedAt"));
+    let availability = mangadex_chapter_availability(chapter_attrs);
+
+    Some(ComicChapterCatalogEntry {
+        identity: ChapterSourceIdentity::new("mangadex", manga_id, chapter_id)?,
+        metadata: ComicChapterMetadata {
+            edition_profile: EditionProfile {
+                language: translated_language,
+                // MangaDex exposes the translation language and scanlation
+                // group independently. It has no universal translation-line
+                // field, so do not conflate the two.
+                translation_line: IdentityFacet::unknown(),
+                scan_group,
+                // Color is not authoritative in the chapter feed. A future
+                // provider-specific signal can fill it without changing the
+                // source identity key.
+                color_mode: Default::default(),
+            },
+            chapter_number,
+            volume_number,
+            title,
+            page_count,
+            authoritative_content_key: None,
+        },
+        availability,
+        published_at,
+        updated_at,
+    })
+}
+
+#[derive(Default)]
+struct MangadexFeedCoverage {
+    chapters: Vec<ComicChapterCatalogEntry>,
+    seen_identities: HashSet<ChapterSourceIdentity>,
+    total: Option<u32>,
+    truncated: bool,
+}
+
+struct MangadexFeedPage {
+    next_offset: usize,
+    stop: bool,
+}
+
+/// Merge one paginated MangaDex response into the bounded coverage state.
+///
+/// Keeping this decision pure makes the refresh safety rule testable without
+/// network access: malformed/duplicated pages remain visible in the diagnostic
+/// coverage state and can never be mistaken for a complete snapshot.
+fn consume_mangadex_feed_page(
+    coverage: &mut MangadexFeedCoverage,
+    manga_id: &str,
+    raw_chapters: &[Value],
+    reported_total: Option<u32>,
+    offset: usize,
+) -> MangadexFeedPage {
+    if let Some(reported_total) = reported_total {
+        coverage.total = Some(reported_total);
+    }
+    let raw_len = raw_chapters.len();
+    let (parsed_chapters, rejected_count) =
+        parse_mangadex_feed_with_rejections(manga_id, raw_chapters);
+    if rejected_count > 0 {
+        // A malformed entry means this page is not a trustworthy complete
+        // snapshot. Keep the entries we can understand, but do not let refresh
+        // mark unseen historical chapters Missing.
+        coverage.truncated = true;
+    }
+    for chapter in parsed_chapters {
+        if !coverage.seen_identities.insert(chapter.identity.clone()) {
+            // Overlapping/duplicated API data is not a new chapter. Keep the
+            // first provider-order observation, but do not claim that the
+            // resulting snapshot is complete enough to mark unseen rows Missing.
+            coverage.truncated = true;
+            continue;
+        }
+        coverage.chapters.push(chapter);
+    }
+
+    let next_offset = offset.saturating_add(raw_len);
+    if coverage
+        .total
+        .is_some_and(|reported_total| (reported_total as usize) < next_offset)
+    {
+        // A contradictory total is a partial/invalid coverage signal, even if
+        // the current page itself is otherwise parseable.
+        coverage.truncated = true;
+    }
+
+    if next_offset >= MAX_MANGA_CHAPTERS {
+        coverage.truncated |= coverage
+            .total
+            .map(|reported_total| reported_total as usize > next_offset)
+            .unwrap_or(true);
+        return MangadexFeedPage {
+            next_offset,
+            stop: true,
+        };
+    }
+    if raw_len == 0 {
+        // An empty page with no total is not proof that the preceding pages
+        // were a complete snapshot; preserve existing chapters as-is.
+        coverage.truncated |= coverage
+            .total
+            .map(|reported_total| reported_total as usize > next_offset)
+            .unwrap_or(true);
+        return MangadexFeedPage {
+            next_offset,
+            stop: true,
+        };
+    }
+    if raw_len < MANGADEX_FEED_PAGE_LIMIT
+        && coverage
+            .total
+            .map(|reported_total| next_offset >= reported_total as usize)
+            .unwrap_or(true)
+    {
+        return MangadexFeedPage {
+            next_offset,
+            stop: true,
+        };
+    }
+
+    MangadexFeedPage {
+        next_offset,
+        stop: false,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_mangadex_feed(manga_id: &str, chapters: &[Value]) -> Vec<ComicChapterCatalogEntry> {
+    parse_mangadex_feed_with_rejections(manga_id, chapters).0
+}
+
+fn parse_mangadex_feed_with_rejections(
+    manga_id: &str,
+    chapters: &[Value],
+) -> (Vec<ComicChapterCatalogEntry>, usize) {
+    let mut rejected_count = 0;
+    let parsed = chapters
+        .iter()
+        .filter_map(|chapter| match parse_mangadex_chapter(manga_id, chapter) {
+            Some(chapter) => Some(chapter),
+            None => {
+                rejected_count += 1;
+                None
+            }
+        })
+        .collect();
+    (parsed, rejected_count)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn readable_mangadex_chapter(chapter: &Value) -> Option<(String, String)> {
+    let parsed = parse_mangadex_chapter("00000000-0000-4000-8000-000000000000", chapter)?;
+    // Keep this small legacy helper's label contract unchanged: callers that
+    // use it for selection expect the raw MangaDex chapter field ("12.5"),
+    // while the catalog-backed detail path uses the human-readable label.
+    let label = chapter
+        .get("attributes")
+        .and_then(|attributes| attributes.get("chapter"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("正文")
+        .to_owned();
+    parsed
+        .availability
+        .is_readable()
+        .then_some((parsed.identity.remote_chapter_id, label))
+}
+
+fn mangadex_chapter_label(chapter: &ComicChapterCatalogEntry) -> String {
+    if let Some(number) = chapter.metadata.chapter_number {
+        if number.fract() == 0.0 {
+            return format!("第 {} 章", number as i64);
+        }
+        return format!("第 {number} 章");
+    }
+    chapter
+        .metadata
+        .title
+        .clone()
+        .unwrap_or_else(|| "正文".to_owned())
+}
+
+fn parse_mangadex_number(value: Option<&Value>) -> Option<f64> {
+    let raw = value?.as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let number = raw.parse::<f64>().ok()?;
+    number.is_finite().then_some(number)
+}
+
+fn safe_mangadex_text(value: Option<&Value>) -> Option<String> {
+    let text = value?.as_str()?.trim();
+    (!text.is_empty() && text.len() <= 512 && !text.chars().any(char::is_control))
+        .then(|| text.to_owned())
+}
+
+fn safe_mangadex_timestamp(value: Option<&Value>) -> Option<String> {
+    let text = value?.as_str()?.trim();
+    (!text.is_empty() && text.len() <= 64 && !text.chars().any(char::is_control))
+        .then(|| text.to_owned())
+}
+
+fn manga_scan_group(chapter: &Value) -> ScanGroupFacet {
+    let Some(relationships) = chapter.get("relationships").and_then(Value::as_array) else {
+        return ScanGroupFacet::Unknown;
+    };
+    relationships
+        .iter()
+        .find(|relationship| {
+            relationship.get("type").and_then(Value::as_str) == Some("scanlation_group")
+        })
+        .and_then(|relationship| relationship.get("id"))
+        .and_then(Value::as_str)
+        .filter(|value| validate_uuid_like(value, "MangaDex 扫描组标识").is_ok())
+        .map(ScanGroupFacet::content_line)
+        .unwrap_or(ScanGroupFacet::Unknown)
+}
+
+fn mangadex_chapter_availability(attributes: &Value) -> ComicChapterAvailability {
+    if attributes
+        .get("externalUrl")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return ComicChapterAvailability::ExternalOnly;
+    }
+    if attributes
         .get("isUnavailable")
         .and_then(Value::as_bool)
         .unwrap_or(false)
-        || chapter_attrs
+        || attributes
             .get("pages")
             .and_then(Value::as_u64)
             .is_some_and(|pages| pages == 0)
-        || chapter_attrs
-            .get("externalUrl")
-            .and_then(Value::as_str)
-            .is_some()
     {
-        return None;
+        return ComicChapterAvailability::TemporarilyUnavailable;
     }
-    validate_uuid_like(chapter_id, "MangaDex 章节标识").ok()?;
-    let chapter_label = chapter_attrs
-        .get("chapter")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("正文");
-    Some((chapter_id.to_owned(), chapter_label.to_owned()))
+    match attributes.get("pages").and_then(Value::as_u64) {
+        Some(pages) if pages > 0 => ComicChapterAvailability::Available,
+        _ => ComicChapterAvailability::Unknown,
+    }
 }
 
 fn localized_value(value: Option<&Value>) -> Option<String> {
@@ -1640,10 +1936,10 @@ mod tests {
     }
 
     #[test]
-    fn mangadex_chapter_selection_accepts_non_preferred_languages_and_unknown_pages() {
+    fn mangadex_chapter_selection_accepts_non_preferred_languages_with_confirmed_pages() {
         let chapter = serde_json::json!({
             "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-            "attributes": {"translatedLanguage": "ja", "chapter": "12"}
+            "attributes": {"translatedLanguage": "ja", "chapter": "12", "pages": 12}
         });
         assert_eq!(
             readable_mangadex_chapter(&chapter),
@@ -1652,6 +1948,12 @@ mod tests {
                 "12".to_owned()
             ))
         );
+
+        let unknown = serde_json::json!({
+            "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "attributes": {"translatedLanguage": "ja", "chapter": "13"}
+        });
+        assert!(readable_mangadex_chapter(&unknown).is_none());
     }
 
     #[test]
@@ -1666,6 +1968,320 @@ mod tests {
         });
         assert!(readable_mangadex_chapter(&zero_pages).is_none());
         assert!(readable_mangadex_chapter(&external).is_none());
+    }
+
+    #[test]
+    fn mangadex_catalog_fixture_keeps_status_and_edition_facets() {
+        let manga_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let chapters = vec![
+            serde_json::json!({
+                "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "attributes": {
+                    "chapter": "12.5",
+                    "volume": "2",
+                    "title": "幕间",
+                    "translatedLanguage": "zh-hk",
+                    "pages": 24,
+                    "publishAt": "2026-08-01T00:00:00+00:00",
+                    "updatedAt": "2026-08-02T00:00:00+00:00"
+                },
+                "relationships": [{
+                    "id": "ffffffff-ffff-4fff-8fff-ffffffffffff",
+                    "type": "scanlation_group",
+                    "attributes": {"name": "Fixture Scan Group"}
+                }]
+            }),
+            serde_json::json!({
+                "id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                "attributes": {"chapter": "13", "pages": 0}
+            }),
+            serde_json::json!({
+                "id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                "attributes": {
+                    "chapter": "14",
+                    "externalUrl": "https://example.invalid/chapter/14"
+                }
+            }),
+            serde_json::json!({
+                "id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                "attributes": {"chapter": "15"}
+            }),
+        ];
+
+        let parsed = parse_mangadex_feed(manga_id, &chapters);
+        assert_eq!(parsed.len(), 4);
+        assert_eq!(parsed[0].metadata.chapter_number, Some(12.5));
+        assert_eq!(parsed[0].metadata.volume_number, Some(2.0));
+        assert_eq!(
+            parsed[0].metadata.edition_profile.language.as_known(),
+            Some("zh-hk")
+        );
+        assert_eq!(
+            parsed[0].metadata.edition_profile.scan_group,
+            ScanGroupFacet::ContentLine("ffffffff-ffff-4fff-8fff-ffffffffffff".to_owned())
+        );
+        assert_eq!(parsed[0].availability, ComicChapterAvailability::Available);
+        assert_eq!(
+            parsed[1].availability,
+            ComicChapterAvailability::TemporarilyUnavailable
+        );
+        assert_eq!(
+            parsed[2].availability,
+            ComicChapterAvailability::ExternalOnly
+        );
+        assert_eq!(parsed[3].availability, ComicChapterAvailability::Unknown);
+
+        let catalog =
+            ComicChapterCatalog::new("mangadex", manga_id, parsed, UtcMillis(42)).unwrap();
+        assert_eq!(catalog.readable_chapters().count(), 1);
+        assert_eq!(catalog.probeable_chapters().count(), 2);
+    }
+
+    #[test]
+    fn mangadex_catalog_tracks_rejected_entries_as_incomplete_coverage() {
+        let manga_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let chapters = vec![
+            serde_json::json!({
+                "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "attributes": {"chapter": "1", "pages": 8}
+            }),
+            serde_json::json!({
+                "id": "not-a-mangadex-uuid",
+                "attributes": {"chapter": "2", "pages": 8}
+            }),
+        ];
+
+        let (parsed, rejected_count) = parse_mangadex_feed_with_rejections(manga_id, &chapters);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(rejected_count, 1);
+        // The fetch path promotes any rejection to truncated=true, so a
+        // refresh cannot infer that the rejected historical chapter is Missing.
+    }
+
+    fn feed_chapter(id: &str, number: &str) -> Value {
+        serde_json::json!({
+            "id": id,
+            "attributes": {"chapter": number, "pages": 8}
+        })
+    }
+
+    fn feed_chapter_for_index(index: usize) -> Value {
+        let id = format!("{index:08x}-0000-4000-8000-{index:012x}");
+        let number = index.to_string();
+        feed_chapter(&id, &number)
+    }
+
+    fn consume_valid_mangadex_prefix(
+        coverage: &mut MangadexFeedCoverage,
+        manga_id: &str,
+        end: usize,
+    ) {
+        for offset in (0..end).step_by(MANGADEX_FEED_PAGE_LIMIT) {
+            let page = (offset..offset + MANGADEX_FEED_PAGE_LIMIT)
+                .map(feed_chapter_for_index)
+                .collect::<Vec<_>>();
+            let outcome = consume_mangadex_feed_page(
+                coverage,
+                manga_id,
+                &page,
+                Some(MAX_MANGA_CHAPTERS as u32),
+                offset,
+            );
+            let _ = outcome;
+        }
+    }
+
+    #[test]
+    fn mangadex_feed_coverage_merges_multiple_pages_in_provider_order() {
+        let manga_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut coverage = MangadexFeedCoverage::default();
+        let first = vec![
+            feed_chapter("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "3"),
+            feed_chapter("cccccccc-cccc-4ccc-8ccc-cccccccccccc", "2"),
+        ];
+        let second = vec![
+            feed_chapter("dddddddd-dddd-4ddd-8ddd-dddddddddddd", "1"),
+            feed_chapter("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", "0"),
+        ];
+
+        let first_page = consume_mangadex_feed_page(&mut coverage, manga_id, &first, Some(4), 0);
+        assert!(!first_page.stop);
+        let second_page = consume_mangadex_feed_page(
+            &mut coverage,
+            manga_id,
+            &second,
+            Some(4),
+            first_page.next_offset,
+        );
+        assert!(second_page.stop);
+        assert_eq!(coverage.total, Some(4));
+        assert!(!coverage.truncated);
+        assert_eq!(coverage.chapters.len(), 4);
+        assert_eq!(coverage.chapters[0].metadata.chapter_number, Some(3.0));
+        assert_eq!(coverage.chapters[3].metadata.chapter_number, Some(0.0));
+    }
+
+    #[test]
+    fn mangadex_feed_coverage_deduplicates_ids_and_marks_overlap_incomplete() {
+        let manga_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let duplicate_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let mut coverage = MangadexFeedCoverage::default();
+        let first = vec![feed_chapter(duplicate_id, "1")];
+        let second = vec![
+            feed_chapter(duplicate_id, "1"),
+            feed_chapter("cccccccc-cccc-4ccc-8ccc-cccccccccccc", "2"),
+        ];
+
+        let first_page = consume_mangadex_feed_page(&mut coverage, manga_id, &first, Some(3), 0);
+        let second_page = consume_mangadex_feed_page(
+            &mut coverage,
+            manga_id,
+            &second,
+            Some(3),
+            first_page.next_offset,
+        );
+        assert!(second_page.stop);
+        assert_eq!(coverage.chapters.len(), 2);
+        assert!(coverage.truncated, "重复远端章节 ID 不能被当成完整目录");
+    }
+
+    #[test]
+    fn mangadex_feed_coverage_rejects_bad_entries_without_marking_them_missing() {
+        let manga_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut coverage = MangadexFeedCoverage::default();
+        let page = vec![
+            feed_chapter("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "1"),
+            serde_json::json!({
+                "id": "not-a-mangadex-uuid",
+                "attributes": {"chapter": "2", "pages": 8}
+            }),
+        ];
+
+        let outcome = consume_mangadex_feed_page(&mut coverage, manga_id, &page, Some(2), 0);
+        assert!(outcome.stop);
+        assert_eq!(coverage.chapters.len(), 1);
+        assert!(coverage.truncated);
+    }
+
+    #[test]
+    fn mangadex_feed_coverage_handles_missing_total_and_contradictory_total() {
+        let manga_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut complete_without_total = MangadexFeedCoverage::default();
+        let short_page = vec![feed_chapter("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "1")];
+        let outcome =
+            consume_mangadex_feed_page(&mut complete_without_total, manga_id, &short_page, None, 0);
+        assert!(outcome.stop);
+        assert!(!complete_without_total.truncated);
+
+        let mut empty_without_total = MangadexFeedCoverage::default();
+        let outcome = consume_mangadex_feed_page(&mut empty_without_total, manga_id, &[], None, 0);
+        assert!(outcome.stop);
+        assert!(
+            empty_without_total.truncated,
+            "空 feed 且无 total 不足以证明完整"
+        );
+
+        let mut contradictory_total = MangadexFeedCoverage::default();
+        let two_chapters = vec![
+            feed_chapter("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "1"),
+            feed_chapter("cccccccc-cccc-4ccc-8ccc-cccccccccccc", "2"),
+        ];
+        let outcome = consume_mangadex_feed_page(
+            &mut contradictory_total,
+            manga_id,
+            &two_chapters,
+            Some(1),
+            0,
+        );
+        assert!(outcome.stop);
+        assert!(contradictory_total.truncated);
+    }
+
+    #[test]
+    fn mangadex_feed_coverage_keeps_exact_five_hundred_chapter_boundary_complete() {
+        let manga_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut coverage = MangadexFeedCoverage::default();
+        consume_valid_mangadex_prefix(&mut coverage, manga_id, MAX_MANGA_CHAPTERS);
+
+        assert_eq!(coverage.chapters.len(), MAX_MANGA_CHAPTERS);
+        assert_eq!(coverage.total, Some(MAX_MANGA_CHAPTERS as u32));
+        assert!(!coverage.truncated);
+    }
+
+    #[test]
+    fn mangadex_feed_coverage_marks_chapters_beyond_the_safety_cap_as_truncated() {
+        let manga_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut coverage = MangadexFeedCoverage::default();
+        consume_valid_mangadex_prefix(&mut coverage, manga_id, 400);
+
+        assert!(
+            consume_mangadex_feed_page(
+                &mut coverage,
+                manga_id,
+                &(400..500).map(feed_chapter_for_index).collect::<Vec<_>>(),
+                Some((MAX_MANGA_CHAPTERS + 1) as u32),
+                400,
+            )
+            .stop
+        );
+        assert!(coverage.truncated);
+    }
+
+    #[test]
+    fn mangadex_feed_coverage_preserves_malformed_last_page_signal_at_cap() {
+        let manga_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut coverage = MangadexFeedCoverage::default();
+        consume_valid_mangadex_prefix(&mut coverage, manga_id, 400);
+        let mut final_page = (400..499).map(feed_chapter_for_index).collect::<Vec<_>>();
+        final_page.push(serde_json::json!({
+            "id": "not-a-mangadex-uuid",
+            "attributes": {"chapter": "499", "pages": 8}
+        }));
+
+        let outcome = consume_mangadex_feed_page(
+            &mut coverage,
+            manga_id,
+            &final_page,
+            Some(MAX_MANGA_CHAPTERS as u32),
+            400,
+        );
+        assert!(outcome.stop);
+        assert_eq!(coverage.chapters.len(), 499);
+        assert!(coverage.truncated);
+    }
+
+    #[test]
+    fn mangadex_feed_coverage_preserves_duplicate_last_page_signal_at_cap() {
+        let manga_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut coverage = MangadexFeedCoverage::default();
+        consume_valid_mangadex_prefix(&mut coverage, manga_id, 400);
+        let mut final_page = (400..499).map(feed_chapter_for_index).collect::<Vec<_>>();
+        final_page.push(feed_chapter_for_index(0));
+
+        let outcome = consume_mangadex_feed_page(
+            &mut coverage,
+            manga_id,
+            &final_page,
+            Some(MAX_MANGA_CHAPTERS as u32),
+            400,
+        );
+        assert!(outcome.stop);
+        assert_eq!(coverage.chapters.len(), 499);
+        assert!(coverage.truncated);
+    }
+
+    #[test]
+    fn mangadex_feed_coverage_preserves_contradictory_total_at_cap() {
+        let manga_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut coverage = MangadexFeedCoverage::default();
+        consume_valid_mangadex_prefix(&mut coverage, manga_id, 400);
+        let final_page = (400..500).map(feed_chapter_for_index).collect::<Vec<_>>();
+
+        let outcome =
+            consume_mangadex_feed_page(&mut coverage, manga_id, &final_page, Some(499), 400);
+        assert!(outcome.stop);
+        assert_eq!(coverage.chapters.len(), 500);
+        assert!(coverage.truncated);
     }
 
     #[test]

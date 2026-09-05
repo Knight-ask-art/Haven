@@ -9,6 +9,9 @@ pub mod app_info;
 pub mod cache;
 pub mod cast;
 pub mod comic;
+pub mod comic_catalog;
+pub mod comic_page_identity;
+pub mod comic_progress_migration;
 pub mod credential;
 pub mod credential_access;
 pub mod download;
@@ -47,6 +50,12 @@ pub use comic::{
     ComicImageMime, ComicPageBody, ComicPageProvider, ComicPageService, PreparedComicPage,
     PreparedComicPageAvailability, PreparedComicPageSource, RemoteComicPageProvider,
 };
+pub use comic_catalog::ComicCatalogService;
+pub use comic_page_identity::{ComicPageIdentityService, ComicPageIdentitySyncResult};
+pub use comic_progress_migration::{
+    ComicPageProgressRemapRequest, ComicProgressMigrationRequest, ComicProgressMigrationResult,
+    ComicProgressMigrationService, ComicProgressMigrationStatus,
+};
 pub use credential::{CredentialDeleteOutcome, CredentialDeletePorts, CredentialDeletionService};
 pub use credential_access::{CredentialAccessService, DEFAULT_PROFILE_ID};
 pub use download::{
@@ -61,6 +70,7 @@ pub use history::{HistoryPorts, HistoryService};
 pub use home::HomeService;
 pub use library::LibraryService;
 pub use marker::{MarkerPorts, MarkerService};
+pub use ports::ComicProgressMigrationPorts;
 pub use ports::SessionOpenPorts;
 pub use ports::{FavoritePorts, LibraryPorts};
 pub use progress::{ProgressPorts, ProgressService};

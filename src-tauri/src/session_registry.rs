@@ -314,6 +314,49 @@ impl SessionRegistry {
         verified_comic_page(&state, grant_id, owner_webview_label)
     }
 
+    /// Replace the server-side prepared page facts for an owner-bound Comic
+    /// session. Existing page grants are revoked before the next manifest is
+    /// materialized, so a refreshed manifest never leaves stale runtime
+    /// capabilities usable.
+    pub(crate) fn replace_comic_pages(
+        &self,
+        id: &str,
+        owner_webview_label: &str,
+        pages: Vec<PreparedComicPage>,
+    ) -> Result<(), AppError> {
+        let mut state = self.write_state()?;
+        let grant_ids = {
+            let record = state
+                .sessions
+                .get(id)
+                .filter(|record| {
+                    record.owner_webview_label == owner_webview_label && !record.is_expired()
+                })
+                .ok_or_else(resource_not_found)?;
+            if record.prepared.engine != SessionEngineDto::Comic {
+                return Err(format_unsupported());
+            }
+            record
+                .comic_manifest
+                .as_ref()
+                .map(|manifest| manifest.grant_ids.clone())
+                .unwrap_or_default()
+        };
+        for grant_id in grant_ids {
+            state.grants.remove(&grant_id);
+        }
+        let record = state
+            .sessions
+            .get_mut(id)
+            .filter(|record| {
+                record.owner_webview_label == owner_webview_label && !record.is_expired()
+            })
+            .ok_or_else(resource_not_found)?;
+        record.prepared.comic_pages = Some(pages);
+        record.comic_manifest = None;
+        Ok(())
+    }
+
     pub(crate) fn begin_comic_page_read(
         self: &Arc<Self>,
         grant_id: &str,
@@ -670,6 +713,7 @@ mod tests {
         prepared.comic_pages = Some(vec![
             PreparedComicPage {
                 availability: PreparedComicPageAvailability::Ready,
+                identity: haven_domain::comic_identity::PageIdentity::stable("page-1"),
                 source: PreparedComicPageSource::ArchiveEntry {
                     entry_index: 0,
                     normalized_name: "page1.jpg".into(),
@@ -682,6 +726,7 @@ mod tests {
             },
             PreparedComicPage {
                 availability: PreparedComicPageAvailability::Unavailable,
+                identity: haven_domain::comic_identity::PageIdentity::stable("page-2"),
                 source: PreparedComicPageSource::ArchiveEntry {
                     entry_index: 1,
                     normalized_name: "page2.jpg".into(),
@@ -694,6 +739,7 @@ mod tests {
             },
             PreparedComicPage {
                 availability: PreparedComicPageAvailability::Ready,
+                identity: haven_domain::comic_identity::PageIdentity::stable("page-3"),
                 source: PreparedComicPageSource::ArchiveEntry {
                     entry_index: 2,
                     normalized_name: "page3.jpg".into(),
@@ -706,6 +752,7 @@ mod tests {
             },
             PreparedComicPage {
                 availability: PreparedComicPageAvailability::Ready,
+                identity: haven_domain::comic_identity::PageIdentity::stable("page-4"),
                 source: PreparedComicPageSource::ArchiveEntry {
                     entry_index: 3,
                     normalized_name: "page4.jpg".into(),

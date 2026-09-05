@@ -15,11 +15,23 @@ use crate::mapper::time::utc_millis_to_rfc3339;
 use crate::wire::{CompletionWire, ProgressSummaryDto};
 
 pub fn progress_summary(progress: &Progress) -> Result<ProgressSummaryDto, AppError> {
+    let revision = progress
+        .revision
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AppError::new(
+                "PROGRESS_REVISION_MISSING",
+                haven_common::ErrorKind::Database,
+                "Progress 缺少持久化 revision",
+                false,
+            )
+        })?;
     Ok(ProgressSummaryDto {
         media_item_id: progress.media_item_id.to_string(),
         completion: CompletionWire::from(progress.completion),
         progress_ratio: progress.percentage.map(|v| v as f64),
-        revision: progress.updated_at.0.to_string(),
+        revision: revision.to_owned(),
         updated_at: utc_millis_to_rfc3339(progress.updated_at),
         locator: locator_to_dto(&progress.locator)?,
         keyframe_uri: progress.keyframe_uri.clone(),
@@ -50,6 +62,7 @@ mod tests {
             percentage: Some(0.5),
             last_active_at: haven_common::UtcMillis(1_700_000_000_000),
             updated_at: haven_common::UtcMillis(1_700_000_000_000),
+            revision: Some("opaque-revision".into()),
             keyframe_uri: None,
         }
     }
@@ -60,7 +73,7 @@ mod tests {
         let dto = progress_summary(&p).unwrap();
         assert_eq!(dto.completion, crate::wire::CompletionWire::InProgress);
         assert_eq!(dto.progress_ratio, Some(0.5));
-        assert_eq!(dto.revision, p.updated_at.0.to_string());
+        assert_eq!(dto.revision, p.revision.clone().unwrap());
         assert_eq!(dto.updated_at, "2023-11-14T22:13:20Z");
         assert_eq!(dto.media_item_id, p.media_item_id.to_string());
         let json = serde_json::to_string(&dto).unwrap();

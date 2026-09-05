@@ -27,6 +27,7 @@ use haven_application::services::source_import::{
 };
 use haven_common::network::{HttpUrlPolicy, parse_http_url};
 use haven_common::{AppError, ErrorKind};
+use haven_domain::comic_catalog::ComicChapterCatalog;
 
 use tokio::io::AsyncWriteExt;
 
@@ -1010,6 +1011,7 @@ impl SourceCatalogProvider for OpdsCatalogProvider {
                 media_type: haven_domain::enums::MediaType::Book,
                 mime_type: Some(EPUB_MIME.to_owned()),
             }),
+            comic_catalog: None,
         })
     }
 }
@@ -1394,6 +1396,17 @@ impl SourceCatalogProvider for RoutingSourceCatalogProvider {
     ) -> Result<SourceCatalogEntry, AppError> {
         self.route(source_id)?
             .detail(source_id, endpoint, external_id)
+            .await
+    }
+
+    async fn comic_chapter_catalog(
+        &self,
+        source_id: &str,
+        endpoint: &str,
+        external_id: &str,
+    ) -> Result<Option<ComicChapterCatalog>, AppError> {
+        self.route(source_id)?
+            .comic_chapter_catalog(source_id, endpoint, external_id)
             .await
     }
 

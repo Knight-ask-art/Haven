@@ -175,14 +175,38 @@ pub(crate) fn save_on_conn(conn: &rusqlite::Connection, edition: &Edition) -> Re
         ],
     )
     .map_err(map_db_error("保存版本失败"))?;
+
+    // `Edition.language` is the legacy/general entity field, while a comic
+    // profile also records whether a NULL language is unknown or explicitly
+    // not applicable. Keep an already-existing profile aligned when generic
+    // metadata refreshes update the Edition. Do not create a profile row for
+    // non-comic or legacy Editions that never had one.
+    conn.execute(
+        "UPDATE edition_profiles
+         SET language_kind = CASE
+                 WHEN ?2 IS NOT NULL THEN 'known'
+                 WHEN language_kind = 'not_applicable' THEN 'not_applicable'
+                 ELSE 'unknown'
+             END,
+             updated_at = ?3
+         WHERE edition_id = ?1",
+        rusqlite::params![
+            edition.id.to_string(),
+            edition.language,
+            edition.updated_at.0
+        ],
+    )
+    .map_err(map_db_error("同步版本语言画像失败"))?;
     Ok(())
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::Db;
+    use crate::db::repos::edition_profiles::SqliteEditionProfileRepository;
+    use haven_domain::comic_identity::{EditionProfile, IdentityFacet};
+    use haven_domain::contracts::EditionProfileRepository;
     use haven_domain::entities::ArtworkSet;
     use haven_domain::enums::MediaType;
 
@@ -247,6 +271,55 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].title, "原著小说");
         assert_eq!(listed[1].title, "漫画改编");
+    }
+
+    #[tokio::test]
+    async fn generic_edition_save_keeps_profile_language_kind_aligned() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let work_id = seed_work(&db);
+        let edition = sample_edition(work_id);
+        let edition_id = edition.id;
+        let repo = SqliteEditionRepository::new(db.clone());
+        let profile_repo = SqliteEditionProfileRepository::new(db);
+
+        repo.save(&edition).await.unwrap();
+        profile_repo
+            .save(
+                edition_id,
+                &EditionProfile {
+                    language: IdentityFacet::NotApplicable,
+                    ..EditionProfile::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut refreshed = edition;
+        refreshed.language = None;
+        refreshed.updated_at = haven_common::UtcMillis(2_000);
+        repo.save(&refreshed).await.unwrap();
+        assert_eq!(
+            profile_repo
+                .get(edition_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .language,
+            IdentityFacet::NotApplicable
+        );
+
+        refreshed.language = Some("en".into());
+        refreshed.updated_at = haven_common::UtcMillis(3_000);
+        repo.save(&refreshed).await.unwrap();
+        assert_eq!(
+            profile_repo
+                .get(edition_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .language,
+            IdentityFacet::known("en")
+        );
     }
 
     #[tokio::test]

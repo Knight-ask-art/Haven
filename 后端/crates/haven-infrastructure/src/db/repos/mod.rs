@@ -5,8 +5,11 @@
 //! - 当前查询均为短事务级操作；Tauri 接线后重查询由外层 `spawn_blocking` 承接。
 //! - Locator 序列化走 `Locator` 自身的 version + kind + data envelope（未知版本拒绝）。
 
+pub mod comic_identity;
+pub mod comic_progress_migrations;
 pub mod download;
 pub mod edition;
+pub mod edition_profiles;
 pub mod enrichment;
 pub mod favorite;
 pub mod hierarchy;
@@ -28,8 +31,11 @@ use haven_common::AppError;
 use haven_domain::entities::ArtworkSet;
 use haven_domain::locator::Locator;
 
+pub use comic_identity::{SqliteChapterSourceRepository, SqliteComicPageIdentityRepository};
+pub use comic_progress_migrations::SqliteComicProgressMigrationRepository;
 pub use download::{SqliteDownloadBatchRepository, SqliteDownloadRepository};
 pub use edition::SqliteEditionRepository;
+pub use edition_profiles::SqliteEditionProfileRepository;
 pub use enrichment::SqliteEnrichmentRepository;
 pub use favorite::SqliteFavoriteRepository;
 pub use history::SqliteHistoryRepository;
@@ -50,6 +56,7 @@ pub use work_relation::SqliteWorkRelationRepository;
 pub struct SqliteRepositories {
     pub work: SqliteWorkRepository,
     pub edition: SqliteEditionRepository,
+    pub edition_profiles: SqliteEditionProfileRepository,
     pub download: SqliteDownloadRepository,
     pub download_batch: SqliteDownloadBatchRepository,
     pub media_item: SqliteMediaItemRepository,
@@ -66,6 +73,9 @@ pub struct SqliteRepositories {
     pub storage_location: SqliteStorageLocationRepository,
     pub trending_cache: SqliteTrendingCacheRepository,
     pub work_relation: SqliteWorkRelationRepository,
+    pub chapter_source: SqliteChapterSourceRepository,
+    pub page_identity: SqliteComicPageIdentityRepository,
+    pub progress_migration: SqliteComicProgressMigrationRepository,
 }
 
 impl SqliteRepositories {
@@ -73,6 +83,7 @@ impl SqliteRepositories {
         Self {
             work: SqliteWorkRepository::new(db.clone()),
             edition: SqliteEditionRepository::new(db.clone()),
+            edition_profiles: SqliteEditionProfileRepository::new(db.clone()),
             download: SqliteDownloadRepository::new(db.clone()),
             download_batch: SqliteDownloadBatchRepository::new(db.clone()),
             media_item: SqliteMediaItemRepository::new(db.clone()),
@@ -88,7 +99,10 @@ impl SqliteRepositories {
             enrichment: SqliteEnrichmentRepository::new(db.clone()),
             storage_location: SqliteStorageLocationRepository::new(db.clone()),
             trending_cache: SqliteTrendingCacheRepository::new(db.clone()),
-            work_relation: SqliteWorkRelationRepository::new(db),
+            work_relation: SqliteWorkRelationRepository::new(db.clone()),
+            chapter_source: SqliteChapterSourceRepository::new(db.clone()),
+            page_identity: SqliteComicPageIdentityRepository::new(db.clone()),
+            progress_migration: SqliteComicProgressMigrationRepository::new(db),
         }
     }
 }
@@ -220,6 +234,127 @@ impl haven_domain::contracts::EditionRepository for SqliteRepositories {
         id: haven_domain::ids::EditionId,
     ) -> Result<bool, haven_common::AppError> {
         self.edition.delete(id).await
+    }
+}
+
+#[async_trait::async_trait]
+impl haven_domain::contracts::EditionProfileRepository for SqliteRepositories {
+    async fn get(
+        &self,
+        edition_id: haven_domain::ids::EditionId,
+    ) -> Result<Option<haven_domain::comic_identity::EditionProfile>, haven_common::AppError> {
+        self.edition_profiles.get(edition_id).await
+    }
+
+    async fn save(
+        &self,
+        edition_id: haven_domain::ids::EditionId,
+        profile: &haven_domain::comic_identity::EditionProfile,
+    ) -> Result<(), haven_common::AppError> {
+        self.edition_profiles.save(edition_id, profile).await
+    }
+}
+
+#[async_trait::async_trait]
+impl haven_domain::contracts::ChapterSourceRepository for SqliteRepositories {
+    async fn get(
+        &self,
+        identity: &haven_domain::comic_identity::ChapterSourceIdentity,
+    ) -> Result<Option<haven_domain::comic_identity::ChapterSourceRef>, haven_common::AppError>
+    {
+        self.chapter_source.get(identity).await
+    }
+
+    async fn list_for_media_item(
+        &self,
+        media_item_id: haven_domain::ids::MediaItemId,
+    ) -> Result<Vec<haven_domain::comic_identity::ChapterSourceRef>, haven_common::AppError> {
+        self.chapter_source.list_for_media_item(media_item_id).await
+    }
+
+    async fn list_for_source_work(
+        &self,
+        source_key: &str,
+        remote_work_id: &str,
+    ) -> Result<Vec<haven_domain::comic_identity::ChapterSourceRef>, haven_common::AppError> {
+        self.chapter_source
+            .list_for_source_work(source_key, remote_work_id)
+            .await
+    }
+
+    async fn refresh_state(
+        &self,
+        source_key: &str,
+        remote_work_id: &str,
+    ) -> Result<Option<haven_domain::comic_catalog::ComicChapterCatalogState>, haven_common::AppError>
+    {
+        self.chapter_source
+            .refresh_state(source_key, remote_work_id)
+            .await
+    }
+
+    async fn save(
+        &self,
+        reference: &haven_domain::comic_identity::ChapterSourceRef,
+    ) -> Result<(), haven_common::AppError> {
+        self.chapter_source.save(reference).await
+    }
+}
+
+#[async_trait::async_trait]
+impl haven_domain::contracts::ComicPageIdentityRepository for SqliteRepositories {
+    async fn get_snapshot(
+        &self,
+        media_item_id: haven_domain::ids::MediaItemId,
+    ) -> Result<haven_domain::comic_identity::ComicPageIdentitySnapshot, haven_common::AppError>
+    {
+        self.page_identity.get_snapshot(media_item_id).await
+    }
+
+    async fn replace_if_revision(
+        &self,
+        media_item_id: haven_domain::ids::MediaItemId,
+        pages: &[haven_domain::comic_identity::PageIdentity],
+        updated_at: haven_common::UtcMillis,
+        expected_revision: Option<&str>,
+    ) -> Result<Option<String>, haven_common::AppError> {
+        self.page_identity
+            .replace_if_revision(media_item_id, pages, updated_at, expected_revision)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl haven_domain::contracts::ComicProgressMigrationRepository for SqliteRepositories {
+    async fn apply(
+        &self,
+        snapshot: &haven_domain::comic_identity::ComicProgressMigrationSnapshot,
+        expected_source_revision: &str,
+        expected_target_revision: Option<&str>,
+    ) -> Result<Option<String>, haven_common::AppError> {
+        self.progress_migration
+            .apply(snapshot, expected_source_revision, expected_target_revision)
+            .await
+    }
+
+    async fn get_snapshot(
+        &self,
+        id: haven_domain::ids::ComicProgressMigrationId,
+    ) -> Result<
+        Option<haven_domain::comic_identity::ComicProgressMigrationSnapshot>,
+        haven_common::AppError,
+    > {
+        self.progress_migration.get_snapshot(id).await
+    }
+
+    async fn revert(
+        &self,
+        id: haven_domain::ids::ComicProgressMigrationId,
+        expected_applied_revision: &str,
+    ) -> Result<bool, haven_common::AppError> {
+        self.progress_migration
+            .revert(id, expected_applied_revision)
+            .await
     }
 }
 
