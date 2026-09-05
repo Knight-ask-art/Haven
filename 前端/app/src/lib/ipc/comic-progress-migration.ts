@@ -72,9 +72,10 @@ export function isComicProgressMigrationRequestDto(
   value: unknown,
 ): value is ComicProgressMigrationRequestDto {
   return isRecord(value)
-    && hasExactKeys(value, ["source", "target", "allowTargetOverwrite"])
+    && hasExactKeys(value, ["source", "target", "allowBestEffort", "allowTargetOverwrite"])
     && isSourceIdentity(value.source)
     && isSourceIdentity(value.target)
+    && typeof value.allowBestEffort === "boolean"
     && typeof value.allowTargetOverwrite === "boolean"
 }
 
@@ -103,6 +104,7 @@ function isOneOf<T extends string>(value: unknown, allowed: readonly T[]): value
 function isMigrationStatus(value: unknown): value is ComicProgressMigrationStatusDto {
   return isOneOf(value, [
     "unchanged",
+    "not_applicable",
     "applied",
     "shared_content",
     "suggested",
@@ -134,6 +136,7 @@ function isEvidenceKind(value: unknown): value is ComicChapterEvidenceKindDto {
   return isOneOf(value, [
     "same_remote_identity",
     "authoritative_content_key",
+    "conflicting_authoritative_content_key",
     "edition_compatible",
     "edition_conflict",
     "exact_page_identity",

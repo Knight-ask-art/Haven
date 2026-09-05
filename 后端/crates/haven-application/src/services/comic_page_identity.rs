@@ -463,7 +463,7 @@ mod tests {
             .await
             .unwrap();
         let service = service(repositories.clone());
-        let fingerprint_pages = vec![
+        let fingerprint_pages = [
             PreparedComicPage {
                 availability: PreparedComicPageAvailability::Ready,
                 identity: PageIdentity::fingerprint("page-a"),

@@ -161,6 +161,7 @@ describe("TauriHavenClient comic progress migration", () => {
     const request: ComicProgressMigrationRequestDto = {
       source,
       target,
+      allowBestEffort: false,
       allowTargetOverwrite: false,
     }
     const result = {

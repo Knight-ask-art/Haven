@@ -1851,14 +1851,18 @@ pub struct ComicChapterSourceIdentityDto {
     pub remote_chapter_id: String,
 }
 
-/// 跨来源章节迁移请求。目标已有进度默认保留，只有用户明确选择覆盖时才允许
-/// `allowTargetOverwrite=true`；源/目标 revision 仍由后端在原子事务中校验。
+/// 跨来源章节迁移请求。低置信度 `Suggested` 匹配只有在用户或应用策略明确
+/// 允许最佳努力迁移时才会写入；目标已有进度默认保留，只有用户明确选择覆盖
+/// 时才允许 `allowTargetOverwrite=true`；源/目标 revision 仍由后端在原子事务中校验。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 #[ts(export, rename_all = "camelCase")]
 pub struct ComicProgressMigrationRequestDto {
     pub source: ComicChapterSourceIdentityDto,
     pub target: ComicChapterSourceIdentityDto,
+    /// 允许低置信度元数据匹配执行可撤销的最佳努力迁移。
+    pub allow_best_effort: bool,
+    /// 只有用户明确选择覆盖目标现有进度时才设为 true。
     pub allow_target_overwrite: bool,
 }
 
@@ -1879,6 +1883,7 @@ pub struct ComicPageProgressRemapRequestDto {
 #[ts(export, rename_all = "snake_case")]
 pub enum ComicProgressMigrationStatusDto {
     Unchanged,
+    NotApplicable,
     Applied,
     SharedContent,
     Suggested,
@@ -1923,6 +1928,7 @@ pub enum ComicProgressMigrationModeDto {
 pub enum ComicChapterEvidenceKindDto {
     SameRemoteIdentity,
     AuthoritativeContentKey,
+    ConflictingAuthoritativeContentKey,
     EditionCompatible,
     EditionConflict,
     ExactPageIdentity,
