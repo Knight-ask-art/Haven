@@ -3,4 +3,4 @@
 /**
  * Library 列表排序。
  */
-export type LibraryListSort = "recently_added" | "title" | "last_active" | "release_date";
+export type LibraryListSort = "recently_added" | "title" | "last_active" | "release_date" | "rating";

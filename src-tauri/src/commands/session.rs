@@ -72,6 +72,12 @@ pub async fn run_session_close(
         .session_registry
         .remove_for_owner(&session_id, owner_webview_label)
         .map_err(|error| to_error_dto(&error))?;
+    // A playback lease may be backed by either registry. Revoke the stream
+    // grant through the same close command so remote playback cannot outlive
+    // the frontend lease.
+    state
+        .stream_registry
+        .revoke(&session_id, owner_webview_label);
     Ok(SessionCloseResultDto {
         schema_version: 1,
         closed: true,

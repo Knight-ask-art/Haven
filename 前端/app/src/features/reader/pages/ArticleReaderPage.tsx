@@ -1,5 +1,5 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
-import type { KeyboardEvent, ReactNode } from "react"
+import { Children, createElement, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
+import type { KeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode } from "react"
 import { useNavigate, useParams } from "react-router"
 import {
   ArrowLeft,
@@ -51,8 +51,13 @@ import { PDF_RANGE_CHUNK_SIZE, type PdfSessionSource } from "../lib/pdf-document
 import { useReadingSettings } from "../lib/use-reading-settings"
 import { resolveReadingPresentation } from "../lib/reading-settings-mapping"
 import { articleMarkerLocator, createMarker, deleteMarker, listMarkers } from "@/features/markers/ipc/marker-gateway"
-import type { MarkerDto } from "@/lib/ipc/generated/wire"
-import { buildArticleTextAnchor, findParagraphText } from "../lib/article-text-anchor"
+import type { MarkerDto, TextAnchorDto } from "@/lib/ipc/generated/wire"
+import {
+  buildArticleTextAnchor,
+  buildArticleTextAnchorAtOffset,
+  findParagraphText,
+  resolveArticleTextAnchor,
+} from "../lib/article-text-anchor"
 
 type ReaderTheme = "paper" | "warm" | "slate" | "dark" | "sepia" | "eyeCare" | "custom"
 type ReaderFont = "serif" | "sans" | "kai" | "heiti" | "fangsong" | "mianfei" | "custom"
@@ -69,6 +74,8 @@ interface ArticleNote {
 interface ArticleHighlight {
   blockId: string
   text: string
+  markerId?: string
+  textAnchor?: TextAnchorDto | null
 }
 
 type ArticleContentState =
@@ -239,12 +246,12 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
     if (demoRuntime) return highlights
     return sessionMarkers
       .filter((marker) => marker.markerType === "highlight")
-      .map((marker) => {
+      .flatMap((marker): ArticleHighlight[] => {
         const blockId = marker.locator.kind === "article" ? marker.locator.data.blockId : null
         const text = marker.excerpt ?? (marker.locator.kind === "article" ? marker.locator.data.textAnchor?.exact : null) ?? ""
-        return blockId && text ? { blockId, text } : null
+        const textAnchor = marker.locator.kind === "article" ? marker.locator.data.textAnchor : null
+        return blockId && text ? [{ blockId, text, markerId: marker.markerId, textAnchor }] : []
       })
-      .filter((value): value is ArticleHighlight => value !== null)
   }, [demoRuntime, highlights, sessionMarkers])
   const [contentState, setContentState] = useState<ArticleContentState>({ status: "idle" })
   const [contentRetryNonce, setContentRetryNonce] = useState(0)
@@ -256,6 +263,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
   const [chromeDimmed, setChromeDimmed] = useState(false)
   const [selectedText, setSelectedText] = useState("")
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null)
+  const [selectedTextAnchor, setSelectedTextAnchor] = useState<TextAnchorDto | null>(null)
   const [selectionPosition, setSelectionPosition] = useState<{ x: number; y: number } | null>(null)
   const [aiInput, setAiInput] = useState("")
   const [aiTyping, setAiTyping] = useState(false)
@@ -268,6 +276,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
   const aiScrollRef = useRef<HTMLDivElement>(null)
   const aiTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const progressControllerRef = useRef<ArticleProgressController | null>(null)
+  const projectedHighlightRangesRef = useRef<Array<{ highlight: ArticleHighlight; range: Range }>>([])
   const pdfProgressControllerRef = useRef<PdfProgressController | null>(null)
   const restoredProgressRef = useRef<string | null>(null)
   const restoredPdfProgressRef = useRef<string | null>(null)
@@ -559,16 +568,12 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
     if (!contentReady || !articleDocument || sessionView.status !== "ready" || state.status !== "ready") return
     const restored = restoreArticleProgress(state.session, restoredProgressRef)
     if (!restored) return
-    const restoredBlockId = restored.blockId
-    if (restoredBlockId && outline.some((item) => item.id === restoredBlockId)) {
-      const frame = requestAnimationFrame(() => {
-        document.getElementById(restoredBlockId)?.scrollIntoView({ block: "start" })
-      })
-      return () => cancelAnimationFrame(frame)
-    }
     const maxScroll = document.documentElement.scrollHeight - window.innerHeight
     if (maxScroll <= 0) return
-    window.scrollTo({ top: Math.min(maxScroll, restored.progression * maxScroll) })
+    // `progression` is the whole-document ratio. A block id is only a coarse
+    // activity label, not a second coordinate; applying both double-counts
+    // the remaining distance (p * (2 - p)).
+    window.scrollTo({ top: Math.min(maxScroll, Math.max(0, restored.progression * maxScroll)) })
   }, [articleDocument, contentReady, outline, sessionView.status, state, sessionContentUri])
 
   useEffect(() => {
@@ -697,6 +702,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
     if (!text || !selection?.rangeCount) {
       setSelectedText("")
       setSelectedBlockId(null)
+      setSelectedTextAnchor(null)
       setSelectionPosition(null)
       return
     }
@@ -707,12 +713,32 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
     if (!startBlock || startBlock !== endBlock || !blockId) {
       setSelectedText("")
       setSelectedBlockId(null)
+      setSelectedTextAnchor(null)
+      setSelectionPosition(null)
+      return
+    }
+    const blockText = startBlock.textContent ?? ""
+    const beforeSelection = document.createRange()
+    beforeSelection.selectNodeContents(startBlock)
+    beforeSelection.setEnd(range.startContainer, range.startOffset)
+    const rawSelection = selection.toString()
+    const leadingWhitespace = rawSelection.length - rawSelection.trimStart().length
+    const textAnchor = buildArticleTextAnchorAtOffset(
+      blockText,
+      text,
+      beforeSelection.toString().length + leadingWhitespace,
+    )
+    if (!textAnchor) {
+      setSelectedText("")
+      setSelectedBlockId(null)
+      setSelectedTextAnchor(null)
       setSelectionPosition(null)
       return
     }
     const rect = range.getBoundingClientRect()
     setSelectedText(text)
     setSelectedBlockId(blockId)
+    setSelectedTextAnchor(textAnchor)
     setSelectionPosition({
       x: Math.min(window.innerWidth - 120, Math.max(120, rect.left + rect.width / 2)),
       y: Math.max(84, rect.top - 12),
@@ -724,16 +750,16 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
     const blockId = selectedBlockId
     const text = selectedText
     if (tauriRuntime && mediaItemId) {
-      const sections = articleDocument?.sections ?? []
-      const paragraphText = findParagraphText(sections, blockId) ?? text
-      const textAnchor = buildArticleTextAnchor(paragraphText, text)
+      const textAnchor = selectedTextAnchor
       const locator = articleMarkerLocator(blockId, Math.max(0, Math.min(1, progress / 100)), textAnchor)
       const already = sessionMarkers.some(
         (marker) =>
           marker.markerType === "highlight" &&
           marker.locator.kind === "article" &&
           marker.locator.data.blockId === blockId &&
-          (marker.excerpt === text || marker.locator.data.textAnchor?.exact === text),
+          marker.locator.data.textAnchor?.exact === textAnchor?.exact
+          && marker.locator.data.textAnchor?.prefix === textAnchor?.prefix
+          && marker.locator.data.textAnchor?.suffix === textAnchor?.suffix,
       )
       if (already) {
         dismissSelection()
@@ -752,9 +778,12 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
       dismissSelection()
       return
     }
+    const markerId = crypto.randomUUID()
     setHighlights((current) => current.some((highlight) => (
-      highlight.blockId === blockId && highlight.text === text
-    )) ? current : [...current, { blockId, text }])
+      highlight.blockId === blockId
+      && highlight.textAnchor?.prefix === selectedTextAnchor?.prefix
+      && highlight.textAnchor?.suffix === selectedTextAnchor?.suffix
+    )) ? current : [...current, { blockId, text, markerId, textAnchor: selectedTextAnchor }])
     setNotes((current) => [
       { id: Date.now().toString(), blockId, text, time: "刚刚" },
       ...current,
@@ -764,13 +793,15 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
 
   const removeHighlight = (highlight: ArticleHighlight) => {
     if (tauriRuntime && mediaItemId) {
-      const target = sessionMarkers.find(
+      const target = highlight.markerId
+        ? sessionMarkers.find((marker) => marker.markerId === highlight.markerId)
+        : sessionMarkers.find(
         (marker) =>
           marker.markerType === "highlight" &&
           marker.locator.kind === "article" &&
           marker.locator.data.blockId === highlight.blockId &&
           (marker.excerpt === highlight.text || marker.locator.data.textAnchor?.exact === highlight.text),
-      )
+        )
       if (!target) return
       setSessionMarkers((current) => current.filter((marker) => marker.markerId !== target.markerId))
       void deleteMarker(target.markerId).catch(() => {
@@ -778,9 +809,9 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
       })
       return
     }
-    setHighlights((current) => current.filter((item) => !(
-      item.blockId === highlight.blockId && item.text === highlight.text
-    )))
+    setHighlights((current) => current.filter((item) => highlight.markerId
+      ? item.markerId !== highlight.markerId
+      : !(item.blockId === highlight.blockId && item.text === highlight.text)))
     setNotes((current) => current.filter((note) => !(
       note.blockId === highlight.blockId && note.text === highlight.text
     )))
@@ -797,6 +828,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
   const dismissSelection = () => {
     setSelectedText("")
     setSelectedBlockId(null)
+    setSelectedTextAnchor(null)
     setSelectionPosition(null)
     window.getSelection()?.removeAllRanges()
   }
@@ -826,23 +858,101 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
   }
 
   const renderHighlightedText = (text: string, blockId: string): ReactNode[] => {
-    const marked = effectiveHighlights
-      .filter((highlight) => (
-        highlight.text.length > 0 && highlight.blockId === blockId
+    if (articleDocument?.format !== "text") return [text]
+    const ranges = effectiveHighlights
+      .filter((highlight) => highlight.text.length > 0 && highlight.blockId === blockId)
+      .map((highlight) => ({
+        highlight,
+        range: resolveArticleTextAnchor(
+          text,
+          highlight.textAnchor ?? buildArticleTextAnchor(text, highlight.text),
+        ),
+      }))
+      .filter((value): value is { highlight: ArticleHighlight; range: { start: number; end: number } } => value.range !== null)
+      .sort((a, b) => a.range.start - b.range.start)
+    const output: ReactNode[] = []
+    let cursor = 0
+    for (const { highlight, range } of ranges) {
+      if (range.start < cursor) continue
+      output.push(text.slice(cursor, range.start))
+      output.push(
+        <mark key={highlight.markerId ?? `${blockId}-${range.start}`} onClick={() => removeHighlight(highlight)} className="cursor-pointer rounded-sm bg-amber-300/30 px-0.5 text-inherit underline decoration-amber-700/45 decoration-dotted underline-offset-4 transition-colors hover:bg-amber-300/50" title="点击取消划线">
+          {text.slice(range.start, range.end)}
+        </mark>,
+      )
+      cursor = range.end
+    }
+    output.push(text.slice(cursor))
+    return output
+  }
+
+  const renderHighlightedChildren = (children: ReactNode, blockId: string): ReactNode[] =>
+    Children.toArray(children).flatMap((child) => (
+      typeof child === "string" ? renderHighlightedText(child, blockId) : [child]
+    ))
+
+  const renderSanitizedHtml = (html: string, blockId: string): ReactNode => {
+    const root = new DOMParser().parseFromString(html, "text/html").body
+    const allowed = new Set(["a", "article", "blockquote", "br", "code", "dd", "div", "dl", "dt", "em", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "ol", "p", "pre", "section", "strong", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul"])
+    const renderNode = (node: Node, key: string, inheritedBlockId: string): ReactNode => {
+      if (node.nodeType === Node.TEXT_NODE) return renderHighlightedText(node.textContent ?? "", inheritedBlockId)
+      if (node.nodeType !== Node.ELEMENT_NODE) return null
+      const element = node as HTMLElement
+      const tag = element.tagName.toLowerCase()
+      if (!allowed.has(tag)) return Array.from(element.childNodes).map((child, index) => renderNode(child, `${key}-${index}`, inheritedBlockId))
+      const currentBlockId = element.dataset.articleBlockId ?? inheritedBlockId
+      const props: Record<string, string> = { key }
+      for (const attribute of Array.from(element.attributes)) {
+        if (["class", "id", "title", "data-article-block-id"].includes(attribute.name)) {
+          props[attribute.name === "class" ? "className" : attribute.name] = attribute.value
+        }
+      }
+      return createElement(tag, props, Array.from(element.childNodes).map((child, index) => renderNode(child, `${key}-${index}`, currentBlockId)))
+    }
+    return Array.from(root.childNodes).map((node, index) => renderNode(node, `html-${index}`, blockId))
+  }
+
+  useLayoutEffect(() => {
+    const registry = getCssHighlightRegistry()
+    const HighlightConstructor = getHighlightConstructor()
+    const article = articleRef.current
+    projectedHighlightRangesRef.current = []
+    if (!registry || !HighlightConstructor || !articleDocument || articleDocument.format === "text" || !article) {
+      registry?.delete("haven-article-highlight")
+      return
+    }
+    const ranges: Range[] = []
+    for (const highlight of effectiveHighlights) {
+      const block = Array.from(article.querySelectorAll<HTMLElement>("[data-article-block-id]"))
+        .find((element) => element.dataset.articleBlockId === highlight.blockId)
+      if (!block) continue
+      const location = resolveArticleTextAnchor(
+        block.textContent ?? "",
+        highlight.textAnchor ?? buildArticleTextAnchor(block.textContent ?? "", highlight.text),
+      )
+      if (!location) continue
+      const range = createTextRange(block, location.start, location.end)
+      if (!range) continue
+      ranges.push(range)
+      projectedHighlightRangesRef.current.push({ highlight, range })
+    }
+    if (ranges.length > 0) registry.set("haven-article-highlight", new HighlightConstructor(...ranges))
+    else registry.delete("haven-article-highlight")
+    return () => {
+      registry.delete("haven-article-highlight")
+      projectedHighlightRangesRef.current = []
+    }
+  }, [articleDocument, effectiveHighlights])
+
+  const handleArticleHighlightClick = (event: ReactMouseEvent<HTMLElement>) => {
+    if (!window.getSelection()?.isCollapsed) return
+    const target = projectedHighlightRangesRef.current.find(({ range }) => (
+      Array.from(range.getClientRects()).some((rect) => (
+        event.clientX >= rect.left && event.clientX <= rect.right
+        && event.clientY >= rect.top && event.clientY <= rect.bottom
       ))
-      .sort((a, b) => b.text.length - a.text.length)
-    if (marked.length === 0) return [text]
-    let parts: ReactNode[] = [text]
-    marked.forEach((highlight) => {
-      parts = parts.flatMap((part, partIndex) => {
-        if (typeof part !== "string") return part
-        const chunks = part.split(highlight.text)
-        return chunks.flatMap((chunk, index) => index === chunks.length - 1
-          ? [chunk]
-          : [chunk, <mark key={`${blockId}-${highlight.text}-${partIndex}-${index}`} onClick={() => removeHighlight(highlight)} className="cursor-pointer rounded-sm bg-amber-300/30 px-0.5 text-inherit underline decoration-amber-700/45 decoration-dotted underline-offset-4 transition-colors hover:bg-amber-300/50" title="点击取消划线">{highlight.text}</mark>])
-      })
-    })
-    return parts
+    ))
+    if (target) removeHighlight(target.highlight)
   }
 
   return (
@@ -927,7 +1037,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
           pdfProgressControllerRef.current?.locatorChange(locator)
         }} />}
         {contentReady && articleDocument && (
-          <article ref={articleRef} onMouseUp={handleSelection} onTouchEnd={handleSelection} className={cn("mx-auto w-full select-text", bodyFont)} style={{ maxWidth: contentWidth, fontSize: `${fontSize}px`, lineHeight: bodyLineHeight }}>
+          <article ref={articleRef} onClick={handleArticleHighlightClick} onMouseUp={handleSelection} onTouchEnd={handleSelection} className={cn("mx-auto w-full select-text", bodyFont)} style={{ maxWidth: contentWidth, fontSize: `${fontSize}px`, lineHeight: bodyLineHeight }}>
             <header className="border-b border-current/15 pb-[48px]">
               <p className="text-xs font-semibold uppercase tracking-[0.22em] text-primary">
                 {tauriRuntime ? "LOCAL ARTICLE" : "《Torto 架构专栏》 · 2026.08"}
@@ -943,8 +1053,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
               {articleDocument.format === "html" && articleDocument.sanitizedHtml ? (
                 <div
                   className="article-html space-y-7 leading-[inherit] [&_a]:underline [&_blockquote]:my-8 [&_blockquote]:border-l-2 [&_blockquote]:border-primary/65 [&_blockquote]:py-2 [&_blockquote]:pl-6 [&_code]:rounded [&_code]:bg-black/[0.06] [&_code]:px-1 [&_pre]:overflow-x-auto [&_pre]:rounded-xl [&_pre]:bg-black/[0.06] [&_pre]:p-4 [&_ul]:list-disc [&_ul]:pl-6 [&_ol]:list-decimal [&_ol]:pl-6"
-                  dangerouslySetInnerHTML={{ __html: articleDocument.sanitizedHtml }}
-                />
+                >{renderSanitizedHtml(articleDocument.sanitizedHtml, "article-body")}</div>
               ) : articleSections.map((section, sectionIndex) => (
                 <section key={section.id} className="scroll-mt-28">
                   {sectionIndex > 0 && (
@@ -962,7 +1071,10 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
                       {articleDocument.format === "markdown" ? (
                         <ReactMarkdown
                           components={{
-                            a: ({ children }) => <span className="underline decoration-current/40 underline-offset-4">{children}</span>,
+                            p: ({ children }) => <p>{renderHighlightedChildren(children, paragraph.id)}</p>,
+                            strong: ({ children }) => <strong>{renderHighlightedChildren(children, paragraph.id)}</strong>,
+                            em: ({ children }) => <em>{renderHighlightedChildren(children, paragraph.id)}</em>,
+                            a: ({ children }) => <span className="underline decoration-current/40 underline-offset-4">{renderHighlightedChildren(children, paragraph.id)}</span>,
                             img: () => <span className="opacity-55">[图片已隐藏]</span>,
                           }}
                         >
@@ -1057,6 +1169,50 @@ function closestArticleBlock(node: Node): HTMLElement | null {
   return element?.closest<HTMLElement>("[data-article-block-id]") ?? null
 }
 
+type CssHighlightRegistry = {
+  set(name: string, highlight: unknown): void
+  delete(name: string): boolean
+}
+
+type HighlightConstructor = new (...ranges: Range[]) => unknown
+
+function getCssHighlightRegistry(): CssHighlightRegistry | null {
+  const css = CSS as typeof CSS & { highlights?: CssHighlightRegistry }
+  return css.highlights ?? null
+}
+
+function getHighlightConstructor(): HighlightConstructor | null {
+  return (globalThis as typeof globalThis & { Highlight?: HighlightConstructor }).Highlight ?? null
+}
+
+function createTextRange(root: HTMLElement, start: number, end: number): Range | null {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+  let offset = 0
+  let startNode: Text | null = null
+  let endNode: Text | null = null
+  let startOffset = 0
+  let endOffset = 0
+  while (walker.nextNode()) {
+    const node = walker.currentNode as Text
+    const next = offset + node.data.length
+    if (!startNode && start >= offset && start <= next) {
+      startNode = node
+      startOffset = start - offset
+    }
+    if (end >= offset && end <= next) {
+      endNode = node
+      endOffset = end - offset
+      break
+    }
+    offset = next
+  }
+  if (!startNode || !endNode) return null
+  const range = document.createRange()
+  range.setStart(startNode, startOffset)
+  range.setEnd(endNode, endOffset)
+  return range
+}
+
 function legacyDemoBlockId(text: string): string | null {
   if (!text) return null
   const matches = ARTICLE_SECTIONS.flatMap((section) => section.paragraphs)
@@ -1080,7 +1236,19 @@ function readHighlights(storageId: string): ArticleHighlight[] {
       }
       if (!value.text) return []
       const blockId = value.blockId === "legacy" ? legacyDemoBlockId(value.text) : value.blockId
-      return blockId ? [{ blockId, text: value.text }] : []
+      const textAnchor = isRecord(value.textAnchor)
+        ? {
+            exact: typeof value.textAnchor.exact === "string" ? value.textAnchor.exact : null,
+            prefix: typeof value.textAnchor.prefix === "string" ? value.textAnchor.prefix : null,
+            suffix: typeof value.textAnchor.suffix === "string" ? value.textAnchor.suffix : null,
+          }
+        : null
+      return blockId ? [{
+        blockId,
+        text: value.text,
+        markerId: typeof value.markerId === "string" ? value.markerId : undefined,
+        textAnchor,
+      }] : []
     })
   } catch {
     return []

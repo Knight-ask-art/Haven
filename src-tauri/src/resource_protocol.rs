@@ -193,7 +193,7 @@ enum ResourceRequest {
     Subtitle(Uuid, Uuid),
     ComicPage(Uuid),
     /// 远端流代理（V2-B 实战批次）：grant UUID + 上游目标（空 = 初始 manifest）。
-    Stream(Uuid, String),
+    Stream(Uuid, String, String),
     /// 受控图片资源：image_proxy 注册的 opaque id + 只允许的列表变体。
     Artwork {
         id: String,
@@ -766,7 +766,7 @@ pub(crate) fn register_resource_protocol<R: tauri::Runtime>(
                                 origin.as_deref(),
                             ))
                         }
-                        ResourceRequest::Stream(grant_id, target) => {
+                        ResourceRequest::Stream(grant_id, target, manifest_version) => {
                             if method == Method::HEAD {
                                 return Ok::<_, AppError>(error_response(
                                     405,
@@ -790,6 +790,7 @@ pub(crate) fn register_resource_protocol<R: tauri::Runtime>(
                                 &inner,
                                 &grant_id.to_string(),
                                 target.as_str(),
+                                manifest_version.as_str(),
                                 range.as_deref(),
                                 origin.as_deref(),
                             )) {
@@ -879,9 +880,8 @@ fn parse_request_resource(uri: &Uri) -> Result<ResourceRequest, ResourceUriError
             Some("artwork") => {
                 parse_artwork_id(uri).map(|(id, variant)| ResourceRequest::Artwork { id, variant })
             }
-            Some("stream") => {
-                parse_stream_request(uri).map(|(id, target)| ResourceRequest::Stream(id, target))
-            }
+            Some("stream") => parse_stream_request(uri)
+                .map(|(id, target, version)| ResourceRequest::Stream(id, target, version)),
             _ => Err(ResourceUriError::InvalidAuthority),
         };
     }
@@ -903,42 +903,55 @@ fn parse_request_resource(uri: &Uri) -> Result<ResourceRequest, ResourceUriError
         Some("haven-resource.artwork") => {
             parse_artwork_id(uri).map(|(id, variant)| ResourceRequest::Artwork { id, variant })
         }
-        Some("haven-resource.stream") => {
-            parse_stream_request(uri).map(|(id, target)| ResourceRequest::Stream(id, target))
-        }
+        Some("haven-resource.stream") => parse_stream_request(uri)
+            .map(|(id, target, version)| ResourceRequest::Stream(id, target, version)),
         _ => Err(ResourceUriError::InvalidAuthority),
     }
 }
 
-/// 解析流代理请求：路径为 canonical grant UUID；query 必须恰好携带一个 `u` 参数
-/// （上游目标，由 manifest 改写阶段生成），禁止 fragment。
-fn parse_stream_request(uri: &Uri) -> Result<(Uuid, String), ResourceUriError> {
+/// 解析流代理请求：初始清单无 query；清单引用必须同时携带 `u` token 和
+/// `v` manifest version，二者共同绑定一次清单改写生命周期。
+fn parse_stream_request(uri: &Uri) -> Result<(Uuid, String, String), ResourceUriError> {
     if uri.query().is_none() {
         // 无 u 参数 = 拉取初始 manifest（upstream URL 在 grant 事实中）。
         let id = parse_stream_grant_path(uri)?;
-        return Ok((id, String::new()));
+        return Ok((id, String::new(), String::new()));
     }
     let query = uri.query().unwrap_or_default();
     let mut pairs = query.split('&');
-    let (key, value) = pairs
+    let first = pairs
         .next()
         .and_then(|pair| pair.split_once('='))
         .ok_or(ResourceUriError::InvalidPath)?;
-    if key != "u" || pairs.next().is_some() || value.is_empty() {
+    let second = pairs
+        .next()
+        .and_then(|pair| pair.split_once('='))
+        .ok_or(ResourceUriError::InvalidPath)?;
+    if first.0 != "u"
+        || second.0 != "v"
+        || pairs.next().is_some()
+        || first.1.is_empty()
+        || second.1.is_empty()
+    {
         return Err(ResourceUriError::InvalidPath);
     }
     // Manifest rewrites carry only UUID tokens. Reject percent-encoded values
     // (in particular a URL) and require the canonical UUID representation.
-    if value.contains('%')
-        || Uuid::parse_str(value).is_err()
-        || Uuid::parse_str(value)
+    if first.1.contains('%')
+        || second.1.contains('%')
+        || Uuid::parse_str(first.1).is_err()
+        || Uuid::parse_str(first.1)
             .ok()
-            .is_some_and(|id| id.to_string() != value)
+            .is_some_and(|id| id.to_string() != first.1)
+        || Uuid::parse_str(second.1).is_err()
+        || Uuid::parse_str(second.1)
+            .ok()
+            .is_some_and(|id| id.to_string() != second.1)
     {
         return Err(ResourceUriError::InvalidPath);
     }
     let id = parse_stream_grant_path_without_query(uri)?;
-    Ok((id, value.to_owned()))
+    Ok((id, first.1.to_owned(), second.1.to_owned()))
 }
 
 fn parse_stream_grant_path(uri: &Uri) -> Result<Uuid, ResourceUriError> {
@@ -1035,6 +1048,17 @@ fn response_for_open_file_with_origin(
         Ok(range) => range,
         Err(_) => return error_response(416, true, Some(format!("bytes */{total}")), origin),
     };
+    let range = range.map(|mut range| {
+        if range_header.is_some_and(|header| header.trim_end().ends_with('-'))
+            && range.len() > MAX_RESPONSE_BYTES
+        {
+            range.end = range
+                .start
+                .saturating_add(MAX_RESPONSE_BYTES.saturating_sub(1))
+                .min(total.saturating_sub(1));
+        }
+        range
+    });
     let (status, start, content_length) = match range {
         Some(range) => (206, range.start, range.len()),
         None => (200, 0, total),
@@ -1358,28 +1382,24 @@ fn absolutize(base_url: &str, target: &str) -> Option<String> {
 }
 
 /// 改写 HLS manifest：所有片段/子清单 URI 与 URI="..." 属性都收敛到本会话代理。
-/// 返回改写后的文本与需要学习的主机列表。
+/// 注册回调只构造请求私有候选；调用方在完整改写后原子提交。
 fn rewrite_hls_manifest(
     body: &str,
     manifest_base: &str,
     grant_id: &str,
+    manifest_version: &str,
     register_target: &mut dyn FnMut(&str) -> String,
-) -> (String, Vec<String>) {
-    let mut hosts: Vec<String> = Vec::new();
+) -> Option<String> {
     let mut proxy_for = |raw: &str| -> Option<String> {
         let raw = raw.trim();
         if raw.is_empty() {
             return None;
         }
         let absolute = absolutize(manifest_base, raw)?;
-        let host = crate::stream_registry::host_of(&absolute)?;
-        if !hosts.contains(&host) {
-            hosts.push(host);
-        }
         let token = register_target(&absolute);
         Some(format!(
-            "http://haven-resource.stream/{grant_id}?u={}",
-            percent_encode(&token)
+            "http://haven-resource.stream/{grant_id}?u={}&v={manifest_version}",
+            percent_encode(&token),
         ))
     };
     let mut rewritten = String::with_capacity(body.len());
@@ -1405,7 +1425,7 @@ fn rewrite_hls_manifest(
             rewritten.push('\n');
         }
     }
-    (rewritten, hosts)
+    Some(rewritten)
 }
 
 fn rewrite_hls_uri_attributes(
@@ -1433,6 +1453,7 @@ async fn serve_stream(
     inner: &Arc<StreamGrantInner>,
     grant_id: &str,
     target_encoded: &str,
+    manifest_version: &str,
     range_header: Option<&str>,
     origin: Option<&str>,
 ) -> Result<Response<Vec<u8>>, AppError> {
@@ -1440,6 +1461,7 @@ async fn serve_stream(
         inner,
         grant_id,
         target_encoded,
+        manifest_version,
         range_header,
         origin,
         StreamResolution::System,
@@ -1451,6 +1473,7 @@ async fn serve_stream_with_resolution(
     inner: &Arc<StreamGrantInner>,
     grant_id: &str,
     target_encoded: &str,
+    manifest_version: &str,
     range_header: Option<&str>,
     origin: Option<&str>,
     resolution: StreamResolution,
@@ -1459,7 +1482,7 @@ async fn serve_stream_with_resolution(
         inner.facts.upstream_url.clone()
     } else {
         inner
-            .resolve_target(target_encoded)
+            .resolve_target(manifest_version, target_encoded)
             .ok_or_else(|| policy_denied("流目标令牌已失效"))?
     };
     // Reject malformed/multi-range requests before contacting the upstream.
@@ -1468,15 +1491,25 @@ async fn serve_stream_with_resolution(
     if range_header.is_some() && parse_remote_byte_range(range_header).is_err() {
         return Err(invalid_remote_range());
     }
+    let requested_range =
+        range_header.and_then(|header| parse_remote_byte_range(Some(header)).ok().flatten());
+    let bounded_range_header = requested_range.and_then(|range| {
+        range.end.is_none().then(|| {
+            let end = range
+                .start
+                .saturating_add(MAX_STREAM_BYTES.saturating_sub(1));
+            format!("bytes={}-{}", range.start, end)
+        })
+    });
+    let upstream_range_header = bounded_range_header.as_deref().or(range_header);
     let (response, upstream) =
-        fetch_stream_response(inner, upstream, range_header, resolution).await?;
+        fetch_stream_response(inner, upstream, upstream_range_header, resolution).await?;
 
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let upstream_total = response.content_length();
     let is_manifest = (target_encoded.is_empty() && inner.facts.is_hls)
         || is_hls_manifest_mime(content_type.as_deref())
         || is_hls_manifest_url(&upstream);
@@ -1487,10 +1520,31 @@ async fn serve_stream_with_resolution(
             return Err(resource_unavailable());
         }
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        let mut register_target = |target: &str| inner.register_target(target);
-        let (rewritten, learned) =
-            rewrite_hls_manifest(&text, &upstream, grant_id, &mut register_target);
-        inner.learn_hosts(learned);
+        let manifest_version = Uuid::new_v4().to_string();
+        let mut candidates = Vec::new();
+        let mut tokens_by_target: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut register_target = |target: &str| {
+            if let Some(token) = tokens_by_target.get(target) {
+                return token.clone();
+            }
+            let token = Uuid::new_v4().to_string();
+            tokens_by_target.insert(target.to_owned(), token.clone());
+            candidates.push((token.clone(), target.to_owned()));
+            token
+        };
+        let Some(rewritten) = rewrite_hls_manifest(
+            &text,
+            &upstream,
+            grant_id,
+            &manifest_version,
+            &mut register_target,
+        ) else {
+            return Err(resource_unavailable());
+        };
+        if !inner.commit_manifest(&upstream, &manifest_version, &candidates) {
+            return Err(resource_unavailable());
+        }
         let mut headers = vec![
             ("Content-Length", rewritten.len().to_string()),
             ("Content-Type", "application/vnd.apple.mpegurl".to_owned()),
@@ -1518,17 +1572,13 @@ async fn serve_stream_with_resolution(
                 .split(',')
                 .any(|part| part.trim().eq_ignore_ascii_case("bytes"))
         });
-    let requested_range =
-        range_header.and_then(|header| parse_remote_byte_range(Some(header)).ok().flatten());
-    validate_direct_stream_headers(
+    validate_direct_stream_headers_with_hls(
         upstream_status,
         content_type.as_deref(),
         requested_range,
         upstream_content_range,
+        inner.facts.is_hls,
     )?;
-    if upstream_total.is_some_and(|total| total > MAX_STREAM_BYTES) {
-        return Err(resource_unavailable());
-    }
     let bytes = read_stream_body_bounded(response, MAX_STREAM_BYTES).await?;
     if bytes.is_empty() {
         return Err(resource_unavailable());
@@ -1605,7 +1655,10 @@ fn canonical_direct_stream_mime(value: Option<&str>) -> String {
     let Some(base) = base else {
         return "video/mp4".to_owned();
     };
-    if base.eq_ignore_ascii_case("application/octet-stream") {
+    if base.eq_ignore_ascii_case("application/octet-stream")
+        || is_audio_mime_base(base)
+        || base.eq_ignore_ascii_case("text/vtt")
+    {
         return "application/octet-stream".to_owned();
     }
     if is_video_mime_base(base) {
@@ -1625,11 +1678,28 @@ fn is_video_mime_base(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"!#$&^_.+-".contains(&byte))
 }
 
+#[cfg(test)]
 fn validate_direct_stream_headers(
     status: u16,
     content_type: Option<&str>,
     requested_range: Option<RemoteByteRange>,
     content_range: Option<StreamContentRange>,
+) -> Result<(), AppError> {
+    validate_direct_stream_headers_with_hls(
+        status,
+        content_type,
+        requested_range,
+        content_range,
+        false,
+    )
+}
+
+fn validate_direct_stream_headers_with_hls(
+    status: u16,
+    content_type: Option<&str>,
+    requested_range: Option<RemoteByteRange>,
+    content_range: Option<StreamContentRange>,
+    allow_hls_media: bool,
 ) -> Result<(), AppError> {
     let mime_is_empty = content_type
         .map(|value| {
@@ -1641,23 +1711,23 @@ fn validate_direct_stream_headers(
                 .is_empty()
         })
         .unwrap_or(true);
-    let mime_is_video = content_type
+    let mime_base = content_type
         .and_then(|value| value.split(';').next())
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_some_and(|value| {
-            is_video_mime_base(value) || value.eq_ignore_ascii_case("application/octet-stream")
-        });
-    if !mime_is_empty && !mime_is_video {
+        .filter(|value| !value.is_empty());
+    let mime_is_video = mime_base.is_some_and(|value| {
+        is_video_mime_base(value) || value.eq_ignore_ascii_case("application/octet-stream")
+    });
+    let mime_is_hls_media = mime_base
+        .is_some_and(|value| is_audio_mime_base(value) || value.eq_ignore_ascii_case("text/vtt"));
+    if !(mime_is_empty || mime_is_video || (allow_hls_media && mime_is_hls_media)) {
         return Err(resource_unavailable());
     }
 
     match (status, requested_range, content_range) {
         (200, None, None) => Ok(()),
         (206, Some(requested), Some(actual)) => {
-            if actual.total > MAX_STREAM_BYTES
-                || actual.start != requested.start
-                || requested.end.is_some_and(|end| actual.end != end)
+            if actual.start != requested.start || requested.end.is_some_and(|end| actual.end != end)
             {
                 return Err(resource_unavailable());
             }
@@ -1667,6 +1737,17 @@ fn validate_direct_stream_headers(
         // partial response without a requested range is equally ambiguous.
         _ => Err(resource_unavailable()),
     }
+}
+
+fn is_audio_mime_base(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let Some(subtype) = lower.strip_prefix("audio/") else {
+        return false;
+    };
+    !subtype.is_empty()
+        && subtype
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$&^_.+-".contains(&byte))
 }
 
 fn validate_direct_stream_body_len(
@@ -1965,17 +2046,20 @@ mod tests {
     fn hls_manifest_rewrites_segments_and_uri_attrs_to_proxy() {
         let manifest = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MAP:URI=\"init.mp4\"\nseg0.ts\nhttps://other-cdn.example.net/abs.ts\n";
         let mut targets = std::collections::HashMap::new();
+        let manifest_version = Uuid::new_v4().to_string();
         let mut register_target = |target: &str| {
             let token = Uuid::new_v4().to_string();
             targets.insert(token.clone(), target.to_owned());
             token
         };
-        let (rewritten, hosts) = rewrite_hls_manifest(
+        let rewritten = rewrite_hls_manifest(
             manifest,
             "https://cdn.example.com/a/index.m3u8",
             "00000000-0000-0000-0000-000000000001",
+            &manifest_version,
             &mut register_target,
-        );
+        )
+        .expect("fixture manifest must fit target budget");
         assert!(rewritten.contains("#EXTM3U"));
         // 相对片段 → 代理 URL（u 仅携带 opaque token，不是远端 URL）。
         assert!(rewritten
@@ -1984,7 +2068,16 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("http://haven-resource.stream/"))
             .expect("改写后必须保留片段代理行");
-        let target_token = percent_decode(seg_line.split_once("?u=").unwrap().1).unwrap();
+        let target_token = percent_decode(
+            seg_line
+                .split_once("?u=")
+                .unwrap()
+                .1
+                .split_once("&v=")
+                .unwrap()
+                .0,
+        )
+        .unwrap();
         assert!(!target_token.contains("://"));
         assert_eq!(
             targets.get(&target_token).map(String::as_str),
@@ -1994,9 +2087,6 @@ mod tests {
         assert!(rewritten.contains(
             "URI=\"http://haven-resource.stream/00000000-0000-0000-0000-000000000001?u="
         ));
-        // 学习主机包含初始 CDN 与绝对地址的另一个 CDN。
-        assert!(hosts.contains(&"cdn.example.com".to_owned()));
-        assert!(hosts.contains(&"other-cdn.example.net".to_owned()));
     }
 
     #[test]
@@ -2043,22 +2133,25 @@ mod tests {
     fn stream_query_requires_single_u_param() {
         let base = format!("http://haven-resource.stream/{}", Uuid::new_v4());
         let target_token = Uuid::new_v4().to_string();
-        let with_u = format!("{base}?u={target_token}");
+        let version = Uuid::new_v4();
+        let with_u = format!("{base}?u={target_token}&v={version}");
         let parsed = with_u.parse::<Uri>().unwrap();
         // u 值是服务端注册的 opaque token；真实 URL 不进入 URI。
-        let (_, target) = parse_stream_request(&parsed).unwrap();
+        let (_, target, parsed_version) = parse_stream_request(&parsed).unwrap();
         assert_eq!(target, target_token);
+        assert_eq!(parsed_version, version.to_string());
 
         let raw_url = format!("{base}?u=https%3A%2F%2Fcdn.example.com%2Fa.ts");
         let parsed = raw_url.parse::<Uri>().unwrap();
         assert!(parse_stream_request(&parsed).is_err());
 
         let no_query = base.parse::<Uri>().unwrap();
-        let (id, empty) = parse_stream_request(&no_query).unwrap();
+        let (id, empty, version) = parse_stream_request(&no_query).unwrap();
         assert!(empty.is_empty());
+        assert!(version.is_empty());
         assert_eq!(
             parse_request_resource(&no_query).unwrap(),
-            ResourceRequest::Stream(id, String::new())
+            ResourceRequest::Stream(id, String::new(), String::new())
         );
 
         let extra = format!("{base}?u=a&b=c").parse::<Uri>().unwrap();
@@ -2469,6 +2562,7 @@ mod tests {
             &inner,
             &grant.to_string(),
             "",
+            "",
             Some("bytes=0-2"),
             None,
             StreamResolution::Fixture(address),
@@ -2490,6 +2584,7 @@ mod tests {
         let error = serve_stream_with_resolution(
             &inner,
             &grant.to_string(),
+            "",
             "",
             None,
             None,
@@ -2515,6 +2610,7 @@ mod tests {
         let response = serve_stream_with_resolution(
             &inner,
             &grant.to_string(),
+            "",
             "",
             Some("bytes=0-2"),
             None,
@@ -2604,6 +2700,31 @@ mod tests {
         assert_eq!(response.status().as_u16(), 413);
         assert!(response.body().is_empty());
         assert_eq!(response.headers().get("accept-ranges").unwrap(), "bytes");
+    }
+
+    #[test]
+    fn open_range_on_large_file_is_bounded_and_keeps_content_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.mp4");
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_RESPONSE_BYTES + 1024).unwrap();
+        let response = response_for_open_file(
+            &Method::GET,
+            File::open(&path).unwrap(),
+            &path,
+            Some("bytes=0-"),
+        );
+        assert_eq!(response.status().as_u16(), 206);
+        assert_eq!(response.body().len() as u64, MAX_RESPONSE_BYTES);
+        assert_eq!(
+            response.headers().get("content-range").unwrap(),
+            format!(
+                "bytes 0-{}/{}",
+                MAX_RESPONSE_BYTES - 1,
+                MAX_RESPONSE_BYTES + 1024
+            )
+            .as_str()
+        );
     }
 
     #[test]
