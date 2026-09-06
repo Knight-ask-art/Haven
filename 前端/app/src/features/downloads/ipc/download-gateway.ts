@@ -121,6 +121,11 @@ export async function getMediaItemDownloadInfo(
     && task.state !== "failed"
     && (task.state !== "completed" || task.offlineResourceId !== null)
   ))
+  const completedOfflineTask = tasks.find((task) => (
+    task.mediaItemId === mediaItemId
+    && task.state === "completed"
+    && task.offlineResourceId !== null
+  ))
   const offlineResource = resources.items.some((item) => (
     item.isOffline && item.availability === "offline_available"
   ))
@@ -142,7 +147,9 @@ export async function getMediaItemDownloadInfo(
     hasOfflineResource: offlineResource,
     canOnlineRead: onlineResource,
     sourceResourceId: source?.resourceId ?? null,
-    taskId: activeTask?.taskId ?? null,
+    taskId: offlineResource
+      ? completedOfflineTask?.taskId ?? null
+      : activeTask?.taskId ?? null,
   }
 }
 

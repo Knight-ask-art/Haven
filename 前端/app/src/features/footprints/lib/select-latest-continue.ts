@@ -1,15 +1,15 @@
 import type { MediaCardProps } from "@/components/ui/haven/MediaCard"
 
-export interface LatestContinueSplit {
-  hero: MediaCardProps | null
-  rest: MediaCardProps[]
+export interface LatestContinueSplit<T extends MediaCardProps = MediaCardProps> {
+  hero: T | null
+  rest: T[]
 }
 
 /**
  * 严格按 progress 0 < x < 100 筛选“最新未看完”的首项作为 Hero。
  * items 已为 progressRecent 原序（updatedAt 倒序），首个匹配即最新。
  */
-export function selectLatestUnfinished(items: MediaCardProps[]): LatestContinueSplit {
+export function selectLatestUnfinished<T extends MediaCardProps>(items: T[]): LatestContinueSplit<T> {
   const heroIndex = items.findIndex(
     (item) => item.progress !== undefined && item.progress > 0 && item.progress < 100,
   )

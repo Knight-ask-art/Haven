@@ -90,11 +90,15 @@ function toMediaCard(card: WorkCardDto): FootprintActionCard {
 }
 
 /** 拉取「我的喜爱 · 收藏」投影：真实收藏（浏览器为 localStorage 演示收藏）。 */
-export async function getFavoriteFootprintItems(): Promise<MediaCardProps[]> {
+export async function getFavoriteFootprintItems(): Promise<FootprintActionCard[]> {
   const mode = getHavenClientMode()
   if (mode === "mock") {
     return getCatalogItems(getStoredFavoriteIds()).map((item) => ({
       id: item.id,
+      workId: item.id,
+      mediaItemId: null,
+      primaryAction: null,
+      favorite: true,
       title: item.title,
       subtitle: `已收藏 · ${item.badge || "已收藏"}`,
       typeBadge: item.badge,
@@ -204,7 +208,7 @@ function historyToCard(
 
 /** 拉取「继续」分组：progress_recent 联查 WorkCard 投影（浏览器演示环境返回空，由页面兜底 mock）。
  *  去重：同一 work 仅保留最新一条（progress_recent 已按 updatedAt 倒序），避免多集同一作品刷屏。 */
-export async function getContinueFootprintItems(): Promise<MediaCardProps[]> {
+export async function getContinueFootprintItems(): Promise<FootprintActionCard[]> {
   if (getHavenClientMode() !== "tauri") return []
   const [progressItems, cards] = await Promise.all([
     getHavenClient().progressRecent({ limit: LIST_LIMIT }),
@@ -212,7 +216,7 @@ export async function getContinueFootprintItems(): Promise<MediaCardProps[]> {
   ])
   const index = buildMediaItemIndex(cards)
   const seenWork = new Set<string>()
-  const result: MediaCardProps[] = []
+  const result: FootprintActionCard[] = []
   for (const p of progressItems) {
     const card = index.get(p.mediaItemId)
     if (!card) continue

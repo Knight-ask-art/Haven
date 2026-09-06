@@ -102,7 +102,11 @@ describe("getWorkDownloadState", () => {
       }],
     }
     await expect(getMediaItemDownloadInfo("media-1", clientWith([queued], resources)))
-      .resolves.toMatchObject({ status: "downloaded", hasOfflineResource: true })
+      .resolves.toMatchObject({ status: "downloaded", hasOfflineResource: true, taskId: null })
+
+    const completed = { ...BASE_TASK, taskId: "completed-task", offlineResourceId: "offline-1" }
+    await expect(getMediaItemDownloadInfo("media-1", clientWith([queued, completed], resources)))
+      .resolves.toMatchObject({ status: "downloaded", taskId: "completed-task" })
   })
 
   it("does not report a completed task without an offline resource as downloaded", async () => {

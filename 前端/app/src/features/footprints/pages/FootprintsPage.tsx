@@ -9,13 +9,13 @@ import { ArrowRight, Bookmark, Heart, Trash2 } from "lucide-react"
 import type { MediaCardProps } from "@/components/ui/haven/MediaCard"
 import { primaryActionRoute } from "@/features/media/lib/primary-action-route"
 import { setFavorite } from "@/features/media/ipc/favorite-gateway"
-import { createDownloadForMediaItem, getMediaItemDownloadInfo, revealOfflineDownload } from "@/features/downloads/ipc/download-gateway"
+import { createDownloadForMediaItem, deleteOfflineDownload, getMediaItemDownloadInfo, revealOfflineDownload, type MediaItemDownloadInfo } from "@/features/downloads/ipc/download-gateway"
 import { getCatalogItem, getStoredMarkers, removeStoredMarker } from "@/lib/havenState"
 import { getHavenClientMode } from "@/lib/ipc/runtime"
 import { onFavoriteChanged } from "@/lib/ipc/events"
 import { HavenError, toHavenError, type HavenError as HavenErrorType } from "@/lib/ipc/errors"
 import { deriveLibrarySliceState } from "@/lib/slice-state"
-import { getFavoriteFootprintItems, getContinueFootprintItems, getRecentActivityFootprintItems, getMarkerFootprintCards, deleteFootprintMarker, resetFootprintProgress } from "../ipc/footprints-gateway"
+import { getFavoriteFootprintItems, getContinueFootprintItems, getRecentActivityFootprintItems, getMarkerFootprintCards, deleteFootprintMarker, resetFootprintProgress, type FootprintActionCard, type HistoryCardProps } from "../ipc/footprints-gateway"
 import {
   canLoadFootprintsData,
   loadDemoFootprintMarkers,
@@ -179,7 +179,7 @@ export function FootprintsPage() {
   const [activeLikesTab, setActiveLikesTab] = useState<"favorites" | "markers">("favorites")
   // IPC-MOCK-001：收藏改经 gateway 拉真实数据（Tauri=library_list 过滤 favorite）；
   // 浏览器演示环境保持既有演示目录兜底（零 localStorage 依赖差异可见化）。
-  const [favoriteItems, setFavoriteItems] = useState<MediaCardProps[]>([])
+  const [favoriteItems, setFavoriteItems] = useState<FootprintActionCard[]>([])
   const [favoritesLoading, setFavoritesLoading] = useState(productionMode)
   const [favoritesError, setFavoritesError] = useState<HavenErrorType | null>(null)
   const favoritesRequestRef = useRef(0)
@@ -198,7 +198,7 @@ export function FootprintsPage() {
   }, [])
 
   // 继续观看/阅读：progress_recent 联查 WorkCard 投影（浏览器演示环境返回空，由页面兜底 mock）。
-  const [continueItems, setContinueItems] = useState<MediaCardProps[]>([])
+  const [continueItems, setContinueItems] = useState<FootprintActionCard[]>([])
   const [continueLoading, setContinueLoading] = useState(productionMode)
   const [continueError, setContinueError] = useState<HavenErrorType | null>(null)
   const continueRequestRef = useRef(0)
@@ -217,11 +217,12 @@ export function FootprintsPage() {
   }, [])
 
   // 最近活动：history_list 联查 WorkCard 投影（浏览器演示环境返回空，由页面兜底 mock）。
-  const [recentItems, setRecentItems] = useState<MediaCardProps[]>([])
+  const [recentItems, setRecentItems] = useState<HistoryCardProps[]>([])
   const [recentLoading, setRecentLoading] = useState(productionMode)
   const [recentError, setRecentError] = useState<HavenErrorType | null>(null)
   const recentRequestRef = useRef(0)
-  const [heroDownloaded, setHeroDownloaded] = useState(false)
+  const [heroDownloadInfo, setHeroDownloadInfo] = useState<MediaItemDownloadInfo | null>(null)
+  const [heroActionPending, setHeroActionPending] = useState(false)
   const loadRecent = useCallback(async () => {
     const requestId = ++recentRequestRef.current
     setRecentLoading(true)
@@ -319,31 +320,16 @@ export function FootprintsPage() {
   }, [loadMarkers, productionMode])
 
   // 继续/最近：Tauri 环境用真实 IPC 结果；浏览器演示环境保持既有 mock 兜底。
-  const continueDisplay = useMemo(
-    () =>
-      productionMode
-        ? continueItems.map((item) => {
-            const action = (item as MediaCardProps & { primaryAction?: import("@/lib/ipc/generated/wire").PrimaryActionDto | null }).primaryAction
-            const target = primaryActionRoute(action)
-            return target ? { ...item, onClick: () => navigate(target) } : item
-          })
-        : demoMode
-          ? isEmptyState
-            ? []
-            : mockContinueShelf.map((item) => ({ ...item, onClick: () => navigate(`/player/${item.id}`) }))
-          : [],
-    [continueItems, demoMode, isEmptyState, navigate, productionMode],
-  )
-  const recentDisplay = useMemo(
-    () => (productionMode
-      ? recentItems.map((item) => {
-          const action = (item as MediaCardProps & { primaryAction?: import("@/lib/ipc/generated/wire").PrimaryActionDto | null }).primaryAction
-          const target = primaryActionRoute(action)
-          return target ? { ...item, onClick: () => navigate(target) } : item
-        })
-      : demoMode ? (isEmptyState ? [] : mockRecentActivity) : []),
-    [demoMode, isEmptyState, navigate, productionMode, recentItems],
-  )
+  const continueDisplay = productionMode
+    ? continueItems.map((item) => ({ ...item, onClick: () => void openFootprintAction(item) }))
+    : demoMode
+      ? isEmptyState
+        ? []
+        : mockContinueShelf.map((item) => ({ ...item, onClick: () => navigate(`/player/${item.id}`) }))
+      : []
+  const recentDisplay = productionMode
+    ? recentItems.map((item) => ({ ...item, onClick: () => void openFootprintAction(item) }))
+    : demoMode ? (isEmptyState ? [] : mockRecentActivity) : []
   // 生产：最新未看完的置顶为 Hero（严格 0<progress<100），剩下的按时间依次排序；Demo 保持既有沙丘2 Hero 不动
   const productionHeroSplit = useMemo(
     () =>
@@ -362,30 +348,30 @@ export function FootprintsPage() {
     ].filter(Boolean) as string[]
     return {
       id: productionHero.id,
-      workId: (productionHero as { workId?: string }).workId ?? productionHero.id,
-      mediaItemId: (productionHero as { mediaItemId?: string | null }).mediaItemId ?? null,
-      primaryAction: (productionHero as { primaryAction?: import("@/lib/ipc/generated/wire").PrimaryActionDto | null }).primaryAction ?? null,
-      isFavorite: (productionHero as MediaCardProps & { favorite?: boolean }).favorite ?? false,
+      workId: productionHero.workId,
+      mediaItemId: productionHero.mediaItemId,
+      primaryAction: productionHero.primaryAction,
+      isFavorite: productionHero.favorite,
       title: productionHero.title,
       originalTitle: undefined as string | undefined,
       metadata: metaParts.length > 0 ? metaParts.join(" · ") : (productionHero.subtitle ?? ""),
       description: productionHero.description ?? "",
       backdropUrl: productionHero.imageUrl,
       primaryActionLabel:
-        productionHero.progress !== undefined ? `继续播放 (${productionHero.progress}%)` : "继续播放",
+        `${productionHero.primaryAction?.kind === "playback" ? "继续播放" : "继续阅读"}${productionHero.progress !== undefined ? ` (${productionHero.progress}%)` : ""}`,
     }
   }, [isEmptyState, productionHero, productionMode])
   useEffect(() => {
     let cancelled = false
-    const mediaItemId = productionHero && (productionHero as MediaCardProps & { mediaItemId?: string | null }).mediaItemId
+    const mediaItemId = productionHero?.mediaItemId
     if (!productionMode || !mediaItemId) {
-      setHeroDownloaded(false)
+      setHeroDownloadInfo(null)
       return
     }
     void getMediaItemDownloadInfo(mediaItemId).then((info) => {
-      if (!cancelled) setHeroDownloaded(info.hasOfflineResource)
+      if (!cancelled) setHeroDownloadInfo(info)
     }).catch(() => {
-      if (!cancelled) setHeroDownloaded(false)
+      if (!cancelled) setHeroDownloadInfo(null)
     })
     return () => { cancelled = true }
   }, [productionHero, productionMode])
@@ -402,39 +388,71 @@ export function FootprintsPage() {
   })
   const stageData = isEmptyState ? { title: "", backdropUrl: "", metadata: "", description: "", primaryActionLabel: "", id: "" } : mockHavenStageData
 
-  const showMessage = (message: string) => {
+  function showMessage(message: string) {
     // Keep the existing page-level visual surface; action errors are rendered as a live region.
     setBatchActionMessage(message)
   }
   const [batchActionMessage, setBatchActionMessage] = useState<string | null>(null)
+  async function openFootprintAction(card: Pick<FootprintActionCard, "primaryAction" | "mediaItemId">) {
+    const target = primaryActionRoute(card.primaryAction)
+    if (!target) {
+      showMessage("当前内容暂不可打开")
+      return
+    }
+    if (card.primaryAction?.kind === "open_edition") {
+      navigate(target)
+      return
+    }
+    if (!card.mediaItemId) {
+      showMessage("当前内容缺少可用版本")
+      return
+    }
+    try {
+      const info = await getMediaItemDownloadInfo(card.mediaItemId)
+      if (info.canOnlineRead || info.hasOfflineResource) navigate(target)
+      else showMessage(info.canDownload ? "该内容需要下载后阅读" : "当前内容暂不可用")
+    } catch (error) {
+      showMessage(error instanceof HavenError ? error.dto.userMessage : "读取内容能力失败，请重试")
+    }
+  }
   const handleHeroAction = async (action: string) => {
-    if (!productionHero) return
+    if (!productionHero || heroActionPending) return
+    setHeroActionPending(true)
     try {
       if (action === "heart") {
-        const card = productionHero as MediaCardProps & { workId?: string; favorite?: boolean }
-        const favorite = !(card.favorite ?? false)
-        await setFavorite({ workId: card.workId ?? productionHero.id, favorite })
+        const favorite = !productionHero.favorite
+        await setFavorite({ workId: productionHero.workId, favorite })
         setContinueItems((items) => items.map((item) => item.id === productionHero.id ? { ...item, favorite } : item))
         await loadFavorites()
-      } else if (action === "download" && (productionHero as { mediaItemId?: string | null }).mediaItemId) {
-        const mediaItemId = (productionHero as MediaCardProps & { mediaItemId?: string | null }).mediaItemId
+      } else if (action === "download") {
+        const mediaItemId = productionHero.mediaItemId
         if (!mediaItemId) throw new Error("当前内容没有可下载的媒体版本")
         const info = await getMediaItemDownloadInfo(mediaItemId)
         if (info.hasOfflineResource && info.taskId) await revealOfflineDownload(info.taskId)
         else if (!info.hasOfflineResource) await createDownloadForMediaItem(mediaItemId)
-        setHeroDownloaded(true)
+        setHeroDownloadInfo(await getMediaItemDownloadInfo(mediaItemId))
         showMessage(info.hasOfflineResource ? "已打开本地文件夹" : "已加入下载队列")
-      } else if (action === "reset" && (productionHero as { mediaItemId?: string | null }).mediaItemId) {
-        const mediaItemId = (productionHero as MediaCardProps & { mediaItemId?: string | null }).mediaItemId
+      } else if (action === "reset") {
+        const mediaItemId = productionHero.mediaItemId
         if (!mediaItemId) throw new Error("当前内容没有可重置的媒体版本")
         await resetFootprintProgress(mediaItemId)
         await loadContinue()
         showMessage("已重置进度")
       } else if (action === "folder") {
-        showMessage("当前没有可定位的离线文件")
+        if (!heroDownloadInfo?.hasOfflineResource || !heroDownloadInfo.taskId) throw new Error("当前没有可定位的离线文件")
+        await revealOfflineDownload(heroDownloadInfo.taskId)
+        showMessage("已打开离线文件夹")
+      } else if (action === "delete") {
+        if (!heroDownloadInfo?.hasOfflineResource || !heroDownloadInfo.taskId) throw new Error("当前没有可删除的离线内容")
+        if (!window.confirm("确定删除这个作品的离线内容吗？此操作不会删除媒体库记录。")) return
+        await deleteOfflineDownload(heroDownloadInfo.taskId)
+        setHeroDownloadInfo(await getMediaItemDownloadInfo(productionHero.mediaItemId!))
+        showMessage("已删除离线内容")
       }
     } catch (error) {
       showMessage(error instanceof HavenError ? error.dto.userMessage : "操作失败，请重试")
+    } finally {
+      setHeroActionPending(false)
     }
   }
 
@@ -468,12 +486,12 @@ export function FootprintsPage() {
         <HavenStage
           {...heroStageData}
           onPrimaryAction={() => {
-            const target = primaryActionRoute(heroStageData.primaryAction)
-            if (target) navigate(target)
-            else showMessage("当前内容暂不可打开")
+            void openFootprintAction(heroStageData)
           }}
           isFavorite={heroStageData.isFavorite}
-          isDownloaded={heroDownloaded}
+          isDownloaded={heroDownloadInfo?.hasOfflineResource ?? false}
+          canManageOffline={Boolean(heroDownloadInfo?.hasOfflineResource && heroDownloadInfo.taskId)}
+          isActionPending={heroActionPending}
           onAction={(action) => void handleHeroAction(action)}
         />
       )}

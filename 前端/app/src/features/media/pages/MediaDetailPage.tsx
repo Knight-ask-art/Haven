@@ -27,12 +27,12 @@ import { primaryActionRoute } from "../lib/primary-action-route"
 import type { PrimaryActionDto } from "@/lib/ipc/generated/wire"
 import {
   createDownloadForMediaItem,
+  deleteOfflineDownload,
   getMediaItemDownloadInfo,
   revealOfflineDownload,
   type DownloadStatus,
 } from "@/features/downloads/ipc/download-gateway"
 import { resetProgress } from "@/features/progress/ipc/progress-gateway"
-import { clearArtworkCache } from "@/features/settings/ipc/privacy-gateway"
 
 export interface MediaDetailData {
   id: string
@@ -808,6 +808,9 @@ function MediaDetailExperience({ production }: { production: boolean }) {
   const [isDownloadSaving, setIsDownloadSaving] = useState(false)
   const favoriteRequestRef = useRef(0)
   const [downloadStatus, setDownloadStatus] = useState<DownloadStatus>("idle")
+  const [downloadTaskId, setDownloadTaskId] = useState<string | null>(null)
+  const [hasOfflineResource, setHasOfflineResource] = useState(false)
+  const [moreActionPending, setMoreActionPending] = useState<"folder" | "reset" | "delete" | null>(null)
   const [downloadCapability, setDownloadCapability] = useState<"loading" | "available" | "unavailable" | "error">(
     production ? "loading" : "unavailable",
   )
@@ -863,6 +866,8 @@ function MediaDetailExperience({ production }: { production: boolean }) {
     setEditionOpeningId(null)
     setIsFavoriteSaving(false)
     setDownloadStatus("idle")
+    setDownloadTaskId(null)
+    setHasOfflineResource(false)
     setDownloadCapability(production ? "loading" : "unavailable")
     setOnlineReadCapability(production ? "loading" : "available")
     setActiveTab("contents")
@@ -969,30 +974,39 @@ function MediaDetailExperience({ production }: { production: boolean }) {
     }
   }
 
-  const handleMoreAction = async (action: "folder" | "reset" | "cache") => {
+  const handleMoreAction = async (action: "folder" | "reset" | "delete") => {
+    if (moreActionPending) return
     setIsMoreMenuOpen(false)
     if (!production) {
       setToastMessage("该操作仅在桌面应用中可用")
       return
     }
+    if (action === "delete" && !window.confirm("确定删除这个作品的离线内容吗？此操作不会删除媒体库记录。")) return
+    setMoreActionPending(action)
     try {
-      if (action === "cache") {
-        await clearArtworkCache()
-        setToastMessage("已清理 Artwork 缓存")
-        return
-      }
       if (!downloadableMediaItemId) throw new Error("当前作品没有可用的媒体版本")
       if (action === "reset") {
         await resetProgress(downloadableMediaItemId)
+        setDetailRetryNonce((value) => value + 1)
         setToastMessage("已重置进度")
         return
       }
-      const info = await getMediaItemDownloadInfo(downloadableMediaItemId)
-      if (!info.taskId || !info.hasOfflineResource) throw new Error("当前作品没有可定位的离线文件")
-      await revealOfflineDownload(info.taskId)
-      setToastMessage("已打开离线文件夹")
+      if (!downloadTaskId || !hasOfflineResource) throw new Error(action === "folder" ? "当前作品没有可定位的离线文件" : "当前作品没有可删除的离线内容")
+      if (action === "folder") {
+        await revealOfflineDownload(downloadTaskId)
+        setToastMessage("已打开离线文件夹")
+      } else {
+        await deleteOfflineDownload(downloadTaskId)
+        const info = await getMediaItemDownloadInfo(downloadableMediaItemId)
+        setDownloadStatus(info.status)
+        setDownloadTaskId(info.taskId)
+        setHasOfflineResource(info.hasOfflineResource)
+        setToastMessage("已删除离线内容")
+      }
     } catch (error) {
       setToastMessage(error instanceof HavenError ? error.dto.userMessage : "操作失败，请重试")
+    } finally {
+      setMoreActionPending(null)
     }
   }
 
@@ -1129,6 +1143,8 @@ function MediaDetailExperience({ production }: { production: boolean }) {
   useEffect(() => {
     if (!production || detailState !== "data" || !downloadableMediaItemId) {
       setDownloadStatus("idle")
+      setDownloadTaskId(null)
+      setHasOfflineResource(false)
       setDownloadCapability("unavailable")
       setOnlineReadCapability(production && detailState === "data" ? "unavailable" : production ? "loading" : "available")
       return
@@ -1140,6 +1156,8 @@ function MediaDetailExperience({ production }: { production: boolean }) {
       .then((info) => {
         if (cancelled) return
         setDownloadStatus(info.status)
+        setDownloadTaskId(info.taskId)
+        setHasOfflineResource(info.hasOfflineResource)
         setDownloadCapability(
           info.canDownload || info.hasOfflineResource || info.status === "queued"
             ? "available"
@@ -1150,6 +1168,8 @@ function MediaDetailExperience({ production }: { production: boolean }) {
       .catch(() => {
         if (!cancelled) {
           setDownloadStatus("idle")
+          setDownloadTaskId(null)
+          setHasOfflineResource(false)
           setDownloadCapability("error")
           setOnlineReadCapability("error")
         }
@@ -1445,26 +1465,29 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                           "flex flex-col gap-1.5 animate-in fade-in zoom-in-95 duration-150"
                         )}>
                           <button 
+                            disabled={moreActionPending !== null || !hasOfflineResource || !downloadTaskId}
                             onClick={() => void handleMoreAction("folder")}
-                            className="flex items-center gap-3.5 px-[16px] py-3 rounded-xl text-base font-medium text-foreground hover:bg-black/5 dark:hover:bg-white/10 transition-colors text-left whitespace-nowrap"
+                            className="flex items-center gap-3.5 px-[16px] py-3 rounded-xl text-base font-medium text-foreground hover:bg-black/5 dark:hover:bg-white/10 transition-colors text-left whitespace-nowrap disabled:opacity-40"
                           >
                             <Folder className="w-5 h-5 text-muted-foreground shrink-0" />
                             在文件夹中定位
                           </button>
                           <button 
+                            disabled={moreActionPending !== null || !downloadableMediaItemId}
                             onClick={() => void handleMoreAction("reset")}
-                            className="flex items-center gap-3.5 px-[16px] py-3 rounded-xl text-base font-medium text-foreground hover:bg-black/5 dark:hover:bg-white/10 transition-colors text-left whitespace-nowrap"
+                            className="flex items-center gap-3.5 px-[16px] py-3 rounded-xl text-base font-medium text-foreground hover:bg-black/5 dark:hover:bg-white/10 transition-colors text-left whitespace-nowrap disabled:opacity-40"
                           >
                             <RotateCcw className="w-5 h-5 text-muted-foreground shrink-0" />
                             重置进度
                           </button>
                           <div className="h-px bg-black/5 dark:bg-white/10 my-1.5" />
                           <button 
-                            onClick={() => void handleMoreAction("cache")}
-                            className="flex items-center gap-3.5 px-[16px] py-3 rounded-xl text-base font-medium text-destructive hover:bg-destructive/10 transition-colors text-left whitespace-nowrap"
+                            disabled={moreActionPending !== null || !hasOfflineResource || !downloadTaskId}
+                            onClick={() => void handleMoreAction("delete")}
+                            className="flex items-center gap-3.5 px-[16px] py-3 rounded-xl text-base font-medium text-destructive hover:bg-destructive/10 transition-colors text-left whitespace-nowrap disabled:opacity-40"
                           >
                             <Trash2 className="w-5 h-5 shrink-0" />
-                            清理本地缓存
+                            删除离线内容
                           </button>
                         </div>
                       </>

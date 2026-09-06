@@ -10,7 +10,6 @@ import { isTauriRuntime } from "@/lib/ipc/runtime"
 import { onFavoriteChanged, onLibraryChanged } from "@/lib/ipc/events"
 import { toHavenError, type HavenError } from "@/lib/ipc/errors"
 import { deriveLibrarySliceState } from "@/lib/slice-state"
-import { setFavorite } from "@/features/media/ipc/favorite-gateway"
 
 export function LibraryPage() {
   const [searchParams, setSearchParams] = useSearchParams()
@@ -28,10 +27,6 @@ export function LibraryPage() {
   const loadRequestRef = useRef(0)
   // 10-foot TV UI 核心焦点：当前选中的媒体原信息展示（数据到达前为 null，隐藏 Hero 与背景图）
   const [focusedItem, setFocusedItem] = useState<LibraryMediaItemData | null>(null)
-  const [selectionMode, setSelectionMode] = useState(false)
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set())
-  const [batchSaving, setBatchSaving] = useState(false)
-  const [batchMessage, setBatchMessage] = useState<string | null>(null)
 
   const loadLibrary = useCallback(async () => {
     const requestId = ++loadRequestRef.current
@@ -137,31 +132,6 @@ export function LibraryPage() {
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current)
     hoverTimerRef.current = setTimeout(() => setFocusedItem(item), 220)
   }, [])
-  const toggleSelected = useCallback((id: string) => {
-    setSelectedIds((current) => {
-      const next = new Set(current)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      return next
-    })
-  }, [])
-  const handleBatchFavorite = async () => {
-    if (batchSaving || selectedIds.size === 0) return
-    setBatchSaving(true)
-    setBatchMessage(null)
-    const selected = libraryItems.filter((item) => selectedIds.has(item.id))
-    const results = await Promise.allSettled(selected.map((item) => setFavorite({ workId: item.id, favorite: true })))
-    const failed = results.filter((result) => result.status === "rejected").length
-    if (failed === 0) {
-      setLibraryItems((items) => items.map((item) => selectedIds.has(item.id) ? { ...item, favorite: true } : item))
-      setSelectedIds(new Set())
-      setSelectionMode(false)
-      setBatchMessage(`已收藏 ${selected.length} 项`)
-    } else {
-      setBatchMessage(`${selected.length - failed} 项已收藏，${failed} 项失败，请重试`)
-    }
-    setBatchSaving(false)
-  }
   useEffect(() => () => {
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current)
   }, [])
@@ -211,35 +181,6 @@ export function LibraryPage() {
         <div className="absolute inset-0 bg-gradient-to-t from-black via-black/60 to-transparent" />
       </div>
 
-      {/* 批量操作栏（P1） */}
-      {selectionMode && (
-        <div className="absolute top-0 inset-x-0 z-20 flex items-center justify-between bg-black/80 px-6 py-3 text-white backdrop-blur-md">
-          <span className="text-sm font-semibold">已选 {selectedIds.size} 项</span>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => {
-                setSelectedIds(new Set())
-                setSelectionMode(false)
-              }}
-              className="rounded-full bg-white/10 px-3 py-1.5 text-xs font-semibold hover:bg-white/20"
-            >
-              取消
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                void handleBatchFavorite()
-              }}
-              aria-label="批量收藏"
-              disabled={batchSaving || selectedIds.size === 0}
-              className="rounded-full bg-white px-3 py-1.5 text-xs font-bold text-black disabled:opacity-40"
-            >
-              {batchSaving ? "收藏中…" : "批量收藏"}
-            </button>
-          </div>
-        </div>
-      )}
 
       {/* 
         ====================================================
@@ -292,17 +233,6 @@ export function LibraryPage() {
           <p className="px-[32px] pt-[32px] text-sm text-white/70">媒体库中还没有内容</p>
         )}
         
-        {/* 批量入口（P1） */}
-        <div className="flex items-center justify-end gap-3 px-[32px] pt-[8px]">
-          {batchMessage && <span role="status" className="text-xs text-white/80">{batchMessage}</span>}
-          <button
-            type="button"
-            onClick={() => setSelectionMode(!selectionMode)}
-            className="rounded-full bg-white/10 px-3 py-1.5 text-xs font-semibold text-white backdrop-blur hover:bg-white/20"
-          >
-            {selectionMode ? "退出批量" : "批量操作"}
-          </button>
-        </div>
 
         {/* 顶部选中的媒体原信息展示 (Hero Info Section) */}
         {focusedItem && <LibraryTVHeroInfo item={focusedItem} />}
@@ -373,9 +303,6 @@ export function LibraryPage() {
                   viewMode="grid"
                   items={libraryItems}
                   onHoverItem={handleHoverSpotlight}
-                  selectionMode={selectionMode}
-                  selectedIds={selectedIds}
-                  onToggleSelect={toggleSelected}
                 />
               </div>
             </div>

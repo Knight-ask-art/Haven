@@ -19,7 +19,7 @@ vi.mock("@/lib/havenState", () => ({
   getStoredFavoriteIds: mocks.getStoredFavoriteIds,
 }))
 
-import { getFavoriteFootprintItems } from "./footprints-gateway"
+import { getContinueFootprintItems, getFavoriteFootprintItems } from "./footprints-gateway"
 
 function workCard(): WorkCardDto {
   return {
@@ -111,6 +111,10 @@ describe("footprints gateway runtime boundary", () => {
     await expect(getFavoriteFootprintItems()).resolves.toEqual([
       {
         id: "demo-id",
+        workId: "demo-id",
+        mediaItemId: null,
+        primaryAction: null,
+        favorite: true,
         title: "Demo 作品",
         subtitle: "已收藏 · 图书",
         typeBadge: "图书",
@@ -121,5 +125,40 @@ describe("footprints gateway runtime boundary", () => {
     expect(mocks.getStoredFavoriteIds).toHaveBeenCalledOnce()
     expect(mocks.getCatalogItems).toHaveBeenCalledWith(["demo-id"])
     expect(mocks.getHavenClient).not.toHaveBeenCalled()
+  })
+
+  it("preserves distinct work, media item, and primary action identities for continue cards", async () => {
+    mocks.getHavenClientMode.mockReturnValue("tauri")
+    const mediaItemId = "11111111-1111-4111-8111-111111111111"
+    const card = workCard()
+    card.progress = {
+      mediaItemId,
+      completion: "in_progress",
+      progressRatio: 0.4,
+      revision: "revision-1",
+      updatedAt: "2026-09-06T00:00:00Z",
+      locator: { version: 1, kind: "book", data: { publicationResource: "chapter-1", formatLocator: null, progression: 0.4, textAnchor: null } },
+    }
+    card.primaryAction = {
+      kind: "reader",
+      labelHint: "continue",
+      editionId: "22222222-2222-4222-8222-222222222222",
+      mediaItemId,
+      locator: card.progress.locator,
+    }
+    const client = {
+      libraryList: vi.fn().mockResolvedValue(page([card])),
+      progressRecent: vi.fn().mockResolvedValue([card.progress]),
+    }
+    mocks.getHavenClient.mockReturnValue(client)
+
+    const [result] = await getContinueFootprintItems()
+
+    expect(result).toEqual(expect.objectContaining({
+      id: "work-tauri",
+      workId: "work-tauri",
+      mediaItemId,
+      primaryAction: card.primaryAction,
+    }))
   })
 })
