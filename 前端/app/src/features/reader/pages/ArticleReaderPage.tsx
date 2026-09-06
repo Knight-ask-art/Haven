@@ -1,4 +1,4 @@
-import { Children, createElement, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
+import { createElement, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import type { KeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode } from "react"
 import { useNavigate, useParams } from "react-router"
 import {
@@ -58,6 +58,11 @@ import {
   findParagraphText,
   resolveArticleTextAnchor,
 } from "../lib/article-text-anchor"
+import {
+  applyArticleFallbackHighlight,
+  clearArticleFallbackHighlights,
+  createArticleTextRange,
+} from "../lib/article-highlight-dom"
 
 type ReaderTheme = "paper" | "warm" | "slate" | "dark" | "sepia" | "eyeCare" | "custom"
 type ReaderFont = "serif" | "sans" | "kai" | "heiti" | "fangsong" | "mianfei" | "custom"
@@ -267,12 +272,15 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
   const [selectionPosition, setSelectionPosition] = useState<{ x: number; y: number } | null>(null)
   const [selectionError, setSelectionError] = useState<string | null>(null)
   const [markerError, setMarkerError] = useState<string | null>(null)
-  const [markerRetryKind, setMarkerRetryKind] = useState<"highlight" | "migration" | "delete" | null>(null)
+  const [markerRetryKind, setMarkerRetryKind] = useState<"highlight" | "migration" | "delete" | "bookmark" | null>(null)
   const [failedDeleteMarker, setFailedDeleteMarker] = useState<MarkerDto | null>(null)
   const [anchorError, setAnchorError] = useState<string | null>(null)
   const [isHighlightPending, setIsHighlightPending] = useState(false)
   const [migrationRetryNonce, setMigrationRetryNonce] = useState(0)
-  const migrationAttemptRef = useRef<string | null>(null)
+  const migrationGenerationRef = useRef(0)
+  const migrationInFlightRef = useRef(new Set<string>())
+  const migrationCompletedRef = useRef(new Set<string>())
+  const migrationFailedRef = useRef(new Set<string>())
   const [aiInput, setAiInput] = useState("")
   const [aiTyping, setAiTyping] = useState(false)
   const [aiMessages, setAiMessages] = useState<Array<{ role: "user" | "assistant"; text: string }>>(() => (
@@ -365,7 +373,10 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
   // 路由复用时按媒体重新装载业务状态，避免标注或 marker ID 泄漏到另一篇文章。
   useLayoutEffect(() => {
     storageScopeRef.current = storageScope
-    migrationAttemptRef.current = null
+    migrationGenerationRef.current += 1
+    migrationInFlightRef.current.clear()
+    migrationCompletedRef.current.clear()
+    migrationFailedRef.current.clear()
     markerListRequestRef.current += 1
     bookmarkRequestRef.current += 1
     setIsBookmarked(loadDemoArticleReaderValue(
@@ -418,81 +429,85 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
     const legacyHighlights = readHighlights(storageId)
     const legacyNotes = readNotes(storageId).filter((note) => note.id !== "default-note")
     if (legacyHighlights.length === 0 && legacyNotes.length === 0) return
-    const pendingHighlights = legacyHighlights.filter((highlight) => !sessionMarkers.some((marker) => (
-      marker.markerType === "highlight"
-      && marker.locator.kind === "article"
-      && marker.locator.data.blockId === highlight.blockId
-      && (marker.excerpt === highlight.text || marker.locator.data.textAnchor?.exact === highlight.text)
-    )))
-    const pendingNotes = legacyNotes.filter((note) => !sessionMarkers.some((marker) => (
-      marker.markerType === "note"
-      && marker.locator.kind === "article"
-      && marker.locator.data.blockId === note.blockId
-      && marker.excerpt === note.text
-      && marker.note === (note.note ?? null)
-    )))
-    const migrationKey = `${storageScope}:${pendingHighlights.length}:${pendingNotes.length}:${migrationRetryNonce}`
-    if (migrationAttemptRef.current === migrationKey) return
-    migrationAttemptRef.current = migrationKey
-    if (pendingHighlights.length === 0 && pendingNotes.length === 0) {
-      try {
-        localStorage.removeItem(`haven:article-highlights:${storageId}`)
-        localStorage.removeItem(`haven:article-notes:${storageId}`)
-        localStorage.removeItem(`haven:article-bookmark:${storageId}`)
-        localStorage.removeItem(articleMarkerKey)
-        setMarkerError(null)
-        setMarkerRetryKind(null)
-      } catch {
-        setMarkerRetryKind("migration")
-        setMarkerError("旧标记已迁移，但清理本地副本失败，请稍后重试")
-      }
-      return
-    }
-    const sections = articleDocument?.sections ?? []
-    const migrations = [
-      ...pendingHighlights.map((highlight) => {
-        const paragraphText = findParagraphText(sections, highlight.blockId) ?? highlight.text
-        const textAnchor = buildArticleTextAnchor(paragraphText, highlight.text)
-        return createMarker({
-        mediaItemId,
-        locator: articleMarkerLocator(highlight.blockId, 0, textAnchor),
-        markerType: "highlight",
-        title: null,
-        excerpt: highlight.text,
+    const generation = migrationGenerationRef.current
+    const requestScope = storageScope
+    const items = [
+      ...legacyHighlights.map((highlight) => ({
+        kind: "highlight" as const,
+        key: JSON.stringify(["highlight", highlight.blockId, highlight.text, highlight.textAnchor]),
+        blockId: highlight.blockId,
+        text: highlight.text,
+        textAnchor: highlight.textAnchor,
         note: null,
-        }).then((marker) => setSessionMarkers((current) => [...current, marker]))
-      }),
-      ...pendingNotes.map((note) => {
-        const paragraphText = findParagraphText(sections, note.blockId) ?? note.text
-        const textAnchor = buildArticleTextAnchor(paragraphText, note.text)
-        return createMarker({
-        mediaItemId,
-        locator: articleMarkerLocator(note.blockId, 0, textAnchor),
-        markerType: "note",
-        title: null,
-        excerpt: note.text,
+      })),
+      ...legacyNotes.map((note) => ({
+        kind: "note" as const,
+        key: JSON.stringify(["note", note.blockId, note.text, note.note ?? null]),
+        blockId: note.blockId,
+        text: note.text,
+        textAnchor: null,
         note: note.note ?? null,
-        }).then((marker) => setSessionMarkers((current) => [...current, marker]))
-      }),
+      })),
     ]
-    void Promise.allSettled(migrations).then((results) => {
-      if (results.every((result) => result.status === "fulfilled")) {
-        try {
-          localStorage.removeItem(`haven:article-highlights:${storageId}`)
-          localStorage.removeItem(`haven:article-notes:${storageId}`)
-          localStorage.removeItem(`haven:article-bookmark:${storageId}`)
-          localStorage.removeItem(articleMarkerKey)
-          setMarkerError(null)
-          setMarkerRetryKind(null)
-        } catch {
-          setMarkerRetryKind("migration")
-          setMarkerError("旧标记已迁移，但清理本地副本失败，请稍后重试")
-        }
-      } else {
+    const markerExists = (item: (typeof items)[number]) => sessionMarkers.some((marker) => (
+      marker.markerType === item.kind
+      && marker.locator.kind === "article"
+      && marker.locator.data.blockId === item.blockId
+      && marker.excerpt === item.text
+      && (!item.textAnchor || (
+        marker.locator.data.textAnchor?.exact === item.textAnchor.exact
+        && marker.locator.data.textAnchor?.prefix === item.textAnchor.prefix
+        && marker.locator.data.textAnchor?.suffix === item.textAnchor.suffix
+      ))
+      && (item.kind !== "note" || marker.note === item.note)
+    ))
+    const completed = items.filter((item) => (
+      markerExists(item) || migrationCompletedRef.current.has(item.key)
+    ))
+    const failed = items.filter((item) => migrationFailedRef.current.has(item.key))
+    const pending = items.filter((item) => (
+      !markerExists(item)
+      && !migrationCompletedRef.current.has(item.key)
+      && !migrationInFlightRef.current.has(item.key)
+      && !migrationFailedRef.current.has(item.key)
+    ))
+    const sections = articleDocument?.sections ?? []
+    for (const item of pending) {
+      migrationInFlightRef.current.add(item.key)
+      const paragraphText = findParagraphText(sections, item.blockId) ?? item.text
+      const textAnchor = item.textAnchor ?? buildArticleTextAnchor(paragraphText, item.text)
+      void createMarker({
+        mediaItemId,
+        locator: articleMarkerLocator(item.blockId, 0, textAnchor),
+        markerType: item.kind,
+        title: null,
+        excerpt: item.text,
+        note: item.note,
+      }).then((marker) => {
+        if (migrationGenerationRef.current !== generation || storageScopeRef.current !== requestScope) return
+        migrationInFlightRef.current.delete(item.key)
+        migrationCompletedRef.current.add(item.key)
+        migrationFailedRef.current.delete(item.key)
+        setSessionMarkers((current) => [...current.filter((existing) => existing.markerId !== marker.markerId), marker])
+      }).catch(() => {
+        if (migrationGenerationRef.current !== generation || storageScopeRef.current !== requestScope) return
+        migrationInFlightRef.current.delete(item.key)
+        migrationFailedRef.current.add(item.key)
         setMarkerRetryKind("migration")
         setMarkerError("部分旧标记保存失败，原数据已保留。请点击重试")
-      }
-    })
+      })
+    }
+
+    if (pending.length > 0 || failed.length > 0 || migrationInFlightRef.current.size > 0 || completed.length !== items.length) return
+    try {
+      localStorage.removeItem(`haven:article-highlights:${storageId}`)
+      localStorage.removeItem(`haven:article-notes:${storageId}`)
+      setMarkerError(null)
+      setMarkerRetryKind(null)
+    } catch {
+      setMarkerRetryKind("migration")
+      setMarkerError("旧标记已迁移，但清理本地副本失败，请稍后重试")
+    }
   }, [articleDocument, articleMarkerKey, mediaItemId, markersLoaded, migrationRetryNonce, sessionMarkers, storageId, storageScope, tauriRuntime])
 
   useEffect(() => {
@@ -693,12 +708,17 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
           if (!requestIsCurrent()) return
           setSessionMarkers((current) => [...current.filter((item) => item.markerId !== marker.markerId), marker])
           setArticleMarkerId(marker.markerId)
+          setFailedDeleteMarker(null)
+          setMarkerError(null)
+          setMarkerRetryKind(null)
         })
         .catch(() => {
           if (!requestIsCurrent()) return
           // 创建失败：回滚书签状态，避免显示后端不存在的标记。
           setIsBookmarked(false)
           setArticleMarkerId(null)
+          setMarkerRetryKind("bookmark")
+          setMarkerError("文章书签保存失败，请重试")
         })
         .finally(() => {
           if (requestIsCurrent()) setIsBookmarkPending(false)
@@ -712,15 +732,25 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
       const removing = removingMarker.markerId
       setArticleMarkerId(null)
       setSessionMarkers((current) => current.filter((marker) => marker.markerId !== removing))
-      void deleteMarker(removing).catch(() => {
-        if (!requestIsCurrent()) return
-        // 删除失败：恢复书签状态与 markerId。
-        setSessionMarkers((current) => [...current, removingMarker])
-        setIsBookmarked(true)
-        setArticleMarkerId(removing)
-      }).finally(() => {
-        if (requestIsCurrent()) setIsBookmarkPending(false)
-      })
+      void deleteMarker(removing)
+        .then(() => {
+          if (!requestIsCurrent()) return
+          setFailedDeleteMarker(null)
+          setMarkerError(null)
+          setMarkerRetryKind(null)
+        }, () => {
+          if (!requestIsCurrent()) return
+          // 删除失败：恢复书签状态与 markerId。
+          setSessionMarkers((current) => [...current, removingMarker])
+          setIsBookmarked(true)
+          setArticleMarkerId(removing)
+          setFailedDeleteMarker(removingMarker)
+          setMarkerRetryKind("bookmark")
+          setMarkerError("取消文章书签失败，已恢复原标记，请重试")
+        })
+        .finally(() => {
+          if (requestIsCurrent()) setIsBookmarkPending(false)
+        })
       return
     }
     setIsBookmarked(true)
@@ -860,11 +890,18 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
         )
       if (!target) return
       setSessionMarkers((current) => current.filter((marker) => marker.markerId !== target.markerId))
-      void deleteMarker(target.markerId).catch(() => {
-        setSessionMarkers((current) => [...current, target])
-        setFailedDeleteMarker(target)
-        setMarkerRetryKind("delete")
-        setMarkerError("取消划线失败，已恢复原标记，请重试")
+      void deleteMarker(target.markerId).then(() => {
+        if (storageScopeRef.current !== storageScope) return
+        setFailedDeleteMarker(null)
+        setMarkerError(null)
+        setMarkerRetryKind(null)
+      }, () => {
+        if (storageScopeRef.current === storageScope) {
+          setSessionMarkers((current) => [...current, target])
+          setFailedDeleteMarker(target)
+          setMarkerRetryKind("delete")
+          setMarkerError("取消划线失败，已恢复原标记，请重试")
+        }
       })
       return
     }
@@ -917,45 +954,16 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
     }
   }
 
-  const renderHighlightedText = (text: string, blockId: string): ReactNode[] => {
-    if (articleDocument?.format !== "text") return [text]
-    const ranges = effectiveHighlights
-      .filter((highlight) => highlight.text.length > 0 && highlight.blockId === blockId)
-      .map((highlight) => ({
-        highlight,
-        range: resolveArticleTextAnchor(
-          text,
-          highlight.textAnchor ?? buildArticleTextAnchor(text, highlight.text),
-        ),
-      }))
-      .filter((value): value is { highlight: ArticleHighlight; range: { start: number; end: number } } => value.range !== null)
-      .sort((a, b) => a.range.start - b.range.start)
-    const output: ReactNode[] = []
-    let cursor = 0
-    for (const { highlight, range } of ranges) {
-      if (range.start < cursor) continue
-      output.push(text.slice(cursor, range.start))
-      output.push(
-        <mark key={highlight.markerId ?? `${blockId}-${range.start}`} onClick={() => removeHighlight(highlight)} className="cursor-pointer rounded-sm bg-amber-300/30 px-0.5 text-inherit underline decoration-amber-700/45 decoration-dotted underline-offset-4 transition-colors hover:bg-amber-300/50" title="点击取消划线">
-          {text.slice(range.start, range.end)}
-        </mark>,
-      )
-      cursor = range.end
-    }
-    output.push(text.slice(cursor))
-    return output
-  }
-
-  const renderHighlightedChildren = (children: ReactNode, blockId: string): ReactNode[] =>
-    Children.toArray(children).flatMap((child) => (
-      typeof child === "string" ? renderHighlightedText(child, blockId) : [child]
-    ))
+  // Highlights are projected after the complete block is rendered. This is
+  // important for Markdown inline elements: a selection may cross strong/em/a
+  // nodes, while its anchor is defined against the whole block text.
+  const renderArticleText = (text: string): ReactNode[] => [text]
 
   const renderSanitizedHtml = (html: string, blockId: string): ReactNode => {
     const root = new DOMParser().parseFromString(html, "text/html").body
     const allowed = new Set(["a", "article", "blockquote", "br", "code", "dd", "div", "dl", "dt", "em", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "ol", "p", "pre", "section", "strong", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul"])
     const renderNode = (node: Node, key: string, inheritedBlockId: string): ReactNode => {
-      if (node.nodeType === Node.TEXT_NODE) return renderHighlightedText(node.textContent ?? "", inheritedBlockId)
+      if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? ""
       if (node.nodeType !== Node.ELEMENT_NODE) return null
       const element = node as HTMLElement
       const tag = element.tagName.toLowerCase()
@@ -977,11 +985,15 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
     const HighlightConstructor = getHighlightConstructor()
     const article = articleRef.current
     projectedHighlightRangesRef.current = []
-    if (!registry || !HighlightConstructor || !articleDocument || articleDocument.format === "text" || !article) {
+    if (!articleDocument || !article) {
       registry?.delete("haven-article-highlight")
       return
     }
-    const ranges: Range[] = []
+    clearArticleFallbackHighlights(article)
+    if (!registry || !HighlightConstructor) {
+      registry?.delete("haven-article-highlight")
+    }
+    const resolved: Array<{ highlight: ArticleHighlight; range: Range }> = []
     for (const highlight of effectiveHighlights) {
       const block = Array.from(article.querySelectorAll<HTMLElement>("[data-article-block-id]"))
         .find((element) => element.dataset.articleBlockId === highlight.blockId)
@@ -991,15 +1003,25 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
         highlight.textAnchor ?? buildArticleTextAnchor(block.textContent ?? "", highlight.text),
       )
       if (!location) continue
-      const range = createTextRange(block, location.start, location.end)
-      if (!range) continue
-      ranges.push(range)
-      projectedHighlightRangesRef.current.push({ highlight, range })
+      const range = createArticleTextRange(block, location.start, location.end)
+      if (range) resolved.push({ highlight, range })
     }
-    if (ranges.length > 0) registry.set("haven-article-highlight", new HighlightConstructor(...ranges))
-    else registry.delete("haven-article-highlight")
+    projectedHighlightRangesRef.current = resolved
+    if (registry && HighlightConstructor) {
+      if (resolved.length > 0) registry.set("haven-article-highlight", new HighlightConstructor(...resolved.map(({ range }) => range)))
+      else registry.delete("haven-article-highlight")
+    } else {
+      // Work from the end of each block so splitting a text node cannot shift
+      // the offsets of an earlier marker in the same block.
+      [...resolved]
+        .sort((a, b) => b.range.compareBoundaryPoints(Range.START_TO_START, a.range))
+        .forEach(({ highlight, range }) => {
+          if (highlight.markerId) applyArticleFallbackHighlight(range, highlight.markerId)
+        })
+    }
     return () => {
-      registry.delete("haven-article-highlight")
+      registry?.delete("haven-article-highlight")
+      clearArticleFallbackHighlights(article)
       projectedHighlightRangesRef.current = []
     }
   }, [articleDocument, effectiveHighlights])
@@ -1025,6 +1047,12 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
 
   const handleArticleHighlightClick = (event: ReactMouseEvent<HTMLElement>) => {
     if (!window.getSelection()?.isCollapsed) return
+    const fallbackMarker = (event.target as HTMLElement).closest<HTMLElement>("mark[data-haven-marker-id]")
+    if (fallbackMarker?.dataset.havenMarkerId) {
+      const target = effectiveHighlights.find((highlight) => highlight.markerId === fallbackMarker.dataset.havenMarkerId)
+      if (target) removeHighlight(target)
+      return
+    }
     const target = projectedHighlightRangesRef.current.find(({ range }) => (
       Array.from(range.getClientRects()).some((rect) => (
         event.clientX >= rect.left && event.clientX <= rect.right
@@ -1150,17 +1178,17 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
                       {articleDocument.format === "markdown" ? (
                         <ReactMarkdown
                           components={{
-                            p: ({ children }) => <p>{renderHighlightedChildren(children, paragraph.id)}</p>,
-                            strong: ({ children }) => <strong>{renderHighlightedChildren(children, paragraph.id)}</strong>,
-                            em: ({ children }) => <em>{renderHighlightedChildren(children, paragraph.id)}</em>,
-                            a: ({ children }) => <span className="underline decoration-current/40 underline-offset-4">{renderHighlightedChildren(children, paragraph.id)}</span>,
+                            p: ({ children }) => <p>{children}</p>,
+                            strong: ({ children }) => <strong>{children}</strong>,
+                            em: ({ children }) => <em>{children}</em>,
+                            a: ({ children }) => <span className="underline decoration-current/40 underline-offset-4">{children}</span>,
                             img: () => <span className="opacity-55">[图片已隐藏]</span>,
                           }}
                         >
                           {paragraph.text}
                         </ReactMarkdown>
                       ) : (
-                        <p className="leading-[inherit]">{renderHighlightedText(paragraph.text, paragraph.id)}</p>
+                        <p className="leading-[inherit]">{renderArticleText(paragraph.text)}</p>
                       )}
                       {demoRuntime && showTranslations && paragraph.translation && (
                         <p className="mt-[16px] border-l-2 border-primary/35 pl-5 text-[0.82em] leading-[1.8] opacity-55">{paragraph.translation}</p>
@@ -1241,9 +1269,12 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
             <button type="button" onClick={() => {
               if (markerRetryKind === "highlight") addHighlight()
               else if (markerRetryKind === "migration") {
-                migrationAttemptRef.current = null
+                migrationFailedRef.current.clear()
                 setMarkerError(null)
                 setMigrationRetryNonce((value) => value + 1)
+              } else if (markerRetryKind === "bookmark") {
+                setMarkerError(null)
+                toggleArticleBookmark()
               } else if (markerRetryKind === "delete" && failedDeleteMarker) {
                 void deleteMarker(failedDeleteMarker.markerId)
                   .then(() => {
@@ -1280,40 +1311,13 @@ type CssHighlightRegistry = {
 type HighlightConstructor = new (...ranges: Range[]) => unknown
 
 function getCssHighlightRegistry(): CssHighlightRegistry | null {
+  if (typeof CSS === "undefined") return null
   const css = CSS as typeof CSS & { highlights?: CssHighlightRegistry }
   return css.highlights ?? null
 }
 
 function getHighlightConstructor(): HighlightConstructor | null {
   return (globalThis as typeof globalThis & { Highlight?: HighlightConstructor }).Highlight ?? null
-}
-
-function createTextRange(root: HTMLElement, start: number, end: number): Range | null {
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
-  let offset = 0
-  let startNode: Text | null = null
-  let endNode: Text | null = null
-  let startOffset = 0
-  let endOffset = 0
-  while (walker.nextNode()) {
-    const node = walker.currentNode as Text
-    const next = offset + node.data.length
-    if (!startNode && start >= offset && start <= next) {
-      startNode = node
-      startOffset = start - offset
-    }
-    if (end >= offset && end <= next) {
-      endNode = node
-      endOffset = end - offset
-      break
-    }
-    offset = next
-  }
-  if (!startNode || !endNode) return null
-  const range = document.createRange()
-  range.setStart(startNode, startOffset)
-  range.setEnd(endNode, endOffset)
-  return range
 }
 
 function legacyDemoBlockId(text: string): string | null {

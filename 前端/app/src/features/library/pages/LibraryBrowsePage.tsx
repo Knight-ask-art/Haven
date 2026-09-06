@@ -229,8 +229,13 @@ export function LibraryBrowsePage() {
     cursorQueryKeyRef.current = null
     seenCursorsRef.current = new Set<string>()
     let cancelled = false
-    const hadData = browseItemsRef.current.length > 0
-    setIsLoading(!hadData)
+    // A cursor belongs to the complete query key. Clear the previous result
+    // set before the new first page starts so a manual load-more can never
+    // borrow the old cursor while the new request is in flight.
+    browseItemsRef.current = []
+    setBrowseItems([])
+    const hadData = false
+    setIsLoading(true)
     setIsLoadingMore(false)
     setIsFirstPagePending(true)
     setLoadError(null)
@@ -405,14 +410,14 @@ export function LibraryBrowsePage() {
     partial: partialError !== null,
   })
 
-  const loadMore = useCallback(async () => {
+  const loadMore = useCallback(async (allowRetryAfterError = false) => {
     if (!canLoadLibraryNextPage({
       nextCursor,
       isLoadingMore,
       isFirstPagePending,
       cursorQueryKey: cursorQueryKeyRef.current,
       activeQueryKey: queryKey,
-      partialError: false,
+      partialError: allowRetryAfterError ? false : partialError !== null,
     })) return
     const generation = queryGenerationRef.current
     const requestQueryKey = queryKey
@@ -449,7 +454,7 @@ export function LibraryBrowsePage() {
         && activeQueryKeyRef.current === requestQueryKey
       ) setIsLoadingMore(false)
     }
-  }, [isFirstPagePending, isLoadingMore, listQuery, nextCursor, queryKey])
+  }, [isFirstPagePending, isLoadingMore, listQuery, nextCursor, partialError, queryKey])
 
   // Year/initial filters are projections over the typed page DTO. Consume the
   // cursor chain while such a filter is active so a match cannot be hidden on
@@ -672,7 +677,7 @@ export function LibraryBrowsePage() {
               {nextCursor && (
                 <button
                   type="button"
-                  onClick={loadMore}
+                  onClick={() => void loadMore(true)}
                   disabled={isLoadingMore}
                   className="mt-3 rounded-full border border-border px-5 py-[10px] text-xs font-bold text-foreground disabled:opacity-50"
                 >
@@ -685,7 +690,7 @@ export function LibraryBrowsePage() {
               {partialError && (
                 <div className="mt-6 flex items-center justify-between gap-4 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs">
                   <span>{partialError.message || "部分内容加载失败"}</span>
-                  <button type="button" onClick={nextCursor ? loadMore : reloadFirstPage} className="shrink-0 font-bold text-primary">
+                  <button type="button" onClick={nextCursor ? () => void loadMore(true) : reloadFirstPage} className="shrink-0 font-bold text-primary">
                     {nextCursor ? "重试继续" : "重新加载"}
                     </button>
                 </div>
@@ -702,7 +707,7 @@ export function LibraryBrowsePage() {
                   </p>
                   <button
                     type="button"
-                    onClick={loadMore}
+                    onClick={() => void loadMore(true)}
                     disabled={isLoadingMore}
                     className="rounded-full border border-border px-5 py-[10px] text-xs font-bold text-foreground disabled:opacity-50"
                   >

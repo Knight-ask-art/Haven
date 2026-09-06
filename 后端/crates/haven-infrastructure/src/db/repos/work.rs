@@ -300,7 +300,7 @@ impl WorkRepository for SqliteWorkRepository {
         // progress 唯一约束在 media_item_id 而非 work_id，一个 Work 下多个
         // MediaItem 各有进度时，裸 LEFT JOIN 会让同一作品重复出现、与
         // count_filtered（无 JOIN）的 total 错位（审查 P1-3）。
-        let (join_sql, order_by) = if has_query {
+        let (join_sql, order_by) = if has_query && matches!(order, WorkOrder::Title) {
             // FTS 排名：bm25 越小越相关，辅以 id 保证稳定排序
             (
                 "JOIN work_fts ON work_fts.rowid = w.rowid",
@@ -530,9 +530,21 @@ mod tests {
         let conn = db.lock();
         let search_title = haven_common::tokenizer::tokenize(&work.canonical_title).join(" ");
         conn.execute(
-            "INSERT INTO works (id, canonical_title, work_type, status, created_at, updated_at, search_title, search_original_title, search_body)
-             VALUES (?1, ?2, 'fiction', 'completed', ?3, ?3, ?4, '', ?4)",
-            rusqlite::params![work.id.to_string(), work.canonical_title, now, search_title],
+            "INSERT INTO works (id, canonical_title, original_title, sort_title, work_type, status,
+             release_year, rating_value, rating_scale, created_at, updated_at,
+             search_title, search_original_title, search_body)
+             VALUES (?1, ?2, ?3, ?4, 'fiction', 'completed', ?5, ?6, ?7, ?8, ?8, ?9, '', ?9)",
+            rusqlite::params![
+                work.id.to_string(),
+                work.canonical_title,
+                work.original_title,
+                work.sort_title,
+                work.release_year,
+                work.rating_value,
+                work.rating_scale,
+                work.created_at.0,
+                search_title,
+            ],
         )
         .unwrap();
         conn.execute(
@@ -757,6 +769,54 @@ mod tests {
         }
         assert_eq!(seen.len(), 5, "两页一页地翻完必须覆盖全部 5 条");
         assert!(pages >= 3, "limit=2 至少需要 3 页，实际 {pages}");
+    }
+
+    #[tokio::test]
+    async fn explicit_query_sorting_is_preserved_across_pages() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repo = SqliteWorkRepository::new(db.clone());
+        for (title, rating, year, created) in [
+            ("目标低分", Some(6.0), Some(2024), 1_000),
+            ("目标高分", Some(9.0), Some(2022), 2_000),
+            ("目标中分", Some(7.0), Some(2026), 3_000),
+        ] {
+            let mut work = sample_work();
+            work.id = WorkId::new();
+            work.canonical_title = title.into();
+            work.sort_title = Some(title.into());
+            work.rating_value = rating;
+            work.rating_scale = Some(10.0);
+            work.release_year = year;
+            work.created_at = haven_common::UtcMillis(created);
+            seed_with_media(&db, &work, MediaType::Movie);
+        }
+
+        for (order, expected) in [
+            (WorkOrder::Rating, vec!["目标高分", "目标中分", "目标低分"]),
+            (
+                WorkOrder::ReleaseDate,
+                vec!["目标中分", "目标低分", "目标高分"],
+            ),
+            (
+                WorkOrder::RecentlyAdded,
+                vec!["目标中分", "目标高分", "目标低分"],
+            ),
+        ] {
+            let first = repo
+                .list_filtered(order, None, None, Some("目标"), 2, 0)
+                .await
+                .unwrap();
+            let second = repo
+                .list_filtered(order, None, None, Some("目标"), 2, 2)
+                .await
+                .unwrap();
+            let titles = first
+                .into_iter()
+                .chain(second.into_iter())
+                .map(|work| work.canonical_title)
+                .collect::<Vec<_>>();
+            assert_eq!(titles, expected, "query sort must remain {:?}", order);
+        }
     }
 
     #[tokio::test]

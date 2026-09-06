@@ -144,6 +144,16 @@ impl StreamGrantInner {
             .filter(|entry| entry.version == manifest_version)
             .map(|entry| entry.target.clone())
     }
+
+    #[cfg(test)]
+    pub(crate) fn manifest_version_count(&self, manifest_key: &str) -> usize {
+        self.stream_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .manifest_versions
+            .get(manifest_key)
+            .map_or(0, VecDeque::len)
+    }
 }
 
 /// 流授权注册表。容量上限淘汰最旧，防无界增长。
@@ -315,16 +325,51 @@ pub(crate) fn host_of(url: &str) -> Option<String> {
 }
 
 /// Signed query parameters and fragments identify a fetch authorization, not
-/// a different logical HLS playlist. Redirects may change those parameters on
-/// every refresh, so use the stable HTTP URL components as the manifest slot.
+/// a different logical HLS playlist. Keep query parameters with playlist
+/// semantics (language, rendition, variant, etc.) in the identity; only the
+/// known authorization parameters are volatile across refreshes.
 pub(crate) fn manifest_identity(url: &str) -> Option<String> {
     let mut parsed = reqwest::Url::parse(url).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
         return None;
     }
+    let retained = parsed
+        .query_pairs()
+        .filter(|(key, _)| !is_volatile_manifest_query_key(key))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
     parsed.set_query(None);
+    if !retained.is_empty() {
+        let mut query = parsed.query_pairs_mut();
+        for (key, value) in retained {
+            query.append_pair(&key, &value);
+        }
+    }
     parsed.set_fragment(None);
     Some(parsed.to_string())
+}
+
+fn is_volatile_manifest_query_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "sig"
+            | "signature"
+            | "expires"
+            | "expire"
+            | "exp"
+            | "token"
+            | "access_token"
+            | "auth"
+            | "hmac"
+            | "md5"
+            | "hdnts"
+            | "st"
+            | "et"
+            | "e"
+            | "__token"
+    ) || lower.starts_with("x-amz-")
+        || lower.starts_with("x-goog-")
 }
 
 #[cfg(test)]
@@ -464,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_identity_ignores_rotating_signature_and_fragment() {
+    fn manifest_identity_ignores_rotating_signature_but_keeps_playlist_semantics() {
         assert_eq!(
             manifest_identity("https://cdn.example.com/live/index.m3u8?sig=one&expires=1#x"),
             Some("https://cdn.example.com/live/index.m3u8".into())
@@ -472,6 +517,18 @@ mod tests {
         assert_eq!(
             manifest_identity("https://cdn.example.com/live/index.m3u8?sig=two&expires=2"),
             manifest_identity("https://cdn.example.com/live/index.m3u8?sig=one&expires=1")
+        );
+        assert_ne!(
+            manifest_identity("https://cdn.example.com/live/index.m3u8?audio=1&sig=one"),
+            manifest_identity("https://cdn.example.com/live/index.m3u8?audio=2&sig=two")
+        );
+        assert_eq!(
+            manifest_identity(
+                "https://cdn.example.com/live/index.m3u8?lang=zh&variant=mobile&sig=one"
+            ),
+            manifest_identity(
+                "https://cdn.example.com/live/index.m3u8?lang=zh&variant=mobile&sig=two"
+            )
         );
     }
 
@@ -566,7 +623,10 @@ mod tests {
     }
 
     #[test]
-    fn failed_manifest_commit_does_not_damage_another_manifest() {
+    fn controlled_concurrent_failed_commit_does_not_damage_successful_manifest() {
+        use std::sync::{mpsc, Barrier};
+        use std::thread;
+
         let registry = StreamRegistry::new();
         let grant = registry
             .register(
@@ -586,23 +646,44 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(inner.commit_manifest("base", "v1", &existing));
 
+        let start = Arc::new(Barrier::new(2));
+        let (committed, wait_for_failure) = mpsc::channel();
+        let (release_failure, failure_release_rx) = mpsc::channel();
         let successful_token = "successful-token".to_owned();
-        assert!(inner.commit_manifest(
-            "video",
-            "v1",
-            &[(
-                successful_token.clone(),
-                "https://video.example.net/segment.ts".into()
-            )],
-        ));
-        assert!(!inner.commit_manifest(
-            "audio",
-            "v1",
-            &[(
-                "overflow".into(),
-                "https://audio.example.net/segment.aac".into()
-            )],
-        ));
+        let success_token_for_thread = successful_token.clone();
+        let success_inner = Arc::clone(&inner);
+        let success_start = Arc::clone(&start);
+        let success_thread = thread::spawn(move || {
+            success_start.wait();
+            let result = success_inner.commit_manifest(
+                "video",
+                "v1",
+                &[(
+                    success_token_for_thread,
+                    "https://video.example.net/segment.ts".into(),
+                )],
+            );
+            committed.send(result).unwrap();
+            result
+        });
+        let failure_inner = Arc::clone(&inner);
+        let failure_start = Arc::clone(&start);
+        let failure_thread = thread::spawn(move || {
+            failure_start.wait();
+            wait_for_failure.recv().unwrap();
+            failure_release_rx.recv().unwrap();
+            failure_inner.commit_manifest(
+                "audio",
+                "v1",
+                &[(
+                    "overflow".into(),
+                    "https://audio.example.net/segment.aac".into(),
+                )],
+            )
+        });
+        assert!(success_thread.join().unwrap());
+        release_failure.send(()).unwrap();
+        assert!(!failure_thread.join().unwrap());
         assert!(inner.resolve_target("v1", &successful_token).is_some());
         assert!(inner.host_allowed("video.example.net"));
         assert!(!inner.host_allowed("audio.example.net"));

@@ -28,4 +28,27 @@ describe("article-content HTML block projection", () => {
     expect(projected.map((element) => element.getAttribute("data-article-block-id")))
       .toEqual(paragraphs.map((paragraph) => paragraph.id))
   })
+
+  it("keeps every paragraph when HTML has no heading and ignores nested block wrappers", () => {
+    const document = parseArticleContent(`
+      <article>
+        <p>第一段</p>
+        <ul><li><p>列表段落</p></li><li>列表文本</li></ul>
+        <table><tbody><tr><td><p>单元格段落</p></td><th>表头</th></tr></tbody></table>
+        <blockquote>引用</blockquote>
+        <p>最后一段</p>
+      </article>
+    `, "text/html")
+
+    expect(document?.title).toBe("文章")
+    const paragraphs = document?.sections.flatMap((section) => section.paragraphs) ?? []
+    expect(paragraphs.map((paragraph) => paragraph.text)).toEqual([
+      "第一段", "列表段落", "列表文本", "单元格段落", "表头", "引用", "最后一段",
+    ])
+    const root = new DOMParser().parseFromString(document?.sanitizedHtml ?? "", "text/html")
+    const projected = Array.from(root.querySelectorAll("p,blockquote,li,th,td"))
+      .filter((element) => element.hasAttribute("data-article-block-id"))
+    expect(projected.map((element) => element.textContent?.trim())).toEqual(paragraphs.map((paragraph) => paragraph.text))
+    expect(projected).toHaveLength(paragraphs.length)
+  })
 })

@@ -1381,6 +1381,21 @@ fn absolutize(base_url: &str, target: &str) -> Option<String> {
         .map(|safe| safe.as_str().to_owned())
 }
 
+#[cfg(test)]
+fn absolutize_fixture(base_url: &str, target: &str) -> Option<String> {
+    let base = reqwest::Url::parse(base_url).ok()?;
+    let joined = base.join(target).ok()?;
+    if !matches!(joined.scheme(), "http" | "https")
+        || joined.host_str().is_none()
+        || !joined.username().is_empty()
+        || joined.password().is_some()
+        || joined.fragment().is_some()
+    {
+        return None;
+    }
+    Some(joined.to_string())
+}
+
 /// 改写 HLS manifest：所有片段/子清单 URI 与 URI="..." 属性都收敛到本会话代理。
 /// 注册回调只构造请求私有候选；调用方在完整改写后原子提交。
 fn rewrite_hls_manifest(
@@ -1866,7 +1881,11 @@ async fn fetch_stream_response(
                     true,
                 ));
             };
-            let Some(next) = absolutize(&target.url, location) else {
+            let Some(next) = (match resolution {
+                StreamResolution::System => absolutize(&target.url, location),
+                #[cfg(test)]
+                StreamResolution::Fixture(_) => absolutize_fixture(&target.url, location),
+            }) else {
                 return Err(policy_denied("流源跳转地址不受支持"));
             };
             upstream = next;
@@ -2542,6 +2561,47 @@ mod tests {
         )
     }
 
+    fn spawn_manifest_redirect_fixture() -> (String, std::net::SocketAddr) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let manifest = b"#EXTM3U\n#EXTINF:1,\nsegment.ts\n".to_vec();
+        let redirect = b"HTTP/1.1 302 Found\r\nLocation: /redirected/live/index.m3u8?sig=two&expires=2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        let success = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            manifest.len()
+        )
+        .into_bytes();
+        std::thread::spawn(move || {
+            for response in [redirect, [success, manifest].concat()] {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(&response);
+            }
+        });
+        (
+            format!(
+                "http://stream.example.test:{}/live/index.m3u8?sig=one&expires=1",
+                address.port()
+            ),
+            address,
+        )
+    }
+
+    fn hls_stream_facts(url: &str) -> crate::stream_registry::StreamGrantFacts {
+        crate::stream_registry::StreamGrantFacts {
+            work_id: "w".into(),
+            edition_id: "e".into(),
+            media_item_id: "m".into(),
+            mime_type: Some("application/vnd.apple.mpegurl".into()),
+            is_hls: true,
+            progress: None,
+            upstream_url: url.to_owned(),
+        }
+    }
+
     fn direct_stream_facts(url: &str) -> crate::stream_registry::StreamGrantFacts {
         crate::stream_registry::StreamGrantFacts {
             work_id: "w".into(),
@@ -2627,6 +2687,45 @@ mod tests {
         assert_eq!(
             response.headers().get("content-range").unwrap(),
             "bytes 0-2/3"
+        );
+    }
+
+    #[tokio::test]
+    async fn hls_redirect_keeps_initial_logical_manifest_identity() {
+        let (url, address) = spawn_manifest_redirect_fixture();
+        let registry = crate::stream_registry::StreamRegistry::new();
+        let grant = registry
+            .register_fixture(hls_stream_facts(&url), &url, "main")
+            .unwrap();
+        let inner = registry.lookup(&grant.to_string(), "main").unwrap();
+        let response = serve_stream_with_resolution(
+            &inner,
+            &grant.to_string(),
+            "",
+            "",
+            None,
+            None,
+            StreamResolution::Fixture(address),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status().as_u16(), 200);
+        assert!(String::from_utf8_lossy(response.body()).contains("#EXTM3U"));
+        assert_eq!(
+            inner.manifest_version_count(&manifest_identity(&url).unwrap()),
+            1,
+            "redirect 后应仍归入初始逻辑清单，而不是按最终 URL 新建清单"
+        );
+        assert_eq!(
+            inner.manifest_version_count(
+                &manifest_identity(&format!(
+                    "http://stream.example.test:{}/redirected/live/index.m3u8?sig=two&expires=2",
+                    address.port()
+                ))
+                .unwrap(),
+            ),
+            0
         );
     }
 
