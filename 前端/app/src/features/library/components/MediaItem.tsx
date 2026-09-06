@@ -21,7 +21,7 @@ export interface LibraryMediaItemData {
   description?: string
   /** 服务端收藏投影（WorkCardDto.favorite）；随导航传给详情页作初始值。 */
   favorite?: boolean
-  /** Server-selected progress target; absent means batch completion is unavailable. */
+  /** Server-selected progress target or a safe start locator derived by the gateway. */
   progressMediaItemId?: string
   progressLocator?: LocatorDto | null
 }

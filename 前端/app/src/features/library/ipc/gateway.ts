@@ -14,7 +14,7 @@ import { getHavenClient, getHavenClientMode } from "@/lib/ipc/runtime"
 
 import type { HavenClient } from "@/lib/ipc/client"
 
-import type { LibraryListRequest, PageDto, WorkCardDto } from "@/lib/ipc/generated/wire"
+import type { LibraryListRequest, LocatorDto, PageDto, WorkCardDto } from "@/lib/ipc/generated/wire"
 
 import { resolveLibraryRuntimeState } from "../lib/library-runtime-state"
 import { saveProgress } from "@/features/progress/ipc/progress-gateway"
@@ -27,6 +27,7 @@ function deriveCardType(card: WorkCardDto): string {
   const media = card.availableMediaTypes
   if (media.includes("series") || media.includes("episode")) return "tv"
   if (media.includes("movie")) return "movie"
+  if (media.includes("audio")) return "movie"
   if (media.includes("document")) return "document"
   if (media.includes("article")) return "article"
   if (media.includes("comic")) return "comic"
@@ -34,7 +35,54 @@ function deriveCardType(card: WorkCardDto): string {
   return card.categories[0] ?? "document"
 }
 
+/**
+ * A library card can have a consumable media item before it has any saved
+ * progress. These are the only locator kinds whose start position is
+ * unambiguous from the card contract. Books are intentionally excluded: a
+ * BookLocator needs the real publication resource (for example an EPUB
+ * spine item), which is not exposed by WorkCardDto.
+ */
+export function defaultCompletionLocator(card: WorkCardDto): LocatorDto | null {
+  const mediaItemId = card.primaryAction?.mediaItemId ?? card.progress?.mediaItemId
+  if (!mediaItemId) return null
+
+  const primaryKind = card.primaryAction?.kind
+  if (primaryKind === "playback") {
+    return { version: 1, kind: "video", data: { positionMs: 0 } }
+  }
+  if (primaryKind === "comic") {
+    return { version: 1, kind: "comic", data: { chapterItemId: mediaItemId, pageIndex: 0, pageProgression: null } }
+  }
+  if (primaryKind === "article") {
+    return { version: 1, kind: "article", data: { blockId: null, progression: 0, textAnchor: null } }
+  }
+  if (primaryKind === "reader" && card.availableMediaTypes.length === 1 && card.availableMediaTypes[0] === "document") {
+    return { version: 1, kind: "pdf", data: { pageIndex: 0, x: null, y: null, zoom: null, textAnchor: null } }
+  }
+
+  // Progress can exist without a current primary action. Only infer a kind
+  // when the card exposes exactly one compatible media type.
+  const mediaTypes = card.availableMediaTypes
+  if (mediaTypes.length !== 1) return null
+  switch (mediaTypes[0]) {
+    case "movie":
+    case "series":
+    case "episode":
+    case "audio":
+      return { version: 1, kind: "video", data: { positionMs: 0 } }
+    case "document":
+      return { version: 1, kind: "pdf", data: { pageIndex: 0, x: null, y: null, zoom: null, textAnchor: null } }
+    case "comic":
+      return { version: 1, kind: "comic", data: { chapterItemId: mediaItemId, pageIndex: 0, pageProgression: null } }
+    case "article":
+      return { version: 1, kind: "article", data: { blockId: null, progression: 0, textAnchor: null } }
+    default:
+      return null
+  }
+}
+
 function toMediaItemData(card: WorkCardDto): LibraryMediaItemData {
+  const progressLocator = card.primaryAction?.locator ?? card.progress?.locator ?? defaultCompletionLocator(card)
   return {
     id: card.workId,
     title: card.title,
@@ -47,7 +95,7 @@ function toMediaItemData(card: WorkCardDto): LibraryMediaItemData {
     description: card.description ?? undefined,
     favorite: card.favorite,
     progressMediaItemId: card.primaryAction?.mediaItemId ?? card.progress?.mediaItemId,
-    progressLocator: card.primaryAction?.locator ?? card.progress?.locator ?? null,
+    progressLocator,
   }
 }
 
