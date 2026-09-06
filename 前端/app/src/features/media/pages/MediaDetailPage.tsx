@@ -28,8 +28,11 @@ import type { PrimaryActionDto } from "@/lib/ipc/generated/wire"
 import {
   createDownloadForMediaItem,
   getMediaItemDownloadInfo,
+  revealOfflineDownload,
   type DownloadStatus,
 } from "@/features/downloads/ipc/download-gateway"
+import { resetProgress } from "@/features/progress/ipc/progress-gateway"
+import { clearArtworkCache } from "@/features/settings/ipc/privacy-gateway"
 
 export interface MediaDetailData {
   id: string
@@ -966,6 +969,33 @@ function MediaDetailExperience({ production }: { production: boolean }) {
     }
   }
 
+  const handleMoreAction = async (action: "folder" | "reset" | "cache") => {
+    setIsMoreMenuOpen(false)
+    if (!production) {
+      setToastMessage("该操作仅在桌面应用中可用")
+      return
+    }
+    try {
+      if (action === "cache") {
+        await clearArtworkCache()
+        setToastMessage("已清理 Artwork 缓存")
+        return
+      }
+      if (!downloadableMediaItemId) throw new Error("当前作品没有可用的媒体版本")
+      if (action === "reset") {
+        await resetProgress(downloadableMediaItemId)
+        setToastMessage("已重置进度")
+        return
+      }
+      const info = await getMediaItemDownloadInfo(downloadableMediaItemId)
+      if (!info.taskId || !info.hasOfflineResource) throw new Error("当前作品没有可定位的离线文件")
+      await revealOfflineDownload(info.taskId)
+      setToastMessage("已打开离线文件夹")
+    } catch (error) {
+      setToastMessage(error instanceof HavenError ? error.dto.userMessage : "操作失败，请重试")
+    }
+  }
+
   /**
    * Edition rows carry the server-selected action so they can still identify
    * a download-only remote resource.  They must not navigate directly to a
@@ -1415,14 +1445,14 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                           "flex flex-col gap-1.5 animate-in fade-in zoom-in-95 duration-150"
                         )}>
                           <button 
-                            onClick={() => setIsMoreMenuOpen(false)}
+                            onClick={() => void handleMoreAction("folder")}
                             className="flex items-center gap-3.5 px-[16px] py-3 rounded-xl text-base font-medium text-foreground hover:bg-black/5 dark:hover:bg-white/10 transition-colors text-left whitespace-nowrap"
                           >
                             <Folder className="w-5 h-5 text-muted-foreground shrink-0" />
                             在文件夹中定位
                           </button>
                           <button 
-                            onClick={() => setIsMoreMenuOpen(false)}
+                            onClick={() => void handleMoreAction("reset")}
                             className="flex items-center gap-3.5 px-[16px] py-3 rounded-xl text-base font-medium text-foreground hover:bg-black/5 dark:hover:bg-white/10 transition-colors text-left whitespace-nowrap"
                           >
                             <RotateCcw className="w-5 h-5 text-muted-foreground shrink-0" />
@@ -1430,7 +1460,7 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                           </button>
                           <div className="h-px bg-black/5 dark:bg-white/10 my-1.5" />
                           <button 
-                            onClick={() => setIsMoreMenuOpen(false)}
+                            onClick={() => void handleMoreAction("cache")}
                             className="flex items-center gap-3.5 px-[16px] py-3 rounded-xl text-base font-medium text-destructive hover:bg-destructive/10 transition-colors text-left whitespace-nowrap"
                           >
                             <Trash2 className="w-5 h-5 shrink-0" />

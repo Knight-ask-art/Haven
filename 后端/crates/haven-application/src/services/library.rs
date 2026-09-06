@@ -43,6 +43,7 @@ impl LibraryService {
             LibraryListSort::Title => haven_domain::contracts::WorkOrder::Title,
             LibraryListSort::LastActive => haven_domain::contracts::WorkOrder::LastActive,
             LibraryListSort::ReleaseDate => haven_domain::contracts::WorkOrder::ReleaseDate,
+            LibraryListSort::Rating => haven_domain::contracts::WorkOrder::Rating,
         };
         let category = domain_category(request.category);
         let media_types: Option<Vec<haven_domain::enums::MediaType>> = request
@@ -51,6 +52,43 @@ impl LibraryService {
         let query = request.query.filter(|q| !q.trim().is_empty());
 
         if has_query {
+            // Relevance uses FTS keyset paging. Explicit user sorting must use
+            // the same repository ordering for every page, so do not let the
+            // FTS path silently override rating/year/recent sorting.
+            if !matches!(request.sort, LibraryListSort::Title) {
+                let offset = match request.cursor.as_deref() {
+                    Some(cursor) => parse_offset(cursor)?,
+                    None => 0,
+                };
+                let works = self
+                    .ports
+                    .list_filtered(
+                        order,
+                        category,
+                        media_types.as_deref(),
+                        query.as_deref(),
+                        limit,
+                        offset,
+                    )
+                    .await?;
+                let total = self
+                    .ports
+                    .count_filtered(category, media_types.as_deref(), query.as_deref())
+                    .await?;
+                let items = self.build_cards(&works).await?;
+                let next_cursor = if u64::from(offset + items.len() as u32) < total {
+                    Some((offset + items.len() as u32).to_string())
+                } else {
+                    None
+                };
+                return Ok(PageDto {
+                    schema_version: 1,
+                    items,
+                    next_cursor,
+                    total: Some(total),
+                    revision: None,
+                });
+            }
             return self
                 .list_fts(
                     category,

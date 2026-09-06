@@ -10,6 +10,7 @@ import { isTauriRuntime } from "@/lib/ipc/runtime"
 import { onFavoriteChanged, onLibraryChanged } from "@/lib/ipc/events"
 import { toHavenError, type HavenError } from "@/lib/ipc/errors"
 import { deriveLibrarySliceState } from "@/lib/slice-state"
+import { setFavorite } from "@/features/media/ipc/favorite-gateway"
 
 export function LibraryPage() {
   const [searchParams, setSearchParams] = useSearchParams()
@@ -29,6 +30,8 @@ export function LibraryPage() {
   const [focusedItem, setFocusedItem] = useState<LibraryMediaItemData | null>(null)
   const [selectionMode, setSelectionMode] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set())
+  const [batchSaving, setBatchSaving] = useState(false)
+  const [batchMessage, setBatchMessage] = useState<string | null>(null)
 
   const loadLibrary = useCallback(async () => {
     const requestId = ++loadRequestRef.current
@@ -134,6 +137,31 @@ export function LibraryPage() {
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current)
     hoverTimerRef.current = setTimeout(() => setFocusedItem(item), 220)
   }, [])
+  const toggleSelected = useCallback((id: string) => {
+    setSelectedIds((current) => {
+      const next = new Set(current)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }, [])
+  const handleBatchFavorite = async () => {
+    if (batchSaving || selectedIds.size === 0) return
+    setBatchSaving(true)
+    setBatchMessage(null)
+    const selected = libraryItems.filter((item) => selectedIds.has(item.id))
+    const results = await Promise.allSettled(selected.map((item) => setFavorite({ workId: item.id, favorite: true })))
+    const failed = results.filter((result) => result.status === "rejected").length
+    if (failed === 0) {
+      setLibraryItems((items) => items.map((item) => selectedIds.has(item.id) ? { ...item, favorite: true } : item))
+      setSelectedIds(new Set())
+      setSelectionMode(false)
+      setBatchMessage(`已收藏 ${selected.length} 项`)
+    } else {
+      setBatchMessage(`${selected.length - failed} 项已收藏，${failed} 项失败，请重试`)
+    }
+    setBatchSaving(false)
+  }
   useEffect(() => () => {
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current)
   }, [])
@@ -200,15 +228,14 @@ export function LibraryPage() {
             </button>
             <button
               type="button"
-              disabled={selectedIds.size === 0}
               onClick={() => {
-                // 批量标记为已看（P1 占位，实际落库由后续 progress 批量接口实现）
-                setSelectedIds(new Set())
-                setSelectionMode(false)
+                void handleBatchFavorite()
               }}
+              aria-label="批量收藏"
+              disabled={batchSaving || selectedIds.size === 0}
               className="rounded-full bg-white px-3 py-1.5 text-xs font-bold text-black disabled:opacity-40"
             >
-              标记已看
+              {batchSaving ? "收藏中…" : "批量收藏"}
             </button>
           </div>
         </div>
@@ -266,7 +293,8 @@ export function LibraryPage() {
         )}
         
         {/* 批量入口（P1） */}
-        <div className="flex justify-end px-[32px] pt-[8px]">
+        <div className="flex items-center justify-end gap-3 px-[32px] pt-[8px]">
+          {batchMessage && <span role="status" className="text-xs text-white/80">{batchMessage}</span>}
           <button
             type="button"
             onClick={() => setSelectionMode(!selectionMode)}
@@ -345,6 +373,9 @@ export function LibraryPage() {
                   viewMode="grid"
                   items={libraryItems}
                   onHoverItem={handleHoverSpotlight}
+                  selectionMode={selectionMode}
+                  selectedIds={selectedIds}
+                  onToggleSelect={toggleSelected}
                 />
               </div>
             </div>

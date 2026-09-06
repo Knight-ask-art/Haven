@@ -13,6 +13,8 @@ export interface HavenStageProps {
   backdropUrl: string
   primaryActionLabel: string
   isDownloaded?: boolean
+  isFavorite?: boolean
+  onDownloadStateChange?: (downloaded: boolean) => void
   onPrimaryAction?: () => void
   onAction?: (action: string) => void
 }
@@ -26,6 +28,8 @@ export function HavenStage({
   backdropUrl,
   primaryActionLabel,
   isDownloaded = true,
+  isFavorite: favoriteProp = false,
+  onDownloadStateChange,
   onPrimaryAction,
   onAction
 }: HavenStageProps) {
@@ -33,10 +37,12 @@ export function HavenStage({
   const isEmpty = !title && !backdropUrl
   const [isMoreMenuOpen, setIsMoreMenuOpen] = useState(false)
   const [isShareModalOpen, setIsShareModalOpen] = useState(false)
-  const [isFavorite, setIsFavorite] = useState(false)
+  const [isFavorite, setIsFavorite] = useState(favoriteProp)
   const [downloadState, setDownloadState] = useState(isDownloaded)
-  const [toastMessage, setToastMessage] = useState<string | null>(null)
   const menuRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => setIsFavorite(favoriteProp), [favoriteProp])
+  useEffect(() => setDownloadState(isDownloaded), [isDownloaded])
 
   // 点击外部关闭菜单
   useEffect(() => {
@@ -56,13 +62,6 @@ export function HavenStage({
   return (
     <section className="relative w-full h-[70vh] min-h-[580px] max-h-[850px] flex items-end overflow-hidden">
       {/* 极简苹果风 Toast 提示弹窗 */}
-      {toastMessage && (
-        <div className="fixed top-[32px] left-1/2 -translate-x-1/2 z-[100] flex items-center gap-3 px-6 py-3.5 rounded-full bg-zinc-950/90 dark:bg-white/95 text-white dark:text-zinc-950 text-base font-bold shadow-2xl backdrop-blur-2xl border border-white/10 dark:border-black/10 animate-in fade-in slide-in-from-top-[16px] duration-300">
-          <Download className="w-6 h-6 text-emerald-400 dark:text-emerald-600 shrink-0" />
-          <span>{toastMessage}</span>
-        </div>
-      )}
-
       {/* 沉浸式背景图 */}
       <div className="absolute inset-0 z-0 select-none">
         <img 
@@ -142,7 +141,6 @@ export function HavenStage({
               <div className="flex items-center gap-[16px] relative" ref={menuRef}>
                 <button
                   onClick={() => {
-                    setIsFavorite(!isFavorite)
                     onAction?.('heart')
                   }}
                   title={isFavorite ? "已收藏" : "加入收藏"}
@@ -162,10 +160,8 @@ export function HavenStage({
                 <button
                   onClick={() => {
                     const next = !downloadState
-                    setDownloadState(next)
+                    onDownloadStateChange?.(next)
                     onAction?.('download')
-                    setToastMessage(next ? "已进入下载队列" : "已从下载队列中移除")
-                    setTimeout(() => setToastMessage(null), 2500)
                   }}
                   title={downloadState ? "已下载" : "下载至本地"}
                   className={cn(

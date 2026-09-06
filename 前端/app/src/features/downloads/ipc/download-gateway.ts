@@ -21,6 +21,7 @@ export interface MediaItemDownloadInfo {
   hasOfflineResource: boolean
   canOnlineRead: boolean
   sourceResourceId: string | null
+  taskId: string | null
 }
 
 export async function listDownloads(): Promise<DownloadTaskDto[]> {
@@ -141,6 +142,7 @@ export async function getMediaItemDownloadInfo(
     hasOfflineResource: offlineResource,
     canOnlineRead: onlineResource,
     sourceResourceId: source?.resourceId ?? null,
+    taskId: activeTask?.taskId ?? null,
   }
 }
 

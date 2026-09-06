@@ -67,6 +67,10 @@ describe("footprints gateway runtime boundary", () => {
     await expect(getFavoriteFootprintItems()).resolves.toEqual([
       {
         id: "work-tauri",
+        workId: "work-tauri",
+        mediaItemId: null,
+        primaryAction: null,
+        favorite: true,
         title: "真实作品",
         subtitle: "已收藏 · 图书",
         typeBadge: "图书",

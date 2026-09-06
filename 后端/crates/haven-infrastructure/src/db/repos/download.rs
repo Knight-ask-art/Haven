@@ -213,8 +213,7 @@ impl DownloadRepository for SqliteDownloadRepository {
             .prepare(&format!(
                 "SELECT {SELECT_COLUMNS} FROM download_tasks
                  WHERE source_resource_id = ?1 AND target_storage_id = ?2
-                   AND state NOT IN ('failed', 'cancelled')
-                   AND (state != 'completed' OR offline_resource_id IS NOT NULL)
+                   AND state IN ('queued', 'resolving', 'downloading', 'paused', 'verifying', 'interrupted')
                  ORDER BY created_at DESC LIMIT 1"
             ))
             .map_err(map_db_error("查询现有下载任务失败"))?;
@@ -230,6 +229,34 @@ impl DownloadRepository for SqliteDownloadRepository {
         rows.next()
             .transpose()
             .map_err(map_db_error("查询现有下载任务失败"))
+    }
+
+    async fn find_completed(
+        &self,
+        source_resource_id: ResourceId,
+        target_storage_id: StorageLocationId,
+    ) -> Result<Option<DownloadTask>, AppError> {
+        let conn = self.db.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {SELECT_COLUMNS} FROM download_tasks
+                 WHERE source_resource_id = ?1 AND target_storage_id = ?2
+                   AND state = 'completed'
+                 ORDER BY created_at DESC LIMIT 1"
+            ))
+            .map_err(map_db_error("查询已完成下载任务失败"))?;
+        let mut rows = stmt
+            .query_map(
+                rusqlite::params![
+                    source_resource_id.to_string(),
+                    target_storage_id.to_string()
+                ],
+                row_to_download_task,
+            )
+            .map_err(map_db_error("查询已完成下载任务失败"))?;
+        rows.next()
+            .transpose()
+            .map_err(map_db_error("查询已完成下载任务失败"))
     }
 
     async fn delete_terminal(&self, id: DownloadTaskId) -> Result<bool, AppError> {
@@ -652,7 +679,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_record_is_reusable_for_duplicate_requests() {
+    async fn completed_record_is_not_reused_by_active_lookup() {
         let db = Arc::new(Db::open_in_memory().unwrap());
         let repo = SqliteDownloadRepository::new(db.clone());
         let now = haven_common::UtcMillis::now();
@@ -701,12 +728,11 @@ mod tests {
         };
         repo.save(&task).await.unwrap();
 
-        let existing = repo
-            .find_active(ids.3, ids.4)
-            .await
-            .unwrap()
-            .expect("completed task should be returned for idempotent duplicate request");
-        assert_eq!(existing.id, task.id);
+        let existing = repo.find_active(ids.3, ids.4).await.unwrap();
+        assert!(
+            existing.is_none(),
+            "completed task must be checked by the application service"
+        );
     }
 
     fn seed_dependencies(

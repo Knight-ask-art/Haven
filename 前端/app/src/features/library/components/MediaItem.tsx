@@ -5,6 +5,7 @@ import { Star } from "lucide-react"
 import { ArtworkImage } from "@/components/ui/haven/ArtworkImage"
 import { defaultCoverCategoryForMediaType } from "@/lib/default-cover"
 import { getHavenClientMode } from "@/lib/ipc/runtime"
+import { Check } from "lucide-react"
 
 export interface LibraryMediaItemData {
   id: string
@@ -26,6 +27,9 @@ interface MediaItemProps {
   item: LibraryMediaItemData
   onHover?: (item: LibraryMediaItemData) => void
   density?: "regular" | "compact"
+  selectionMode?: boolean
+  selected?: boolean
+  onSelect?: (id: string) => void
 }
 
 const getTypeLabel = (type: string) => {
@@ -39,7 +43,7 @@ const getTypeLabel = (type: string) => {
   }
 }
 
-export function MediaItem({ item, onHover, density = "regular" }: MediaItemProps) {
+export function MediaItem({ item, onHover, density = "regular", selectionMode = false, selected = false, onSelect }: MediaItemProps) {
   const navigate = useNavigate()
   const isCompact = density === "compact"
   const allowExternal = getHavenClientMode() !== "tauri"
@@ -64,6 +68,17 @@ export function MediaItem({ item, onHover, density = "regular" }: MediaItemProps
           "group-focus-visible:scale-105 group-focus-visible:border-primary/50 group-focus-visible:shadow-xl group-focus-visible:z-30"
         )}
       >
+        {selectionMode && (
+          <button
+            type="button"
+            aria-label={selected ? `取消选择 ${item.title}` : `选择 ${item.title}`}
+            aria-pressed={selected}
+            onClick={(event) => { event.stopPropagation(); onSelect?.(item.id) }}
+            className={cn("absolute left-3 top-3 z-20 flex h-8 w-8 items-center justify-center rounded-full border-2 shadow-lg", selected ? "border-primary bg-primary text-primary-foreground" : "border-white bg-black/45 text-transparent")}
+          >
+            <Check className="h-4 w-4" />
+          </button>
+        )}
         <ArtworkImage
           src={item.imageUrl}
           alt={item.title}

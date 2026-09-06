@@ -18,6 +18,9 @@ interface LibraryGridProps {
   onHoverItem?: (item: LibraryMediaItemData) => void
   /** 数据源注入（IPC-MOCK-001）：缺省回落共享 Mock（搜索/下载页迁移前保持原行为）。 */
   items?: LibraryMediaItemData[]
+  selectionMode?: boolean
+  selectedIds?: Set<string>
+  onToggleSelect?: (id: string) => void
 }
 
 // 丰富的影视、图书、漫画、报刊、资料综合演示数据库
@@ -317,6 +320,7 @@ export function LibraryGrid({
   density = "regular",
   onHoverItem,
   items: itemsProp
+  , selectionMode = false, selectedIds = new Set(), onToggleSelect
 }: LibraryGridProps) {
   const navigate = useNavigate()
   const allowExternal = getHavenClientMode() !== "tauri"
@@ -366,6 +370,15 @@ export function LibraryGrid({
             onMouseEnter={() => onHoverItem?.(item)}
             className="flex items-center gap-6 p-3.5 rounded-2xl bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 transition-all cursor-pointer group border border-black/5 dark:border-white/5"
           >
+            {selectionMode && (
+              <button
+                type="button"
+                aria-label={selectedIds.has(item.id) ? `取消选择 ${item.title}` : `选择 ${item.title}`}
+                aria-pressed={selectedIds.has(item.id)}
+                onClick={(event) => { event.stopPropagation(); onToggleSelect?.(item.id) }}
+                className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full border-2 ${selectedIds.has(item.id) ? "border-primary bg-primary text-primary-foreground" : "border-muted-foreground text-transparent"}`}
+              >✓</button>
+            )}
             {/* Thumbnail */}
             <div className="w-[72px] sm:w-[90px] aspect-[2/3] rounded-xl overflow-hidden bg-muted shrink-0 shadow-sm border border-black/10 dark:border-white/10 group-hover:scale-105 transition-transform">
               <ArtworkImage
@@ -420,7 +433,7 @@ export function LibraryGrid({
       : "grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-5 md:gap-7"
     }>
       {items.map((item) => (
-        <MediaItem key={item.id} item={item} onHover={onHoverItem} density={density} />
+          <MediaItem key={item.id} item={item} onHover={onHoverItem} density={density} selectionMode={selectionMode} selected={selectedIds.has(item.id)} onSelect={onToggleSelect} />
       ))}
     </div>
   )

@@ -755,6 +755,16 @@ impl haven_domain::contracts::DownloadRepository for SqliteRepositories {
             .find_active(source_resource_id, target_storage_id)
             .await
     }
+
+    async fn find_completed(
+        &self,
+        source_resource_id: haven_domain::ids::ResourceId,
+        target_storage_id: haven_domain::ids::StorageLocationId,
+    ) -> Result<Option<haven_domain::entities::DownloadTask>, haven_common::AppError> {
+        self.download
+            .find_completed(source_resource_id, target_storage_id)
+            .await
+    }
     async fn delete_terminal(
         &self,
         id: haven_domain::ids::DownloadTaskId,

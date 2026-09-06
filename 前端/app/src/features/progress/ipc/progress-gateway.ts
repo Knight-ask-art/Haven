@@ -102,3 +102,8 @@ export async function saveProgress(
 }
 
 export { isCanonicalUuid, isLocator, isRequest, isResult }
+
+/** Reset progress through the feature gateway; the page never calls the client directly. */
+export async function resetProgress(mediaItemId: string, client: HavenClient = getHavenClient()): Promise<void> {
+  await client.progressReset({ mediaItemId })
+}
