@@ -867,6 +867,9 @@ function MediaDetailExperience({ production }: { production: boolean }) {
     editionOpenRequestRef.current += 1
     setEditionOpeningId(null)
     setIsFavoriteSaving(false)
+    setIsDownloadSaving(false)
+    setMoreActionPending(null)
+    setToastMessage(null)
     setDownloadStatus("idle")
     setDownloadTaskId(null)
     setHasOfflineResource(false)
@@ -964,15 +967,22 @@ function MediaDetailExperience({ production }: { production: boolean }) {
       return
     }
     setIsDownloadSaving(true)
+    const requestGeneration = mediaActionGenerationRef.current
+    const isCurrent = () => mediaActionGenerationRef.current === requestGeneration
     try {
       const task = await createDownloadForMediaItem(downloadableMediaItemId)
+      if (!isCurrent()) return
       setDownloadStatus(task.state === "completed" ? "downloaded" : "queued")
       setToastMessage(task.state === "completed" ? "已保存到离线库" : "已加入下载列表")
     } catch (error) {
-      setToastMessage(error instanceof HavenError ? error.dto.userMessage : "创建下载任务失败")
+      if (isCurrent()) setToastMessage(error instanceof HavenError ? error.dto.userMessage : "创建下载任务失败")
     } finally {
-      setIsDownloadSaving(false)
-      setTimeout(() => setToastMessage(null), 2500)
+      if (isCurrent()) {
+        setIsDownloadSaving(false)
+        setTimeout(() => {
+          if (isCurrent()) setToastMessage(null)
+        }, 2500)
+      }
     }
   }
 

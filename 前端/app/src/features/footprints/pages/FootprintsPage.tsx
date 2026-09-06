@@ -225,6 +225,8 @@ export function FootprintsPage() {
   const [heroDownloadInfo, setHeroDownloadInfo] = useState<MediaItemDownloadInfo | null>(null)
   const [heroDownloadMediaItemId, setHeroDownloadMediaItemId] = useState<string | null>(null)
   const [heroActionPending, setHeroActionPending] = useState(false)
+  const heroActionGenerationRef = useRef(0)
+  const heroDownloadRequestRef = useRef(0)
   const loadRecent = useCallback(async () => {
     const requestId = ++recentRequestRef.current
     setRecentLoading(true)
@@ -341,6 +343,7 @@ export function FootprintsPage() {
     [continueItems, productionMode],
   )
   const productionHero = productionHeroSplit.hero
+  const heroMediaItemId = productionHero?.mediaItemId ?? null
   const productionContinueRest = productionHeroSplit.rest.map((item) => ({
     ...item,
     onClick: () => void openFootprintAction(item),
@@ -367,33 +370,38 @@ export function FootprintsPage() {
     }
   }, [isEmptyState, productionHero, productionMode])
   useEffect(() => {
-    let cancelled = false
-    const mediaItemId = productionHero?.mediaItemId
+    heroActionGenerationRef.current += 1
+    setHeroActionPending(false)
+  }, [productionHero?.id, heroMediaItemId, productionMode])
+  useEffect(() => {
+    const requestId = ++heroDownloadRequestRef.current
     setHeroDownloadInfo(null)
     setHeroDownloadMediaItemId(null)
-    if (!productionMode || !mediaItemId) {
-      return
-    }
-    void getMediaItemDownloadInfo(mediaItemId).then((info) => {
-      if (!cancelled) {
+    if (productionMode && heroMediaItemId) {
+      void getMediaItemDownloadInfo(heroMediaItemId).then((info) => {
+        if (heroDownloadRequestRef.current !== requestId) return
         setHeroDownloadInfo(info)
-        setHeroDownloadMediaItemId(mediaItemId)
-      }
-    }).catch(() => {
-      if (!cancelled) setHeroDownloadInfo(null)
-    })
-    return () => { cancelled = true }
-  }, [productionHero, productionMode])
+        setHeroDownloadMediaItemId(heroMediaItemId)
+      }).catch(() => {
+        if (heroDownloadRequestRef.current !== requestId) return
+        setHeroDownloadInfo(null)
+        setHeroDownloadMediaItemId(null)
+      })
+    }
+    return () => {
+      if (heroDownloadRequestRef.current === requestId) heroDownloadRequestRef.current += 1
+    }
+  }, [heroMediaItemId, productionMode])
   useEffect(() => {
-    if (!productionMode || !productionHero?.mediaItemId) return
+    if (!productionMode || !heroMediaItemId) return
     let mounted = true
     let dispose: (() => Promise<void>) | null = null
     const onEvent = (_event: DownloadEvent) => {
-      void getMediaItemDownloadInfo(productionHero.mediaItemId!).then((info) => {
-        if (mounted) {
-          setHeroDownloadInfo(info)
-          setHeroDownloadMediaItemId(productionHero.mediaItemId!)
-        }
+      const requestId = ++heroDownloadRequestRef.current
+      void getMediaItemDownloadInfo(heroMediaItemId).then((info) => {
+        if (!mounted || heroDownloadRequestRef.current !== requestId) return
+        setHeroDownloadInfo(info)
+        setHeroDownloadMediaItemId(heroMediaItemId)
       }).catch(() => {})
     }
     void subscribeDownloadEvents(onEvent).then((cleanup) => {
@@ -404,7 +412,7 @@ export function FootprintsPage() {
       mounted = false
       if (dispose) void dispose().catch(() => undefined)
     }
-  }, [productionHero, productionMode])
+  }, [heroMediaItemId, productionMode])
   const continueShelfItems = productionMode ? productionContinueRest : continueDisplay
   const continueSliceState = deriveLibrarySliceState({
     loading: continueLoading,
@@ -448,44 +456,59 @@ export function FootprintsPage() {
   }
   const handleHeroAction = async (action: string) => {
     if (!productionHero || heroActionPending) return
+    const actionGeneration = heroActionGenerationRef.current
+    const isCurrent = () => heroActionGenerationRef.current === actionGeneration
+    const actionMediaItemId = productionHero.mediaItemId
     setHeroActionPending(true)
     try {
       if (action === "heart") {
         const favorite = !productionHero.favorite
         await setFavorite({ workId: productionHero.workId, favorite })
+        if (!isCurrent()) return
         setContinueItems((items) => items.map((item) => item.id === productionHero.id ? { ...item, favorite } : item))
         await loadFavorites()
       } else if (action === "download") {
-        const mediaItemId = productionHero.mediaItemId
+        const mediaItemId = actionMediaItemId
         if (!mediaItemId) throw new Error("当前内容没有可下载的媒体版本")
         const info = await getMediaItemDownloadInfo(mediaItemId)
+        if (!isCurrent()) return
         if (info.hasOfflineResource && info.taskId) await revealOfflineDownload(info.taskId)
         else if (!info.hasOfflineResource) await createDownloadForMediaItem(mediaItemId)
-        setHeroDownloadInfo(await getMediaItemDownloadInfo(mediaItemId))
+        if (!isCurrent()) return
+        const refreshedInfo = await getMediaItemDownloadInfo(mediaItemId)
+        if (!isCurrent()) return
+        setHeroDownloadInfo(refreshedInfo)
+        setHeroDownloadMediaItemId(mediaItemId)
         showMessage(info.hasOfflineResource ? "已打开本地文件夹" : "已加入下载队列")
       } else if (action === "reset") {
-        const mediaItemId = productionHero.mediaItemId
+        const mediaItemId = actionMediaItemId
         if (!mediaItemId) throw new Error("当前内容没有可重置的媒体版本")
         await resetFootprintProgress(mediaItemId)
+        if (!isCurrent()) return
         await Promise.all([loadContinue(), loadRecent()])
+        if (!isCurrent()) return
         showMessage("已重置进度")
       } else if (action === "folder") {
         if (heroDownloadMediaItemId !== productionHero.mediaItemId || !heroDownloadInfo?.hasOfflineResource || !heroDownloadInfo.taskId) throw new Error("当前没有可定位的离线文件")
         await revealOfflineDownload(heroDownloadInfo.taskId)
+        if (!isCurrent()) return
         showMessage("已打开离线文件夹")
       } else if (action === "delete") {
         if (heroDownloadMediaItemId !== productionHero.mediaItemId || !heroDownloadInfo?.hasOfflineResource || !heroDownloadInfo.taskId) throw new Error("当前没有可删除的离线内容")
+        if (!actionMediaItemId) throw new Error("当前内容没有可删除的媒体版本")
         if (!window.confirm("确定删除这个作品的离线内容吗？此操作不会删除媒体库记录。")) return
         await deleteOfflineDownload(heroDownloadInfo.taskId)
-        const info = await getMediaItemDownloadInfo(productionHero.mediaItemId!)
+        if (!isCurrent()) return
+        const info = await getMediaItemDownloadInfo(actionMediaItemId)
+        if (!isCurrent()) return
         setHeroDownloadInfo(info)
-        setHeroDownloadMediaItemId(productionHero.mediaItemId)
+        setHeroDownloadMediaItemId(actionMediaItemId)
         showMessage("已删除离线内容")
       }
     } catch (error) {
-      showMessage(error instanceof HavenError ? error.dto.userMessage : "操作失败，请重试")
+      if (isCurrent()) showMessage(error instanceof HavenError ? error.dto.userMessage : "操作失败，请重试")
     } finally {
-      setHeroActionPending(false)
+      if (isCurrent()) setHeroActionPending(false)
     }
   }
 
@@ -522,7 +545,7 @@ export function FootprintsPage() {
             void openFootprintAction(heroStageData)
           }}
           isFavorite={heroStageData.isFavorite}
-          isDownloaded={heroDownloadInfo?.hasOfflineResource ?? false}
+          isDownloaded={heroDownloadMediaItemId === productionHero?.mediaItemId && (heroDownloadInfo?.hasOfflineResource ?? false)}
           canManageOffline={heroDownloadMediaItemId === productionHero?.mediaItemId && Boolean(heroDownloadInfo?.hasOfflineResource && heroDownloadInfo.taskId)}
           isActionPending={heroActionPending}
           onAction={(action) => void handleHeroAction(action)}
