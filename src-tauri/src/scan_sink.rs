@@ -118,11 +118,11 @@ impl ScanRoute {
 
     /// 锁内绑定 task_id、把匹配的 pending（含 terminal）按 sequence 稳定合并进 outbound、
     /// 再判定启动 drainer；live 事件（此后 deliver）只能排在已合并序列之后。
-    pub(crate) fn assign_task(&self, task_id: String) {
-        let should_drain = {
+    pub(crate) fn assign_task(&self, task_id: String) -> bool {
+        let (should_drain, terminal_buffered) = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.task_id.is_some() {
-                return; // 已 assign（幂等；同 ID 重绑定由 bind 新建 route）。
+                return false; // 已 assign（幂等；同 ID 重绑定由 bind 新建 route）。
             }
             state.task_id = Some(task_id.clone());
             // 筛选本 task 的 pending，按 sequence 稳定排序后合并进 outbound（FIFO 尾）。
@@ -132,16 +132,26 @@ impl ScanRoute {
                 .filter(|e| e.data.task_id == task_id)
                 .cloned()
                 .collect();
+            let terminal_buffered = matched.iter().any(|event| {
+                matches!(
+                    event.kind,
+                    haven_application::wire::ScanPhase::Completed
+                        | haven_application::wire::ScanPhase::Cancelled
+                        | haven_application::wire::ScanPhase::Failed
+                )
+            });
             matched.sort_by_key(|e| e.sequence);
             for event in matched {
                 state.outbound.push_back(event);
             }
             state.pending.clear();
-            maybe_start_drain(&mut state)
+            let should_drain = maybe_start_drain(&mut state);
+            (should_drain, terminal_buffered)
         };
         if should_drain {
             self.drain_outbound();
         }
+        terminal_buffered
     }
 
     /// **锁外** drainer：每轮短锁 pop；空队列时同一锁内 draining=false 并返回；
@@ -633,5 +643,25 @@ mod tests {
 
         assert_eq!(received.lock().unwrap().as_slice(), &[ScanPhase::Completed]);
         assert!(sink.emitters.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn assigning_after_a_buffered_terminal_reports_terminal_state() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_ref = Arc::clone(&received);
+        let route = ScanRoute {
+            channel_id: 8,
+            state: Mutex::new(ScanRouteState {
+                task_id: None,
+                pending: VecDeque::new(),
+                outbound: VecDeque::new(),
+                draining: false,
+            }),
+            send: Box::new(move |event| received_ref.lock().unwrap().push(event.kind)),
+        };
+        route.deliver(sample_scan_event("op", "task", 3, ScanPhase::Completed));
+
+        assert!(route.assign_task("task".into()));
+        assert_eq!(received.lock().unwrap().as_slice(), &[ScanPhase::Completed]);
     }
 }

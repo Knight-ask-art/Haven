@@ -34,7 +34,10 @@ pub async fn run_library_scan_start<R: tauri::Runtime>(
     let route = state.scan_sink.bind(app, on_event);
     match state.scan.start(location_id).await {
         Ok(result) => {
-            route.assign_task(result.task_id.clone());
+            let terminal_buffered = route.assign_task(result.task_id.clone());
+            if terminal_buffered {
+                state.scan_sink.unbind(&route);
+            }
             Ok(result)
         }
         // 启动失败（未知位置/stale/DB 错误）时回收出口：绑定先于 start，

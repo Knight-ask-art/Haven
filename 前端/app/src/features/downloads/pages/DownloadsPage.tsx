@@ -113,7 +113,7 @@ export function DownloadsPage() {
       setTasks(merged)
       setErrorMessage(null)
     } catch (error) {
-      if (!silent) {
+      if (!silent && requestId === listRequestRef.current) {
         setErrorMessage(userMessage(error, "无法加载下载任务"))
         publishDownloadError(error, "无法加载下载任务", "downloads:list")
       }
@@ -128,6 +128,7 @@ export function DownloadsPage() {
     action: (id: string) => Promise<DownloadTaskDto>,
   ) => {
     setPendingTaskIds((current) => new Set(current).add(taskId))
+    unknownRefreshPendingRef.current = false
     try {
       const updated = await action(taskId)
       listRequestRef.current += 1
@@ -221,6 +222,7 @@ export function DownloadsPage() {
     action: (id: string) => Promise<{ recordRemoved: boolean; offlineResourceRemoved: boolean }>,
   ) => {
     setPendingTaskIds((current) => new Set(current).add(taskId))
+    unknownRefreshPendingRef.current = false
     try {
       const result = await action(taskId)
       forgetDownloadEventsForTask(eventStateRef.current, taskId)
