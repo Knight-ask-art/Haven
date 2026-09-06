@@ -310,6 +310,13 @@
   }
 }
 
+::highlight(haven-article-highlight) {
+  background-color: rgb(252 211 77 / 0.3);
+  text-decoration-line: underline;
+  text-decoration-style: dotted;
+  text-decoration-color: rgb(161 98 7 / 0.55);
+}
+
 @layer base {
   * {
     @apply border-border;

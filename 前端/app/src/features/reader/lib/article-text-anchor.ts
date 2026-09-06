@@ -9,6 +9,11 @@ function clean(value: string | null | undefined, max: number): string | null {
   return trimmed === "" ? null : trimmed.slice(0, max)
 }
 
+function cleanContext(value: string | null | undefined): string | null {
+  if (typeof value !== "string" || value.length === 0) return null
+  return value.slice(0, MAX_CONTEXT)
+}
+
 /** 复用 pdf-progress-controller 的 sanitize 语义，保持 TextAnchor 上限一致。 */
 export function sanitizeArticleTextAnchor(anchor: TextAnchorDto | null | undefined): TextAnchorDto | null {
   if (!anchor || typeof anchor !== "object") return null
@@ -16,8 +21,8 @@ export function sanitizeArticleTextAnchor(anchor: TextAnchorDto | null | undefin
   if (!exact) return null
   return {
     exact,
-    prefix: clean(anchor.prefix, MAX_CONTEXT),
-    suffix: clean(anchor.suffix, MAX_CONTEXT),
+    prefix: cleanContext(anchor.prefix),
+    suffix: cleanContext(anchor.suffix),
   }
 }
 
@@ -36,6 +41,44 @@ export function buildArticleTextAnchor(paragraphText: string, selectedText: stri
   const prefix = paragraphText.slice(Math.max(0, offset - 30), offset) || null
   const suffix = paragraphText.slice(offset + exact.length, offset + exact.length + 30) || null
   return sanitizeArticleTextAnchor({ exact, prefix, suffix })
+}
+
+/** Build an anchor from the actual rendered selection offset, avoiding first-match ambiguity. */
+export function buildArticleTextAnchorAtOffset(
+  blockText: string,
+  selectedText: string,
+  startOffset: number,
+): TextAnchorDto | null {
+  const exact = selectedText.trim()
+  if (!exact || exact.length > MAX_EXACT) return null
+  const start = Math.max(0, Math.min(startOffset, blockText.length))
+  if (blockText.slice(start, start + exact.length) !== exact) return null
+  return sanitizeArticleTextAnchor({
+    exact,
+    prefix: blockText.slice(Math.max(0, start - 30), start) || null,
+    suffix: blockText.slice(start + exact.length, start + exact.length + 30) || null,
+  })
+}
+
+export function resolveArticleTextAnchor(
+  blockText: string,
+  anchor: TextAnchorDto | null | undefined,
+): { start: number; end: number } | null {
+  const cleanAnchor = sanitizeArticleTextAnchor(anchor)
+  if (!cleanAnchor || !cleanAnchor.exact) return null
+  const exact = cleanAnchor.exact
+  const matches: number[] = []
+  let offset = blockText.indexOf(exact)
+  while (offset !== -1) {
+    const prefixMatches = !cleanAnchor.prefix
+      || blockText.slice(Math.max(0, offset - cleanAnchor.prefix.length), offset) === cleanAnchor.prefix
+    const suffixMatches = !cleanAnchor.suffix
+      || blockText.slice(offset + exact.length, offset + exact.length + cleanAnchor.suffix.length) === cleanAnchor.suffix
+    if (prefixMatches && suffixMatches) matches.push(offset)
+    offset = blockText.indexOf(exact, offset + 1)
+  }
+  if (matches.length !== 1) return null
+  return { start: matches[0], end: matches[0] + exact.length }
 }
 
 /** 按 blockId 在文档中查找段落原文；未找到返回 null。 */

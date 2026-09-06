@@ -1050,7 +1050,7 @@ impl LocalDownloadRunner {
                         .map_err(|_| repository_failure())?
                         .ok_or_else(repository_failure)?
                         .state;
-                    if state == DownloadState::Cancelled {
+                    if matches!(state, DownloadState::Cancelled | DownloadState::Paused) {
                         let _ = fs::remove_file(&part_path).await;
                         return Ok(());
                     }

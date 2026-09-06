@@ -742,6 +742,7 @@ pub enum LibraryListSort {
     Title,
     LastActive,
     ReleaseDate,
+    Rating,
 }
 
 /// `library_list` 请求（契约 §14.3）。

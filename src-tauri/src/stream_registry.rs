@@ -9,7 +9,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use haven_common::network::{parse_http_url, validate_host, HttpUrlPolicy};
+#[cfg(test)]
+use haven_common::network::validate_host;
+use haven_common::network::{parse_http_url, HttpUrlPolicy};
 use haven_common::{AppError, ErrorKind};
 use uuid::Uuid;
 
@@ -32,110 +34,125 @@ pub struct StreamGrantInner {
     pub facts: StreamGrantFacts,
     pub owner_label: String,
     initial_host: String,
-    allowed_hosts: Mutex<HashSet<String>>,
-    /// Opaque tokens for HLS manifest targets.  The browser receives only the
-    /// token in the proxy URI; the real upstream URL remains in this
-    /// owner-bound registry entry.
-    targets: Mutex<HashMap<String, String>>,
-    /// Insertion order for `targets`. `HashMap` iteration order is deliberately
-    /// unspecified, so it cannot be used to implement the bounded eviction
-    /// policy safely.
-    target_order: Mutex<VecDeque<String>>,
-    /// Manifest hosts learned after the initial request. Keep their insertion
-    /// order separately so a hostile manifest cannot grow this set without
-    /// bound. The initial host is retained independently and never evicted.
-    host_order: Mutex<VecDeque<String>>,
+    stream_state: Mutex<StreamTargetState>,
     created_at: Instant,
 }
 
-const TARGET_CAP: usize = 512;
-const LEARNED_HOST_CAP: usize = 64;
+#[derive(Default)]
+struct StreamTargetState {
+    targets: HashMap<String, RegisteredTarget>,
+    manifest_versions: HashMap<String, VecDeque<String>>,
+}
+
+struct RegisteredTarget {
+    manifest_key: String,
+    version: String,
+    target: String,
+    host: String,
+}
+
+// A single long-form VOD manifest can legitimately contain thousands of
+// unique segment references. Keep the bound finite while ensuring one
+// manifest cannot invalidate references already handed to the player.
+const TARGET_CAP: usize = 4096;
+// Keep the current manifest plus one retired generation so requests already
+// dispatched by the player have a bounded grace period.
+const MANIFEST_VERSION_GRACE: usize = 2;
 
 impl StreamGrantInner {
+    /// Atomically replace one manifest slot. Candidates are prepared privately
+    /// by the request; capacity failure leaves every committed manifest intact.
+    pub(crate) fn commit_manifest(
+        &self,
+        manifest_key: &str,
+        version: &str,
+        candidates: &[(String, String)],
+    ) -> bool {
+        let Some(validated) = candidates
+            .iter()
+            .map(|(token, target)| {
+                host_of(target).map(|host| (token.clone(), target.clone(), host))
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+
+        let mut state = self.stream_state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut versions = state
+            .manifest_versions
+            .get(manifest_key)
+            .cloned()
+            .unwrap_or_default();
+        versions.push_back(version.to_owned());
+        let mut retired = HashSet::new();
+        while versions.len() > MANIFEST_VERSION_GRACE {
+            if let Some(value) = versions.pop_front() {
+                retired.insert(value);
+            }
+        }
+        let retained = state
+            .targets
+            .values()
+            .filter(|entry| entry.manifest_key != manifest_key || !retired.contains(&entry.version))
+            .count();
+        if retained.saturating_add(validated.len()) > TARGET_CAP {
+            return false;
+        }
+
+        state.targets.retain(|_, entry| {
+            entry.manifest_key != manifest_key || !retired.contains(&entry.version)
+        });
+        for (token, target, host) in validated {
+            state.targets.insert(
+                token,
+                RegisteredTarget {
+                    manifest_key: manifest_key.to_owned(),
+                    version: version.to_owned(),
+                    target,
+                    host,
+                },
+            );
+        }
+        state
+            .manifest_versions
+            .insert(manifest_key.to_owned(), versions);
+        true
+    }
+
     /// 目标主机是否被授权（初始主机或 manifest 学习到的主机）。
     pub fn host_allowed(&self, host: &str) -> bool {
         if host == self.initial_host {
             return true;
         }
-        self.allowed_hosts
+        self.stream_state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(host)
-    }
-
-    /// 学习（收敛）manifest 中出现的主机。
-    pub fn learn_hosts(&self, hosts: impl IntoIterator<Item = impl Into<String>>) {
-        let mut allowed = self.allowed_hosts.lock().unwrap_or_else(|e| e.into_inner());
-        let mut order = self.host_order.lock().unwrap_or_else(|e| e.into_inner());
-        for host in hosts.into_iter().map(Into::into) {
-            // `rewrite_hls_manifest` supplies normalized hosts from `host_of`,
-            // but keep this method defensive because it is the registry's
-            // security boundary and is also exercised directly by tests.
-            let Ok(host) = validate_host(&host) else {
-                continue;
-            };
-            if host == self.initial_host || !allowed.insert(host.clone()) {
-                continue;
-            }
-            order.push_back(host);
-            while order.len() > LEARNED_HOST_CAP {
-                let Some(oldest) = order.pop_front() else {
-                    break;
-                };
-                allowed.remove(&oldest);
-            }
-        }
-    }
-
-    /// Register one validated absolute target and return an opaque UUID token.
-    /// The token is intentionally independent of the target contents so a
-    /// browser-visible manifest cannot disclose the upstream URL. Reuse an
-    /// existing token for repeated URIs so a manifest with repeated segments
-    /// cannot consume the bounded target table unnecessarily.
-    pub fn register_target(&self, target: &str) -> String {
-        let mut targets = self.targets.lock().unwrap_or_else(|e| e.into_inner());
-        let mut order = self.target_order.lock().unwrap_or_else(|e| e.into_inner());
-
-        if let Some(token) = targets
-            .iter()
-            .find_map(|(token, value)| (value == target).then(|| token.clone()))
-        {
-            // Refresh the insertion order as a small LRU rule. A target that
-            // remains referenced by a later manifest should outlive stale
-            // targets when the table reaches its cap.
-            if let Some(position) = order.iter().position(|item| item == &token) {
-                order.remove(position);
-            }
-            order.push_back(token.clone());
-            return token;
-        }
-
-        let token = Uuid::new_v4().to_string();
-        while targets.len() >= TARGET_CAP {
-            let Some(oldest) = order.pop_front() else {
-                // The order list is an internal invariant. If it is ever
-                // damaged, fail closed by removing one actual target rather
-                // than allowing an unbounded map to grow.
-                if let Some(oldest) = targets.keys().next().cloned() {
-                    targets.remove(&oldest);
-                }
-                break;
-            };
-            targets.remove(&oldest);
-        }
-        targets.insert(token.clone(), target.to_owned());
-        order.push_back(token.clone());
-        token
+            .targets
+            .values()
+            .any(|entry| entry.host == host)
     }
 
     /// Resolve a browser-provided target token.  Callers must still apply the
     /// grant's host policy to the resolved URL before issuing a request.
-    pub fn resolve_target(&self, token: &str) -> Option<String> {
-        self.targets
+    pub fn resolve_target(&self, manifest_version: &str, token: &str) -> Option<String> {
+        self.stream_state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .targets
             .get(token)
-            .cloned()
+            .filter(|entry| entry.version == manifest_version)
+            .map(|entry| entry.target.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn manifest_version_count(&self, manifest_key: &str) -> usize {
+        self.stream_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .manifest_versions
+            .get(manifest_key)
+            .map_or(0, VecDeque::len)
     }
 }
 
@@ -254,16 +271,11 @@ impl StreamRegistry {
         owner_label: &str,
     ) -> Uuid {
         let grant = Uuid::new_v4();
-        let mut hosts = HashSet::new();
-        hosts.insert(initial_host.clone());
         let inner = Arc::new(StreamGrantInner {
             facts,
             owner_label: owner_label.to_owned(),
             initial_host,
-            allowed_hosts: Mutex::new(hosts),
-            targets: Mutex::new(HashMap::new()),
-            target_order: Mutex::new(VecDeque::new()),
-            host_order: Mutex::new(VecDeque::new()),
+            stream_state: Mutex::new(StreamTargetState::default()),
             created_at: Instant::now(),
         });
         let mut grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
@@ -310,6 +322,54 @@ pub(crate) fn host_of(url: &str) -> Option<String> {
     parse_http_url(url, HttpUrlPolicy::MediaResource)
         .ok()
         .map(|safe| safe.host().to_owned())
+}
+
+/// Signed query parameters and fragments identify a fetch authorization, not
+/// a different logical HLS playlist. Keep query parameters with playlist
+/// semantics (language, rendition, variant, etc.) in the identity; only the
+/// known authorization parameters are volatile across refreshes.
+pub(crate) fn manifest_identity(url: &str) -> Option<String> {
+    let mut parsed = reqwest::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return None;
+    }
+    let retained = parsed
+        .query_pairs()
+        .filter(|(key, _)| !is_volatile_manifest_query_key(key))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    parsed.set_query(None);
+    if !retained.is_empty() {
+        let mut query = parsed.query_pairs_mut();
+        for (key, value) in retained {
+            query.append_pair(&key, &value);
+        }
+    }
+    parsed.set_fragment(None);
+    Some(parsed.to_string())
+}
+
+fn is_volatile_manifest_query_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "sig"
+            | "signature"
+            | "expires"
+            | "expire"
+            | "exp"
+            | "token"
+            | "access_token"
+            | "auth"
+            | "hmac"
+            | "md5"
+            | "hdnts"
+            | "st"
+            | "et"
+            | "e"
+            | "__token"
+    ) || lower.starts_with("x-amz-")
+        || lower.starts_with("x-goog-")
 }
 
 #[cfg(test)]
@@ -363,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn hosts_learned_via_manifest_are_authorized_others_denied() {
+    fn committed_manifest_hosts_are_authorized_others_denied() {
         let registry = StreamRegistry::new();
         let grant = registry
             .register(
@@ -378,22 +438,25 @@ mod tests {
             !inner.host_allowed("seg.other-cdn.net"),
             "未学习主机默认拒绝"
         );
-        inner.learn_hosts(["seg.other-cdn.net"]);
+        assert!(inner.commit_manifest(
+            "https://cdn.example.com/video.m3u8",
+            "v1",
+            &[(
+                "token-1".into(),
+                "https://seg.other-cdn.net/segment.ts".into()
+            )],
+        ));
         assert!(inner.host_allowed("seg.other-cdn.net"));
-        inner.learn_hosts([
-            "127.0.0.1",
-            "10.0.0.1",
-            "169.254.169.254",
-            "localhost",
-            "media.internal",
-            "2001:db8::1",
-        ]);
+        assert!(!inner.commit_manifest(
+            "https://cdn.example.com/unsafe.m3u8",
+            "v1",
+            &[("unsafe".into(), "http://127.0.0.1/segment.ts".into())],
+        ));
         assert!(!inner.host_allowed("127.0.0.1"));
-        assert!(!inner.host_allowed("media.internal"));
     }
 
     #[test]
-    fn learned_hosts_are_bounded_and_evict_oldest_non_initial_host() {
+    fn repeated_manifest_refresh_reclaims_retired_versions() {
         let registry = StreamRegistry::new();
         let grant = registry
             .register(
@@ -404,15 +467,29 @@ mod tests {
             .unwrap();
         let inner = registry.lookup(&grant.to_string(), "main").unwrap();
 
-        inner.learn_hosts(
-            (0..(LEARNED_HOST_CAP + 2)).map(|index| format!("segment-{index}.example.net")),
-        );
-
-        assert!(inner.host_allowed("cdn.example.com"), "初始主机不能被淘汰");
-        assert!(!inner.host_allowed("segment-0.example.net"));
-        assert!(!inner.host_allowed("segment-1.example.net"));
-        assert!(inner.host_allowed("segment-2.example.net"));
-        assert!(inner.host_allowed("segment-65.example.net"));
+        let mut previous: Option<(String, String)> = None;
+        for refresh in 0..1_000 {
+            let version = format!("v{refresh}");
+            let candidates = (0..6)
+                .map(|segment| {
+                    (
+                        format!("t-{refresh}-{segment}"),
+                        format!("https://cdn.example.com/segment-{}.ts", refresh + segment),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert!(inner.commit_manifest(
+                "https://cdn.example.com/live.m3u8",
+                &version,
+                &candidates
+            ));
+            if let Some((old_version, old_token)) = previous.take() {
+                assert!(inner.resolve_target(&old_version, &old_token).is_some());
+            }
+            previous = Some((version, candidates[0].0.clone()));
+        }
+        let state = inner.stream_state.lock().unwrap();
+        assert_eq!(state.targets.len(), 12);
     }
 
     #[test]
@@ -432,6 +509,93 @@ mod tests {
     }
 
     #[test]
+    fn manifest_identity_ignores_rotating_signature_but_keeps_playlist_semantics() {
+        assert_eq!(
+            manifest_identity("https://cdn.example.com/live/index.m3u8?sig=one&expires=1#x"),
+            Some("https://cdn.example.com/live/index.m3u8".into())
+        );
+        assert_eq!(
+            manifest_identity("https://cdn.example.com/live/index.m3u8?sig=two&expires=2"),
+            manifest_identity("https://cdn.example.com/live/index.m3u8?sig=one&expires=1")
+        );
+        assert_ne!(
+            manifest_identity("https://cdn.example.com/live/index.m3u8?audio=1&sig=one"),
+            manifest_identity("https://cdn.example.com/live/index.m3u8?audio=2&sig=two")
+        );
+        assert_eq!(
+            manifest_identity(
+                "https://cdn.example.com/live/index.m3u8?lang=zh&variant=mobile&sig=one"
+            ),
+            manifest_identity(
+                "https://cdn.example.com/live/index.m3u8?lang=zh&variant=mobile&sig=two"
+            )
+        );
+    }
+
+    #[test]
+    fn concurrent_manifest_commit_has_isolated_atomic_result() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let registry = StreamRegistry::new();
+        let grant = registry
+            .register(
+                facts("https://cdn.example.com/a.m3u8"),
+                "https://cdn.example.com/a.m3u8",
+                "main",
+            )
+            .unwrap();
+        let inner = registry.lookup(&grant.to_string(), "main").unwrap();
+        let existing = (0..TARGET_CAP - 1)
+            .map(|index| {
+                (
+                    format!("base-{index}"),
+                    format!("https://cdn.example.com/base-{index}.ts"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(inner.commit_manifest("base", "v1", &existing));
+
+        let barrier = Arc::new(Barrier::new(2));
+        let left = Arc::clone(&inner);
+        let left_barrier = Arc::clone(&barrier);
+        let left_thread = thread::spawn(move || {
+            left_barrier.wait();
+            left.commit_manifest(
+                "video",
+                "video-v1",
+                &[(
+                    "video-token".into(),
+                    "https://video.example.net/v.ts".into(),
+                )],
+            )
+        });
+        let right = Arc::clone(&inner);
+        let right_barrier = Arc::clone(&barrier);
+        let right_thread = thread::spawn(move || {
+            right_barrier.wait();
+            right.commit_manifest(
+                "audio",
+                "audio-v1",
+                &[(
+                    "audio-token".into(),
+                    "https://audio.example.net/a.ts".into(),
+                )],
+            )
+        });
+        let left_ok = left_thread.join().unwrap();
+        let right_ok = right_thread.join().unwrap();
+        assert_eq!(left_ok as u8 + right_ok as u8, 1);
+        if left_ok {
+            assert!(inner.resolve_target("video-v1", "video-token").is_some());
+            assert!(inner.host_allowed("video.example.net"));
+        } else {
+            assert!(inner.resolve_target("audio-v1", "audio-token").is_some());
+            assert!(inner.host_allowed("audio.example.net"));
+        }
+    }
+
+    #[test]
     fn target_tokens_are_opaque_and_owner_bound() {
         let registry = StreamRegistry::new();
         let grant = registry
@@ -442,18 +606,27 @@ mod tests {
             )
             .unwrap();
         let inner = registry.lookup(&grant.to_string(), "main").unwrap();
-        let token = inner.register_target("https://cdn.example.com/seg-01.ts");
+        let token = Uuid::new_v4().to_string();
+        assert!(inner.commit_manifest(
+            "https://cdn.example.com/a.m3u8",
+            "v1",
+            &[(token.clone(), "https://cdn.example.com/seg-01.ts".into())],
+        ));
         assert_eq!(token.len(), 36);
         assert!(!token.contains("://"));
         assert_eq!(
-            inner.resolve_target(&token).as_deref(),
+            inner.resolve_target("v1", &token).as_deref(),
             Some("https://cdn.example.com/seg-01.ts")
         );
+        assert!(inner.resolve_target("other-version", &token).is_none());
         assert!(registry.lookup(&grant.to_string(), "other").is_none());
     }
 
     #[test]
-    fn target_tokens_evict_in_insertion_order() {
+    fn controlled_concurrent_failed_commit_does_not_damage_successful_manifest() {
+        use std::sync::{mpsc, Barrier};
+        use std::thread;
+
         let registry = StreamRegistry::new();
         let grant = registry
             .register(
@@ -463,43 +636,56 @@ mod tests {
             )
             .unwrap();
         let inner = registry.lookup(&grant.to_string(), "main").unwrap();
-        let first = inner.register_target("https://cdn.example.com/first.ts");
-        let second = inner.register_target("https://cdn.example.com/second.ts");
+        let existing = (0..TARGET_CAP - 1)
+            .map(|index| {
+                (
+                    format!("base-{index}"),
+                    format!("https://cdn.example.com/base-{index}.ts"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(inner.commit_manifest("base", "v1", &existing));
 
-        for index in 0..TARGET_CAP {
-            inner.register_target(&format!("https://cdn.example.com/segment-{index}.ts"));
-        }
-
-        assert_eq!(inner.resolve_target(&first), None, "最早令牌应先淘汰");
-        assert_eq!(inner.resolve_target(&second), None, "第二早令牌也应被淘汰");
-        let last = inner.register_target("https://cdn.example.com/last.ts");
-        assert_eq!(
-            inner.resolve_target(&last).as_deref(),
-            Some("https://cdn.example.com/last.ts")
-        );
-    }
-
-    #[test]
-    fn repeated_target_reuses_token_and_refreshes_eviction_order() {
-        let registry = StreamRegistry::new();
-        let grant = registry
-            .register(
-                facts("https://cdn.example.com/a.m3u8"),
-                "https://cdn.example.com/a.m3u8",
-                "main",
+        let start = Arc::new(Barrier::new(2));
+        let (committed, wait_for_failure) = mpsc::channel();
+        let (release_failure, failure_release_rx) = mpsc::channel();
+        let successful_token = "successful-token".to_owned();
+        let success_token_for_thread = successful_token.clone();
+        let success_inner = Arc::clone(&inner);
+        let success_start = Arc::clone(&start);
+        let success_thread = thread::spawn(move || {
+            success_start.wait();
+            let result = success_inner.commit_manifest(
+                "video",
+                "v1",
+                &[(
+                    success_token_for_thread,
+                    "https://video.example.net/segment.ts".into(),
+                )],
+            );
+            committed.send(result).unwrap();
+            result
+        });
+        let failure_inner = Arc::clone(&inner);
+        let failure_start = Arc::clone(&start);
+        let failure_thread = thread::spawn(move || {
+            failure_start.wait();
+            wait_for_failure.recv().unwrap();
+            failure_release_rx.recv().unwrap();
+            failure_inner.commit_manifest(
+                "audio",
+                "v1",
+                &[(
+                    "overflow".into(),
+                    "https://audio.example.net/segment.aac".into(),
+                )],
             )
-            .unwrap();
-        let inner = registry.lookup(&grant.to_string(), "main").unwrap();
-        let repeated = "https://cdn.example.com/repeated.ts";
-        let first = inner.register_target(repeated);
-
-        for index in 0..TARGET_CAP - 1 {
-            inner.register_target(&format!("https://cdn.example.com/segment-{index}.ts"));
-        }
-        let refreshed = inner.register_target(repeated);
-        assert_eq!(refreshed, first);
-
-        inner.register_target("https://cdn.example.com/evict-oldest.ts");
-        assert!(inner.resolve_target(&first).is_some());
+        });
+        assert!(success_thread.join().unwrap());
+        release_failure.send(()).unwrap();
+        assert!(!failure_thread.join().unwrap());
+        assert!(inner.resolve_target("v1", &successful_token).is_some());
+        assert!(inner.host_allowed("video.example.net"));
+        assert!(!inner.host_allowed("audio.example.net"));
     }
 }

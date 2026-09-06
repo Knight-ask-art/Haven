@@ -73,6 +73,20 @@ const HTML_SANITIZE_CONFIG: Config = {
   RETURN_TRUSTED_TYPE: false,
 }
 
+export const ARTICLE_HTML_BLOCK_TAGS = ["h1", "h2", "h3", "h4", "h5", "h6", "p", "blockquote", "li", "td", "th"] as const
+const ARTICLE_HTML_PARAGRAPH_TAGS = ARTICLE_HTML_BLOCK_TAGS.slice(6)
+
+function htmlBlockElements(root: ParentNode): Element[] {
+  const blockTags = new Set<string>(ARTICLE_HTML_BLOCK_TAGS)
+  return Array.from(root.querySelectorAll(ARTICLE_HTML_BLOCK_TAGS.join(","))).filter((element) => {
+    // A list item or table cell may contain a nested paragraph. Treat the
+    // innermost block as the model paragraph so one DOM block maps to one ID.
+    return !element.parentElement?.closest(
+      ARTICLE_HTML_BLOCK_TAGS.filter((tag) => blockTags.has(tag)).join(","),
+    )
+  })
+}
+
 /**
  * Sanitize untrusted local HTML before it enters the WebView DOM.  The
  * allowlist intentionally excludes every resource-bearing attribute/tag, so
@@ -89,7 +103,10 @@ function plainTextFromHtml(html: string): string {
   const template = document.createElement("template")
   template.innerHTML = html
   const lines: string[] = []
-  for (const element of template.content.querySelectorAll("h1,h2,h3,h4,h5,h6,p,blockquote,li")) {
+  const blocks = htmlBlockElements(template.content)
+  const hasHeading = blocks.some((element) => /^h[1-6]$/i.test(element.tagName))
+  if (!hasHeading) lines.push("# 文章", "")
+  for (const element of blocks) {
     const text = element.textContent?.replace(/\s+/g, " ").trim()
     if (!text) continue
     if (/^h[1-6]$/i.test(element.tagName)) {
@@ -106,8 +123,12 @@ function plainTextFromHtml(html: string): string {
 function addStableHtmlBlockIds(html: string, documentModel: ArticleDocument): string {
   const template = document.createElement("template")
   template.innerHTML = html
-  const headings = Array.from(template.content.querySelectorAll("h1,h2,h3,h4,h5,h6"))
-  const blocks = Array.from(template.content.querySelectorAll("p,blockquote"))
+  const blocks = htmlBlockElements(template.content)
+  const headings = blocks.filter((element) => /^h[1-6]$/i.test(element.tagName))
+  // Keep this order identical to plainTextFromHtml. List items and table cells
+  // are paragraphs in the article model too; omitting them shifts every later
+  // marker onto the wrong DOM block.
+  const paragraphs = blocks.filter((element) => ARTICLE_HTML_PARAGRAPH_TAGS.includes(element.tagName.toLowerCase() as (typeof ARTICLE_HTML_PARAGRAPH_TAGS)[number]))
   const sections = documentModel.sections
   headings.forEach((heading, index) => {
     const section = sections[index]
@@ -116,7 +137,7 @@ function addStableHtmlBlockIds(html: string, documentModel: ArticleDocument): st
   let paragraphIndex = 0
   for (const section of sections) {
     for (const paragraph of section.paragraphs) {
-      const block = blocks[paragraphIndex]
+      const block = paragraphs[paragraphIndex]
       if (block) block.setAttribute("data-article-block-id", paragraph.id)
       paragraphIndex += 1
     }

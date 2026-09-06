@@ -48,12 +48,18 @@ function toMediaItemData(card: WorkCardDto): LibraryMediaItemData {
   }
 }
 
-function listRequest(cursor: string | null): LibraryListRequest {
+export interface LibraryBrowseQuery {
+  category?: LibraryListRequest["category"]
+  query?: string
+  sort?: LibraryListRequest["sort"]
+}
+
+function listRequest(cursor: string | null, options: LibraryBrowseQuery = {}): LibraryListRequest {
   return {
-    category: "all",
+    category: options.category ?? "all",
     mediaTypes: null,
-    query: null,
-    sort: "recently_added",
+    query: options.query?.trim() || null,
+    sort: options.sort ?? "recently_added",
     cursor,
     limit: LIST_LIMIT,
   }
@@ -74,13 +80,16 @@ export function acceptLibraryCursor(seen: Set<string>, nextCursor: string | null
 }
 
 /** 拉取一页真实投影；浏览器演示环境只有一页。 */
-export async function getLibraryBrowsePage(cursor: string | null = null): Promise<LibraryBrowsePage> {
+export async function getLibraryBrowsePage(
+  cursor: string | null = null,
+  options: LibraryBrowseQuery = {},
+): Promise<LibraryBrowsePage> {
   const runtimeState = resolveLibraryRuntimeState(getHavenClientMode())
   if (runtimeState === "demo") {
     if (cursor !== null) return { items: [], nextCursor: null, total: REPRESENTATIVE_ITEMS.length }
     return { items: REPRESENTATIVE_ITEMS, nextCursor: null, total: REPRESENTATIVE_ITEMS.length }
   }
-  const page: PageDto<WorkCardDto> = await getHavenClient().libraryList(listRequest(cursor))
+  const page: PageDto<WorkCardDto> = await getHavenClient().libraryList(listRequest(cursor, options))
   return {
     items: page.items.map(toMediaItemData),
     nextCursor: page.nextCursor,

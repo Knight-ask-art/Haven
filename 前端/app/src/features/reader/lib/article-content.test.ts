@@ -5,6 +5,7 @@ import {
   articleOutline,
   decodeArticleText,
   MAX_ARTICLE_TEXT_BYTES,
+  ARTICLE_HTML_BLOCK_TAGS,
   parseArticleContent,
   parseArticleText,
 } from "./article-content"
@@ -14,6 +15,10 @@ function utf8(value: string): ArrayBuffer {
 }
 
 describe("article-content", () => {
+  it("keeps HTML text extraction and marker projection block types aligned", () => {
+    expect(ARTICLE_HTML_BLOCK_TAGS).toEqual(["h1", "h2", "h3", "h4", "h5", "h6", "p", "blockquote", "li", "td", "th"])
+    expect(ARTICLE_HTML_BLOCK_TAGS.slice(6)).toEqual(["p", "blockquote", "li", "td", "th"])
+  })
   it("parses a real title, paragraphs, and an outline from the same stable blocks", () => {
     const source = "# 本地优先\n\n开场第一行\n开场第二行\n\n## 数据主权\n\n第二节正文。"
     const first = parseArticleText(source)

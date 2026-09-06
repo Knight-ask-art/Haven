@@ -4,7 +4,6 @@ import { ChevronRight, Star, Check, RefreshCw, Search } from "lucide-react"
 import { SearchBar } from "../components/SearchBar"
 import { SearchHistory } from "../components/SearchHistory"
 import { TrendingBoard } from "../components/TrendingBoard"
-import { REPRESENTATIVE_ITEMS } from "@/features/library/components/LibraryGrid"
 import { getHavenClientMode } from "@/lib/ipc/runtime"
 import { HavenError } from "@/lib/ipc/errors"
 import { cn } from "@/lib/utils"
@@ -185,15 +184,8 @@ export function SearchPage() {
   }
 
   const openBoardItem = (title: string) => {
-    const match = REPRESENTATIVE_ITEMS.find(
-      (item) => item.title === title || item.title.includes(title.split(/[（(]/)[0].trim())
-    )
-    if (match) {
-      navigate(`/work/${match.id}`)
-    } else {
-      setSearchValue(title)
-      commitSearch(title)
-    }
+    setSearchValue(title)
+    commitSearch(title)
   }
 
   const cycleSortMode = () => {
