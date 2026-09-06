@@ -811,6 +811,7 @@ function MediaDetailExperience({ production }: { production: boolean }) {
   const [downloadTaskId, setDownloadTaskId] = useState<string | null>(null)
   const [hasOfflineResource, setHasOfflineResource] = useState(false)
   const [moreActionPending, setMoreActionPending] = useState<"folder" | "reset" | "delete" | null>(null)
+  const mediaActionGenerationRef = useRef(0)
   const [downloadCapability, setDownloadCapability] = useState<"loading" | "available" | "unavailable" | "error">(
     production ? "loading" : "unavailable",
   )
@@ -861,6 +862,7 @@ function MediaDetailExperience({ production }: { production: boolean }) {
 
   // 同一组件实例切换 /work/:id 时，所有与作品绑定的局部状态都必须重置。
   useEffect(() => {
+    mediaActionGenerationRef.current += 1
     favoriteRequestRef.current += 1
     editionOpenRequestRef.current += 1
     setEditionOpeningId(null)
@@ -983,30 +985,40 @@ function MediaDetailExperience({ production }: { production: boolean }) {
     }
     if (action === "delete" && !window.confirm("确定删除这个作品的离线内容吗？此操作不会删除媒体库记录。")) return
     setMoreActionPending(action)
+    const requestGeneration = mediaActionGenerationRef.current
+    const isCurrent = () => mediaActionGenerationRef.current === requestGeneration
     try {
       if (!downloadableMediaItemId) throw new Error("当前作品没有可用的媒体版本")
       if (action === "reset") {
         await resetProgress(downloadableMediaItemId)
+        if (!isCurrent()) return
         setDetailRetryNonce((value) => value + 1)
+        setEditionRetryNonce((value) => value + 1)
         setToastMessage("已重置进度")
         return
       }
       if (!downloadTaskId || !hasOfflineResource) throw new Error(action === "folder" ? "当前作品没有可定位的离线文件" : "当前作品没有可删除的离线内容")
       if (action === "folder") {
         await revealOfflineDownload(downloadTaskId)
+        if (!isCurrent()) return
         setToastMessage("已打开离线文件夹")
       } else {
         await deleteOfflineDownload(downloadTaskId)
         const info = await getMediaItemDownloadInfo(downloadableMediaItemId)
+        if (!isCurrent()) return
         setDownloadStatus(info.status)
         setDownloadTaskId(info.taskId)
         setHasOfflineResource(info.hasOfflineResource)
+        setDownloadCapability(
+          info.canDownload || info.hasOfflineResource || info.status === "queued" ? "available" : "unavailable",
+        )
+        setOnlineReadCapability(info.canOnlineRead ? "available" : "unavailable")
         setToastMessage("已删除离线内容")
       }
     } catch (error) {
-      setToastMessage(error instanceof HavenError ? error.dto.userMessage : "操作失败，请重试")
+      if (isCurrent()) setToastMessage(error instanceof HavenError ? error.dto.userMessage : "操作失败，请重试")
     } finally {
-      setMoreActionPending(null)
+      if (isCurrent()) setMoreActionPending(null)
     }
   }
 

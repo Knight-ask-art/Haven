@@ -9,7 +9,8 @@ import { ArrowRight, Bookmark, Heart, Trash2 } from "lucide-react"
 import type { MediaCardProps } from "@/components/ui/haven/MediaCard"
 import { primaryActionRoute } from "@/features/media/lib/primary-action-route"
 import { setFavorite } from "@/features/media/ipc/favorite-gateway"
-import { createDownloadForMediaItem, deleteOfflineDownload, getMediaItemDownloadInfo, revealOfflineDownload, type MediaItemDownloadInfo } from "@/features/downloads/ipc/download-gateway"
+import { createDownloadForMediaItem, deleteOfflineDownload, getMediaItemDownloadInfo, revealOfflineDownload, subscribeDownloadEvents, type MediaItemDownloadInfo } from "@/features/downloads/ipc/download-gateway"
+import type { DownloadEvent } from "@/lib/ipc/generated/wire"
 import { getCatalogItem, getStoredMarkers, removeStoredMarker } from "@/lib/havenState"
 import { getHavenClientMode } from "@/lib/ipc/runtime"
 import { onFavoriteChanged } from "@/lib/ipc/events"
@@ -222,6 +223,7 @@ export function FootprintsPage() {
   const [recentError, setRecentError] = useState<HavenErrorType | null>(null)
   const recentRequestRef = useRef(0)
   const [heroDownloadInfo, setHeroDownloadInfo] = useState<MediaItemDownloadInfo | null>(null)
+  const [heroDownloadMediaItemId, setHeroDownloadMediaItemId] = useState<string | null>(null)
   const [heroActionPending, setHeroActionPending] = useState(false)
   const loadRecent = useCallback(async () => {
     const requestId = ++recentRequestRef.current
@@ -339,7 +341,10 @@ export function FootprintsPage() {
     [continueItems, productionMode],
   )
   const productionHero = productionHeroSplit.hero
-  const productionContinueRest = productionHeroSplit.rest
+  const productionContinueRest = productionHeroSplit.rest.map((item) => ({
+    ...item,
+    onClick: () => void openFootprintAction(item),
+  }))
   const heroStageData = useMemo(() => {
     if (!productionMode || isEmptyState || !productionHero) return null
     const metaParts = [
@@ -364,16 +369,41 @@ export function FootprintsPage() {
   useEffect(() => {
     let cancelled = false
     const mediaItemId = productionHero?.mediaItemId
+    setHeroDownloadInfo(null)
+    setHeroDownloadMediaItemId(null)
     if (!productionMode || !mediaItemId) {
-      setHeroDownloadInfo(null)
       return
     }
     void getMediaItemDownloadInfo(mediaItemId).then((info) => {
-      if (!cancelled) setHeroDownloadInfo(info)
+      if (!cancelled) {
+        setHeroDownloadInfo(info)
+        setHeroDownloadMediaItemId(mediaItemId)
+      }
     }).catch(() => {
       if (!cancelled) setHeroDownloadInfo(null)
     })
     return () => { cancelled = true }
+  }, [productionHero, productionMode])
+  useEffect(() => {
+    if (!productionMode || !productionHero?.mediaItemId) return
+    let mounted = true
+    let dispose: (() => Promise<void>) | null = null
+    const onEvent = (_event: DownloadEvent) => {
+      void getMediaItemDownloadInfo(productionHero.mediaItemId!).then((info) => {
+        if (mounted) {
+          setHeroDownloadInfo(info)
+          setHeroDownloadMediaItemId(productionHero.mediaItemId!)
+        }
+      }).catch(() => {})
+    }
+    void subscribeDownloadEvents(onEvent).then((cleanup) => {
+      if (!mounted) void cleanup().catch(() => undefined)
+      else dispose = cleanup
+    }).catch(() => {})
+    return () => {
+      mounted = false
+      if (dispose) void dispose().catch(() => undefined)
+    }
   }, [productionHero, productionMode])
   const continueShelfItems = productionMode ? productionContinueRest : continueDisplay
   const continueSliceState = deriveLibrarySliceState({
@@ -403,12 +433,13 @@ export function FootprintsPage() {
       navigate(target)
       return
     }
-    if (!card.mediaItemId) {
+    const mediaItemId = card.primaryAction?.mediaItemId ?? card.mediaItemId
+    if (!mediaItemId) {
       showMessage("当前内容缺少可用版本")
       return
     }
     try {
-      const info = await getMediaItemDownloadInfo(card.mediaItemId)
+      const info = await getMediaItemDownloadInfo(mediaItemId)
       if (info.canOnlineRead || info.hasOfflineResource) navigate(target)
       else showMessage(info.canDownload ? "该内容需要下载后阅读" : "当前内容暂不可用")
     } catch (error) {
@@ -436,17 +467,19 @@ export function FootprintsPage() {
         const mediaItemId = productionHero.mediaItemId
         if (!mediaItemId) throw new Error("当前内容没有可重置的媒体版本")
         await resetFootprintProgress(mediaItemId)
-        await loadContinue()
+        await Promise.all([loadContinue(), loadRecent()])
         showMessage("已重置进度")
       } else if (action === "folder") {
-        if (!heroDownloadInfo?.hasOfflineResource || !heroDownloadInfo.taskId) throw new Error("当前没有可定位的离线文件")
+        if (heroDownloadMediaItemId !== productionHero.mediaItemId || !heroDownloadInfo?.hasOfflineResource || !heroDownloadInfo.taskId) throw new Error("当前没有可定位的离线文件")
         await revealOfflineDownload(heroDownloadInfo.taskId)
         showMessage("已打开离线文件夹")
       } else if (action === "delete") {
-        if (!heroDownloadInfo?.hasOfflineResource || !heroDownloadInfo.taskId) throw new Error("当前没有可删除的离线内容")
+        if (heroDownloadMediaItemId !== productionHero.mediaItemId || !heroDownloadInfo?.hasOfflineResource || !heroDownloadInfo.taskId) throw new Error("当前没有可删除的离线内容")
         if (!window.confirm("确定删除这个作品的离线内容吗？此操作不会删除媒体库记录。")) return
         await deleteOfflineDownload(heroDownloadInfo.taskId)
-        setHeroDownloadInfo(await getMediaItemDownloadInfo(productionHero.mediaItemId!))
+        const info = await getMediaItemDownloadInfo(productionHero.mediaItemId!)
+        setHeroDownloadInfo(info)
+        setHeroDownloadMediaItemId(productionHero.mediaItemId)
         showMessage("已删除离线内容")
       }
     } catch (error) {
@@ -490,7 +523,7 @@ export function FootprintsPage() {
           }}
           isFavorite={heroStageData.isFavorite}
           isDownloaded={heroDownloadInfo?.hasOfflineResource ?? false}
-          canManageOffline={Boolean(heroDownloadInfo?.hasOfflineResource && heroDownloadInfo.taskId)}
+          canManageOffline={heroDownloadMediaItemId === productionHero?.mediaItemId && Boolean(heroDownloadInfo?.hasOfflineResource && heroDownloadInfo.taskId)}
           isActionPending={heroActionPending}
           onAction={(action) => void handleHeroAction(action)}
         />
