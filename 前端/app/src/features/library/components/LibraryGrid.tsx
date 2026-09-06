@@ -18,6 +18,9 @@ interface LibraryGridProps {
   onHoverItem?: (item: LibraryMediaItemData) => void
   /** 数据源注入（IPC-MOCK-001）：缺省回落共享 Mock（搜索/下载页迁移前保持原行为）。 */
   items?: LibraryMediaItemData[]
+  selectionMode?: boolean
+  selectedIds?: Set<string>
+  onToggleSelect?: (id: string) => void
 }
 
 // 丰富的影视、图书、漫画、报刊、资料综合演示数据库
@@ -316,7 +319,10 @@ export function LibraryGrid({
   searchQuery = "",
   density = "regular",
   onHoverItem,
-  items: itemsProp
+  items: itemsProp,
+  selectionMode = false,
+  selectedIds = new Set(),
+  onToggleSelect,
 }: LibraryGridProps) {
   const navigate = useNavigate()
   const allowExternal = getHavenClientMode() !== "tauri"
@@ -420,7 +426,15 @@ export function LibraryGrid({
       : "grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-5 md:gap-7"
     }>
       {items.map((item) => (
-          <MediaItem key={item.id} item={item} onHover={onHoverItem} density={density} />
+          <MediaItem
+            key={item.id}
+            item={item}
+            onHover={onHoverItem}
+            density={density}
+            selectionMode={selectionMode}
+            selected={selectedIds.has(item.id)}
+            onSelect={onToggleSelect}
+          />
       ))}
     </div>
   )

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import type { HavenClient } from "@/lib/ipc/client"
 import type { EditionListByWorkRequest, EditionListByWorkResultDto } from "@/features/media/ipc/edition-wire"
 import type {
@@ -15,7 +15,13 @@ import type {
   ResourceListByMediaItemRequest,
   ResourceListDto,
 } from "@/lib/ipc/generated/wire"
-import { acceptLibraryCursor, findLibraryItemById, loadAllLibraryPages } from "./gateway"
+const { saveProgress } = vi.hoisted(() => ({
+  saveProgress: vi.fn().mockResolvedValue({ revision: "revision-2" }),
+}))
+
+vi.mock("@/features/progress/ipc/progress-gateway", () => ({ saveProgress }))
+
+import { acceptLibraryCursor, findLibraryItemById, loadAllLibraryPages, markLibraryItemCompleted } from "./gateway"
 
 function fakeClient(pages: Array<PageDto<WorkCardDto>>): HavenClient {
   let calls = 0
@@ -153,5 +159,32 @@ describe("library cursor pagination", () => {
 
     const items = await loadAllLibraryPages(fakeClient([page([document, article], null)]))
     expect(items.map((item) => item.type)).toEqual(["document", "article"])
+  })
+
+  it("uses the server-selected media item and locator for batch completion", async () => {
+    const item = {
+      id: "work-1",
+      title: "作品",
+      type: "video",
+      year: 2026,
+      imageUrl: "",
+      progressMediaItemId: "11111111-1111-4111-8111-111111111111",
+      progressLocator: { version: 1 as const, kind: "video" as const, data: { positionMs: 12_000 } },
+    }
+
+    await markLibraryItemCompleted(item)
+
+    expect(saveProgress).toHaveBeenCalledWith({
+      mediaItemId: item.progressMediaItemId,
+      locator: item.progressLocator,
+      completion: "completed",
+      expectedRevision: null,
+    })
+  })
+
+  it("rejects batch completion when the authoritative locator is missing", async () => {
+    await expect(markLibraryItemCompleted({ id: "work-2", title: "无定位作品", type: "book", year: 2026, imageUrl: "" }))
+      .rejects.toThrow("没有可用的阅读定位")
+    expect(saveProgress).not.toHaveBeenCalledWith(expect.objectContaining({ mediaItemId: "work-2" }))
   })
 })

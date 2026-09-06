@@ -5,7 +5,7 @@ import { LibraryTVHeroInfo } from "../components/LibraryTVHeroInfo"
 import { LibraryTVRowShelf } from "../components/LibraryTVRowShelf"
 import { LibraryGrid } from "../components/LibraryGrid"
 import type { LibraryMediaItemData } from "../components/MediaItem"
-import { getLibraryBrowseItems } from "../ipc/gateway"
+import { getLibraryBrowseItems, markLibraryItemCompleted } from "../ipc/gateway"
 import { isTauriRuntime } from "@/lib/ipc/runtime"
 import { onFavoriteChanged, onLibraryChanged } from "@/lib/ipc/events"
 import { toHavenError, type HavenError } from "@/lib/ipc/errors"
@@ -27,6 +27,10 @@ export function LibraryPage() {
   const loadRequestRef = useRef(0)
   // 10-foot TV UI 核心焦点：当前选中的媒体原信息展示（数据到达前为 null，隐藏 Hero 与背景图）
   const [focusedItem, setFocusedItem] = useState<LibraryMediaItemData | null>(null)
+  const [selectionMode, setSelectionMode] = useState(false)
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set())
+  const [batchSaving, setBatchSaving] = useState(false)
+  const [batchMessage, setBatchMessage] = useState<string | null>(null)
 
   const loadLibrary = useCallback(async () => {
     const requestId = ++loadRequestRef.current
@@ -48,6 +52,16 @@ export function LibraryPage() {
       loadRequestRef.current += 1
     }
   }, [loadLibrary])
+
+  useEffect(() => {
+    setSelectedIds((current) => {
+      const available = new Set(libraryItems
+        .filter((item) => item.progressMediaItemId && item.progressLocator)
+        .map((item) => item.id))
+      const next = new Set([...current].filter((id) => available.has(id)))
+      return next.size === current.size ? current : next
+    })
+  }, [libraryItems])
 
   // library-changed → 重新拉取（SLICE-SCAN-001：扫描终态后库内容刷新，无需重启；
   // 仅 Tauri 环境；浏览器演示目录不经此路径）。
@@ -132,6 +146,36 @@ export function LibraryPage() {
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current)
     hoverTimerRef.current = setTimeout(() => setFocusedItem(item), 220)
   }, [])
+
+  const toggleSelected = useCallback((id: string) => {
+    setSelectedIds((current) => {
+      const next = new Set(current)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }, [])
+
+  const handleBatchComplete = useCallback(async () => {
+    if (batchSaving || selectedIds.size === 0) return
+    const selected = libraryItems.filter((item) => selectedIds.has(item.id))
+    setBatchSaving(true)
+    setBatchMessage(null)
+    const results = await Promise.allSettled(selected.map((item) => markLibraryItemCompleted(item)))
+    const failedIds = new Set(results
+      .flatMap((result, index) => result.status === "rejected" ? [selected[index]?.id] : [])
+      .filter((id): id is string => Boolean(id)))
+    const succeeded = selected.length - failedIds.size
+    setSelectedIds(failedIds)
+    if (failedIds.size === 0) {
+      setSelectionMode(false)
+      setBatchMessage(`已标记 ${succeeded} 项为已读`)
+    } else {
+      setBatchMessage(`${succeeded} 项已标记，${failedIds.size} 项失败，请重试`)
+    }
+    await loadLibrary()
+    setBatchSaving(false)
+  }, [batchSaving, libraryItems, loadLibrary, selectedIds])
   useEffect(() => () => {
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current)
   }, [])
@@ -155,6 +199,7 @@ export function LibraryPage() {
     itemCount: libraryItems.length,
     error: loadError,
   })
+  const batchOperationAvailable = isTauriRuntime() && activeCategory === "all"
 
   return (
     <div
@@ -198,6 +243,17 @@ export function LibraryPage() {
         ====================================================
       */}
       <div className="flex-1 pl-[128px] flex flex-col min-w-0 z-10">
+        {batchOperationAvailable && selectionMode && (
+          <div className="absolute top-0 inset-x-0 z-20 flex items-center justify-between bg-black/80 px-6 py-3 text-white backdrop-blur-md">
+            <span className="text-sm font-semibold">已选 {selectedIds.size} 项</span>
+            <div className="flex items-center gap-2">
+              <button type="button" onClick={() => { setSelectedIds(new Set()); setSelectionMode(false) }} className="rounded-full bg-white/10 px-3 py-1.5 text-xs font-semibold hover:bg-white/20">取消</button>
+              <button type="button" onClick={() => void handleBatchComplete()} disabled={batchSaving || selectedIds.size === 0} className="rounded-full bg-white px-3 py-1.5 text-xs font-bold text-black disabled:opacity-40">
+                {batchSaving ? "标记中…" : "标记已看"}
+              </button>
+            </div>
+          </div>
+        )}
         {sliceState.kind === "loading" && (
           <div className="grid grid-cols-2 gap-4 px-[32px] pt-[32px] sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6" aria-label="正在加载媒体库">
             {Array.from({ length: 6 }).map((_, i) => (
@@ -243,6 +299,14 @@ export function LibraryPage() {
           ====================================================
         */}
         <main className="flex flex-col gap-10 px-[32px] pt-[16px]">
+          {batchOperationAvailable && (
+            <div className="flex items-center justify-end gap-3">
+              {batchMessage && <span role="status" className="text-xs text-white/80">{batchMessage}</span>}
+              <button type="button" onClick={() => setSelectionMode((current) => !current)} className="rounded-full bg-white/10 px-3 py-1.5 text-xs font-semibold text-white backdrop-blur hover:bg-white/20">
+                {selectionMode ? "退出批量" : "批量操作"}
+              </button>
+            </div>
+          )}
           
           {/* 如果是“全部”或“推荐”，展示多排大分类陈列栏 */}
           {activeCategory === "all" && (
@@ -303,6 +367,9 @@ export function LibraryPage() {
                   viewMode="grid"
                   items={libraryItems}
                   onHoverItem={handleHoverSpotlight}
+                  selectionMode={selectionMode}
+                  selectedIds={selectedIds}
+                  onToggleSelect={toggleSelected}
                 />
               </div>
             </div>

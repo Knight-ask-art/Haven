@@ -17,6 +17,7 @@ import type { HavenClient } from "@/lib/ipc/client"
 import type { LibraryListRequest, PageDto, WorkCardDto } from "@/lib/ipc/generated/wire"
 
 import { resolveLibraryRuntimeState } from "../lib/library-runtime-state"
+import { saveProgress } from "@/features/progress/ipc/progress-gateway"
 
 
 /** 每个 IPC 请求的上限；调用方必须继续消费 nextCursor。 */
@@ -45,6 +46,8 @@ function toMediaItemData(card: WorkCardDto): LibraryMediaItemData {
     rating: card.ratingValue != null ? String(card.ratingValue) : undefined,
     description: card.description ?? undefined,
     favorite: card.favorite,
+    progressMediaItemId: card.primaryAction?.mediaItemId ?? card.progress?.mediaItemId,
+    progressLocator: card.primaryAction?.locator ?? card.progress?.locator ?? null,
   }
 }
 
@@ -129,4 +132,17 @@ export async function getLibraryBrowseItem(workId: string): Promise<LibraryMedia
   const runtimeState = resolveLibraryRuntimeState(getHavenClientMode())
   if (runtimeState === "demo") return REPRESENTATIVE_ITEMS.find((item) => item.id === workId)
   return findLibraryItemById(getHavenClient(), workId)
+}
+
+/** Complete one server-selected media item without inventing a locator. */
+export async function markLibraryItemCompleted(item: LibraryMediaItemData): Promise<void> {
+  if (!item.progressMediaItemId || !item.progressLocator) {
+    throw new Error(`${item.title}没有可用的阅读定位`)
+  }
+  await saveProgress({
+    mediaItemId: item.progressMediaItemId,
+    locator: item.progressLocator,
+    completion: "completed",
+    expectedRevision: null,
+  })
 }

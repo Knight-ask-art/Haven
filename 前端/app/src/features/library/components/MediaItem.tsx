@@ -5,6 +5,7 @@ import { Star } from "lucide-react"
 import { ArtworkImage } from "@/components/ui/haven/ArtworkImage"
 import { defaultCoverCategoryForMediaType } from "@/lib/default-cover"
 import { getHavenClientMode } from "@/lib/ipc/runtime"
+import type { LocatorDto } from "@/lib/ipc/generated/wire"
 
 export interface LibraryMediaItemData {
   id: string
@@ -20,12 +21,18 @@ export interface LibraryMediaItemData {
   description?: string
   /** 服务端收藏投影（WorkCardDto.favorite）；随导航传给详情页作初始值。 */
   favorite?: boolean
+  /** Server-selected progress target; absent means batch completion is unavailable. */
+  progressMediaItemId?: string
+  progressLocator?: LocatorDto | null
 }
 
 interface MediaItemProps {
   item: LibraryMediaItemData
   onHover?: (item: LibraryMediaItemData) => void
   density?: "regular" | "compact"
+  selectionMode?: boolean
+  selected?: boolean
+  onSelect?: (id: string) => void
 }
 
 const getTypeLabel = (type: string) => {
@@ -39,10 +46,11 @@ const getTypeLabel = (type: string) => {
   }
 }
 
-export function MediaItem({ item, onHover, density = "regular" }: MediaItemProps) {
+export function MediaItem({ item, onHover, density = "regular", selectionMode = false, selected = false, onSelect }: MediaItemProps) {
   const navigate = useNavigate()
   const isCompact = density === "compact"
   const allowExternal = getHavenClientMode() !== "tauri"
+  const canBatchComplete = Boolean(item.progressMediaItemId && item.progressLocator)
 
   return (
     <div 
@@ -64,6 +72,24 @@ export function MediaItem({ item, onHover, density = "regular" }: MediaItemProps
           "group-focus-visible:scale-105 group-focus-visible:border-primary/50 group-focus-visible:shadow-xl group-focus-visible:z-30"
         )}
       >
+        {selectionMode && (
+          <button
+            type="button"
+            aria-label={canBatchComplete
+              ? (selected ? `取消选择 ${item.title}` : `选择 ${item.title}`)
+              : `${item.title}没有可用的阅读定位`}
+            aria-pressed={selected}
+            disabled={!canBatchComplete}
+            onClick={(event) => { event.stopPropagation(); onSelect?.(item.id) }}
+            className={cn(
+              "absolute left-3 top-3 z-20 flex h-8 w-8 items-center justify-center rounded-full border-2 shadow-lg",
+              selected ? "border-primary bg-primary text-primary-foreground" : "border-white bg-black/45 text-transparent",
+              !canBatchComplete && "cursor-not-allowed opacity-45",
+            )}
+          >
+            <span aria-hidden="true">✓</span>
+          </button>
+        )}
         <ArtworkImage
           src={item.imageUrl}
           alt={item.title}
