@@ -743,8 +743,9 @@ impl haven_domain::contracts::DownloadRepository for SqliteRepositories {
     async fn list(
         &self,
         limit: u32,
+        offset: u32,
     ) -> Result<Vec<haven_domain::entities::DownloadTask>, haven_common::AppError> {
-        self.download.list(limit).await
+        self.download.list(limit, offset).await
     }
     async fn find_active(
         &self,

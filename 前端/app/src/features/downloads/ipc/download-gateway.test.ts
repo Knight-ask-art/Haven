@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 
 import type { HavenClient } from "@/lib/ipc/client"
 import type { DownloadTaskDto, ResourceListDto, ResourceSummaryDto, StorageLocationDto } from "@/lib/ipc/generated/wire"
@@ -33,9 +33,10 @@ function clientWith(
   tasks: DownloadTaskDto[],
   resources: ResourceListDto = EMPTY_RESOURCES,
   storageLocations: StorageLocationDto[] = [],
+  downloadList: (request: { limit: number; offset: number }) => Promise<DownloadTaskDto[]> = async () => tasks,
 ): HavenClient {
   const client = {
-    downloadList: async () => tasks,
+    downloadList,
     resourceListByMediaItem: async () => resources,
     storageLocationList: async () => storageLocations,
   } satisfies Pick<HavenClient, "downloadList" | "resourceListByMediaItem" | "storageLocationList">
@@ -43,6 +44,22 @@ function clientWith(
 }
 
 describe("getWorkDownloadState", () => {
+  it("pages through the complete task history instead of truncating at 200 rows", async () => {
+    const firstPage = Array.from({ length: 200 }, (_, index) => ({
+      ...BASE_TASK,
+      taskId: `task-${index}`,
+    }))
+    const oldTask = { ...BASE_TASK, taskId: "old-task", state: "failed" as const }
+    const downloadList = vi.fn(async ({ offset }: { limit: number; offset: number }) => (
+      offset === 0 ? firstPage : [oldTask]
+    ))
+
+    await expect(getWorkDownloadState("work-1", "media-1", clientWith([], EMPTY_RESOURCES, [], downloadList)))
+      .resolves.toBe("idle")
+    expect(downloadList).toHaveBeenNthCalledWith(1, { limit: 200, offset: 0 })
+    expect(downloadList).toHaveBeenNthCalledWith(2, { limit: 200, offset: 200 })
+  })
+
   it("uses an active task as the authoritative queued state", async () => {
     const active = { ...BASE_TASK, state: "downloading" as const, offlineResourceId: null }
     await expect(getWorkDownloadState("work-1", "media-1", clientWith([active])))

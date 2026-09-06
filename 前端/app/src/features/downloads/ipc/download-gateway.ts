@@ -24,8 +24,15 @@ export interface MediaItemDownloadInfo {
   taskId: string | null
 }
 
-export async function listDownloads(): Promise<DownloadTaskDto[]> {
-  return getHavenClient().downloadList({ limit: 200 })
+const DOWNLOAD_PAGE_SIZE = 200
+
+export async function listDownloads(client = getHavenClient()): Promise<DownloadTaskDto[]> {
+  const tasks: DownloadTaskDto[] = []
+  for (let offset = 0; ; offset += DOWNLOAD_PAGE_SIZE) {
+    const page = await client.downloadList({ limit: DOWNLOAD_PAGE_SIZE, offset })
+    tasks.push(...page)
+    if (page.length < DOWNLOAD_PAGE_SIZE) return tasks
+  }
 }
 
 export async function pauseDownload(taskId: string): Promise<DownloadTaskDto> {
@@ -112,7 +119,7 @@ export async function getMediaItemDownloadInfo(
   client = getHavenClient(),
 ): Promise<MediaItemDownloadInfo> {
   const [tasks, resources] = await Promise.all([
-    client.downloadList({ limit: 200 }),
+    listDownloads(client),
     client.resourceListByMediaItem({ mediaItemId }),
   ])
   const activeTask = tasks.find((task) => (
@@ -161,7 +168,7 @@ export async function getWorkDownloadState(
   if (mediaItemId) {
     return (await getMediaItemDownloadInfo(mediaItemId, client)).status
   }
-  const tasks = await client.downloadList({ limit: 200 })
+  const tasks = await listDownloads(client)
   const task = tasks.find((item) => (
     item.workId === workId
     && item.state !== "cancelled"

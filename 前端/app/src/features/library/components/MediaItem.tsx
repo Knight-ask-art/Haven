@@ -51,10 +51,22 @@ export function MediaItem({ item, onHover, density = "regular", selectionMode = 
   const isCompact = density === "compact"
   const allowExternal = getHavenClientMode() !== "tauri"
   const canBatchComplete = Boolean(item.progressMediaItemId && item.progressLocator)
+  const activate = () => {
+    if (selectionMode) {
+      if (canBatchComplete) onSelect?.(item.id)
+      return
+    }
+    navigate(`/work/${item.id}`)
+  }
 
   return (
     <div 
-      onClick={() => navigate(`/work/${item.id}`)}
+      onClick={activate}
+      onKeyDown={(event) => {
+        if (event.key !== "Enter" && event.key !== " ") return
+        event.preventDefault()
+        activate()
+      }}
       onMouseEnter={() => onHover?.(item)}
       className={cn(
         "group relative flex cursor-pointer select-none outline-none",

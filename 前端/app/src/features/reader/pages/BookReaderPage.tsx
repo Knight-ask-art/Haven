@@ -239,6 +239,7 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
   ))
   const [sessionMarkers, setSessionMarkers] = useState<MarkerDto[]>([])
   const [isBookmarkPending, setIsBookmarkPending] = useState(false)
+  const [bookmarkError, setBookmarkError] = useState<string | null>(null)
   const [markersLoaded, setMarkersLoaded] = useState(false)
   const [contentState, setContentState] = useState<BookContentState>({ status: "idle" })
   const [contentRetryNonce, setContentRetryNonce] = useState(0)
@@ -345,6 +346,22 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
   const isBookmarked = tauriRuntime
     ? sessionBookmark !== null
     : bookmarks.some((bookmark) => Math.abs(bookmark.progress - readingProgress) < 1)
+  const drawerBookmarks = useMemo<BookmarkType[]>(() => {
+    if (!tauriRuntime) return bookmarks
+    return sessionMarkers.flatMap((marker) => {
+      if (marker.markerType !== "bookmark" || marker.locator.kind !== "book") return []
+      const progress = Math.round((marker.locator.data.progression ?? 0) * 100)
+      return [{
+        id: marker.markerId,
+        markerId: marker.markerId,
+        progress,
+        scrollTop: 0,
+        chapterId: marker.locator.data.publicationResource,
+        chapterTitle: marker.title || "书签",
+        timestamp: new Date(marker.createdAt).toLocaleDateString(),
+      }]
+    })
+  }, [bookmarks, sessionMarkers, tauriRuntime])
   const bookFormat: BookContentFormat = demoRuntime
     ? "text"
     : (contentState.status === "ready" && contentMatchesSession ? contentState.format : "text")
@@ -930,12 +947,14 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
       markerListRequestRef.current += 1
       const operation = ++bookmarkOperationRef.current
       setIsBookmarkPending(true)
+      setBookmarkError(null)
       if (sessionBookmark) {
         setSessionMarkers((current) => current.filter((marker) => marker.markerId !== sessionBookmark.markerId))
         void deleteMarker(sessionBookmark.markerId)
           .catch(() => {
             if (bookmarkOperationRef.current !== operation) return
             setSessionMarkers((current) => [...current, sessionBookmark])
+            setBookmarkError("删除书签失败，请重试")
           })
           .finally(() => {
             if (bookmarkOperationRef.current === operation) setIsBookmarkPending(false)
@@ -956,7 +975,9 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
           if (bookmarkOperationRef.current !== operation) return
           setSessionMarkers((current) => [...current.filter((item) => item.markerId !== marker.markerId), marker])
         })
-        .catch(() => undefined)
+        .catch(() => {
+          if (bookmarkOperationRef.current === operation) setBookmarkError("添加书签失败，请重试")
+        })
         .finally(() => {
           if (bookmarkOperationRef.current === operation) setIsBookmarkPending(false)
         })
@@ -1007,6 +1028,29 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
       scrollContainer.scrollTo({ left, top: 0, behavior: "smooth" })
     }
     setDrawerOpen(false)
+  }
+
+  const removeDrawerBookmark = (bookmark: BookmarkType) => {
+    if (!tauriRuntime || !bookmark.markerId) {
+      setBookmarks((current) => current.filter((item) => item.id !== bookmark.id))
+      return
+    }
+    if (isBookmarkPending) return
+    const marker = sessionMarkers.find((item) => item.markerId === bookmark.markerId)
+    if (!marker) return
+    const operation = ++bookmarkOperationRef.current
+    setIsBookmarkPending(true)
+    setBookmarkError(null)
+    setSessionMarkers((current) => current.filter((item) => item.markerId !== marker.markerId))
+    void deleteMarker(marker.markerId)
+      .catch(() => {
+        if (bookmarkOperationRef.current !== operation) return
+        setSessionMarkers((current) => [...current.filter((item) => item.markerId !== marker.markerId), marker])
+        setBookmarkError("删除书签失败，请重试")
+      })
+      .finally(() => {
+        if (bookmarkOperationRef.current === operation) setIsBookmarkPending(false)
+      })
   }
 
   return (
@@ -1181,8 +1225,9 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
       {drawerOpen && (
         <div className="fixed inset-0 z-[60]" onClick={() => setDrawerOpen(false)}>
           <aside onClick={(event) => event.stopPropagation()} className={cn("absolute right-0 top-0 flex h-full w-[min(380px,100vw)] flex-col border-l pt-[68px] shadow-2xl backdrop-blur-2xl", isDark ? "border-white/10 bg-[#18181b]/95" : "border-black/[0.08] bg-white/95")}>
-            <div className="flex items-center justify-between border-b border-current/10 px-5 py-[16px]"><div className="flex gap-1 rounded-xl bg-black/[0.05] p-1 dark:bg-white/[0.08]"><button type="button" onClick={() => setDrawerTab("toc")} className={cn("rounded-lg px-3 py-1.5 text-xs font-semibold", drawerTab === "toc" ? "bg-background shadow-sm" : "opacity-55")}>章节目录</button><button type="button" onClick={() => setDrawerTab("search")} className={cn("flex items-center gap-1 rounded-lg px-3 py-1.5 text-xs font-semibold", drawerTab === "search" ? "bg-background shadow-sm" : "opacity-55")}><Search className="h-3 w-3" />搜索</button><button type="button" onClick={() => setDrawerTab("bookmarks")} className={cn("rounded-lg px-3 py-1.5 text-xs font-semibold", drawerTab === "bookmarks" ? "bg-background shadow-sm" : "opacity-55")}>书签 {bookmarks.length > 0 && `(${bookmarks.length})`}</button></div><button type="button" onClick={() => setDrawerOpen(false)} aria-label="关闭目录" className="rounded-full p-[8px] opacity-55 hover:bg-black/[0.06] hover:opacity-100 dark:hover:bg-white/[0.08]"><X className="h-[16px] w-[16px]" /></button></div>
-            {drawerTab === "toc" ? <nav className="flex-1 space-y-1 overflow-y-auto p-[16px] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">{tocItems.length > 0 ? tocItems.map((item) => <button key={item.id} type="button" onClick={() => scrollToTocItem(item)} className="flex w-full items-center justify-between rounded-xl px-3 py-3 text-left text-sm transition-colors hover:bg-black/[0.05] dark:hover:bg-white/[0.08]" style={{ paddingLeft: `${16 + Math.min(item.depth, 8) * 16}px` }}><span className="truncate">{item.title}</span><span className="ml-3 shrink-0 text-[10px] opacity-45">{Math.round(item.progression * 100)}%</span></button>) : chapters.map((chapter, index) => <button key={chapter.id} type="button" onClick={() => scrollToChapter(chapter.id)} className={cn("flex w-full items-center justify-between rounded-xl px-3 py-3 text-left text-sm transition-colors hover:bg-black/[0.05] dark:hover:bg-white/[0.08]", activeChapterId === chapter.id && "bg-primary/10 font-semibold text-primary")}><span className="truncate">{chapter.title}</span><span className="ml-3 shrink-0 text-[10px] opacity-45">{index + 1}</span></button>)}</nav> : drawerTab === "search" ? <div className="flex flex-1 flex-col overflow-hidden"><div className="border-b border-current/10 p-3"><div className="flex items-center gap-2 rounded-xl border border-current/10 bg-black/[0.03] px-3 py-2 focus-within:border-primary/40 dark:bg-white/[0.06]"><Search className="h-4 w-4 shrink-0 opacity-40" /><input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="搜索本书内容…" aria-label="搜索本书" className="w-full bg-transparent text-sm outline-none placeholder:text-current/40" /><button type="button" onClick={() => setSearchQuery("")} aria-label="清空搜索" className={cn("rounded-full p-1 opacity-40 hover:opacity-80", !searchQuery && "invisible")}><X className="h-3.5 w-3.5" /></button></div><p className="mt-2 px-1 text-[11px] opacity-45">{searchStatus === "searching" ? "正在搜索…" : searchQuery.trim().length >= 2 ? `找到 ${searchHits.length} 条结果` : "输入至少 2 个字符开始搜索"}</p></div><div className="flex-1 space-y-1 overflow-y-auto p-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">{searchHits.length === 0 ? <div className="flex h-[120px] flex-col items-center justify-center gap-2 text-xs opacity-40"><Search className="h-5 w-5" /><span>{searchQuery.trim().length >= 2 ? "未找到匹配内容" : "输入关键词搜索正文"}</span></div> : searchHits.map((hit, index) => <button key={`${hit.chapterId}:${hit.paragraphIndex}:${index}:${hit.exact.slice(0, 8)}`} type="button" onClick={() => scrollToSearchHit(hit)} className="w-full rounded-xl border border-transparent px-3 py-3 text-left transition-colors hover:border-current/10 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"><p className="truncate text-xs font-semibold text-primary">{hit.chapterTitle}</p><p className="mt-1 line-clamp-2 text-sm leading-relaxed opacity-80"><span className="opacity-40">{hit.prefix?.slice(-24)}</span><mark className="rounded bg-primary/15 px-0.5 font-medium text-primary">{hit.exact.slice(0, 80)}</mark><span className="opacity-40">{hit.suffix?.slice(0, 24)}</span></p><p className="mt-1 text-[10px] opacity-35">第 {hit.chapterIndex + 1} 章 · 段 {hit.paragraphIndex + 1}</p></button>)}</div></div> : <div className="flex-1 space-y-3 overflow-y-auto p-[16px] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">{bookmarks.length === 0 ? <div className="flex h-[160px] flex-col items-center justify-center gap-[8px] text-xs opacity-50"><Bookmark className="h-6 w-6" /><span>暂无书签</span></div> : bookmarks.map((bookmark) => <div key={bookmark.id} className="group rounded-2xl border border-current/10 bg-black/[0.04] p-[16px] dark:bg-white/[0.06]"><button type="button" onClick={() => restoreBookmark(bookmark)} className="w-full text-left"><div className="flex items-center justify-between gap-[8px]"><p className="truncate text-xs font-semibold text-primary">{bookmark.chapterTitle}</p><span className="text-[10px] opacity-55">{bookmark.progress}%</span></div><p className="mt-[8px] text-xs opacity-55">保存于 {bookmark.timestamp}</p></button><button type="button" onClick={() => setBookmarks((current) => current.filter((item) => item.id !== bookmark.id))} aria-label="删除书签" className="mt-3 flex items-center gap-1 text-[11px] text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 hover:text-destructive"><Trash2 className="h-[14px] w-[14px]" />删除</button></div>)}</div>}
+            <div className="flex items-center justify-between border-b border-current/10 px-5 py-[16px]"><div className="flex gap-1 rounded-xl bg-black/[0.05] p-1 dark:bg-white/[0.08]"><button type="button" onClick={() => setDrawerTab("toc")} className={cn("rounded-lg px-3 py-1.5 text-xs font-semibold", drawerTab === "toc" ? "bg-background shadow-sm" : "opacity-55")}>章节目录</button><button type="button" onClick={() => setDrawerTab("search")} className={cn("flex items-center gap-1 rounded-lg px-3 py-1.5 text-xs font-semibold", drawerTab === "search" ? "bg-background shadow-sm" : "opacity-55")}><Search className="h-3 w-3" />搜索</button><button type="button" onClick={() => setDrawerTab("bookmarks")} className={cn("rounded-lg px-3 py-1.5 text-xs font-semibold", drawerTab === "bookmarks" ? "bg-background shadow-sm" : "opacity-55")}>书签 {drawerBookmarks.length > 0 && `(${drawerBookmarks.length})`}</button></div><button type="button" onClick={() => setDrawerOpen(false)} aria-label="关闭目录" className="rounded-full p-[8px] opacity-55 hover:bg-black/[0.06] hover:opacity-100 dark:hover:bg-white/[0.08]"><X className="h-[16px] w-[16px]" /></button></div>
+            {bookmarkError && <p className="border-b border-destructive/20 bg-destructive/5 px-5 py-2 text-xs text-destructive">{bookmarkError} · 可重试</p>}
+            {drawerTab === "toc" ? <nav className="flex-1 space-y-1 overflow-y-auto p-[16px] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">{tocItems.length > 0 ? tocItems.map((item) => <button key={item.id} type="button" onClick={() => scrollToTocItem(item)} className="flex w-full items-center justify-between rounded-xl px-3 py-3 text-left text-sm transition-colors hover:bg-black/[0.05] dark:hover:bg-white/[0.08]" style={{ paddingLeft: `${16 + Math.min(item.depth, 8) * 16}px` }}><span className="truncate">{item.title}</span><span className="ml-3 shrink-0 text-[10px] opacity-45">{Math.round(item.progression * 100)}%</span></button>) : chapters.map((chapter, index) => <button key={chapter.id} type="button" onClick={() => scrollToChapter(chapter.id)} className={cn("flex w-full items-center justify-between rounded-xl px-3 py-3 text-left text-sm transition-colors hover:bg-black/[0.05] dark:hover:bg-white/[0.08]", activeChapterId === chapter.id && "bg-primary/10 font-semibold text-primary")}><span className="truncate">{chapter.title}</span><span className="ml-3 shrink-0 text-[10px] opacity-45">{index + 1}</span></button>)}</nav> : drawerTab === "search" ? <div className="flex flex-1 flex-col overflow-hidden"><div className="border-b border-current/10 p-3"><div className="flex items-center gap-2 rounded-xl border border-current/10 bg-black/[0.03] px-3 py-2 focus-within:border-primary/40 dark:bg-white/[0.06]"><Search className="h-4 w-4 shrink-0 opacity-40" /><input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="搜索本书内容…" aria-label="搜索本书" className="w-full bg-transparent text-sm outline-none placeholder:text-current/40" /><button type="button" onClick={() => setSearchQuery("")} aria-label="清空搜索" className={cn("rounded-full p-1 opacity-40 hover:opacity-80", !searchQuery && "invisible")}><X className="h-3.5 w-3.5" /></button></div><p className="mt-2 px-1 text-[11px] opacity-45">{searchStatus === "searching" ? "正在搜索…" : searchQuery.trim().length >= 2 ? `找到 ${searchHits.length} 条结果` : "输入至少 2 个字符开始搜索"}</p></div><div className="flex-1 space-y-1 overflow-y-auto p-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">{searchHits.length === 0 ? <div className="flex h-[120px] flex-col items-center justify-center gap-2 text-xs opacity-40"><Search className="h-5 w-5" /><span>{searchQuery.trim().length >= 2 ? "未找到匹配内容" : "输入关键词搜索正文"}</span></div> : searchHits.map((hit, index) => <button key={`${hit.chapterId}:${hit.paragraphIndex}:${index}:${hit.exact.slice(0, 8)}`} type="button" onClick={() => scrollToSearchHit(hit)} className="w-full rounded-xl border border-transparent px-3 py-3 text-left transition-colors hover:border-current/10 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"><p className="truncate text-xs font-semibold text-primary">{hit.chapterTitle}</p><p className="mt-1 line-clamp-2 text-sm leading-relaxed opacity-80"><span className="opacity-40">{hit.prefix?.slice(-24)}</span><mark className="rounded bg-primary/15 px-0.5 font-medium text-primary">{hit.exact.slice(0, 80)}</mark><span className="opacity-40">{hit.suffix?.slice(0, 24)}</span></p><p className="mt-1 text-[10px] opacity-35">第 {hit.chapterIndex + 1} 章 · 段 {hit.paragraphIndex + 1}</p></button>)}</div></div> : <div className="flex-1 space-y-3 overflow-y-auto p-[16px] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">{drawerBookmarks.length === 0 ? <div className="flex h-[160px] flex-col items-center justify-center gap-[8px] text-xs opacity-50"><Bookmark className="h-6 w-6" /><span>暂无书签</span></div> : drawerBookmarks.map((bookmark) => <div key={bookmark.id} className="group rounded-2xl border border-current/10 bg-black/[0.04] p-[16px] dark:bg-white/[0.06]"><button type="button" onClick={() => restoreBookmark(bookmark)} className="w-full text-left"><div className="flex items-center justify-between gap-[8px]"><p className="truncate text-xs font-semibold text-primary">{bookmark.chapterTitle}</p><span className="text-[10px] opacity-55">{bookmark.progress}%</span></div><p className="mt-[8px] text-xs opacity-55">保存于 {bookmark.timestamp}</p></button><button type="button" onClick={() => removeDrawerBookmark(bookmark)} aria-label="删除书签" className="mt-3 flex items-center gap-1 text-[11px] text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 hover:text-destructive"><Trash2 className="h-[14px] w-[14px]" />删除</button></div>)}</div>}
           </aside>
         </div>
       )}

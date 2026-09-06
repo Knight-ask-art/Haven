@@ -25,7 +25,13 @@ export function applyDownloadEvent(
   event: DownloadEvent,
 ): DownloadTaskDto[] {
   return tasks.map((task) => task.taskId === event.data.taskId
-    ? patchDownloadTask(task, event)
+    ? event.at >= task.updatedAt ? patchDownloadTask(task, event) : task
+    : task)
+}
+
+export function mergeDownloadTask(tasks: DownloadTaskDto[], updated: DownloadTaskDto): DownloadTaskDto[] {
+  return tasks.map((task) => task.taskId === updated.taskId
+    ? updated.updatedAt >= task.updatedAt ? updated : task
     : task)
 }
 

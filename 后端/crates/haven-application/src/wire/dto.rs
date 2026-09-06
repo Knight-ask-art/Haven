@@ -2237,6 +2237,7 @@ pub struct DownloadCreateRequest {
 #[ts(export, rename_all = "camelCase")]
 pub struct DownloadListRequest {
     pub limit: Option<u32>,
+    pub offset: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

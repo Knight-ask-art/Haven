@@ -10,6 +10,7 @@ import { isTauriRuntime } from "@/lib/ipc/runtime"
 import { onFavoriteChanged, onLibraryChanged } from "@/lib/ipc/events"
 import { toHavenError, type HavenError } from "@/lib/ipc/errors"
 import { deriveLibrarySliceState } from "@/lib/slice-state"
+import { filterLibraryItemsByCategory } from "../lib/library-category"
 
 export function LibraryPage() {
   const [searchParams, setSearchParams] = useSearchParams()
@@ -111,7 +112,7 @@ export function LibraryPage() {
     }
   }, [])
 
-  const getCategoryItems = (cat: string) => filterByCategory(libraryItems, cat)
+  const getCategoryItems = (cat: string) => filterLibraryItemsByCategory(libraryItems, cat)
 
   const handleSelectCategory = (categoryId: string) => {
     setSearchParams(
@@ -122,9 +123,7 @@ export function LibraryPage() {
       { replace: true }
     )
     const categoryItems = getCategoryItems(categoryId)
-    if (categoryItems.length > 0) {
-      setFocusedItem(categoryItems[0])
-    }
+    setFocusedItem(categoryItems[0] ?? null)
   }
 
   // 背景图预载：焦点切换时背景已是缓存命中，消除网络等待造成的闪烁/卡顿
@@ -182,17 +181,17 @@ export function LibraryPage() {
 
   // 直接带分类参数进入页面或数据到达时，同步 Hero 焦点（首项优先）
   useEffect(() => {
-    const categoryItems = filterByCategory(libraryItems, activeCategory)
-    if (categoryItems.length > 0) {
-      setFocusedItem(categoryItems[0])
-    }
+    const categoryItems = filterLibraryItemsByCategory(libraryItems, activeCategory)
+    setFocusedItem((current) => current && categoryItems.some((item) => item.id === current.id)
+      ? current
+      : categoryItems[0] ?? null)
   }, [activeCategory, libraryItems])
 
   // 根据分类预筛选不同的陈列栏数据 (Shelves)
   const movies = useMemo(() => libraryItems.filter((i) => i.type === "movie" || i.type === "tv"), [libraryItems])
   const books = useMemo(() => libraryItems.filter((i) => i.type === "book"), [libraryItems])
   const comics = useMemo(() => libraryItems.filter((i) => i.type === "comic"), [libraryItems])
-  const periodicals = useMemo(() => libraryItems.filter((i) => i.type === "periodical"), [libraryItems])
+  const periodicals = useMemo(() => filterLibraryItemsByCategory(libraryItems, "periodical"), [libraryItems])
   const documents = useMemo(() => libraryItems.filter((i) => i.type === "document"), [libraryItems])
   const sliceState = deriveLibrarySliceState({
     loading: isLoading,
@@ -379,11 +378,6 @@ export function LibraryPage() {
       </div>
     </div>
   )
-}
-
-function filterByCategory(items: LibraryMediaItemData[], cat: string) {
-  if (cat === "video") return items.filter((i) => i.type === "movie" || i.type === "tv")
-  return items.filter((i) => i.type === cat)
 }
 
 function getCategoryTitle(cat: string) {

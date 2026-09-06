@@ -16,6 +16,7 @@ import {
   resolveHistoryRuntimeState,
   shouldApplyHistoryRequest,
 } from "@/features/footprints/lib/history-runtime-state"
+import { primaryActionRoute } from "@/features/media/lib/primary-action-route"
 
 // Mock Data
 const todayHistory: MediaCardProps[] = [
@@ -86,6 +87,7 @@ export function HistoryPage() {
   const [recentHistoryItems, setRecentHistoryItems] = useState<HistoryCardProps[]>([])
   const [historyLoading, setHistoryLoading] = useState(productionMode)
   const [historyError, setHistoryError] = useState<HavenError | null>(null)
+  const [openError, setOpenError] = useState<string | null>(null)
   const historyRequestRef = useRef(0)
 
   const productionGroups = useMemo(
@@ -187,6 +189,15 @@ export function HistoryPage() {
   if (unavailableMode) return <UnavailableHistoryState />
 
   if (productionMode) {
+    const openHistoryItem = (item: HistoryCardProps) => {
+      const route = primaryActionRoute(item.primaryAction)
+      if (!route) {
+        setOpenError(`${item.title}当前没有可用内容`)
+        return
+      }
+      setOpenError(null)
+      navigate(route)
+    }
     return (
       <div className="w-full min-h-full bg-background selection:bg-primary/20 transition-colors">
         <HistoryHeader onBack={() => navigate(-1)} />
@@ -208,6 +219,7 @@ export function HistoryPage() {
                   selectedIds={new Set()}
                   onToggle={() => undefined}
                   onToggleGroup={() => undefined}
+                  onOpen={openHistoryItem}
                 />
               ))}
             </>
@@ -215,6 +227,7 @@ export function HistoryPage() {
           {historyError && recentHistoryItems.length > 0 && (
             <HistoryErrorState error={historyError} onRetry={() => void loadRecentHistory()} compact />
           )}
+          {openError && <HistoryMessage>{openError}</HistoryMessage>}
         </main>
       </div>
     )
@@ -383,6 +396,7 @@ function HistoryGroup({
   selectedIds,
   onToggle,
   onToggleGroup,
+  onOpen,
 }: {
   title: string
   items: MediaCardProps[]
@@ -390,6 +404,7 @@ function HistoryGroup({
   selectedIds: Set<string>
   onToggle: (id: string) => void
   onToggleGroup: () => void
+  onOpen?: (item: HistoryCardProps) => void
 }) {
   if (!items || items.length === 0) return null
 
@@ -418,10 +433,18 @@ function HistoryGroup({
           return (
             <div
               key={item.id}
-              onClick={selectionMode ? () => onToggle(item.id) : undefined}
+              onClick={selectionMode ? () => onToggle(item.id) : onOpen ? () => onOpen(item as HistoryCardProps) : undefined}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter" && event.key !== " ") return
+                event.preventDefault()
+                if (selectionMode) onToggle(item.id)
+                else if (onOpen) onOpen(item as HistoryCardProps)
+              }}
+              role="button"
+              tabIndex={0}
               className={cn(
                 "relative group flex flex-col gap-3 outline-none shrink-0 w-[140px] md:w-[160px] lg:w-[200px] select-none transition-transform duration-200",
-                selectionMode ? "cursor-pointer" : "cursor-default",
+                selectionMode || onOpen ? "cursor-pointer" : "cursor-default",
                 selectionMode && isSelected && "scale-[1.02]"
               )}
             >

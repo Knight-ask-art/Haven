@@ -66,6 +66,14 @@ struct ScanRouteState {
 }
 
 impl ScanRoute {
+    fn is_assigned_to(&self, task_id: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .task_id
+            .as_deref()
+            == Some(task_id)
+    }
     /// 锁内入队（FIFO）+ 判定是否需要启动 drainer。
     fn deliver(&self, event: LibraryScanEvent) {
         let should_drain = {
@@ -258,6 +266,15 @@ impl ScanEventSink for TauriScanEventSink {
         };
         for route in routes {
             route.deliver(event.clone());
+        }
+        if matches!(
+            event.kind,
+            haven_application::wire::ScanPhase::Completed
+                | haven_application::wire::ScanPhase::Cancelled
+                | haven_application::wire::ScanPhase::Failed
+        ) {
+            let mut emitters = self.emitters.lock().unwrap_or_else(|e| e.into_inner());
+            emitters.retain(|entry| !entry.route.is_assigned_to(&event.data.task_id));
         }
     }
 
@@ -583,5 +600,38 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
             .outbound
             .is_empty());
+    }
+
+    #[test]
+    fn terminal_event_unbinds_the_matching_route() {
+        let sink = TauriScanEventSink::new();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let route = Arc::new(ScanRoute {
+            channel_id: 7,
+            state: Mutex::new(ScanRouteState {
+                task_id: Some("task-terminal".into()),
+                pending: VecDeque::new(),
+                outbound: VecDeque::new(),
+                draining: false,
+            }),
+            send: {
+                let received = Arc::clone(&received);
+                Box::new(move |event| received.lock().unwrap().push(event.kind))
+            },
+        });
+        sink.emitters
+            .lock()
+            .unwrap()
+            .push(BoundEmitter { route });
+
+        sink.emit_scan_event(sample_scan_event(
+            "op-terminal",
+            "task-terminal",
+            2,
+            ScanPhase::Completed,
+        ));
+
+        assert_eq!(received.lock().unwrap().as_slice(), &[ScanPhase::Completed]);
+        assert!(sink.emitters.lock().unwrap().is_empty());
     }
 }

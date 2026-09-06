@@ -18,6 +18,7 @@ import { toHavenError, type HavenError } from "@/lib/ipc/errors"
 import { deriveLibrarySliceState } from "@/lib/slice-state"
 import { MediaItem } from "../components/MediaItem"
 import type { LibraryMediaItemData } from "../components/MediaItem"
+import { matchesLibraryCategory } from "../lib/library-category"
 
 type BrowseCategory = "video" | "comic" | "periodical" | "book" | "document"
 
@@ -35,7 +36,7 @@ const CATEGORY_FILTERS: Record<BrowseCategory, FilterGroupConfig[]> = {
     { key: "year", label: "年份", options: ["全部", "2026", "2025", "2024", "2023", "2022", "2021", "2020", "2019", "2018", "2015以前"] },
     { key: "season", label: "季度", options: ["全部", "1月", "4月", "7月", "10月"] },
     { key: "status", label: "观看状态", options: ["全部", "未看", "观看中", "已看完"] },
-    { key: "letter", label: "首字母", options: ["全部", "A", "B", "C", "D", "E", "F", "G", "H", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "W", "X", "Y", "Z"] },
+    { key: "letter", label: "拉丁首字母", options: ["全部", "A", "B", "C", "D", "E", "F", "G", "H", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "W", "X", "Y", "Z"] },
     { key: "source", label: "内容位置", options: ["全部", "本地媒体库", "个人云盘", "合法网络"] },
   ],
   comic: [
@@ -44,7 +45,7 @@ const CATEGORY_FILTERS: Record<BrowseCategory, FilterGroupConfig[]> = {
     { key: "genre", label: "题材", options: ["全部", "热血", "冒险", "奇幻", "校园", "日常", "科幻", "悬疑", "搞笑", "恋爱", "竞技"] },
     { key: "status", label: "阅读进度", options: ["全部", "未读", "阅读中", "已完结", "收藏中"] },
     { key: "fileType", label: "格式", options: ["全部", "CBZ", "CBR", "PDF", "EPUB"] },
-    { key: "letter", label: "首字母", options: ["全部", "A", "B", "C", "D", "E", "F", "G", "H", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "W", "X", "Y", "Z"] },
+    { key: "letter", label: "拉丁首字母", options: ["全部", "A", "B", "C", "D", "E", "F", "G", "H", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "W", "X", "Y", "Z"] },
     { key: "source", label: "内容位置", options: ["全部", "本地媒体库", "个人云盘"] },
   ],
   book: [
@@ -54,7 +55,7 @@ const CATEGORY_FILTERS: Record<BrowseCategory, FilterGroupConfig[]> = {
     { key: "status", label: "阅读状态", options: ["全部", "未读", "阅读中", "已读完", "已标记"] },
     { key: "year", label: "出版年份", options: ["全部", "2026", "2025", "2024", "2023", "2022", "2020以前"] },
     { key: "fileType", label: "格式", options: ["全部", "EPUB", "PDF", "MOBI", "AZW3", "TXT"] },
-    { key: "letter", label: "首字母", options: ["全部", "A", "B", "C", "D", "E", "F", "G", "H", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "W", "X", "Y", "Z"] },
+    { key: "letter", label: "拉丁首字母", options: ["全部", "A", "B", "C", "D", "E", "F", "G", "H", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "W", "X", "Y", "Z"] },
     { key: "source", label: "内容位置", options: ["全部", "本地书库", "个人云盘"] },
   ],
   periodical: [
@@ -163,7 +164,7 @@ function matchesMetaFilter(item: LibraryMediaItemData, key: string, value: strin
   if (value === "全部" || !value) return true
 
   if (key === "letter") {
-    const firstChar = item.originalTitle?.[0]?.toUpperCase()
+    const firstChar = (item.originalTitle || item.title).trim()[0]?.toUpperCase()
     return Boolean(firstChar) && firstChar === value
   }
 
@@ -361,11 +362,7 @@ export function LibraryBrowsePage() {
   }
 
   const filteredItems = browseItems
-    .filter((item) => (
-      categoryKey === "video"
-        ? item.type === "movie" || item.type === "tv"
-        : item.type === categoryKey
-    ))
+    .filter((item) => matchesLibraryCategory(item, categoryKey))
     .filter((item) => {
       const normalizedQuery = query.trim().toLowerCase()
       const matchesQuery = !normalizedQuery
@@ -385,7 +382,7 @@ export function LibraryBrowsePage() {
 
         if (group.key === "year") {
           const beforeYear = parseBeforeYear(value)
-          const matchesYear = beforeYear !== null ? item.year < beforeYear : String(item.year) === value
+          const matchesYear = beforeYear !== null ? item.year <= beforeYear : String(item.year) === value
           if (!matchesYear) return false
           continue
         }

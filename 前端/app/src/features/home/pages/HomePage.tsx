@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useState, useSyncExternalStore } from "react"
 import { Link } from "react-router"
 import {
   ArrowUpRight,
@@ -9,6 +9,8 @@ import {
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { HavenMascot } from "../components/mascot"
+import { getSettingsRuntimeSnapshot, publishSettingsRuntimeValue, subscribeSettingsRuntime } from "@/features/settings/lib/settings-runtime-state"
+import { settingsGateway } from "@/features/settings/ipc/gateway"
 
 function GithubIcon({ size = 16, className }: { size?: number; className?: string }) {
   return (
@@ -36,7 +38,24 @@ const navLinks = [
 ]
 
 export function HomePage() {
-  const [isDark, setIsDark] = useState(false)
+  const settings = useSyncExternalStore(subscribeSettingsRuntime, getSettingsRuntimeSnapshot, getSettingsRuntimeSnapshot)
+  const [isUpdatingTheme, setIsUpdatingTheme] = useState(false)
+  const isDark = settings.appearance.theme === "dark"
+
+  const toggleTheme = () => {
+    if (isUpdatingTheme) return
+    const nextTheme = isDark ? "light" : "dark"
+    setIsUpdatingTheme(true)
+    void settingsGateway.settingsGet("appearance")
+      .then((current) => settingsGateway.settingsUpdate({
+        section: "appearance",
+        expectedRevision: current.revision,
+        patch: { section: "appearance", theme: nextTheme },
+      }))
+      .then((result) => publishSettingsRuntimeValue(result.value))
+      .catch(() => undefined)
+      .finally(() => setIsUpdatingTheme(false))
+  }
 
   return (
     <div className={cn(
@@ -101,7 +120,8 @@ export function HomePage() {
           </span>
           <button
             type="button"
-            onClick={() => setIsDark((current) => !current)}
+            onClick={toggleTheme}
+            disabled={isUpdatingTheme}
             aria-label={isDark ? "切换浅色主题" : "切换深色主题"}
             className={cn(
               "flex h-9 w-9 items-center justify-center rounded-full transition-colors",

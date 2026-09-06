@@ -418,7 +418,7 @@ pub trait StorageLocationRepository {
 pub trait DownloadRepository {
     async fn get(&self, id: DownloadTaskId) -> Result<Option<DownloadTask>, AppError>;
     async fn save(&self, task: &DownloadTask) -> Result<(), AppError>;
-    async fn list(&self, limit: u32) -> Result<Vec<DownloadTask>, AppError>;
+    async fn list(&self, limit: u32, offset: u32) -> Result<Vec<DownloadTask>, AppError>;
     /// 查找同一来源和目标的可复用任务；失败/取消任务允许重新创建。
     async fn find_active(
         &self,

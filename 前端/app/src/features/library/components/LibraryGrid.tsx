@@ -5,6 +5,7 @@ import { useNavigate } from "react-router"
 import { ArtworkImage } from "@/components/ui/haven/ArtworkImage"
 import { defaultCoverCategoryForMediaType } from "@/lib/default-cover"
 import { getHavenClientMode } from "@/lib/ipc/runtime"
+import { matchesLibraryCategory } from "../lib/library-category"
 
 export type SortOption = "date" | "name" | "year"
 export type ViewMode = "grid" | "list"
@@ -327,15 +328,8 @@ export function LibraryGrid({
   const navigate = useNavigate()
   const allowExternal = getHavenClientMode() !== "tauri"
 
-  const matchesCategory = (item: LibraryMediaItemData) => {
-    if (category === "all") return true
-    if (category === "video") return item.type === "movie" || item.type === "tv"
-    if (category === "periodical") return item.type === "periodical"
-    return item.type === category
-  }
-
   const sourceItems = itemsProp ?? REPRESENTATIVE_ITEMS
-  let items = sourceItems.filter(matchesCategory)
+  let items = sourceItems.filter((item) => matchesLibraryCategory(item, category))
 
   if (searchQuery.trim() !== "") {
     const q = searchQuery.toLowerCase()
@@ -368,7 +362,15 @@ export function LibraryGrid({
         {items.map((item) => (
           <div 
             key={item.id} 
-            onClick={() => navigate(`/work/${item.id}`, { state: { favorite: item.favorite } })}
+            role="button"
+            tabIndex={0}
+            onClick={() => selectionMode ? onToggleSelect?.(item.id) : navigate(`/work/${item.id}`, { state: { favorite: item.favorite } })}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" && event.key !== " ") return
+              event.preventDefault()
+              if (selectionMode) onToggleSelect?.(item.id)
+              else navigate(`/work/${item.id}`, { state: { favorite: item.favorite } })
+            }}
             onMouseEnter={() => onHoverItem?.(item)}
             className="flex items-center gap-6 p-3.5 rounded-2xl bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 transition-all cursor-pointer group border border-black/5 dark:border-white/5"
           >
