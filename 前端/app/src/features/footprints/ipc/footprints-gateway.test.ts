@@ -19,7 +19,7 @@ vi.mock("@/lib/havenState", () => ({
   getStoredFavoriteIds: mocks.getStoredFavoriteIds,
 }))
 
-import { getContinueFootprintItems, getFavoriteFootprintItems } from "./footprints-gateway"
+import { getContinueFootprintItems, getFavoriteFootprintItems, getRecentActivityFootprintItems } from "./footprints-gateway"
 
 function workCard(): WorkCardDto {
   return {
@@ -159,6 +159,64 @@ describe("footprints gateway runtime boundary", () => {
       workId: "work-tauri",
       mediaItemId,
       primaryAction: card.primaryAction,
+    }))
+  })
+
+  it("uses the history entry's exact media action and progress when the work card projects another episode", async () => {
+    mocks.getHavenClientMode.mockReturnValue("tauri")
+    const historyMediaItemId = "33333333-3333-4333-8333-333333333333"
+    const projectedMediaItemId = "44444444-4444-4444-8444-444444444444"
+    const card = workCard()
+    card.progress = {
+      mediaItemId: projectedMediaItemId,
+      completion: "in_progress",
+      progressRatio: 0.8,
+      revision: "revision-current",
+      updatedAt: "2026-09-07T00:00:00Z",
+      locator: { version: 1, kind: "book", data: { publicationResource: "chapter-current", formatLocator: null, progression: 0.8, textAnchor: null } },
+    }
+    card.primaryAction = {
+      kind: "reader",
+      labelHint: "continue",
+      editionId: "22222222-2222-4222-8222-222222222222",
+      mediaItemId: projectedMediaItemId,
+      locator: null,
+    }
+    const historyAction = {
+      kind: "reader" as const,
+      labelHint: "continue" as const,
+      editionId: "55555555-5555-4555-8555-555555555555",
+      mediaItemId: historyMediaItemId,
+      locator: null,
+    }
+    const historyProgress = {
+      ...card.progress,
+      mediaItemId: historyMediaItemId,
+      progressRatio: 0.4,
+      locator: { version: 1, kind: "book" as const, data: { publicationResource: "chapter-history", formatLocator: null, progression: 0.4, textAnchor: null } },
+    }
+    const entry = {
+      historyEntryId: "history-1",
+      mediaItemId: historyMediaItemId,
+      workId: card.workId,
+      editionId: historyAction.editionId,
+      startedAt: "2026-09-06T00:00:00Z",
+      lastActiveAt: "2026-09-06T00:00:00Z",
+      completedAt: null,
+      primaryAction: historyAction,
+      progress: historyProgress,
+    } as unknown as import("@/lib/ipc/generated/wire").HistoryEntryDto
+    mocks.getHavenClient.mockReturnValue({
+      historyList: vi.fn().mockResolvedValue([entry]),
+      libraryList: vi.fn().mockResolvedValue(page([card])),
+    })
+
+    const [result] = await getRecentActivityFootprintItems()
+
+    expect(result).toEqual(expect.objectContaining({
+      mediaItemId: historyMediaItemId,
+      primaryAction: historyAction,
+      progress: 40,
     }))
   })
 })

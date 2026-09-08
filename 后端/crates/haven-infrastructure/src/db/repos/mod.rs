@@ -415,6 +415,12 @@ impl haven_domain::contracts::ProgressRepository for SqliteRepositories {
             .save_if_revision(progress, expected_revision)
             .await
     }
+    async fn mark_completed(
+        &self,
+        progress: &haven_domain::entities::Progress,
+    ) -> Result<String, haven_common::AppError> {
+        self.progress.mark_completed(progress).await
+    }
     async fn recent(
         &self,
         limit: u32,

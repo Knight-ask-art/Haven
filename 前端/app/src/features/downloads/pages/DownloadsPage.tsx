@@ -23,7 +23,8 @@ import {
   applyDownloadEvent,
   createDownloadEventState,
   forgetDownloadEventsForTask,
-  mergeLatestDownloadEvents,
+  markOfflineResourceDeleted,
+  mergeDownloadList,
   mergeDownloadTask,
 } from "../lib/download-event-state"
 import { downloadErrorMessage, downloadErrorRetryable } from "../lib/download-error"
@@ -79,6 +80,7 @@ export function DownloadsPage() {
   const eventStateRef = useRef(createDownloadEventState())
   const tasksRef = useRef<DownloadTaskDto[]>([])
   const listRequestRef = useRef(0)
+  const visibleListRequestsRef = useRef(0)
   const unknownRefreshPendingRef = useRef(false)
   const { push, confirm } = useNotice()
 
@@ -104,11 +106,14 @@ export function DownloadsPage() {
   const refresh = useCallback(async (silent = false) => {
     if (runtimeState !== "ready") return
     const requestId = ++listRequestRef.current
-    if (!silent) setLoading(true)
+    if (!silent) {
+      visibleListRequestsRef.current += 1
+      setLoading(true)
+    }
     try {
       const next = await listDownloads()
       if (requestId !== listRequestRef.current) return
-      const merged = mergeLatestDownloadEvents(next, eventStateRef.current)
+      const merged = mergeDownloadList(tasksRef.current, next, eventStateRef.current)
       tasksRef.current = merged
       setTasks(merged)
       setErrorMessage(null)
@@ -118,7 +123,10 @@ export function DownloadsPage() {
         publishDownloadError(error, "无法加载下载任务", "downloads:list")
       }
     } finally {
-      if (!silent && requestId === listRequestRef.current) setLoading(false)
+      if (!silent) {
+        visibleListRequestsRef.current = Math.max(0, visibleListRequestsRef.current - 1)
+        if (visibleListRequestsRef.current === 0) setLoading(false)
+      }
       if (requestId === listRequestRef.current) unknownRefreshPendingRef.current = false
     }
   }, [publishDownloadError, runtimeState])
@@ -128,7 +136,6 @@ export function DownloadsPage() {
     action: (id: string) => Promise<DownloadTaskDto>,
   ) => {
     setPendingTaskIds((current) => new Set(current).add(taskId))
-    unknownRefreshPendingRef.current = false
     try {
       const updated = await action(taskId)
       listRequestRef.current += 1
@@ -137,6 +144,7 @@ export function DownloadsPage() {
         tasksRef.current = next
         return next
       })
+      if (unknownRefreshPendingRef.current) void refresh(true)
       setErrorMessage(null)
     } catch (error) {
       setErrorMessage(userMessage(error, "下载操作失败"))
@@ -156,7 +164,7 @@ export function DownloadsPage() {
         return next
       })
     }
-  }, [publishDownloadError])
+  }, [publishDownloadError, refresh])
 
   useEffect(() => {
     if (runtimeState !== "ready") return
@@ -165,7 +173,6 @@ export function DownloadsPage() {
     const onEvent = (event: DownloadEvent) => {
       if (!mounted || !acceptDownloadEvent(eventStateRef.current, event)) return
       const unknownTask = !tasksRef.current.some((task) => task.taskId === event.data.taskId)
-      listRequestRef.current += 1
       if ((event.data.state === "failed" || event.data.state === "interrupted") && event.data.errorCode) {
         const retryable = downloadErrorRetryable(event.data.errorCode)
         push({
@@ -184,7 +191,7 @@ export function DownloadsPage() {
         })
       }
       setTasks((current) => {
-        const next = applyDownloadEvent(current, event)
+        const next = applyDownloadEvent(current, event, eventStateRef.current)
         tasksRef.current = next
         return next
       })
@@ -222,11 +229,10 @@ export function DownloadsPage() {
     action: (id: string) => Promise<{ recordRemoved: boolean; offlineResourceRemoved: boolean }>,
   ) => {
     setPendingTaskIds((current) => new Set(current).add(taskId))
-    unknownRefreshPendingRef.current = false
     try {
       const result = await action(taskId)
-      forgetDownloadEventsForTask(eventStateRef.current, taskId)
       if (result.recordRemoved) {
+        forgetDownloadEventsForTask(eventStateRef.current, taskId)
         listRequestRef.current += 1
         setTasks((current) => {
           const next = current.filter((task) => task.taskId !== taskId)
@@ -234,6 +240,7 @@ export function DownloadsPage() {
           return next
         })
       } else if (result.offlineResourceRemoved) {
+        markOfflineResourceDeleted(eventStateRef.current, taskId)
         listRequestRef.current += 1
         setTasks((current) => {
           const next = current.map((task) => task.taskId === taskId ? { ...task, offlineResourceId: null } : task)
@@ -241,6 +248,7 @@ export function DownloadsPage() {
           return next
         })
       }
+      if (unknownRefreshPendingRef.current) void refresh(true)
       setErrorMessage(null)
     } catch (error) {
       setErrorMessage(userMessage(error, "下载内容操作失败"))
@@ -252,7 +260,7 @@ export function DownloadsPage() {
         return next
       })
     }
-  }, [publishDownloadError])
+  }, [publishDownloadError, refresh])
 
   const handleDeleteOffline = useCallback((taskId: string) => {
     void confirm({

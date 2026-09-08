@@ -18,6 +18,7 @@
     "allow-open-cache-directory",
     "allow-library-list",
     "allow-progress-save",
+    "allow-progress-mark-completed",
     "allow-favorite-set",
     "allow-home-get",
     "allow-storage-location-list",

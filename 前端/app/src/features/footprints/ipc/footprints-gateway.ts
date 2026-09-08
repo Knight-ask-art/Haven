@@ -72,6 +72,7 @@ export type FootprintActionCard = MediaCardProps & {
   mediaItemId: string | null
   primaryAction: PrimaryActionDto | null
   favorite: boolean
+  completion?: ProgressSummaryDto["completion"]
 }
 
 function toMediaCard(card: WorkCardDto): FootprintActionCard {
@@ -81,6 +82,7 @@ function toMediaCard(card: WorkCardDto): FootprintActionCard {
     mediaItemId: card.primaryAction?.mediaItemId ?? null,
     primaryAction: card.primaryAction,
     favorite: card.favorite,
+    completion: card.progress?.completion,
     title: card.title,
     subtitle: `已收藏 · ${categoryLabel(card)}`,
     typeBadge: categoryLabel(card),
@@ -153,6 +155,7 @@ function progressToCard(p: ProgressSummaryDto, card: WorkCardDto | undefined): F
     mediaItemId: p.mediaItemId,
     primaryAction: card.primaryAction,
     favorite: card.favorite,
+    completion: p.completion,
     title: card.title,
     subtitle: PROGRESS_LABEL[mediaType] ?? "继续",
     typeBadge: categoryLabel(card),
@@ -180,16 +183,15 @@ export type HistoryCardProps = MediaCardProps & {
 function historyToCard(
   entry: HistoryEntryDto,
   card: WorkCardDto | undefined,
-  _progress?: ProgressSummaryDto | null,
 ): HistoryCardProps | null {
   if (!card) return null
   // 浏览记录一律海报，不取关键帧（产品要求）
-  const p = card.progress
+  const p = entry.progress
   return {
-    id: card.workId,
+    id: entry.historyEntryId,
     workId: card.workId,
     mediaItemId: entry.mediaItemId,
-    primaryAction: card.primaryAction,
+    primaryAction: entry.primaryAction,
     title: card.title,
     subtitle: `最近活动 · ${categoryLabel(card)}`,
     typeBadge: categoryLabel(card),
@@ -238,7 +240,10 @@ export async function getRecentActivityFootprintItems(): Promise<HistoryCardProp
   ])
   const index = buildMediaItemIndex(cards)
   return historyItems
-    .map((entry) => historyToCard(entry, index.get(entry.mediaItemId) ?? index.get(entry.workId)))
+    // WorkCard is display metadata only. HistoryEntry owns its exact MediaItem
+    // action/progress, so a current card projection for another episode cannot
+    // reroute a historical click or overwrite its percentage.
+    .map((entry) => historyToCard(entry, index.get(entry.workId)))
     .filter((item): item is HistoryCardProps => item !== null)
 }
 

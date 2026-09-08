@@ -43,4 +43,21 @@ describe("video progress controller", () => {
   it("restores video once, rejects invalid and clamps duration", () => {
     const s = session({ mediaItemId: session().mediaItemId, completion: "in_progress", progressRatio: null, revision: "progress-rev-1", updatedAt: "2026-08-18T00:00:00.000Z", locator: { version: 1, kind: "video", data: { positionMs: 9000 } } }); const video = { currentTime: 0, duration: 5 }; const once = { current: null as string | null }; expect(restoreVideoProgress(video, s, once)).toBe(true); expect(video.currentTime).toBe(5); expect(restoreVideoProgress(video, s, once)).toBe(false); const other = session({ ...s.progress!, locator: { version: 1, kind: "video", data: { positionMs: 1000 } } }); other.sessionId = "0196f0d2-0000-0000-0000-000000000099"; expect(restoreVideoProgress(video, other, once)).toBe(true); expect(restoreVideoProgress(video, session({ ...s.progress!, locator: { version: 1, kind: "book", data: { publicationResource: "x", progression: null, textAnchor: null, formatLocator: null } } }), once)).toBe(false)
   })
+
+  it("opens reset progress at the beginning instead of applying its retained locator", () => {
+    const reset = session({
+      mediaItemId: session().mediaItemId,
+      completion: "not_started",
+      progressRatio: 0,
+      revision: "progress-rev-reset",
+      updatedAt: "2026-09-07T00:00:00.000Z",
+      locator: { version: 1, kind: "video", data: { positionMs: 50_000 } },
+    })
+    const video = { currentTime: 37, duration: 90 }
+    const restored = { current: null as string | null }
+
+    expect(restoreVideoProgress(video, reset, restored)).toBe(true)
+    expect(video.currentTime).toBe(0)
+    expect(restored.current).toBe(`${reset.sessionId}:${reset.mediaItemId}:${reset.contentUri}`)
+  })
 })

@@ -629,10 +629,7 @@ mod tests {
                 Box::new(move |event| received.lock().unwrap().push(event.kind))
             },
         });
-        sink.emitters
-            .lock()
-            .unwrap()
-            .push(BoundEmitter { route });
+        sink.emitters.lock().unwrap().push(BoundEmitter { route });
 
         sink.emit_scan_event(sample_scan_event(
             "op-terminal",

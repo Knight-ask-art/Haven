@@ -115,6 +115,10 @@ export function LibraryPage() {
   const getCategoryItems = (cat: string) => filterLibraryItemsByCategory(libraryItems, cat)
 
   const handleSelectCategory = (categoryId: string) => {
+    if (batchSaving) return
+    // A selection is scoped to the category visible when it was made. Keep
+    // batch mode open across category changes, but never carry hidden items.
+    setSelectedIds(new Set())
     setSearchParams(
       (prev) => {
         prev.set("category", categoryId)
@@ -147,34 +151,43 @@ export function LibraryPage() {
   }, [])
 
   const toggleSelected = useCallback((id: string) => {
+    if (batchSaving) return
     setSelectedIds((current) => {
       const next = new Set(current)
       if (next.has(id)) next.delete(id)
       else next.add(id)
       return next
     })
-  }, [])
+  }, [batchSaving])
 
   const handleBatchComplete = useCallback(async () => {
     if (batchSaving || selectedIds.size === 0) return
-    const selected = libraryItems.filter((item) => selectedIds.has(item.id))
+    const selected = filterLibraryItemsByCategory(libraryItems, activeCategory)
+      .filter((item) => selectedIds.has(item.id))
     setBatchSaving(true)
     setBatchMessage(null)
-    const results = await Promise.allSettled(selected.map((item) => markLibraryItemCompleted(item)))
-    const failedIds = new Set(results
-      .flatMap((result, index) => result.status === "rejected" ? [selected[index]?.id] : [])
-      .filter((id): id is string => Boolean(id)))
-    const succeeded = selected.length - failedIds.size
-    setSelectedIds(failedIds)
-    if (failedIds.size === 0) {
-      setSelectionMode(false)
-      setBatchMessage(`已标记 ${succeeded} 项为已读`)
-    } else {
-      setBatchMessage(`${succeeded} 项已标记，${failedIds.size} 项失败，请重试`)
+    try {
+      const results = await Promise.allSettled(selected.map((item) => markLibraryItemCompleted(item)))
+      const failedIds = new Set(results
+        .flatMap((result, index) => result.status === "rejected" ? [selected[index]?.id] : [])
+        .filter((id): id is string => Boolean(id)))
+      const succeeded = selected.length - failedIds.size
+      setSelectedIds(failedIds)
+      if (failedIds.size === 0) {
+        setSelectionMode(false)
+        setBatchMessage(`已标记 ${succeeded} 项为已读`)
+      } else {
+        setBatchMessage(`${succeeded} 项已标记，${failedIds.size} 项失败，请重试`)
+      }
+      try {
+        await loadLibrary()
+      } catch {
+        // Per-item results remain authoritative even if the follow-up refresh fails.
+      }
+    } finally {
+      setBatchSaving(false)
     }
-    await loadLibrary()
-    setBatchSaving(false)
-  }, [batchSaving, libraryItems, loadLibrary, selectedIds])
+  }, [activeCategory, batchSaving, libraryItems, loadLibrary, selectedIds])
   useEffect(() => () => {
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current)
   }, [])
@@ -198,7 +211,7 @@ export function LibraryPage() {
     itemCount: libraryItems.length,
     error: loadError,
   })
-  const batchOperationAvailable = isTauriRuntime() && activeCategory === "all"
+  const batchOperationAvailable = isTauriRuntime()
 
   return (
     <div
@@ -246,7 +259,7 @@ export function LibraryPage() {
           <div className="absolute top-0 inset-x-0 z-20 flex items-center justify-between bg-black/80 px-6 py-3 text-white backdrop-blur-md">
             <span className="text-sm font-semibold">已选 {selectedIds.size} 项</span>
             <div className="flex items-center gap-2">
-              <button type="button" onClick={() => { setSelectedIds(new Set()); setSelectionMode(false) }} className="rounded-full bg-white/10 px-3 py-1.5 text-xs font-semibold hover:bg-white/20">取消</button>
+              <button type="button" disabled={batchSaving} onClick={() => { setSelectedIds(new Set()); setSelectionMode(false) }} className="rounded-full bg-white/10 px-3 py-1.5 text-xs font-semibold hover:bg-white/20 disabled:opacity-40">取消</button>
               <button type="button" onClick={() => void handleBatchComplete()} disabled={batchSaving || selectedIds.size === 0} className="rounded-full bg-white px-3 py-1.5 text-xs font-bold text-black disabled:opacity-40">
                 {batchSaving ? "标记中…" : "标记已看"}
               </button>
@@ -301,7 +314,10 @@ export function LibraryPage() {
           {batchOperationAvailable && (
             <div className="flex items-center justify-end gap-3">
               {batchMessage && <span role="status" className="text-xs text-white/80">{batchMessage}</span>}
-              <button type="button" onClick={() => setSelectionMode((current) => !current)} className="rounded-full bg-white/10 px-3 py-1.5 text-xs font-semibold text-white backdrop-blur hover:bg-white/20">
+              <button type="button" disabled={batchSaving} onClick={() => {
+                setSelectedIds(new Set())
+                setSelectionMode((current) => !current)
+              }} className="rounded-full bg-white/10 px-3 py-1.5 text-xs font-semibold text-white backdrop-blur hover:bg-white/20 disabled:opacity-40">
                 {selectionMode ? "退出批量" : "批量操作"}
               </button>
             </div>
@@ -315,6 +331,9 @@ export function LibraryPage() {
                 items={movies}
                 onHoverSpotlight={handleHoverSpotlight}
                 onSeeMore={() => navigate("/library/browse/video")}
+                selectionMode={selectionMode}
+                selectedIds={selectedIds}
+                onToggleSelect={toggleSelected}
               />
 
               <LibraryTVRowShelf
@@ -322,6 +341,9 @@ export function LibraryPage() {
                 items={books}
                 onHoverSpotlight={handleHoverSpotlight}
                 onSeeMore={() => navigate("/library/browse/book")}
+                selectionMode={selectionMode}
+                selectedIds={selectedIds}
+                onToggleSelect={toggleSelected}
               />
 
               <LibraryTVRowShelf
@@ -329,6 +351,9 @@ export function LibraryPage() {
                 items={comics}
                 onHoverSpotlight={handleHoverSpotlight}
                 onSeeMore={() => navigate("/library/browse/comic")}
+                selectionMode={selectionMode}
+                selectedIds={selectedIds}
+                onToggleSelect={toggleSelected}
               />
 
               <LibraryTVRowShelf
@@ -336,6 +361,9 @@ export function LibraryPage() {
                 items={periodicals}
                 onHoverSpotlight={handleHoverSpotlight}
                 onSeeMore={() => navigate("/library/browse/periodical")}
+                selectionMode={selectionMode}
+                selectedIds={selectedIds}
+                onToggleSelect={toggleSelected}
               />
 
               <LibraryTVRowShelf
@@ -343,6 +371,9 @@ export function LibraryPage() {
                 items={documents}
                 onHoverSpotlight={handleHoverSpotlight}
                 onSeeMore={() => navigate("/library/browse/document")}
+                selectionMode={selectionMode}
+                selectedIds={selectedIds}
+                onToggleSelect={toggleSelected}
               />
             </>
           )}
@@ -355,6 +386,9 @@ export function LibraryPage() {
                 items={getCategoryItems(activeCategory)}
                 onHoverSpotlight={handleHoverSpotlight}
                 onSeeMore={() => navigate(`/library/browse/${activeCategory}`)}
+                selectionMode={selectionMode}
+                selectedIds={selectedIds}
+                onToggleSelect={toggleSelected}
               />
 
               <div className="flex flex-col gap-[16px] border-t border-white/10 pt-[32px]">

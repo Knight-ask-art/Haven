@@ -25,6 +25,20 @@ function publicationResourceOf(mediaItemId: string): string {
   return `haven-resource://text/${mediaItemId}`
 }
 
+/**
+ * Returns the bounded progression used to initialise reader UI and the first
+ * controller update. A reset intentionally retains its locator on the server,
+ * but it must never make that stale position visible or writable again.
+ */
+export function bookResumeProgression(session: SessionOpenResultDto): number {
+  const progress = session.progress
+  if (!progress || progress.locator.kind !== "book" || progress.completion === "not_started") return 0
+  const progression = progress.locator.data.progression
+  return typeof progression === "number" && Number.isFinite(progression)
+    ? Math.min(1, Math.max(0, progression))
+    : 0
+}
+
 export function createBookProgressController(options: BookProgressControllerOptions): BookProgressController {
   const { session } = options
   const save = options.save ?? ((request) => saveProgress(request))
@@ -99,6 +113,12 @@ export function restoreBookProgress(
   if (session.progress.locator.kind !== "book") return false
   const identity = `${session.sessionId}:${session.mediaItemId}:${session.contentUri}`
   if (restored?.current === identity) return false
+  if (session.progress.completion === "not_started") {
+    if (mode !== "scroll" && scrollContainer.scrollLeft === undefined) return false
+    setBookPaginationOffsetInstant(scrollContainer, 0, mode)
+    if (restored) restored.current = identity
+    return true
+  }
   const progression = session.progress.locator.data.progression
   if (progression == null || !Number.isFinite(progression) || progression < 0) return false
   const viewport: BookPaginationViewport = {

@@ -6,15 +6,20 @@
 //! - record 幂等：同一 media_item 只保留一条（started_at 保留首次，last_active_at 刷新）。
 //! - MediaItem 不存在 → `MEDIA_ITEM_NOT_FOUND`（友好错误码，链校验兜底在 Repository）。
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use haven_common::AppError;
-use haven_domain::contracts::{EditionRepository, HistoryRepository, MediaItemRepository};
+use haven_domain::contracts::{
+    EditionRepository, HistoryRepository, MediaItemRepository, ProgressRepository,
+};
 use haven_domain::entities::HistoryEntry;
 use haven_domain::ids::{HistoryEntryId, MediaItemId};
 use haven_domain::settings::{SettingsSection, SettingsValue};
 
+use crate::mapper::progress::progress_summary;
 use crate::mapper::time::utc_millis_to_rfc3339;
+use crate::mapper::work_card::primary_action_for_media_item;
 use crate::services::settings::SettingsService;
 use crate::wire::HistoryEntryDto;
 
@@ -22,7 +27,7 @@ use crate::wire::HistoryEntryDto;
 /// 访问方法由 blanket impl 提供（具体类型 → 子契约 coercion），
 /// 避免 dyn→dyn trait upcasting（MSRV 1.85 不支持，E0658）。
 pub trait HistoryPorts:
-    MediaItemRepository + EditionRepository + HistoryRepository + Send + Sync
+    MediaItemRepository + EditionRepository + HistoryRepository + ProgressRepository + Send + Sync
 {
     fn as_history(&self) -> &dyn HistoryRepository;
     fn as_media_item(&self) -> &dyn MediaItemRepository;
@@ -30,7 +35,12 @@ pub trait HistoryPorts:
 }
 impl<T> HistoryPorts for T
 where
-    T: MediaItemRepository + EditionRepository + HistoryRepository + Send + Sync,
+    T: MediaItemRepository
+        + EditionRepository
+        + HistoryRepository
+        + ProgressRepository
+        + Send
+        + Sync,
 {
     fn as_history(&self) -> &dyn HistoryRepository {
         self
@@ -149,7 +159,7 @@ impl HistoryService {
             .as_history()
             .list_for_media_item(media_item_id)
             .await?;
-        Ok(entries.iter().map(to_dto).collect())
+        self.to_dtos(entries).await
     }
 
     pub async fn recent(&self, limit: u32) -> Result<Vec<HistoryEntryDto>, AppError> {
@@ -158,7 +168,7 @@ impl HistoryService {
             .as_history()
             .recent(limit.min(crate::services::library::MAX_LIMIT))
             .await?;
-        Ok(entries.iter().map(to_dto).collect())
+        self.to_dtos(entries).await
     }
 
     /// `history_clear`：只清历史，不动 Progress / Favorite / Marker（契约 §23.2）。
@@ -173,10 +183,61 @@ impl HistoryService {
             None => Err(media_item_not_found()),
         }
     }
+
+    async fn to_dtos(&self, entries: Vec<HistoryEntry>) -> Result<Vec<HistoryEntryDto>, AppError> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `history_list` can return up to MAX_LIMIT rows. Resolve the content
+        // chain in bounded batch queries instead of reintroducing an N+1 query
+        // path merely to preserve each historical item's action identity.
+        let work_ids: Vec<_> = entries
+            .iter()
+            .map(|entry| entry.work_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let editions = EditionRepository::list_by_works(&*self.ports, &work_ids).await?;
+        let expected_edition_ids: HashSet<_> =
+            entries.iter().map(|entry| entry.edition_id).collect();
+        let relevant_editions: Vec<_> = editions
+            .into_iter()
+            .filter(|edition| expected_edition_ids.contains(&edition.id))
+            .collect();
+        let edition_by_id: HashMap<_, _> = relevant_editions
+            .iter()
+            .map(|edition| (edition.id, edition))
+            .collect();
+        let edition_ids: Vec<_> = edition_by_id.keys().copied().collect();
+        let media_items = MediaItemRepository::list_by_editions(&*self.ports, &edition_ids).await?;
+        let media_by_id: HashMap<_, _> = media_items
+            .iter()
+            .map(|media_item| (media_item.id, media_item))
+            .collect();
+        let media_ids: Vec<_> = entries.iter().map(|entry| entry.media_item_id).collect();
+        let progress_by_media =
+            ProgressRepository::get_for_media_items(&*self.ports, &media_ids).await?;
+
+        entries
+            .iter()
+            .map(|entry| {
+                let media_item = media_by_id.get(&entry.media_item_id).copied();
+                let edition =
+                    media_item.and_then(|item| edition_by_id.get(&item.edition_id).copied());
+                let progress = progress_by_media.get(&entry.media_item_id);
+                to_dto(entry, media_item, edition, progress)
+            })
+            .collect()
+    }
 }
 
-fn to_dto(entry: &HistoryEntry) -> HistoryEntryDto {
-    HistoryEntryDto {
+fn to_dto(
+    entry: &HistoryEntry,
+    media_item: Option<&haven_domain::entities::MediaItem>,
+    edition: Option<&haven_domain::entities::Edition>,
+    progress: Option<&haven_domain::entities::Progress>,
+) -> Result<HistoryEntryDto, AppError> {
+    Ok(HistoryEntryDto {
         history_entry_id: entry.id.to_string(),
         media_item_id: entry.media_item_id.to_string(),
         work_id: entry.work_id.to_string(),
@@ -184,7 +245,19 @@ fn to_dto(entry: &HistoryEntry) -> HistoryEntryDto {
         started_at: utc_millis_to_rfc3339(entry.started_at),
         last_active_at: utc_millis_to_rfc3339(entry.last_active_at),
         completed_at: entry.completed_at.map(utc_millis_to_rfc3339),
-    }
+        primary_action: match (media_item, edition) {
+            (Some(media_item), Some(edition)) if media_item.edition_id == edition.id => {
+                Some(primary_action_for_media_item(
+                    edition.id,
+                    edition.edition_type,
+                    media_item,
+                    progress,
+                ))
+            }
+            _ => None,
+        },
+        progress: progress.map(progress_summary).transpose()?,
+    })
 }
 
 fn media_item_not_found() -> AppError {
@@ -280,6 +353,7 @@ mod tests {
         items: Vec<MediaItem>,
         editions: Vec<Edition>,
         entries: std::sync::Mutex<Vec<HistoryEntry>>,
+        progress: std::sync::Mutex<Vec<haven_domain::entities::Progress>>,
     }
 
     fn mem_ports() -> (MemPorts, MediaItemId) {
@@ -318,6 +392,7 @@ mod tests {
                 updated_at: haven_common::UtcMillis(1),
             }],
             entries: std::sync::Mutex::new(vec![]),
+            progress: std::sync::Mutex::new(vec![]),
         };
         (ports, media_item_id)
     }
@@ -330,8 +405,13 @@ mod tests {
         async fn save(&self, _m: &MediaItem) -> Result<(), AppError> {
             Ok(())
         }
-        async fn list_by_edition(&self, _e: EditionId) -> Result<Vec<MediaItem>, AppError> {
-            Ok(vec![])
+        async fn list_by_edition(&self, edition_id: EditionId) -> Result<Vec<MediaItem>, AppError> {
+            Ok(self
+                .items
+                .iter()
+                .filter(|item| item.edition_id == edition_id)
+                .cloned()
+                .collect())
         }
         async fn delete(&self, _id: MediaItemId) -> Result<bool, AppError> {
             Ok(false)
@@ -346,8 +426,13 @@ mod tests {
         async fn save(&self, _e: &Edition) -> Result<(), AppError> {
             Ok(())
         }
-        async fn list_by_work(&self, _w: WorkId) -> Result<Vec<Edition>, AppError> {
-            Ok(vec![])
+        async fn list_by_work(&self, work_id: WorkId) -> Result<Vec<Edition>, AppError> {
+            Ok(self
+                .editions
+                .iter()
+                .filter(|edition| edition.work_id == work_id)
+                .cloned()
+                .collect())
         }
         async fn delete(&self, _id: EditionId) -> Result<bool, AppError> {
             Ok(false)
@@ -402,6 +487,50 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl ProgressRepository for MemPorts {
+        async fn get_for_media_item(
+            &self,
+            media_item_id: MediaItemId,
+        ) -> Result<Option<haven_domain::entities::Progress>, AppError> {
+            Ok(self
+                .progress
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|progress| progress.media_item_id == media_item_id)
+                .cloned())
+        }
+        async fn save(&self, progress: &haven_domain::entities::Progress) -> Result<(), AppError> {
+            self.progress.lock().unwrap().push(progress.clone());
+            Ok(())
+        }
+        async fn save_if_revision(
+            &self,
+            progress: &haven_domain::entities::Progress,
+            _expected_revision: Option<&str>,
+        ) -> Result<Option<String>, AppError> {
+            ProgressRepository::save(self, progress).await?;
+            Ok(progress.revision.clone())
+        }
+        async fn mark_completed(
+            &self,
+            progress: &haven_domain::entities::Progress,
+        ) -> Result<String, AppError> {
+            ProgressRepository::save(self, progress).await?;
+            Ok(progress
+                .revision
+                .clone()
+                .unwrap_or_else(|| "test-revision".into()))
+        }
+        async fn recent(
+            &self,
+            _limit: u32,
+        ) -> Result<Vec<haven_domain::entities::Progress>, AppError> {
+            Ok(self.progress.lock().unwrap().clone())
+        }
+    }
+
     #[tokio::test]
     async fn record_creates_then_refreshes_same_entry() {
         let (ports, media_item_id) = mem_ports();
@@ -430,6 +559,24 @@ mod tests {
         service.complete(media_item_id).await.unwrap();
         let entries = service.list_for_media_item(media_item_id).await.unwrap();
         assert!(entries[0].completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn recent_projects_the_history_media_item_own_action() {
+        let (ports, media_item_id) = mem_ports();
+        let service = HistoryService::new(Arc::new(ports), settings_service(true));
+        service.record(media_item_id).await.unwrap();
+
+        let recent = service.recent(10).await.unwrap();
+        let action = recent[0]
+            .primary_action
+            .as_ref()
+            .expect("known history media item has an action");
+        assert_eq!(
+            action.media_item_id.as_deref(),
+            Some(media_item_id.to_string().as_str())
+        );
+        assert_eq!(action.kind, crate::wire::PrimaryActionKind::Playback);
     }
 
     #[tokio::test]

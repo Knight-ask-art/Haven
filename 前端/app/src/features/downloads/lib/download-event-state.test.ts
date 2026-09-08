@@ -6,6 +6,7 @@ import {
   applyDownloadEvent,
   createDownloadEventState,
   forgetDownloadEventsForTask,
+  markOfflineResourceDeleted,
   mergeLatestDownloadEvents,
 } from "./download-event-state"
 
@@ -63,7 +64,7 @@ describe("download event state", () => {
   })
 
   it("patches progress, speed and ETA from the latest channel event", () => {
-    const [task] = applyDownloadEvent([BASE_TASK], event(1))
+    const [task] = applyDownloadEvent([BASE_TASK], event(1), createDownloadEventState())
 
     expect(task).toMatchObject({
       state: "downloading",
@@ -82,7 +83,7 @@ describe("download event state", () => {
       speedBps: null,
       etaSeconds: null,
     })
-    const [task] = applyDownloadEvent([BASE_TASK], completed)
+    const [task] = applyDownloadEvent([BASE_TASK], completed, createDownloadEventState())
 
     expect(task).toMatchObject({
       state: "completed",
@@ -116,6 +117,21 @@ describe("download event state", () => {
     const [task] = mergeLatestDownloadEvents([BASE_TASK], state)
     expect(task.offlineResourceId).toBeNull()
     expect(task.state).toBe("queued")
+  })
+
+  it("keeps a deleted offline resource absent when a delayed terminal event arrives", () => {
+    const state = createDownloadEventState()
+    const completed = event(2, {
+      state: "completed",
+      offlineResourceId: "resource-offline",
+      bytesDownloaded: 100,
+    })
+    markOfflineResourceDeleted(state, BASE_TASK.taskId)
+
+    const [task] = applyDownloadEvent([BASE_TASK], completed, state)
+
+    expect(task.state).toBe("completed")
+    expect(task.offlineResourceId).toBeNull()
   })
 
   it("keeps a stable worker error code on failed events for the notice layer", () => {

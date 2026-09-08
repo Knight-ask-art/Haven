@@ -17,7 +17,7 @@ import type { HavenClient } from "@/lib/ipc/client"
 import type { LibraryListRequest, LocatorDto, PageDto, WorkCardDto } from "@/lib/ipc/generated/wire"
 
 import { resolveLibraryRuntimeState } from "../lib/library-runtime-state"
-import { saveProgress } from "@/features/progress/ipc/progress-gateway"
+import { markCompletedProgress } from "@/features/progress/ipc/progress-gateway"
 
 
 /** 每个 IPC 请求的上限；调用方必须继续消费 nextCursor。 */
@@ -187,10 +187,8 @@ export async function markLibraryItemCompleted(item: LibraryMediaItemData): Prom
   if (!item.progressMediaItemId || !item.progressLocator) {
     throw new Error(`${item.title}没有可用的阅读定位`)
   }
-  await saveProgress({
+  await markCompletedProgress({
     mediaItemId: item.progressMediaItemId,
-    locator: item.progressLocator,
-    completion: "completed",
-    expectedRevision: null,
+    initialLocator: item.progressLocator,
   })
 }

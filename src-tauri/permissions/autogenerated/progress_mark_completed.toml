@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-progress-mark-completed"
+description = "Enables the progress_mark_completed command without any pre-configured scope."
+commands.allow = ["progress_mark_completed"]
+
+[[permission]]
+identifier = "deny-progress-mark-completed"
+description = "Denies the progress_mark_completed command without any pre-configured scope."
+commands.deny = ["progress_mark_completed"]

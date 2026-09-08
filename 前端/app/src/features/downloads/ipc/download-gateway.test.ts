@@ -66,12 +66,12 @@ describe("getWorkDownloadState", () => {
       .resolves.toBe("queued")
   })
 
-  it("requires a completed task to retain its offline resource", async () => {
+  it("does not trust a completed task unless its offline resource is present", async () => {
     await expect(getWorkDownloadState("work-1", "media-1", clientWith([BASE_TASK])))
       .resolves.toBe("idle")
     const completed = { ...BASE_TASK, offlineResourceId: "offline-1" }
     await expect(getWorkDownloadState("work-1", "media-1", clientWith([completed])))
-      .resolves.toBe("downloaded")
+      .resolves.toBe("idle")
   })
 
   it("still detects Offline Resource after the task record is removed", async () => {
@@ -126,6 +126,36 @@ describe("getWorkDownloadState", () => {
       .resolves.toMatchObject({ status: "downloaded", taskId: "completed-task" })
   })
 
+  it("pairs an available offline resource with its exact completed task", async () => {
+    const resources: ResourceListDto = {
+      schemaVersion: 1,
+      items: [{
+        resourceId: "offline-available",
+        resourceType: "local_file",
+        availability: "offline_available",
+        mimeType: null,
+        size: 100,
+        storageDisplayName: "离线库",
+        sourceDisplayName: null,
+        isOffline: true,
+        isLocal: true,
+        requiresReauthorization: false,
+        canDownload: false,
+        canOnlineRead: true,
+        streamKind: null,
+      }],
+    }
+    const missing = { ...BASE_TASK, taskId: "missing-task", offlineResourceId: "offline-missing" }
+    const available = { ...BASE_TASK, taskId: "available-task", offlineResourceId: "offline-available" }
+
+    await expect(getMediaItemDownloadInfo("media-1", clientWith([missing, available], resources)))
+      .resolves.toMatchObject({
+        status: "downloaded",
+        hasOfflineResource: true,
+        taskId: "available-task",
+      })
+  })
+
   it("does not report a completed task without an offline resource as downloaded", async () => {
     const task = { ...BASE_TASK, state: "completed" as const, offlineResourceId: null }
     await expect(getMediaItemDownloadInfo("media-1", clientWith([task])))
@@ -134,6 +164,42 @@ describe("getWorkDownloadState", () => {
         canDownload: false,
         hasOfflineResource: false,
         sourceResourceId: null,
+      })
+  })
+
+  it("does not report a completed task as downloaded when its offline resource is absent", async () => {
+    const staleCompleted = {
+      ...BASE_TASK,
+      taskId: "stale-completed-task",
+      offlineResourceId: "removed-offline-resource",
+    }
+
+    await expect(getMediaItemDownloadInfo("media-1", clientWith([staleCompleted])))
+      .resolves.toMatchObject({
+        status: "idle",
+        hasOfflineResource: false,
+        taskId: null,
+      })
+  })
+
+  it("uses an active task when an earlier completed task points to an absent resource", async () => {
+    const staleCompleted = {
+      ...BASE_TASK,
+      taskId: "stale-completed-task",
+      offlineResourceId: "removed-offline-resource",
+    }
+    const active = {
+      ...BASE_TASK,
+      taskId: "active-task",
+      state: "downloading" as const,
+      offlineResourceId: null,
+    }
+
+    await expect(getMediaItemDownloadInfo("media-1", clientWith([staleCompleted, active])))
+      .resolves.toMatchObject({
+        status: "queued",
+        hasOfflineResource: false,
+        taskId: "active-task",
       })
   })
 

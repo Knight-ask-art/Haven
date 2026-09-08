@@ -14,7 +14,7 @@ import {
   resolveBookReaderRuntimeState,
 } from "../lib/book-reader-runtime-state"
 import { selectReaderSessionView } from "../lib/reader-session-view"
-import { createBookProgressController, restoreBookProgress, type BookProgressController } from "../lib/book-progress-controller"
+import { bookResumeProgression, createBookProgressController, restoreBookProgress, type BookProgressController } from "../lib/book-progress-controller"
 import { decodeBookText, parseBookText, type BookChapter, type BookContentFormat } from "../lib/book-content"
 import { parseEpubBook } from "../lib/epub-content"
 import { findBookBookmark } from "../lib/book-marker-match"
@@ -663,12 +663,7 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
     let attempts = 0
     const restore = () => {
       if (cancelled) return
-      const progress = state.session.progress?.locator.kind === "book"
-        ? state.session.progress.locator.data.progression
-        : null
-      const safeProgress = typeof progress === "number" && Number.isFinite(progress)
-        ? Math.min(1, Math.max(0, progress))
-        : 0
+      const safeProgress = bookResumeProgression(state.session)
       const layoutReady = paginationMode === "scroll"
         ? scrollContainer.clientHeight > 0 && (safeProgress <= 0 || scrollContainer.scrollHeight > scrollContainer.clientHeight)
         : scrollContainer.clientWidth > 0 && (safeProgress <= 0 || scrollContainer.scrollWidth > scrollContainer.clientWidth)

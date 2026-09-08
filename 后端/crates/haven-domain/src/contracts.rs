@@ -306,6 +306,10 @@ pub trait ProgressRepository {
         progress: &Progress,
         expected_revision: Option<&str>,
     ) -> Result<Option<String>, AppError>;
+    /// 原子地标记已完成。发生冲突时只修改 `completion`、`updated_at` 和
+    /// `revision`，绝不把调用方过期的 Locator/percentage 回写到已有进度。
+    /// `progress` 的其余字段仅在尚不存在记录时作为创建候选。
+    async fn mark_completed(&self, progress: &Progress) -> Result<String, AppError>;
     /// 最近活跃的进度列表（首页 Continue 数据源）。
     async fn recent(&self, limit: u32) -> Result<Vec<Progress>, AppError>;
 
