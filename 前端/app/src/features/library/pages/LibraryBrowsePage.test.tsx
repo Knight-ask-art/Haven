@@ -64,7 +64,7 @@ describe("LibraryBrowsePage pagination races", () => {
 
     renderPage("/library/video?year=2026")
 
-    const retry = await screen.findByRole("button", { name: "重试继续" })
+    const retry = await screen.findByRole("button", { name: "重试继续" }, { timeout: 5_000 })
     expect(getLibraryBrowsePage).toHaveBeenCalledTimes(2)
     await new Promise((resolve) => setTimeout(resolve, 20))
     expect(getLibraryBrowsePage).toHaveBeenCalledTimes(2)

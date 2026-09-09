@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { useParams, useNavigate } from "react-router"
 import { cn } from "@/lib/utils"
 import { 
@@ -27,9 +27,14 @@ import { primaryActionRoute } from "../lib/primary-action-route"
 import type { PrimaryActionDto } from "@/lib/ipc/generated/wire"
 import {
   createDownloadForMediaItem,
+  deleteOfflineDownload,
   getMediaItemDownloadInfo,
+  revealOfflineDownload,
+  subscribeDownloadEvents,
+  type MediaItemDownloadInfo,
   type DownloadStatus,
 } from "@/features/downloads/ipc/download-gateway"
+import { resetProgress } from "@/features/progress/ipc/progress-gateway"
 
 export interface MediaDetailData {
   id: string
@@ -805,6 +810,13 @@ function MediaDetailExperience({ production }: { production: boolean }) {
   const [isDownloadSaving, setIsDownloadSaving] = useState(false)
   const favoriteRequestRef = useRef(0)
   const [downloadStatus, setDownloadStatus] = useState<DownloadStatus>("idle")
+  const [downloadTaskId, setDownloadTaskId] = useState<string | null>(null)
+  const [hasOfflineResource, setHasOfflineResource] = useState(false)
+  const [moreActionPending, setMoreActionPending] = useState<"folder" | "reset" | "delete" | null>(null)
+  const mediaActionGenerationRef = useRef(0)
+  const downloadRequestRef = useRef(0)
+  const downloadTaskIdRef = useRef<string | null>(null)
+  const [downloadRefreshError, setDownloadRefreshError] = useState(false)
   const [downloadCapability, setDownloadCapability] = useState<"loading" | "available" | "unavailable" | "error">(
     production ? "loading" : "unavailable",
   )
@@ -815,6 +827,45 @@ function MediaDetailExperience({ production }: { production: boolean }) {
   const [toastMessage, setToastMessage] = useState<string | null>(null)
   const [isShareModalOpen, setIsShareModalOpen] = useState(false)
   const [isMoreMenuOpen, setIsMoreMenuOpen] = useState(false)
+
+  const applyDownloadInfo = useCallback((info: MediaItemDownloadInfo) => {
+    setDownloadStatus(info.status)
+    downloadTaskIdRef.current = info.taskId
+    setDownloadTaskId(info.taskId)
+    setHasOfflineResource(info.hasOfflineResource)
+    setDownloadCapability(info.canDownload || info.hasOfflineResource || info.status === "queued" ? "available" : "unavailable")
+    setOnlineReadCapability(info.canOnlineRead ? "available" : "unavailable")
+    setDownloadRefreshError(false)
+  }, [])
+
+  const invalidateOfflineDownload = useCallback(() => {
+    setDownloadStatus("idle")
+    downloadTaskIdRef.current = null
+    setDownloadTaskId(null)
+    setHasOfflineResource(false)
+    setDownloadCapability("loading")
+    setOnlineReadCapability("loading")
+  }, [])
+
+  const refreshDownloadInfo = useCallback(async (mediaItemId: string, generation = mediaActionGenerationRef.current) => {
+    const requestId = ++downloadRequestRef.current
+    try {
+      const info = await getMediaItemDownloadInfo(mediaItemId)
+      if (mediaActionGenerationRef.current !== generation || downloadableMediaItemId !== mediaItemId || downloadRequestRef.current !== requestId) return false
+      applyDownloadInfo(info)
+      return true
+    } catch {
+      if (mediaActionGenerationRef.current !== generation || downloadableMediaItemId !== mediaItemId || downloadRequestRef.current !== requestId) return false
+      setDownloadStatus("idle")
+      downloadTaskIdRef.current = null
+      setDownloadTaskId(null)
+      setHasOfflineResource(false)
+      setDownloadCapability("error")
+      setOnlineReadCapability("error")
+      setDownloadRefreshError(true)
+      return false
+    }
+  }, [applyDownloadInfo, downloadableMediaItemId])
   const [selectedSeason, setSelectedSeason] = useState(media.seasons?.[0]?.id || "s1")
   const sortedEpisodes = media.episodesOrChapters
     ? isAscending
@@ -855,13 +906,22 @@ function MediaDetailExperience({ production }: { production: boolean }) {
 
   // 同一组件实例切换 /work/:id 时，所有与作品绑定的局部状态都必须重置。
   useEffect(() => {
+    mediaActionGenerationRef.current += 1
+    downloadRequestRef.current += 1
     favoriteRequestRef.current += 1
     editionOpenRequestRef.current += 1
     setEditionOpeningId(null)
     setIsFavoriteSaving(false)
+    setIsDownloadSaving(false)
+    setMoreActionPending(null)
+    setToastMessage(null)
     setDownloadStatus("idle")
+    downloadTaskIdRef.current = null
+    setDownloadTaskId(null)
+    setHasOfflineResource(false)
     setDownloadCapability(production ? "loading" : "unavailable")
     setOnlineReadCapability(production ? "loading" : "available")
+    setDownloadRefreshError(false)
     setActiveTab("contents")
     setSelectedSeason(initialSeasonId)
     setIsMoreMenuOpen(false)
@@ -954,15 +1014,77 @@ function MediaDetailExperience({ production }: { production: boolean }) {
       return
     }
     setIsDownloadSaving(true)
+    const requestGeneration = mediaActionGenerationRef.current
+    const isCurrent = () => mediaActionGenerationRef.current === requestGeneration
     try {
       const task = await createDownloadForMediaItem(downloadableMediaItemId)
-      setDownloadStatus(task.state === "completed" ? "downloaded" : "queued")
-      setToastMessage(task.state === "completed" ? "已保存到离线库" : "已加入下载列表")
+      if (!isCurrent()) return
+      if (task.state === "completed") {
+        const refreshed = await refreshDownloadInfo(downloadableMediaItemId, requestGeneration)
+        if (!isCurrent()) return
+        setToastMessage(refreshed ? "已保存到离线库" : "下载已完成，状态刷新失败")
+      } else {
+        setDownloadStatus("queued")
+        // Keep the event filter current before React commits state. A very
+        // fast local task may emit a terminal event in this same turn.
+        downloadTaskIdRef.current = task.taskId
+        setDownloadTaskId(task.taskId)
+        setHasOfflineResource(false)
+        // The command response and its progress event have no ordering
+        // guarantee. Re-read the authoritative resource/task projection so a
+        // completion emitted before the component observes taskId is not lost.
+        void refreshDownloadInfo(downloadableMediaItemId, requestGeneration)
+        setToastMessage("已加入下载列表")
+      }
     } catch (error) {
-      setToastMessage(error instanceof HavenError ? error.dto.userMessage : "创建下载任务失败")
+      if (isCurrent()) setToastMessage(error instanceof HavenError ? error.dto.userMessage : "创建下载任务失败")
     } finally {
-      setIsDownloadSaving(false)
-      setTimeout(() => setToastMessage(null), 2500)
+      if (isCurrent()) {
+        setIsDownloadSaving(false)
+        setTimeout(() => {
+          if (isCurrent()) setToastMessage(null)
+        }, 2500)
+      }
+    }
+  }
+
+  const handleMoreAction = async (action: "folder" | "reset" | "delete") => {
+    if (moreActionPending) return
+    setIsMoreMenuOpen(false)
+    if (!production) {
+      setToastMessage("该操作仅在桌面应用中可用")
+      return
+    }
+    if (action === "delete" && !window.confirm("确定删除这个作品的离线内容吗？此操作不会删除媒体库记录。")) return
+    setMoreActionPending(action)
+    const requestGeneration = mediaActionGenerationRef.current
+    const isCurrent = () => mediaActionGenerationRef.current === requestGeneration
+    try {
+      if (!downloadableMediaItemId) throw new Error("当前作品没有可用的媒体版本")
+      if (action === "reset") {
+        await resetProgress(downloadableMediaItemId)
+        if (!isCurrent()) return
+        setDetailRetryNonce((value) => value + 1)
+        setEditionRetryNonce((value) => value + 1)
+        setToastMessage("已重置进度")
+        return
+      }
+      if (!downloadTaskId || !hasOfflineResource) throw new Error(action === "folder" ? "当前作品没有可定位的离线文件" : "当前作品没有可删除的离线内容")
+      if (action === "folder") {
+        await revealOfflineDownload(downloadTaskId)
+        if (!isCurrent()) return
+        setToastMessage("已打开离线文件夹")
+      } else {
+        await deleteOfflineDownload(downloadTaskId)
+        if (!isCurrent()) return
+        invalidateOfflineDownload()
+        const refreshed = await refreshDownloadInfo(downloadableMediaItemId, requestGeneration)
+        if (isCurrent()) setToastMessage(refreshed ? "已删除离线内容" : "离线内容已删除，状态刷新失败")
+      }
+    } catch (error) {
+      if (isCurrent()) setToastMessage(error instanceof HavenError ? error.dto.userMessage : "操作失败，请重试")
+    } finally {
+      if (isCurrent()) setMoreActionPending(null)
     }
   }
 
@@ -1092,6 +1214,7 @@ function MediaDetailExperience({ production }: { production: boolean }) {
       ? getConsumeRoute(media.type, media.id)
       : null
   const canConsume = canConsumeDetail(production, detailState) && canConsumeEdition(production, editionState, primaryActionTarget !== null)
+  const heroImageUrl = media.backdropUrl || media.posterUrl
 
   // Download state is a projection of server resources/tasks. It is deliberately
   // loaded only after authoritative detail data is ready, so stale responses
@@ -1099,35 +1222,63 @@ function MediaDetailExperience({ production }: { production: boolean }) {
   useEffect(() => {
     if (!production || detailState !== "data" || !downloadableMediaItemId) {
       setDownloadStatus("idle")
+      downloadTaskIdRef.current = null
+      setDownloadTaskId(null)
+      setHasOfflineResource(false)
       setDownloadCapability("unavailable")
       setOnlineReadCapability(production && detailState === "data" ? "unavailable" : production ? "loading" : "available")
       return
     }
-    let cancelled = false
-    setDownloadCapability("loading")
-    setOnlineReadCapability("loading")
-    getMediaItemDownloadInfo(downloadableMediaItemId)
-      .then((info) => {
-        if (cancelled) return
-        setDownloadStatus(info.status)
-        setDownloadCapability(
-          info.canDownload || info.hasOfflineResource || info.status === "queued"
-            ? "available"
-            : "unavailable",
-        )
-        setOnlineReadCapability(info.canOnlineRead ? "available" : "unavailable")
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setDownloadStatus("idle")
-          setDownloadCapability("error")
-          setOnlineReadCapability("error")
-        }
-      })
+    const generation = mediaActionGenerationRef.current
+    void refreshDownloadInfo(downloadableMediaItemId, generation)
     return () => {
-      cancelled = true
+      downloadRequestRef.current += 1
     }
-  }, [detailState, downloadableMediaItemId, production])
+  }, [detailState, downloadableMediaItemId, production, refreshDownloadInfo])
+
+  useEffect(() => {
+    if (!production || detailState !== "data" || !downloadableMediaItemId) return
+    let mounted = true
+    let cleanup: (() => Promise<void>) | null = null
+    let refreshInFlight = false
+    let refreshRequested = false
+    const mediaItemId = downloadableMediaItemId
+    const generation = mediaActionGenerationRef.current
+    const refreshForDownloadEvent = () => {
+      if (refreshInFlight) {
+        refreshRequested = true
+        return
+      }
+      refreshInFlight = true
+      // `refreshDownloadInfo` increments this synchronously before its first
+      // await. Retaining the expected sequence lets an action (delete/create)
+      // invalidate an old event refresh before it schedules its one follow-up.
+      const requestId = downloadRequestRef.current + 1
+      void refreshDownloadInfo(mediaItemId, generation).finally(() => {
+        refreshInFlight = false
+        if (
+          !mounted
+          || mediaActionGenerationRef.current !== generation
+          || downloadRequestRef.current !== requestId
+        ) {
+          refreshRequested = false
+          return
+        }
+        if (!refreshRequested) return
+        refreshRequested = false
+        refreshForDownloadEvent()
+      })
+    }
+    void subscribeDownloadEvents((event) => {
+      if (!mounted || mediaActionGenerationRef.current !== generation) return
+      if (event.data.taskId !== downloadTaskIdRef.current) return
+      refreshForDownloadEvent()
+    }).then((dispose) => {
+      if (!mounted) void dispose().catch(() => undefined)
+      else cleanup = dispose
+    }).catch(() => undefined)
+    return () => { mounted = false; if (cleanup) void cleanup().catch(() => undefined) }
+  }, [detailState, downloadableMediaItemId, production, refreshDownloadInfo])
 
   return (
     <div data-slice-state={detailState} className="relative min-h-full w-full bg-background text-foreground flex flex-col overflow-x-hidden select-none">
@@ -1165,11 +1316,13 @@ function MediaDetailExperience({ production }: { production: boolean }) {
       <section className="relative w-full min-h-[500px] lg:min-h-[560px] flex items-end pt-28 pb-[48px] px-6 md:px-[64px] lg:px-[96px]">
         {/* 背景大图遮罩 — 完全对齐 HavenStage：brightness-[0.95] + via-background/50 统一背景 */}
         <div className="absolute inset-0 z-0 select-none overflow-hidden">
-          <img
-            src={media.backdropUrl || media.posterUrl}
-            alt={media.title}
-            className="w-full h-full object-cover object-top filter brightness-[0.95]"
-          />
+          {heroImageUrl && (
+            <img
+              src={heroImageUrl}
+              alt={media.title}
+              className="w-full h-full object-cover object-top filter brightness-[0.95]"
+            />
+          )}
           {/* 深色渐变遮罩，使底部平滑融入页面底色 — 同 HavenStage */}
           <div className="absolute inset-0 bg-gradient-to-t from-background via-background/50 to-transparent" />
           {/* 左侧的额外遮罩，保证文字在复杂背景下的可读性 */}
@@ -1342,6 +1495,20 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                       <span>在线阅读能力读取失败，请重试</span>
                     </div>
                   )}
+                  {production && detailState === "data" && downloadRefreshError && (
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status">
+                      <span>离线内容状态刷新失败，请重试</span>
+                      {downloadableMediaItemId && (
+                        <button
+                          type="button"
+                          onClick={() => void refreshDownloadInfo(downloadableMediaItemId)}
+                          className="font-semibold underline underline-offset-2 hover:text-foreground"
+                        >
+                          重试
+                        </button>
+                      )}
+                    </div>
+                  )}
 
                   {/* 次级操作组：图标明显放大 (w-14 h-14 容器，w-6 h-6 图标) */}
                   <button
@@ -1415,26 +1582,29 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                           "flex flex-col gap-1.5 animate-in fade-in zoom-in-95 duration-150"
                         )}>
                           <button 
-                            onClick={() => setIsMoreMenuOpen(false)}
-                            className="flex items-center gap-3.5 px-[16px] py-3 rounded-xl text-base font-medium text-foreground hover:bg-black/5 dark:hover:bg-white/10 transition-colors text-left whitespace-nowrap"
+                            disabled={moreActionPending !== null || !hasOfflineResource || !downloadTaskId}
+                            onClick={() => void handleMoreAction("folder")}
+                            className="flex items-center gap-3.5 px-[16px] py-3 rounded-xl text-base font-medium text-foreground hover:bg-black/5 dark:hover:bg-white/10 transition-colors text-left whitespace-nowrap disabled:opacity-40"
                           >
                             <Folder className="w-5 h-5 text-muted-foreground shrink-0" />
                             在文件夹中定位
                           </button>
                           <button 
-                            onClick={() => setIsMoreMenuOpen(false)}
-                            className="flex items-center gap-3.5 px-[16px] py-3 rounded-xl text-base font-medium text-foreground hover:bg-black/5 dark:hover:bg-white/10 transition-colors text-left whitespace-nowrap"
+                            disabled={moreActionPending !== null || !downloadableMediaItemId}
+                            onClick={() => void handleMoreAction("reset")}
+                            className="flex items-center gap-3.5 px-[16px] py-3 rounded-xl text-base font-medium text-foreground hover:bg-black/5 dark:hover:bg-white/10 transition-colors text-left whitespace-nowrap disabled:opacity-40"
                           >
                             <RotateCcw className="w-5 h-5 text-muted-foreground shrink-0" />
                             重置进度
                           </button>
                           <div className="h-px bg-black/5 dark:bg-white/10 my-1.5" />
                           <button 
-                            onClick={() => setIsMoreMenuOpen(false)}
-                            className="flex items-center gap-3.5 px-[16px] py-3 rounded-xl text-base font-medium text-destructive hover:bg-destructive/10 transition-colors text-left whitespace-nowrap"
+                            disabled={moreActionPending !== null || !hasOfflineResource || !downloadTaskId}
+                            onClick={() => void handleMoreAction("delete")}
+                            className="flex items-center gap-3.5 px-[16px] py-3 rounded-xl text-base font-medium text-destructive hover:bg-destructive/10 transition-colors text-left whitespace-nowrap disabled:opacity-40"
                           >
                             <Trash2 className="w-5 h-5 shrink-0" />
-                            清理本地缓存
+                            删除离线内容
                           </button>
                         </div>
                       </>

@@ -336,7 +336,8 @@ impl DownloadService {
         request: DownloadListRequest,
     ) -> Result<Vec<DownloadTaskDto>, AppError> {
         let limit = request.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-        let tasks = self.ports.as_download().list(limit).await?;
+        let offset = request.offset.unwrap_or(0);
+        let tasks = self.ports.as_download().list(limit, offset).await?;
         let mut result = Vec::with_capacity(tasks.len());
         for task in tasks {
             result.push(self.to_dto(task).await?);
@@ -349,7 +350,7 @@ impl DownloadService {
     /// 仍按用户已提交的意图启动，后续可用“暂停”明确阻止它们。
     pub async fn resume_startable(&self) -> Result<u32, AppError> {
         let auto_continue = self.auto_continue_enabled().await;
-        let tasks = self.ports.as_download().list(MAX_LIMIT).await?;
+        let tasks = self.ports.as_download().list(MAX_LIMIT, 0).await?;
         let mut started = 0_u32;
         for task in tasks {
             let start = if should_start_on_boot(task.state, auto_continue) {

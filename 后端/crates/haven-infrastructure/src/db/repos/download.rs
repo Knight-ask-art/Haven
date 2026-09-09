@@ -188,16 +188,16 @@ impl DownloadRepository for SqliteDownloadRepository {
         Ok(())
     }
 
-    async fn list(&self, limit: u32) -> Result<Vec<DownloadTask>, AppError> {
+    async fn list(&self, limit: u32, offset: u32) -> Result<Vec<DownloadTask>, AppError> {
         let conn = self.db.lock();
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {SELECT_COLUMNS} FROM download_tasks
-                 ORDER BY created_at DESC LIMIT ?1"
+                 ORDER BY created_at DESC, id DESC LIMIT ?1 OFFSET ?2"
             ))
             .map_err(map_db_error("查询下载列表失败"))?;
         let rows = stmt
-            .query_map(rusqlite::params![limit], row_to_download_task)
+            .query_map(rusqlite::params![limit, offset], row_to_download_task)
             .map_err(map_db_error("查询下载列表失败"))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(map_db_error("查询下载列表失败"))

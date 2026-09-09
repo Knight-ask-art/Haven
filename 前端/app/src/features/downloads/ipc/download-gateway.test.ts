@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 
 import type { HavenClient } from "@/lib/ipc/client"
 import type { DownloadTaskDto, ResourceListDto, ResourceSummaryDto, StorageLocationDto } from "@/lib/ipc/generated/wire"
@@ -33,9 +33,10 @@ function clientWith(
   tasks: DownloadTaskDto[],
   resources: ResourceListDto = EMPTY_RESOURCES,
   storageLocations: StorageLocationDto[] = [],
+  downloadList: (request: { limit: number; offset: number }) => Promise<DownloadTaskDto[]> = async () => tasks,
 ): HavenClient {
   const client = {
-    downloadList: async () => tasks,
+    downloadList,
     resourceListByMediaItem: async () => resources,
     storageLocationList: async () => storageLocations,
   } satisfies Pick<HavenClient, "downloadList" | "resourceListByMediaItem" | "storageLocationList">
@@ -43,18 +44,34 @@ function clientWith(
 }
 
 describe("getWorkDownloadState", () => {
+  it("pages through the complete task history instead of truncating at 200 rows", async () => {
+    const firstPage = Array.from({ length: 200 }, (_, index) => ({
+      ...BASE_TASK,
+      taskId: `task-${index}`,
+    }))
+    const oldTask = { ...BASE_TASK, taskId: "old-task", state: "failed" as const }
+    const downloadList = vi.fn(async ({ offset }: { limit: number; offset: number }) => (
+      offset === 0 ? firstPage : [oldTask]
+    ))
+
+    await expect(getWorkDownloadState("work-1", "media-1", clientWith([], EMPTY_RESOURCES, [], downloadList)))
+      .resolves.toBe("idle")
+    expect(downloadList).toHaveBeenNthCalledWith(1, { limit: 200, offset: 0 })
+    expect(downloadList).toHaveBeenNthCalledWith(2, { limit: 200, offset: 200 })
+  })
+
   it("uses an active task as the authoritative queued state", async () => {
     const active = { ...BASE_TASK, state: "downloading" as const, offlineResourceId: null }
     await expect(getWorkDownloadState("work-1", "media-1", clientWith([active])))
       .resolves.toBe("queued")
   })
 
-  it("requires a completed task to retain its offline resource", async () => {
+  it("does not trust a completed task unless its offline resource is present", async () => {
     await expect(getWorkDownloadState("work-1", "media-1", clientWith([BASE_TASK])))
       .resolves.toBe("idle")
     const completed = { ...BASE_TASK, offlineResourceId: "offline-1" }
     await expect(getWorkDownloadState("work-1", "media-1", clientWith([completed])))
-      .resolves.toBe("downloaded")
+      .resolves.toBe("idle")
   })
 
   it("still detects Offline Resource after the task record is removed", async () => {
@@ -102,7 +119,41 @@ describe("getWorkDownloadState", () => {
       }],
     }
     await expect(getMediaItemDownloadInfo("media-1", clientWith([queued], resources)))
-      .resolves.toMatchObject({ status: "downloaded", hasOfflineResource: true })
+      .resolves.toMatchObject({ status: "downloaded", hasOfflineResource: true, taskId: null })
+
+    const completed = { ...BASE_TASK, taskId: "completed-task", offlineResourceId: "offline-1" }
+    await expect(getMediaItemDownloadInfo("media-1", clientWith([queued, completed], resources)))
+      .resolves.toMatchObject({ status: "downloaded", taskId: "completed-task" })
+  })
+
+  it("pairs an available offline resource with its exact completed task", async () => {
+    const resources: ResourceListDto = {
+      schemaVersion: 1,
+      items: [{
+        resourceId: "offline-available",
+        resourceType: "local_file",
+        availability: "offline_available",
+        mimeType: null,
+        size: 100,
+        storageDisplayName: "离线库",
+        sourceDisplayName: null,
+        isOffline: true,
+        isLocal: true,
+        requiresReauthorization: false,
+        canDownload: false,
+        canOnlineRead: true,
+        streamKind: null,
+      }],
+    }
+    const missing = { ...BASE_TASK, taskId: "missing-task", offlineResourceId: "offline-missing" }
+    const available = { ...BASE_TASK, taskId: "available-task", offlineResourceId: "offline-available" }
+
+    await expect(getMediaItemDownloadInfo("media-1", clientWith([missing, available], resources)))
+      .resolves.toMatchObject({
+        status: "downloaded",
+        hasOfflineResource: true,
+        taskId: "available-task",
+      })
   })
 
   it("does not report a completed task without an offline resource as downloaded", async () => {
@@ -113,6 +164,42 @@ describe("getWorkDownloadState", () => {
         canDownload: false,
         hasOfflineResource: false,
         sourceResourceId: null,
+      })
+  })
+
+  it("does not report a completed task as downloaded when its offline resource is absent", async () => {
+    const staleCompleted = {
+      ...BASE_TASK,
+      taskId: "stale-completed-task",
+      offlineResourceId: "removed-offline-resource",
+    }
+
+    await expect(getMediaItemDownloadInfo("media-1", clientWith([staleCompleted])))
+      .resolves.toMatchObject({
+        status: "idle",
+        hasOfflineResource: false,
+        taskId: null,
+      })
+  })
+
+  it("uses an active task when an earlier completed task points to an absent resource", async () => {
+    const staleCompleted = {
+      ...BASE_TASK,
+      taskId: "stale-completed-task",
+      offlineResourceId: "removed-offline-resource",
+    }
+    const active = {
+      ...BASE_TASK,
+      taskId: "active-task",
+      state: "downloading" as const,
+      offlineResourceId: null,
+    }
+
+    await expect(getMediaItemDownloadInfo("media-1", clientWith([staleCompleted, active])))
+      .resolves.toMatchObject({
+        status: "queued",
+        hasOfflineResource: false,
+        taskId: "active-task",
       })
   })
 

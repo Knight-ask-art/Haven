@@ -21,6 +21,7 @@ import type {
   SessionCloseRequest,
   SessionCloseResultDto,
   ProgressSaveRequest,
+  ProgressMarkCompletedRequest,
   ProgressSaveResult,
   ProgressRecentRequest,
   ProgressResetRequest,
@@ -163,6 +164,7 @@ export interface HavenClient {
   readerSearchCancel(request: ReaderSearchCancelRequest): Promise<ReaderSearchCancelResultDto>;
   sessionClose(request: SessionCloseRequest): Promise<SessionCloseResultDto>;
   progressSave(request: ProgressSaveRequest): Promise<ProgressSaveResult>;
+  progressMarkCompleted(request: ProgressMarkCompletedRequest): Promise<ProgressSaveResult>;
   progressRecent(request: ProgressRecentRequest): Promise<ProgressSummaryDto[]>;
   progressReset(request: ProgressResetRequest): Promise<void>;
   historyList(request: HistoryListRequest): Promise<HistoryEntryDto[]>;

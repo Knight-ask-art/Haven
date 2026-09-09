@@ -1057,6 +1057,16 @@ pub struct ProgressSaveRequest {
     pub keyframe: Option<String>,
 }
 
+/// `progress_mark_completed` 请求。`initial_locator` 只用于尚无 Progress
+/// 时创建安全起点；已有记录时后端原子保留其 Locator 与 percentage。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ProgressMarkCompletedRequest {
+    pub media_item_id: String,
+    pub initial_locator: LocatorDto,
+}
+
 /// `progress_save` 结果：新 Revision（opaque；语义由 BE-REVISION-001 正式化）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -1077,6 +1087,10 @@ pub struct HistoryEntryDto {
     pub started_at: String,
     pub last_active_at: String,
     pub completed_at: Option<String>,
+    /// 精确指向此历史条目的消费目标；绝不能从同一 Work 的首集或当前卡片投影推断。
+    pub primary_action: Option<PrimaryActionDto>,
+    /// 此历史条目 MediaItem 的当前进度（如有）；展示时不得以另一集的进度替代。
+    pub progress: Option<ProgressSummaryDto>,
 }
 
 /// `history_list` 请求（契约 §23.1）：最近活跃历史。
@@ -2237,6 +2251,7 @@ pub struct DownloadCreateRequest {
 #[ts(export, rename_all = "camelCase")]
 pub struct DownloadListRequest {
     pub limit: Option<u32>,
+    pub offset: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

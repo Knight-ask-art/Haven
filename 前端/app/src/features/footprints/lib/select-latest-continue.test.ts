@@ -2,8 +2,16 @@ import { describe, expect, it } from "vitest"
 import { selectLatestUnfinished } from "./select-latest-continue"
 import type { MediaCardProps } from "@/components/ui/haven/MediaCard"
 
-function card(id: string, progress?: number): MediaCardProps {
-  return { id, title: id, imageUrl: `http://${id}`, progress }
+type ContinueCard = MediaCardProps & {
+  completion?: "not_started" | "in_progress" | "completed" | "abandoned"
+}
+
+function card(
+  id: string,
+  progress?: number,
+  completion?: ContinueCard["completion"],
+): ContinueCard {
+  return { id, title: id, imageUrl: `http://${id}`, progress, completion }
 }
 
 describe("selectLatestUnfinished", () => {
@@ -21,6 +29,26 @@ describe("selectLatestUnfinished", () => {
     const { hero, rest } = selectLatestUnfinished(items)
     expect(hero).toBeNull()
     expect(rest.length).toBe(3)
+  })
+  it("does not promote a completed item that retains a non-terminal percentage", () => {
+    const items = [card("completed", 50, "completed"), card("reading", 20, "in_progress")]
+
+    const { hero, rest } = selectLatestUnfinished(items)
+
+    expect(hero?.id).toBe("reading")
+    expect(rest.map((item) => item.id)).toEqual(["completed"])
+  })
+  it("only promotes in-progress items, never reset or abandoned items with retained percentages", () => {
+    const items = [
+      card("reset", 50, "not_started"),
+      card("abandoned", 60, "abandoned"),
+      card("reading", 20, "in_progress"),
+    ]
+
+    const { hero, rest } = selectLatestUnfinished(items)
+
+    expect(hero?.id).toBe("reading")
+    expect(rest.map((item) => item.id)).toEqual(["reset", "abandoned"])
   })
   it("rest preserves time order after removing hero", () => {
     const items = [card("a", 45), card("b", 55), card("c", 60)]

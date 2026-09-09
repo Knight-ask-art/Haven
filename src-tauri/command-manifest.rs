@@ -76,6 +76,11 @@ define_commands!(
     ),
     ("library_list", "allow-library-list", commands::library::library_list),
     ("progress_save", "allow-progress-save", commands::progress::progress_save),
+    (
+        "progress_mark_completed",
+        "allow-progress-mark-completed",
+        commands::progress::progress_mark_completed
+    ),
     ("favorite_set", "allow-favorite-set", commands::favorite::favorite_set),
     ("home_get", "allow-home-get", commands::home::home_get),
     (

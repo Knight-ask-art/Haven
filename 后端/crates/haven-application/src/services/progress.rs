@@ -19,7 +19,9 @@ use haven_domain::locator::{Locator, locator_kind_compatible};
 
 use crate::mapper::progress::progress_summary;
 use crate::services::library::MAX_LIMIT;
-use crate::wire::{ProgressSaveRequest, ProgressSaveResult, ProgressSummaryDto};
+use crate::wire::{
+    ProgressMarkCompletedRequest, ProgressSaveRequest, ProgressSaveResult, ProgressSummaryDto,
+};
 
 /// ProgressService 所需端口（MediaItem + Edition 推导 + Progress 存储）。
 pub trait ProgressPorts:
@@ -119,6 +121,58 @@ impl ProgressService {
         .await?
         .ok_or_else(revision_conflict)?;
 
+        Ok(ProgressSaveResult { revision })
+    }
+
+    /// 标记完成不接受列表快照的完整进度写回。候选 Locator 只用于第一次
+    /// 创建；Repository 的单条 upsert 在已有行时仅改变 completion/revision。
+    pub async fn mark_completed(
+        &self,
+        request: ProgressMarkCompletedRequest,
+    ) -> Result<ProgressSaveResult, AppError> {
+        let media_item_id = parse_id(&request.media_item_id)?;
+        let media_item = MediaItemRepository::get(&*self.ports, media_item_id)
+            .await?
+            .ok_or_else(media_item_not_found)?;
+        let edition = EditionRepository::get(&*self.ports, media_item.edition_id)
+            .await?
+            .ok_or_else(edition_not_found)?;
+        let locator = wire_locator_to_domain(request.initial_locator, media_item_id)?;
+        locator.validate().map_err(|message| {
+            AppError::new(
+                "INVALID_ARGUMENT",
+                haven_common::ErrorKind::Validation,
+                message,
+                false,
+            )
+        })?;
+        if !locator_kind_compatible(media_item.media_type, &locator) {
+            return Err(AppError::new(
+                "LOCATOR_KIND_INCOMPATIBLE",
+                haven_common::ErrorKind::Validation,
+                format!(
+                    "Locator 与媒介类型不兼容（media_type={:?}）",
+                    media_item.media_type
+                ),
+                false,
+            ));
+        }
+        let percentage = derive_ratio(&media_item, &locator);
+        let updated_at = haven_common::UtcMillis::now();
+        let candidate = Progress {
+            id: ProgressId::new(),
+            work_id: edition.work_id,
+            edition_id: edition.id,
+            media_item_id,
+            locator,
+            completion: CompletionState::Completed,
+            percentage,
+            last_active_at: updated_at,
+            updated_at,
+            revision: None,
+            keyframe_uri: None,
+        };
+        let revision = ProgressRepository::mark_completed(&*self.ports, &candidate).await?;
         Ok(ProgressSaveResult { revision })
     }
 
@@ -410,6 +464,20 @@ mod tests {
             stored.revision = Some(revision.clone());
             *guard = Some(stored);
             Ok(Some(revision))
+        }
+        async fn mark_completed(&self, progress: &Progress) -> Result<String, AppError> {
+            let mut guard = self.saved.lock().unwrap();
+            let mut stored = guard.clone().unwrap_or_else(|| progress.clone());
+            stored.completion = CompletionState::Completed;
+            if stored.updated_at.0 <= progress.updated_at.0 {
+                stored.updated_at = haven_common::UtcMillis(progress.updated_at.0 + 1);
+            }
+            let mut counter = self.revision_counter.lock().unwrap();
+            *counter += 1;
+            let revision = format!("mock-progress-revision-{}", *counter);
+            stored.revision = Some(revision.clone());
+            *guard = Some(stored);
+            Ok(revision)
         }
         async fn recent(&self, _limit: u32) -> Result<Vec<Progress>, AppError> {
             Ok(self.saved.lock().unwrap().clone().into_iter().collect())

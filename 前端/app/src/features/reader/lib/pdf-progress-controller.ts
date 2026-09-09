@@ -162,6 +162,10 @@ export function restorePdfProgress(
   if (!session.progress || session.progress.locator.kind !== "pdf") return null
   const identity = `${session.sessionId}:${session.mediaItemId}:${session.contentUri}`
   if (restored?.current === identity) return null
+  if (session.progress.completion === "not_started") {
+    if (restored) restored.current = identity
+    return { pageIndex: 0, zoom: 1 }
+  }
   const data = session.progress.locator.data
   if (!Number.isInteger(data.pageIndex) || data.pageIndex < 0) return null
   const zoom = typeof data.zoom === "number" ? clampPdfZoom(data.zoom) : 1
