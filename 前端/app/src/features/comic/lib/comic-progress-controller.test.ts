@@ -110,6 +110,22 @@ describe("comic-progress-controller", () => {
     expect(restored.current).toBe(`${session.sessionId}:${session.mediaItemId}:${session.contentUri}`)
   })
 
+  it("opens reset progress on the first page instead of applying its retained locator", () => {
+    const session = fakeSession()
+    session.progress = {
+      mediaItemId: session.mediaItemId,
+      completion: "not_started",
+      progressRatio: 0,
+      revision: "progress-rev-reset",
+      updatedAt: "2026-09-07T00:00:00.000Z",
+      locator: { version: 1, kind: "comic", data: { chapterItemId: session.mediaItemId, pageIndex: 8, pageProgression: 0.4 } } as never,
+    }
+    const restored = { current: null as string | null }
+
+    expect(restoreComicProgress(45, session, restored)).toEqual({ pageIndex: 1, pageProgression: null })
+    expect(restored.current).toBe(`${session.sessionId}:${session.mediaItemId}:${session.contentUri}`)
+  })
+
   it("restoreComicProgress rejects out-of-range pageIndex", () => {
     const session = fakeSession()
     session.progress = {

@@ -16,6 +16,7 @@ import {
   resolveHistoryRuntimeState,
   shouldApplyHistoryRequest,
 } from "@/features/footprints/lib/history-runtime-state"
+import { resolveFootprintOpen } from "../lib/open-footprint-action"
 
 // Mock Data
 const todayHistory: MediaCardProps[] = [
@@ -86,7 +87,9 @@ export function HistoryPage() {
   const [recentHistoryItems, setRecentHistoryItems] = useState<HistoryCardProps[]>([])
   const [historyLoading, setHistoryLoading] = useState(productionMode)
   const [historyError, setHistoryError] = useState<HavenError | null>(null)
+  const [openError, setOpenError] = useState<string | null>(null)
   const historyRequestRef = useRef(0)
+  const openActionGenerationRef = useRef(0)
 
   const productionGroups = useMemo(
     () => (productionMode ? groupHistoryByDate(recentHistoryItems) : []),
@@ -118,6 +121,7 @@ export function HistoryPage() {
     void loadRecentHistory()
     return () => {
       historyRequestRef.current += 1
+      openActionGenerationRef.current += 1
     }
   }, [loadRecentHistory, productionMode])
 
@@ -187,6 +191,19 @@ export function HistoryPage() {
   if (unavailableMode) return <UnavailableHistoryState />
 
   if (productionMode) {
+    const openHistoryItem = async (item: HistoryCardProps) => {
+      const generation = ++openActionGenerationRef.current
+      try {
+        const result = await resolveFootprintOpen(item)
+        if (generation !== openActionGenerationRef.current) return
+        if (result.kind === "open") {
+          setOpenError(null)
+          navigate(result.route)
+        } else setOpenError(`${item.title}${result.message}`)
+      } catch {
+        if (generation === openActionGenerationRef.current) setOpenError("读取内容能力失败，请重试")
+      }
+    }
     return (
       <div className="w-full min-h-full bg-background selection:bg-primary/20 transition-colors">
         <HistoryHeader onBack={() => navigate(-1)} />
@@ -208,6 +225,7 @@ export function HistoryPage() {
                   selectedIds={new Set()}
                   onToggle={() => undefined}
                   onToggleGroup={() => undefined}
+                  onOpen={(item) => void openHistoryItem(item)}
                 />
               ))}
             </>
@@ -215,6 +233,7 @@ export function HistoryPage() {
           {historyError && recentHistoryItems.length > 0 && (
             <HistoryErrorState error={historyError} onRetry={() => void loadRecentHistory()} compact />
           )}
+          {openError && <HistoryMessage>{openError}</HistoryMessage>}
         </main>
       </div>
     )
@@ -383,6 +402,7 @@ function HistoryGroup({
   selectedIds,
   onToggle,
   onToggleGroup,
+  onOpen,
 }: {
   title: string
   items: MediaCardProps[]
@@ -390,6 +410,7 @@ function HistoryGroup({
   selectedIds: Set<string>
   onToggle: (id: string) => void
   onToggleGroup: () => void
+  onOpen?: (item: HistoryCardProps) => void
 }) {
   if (!items || items.length === 0) return null
 
@@ -418,10 +439,18 @@ function HistoryGroup({
           return (
             <div
               key={item.id}
-              onClick={selectionMode ? () => onToggle(item.id) : undefined}
+              onClick={selectionMode ? () => onToggle(item.id) : onOpen ? () => onOpen(item as HistoryCardProps) : undefined}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter" && event.key !== " ") return
+                event.preventDefault()
+                if (selectionMode) onToggle(item.id)
+                else if (onOpen) onOpen(item as HistoryCardProps)
+              }}
+              role="button"
+              tabIndex={0}
               className={cn(
                 "relative group flex flex-col gap-3 outline-none shrink-0 w-[140px] md:w-[160px] lg:w-[200px] select-none transition-transform duration-200",
-                selectionMode ? "cursor-pointer" : "cursor-default",
+                selectionMode || onOpen ? "cursor-pointer" : "cursor-default",
                 selectionMode && isSelected && "scale-[1.02]"
               )}
             >

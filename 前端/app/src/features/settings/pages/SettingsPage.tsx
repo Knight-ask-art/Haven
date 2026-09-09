@@ -42,6 +42,7 @@ import { getHavenClientMode } from "@/lib/ipc/runtime"
 import { deriveLibrarySliceState, deriveScanSliceState, deriveStorageSliceState } from "@/lib/slice-state"
 import {
   SCAN_PHASE_LABELS,
+  cancelScan,
   listStorageLocations,
   pickLocalDirectory,
   rebindLocalDirectory,
@@ -2350,6 +2351,7 @@ function StorageSettings({ showNotice }: { showNotice: (message: string) => void
   const [locations, setLocations] = useState<StorageLocationWire[]>([])
   const [scans, setScans] = useState<Record<string, ScanUiState>>({})
   const [removingId, setRemovingId] = useState<string | null>(null)
+  const [cancellingTaskId, setCancellingTaskId] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [loadError, setLoadError] = useState<HavenError | null>(null)
   const loadRequestRef = useRef(0)
@@ -2443,9 +2445,44 @@ function StorageSettings({ showNotice }: { showNotice: (message: string) => void
         }))
         if (terminal) showNotice(`${location.displayName}：${label}`)
       })
+      setScans((prev) => ({
+        ...prev,
+        [location.locationId]: prev[location.locationId] ?? {
+          taskId: result.taskId,
+          phaseCode: "started",
+          phase: SCAN_PHASE_LABELS.started,
+          filesSeen: 0,
+          newItem: 0,
+          message: null,
+          terminal: false,
+        },
+      }))
       if (result.alreadyRunning) showNotice("该目录已有扫描任务在运行，已合并到既有任务")
     } catch (error) {
       showNotice(error instanceof Error ? error.message : "扫描启动失败，请重试")
+    }
+  }
+
+  const handleCancelScan = async (location: StorageLocationWire, scan: ScanUiState) => {
+    if (!scan.taskId || cancellingTaskId) return
+    setCancellingTaskId(scan.taskId)
+    try {
+      const result = await cancelScan(scan.taskId)
+      const phase = result.phase
+      setScans((prev) => ({
+        ...prev,
+        [location.locationId]: {
+          ...scan,
+          phaseCode: phase,
+          phase: SCAN_PHASE_LABELS[phase] ?? phase,
+          terminal: true,
+        },
+      }))
+      showNotice(result.alreadyTerminal ? `${location.displayName}：扫描已经结束` : `${location.displayName}：已取消扫描`)
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "取消扫描失败，请重试")
+    } finally {
+      setCancellingTaskId(null)
     }
   }
 
@@ -2492,6 +2529,16 @@ function StorageSettings({ showNotice }: { showNotice: (message: string) => void
                   <p className="text-sm font-semibold">{location.displayName}</p>
                 </div>
                 <span className="text-xs font-semibold text-[#6e6e73]">{location.status}</span>
+                {running && scan?.taskId && (
+                  <button
+                    type="button"
+                    disabled={cancellingTaskId === scan.taskId}
+                    onClick={() => void handleCancelScan(location, scan)}
+                    className="rounded-full px-3 py-[8px] text-xs font-semibold text-[#d70015] transition-colors hover:bg-[#d70015]/[0.06] disabled:opacity-45"
+                  >
+                    {cancellingTaskId === scan.taskId ? "正在取消…" : "取消扫描"}
+                  </button>
+                )}
                 <button
                   type="button"
                   disabled={running}

@@ -447,6 +447,12 @@ mod tests {
         ) -> Result<Option<String>, AppError> {
             Ok(None)
         }
+        async fn mark_completed(&self, progress: &Progress) -> Result<String, AppError> {
+            Ok(progress
+                .revision
+                .clone()
+                .unwrap_or_else(|| "test-revision".into()))
+        }
         async fn recent(&self, limit: u32) -> Result<Vec<Progress>, AppError> {
             Ok(self.progress.iter().take(limit as usize).cloned().collect())
         }

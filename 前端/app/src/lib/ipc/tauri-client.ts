@@ -28,6 +28,7 @@ import type {
   SessionCloseRequest,
   SessionCloseResultDto,
   ProgressSaveRequest,
+  ProgressMarkCompletedRequest,
   ProgressSaveResult,
   ProgressRecentRequest,
   ProgressResetRequest,
@@ -359,6 +360,14 @@ export class TauriHavenClient implements HavenClient {
   async progressSave(request: ProgressSaveRequest): Promise<ProgressSaveResult> {
     try {
       return await invoke<ProgressSaveResult>("progress_save", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async progressMarkCompleted(request: ProgressMarkCompletedRequest): Promise<ProgressSaveResult> {
+    try {
+      return await invoke<ProgressSaveResult>("progress_mark_completed", { request });
     } catch (error) {
       throw toHavenError(error);
     }

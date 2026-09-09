@@ -198,6 +198,14 @@ describe("restorePdfProgress", () => {
     expect(restorePdfProgress(10, withProgress(pdfLocator(99, 1.25)))).toEqual({ pageIndex: 9, zoom: 1.25 })
   })
 
+  it("opens reset progress on the first page at the default zoom instead of applying its retained locator", () => {
+    const reset = withProgress(pdfLocator(8, 1.75), { completion: "not_started" })
+    const restored = { current: null as string | null }
+
+    expect(restorePdfProgress(10, reset, restored)).toEqual({ pageIndex: 0, zoom: 1 })
+    expect(restored.current).toBe(`${reset.sessionId}:${reset.mediaItemId}:${reset.contentUri}`)
+  })
+
   it("rejects invalid page counts and invalid page indices", () => {
     const valid = withProgress(pdfLocator(1, 1))
     expect(restorePdfProgress(0, valid)).toBeNull()

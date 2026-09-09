@@ -477,6 +477,12 @@
           "markdownDescription": "Enables the preference_update command without any pre-configured scope."
         },
         {
+          "description": "Enables the progress_mark_completed command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-progress-mark-completed",
+          "markdownDescription": "Enables the progress_mark_completed command without any pre-configured scope."
+        },
+        {
           "description": "Enables the progress_recent command without any pre-configured scope.",
           "type": "string",
           "const": "allow-progress-recent",
@@ -1033,6 +1039,12 @@
           "type": "string",
           "const": "deny-preference-update",
           "markdownDescription": "Denies the preference_update command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the progress_mark_completed command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-progress-mark-completed",
+          "markdownDescription": "Denies the progress_mark_completed command without any pre-configured scope."
         },
         {
           "description": "Denies the progress_recent command without any pre-configured scope.",

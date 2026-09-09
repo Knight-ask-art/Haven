@@ -10,13 +10,19 @@ interface LibraryTVRowShelfProps {
   items: LibraryMediaItemData[]
   onHoverSpotlight?: (item: LibraryMediaItemData) => void
   onSeeMore?: () => void
+  selectionMode?: boolean
+  selectedIds?: Set<string>
+  onToggleSelect?: (id: string) => void
 }
 
 export function LibraryTVRowShelf({
   title,
   items,
   onHoverSpotlight,
-  onSeeMore
+  onSeeMore,
+  selectionMode = false,
+  selectedIds = new Set(),
+  onToggleSelect,
 }: LibraryTVRowShelfProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const navigate = useNavigate()
@@ -72,7 +78,13 @@ export function LibraryTVRowShelf({
         >
           {items.map((item) => (
             <div key={item.id} className="w-[150px] md:w-[180px] lg:w-[210px] shrink-0">
-              <MediaItem item={item} onHover={onHoverSpotlight} />
+              <MediaItem
+                item={item}
+                onHover={onHoverSpotlight}
+                selectionMode={selectionMode}
+                selected={selectedIds.has(item.id)}
+                onSelect={onToggleSelect}
+              />
             </div>
           ))}
         </div>

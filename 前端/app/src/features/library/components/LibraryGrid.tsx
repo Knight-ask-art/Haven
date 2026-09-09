@@ -5,6 +5,7 @@ import { useNavigate } from "react-router"
 import { ArtworkImage } from "@/components/ui/haven/ArtworkImage"
 import { defaultCoverCategoryForMediaType } from "@/lib/default-cover"
 import { getHavenClientMode } from "@/lib/ipc/runtime"
+import { matchesLibraryCategory } from "../lib/library-category"
 
 export type SortOption = "date" | "name" | "year"
 export type ViewMode = "grid" | "list"
@@ -18,6 +19,9 @@ interface LibraryGridProps {
   onHoverItem?: (item: LibraryMediaItemData) => void
   /** 数据源注入（IPC-MOCK-001）：缺省回落共享 Mock（搜索/下载页迁移前保持原行为）。 */
   items?: LibraryMediaItemData[]
+  selectionMode?: boolean
+  selectedIds?: Set<string>
+  onToggleSelect?: (id: string) => void
 }
 
 // 丰富的影视、图书、漫画、报刊、资料综合演示数据库
@@ -316,20 +320,16 @@ export function LibraryGrid({
   searchQuery = "",
   density = "regular",
   onHoverItem,
-  items: itemsProp
+  items: itemsProp,
+  selectionMode = false,
+  selectedIds = new Set(),
+  onToggleSelect,
 }: LibraryGridProps) {
   const navigate = useNavigate()
   const allowExternal = getHavenClientMode() !== "tauri"
 
-  const matchesCategory = (item: LibraryMediaItemData) => {
-    if (category === "all") return true
-    if (category === "video") return item.type === "movie" || item.type === "tv"
-    if (category === "periodical") return item.type === "periodical"
-    return item.type === category
-  }
-
   const sourceItems = itemsProp ?? REPRESENTATIVE_ITEMS
-  let items = sourceItems.filter(matchesCategory)
+  let items = sourceItems.filter((item) => matchesLibraryCategory(item, category))
 
   if (searchQuery.trim() !== "") {
     const q = searchQuery.toLowerCase()
@@ -362,7 +362,15 @@ export function LibraryGrid({
         {items.map((item) => (
           <div 
             key={item.id} 
-            onClick={() => navigate(`/work/${item.id}`, { state: { favorite: item.favorite } })}
+            role="button"
+            tabIndex={0}
+            onClick={() => selectionMode ? onToggleSelect?.(item.id) : navigate(`/work/${item.id}`, { state: { favorite: item.favorite } })}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" && event.key !== " ") return
+              event.preventDefault()
+              if (selectionMode) onToggleSelect?.(item.id)
+              else navigate(`/work/${item.id}`, { state: { favorite: item.favorite } })
+            }}
             onMouseEnter={() => onHoverItem?.(item)}
             className="flex items-center gap-6 p-3.5 rounded-2xl bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 transition-all cursor-pointer group border border-black/5 dark:border-white/5"
           >
@@ -420,7 +428,15 @@ export function LibraryGrid({
       : "grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-5 md:gap-7"
     }>
       {items.map((item) => (
-        <MediaItem key={item.id} item={item} onHover={onHoverItem} density={density} />
+          <MediaItem
+            key={item.id}
+            item={item}
+            onHover={onHoverItem}
+            density={density}
+            selectionMode={selectionMode}
+            selected={selectedIds.has(item.id)}
+            onSelect={onToggleSelect}
+          />
       ))}
     </div>
   )

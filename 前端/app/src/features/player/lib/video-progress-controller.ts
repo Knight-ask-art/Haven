@@ -103,6 +103,13 @@ export function restoreVideoProgress(video: Pick<HTMLVideoElement, "currentTime"
   if (session.progress?.locator.kind !== "video") return false
   const identity = `${session.sessionId}:${session.mediaItemId}:${session.contentUri}`
   if (restored?.current === identity) return false
+  if (session.progress.completion === "not_started") {
+    // Progress reset intentionally preserves the last locator for audit and
+    // conflict semantics, but consumers must resume from the beginning.
+    video.currentTime = 0
+    if (restored) restored.current = identity
+    return true
+  }
   const positionMs = session.progress.locator.data.positionMs
   if (!Number.isFinite(positionMs) || positionMs < 0) return false
   const duration = video.duration

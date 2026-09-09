@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import type { ProgressSaveRequest, ProgressSaveResult, SessionOpenResultDto } from "@/lib/ipc/generated/wire"
-import { createBookProgressController, restoreBookProgress } from "./book-progress-controller"
+import { bookResumeProgression, createBookProgressController, restoreBookProgress } from "./book-progress-controller"
 
 function fakeSession(mediaItemId = "0196f0d2-0000-7000-8000-000000000001"): SessionOpenResultDto {
   return {
@@ -143,5 +143,37 @@ describe("book-progress-controller", () => {
     expect(container.scrollTop).toBe(0)
     expect(container.scrollLeft).toBe(800)
     expect(restored.current).toBe(`${session.sessionId}:${session.mediaItemId}:${session.contentUri}`)
+  })
+
+  it("opens reset progress at the beginning instead of applying its retained locator", () => {
+    const session = fakeSession()
+    session.progress = {
+      mediaItemId: session.mediaItemId,
+      completion: "not_started",
+      progressRatio: 0,
+      revision: "progress-rev-reset",
+      updatedAt: "2026-09-07T00:00:00.000Z",
+      locator: { version: 1, kind: "book", data: { publicationResource: "res", progression: 0.8, textAnchor: null, formatLocator: null } } as never,
+    }
+    const container = { scrollTop: 240, scrollHeight: 1000, clientHeight: 500 }
+    const restored = { current: null as string | null }
+
+    expect(restoreBookProgress(container, session, restored)).toBe(true)
+    expect(container.scrollTop).toBe(0)
+    expect(restored.current).toBe(`${session.sessionId}:${session.mediaItemId}:${session.contentUri}`)
+  })
+
+  it("uses zero as the reader's initial progression after reset instead of the retained locator", () => {
+    const session = fakeSession()
+    session.progress = {
+      mediaItemId: session.mediaItemId,
+      completion: "not_started",
+      progressRatio: 0,
+      revision: "progress-rev-reset",
+      updatedAt: "2026-09-07T00:00:00.000Z",
+      locator: { version: 1, kind: "book", data: { publicationResource: "res", progression: 0.8, textAnchor: null, formatLocator: null } } as never,
+    }
+
+    expect(bookResumeProgression(session)).toBe(0)
   })
 })

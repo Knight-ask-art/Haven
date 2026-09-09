@@ -23,7 +23,9 @@ import {
   applyDownloadEvent,
   createDownloadEventState,
   forgetDownloadEventsForTask,
-  mergeLatestDownloadEvents,
+  markOfflineResourceDeleted,
+  mergeDownloadList,
+  mergeDownloadTask,
 } from "../lib/download-event-state"
 import { downloadErrorMessage, downloadErrorRetryable } from "../lib/download-error"
 import { HavenError, toHavenError } from "@/lib/ipc/errors"
@@ -76,6 +78,10 @@ export function DownloadsPage() {
   const [pendingTaskIds, setPendingTaskIds] = useState<Set<string>>(() => new Set())
   const [isDragOver, setIsDragOver] = useState(false)
   const eventStateRef = useRef(createDownloadEventState())
+  const tasksRef = useRef<DownloadTaskDto[]>([])
+  const listRequestRef = useRef(0)
+  const visibleListRequestsRef = useRef(0)
+  const unknownRefreshPendingRef = useRef(false)
   const { push, confirm } = useNotice()
 
   const publishDownloadError = useCallback((
@@ -99,18 +105,29 @@ export function DownloadsPage() {
 
   const refresh = useCallback(async (silent = false) => {
     if (runtimeState !== "ready") return
-    if (!silent) setLoading(true)
+    const requestId = ++listRequestRef.current
+    if (!silent) {
+      visibleListRequestsRef.current += 1
+      setLoading(true)
+    }
     try {
       const next = await listDownloads()
-      setTasks(mergeLatestDownloadEvents(next, eventStateRef.current))
+      if (requestId !== listRequestRef.current) return
+      const merged = mergeDownloadList(tasksRef.current, next, eventStateRef.current)
+      tasksRef.current = merged
+      setTasks(merged)
       setErrorMessage(null)
     } catch (error) {
-      if (!silent) {
+      if (!silent && requestId === listRequestRef.current) {
         setErrorMessage(userMessage(error, "无法加载下载任务"))
         publishDownloadError(error, "无法加载下载任务", "downloads:list")
       }
     } finally {
-      if (!silent) setLoading(false)
+      if (!silent) {
+        visibleListRequestsRef.current = Math.max(0, visibleListRequestsRef.current - 1)
+        if (visibleListRequestsRef.current === 0) setLoading(false)
+      }
+      if (requestId === listRequestRef.current) unknownRefreshPendingRef.current = false
     }
   }, [publishDownloadError, runtimeState])
 
@@ -121,7 +138,13 @@ export function DownloadsPage() {
     setPendingTaskIds((current) => new Set(current).add(taskId))
     try {
       const updated = await action(taskId)
-      setTasks((current) => current.map((task) => task.taskId === taskId ? updated : task))
+      listRequestRef.current += 1
+      setTasks((current) => {
+        const next = mergeDownloadTask(current, updated)
+        tasksRef.current = next
+        return next
+      })
+      if (unknownRefreshPendingRef.current) void refresh(true)
       setErrorMessage(null)
     } catch (error) {
       setErrorMessage(userMessage(error, "下载操作失败"))
@@ -141,7 +164,7 @@ export function DownloadsPage() {
         return next
       })
     }
-  }, [publishDownloadError])
+  }, [publishDownloadError, refresh])
 
   useEffect(() => {
     if (runtimeState !== "ready") return
@@ -149,6 +172,7 @@ export function DownloadsPage() {
     let disposeSubscription: (() => Promise<void>) | null = null
     const onEvent = (event: DownloadEvent) => {
       if (!mounted || !acceptDownloadEvent(eventStateRef.current, event)) return
+      const unknownTask = !tasksRef.current.some((task) => task.taskId === event.data.taskId)
       if ((event.data.state === "failed" || event.data.state === "interrupted") && event.data.errorCode) {
         const retryable = downloadErrorRetryable(event.data.errorCode)
         push({
@@ -166,7 +190,15 @@ export function DownloadsPage() {
             : undefined,
         })
       }
-      setTasks((current) => applyDownloadEvent(current, event))
+      setTasks((current) => {
+        const next = applyDownloadEvent(current, event, eventStateRef.current)
+        tasksRef.current = next
+        return next
+      })
+      if (unknownTask && !unknownRefreshPendingRef.current) {
+        unknownRefreshPendingRef.current = true
+        void refresh(true)
+      }
     }
     void subscribeDownloadEvents(onEvent)
       .then((dispose) => {
@@ -199,14 +231,24 @@ export function DownloadsPage() {
     setPendingTaskIds((current) => new Set(current).add(taskId))
     try {
       const result = await action(taskId)
-      forgetDownloadEventsForTask(eventStateRef.current, taskId)
       if (result.recordRemoved) {
-        setTasks((current) => current.filter((task) => task.taskId !== taskId))
+        forgetDownloadEventsForTask(eventStateRef.current, taskId)
+        listRequestRef.current += 1
+        setTasks((current) => {
+          const next = current.filter((task) => task.taskId !== taskId)
+          tasksRef.current = next
+          return next
+        })
       } else if (result.offlineResourceRemoved) {
-        setTasks((current) => current.map((task) => task.taskId === taskId
-          ? { ...task, offlineResourceId: null }
-          : task))
+        markOfflineResourceDeleted(eventStateRef.current, taskId)
+        listRequestRef.current += 1
+        setTasks((current) => {
+          const next = current.map((task) => task.taskId === taskId ? { ...task, offlineResourceId: null } : task)
+          tasksRef.current = next
+          return next
+        })
       }
+      if (unknownRefreshPendingRef.current) void refresh(true)
       setErrorMessage(null)
     } catch (error) {
       setErrorMessage(userMessage(error, "下载内容操作失败"))
@@ -218,7 +260,7 @@ export function DownloadsPage() {
         return next
       })
     }
-  }, [publishDownloadError])
+  }, [publishDownloadError, refresh])
 
   const handleDeleteOffline = useCallback((taskId: string) => {
     void confirm({
@@ -258,26 +300,25 @@ export function DownloadsPage() {
   }, [category, query, sortMode, status, tasks])
 
   const { batchGroups, singleTasks } = useMemo(() => {
+    const visibleIds = new Set(filteredTasks.map((task) => task.taskId))
     const groups = new Map<string, DownloadTaskDto[]>()
-    const singles: DownloadTaskDto[] = []
-    for (const task of filteredTasks) {
+    const singles = filteredTasks.filter((task) => !task.batchId)
+    for (const task of tasks) {
       if (task.batchId) {
         const list = groups.get(task.batchId) ?? []
         list.push(task)
         groups.set(task.batchId, list)
-      } else {
-        singles.push(task)
       }
     }
     return {
-      batchGroups: Array.from(groups.entries()).map(([batchId, tasks]) => ({
+      batchGroups: Array.from(groups.entries()).filter(([, groupTasks]) => groupTasks.some((task) => visibleIds.has(task.taskId))).map(([batchId, tasks]) => ({
         batchId,
         title: tasks[0]?.title ? `${tasks[0].title} 等 ${tasks.length} 项` : `批次 ${batchId.slice(0, 8)}`,
         tasks,
       })),
       singleTasks: singles,
     }
-  }, [filteredTasks])
+  }, [filteredTasks, tasks])
 
   if (runtimeState === "unavailable") return <DownloadsUnavailablePage />
 
@@ -426,6 +467,15 @@ export function DownloadsPage() {
                     batchId={group.batchId}
                     title={group.title}
                     tasks={group.tasks}
+                    pendingTaskIds={pendingTaskIds}
+                    onPause={(id) => void runAction(id, pauseDownload)}
+                    onResume={(id) => void runAction(id, resumeDownload)}
+                    onCancel={(id) => void runAction(id, cancelDownload)}
+                    onRetry={(id) => void runAction(id, retryDownload)}
+                    onOpen={(task) => navigate(downloadTargetRoute(task))}
+                    onRemoveRecord={(id) => void runManagement(id, removeDownloadRecord)}
+                    onDeleteOffline={handleDeleteOffline}
+                    onRevealOffline={handleRevealOffline}
                   />
                 ))}
               </div>

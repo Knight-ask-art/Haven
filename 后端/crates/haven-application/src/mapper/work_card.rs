@@ -65,31 +65,58 @@ fn controlled_artwork_uri(reference: Option<&ArtworkRef>) -> Option<String> {
 }
 
 /// 主操作：必须取"同一个 Edition + 其下 MediaItem"组合，禁止跨版本错配。
-/// 规则（审查修复）：遍历 editions，找第一个其下存在 media_item 的版本；
-/// 该版本的 kind/editionId 与其第一个 media_item 的 mediaItemId 配对。
+/// 有进度时优先使用该进度所属媒体项；无进度时才回退至第一个可消费单元。
 /// 完整 Resource 可用性判定在 Application Service 层注入。
 pub fn primary_action(input: &WorkCardInput<'_>) -> Result<Option<PrimaryActionDto>, AppError> {
     let progress = input.progress;
 
-    // 找到第一个"其下存在 media_item"的 edition；media_item 必须属于该 edition。
-    let mut matched: Option<(&Edition, &MediaItem)> = None;
-    for edition in input.editions {
-        if let Some(item) = input
+    let progress_item = progress.and_then(|progress| {
+        input
             .media_items
             .iter()
-            .find(|m| m.edition_id == edition.id)
-        {
-            matched = Some((edition, item));
-            break;
-        }
-    }
+            .find(|media_item| media_item.id == progress.media_item_id)
+    });
+
+    let matched = progress_item
+        .and_then(|media_item| {
+            input
+                .editions
+                .iter()
+                .find(|edition| edition.id == media_item.edition_id)
+                .map(|edition| (edition, media_item))
+        })
+        .or_else(|| {
+            input.editions.iter().find_map(|edition| {
+                input
+                    .media_items
+                    .iter()
+                    .find(|media_item| media_item.edition_id == edition.id)
+                    .map(|media_item| (edition, media_item))
+            })
+        });
 
     let (edition, media_item) = match matched {
         Some(pair) => pair,
         None => return Ok(None), // 无任何可消费单元 → 无主操作
     };
 
-    let kind = match edition.edition_type {
+    Ok(Some(primary_action_for_media_item(
+        edition.id,
+        edition.edition_type,
+        media_item,
+        progress,
+    )))
+}
+
+/// 构造已经确定的 MediaItem 的消费动作。历史、首页和卡片投影都必须传入
+/// 该 MediaItem 自身的 Edition/类型，不能从同一 Work 的其他条目借用 action。
+pub fn primary_action_for_media_item(
+    edition_id: haven_domain::ids::EditionId,
+    edition_type: MediaType,
+    media_item: &MediaItem,
+    progress: Option<&Progress>,
+) -> PrimaryActionDto {
+    let kind = match edition_type {
         MediaType::Movie | MediaType::Series | MediaType::Episode | MediaType::Audio => {
             PrimaryActionKind::Playback
         }
@@ -105,13 +132,13 @@ pub fn primary_action(input: &WorkCardInput<'_>) -> Result<Option<PrimaryActionD
         _ => LabelHint::Start,
     };
 
-    Ok(Some(PrimaryActionDto {
+    PrimaryActionDto {
         kind,
         label_hint,
-        edition_id: edition.id.to_string(),
+        edition_id: edition_id.to_string(),
         media_item_id: Some(media_item.id.to_string()),
         locator: None,
-    }))
+    }
 }
 
 fn derive_categories(input: &WorkCardInput<'_>) -> Vec<ContentCategory> {

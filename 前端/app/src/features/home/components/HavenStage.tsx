@@ -13,6 +13,9 @@ export interface HavenStageProps {
   backdropUrl: string
   primaryActionLabel: string
   isDownloaded?: boolean
+  canManageOffline?: boolean
+  isFavorite?: boolean
+  isActionPending?: boolean
   onPrimaryAction?: () => void
   onAction?: (action: string) => void
 }
@@ -26,6 +29,9 @@ export function HavenStage({
   backdropUrl,
   primaryActionLabel,
   isDownloaded = true,
+  canManageOffline = false,
+  isFavorite: favoriteProp = false,
+  isActionPending = false,
   onPrimaryAction,
   onAction
 }: HavenStageProps) {
@@ -33,10 +39,12 @@ export function HavenStage({
   const isEmpty = !title && !backdropUrl
   const [isMoreMenuOpen, setIsMoreMenuOpen] = useState(false)
   const [isShareModalOpen, setIsShareModalOpen] = useState(false)
-  const [isFavorite, setIsFavorite] = useState(false)
+  const [isFavorite, setIsFavorite] = useState(favoriteProp)
   const [downloadState, setDownloadState] = useState(isDownloaded)
-  const [toastMessage, setToastMessage] = useState<string | null>(null)
   const menuRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => setIsFavorite(favoriteProp), [favoriteProp])
+  useEffect(() => setDownloadState(isDownloaded), [isDownloaded])
 
   // 点击外部关闭菜单
   useEffect(() => {
@@ -56,13 +64,6 @@ export function HavenStage({
   return (
     <section className="relative w-full h-[70vh] min-h-[580px] max-h-[850px] flex items-end overflow-hidden">
       {/* 极简苹果风 Toast 提示弹窗 */}
-      {toastMessage && (
-        <div className="fixed top-[32px] left-1/2 -translate-x-1/2 z-[100] flex items-center gap-3 px-6 py-3.5 rounded-full bg-zinc-950/90 dark:bg-white/95 text-white dark:text-zinc-950 text-base font-bold shadow-2xl backdrop-blur-2xl border border-white/10 dark:border-black/10 animate-in fade-in slide-in-from-top-[16px] duration-300">
-          <Download className="w-6 h-6 text-emerald-400 dark:text-emerald-600 shrink-0" />
-          <span>{toastMessage}</span>
-        </div>
-      )}
-
       {/* 沉浸式背景图 */}
       <div className="absolute inset-0 z-0 select-none">
         <img 
@@ -127,7 +128,8 @@ export function HavenStage({
             {/* 操作区：增大上下边距拉开呼吸感 */}
             <div className="flex items-center gap-[16px] mt-[32px]">
               <button 
-          onClick={onPrimaryAction || (() => navigate(`/work/${id || "2"}`))}
+                disabled={isActionPending}
+                onClick={onPrimaryAction || (() => navigate(`/work/${id || "2"}`))}
                 className={cn(
                   "flex items-center gap-[8px] px-[32px] h-[64px] rounded-full bg-foreground text-background font-bold text-sm md:text-base cursor-pointer",
                   "transition-all duration-300 hover:scale-105 active:scale-95 shadow-xl shadow-black/10 hover:opacity-90",
@@ -141,8 +143,8 @@ export function HavenStage({
               {/* 次级操作组 */}
               <div className="flex items-center gap-[16px] relative" ref={menuRef}>
                 <button
+                  disabled={isActionPending}
                   onClick={() => {
-                    setIsFavorite(!isFavorite)
                     onAction?.('heart')
                   }}
                   title={isFavorite ? "已收藏" : "加入收藏"}
@@ -160,12 +162,9 @@ export function HavenStage({
                 </button>
 
                 <button
+                  disabled={isActionPending}
                   onClick={() => {
-                    const next = !downloadState
-                    setDownloadState(next)
                     onAction?.('download')
-                    setToastMessage(next ? "已进入下载队列" : "已从下载队列中移除")
-                    setTimeout(() => setToastMessage(null), 2500)
                   }}
                   title={downloadState ? "已下载" : "下载至本地"}
                   className={cn(
@@ -184,6 +183,7 @@ export function HavenStage({
                 {/* 更多按钮及其弹出菜单 */}
                 <div className="relative">
                   <button
+                    disabled={isActionPending}
                     onClick={() => setIsMoreMenuOpen(!isMoreMenuOpen)}
                     title="更多选项"
                     className={cn(
@@ -205,7 +205,7 @@ export function HavenStage({
                       "bg-white/80 dark:bg-zinc-900/85 backdrop-blur-2xl border border-black/10 dark:border-white/15",
                       "flex flex-col gap-[4px] animate-in fade-in zoom-in-95 duration-150"
                     )}>
-                      <button
+                      <button disabled={isActionPending}
                         onClick={() => { 
                           setIsMoreMenuOpen(false); 
                           onAction?.('info');
@@ -217,7 +217,7 @@ export function HavenStage({
                         查看详细信息
                       </button>
 
-                      <button
+                      <button disabled={isActionPending}
                         onClick={() => { setIsMoreMenuOpen(false); onAction?.('reset') }}
                         className="flex min-h-[48px] items-center justify-center gap-[16px] rounded-xl px-[16px] py-[12px] text-sm md:text-base font-semibold text-foreground hover:bg-black/5 dark:hover:bg-white/10 transition-colors text-center"
                       >
@@ -225,8 +225,8 @@ export function HavenStage({
                         重置播放进度
                       </button>
 
-                      {isDownloaded && (
-                        <button
+                      {canManageOffline && (
+                        <button disabled={isActionPending}
                           onClick={() => { setIsMoreMenuOpen(false); onAction?.('folder') }}
                           className="flex min-h-[48px] items-center justify-center gap-[16px] rounded-xl px-[16px] py-[12px] text-sm md:text-base font-semibold text-foreground hover:bg-black/5 dark:hover:bg-white/10 transition-colors text-center"
                         >
@@ -243,15 +243,19 @@ export function HavenStage({
                         生成分享卡片
                       </button>
 
-                      <div className="h-[1px] bg-black/5 dark:bg-white/10 my-1" />
-
-                      <button
-                        onClick={() => { setIsMoreMenuOpen(false); onAction?.('delete') }}
-                        className="flex min-h-[48px] items-center justify-center gap-[16px] rounded-xl px-[16px] py-[12px] text-sm md:text-base font-semibold text-destructive hover:bg-destructive/10 transition-colors text-center"
-                      >
-                        <Trash2 className="w-[20px] h-[20px] shrink-0 text-destructive" />
-                        清理本地缓存
-                      </button>
+                      {canManageOffline && (
+                        <>
+                          <div className="h-[1px] bg-black/5 dark:bg-white/10 my-1" />
+                          <button
+                            disabled={isActionPending}
+                            onClick={() => { setIsMoreMenuOpen(false); onAction?.('delete') }}
+                            className="flex min-h-[48px] items-center justify-center gap-[16px] rounded-xl px-[16px] py-[12px] text-sm md:text-base font-semibold text-destructive hover:bg-destructive/10 transition-colors text-center disabled:opacity-50"
+                          >
+                            <Trash2 className="w-[20px] h-[20px] shrink-0 text-destructive" />
+                            删除离线内容
+                          </button>
+                        </>
+                      )}
                     </div>
                   )}
                 </div>

@@ -24,6 +24,7 @@ import type {
   WorkCardDto,
 } from "@/lib/ipc/generated/wire"
 import type { MediaCardProps } from "@/components/ui/haven/MediaCard"
+import type { PrimaryActionDto } from "@/lib/ipc/generated/wire"
 
 import { getCatalogItems, getStoredFavoriteIds } from "@/lib/havenState"
 
@@ -66,9 +67,22 @@ function categoryLabel(card: WorkCardDto): string {
   return CATEGORY_LABELS[card.categories[0]] ?? card.categories[0] ?? "媒体"
 }
 
-function toMediaCard(card: WorkCardDto): MediaCardProps {
+export type FootprintActionCard = MediaCardProps & {
+  workId: string
+  mediaItemId: string | null
+  primaryAction: PrimaryActionDto | null
+  favorite: boolean
+  completion?: ProgressSummaryDto["completion"]
+}
+
+function toMediaCard(card: WorkCardDto): FootprintActionCard {
   return {
     id: card.workId,
+    workId: card.workId,
+    mediaItemId: card.primaryAction?.mediaItemId ?? null,
+    primaryAction: card.primaryAction,
+    favorite: card.favorite,
+    completion: card.progress?.completion,
     title: card.title,
     subtitle: `已收藏 · ${categoryLabel(card)}`,
     typeBadge: categoryLabel(card),
@@ -78,11 +92,15 @@ function toMediaCard(card: WorkCardDto): MediaCardProps {
 }
 
 /** 拉取「我的喜爱 · 收藏」投影：真实收藏（浏览器为 localStorage 演示收藏）。 */
-export async function getFavoriteFootprintItems(): Promise<MediaCardProps[]> {
+export async function getFavoriteFootprintItems(): Promise<FootprintActionCard[]> {
   const mode = getHavenClientMode()
   if (mode === "mock") {
     return getCatalogItems(getStoredFavoriteIds()).map((item) => ({
       id: item.id,
+      workId: item.id,
+      mediaItemId: null,
+      primaryAction: null,
+      favorite: true,
       title: item.title,
       subtitle: `已收藏 · ${item.badge || "已收藏"}`,
       typeBadge: item.badge,
@@ -128,11 +146,16 @@ function deriveMediaType(card: WorkCardDto): string {
   return card.categories[0] ?? "video"
 }
 
-function progressToCard(p: ProgressSummaryDto, card: WorkCardDto | undefined): MediaCardProps | null {
+function progressToCard(p: ProgressSummaryDto, card: WorkCardDto | undefined): FootprintActionCard | null {
   if (!card) return null
   const mediaType = deriveMediaType(card)
   return {
-    id: p.mediaItemId,
+    id: card.workId,
+    workId: card.workId,
+    mediaItemId: p.mediaItemId,
+    primaryAction: card.primaryAction,
+    favorite: card.favorite,
+    completion: p.completion,
     title: card.title,
     subtitle: PROGRESS_LABEL[mediaType] ?? "继续",
     typeBadge: categoryLabel(card),
@@ -150,18 +173,25 @@ function progressToCard(p: ProgressSummaryDto, card: WorkCardDto | undefined): M
   }
 }
 
-export type HistoryCardProps = MediaCardProps & { lastActiveAt: string }
+export type HistoryCardProps = MediaCardProps & {
+  lastActiveAt: string
+  workId: string
+  mediaItemId: string | null
+  primaryAction: PrimaryActionDto | null
+}
 
 function historyToCard(
   entry: HistoryEntryDto,
   card: WorkCardDto | undefined,
-  _progress?: ProgressSummaryDto | null,
 ): HistoryCardProps | null {
   if (!card) return null
   // 浏览记录一律海报，不取关键帧（产品要求）
-  const p = card.progress
+  const p = entry.progress
   return {
-    id: entry.mediaItemId,
+    id: entry.historyEntryId,
+    workId: card.workId,
+    mediaItemId: entry.mediaItemId,
+    primaryAction: entry.primaryAction,
     title: card.title,
     subtitle: `最近活动 · ${categoryLabel(card)}`,
     typeBadge: categoryLabel(card),
@@ -180,7 +210,7 @@ function historyToCard(
 
 /** 拉取「继续」分组：progress_recent 联查 WorkCard 投影（浏览器演示环境返回空，由页面兜底 mock）。
  *  去重：同一 work 仅保留最新一条（progress_recent 已按 updatedAt 倒序），避免多集同一作品刷屏。 */
-export async function getContinueFootprintItems(): Promise<MediaCardProps[]> {
+export async function getContinueFootprintItems(): Promise<FootprintActionCard[]> {
   if (getHavenClientMode() !== "tauri") return []
   const [progressItems, cards] = await Promise.all([
     getHavenClient().progressRecent({ limit: LIST_LIMIT }),
@@ -188,7 +218,7 @@ export async function getContinueFootprintItems(): Promise<MediaCardProps[]> {
   ])
   const index = buildMediaItemIndex(cards)
   const seenWork = new Set<string>()
-  const result: MediaCardProps[] = []
+  const result: FootprintActionCard[] = []
   for (const p of progressItems) {
     const card = index.get(p.mediaItemId)
     if (!card) continue
@@ -210,7 +240,10 @@ export async function getRecentActivityFootprintItems(): Promise<HistoryCardProp
   ])
   const index = buildMediaItemIndex(cards)
   return historyItems
-    .map((entry) => historyToCard(entry, index.get(entry.mediaItemId) ?? index.get(entry.workId)))
+    // WorkCard is display metadata only. HistoryEntry owns its exact MediaItem
+    // action/progress, so a current card projection for another episode cannot
+    // reroute a historical click or overwrite its percentage.
+    .map((entry) => historyToCard(entry, index.get(entry.workId)))
     .filter((item): item is HistoryCardProps => item !== null)
 }
 

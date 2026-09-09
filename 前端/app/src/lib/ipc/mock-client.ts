@@ -37,6 +37,7 @@ import type {
   SessionCloseRequest,
   SessionCloseResultDto,
   ProgressSaveRequest,
+  ProgressMarkCompletedRequest,
   ProgressSaveResult,
   ProgressRecentRequest,
   ProgressResetRequest,
@@ -749,6 +750,30 @@ export class MockHavenClient implements HavenClient {
     }
     const revision = `progress-mock-${this.progressRevisionCounter++}`;
     this.progress.set(request.mediaItemId, { request, revision });
+    return { revision };
+  }
+
+  async progressMarkCompleted(request: ProgressMarkCompletedRequest): Promise<ProgressSaveResult> {
+    const current = this.progress.get(request.mediaItemId);
+    const revision = `progress-mock-${this.progressRevisionCounter++}`;
+    if (current) {
+      this.progress.set(request.mediaItemId, {
+        ...current,
+        request: { ...current.request, completion: "completed" as CompletionWire },
+        revision,
+      });
+    } else {
+      this.progress.set(request.mediaItemId, {
+        request: {
+          mediaItemId: request.mediaItemId,
+          locator: request.initialLocator,
+          completion: "completed",
+          expectedRevision: null,
+          keyframe: undefined,
+        },
+        revision,
+      });
+    }
     return { revision };
   }
 

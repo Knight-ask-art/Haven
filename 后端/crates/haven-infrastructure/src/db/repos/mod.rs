@@ -415,6 +415,12 @@ impl haven_domain::contracts::ProgressRepository for SqliteRepositories {
             .save_if_revision(progress, expected_revision)
             .await
     }
+    async fn mark_completed(
+        &self,
+        progress: &haven_domain::entities::Progress,
+    ) -> Result<String, haven_common::AppError> {
+        self.progress.mark_completed(progress).await
+    }
     async fn recent(
         &self,
         limit: u32,
@@ -743,8 +749,9 @@ impl haven_domain::contracts::DownloadRepository for SqliteRepositories {
     async fn list(
         &self,
         limit: u32,
+        offset: u32,
     ) -> Result<Vec<haven_domain::entities::DownloadTask>, haven_common::AppError> {
-        self.download.list(limit).await
+        self.download.list(limit, offset).await
     }
     async fn find_active(
         &self,

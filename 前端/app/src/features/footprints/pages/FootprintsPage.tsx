@@ -7,12 +7,15 @@ import { ArtworkImage } from "@/components/ui/haven/ArtworkImage"
 import { defaultCoverCategoryForMediaType } from "@/lib/default-cover"
 import { ArrowRight, Bookmark, Heart, Trash2 } from "lucide-react"
 import type { MediaCardProps } from "@/components/ui/haven/MediaCard"
+import { setFavorite } from "@/features/media/ipc/favorite-gateway"
+import { createDownloadForMediaItem, deleteOfflineDownload, getMediaItemDownloadInfo, revealOfflineDownload, subscribeDownloadEvents, type MediaItemDownloadInfo } from "@/features/downloads/ipc/download-gateway"
+import type { DownloadEvent } from "@/lib/ipc/generated/wire"
 import { getCatalogItem, getStoredMarkers, removeStoredMarker } from "@/lib/havenState"
 import { getHavenClientMode } from "@/lib/ipc/runtime"
 import { onFavoriteChanged } from "@/lib/ipc/events"
-import { toHavenError, type HavenError } from "@/lib/ipc/errors"
+import { HavenError, toHavenError, type HavenError as HavenErrorType } from "@/lib/ipc/errors"
 import { deriveLibrarySliceState } from "@/lib/slice-state"
-import { getFavoriteFootprintItems, getContinueFootprintItems, getRecentActivityFootprintItems, getMarkerFootprintCards, deleteFootprintMarker } from "../ipc/footprints-gateway"
+import { getFavoriteFootprintItems, getContinueFootprintItems, getRecentActivityFootprintItems, getMarkerFootprintCards, deleteFootprintMarker, resetFootprintProgress, type FootprintActionCard, type HistoryCardProps } from "../ipc/footprints-gateway"
 import {
   canLoadFootprintsData,
   loadDemoFootprintMarkers,
@@ -20,6 +23,7 @@ import {
   resolveFootprintsRuntimeState,
 } from "../lib/footprints-runtime-state"
 import { selectLatestUnfinished } from "../lib/select-latest-continue"
+import { resolveFootprintOpen } from "../lib/open-footprint-action"
 
 const HIDDEN_MARKERS_KEY = "haven:hidden-markers"
 
@@ -176,9 +180,9 @@ export function FootprintsPage() {
   const [activeLikesTab, setActiveLikesTab] = useState<"favorites" | "markers">("favorites")
   // IPC-MOCK-001：收藏改经 gateway 拉真实数据（Tauri=library_list 过滤 favorite）；
   // 浏览器演示环境保持既有演示目录兜底（零 localStorage 依赖差异可见化）。
-  const [favoriteItems, setFavoriteItems] = useState<MediaCardProps[]>([])
+  const [favoriteItems, setFavoriteItems] = useState<FootprintActionCard[]>([])
   const [favoritesLoading, setFavoritesLoading] = useState(productionMode)
-  const [favoritesError, setFavoritesError] = useState<HavenError | null>(null)
+  const [favoritesError, setFavoritesError] = useState<HavenErrorType | null>(null)
   const favoritesRequestRef = useRef(0)
   const loadFavorites = useCallback(async () => {
     const requestId = ++favoritesRequestRef.current
@@ -195,9 +199,9 @@ export function FootprintsPage() {
   }, [])
 
   // 继续观看/阅读：progress_recent 联查 WorkCard 投影（浏览器演示环境返回空，由页面兜底 mock）。
-  const [continueItems, setContinueItems] = useState<MediaCardProps[]>([])
+  const [continueItems, setContinueItems] = useState<FootprintActionCard[]>([])
   const [continueLoading, setContinueLoading] = useState(productionMode)
-  const [continueError, setContinueError] = useState<HavenError | null>(null)
+  const [continueError, setContinueError] = useState<HavenErrorType | null>(null)
   const continueRequestRef = useRef(0)
   const loadContinue = useCallback(async () => {
     const requestId = ++continueRequestRef.current
@@ -214,10 +218,23 @@ export function FootprintsPage() {
   }, [])
 
   // 最近活动：history_list 联查 WorkCard 投影（浏览器演示环境返回空，由页面兜底 mock）。
-  const [recentItems, setRecentItems] = useState<MediaCardProps[]>([])
+  const [recentItems, setRecentItems] = useState<HistoryCardProps[]>([])
   const [recentLoading, setRecentLoading] = useState(productionMode)
-  const [recentError, setRecentError] = useState<HavenError | null>(null)
+  const [recentError, setRecentError] = useState<HavenErrorType | null>(null)
   const recentRequestRef = useRef(0)
+  const [heroDownloadInfo, setHeroDownloadInfo] = useState<MediaItemDownloadInfo | null>(null)
+  const [heroDownloadMediaItemId, setHeroDownloadMediaItemId] = useState<string | null>(null)
+  const [heroDownloadRefreshErrorMediaItemId, setHeroDownloadRefreshErrorMediaItemId] = useState<string | null>(null)
+  const [heroDownloadRefreshPending, setHeroDownloadRefreshPending] = useState(false)
+  const [heroActionPending, setHeroActionPending] = useState(false)
+  const heroActionGenerationRef = useRef(0)
+  const heroDownloadRequestRef = useRef(0)
+  const heroDownloadTaskIdRef = useRef<string | null>(null)
+  const heroDownloadCreationPendingRef = useRef(false)
+  const heroDownloadEventsDuringCreationRef = useRef(new Set<string>())
+  const heroDownloadMutationRef = useRef(false)
+  const heroDownloadEventEpochRef = useRef(0)
+  const openActionGenerationRef = useRef(0)
   const loadRecent = useCallback(async () => {
     const requestId = ++recentRequestRef.current
     setRecentLoading(true)
@@ -262,8 +279,12 @@ export function FootprintsPage() {
     if (!productionMode) return
     let unlisten: (() => void) | null = null
     let disposed = false
-    onFavoriteChanged(() => {
-      if (!disposed) void loadFavorites()
+    onFavoriteChanged((event) => {
+      if (disposed) return
+      setContinueItems((items) => items.map((item) => item.workId === event.workId ? { ...item, favorite: event.favorite } : item))
+      setRecentItems((items) => items.map((item) => item.workId === event.workId ? { ...item, favorite: event.favorite } : item))
+      setFavoriteItems((items) => items.map((item) => item.workId === event.workId ? { ...item, favorite: event.favorite } : item))
+      void loadFavorites()
     })
       .then((fn) => {
         if (disposed) fn()
@@ -285,7 +306,7 @@ export function FootprintsPage() {
   // 书签：Tauri 环境用真实 marker_list_all 联查 WorkCard；浏览器演示用 localStorage 兜底 mock。
   const [markerItems, setMarkerItems] = useState<MarkerItem[]>(() => loadDemoFootprintMarkers(clientMode, buildMarkerItems))
   const [markersLoading, setMarkersLoading] = useState(productionMode)
-  const [markersError, setMarkersError] = useState<HavenError | null>(null)
+  const [markersError, setMarkersError] = useState<HavenErrorType | null>(null)
   const markersRequestRef = useRef(0)
   const loadMarkers = useCallback(async () => {
     if (!productionMode) return
@@ -315,21 +336,16 @@ export function FootprintsPage() {
   }, [loadMarkers, productionMode])
 
   // 继续/最近：Tauri 环境用真实 IPC 结果；浏览器演示环境保持既有 mock 兜底。
-  const continueDisplay = useMemo(
-    () =>
-      productionMode
-        ? continueItems
-        : demoMode
-          ? isEmptyState
-            ? []
-            : mockContinueShelf.map((item) => ({ ...item, onClick: () => navigate(`/player/${item.id}`) }))
-          : [],
-    [continueItems, demoMode, isEmptyState, navigate, productionMode],
-  )
-  const recentDisplay = useMemo(
-    () => (productionMode ? recentItems : demoMode ? (isEmptyState ? [] : mockRecentActivity) : []),
-    [demoMode, isEmptyState, productionMode, recentItems],
-  )
+  const continueDisplay = productionMode
+    ? continueItems.map((item) => ({ ...item, onClick: () => void openFootprintAction(item) }))
+    : demoMode
+      ? isEmptyState
+        ? []
+        : mockContinueShelf.map((item) => ({ ...item, onClick: () => navigate(`/player/${item.id}`) }))
+      : []
+  const recentDisplay = productionMode
+    ? recentItems.map((item) => ({ ...item, onClick: () => void openFootprintAction(item) }))
+    : demoMode ? (isEmptyState ? [] : mockRecentActivity) : []
   // 生产：最新未看完的置顶为 Hero（严格 0<progress<100），剩下的按时间依次排序；Demo 保持既有沙丘2 Hero 不动
   const productionHeroSplit = useMemo(
     () =>
@@ -339,7 +355,11 @@ export function FootprintsPage() {
     [continueItems, productionMode],
   )
   const productionHero = productionHeroSplit.hero
-  const productionContinueRest = productionHeroSplit.rest
+  const heroMediaItemId = productionHero?.mediaItemId ?? null
+  const productionContinueRest = productionHeroSplit.rest.map((item) => ({
+    ...item,
+    onClick: () => void openFootprintAction(item),
+  }))
   const heroStageData = useMemo(() => {
     if (!productionMode || isEmptyState || !productionHero) return null
     const metaParts = [
@@ -348,15 +368,121 @@ export function FootprintsPage() {
     ].filter(Boolean) as string[]
     return {
       id: productionHero.id,
+      workId: productionHero.workId,
+      mediaItemId: productionHero.mediaItemId,
+      primaryAction: productionHero.primaryAction,
+      isFavorite: productionHero.favorite,
       title: productionHero.title,
       originalTitle: undefined as string | undefined,
       metadata: metaParts.length > 0 ? metaParts.join(" · ") : (productionHero.subtitle ?? ""),
       description: productionHero.description ?? "",
       backdropUrl: productionHero.imageUrl,
       primaryActionLabel:
-        productionHero.progress !== undefined ? `继续播放 (${productionHero.progress}%)` : "继续播放",
+        `${productionHero.primaryAction?.kind === "playback" ? "继续播放" : "继续阅读"}${productionHero.progress !== undefined ? ` (${productionHero.progress}%)` : ""}`,
     }
   }, [isEmptyState, productionHero, productionMode])
+  useEffect(() => {
+    heroActionGenerationRef.current += 1
+    heroDownloadTaskIdRef.current = null
+    heroDownloadCreationPendingRef.current = false
+    heroDownloadEventsDuringCreationRef.current.clear()
+    heroDownloadMutationRef.current = false
+    heroDownloadEventEpochRef.current += 1
+    setHeroActionPending(false)
+  }, [productionHero?.id, heroMediaItemId, productionMode])
+  useEffect(() => {
+    const requestId = ++heroDownloadRequestRef.current
+    setHeroDownloadInfo(null)
+    setHeroDownloadMediaItemId(null)
+    setHeroDownloadRefreshErrorMediaItemId(null)
+    setHeroDownloadRefreshPending(false)
+    if (productionMode && heroMediaItemId) {
+      void getMediaItemDownloadInfo(heroMediaItemId).then((info) => {
+        if (heroDownloadRequestRef.current !== requestId) return
+        heroDownloadTaskIdRef.current = info.taskId
+        setHeroDownloadInfo(info)
+        setHeroDownloadMediaItemId(heroMediaItemId)
+      }).catch(() => {
+        if (heroDownloadRequestRef.current !== requestId) return
+        heroDownloadTaskIdRef.current = null
+        setHeroDownloadInfo(null)
+        setHeroDownloadMediaItemId(null)
+      })
+    }
+    return () => {
+      if (heroDownloadRequestRef.current === requestId) heroDownloadRequestRef.current += 1
+    }
+  }, [heroMediaItemId, productionMode])
+  useEffect(() => {
+    if (!productionMode || !heroMediaItemId) return
+    const eventEpoch = heroDownloadEventEpochRef.current
+    let mounted = true
+    let dispose: (() => Promise<void>) | null = null
+    let refreshInFlight = false
+    let refreshRequested = false
+    const refreshHeroDownloadInfo = () => {
+      if (
+        !mounted
+        || heroDownloadMutationRef.current
+        || heroDownloadEventEpochRef.current !== eventEpoch
+      ) return
+      if (refreshInFlight) {
+        refreshRequested = true
+        return
+      }
+      refreshInFlight = true
+      const requestId = ++heroDownloadRequestRef.current
+      void getMediaItemDownloadInfo(heroMediaItemId)
+        .then((info) => {
+          if (
+            !mounted
+            || heroDownloadMutationRef.current
+            || heroDownloadEventEpochRef.current !== eventEpoch
+            || heroDownloadRequestRef.current !== requestId
+          ) return
+          heroDownloadTaskIdRef.current = info.taskId
+          setHeroDownloadInfo(info)
+          setHeroDownloadMediaItemId(heroMediaItemId)
+        })
+        .catch(() => {})
+        .finally(() => {
+          refreshInFlight = false
+          if (
+            !mounted
+            || heroDownloadMutationRef.current
+            || heroDownloadEventEpochRef.current !== eventEpoch
+            || heroDownloadRequestRef.current !== requestId
+          ) {
+            refreshRequested = false
+            return
+          }
+          if (!refreshRequested) return
+          refreshRequested = false
+          refreshHeroDownloadInfo()
+        })
+    }
+    const onEvent = (event: DownloadEvent) => {
+      if (event.data.taskId !== heroDownloadTaskIdRef.current) {
+        if (heroDownloadCreationPendingRef.current) {
+          heroDownloadEventsDuringCreationRef.current.add(event.data.taskId)
+        }
+        return
+      }
+      if (
+        heroDownloadMutationRef.current
+        || heroDownloadEventEpochRef.current !== eventEpoch
+      ) return
+      refreshHeroDownloadInfo()
+    }
+    void subscribeDownloadEvents(onEvent).then((cleanup) => {
+      if (!mounted) void cleanup().catch(() => undefined)
+      else dispose = cleanup
+    }).catch(() => {})
+    return () => {
+      mounted = false
+      if (dispose) void dispose().catch(() => undefined)
+    }
+  }, [heroMediaItemId, productionMode])
   const continueShelfItems = productionMode ? productionContinueRest : continueDisplay
   const continueSliceState = deriveLibrarySliceState({
     loading: continueLoading,
@@ -369,6 +495,175 @@ export function FootprintsPage() {
     error: recentError,
   })
   const stageData = isEmptyState ? { title: "", backdropUrl: "", metadata: "", description: "", primaryActionLabel: "", id: "" } : mockHavenStageData
+
+  function showMessage(message: string) {
+    // Keep the existing page-level visual surface; action errors are rendered as a live region.
+    setBatchActionMessage(message)
+  }
+  const [batchActionMessage, setBatchActionMessage] = useState<string | null>(null)
+  async function openFootprintAction(card: Pick<FootprintActionCard, "primaryAction" | "mediaItemId">) {
+    const generation = ++openActionGenerationRef.current
+    try {
+      const result = await resolveFootprintOpen(card)
+      if (generation !== openActionGenerationRef.current) return
+      if (result.kind === "open") navigate(result.route)
+      else showMessage(result.message)
+    } catch (error) {
+      if (generation === openActionGenerationRef.current) {
+        showMessage(error instanceof HavenError ? error.dto.userMessage : "读取内容能力失败，请重试")
+      }
+    }
+  }
+  useEffect(() => () => { openActionGenerationRef.current += 1 }, [])
+  const retryHeroDownloadRefresh = async () => {
+    const mediaItemId = productionHero?.mediaItemId
+    if (
+      !mediaItemId
+      || heroDownloadRefreshErrorMediaItemId !== mediaItemId
+      || heroDownloadRefreshPending
+    ) return
+    const actionGeneration = heroActionGenerationRef.current
+    const requestId = ++heroDownloadRequestRef.current
+    const isCurrent = () => (
+      heroActionGenerationRef.current === actionGeneration
+      && heroDownloadRequestRef.current === requestId
+    )
+    setHeroDownloadRefreshPending(true)
+    setHeroDownloadRefreshErrorMediaItemId(null)
+    try {
+      const info = await getMediaItemDownloadInfo(mediaItemId)
+      if (!isCurrent()) return
+      heroDownloadTaskIdRef.current = info.taskId
+      setHeroDownloadInfo(info)
+      setHeroDownloadMediaItemId(mediaItemId)
+      showMessage("离线内容状态已更新")
+    } catch {
+      if (!isCurrent()) return
+      heroDownloadTaskIdRef.current = null
+      setHeroDownloadInfo(null)
+      setHeroDownloadMediaItemId(null)
+      setHeroDownloadRefreshErrorMediaItemId(mediaItemId)
+      showMessage("离线内容已删除，状态刷新失败")
+    } finally {
+      if (isCurrent()) setHeroDownloadRefreshPending(false)
+    }
+  }
+  const handleHeroAction = async (action: string) => {
+    if (!productionHero || heroActionPending) return
+    const actionGeneration = heroActionGenerationRef.current
+    const isCurrent = () => heroActionGenerationRef.current === actionGeneration
+    const actionMediaItemId = productionHero.mediaItemId
+    let deletedOffline = false
+    let deletionRefreshRequestId: number | null = null
+    setHeroActionPending(true)
+    try {
+      if (action === "heart") {
+        const favorite = !productionHero.favorite
+        await setFavorite({ workId: productionHero.workId, favorite })
+        if (!isCurrent()) return
+        setContinueItems((items) => items.map((item) => item.id === productionHero.id ? { ...item, favorite } : item))
+        await loadFavorites()
+      } else if (action === "download") {
+        const mediaItemId = actionMediaItemId
+        if (!mediaItemId) throw new Error("当前内容没有可下载的媒体版本")
+        const requestId = ++heroDownloadRequestRef.current
+        const info = await getMediaItemDownloadInfo(mediaItemId)
+        if (!isCurrent() || heroDownloadRequestRef.current !== requestId) return
+        let createdTaskId: string | null = null
+        let earlyCreatedTaskEvent = false
+        if (info.hasOfflineResource && info.taskId) await revealOfflineDownload(info.taskId)
+        else if (info.hasOfflineResource) throw new Error("当前离线内容没有可定位的下载任务")
+        else if (!info.hasOfflineResource) {
+          heroDownloadCreationPendingRef.current = true
+          heroDownloadEventsDuringCreationRef.current.clear()
+          try {
+            const createdTask = await createDownloadForMediaItem(mediaItemId)
+            if (!isCurrent() || heroDownloadRequestRef.current !== requestId) return
+            createdTaskId = createdTask.taskId
+            heroDownloadTaskIdRef.current = createdTask.taskId
+            earlyCreatedTaskEvent = heroDownloadEventsDuringCreationRef.current.has(createdTask.taskId)
+          } finally {
+            heroDownloadCreationPendingRef.current = false
+            heroDownloadEventsDuringCreationRef.current.clear()
+          }
+        }
+        if (!isCurrent() || heroDownloadRequestRef.current !== requestId) return
+        const refreshedInfo = await getMediaItemDownloadInfo(mediaItemId)
+        if (!isCurrent() || heroDownloadRequestRef.current !== requestId) return
+        // A just-created task may not be visible in the first projection yet.
+        // Keep its identity subscribed until the server returns an identity of
+        // its own, otherwise a subsequent completion event would be discarded.
+        heroDownloadTaskIdRef.current = refreshedInfo.taskId ?? createdTaskId
+        setHeroDownloadInfo(refreshedInfo)
+        setHeroDownloadMediaItemId(mediaItemId)
+        if (earlyCreatedTaskEvent) {
+          const completedInfo = await getMediaItemDownloadInfo(mediaItemId)
+          if (!isCurrent() || heroDownloadRequestRef.current !== requestId) return
+          heroDownloadTaskIdRef.current = completedInfo.taskId
+          setHeroDownloadInfo(completedInfo)
+          setHeroDownloadMediaItemId(mediaItemId)
+        }
+        showMessage(info.hasOfflineResource ? "已打开本地文件夹" : "已加入下载队列")
+      } else if (action === "reset") {
+        const mediaItemId = actionMediaItemId
+        if (!mediaItemId) throw new Error("当前内容没有可重置的媒体版本")
+        await resetFootprintProgress(mediaItemId)
+        if (!isCurrent()) return
+        await Promise.all([loadContinue(), loadRecent()])
+        if (!isCurrent()) return
+        showMessage("已重置进度")
+      } else if (action === "folder") {
+        if (heroDownloadMediaItemId !== productionHero.mediaItemId || !heroDownloadInfo?.hasOfflineResource || !heroDownloadInfo.taskId) throw new Error("当前没有可定位的离线文件")
+        await revealOfflineDownload(heroDownloadInfo.taskId)
+        if (!isCurrent()) return
+        showMessage("已打开离线文件夹")
+      } else if (action === "delete") {
+        if (heroDownloadMediaItemId !== productionHero.mediaItemId || !heroDownloadInfo?.hasOfflineResource || !heroDownloadInfo.taskId) throw new Error("当前没有可删除的离线内容")
+        if (!actionMediaItemId) throw new Error("当前内容没有可删除的媒体版本")
+        if (!window.confirm("确定删除这个作品的离线内容吗？此操作不会删除媒体库记录。")) return
+        const deletedTaskId = heroDownloadInfo.taskId
+        heroDownloadMutationRef.current = true
+        await deleteOfflineDownload(deletedTaskId)
+        if (!isCurrent()) return
+        deletedOffline = true
+        // A success means callbacks bound to the deleted task can never be authoritative again.
+        heroDownloadEventEpochRef.current += 1
+        const requestId = ++heroDownloadRequestRef.current
+        deletionRefreshRequestId = requestId
+        setHeroDownloadInfo(null)
+        heroDownloadTaskIdRef.current = null
+        setHeroDownloadMediaItemId(null)
+        setHeroDownloadRefreshErrorMediaItemId(null)
+        const info = await getMediaItemDownloadInfo(actionMediaItemId)
+        if (!isCurrent() || heroDownloadRequestRef.current !== requestId) return
+        heroDownloadTaskIdRef.current = info.taskId
+        setHeroDownloadInfo(info)
+        setHeroDownloadMediaItemId(actionMediaItemId)
+        showMessage("已删除离线内容")
+      }
+    } catch (error) {
+      if (!isCurrent()) return
+      if (
+        action === "delete"
+        && deletedOffline
+        && deletionRefreshRequestId !== null
+        && heroDownloadRequestRef.current === deletionRefreshRequestId
+      ) {
+        setHeroDownloadInfo(null)
+        heroDownloadTaskIdRef.current = null
+        setHeroDownloadMediaItemId(null)
+        setHeroDownloadRefreshErrorMediaItemId(actionMediaItemId)
+        showMessage("离线内容已删除，状态刷新失败")
+      } else {
+        showMessage(error instanceof HavenError ? error.dto.userMessage : "操作失败，请重试")
+      }
+    } finally {
+      if (isCurrent()) {
+        if (action === "delete") heroDownloadMutationRef.current = false
+        setHeroActionPending(false)
+      }
+    }
+  }
 
   const deleteMarker = (id: string) => {
     setMarkerItems((current) => current.filter((marker) => marker.id !== id))
@@ -399,8 +694,14 @@ export function FootprintsPage() {
       {!isEmptyState && heroStageData && (
         <HavenStage
           {...heroStageData}
-          onPrimaryAction={() => navigate(`/player/${heroStageData.id}`)}
-          onAction={(action) => console.log("Action clicked:", action)}
+          onPrimaryAction={() => {
+            void openFootprintAction(heroStageData)
+          }}
+          isFavorite={heroStageData.isFavorite}
+          isDownloaded={heroDownloadMediaItemId === productionHero?.mediaItemId && (heroDownloadInfo?.hasOfflineResource ?? false)}
+          canManageOffline={heroDownloadMediaItemId === productionHero?.mediaItemId && Boolean(heroDownloadInfo?.hasOfflineResource && heroDownloadInfo.taskId)}
+          isActionPending={heroActionPending}
+          onAction={(action) => void handleHeroAction(action)}
         />
       )}
       {!isEmptyState && !heroStageData && demoMode && (
@@ -409,6 +710,21 @@ export function FootprintsPage() {
           onPrimaryAction={() => navigate(`/player/${stageData.id || "2"}`)}
           onAction={(action) => console.log("Action clicked:", action)}
         />
+      )}
+      {batchActionMessage && (
+        <div role="status" className="fixed top-6 left-1/2 z-[100] flex -translate-x-1/2 items-center gap-3 rounded-full bg-zinc-950/90 px-5 py-3 text-sm font-semibold text-white shadow-xl">
+          <span>{batchActionMessage}</span>
+          {heroDownloadRefreshErrorMediaItemId === productionHero?.mediaItemId && (
+            <button
+              type="button"
+              disabled={heroDownloadRefreshPending}
+              onClick={() => void retryHeroDownloadRefresh()}
+              className="underline underline-offset-2 transition-colors hover:text-white/75 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              重试
+            </button>
+          )}
+        </div>
       )}
       {unavailableMode ? (
         <UnavailableFootprintsState />

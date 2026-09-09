@@ -5,6 +5,7 @@ import type {
   CompletionWire,
   LocatorDto,
   ProgressSaveRequest,
+  ProgressMarkCompletedRequest,
   ProgressSaveResult,
 } from "@/lib/ipc/generated/wire"
 
@@ -83,6 +84,14 @@ function isResult(value: unknown): value is ProgressSaveResult {
   return typeof result.revision === "string" && result.revision.length > 0
 }
 
+function isMarkCompletedRequest(value: unknown): value is ProgressMarkCompletedRequest {
+  if (typeof value !== "object" || value === null) return false
+  const request = value as Record<string, unknown>
+  return isCanonicalUuid(request.mediaItemId) && isLocator(request.initialLocator)
+    && ((request.initialLocator as { kind?: string; data?: { chapterItemId?: unknown } }).kind !== "comic"
+      || (request.initialLocator as { data: { chapterItemId?: unknown } }).data.chapterItemId === request.mediaItemId)
+}
+
 /** Saves a progress locator through the typed client and fails closed on malformed wire data. */
 export async function saveProgress(
   request: ProgressSaveRequest,
@@ -101,4 +110,27 @@ export async function saveProgress(
   return result
 }
 
+/** Marks a media item completed without replaying a stale list snapshot over existing progress. */
+export async function markCompletedProgress(
+  request: ProgressMarkCompletedRequest,
+  client: HavenClient = getHavenClient(),
+): Promise<ProgressSaveResult> {
+  if (!isMarkCompletedRequest(request)) {
+    throw new HavenError({ code: "INVALID_ARGUMENT", userMessage: "完成进度参数无效", retryable: false })
+  }
+  let result: ProgressSaveResult
+  try {
+    result = await client.progressMarkCompleted(request)
+  } catch (error) {
+    throw toHavenError(error)
+  }
+  if (!isResult(result)) throw new HavenError(INVALID_RESPONSE)
+  return result
+}
+
 export { isCanonicalUuid, isLocator, isRequest, isResult }
+
+/** Reset progress through the feature gateway; the page never calls the client directly. */
+export async function resetProgress(mediaItemId: string, client: HavenClient = getHavenClient()): Promise<void> {
+  await client.progressReset({ mediaItemId })
+}

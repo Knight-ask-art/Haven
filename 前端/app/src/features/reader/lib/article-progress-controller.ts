@@ -83,6 +83,10 @@ export function restoreArticleProgress(
   if (session.progress.locator.kind !== "article") return null
   const identity = `${session.sessionId}:${session.mediaItemId}:${session.contentUri}`
   if (restored?.current === identity) return null
+  if (session.progress.completion === "not_started") {
+    if (restored) restored.current = identity
+    return { progression: 0, blockId: null }
+  }
   const data = session.progress.locator.data
   if (data.progression == null || !Number.isFinite(data.progression) || data.progression < 0) return null
   if (restored) restored.current = identity

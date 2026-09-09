@@ -12,6 +12,7 @@ use rusqlite::OptionalExtension;
 use haven_common::AppError;
 use haven_domain::contracts::ProgressRepository;
 use haven_domain::entities::Progress;
+use haven_domain::enums::CompletionState;
 use haven_domain::ids::{EditionId, MediaItemId, ProgressId, WorkId};
 use uuid::Uuid;
 
@@ -226,6 +227,58 @@ impl ProgressRepository for SqliteProgressRepository {
         Ok(revision)
     }
 
+    async fn mark_completed(&self, progress: &Progress) -> Result<String, AppError> {
+        if progress.completion != CompletionState::Completed {
+            return Err(AppError::new(
+                "INVALID_PROGRESS_COMPLETION",
+                haven_common::ErrorKind::Validation,
+                "完成操作只能写入 completed 状态",
+                false,
+            ));
+        }
+        let conn = self.db.lock();
+        validate_progress(&conn, progress)?;
+        let locator_json = locator_to_json(&progress.locator)?;
+        let completion = enum_to_db_str(&progress.completion)?;
+        let percentage = progress.percentage.map(|value| value as f64);
+        let revision = new_revision();
+
+        // The conflict arm deliberately retains the persisted locator,
+        // percentage, keyframe, content chain, and last-active timestamp.
+        // This is a single SQLite statement under the repository mutex, so a
+        // library-list snapshot can never replay an older reading position.
+        conn.query_row(
+            "INSERT INTO progress
+                (id, work_id, edition_id, media_item_id, locator_json, locator_version,
+                 completion, percentage, last_active_at, updated_at, revision, keyframe_uri)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(media_item_id) DO UPDATE SET
+                 completion = excluded.completion,
+                 revision = excluded.revision,
+                 updated_at = CASE
+                     WHEN excluded.updated_at <= progress.updated_at THEN progress.updated_at + 1
+                     ELSE excluded.updated_at
+                 END
+             RETURNING revision",
+            rusqlite::params![
+                progress.id.to_string(),
+                progress.work_id.to_string(),
+                progress.edition_id.to_string(),
+                progress.media_item_id.to_string(),
+                locator_json,
+                progress.locator.version(),
+                completion,
+                percentage,
+                progress.last_active_at.0,
+                progress.updated_at.0,
+                revision,
+                progress.keyframe_uri,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(map_db_error("标记 Progress 完成失败"))
+    }
+
     async fn recent(&self, limit: u32) -> Result<Vec<Progress>, AppError> {
         let conn = self.db.lock();
         let mut stmt = conn
@@ -429,6 +482,47 @@ mod tests {
             Locator::Video(v) => assert_eq!(v.position_ms, 9_999_999),
             _ => panic!("locator 类型应保留"),
         }
+    }
+
+    #[tokio::test]
+    async fn mark_completed_preserves_a_newer_persisted_locator() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (w, e, m) = seed_content(&db);
+        let repo = SqliteProgressRepository::new(db);
+
+        // This is the locator that existed when the library page rendered.
+        let mut listed = sample_progress(w, e, m);
+        listed.locator = Locator::Video(VideoLocator {
+            media_item_id: m,
+            position_ms: 10_000,
+        });
+        listed.percentage = Some(0.1);
+        repo.save_if_revision(&listed, None).await.unwrap();
+
+        // The consumer advances before the user submits the bulk action.
+        let mut newer = listed.clone();
+        newer.locator = Locator::Video(VideoLocator {
+            media_item_id: m,
+            position_ms: 50_000,
+        });
+        newer.percentage = Some(0.5);
+        newer.updated_at = haven_common::UtcMillis(listed.updated_at.0 + 10);
+        repo.save_if_revision(&newer, None).await.unwrap();
+
+        // `listed` is only an insert fallback. On conflict the database must
+        // retain `newer`'s locator rather than replaying the stale snapshot.
+        let mut completion_request = listed.clone();
+        completion_request.completion = CompletionState::Completed;
+        repo.mark_completed(&completion_request).await.unwrap();
+
+        let stored = repo
+            .get_for_media_item(m)
+            .await
+            .unwrap()
+            .expect("进度仍存在");
+        assert_eq!(stored.completion, CompletionState::Completed);
+        assert_eq!(stored.locator, newer.locator);
+        assert_eq!(stored.percentage, newer.percentage);
     }
 
     #[tokio::test]

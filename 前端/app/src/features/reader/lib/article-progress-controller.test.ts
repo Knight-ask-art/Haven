@@ -110,4 +110,20 @@ describe("article-progress-controller", () => {
     expect(result!.blockId).toBe("h2-agentic")
     expect(restored.current).toBe(`${session.sessionId}:${session.mediaItemId}:${session.contentUri}`)
   })
+
+  it("opens reset progress at the beginning instead of applying its retained locator", () => {
+    const session = fakeSession()
+    session.progress = {
+      mediaItemId: session.mediaItemId,
+      completion: "not_started",
+      progressRatio: 0,
+      revision: "progress-rev-reset",
+      updatedAt: "2026-09-07T00:00:00.000Z",
+      locator: { version: 1, kind: "article", data: { blockId: "h2-agentic", progression: 0.6, textAnchor: null } } as never,
+    }
+    const restored = { current: null as string | null }
+
+    expect(restoreArticleProgress(session, restored)).toEqual({ progression: 0, blockId: null })
+    expect(restored.current).toBe(`${session.sessionId}:${session.mediaItemId}:${session.contentUri}`)
+  })
 })
