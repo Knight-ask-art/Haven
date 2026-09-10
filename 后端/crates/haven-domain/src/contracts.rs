@@ -28,6 +28,18 @@ pub enum WorkOrder {
     Rating,
 }
 
+/// Work 与来源身份之间的持久化绑定。
+///
+/// 领域层只保留稳定的来源标识和本地 Work 归属，不携带远端 URL、认证材料
+/// 或本地存储路径。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct WorkSourceRef {
+    pub provider: String,
+    pub external_id: String,
+    pub work_id: WorkId,
+}
+
 #[async_trait]
 pub trait WorkRepository {
     async fn get(&self, id: WorkId) -> Result<Option<Work>, AppError>;
@@ -92,6 +104,10 @@ pub trait WorkRepository {
     ) -> Result<Option<WorkId>, AppError>;
     /// 该 Work 是否已有任意来源引用（enrichment 判"新作品"用）。
     async fn has_any_source_ref(&self, id: WorkId) -> Result<bool, AppError>;
+    /// 读取该 Work 的全部来源引用；默认实现供不需要来源读取的内存端口兼容。
+    async fn list_source_refs(&self, _work_id: WorkId) -> Result<Vec<WorkSourceRef>, AppError> {
+        Ok(Vec::new())
+    }
     async fn save_source_ref(
         &self,
         provider: &str,

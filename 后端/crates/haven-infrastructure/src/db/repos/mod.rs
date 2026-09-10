@@ -191,6 +191,12 @@ impl haven_domain::contracts::WorkRepository for SqliteRepositories {
     ) -> Result<bool, haven_common::AppError> {
         self.work.has_any_source_ref(id).await
     }
+    async fn list_source_refs(
+        &self,
+        work_id: haven_domain::ids::WorkId,
+    ) -> Result<Vec<haven_domain::contracts::WorkSourceRef>, haven_common::AppError> {
+        self.work.list_source_refs(work_id).await
+    }
     async fn save_source_ref(
         &self,
         provider: &str,

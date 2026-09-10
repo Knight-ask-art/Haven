@@ -8,7 +8,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use haven_common::{AppError, ErrorKind};
-use haven_domain::contracts::{WorkOrder, WorkRepository};
+use haven_domain::contracts::{WorkOrder, WorkRepository, WorkSourceRef};
 use haven_domain::entities::Work;
 use haven_domain::ids::WorkId;
 use rusqlite::OptionalExtension;
@@ -51,6 +51,14 @@ fn row_to_work(row: &rusqlite::Row<'_>) -> rusqlite::Result<Work> {
         artwork: artwork_from_row(row)?,
         created_at: haven_common::UtcMillis(row.get("created_at")?),
         updated_at: haven_common::UtcMillis(row.get("updated_at")?),
+    })
+}
+
+fn row_to_work_source_ref(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkSourceRef> {
+    Ok(WorkSourceRef {
+        provider: row.get("provider")?,
+        external_id: row.get("external_id")?,
+        work_id: id_from_row::<WorkId>(row.get("work_id")?)?,
     })
 }
 
@@ -476,6 +484,26 @@ impl WorkRepository for SqliteWorkRepository {
         Ok(count > 0)
     }
 
+    async fn list_source_refs(&self, work_id: WorkId) -> Result<Vec<WorkSourceRef>, AppError> {
+        let conn = self.db.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT provider, external_id, work_id
+                 FROM work_source_refs
+                 WHERE work_id = ?1
+                 ORDER BY provider ASC, external_id ASC",
+            )
+            .map_err(map_db_error("查询来源作品引用列表失败"))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![work_id.to_string()],
+                row_to_work_source_ref,
+            )
+            .map_err(map_db_error("查询来源作品引用列表失败"))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_db_error("查询来源作品引用列表失败"))
+    }
+
     async fn save_source_ref(
         &self,
         provider: &str,
@@ -630,7 +658,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_work_can_keep_multiple_source_refs_and_conflicts_are_explicit() {
+    async fn work_source_refs_return_all_in_order_and_conflicts_are_explicit() {
         let db = Arc::new(Db::open_in_memory().unwrap());
         let repo = SqliteWorkRepository::new(db.clone());
         let first = sample_work();
@@ -639,25 +667,40 @@ mod tests {
         repo.save(&first).await.unwrap();
         repo.save(&second).await.unwrap();
 
-        repo.save_source_ref("mangadex", "manga-1", first.id)
+        repo.save_source_ref("mangadex", "work-b", first.id)
+            .await
+            .unwrap();
+        repo.save_source_ref("mangadex", "work-a", first.id)
             .await
             .unwrap();
         repo.save_source_ref("reader-ws", "book-1", first.id)
             .await
             .unwrap();
-
-        let count: i64 = db
-            .lock()
-            .query_row(
-                "SELECT COUNT(*) FROM work_source_refs WHERE work_id = ?1",
-                rusqlite::params![first.id.to_string()],
-                |row| row.get(0),
-            )
+        repo.save_source_ref("mangadex", "work-c", second.id)
+            .await
             .unwrap();
-        assert_eq!(count, 2);
+
+        let refs = repo.list_source_refs(first.id).await.unwrap();
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0].provider, "mangadex");
+        assert_eq!(refs[0].external_id, "work-a");
+        assert_eq!(refs[0].work_id, first.id);
+        assert_eq!(refs[1].provider, "mangadex");
+        assert_eq!(refs[1].external_id, "work-b");
+        assert_eq!(refs[1].work_id, first.id);
+        assert_eq!(refs[2].provider, "reader-ws");
+        assert_eq!(refs[2].external_id, "book-1");
+        assert_eq!(refs[2].work_id, first.id);
+
+        assert!(
+            repo.list_source_refs(WorkId::new())
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         let error = repo
-            .save_source_ref("mangadex", "manga-1", second.id)
+            .save_source_ref("mangadex", "work-a", second.id)
             .await
             .expect_err("同一来源身份绑定其他 Work 必须报告冲突");
         assert_eq!(error.code().as_str(), "SOURCE_REF_CONFLICT");
