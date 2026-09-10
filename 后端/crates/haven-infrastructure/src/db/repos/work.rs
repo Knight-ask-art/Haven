@@ -601,6 +601,91 @@ mod tests {
         (edition_id, media_item_id)
     }
 
+    struct WorkRepositoryWithoutSourceRefs;
+
+    #[async_trait::async_trait]
+    impl WorkRepository for WorkRepositoryWithoutSourceRefs {
+        async fn get(&self, _id: WorkId) -> Result<Option<Work>, AppError> {
+            Ok(None)
+        }
+
+        async fn save(&self, _work: &Work) -> Result<(), AppError> {
+            Ok(())
+        }
+
+        async fn list(&self, _limit: u32, _offset: u32) -> Result<Vec<Work>, AppError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_sorted(
+            &self,
+            _order: WorkOrder,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<Vec<Work>, AppError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_filtered(
+            &self,
+            _order: WorkOrder,
+            _category: Option<ContentCategory>,
+            _media_types: Option<&[MediaType]>,
+            _query: Option<&str>,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<Vec<Work>, AppError> {
+            Ok(Vec::new())
+        }
+
+        async fn count_filtered(
+            &self,
+            _category: Option<ContentCategory>,
+            _media_types: Option<&[MediaType]>,
+            _query: Option<&str>,
+        ) -> Result<u64, AppError> {
+            Ok(0)
+        }
+
+        async fn delete(&self, _id: WorkId) -> Result<bool, AppError> {
+            Ok(false)
+        }
+
+        async fn id_for_source_ref(
+            &self,
+            _provider: &str,
+            _external_id: &str,
+        ) -> Result<Option<WorkId>, AppError> {
+            Ok(None)
+        }
+
+        async fn has_any_source_ref(&self, _id: WorkId) -> Result<bool, AppError> {
+            Ok(false)
+        }
+
+        async fn save_source_ref(
+            &self,
+            _provider: &str,
+            _external_id: &str,
+            _work_id: WorkId,
+        ) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn default_work_source_refs_fallback_is_explicitly_unsupported() {
+        let error = WorkRepositoryWithoutSourceRefs
+            .list_source_refs(WorkId::new())
+            .await
+            .expect_err("未实现来源读取的 WorkRepository 不得伪装为空列表");
+
+        assert_eq!(error.code().as_str(), "WORK_SOURCE_REFS_UNIMPLEMENTED");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert_eq!(error.user_message(), "当前存储实现不支持读取作品来源引用");
+        assert!(!error.retryable());
+    }
+
     #[tokio::test]
     async fn save_get_roundtrip_preserves_artwork() {
         let db = Arc::new(Db::open_in_memory().unwrap());

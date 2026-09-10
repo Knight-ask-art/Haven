@@ -104,9 +104,14 @@ pub trait WorkRepository {
     ) -> Result<Option<WorkId>, AppError>;
     /// 该 Work 是否已有任意来源引用（enrichment 判"新作品"用）。
     async fn has_any_source_ref(&self, id: WorkId) -> Result<bool, AppError>;
-    /// 读取该 Work 的全部来源引用；默认实现供不需要来源读取的内存端口兼容。
+    /// 读取该 Work 的全部来源引用；不支持读取的端口必须显式返回明确错误。
     async fn list_source_refs(&self, _work_id: WorkId) -> Result<Vec<WorkSourceRef>, AppError> {
-        Ok(Vec::new())
+        Err(AppError::new(
+            "WORK_SOURCE_REFS_UNIMPLEMENTED",
+            ErrorKind::Unsupported,
+            "当前存储实现不支持读取作品来源引用",
+            false,
+        ))
     }
     async fn save_source_ref(
         &self,
