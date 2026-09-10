@@ -987,6 +987,28 @@ mod tests {
             target_resolution.media_item_id, first_media_item_id,
             "目标自身 Progress 不得被 Subject pointer 覆盖"
         );
+        let mut dangling_pointer_subject = subject.clone();
+        dangling_pointer_subject.authoritative_progress_media_item_id = Some(third_media_item_id);
+        SqliteUnitOfWork::new(db.clone())
+            .run_comic_progress_subject_write(&ComicProgressSubjectWritePlan {
+                subject: dangling_pointer_subject,
+                members: ComicProgressSubjectRepository::list_members(&*repos, member.subject_id)
+                    .await
+                    .unwrap(),
+                page_identity_write: None,
+                progress_writes: vec![],
+                migration_snapshot: None,
+                refresh_receipt: None,
+            })
+            .unwrap();
+        let err = service
+            .read_for_media_item(first_media_item_id)
+            .await
+            .expect_err("目标自身 Progress 不能掩盖悬空 authoritative pointer");
+        assert_eq!(
+            err.code().as_str(),
+            "COMIC_PROGRESS_SUBJECT_AUTHORITATIVE_PROGRESS_MISSING"
+        );
 
         // Equal timestamps use only MediaItem UUID text as the deterministic tie-breaker.
         let tied_media_item_id =
