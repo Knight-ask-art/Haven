@@ -362,6 +362,104 @@ mod tests {
         (work_id, edition_id, media_item_id)
     }
 
+    fn table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
+             )",
+            rusqlite::params![name],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+            != 0
+    }
+
+    fn index_exists(conn: &rusqlite::Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1
+             )",
+            rusqlite::params![name],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+            != 0
+    }
+
+    #[test]
+    fn migration_comic_progress_subjects_create_schema_and_active_member_index() {
+        let db = Db::open_in_memory().unwrap();
+        let (work, edition, media) = seed(&db);
+        let conn = db.lock();
+
+        assert!(table_exists(&conn, "comic_progress_subjects"));
+        assert!(table_exists(&conn, "comic_progress_subject_members"));
+        assert!(table_exists(&conn, "comic_catalog_refresh_outcomes"));
+        assert!(index_exists(
+            &conn,
+            "uq_comic_progress_subject_members_active_media_item"
+        ));
+
+        let versions: Vec<String> = conn
+            .prepare(
+                "SELECT version FROM schema_migrations
+                 WHERE version IN (
+                     '037_comic_progress_subjects',
+                     '038_comic_progress_subject_members',
+                     '039_comic_catalog_refresh_outcomes'
+                 )
+                 ORDER BY rowid",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            versions,
+            vec![
+                "037_comic_progress_subjects",
+                "038_comic_progress_subject_members",
+                "039_comic_catalog_refresh_outcomes",
+            ]
+        );
+
+        let subject_a = ComicProgressSubjectId::new();
+        let subject_b = ComicProgressSubjectId::new();
+        for subject_id in [subject_a, subject_b] {
+            conn.execute(
+                "INSERT INTO comic_progress_subjects
+                    (id, work_id, edition_id, canonical_media_item_id,
+                     authoritative_progress_media_item_id, state, created_at, updated_at,
+                     algorithm_version, redirect_subject_id)
+                 VALUES (?1, ?2, ?3, ?4, NULL, 'active', 1, 1, 'test-v1', NULL)",
+                rusqlite::params![
+                    subject_id.to_string(),
+                    work.to_string(),
+                    edition.to_string(),
+                    media.to_string()
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO comic_progress_subject_members
+                (subject_id, media_item_id, relationship, confidence, evidence_json,
+                 state, algorithm_version, created_at, updated_at)
+             VALUES (?1, ?2, 'canonical', 'high', '[]', 'active', 'test-v1', 1, 1)",
+            rusqlite::params![subject_a.to_string(), media.to_string()],
+        )
+        .unwrap();
+        let duplicate_active = conn.execute(
+            "INSERT INTO comic_progress_subject_members
+                (subject_id, media_item_id, relationship, confidence, evidence_json,
+                 state, algorithm_version, created_at, updated_at)
+             VALUES (?1, ?2, 'equivalent', 'medium', '[]', 'active', 'test-v1', 1, 1)",
+            rusqlite::params![subject_b.to_string(), media.to_string()],
+        );
+        assert!(duplicate_active.is_err(), "active media_item 必须保持唯一");
+    }
+
     #[tokio::test]
     async fn comic_progress_subjects_roundtrip_without_progress_fields() {
         let db = Arc::new(Db::open_in_memory().unwrap());
@@ -406,5 +504,89 @@ mod tests {
         member.algorithm_version = "https://secret.invalid".to_owned();
         subject.attach_member(member).unwrap();
         assert!(repo.save(&subject).await.is_err());
+    }
+
+    #[test]
+    fn comic_progress_subjects_uow_commits_page_subject_receipt_and_new_progress() {
+        use crate::db::uow::SqliteUnitOfWork;
+        use haven_application::services::ports::{
+            ComicPageIdentityWriteCandidate, ComicProgressWriteCandidate, UnitOfWork,
+        };
+        use haven_domain::comic_catalog::ComicCatalogRefreshReceipt;
+        use haven_domain::comic_identity::PageIdentity;
+        use haven_domain::entities::Progress;
+        use haven_domain::enums::CompletionState;
+        use haven_domain::ids::{ComicCatalogRefreshId, ProgressId};
+        use haven_domain::locator::{ComicLocator, Locator};
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (work_id, edition_id, media_item_id) = seed(&db);
+        let now = UtcMillis(1);
+        let subject = ComicProgressSubject::new(work_id, edition_id, media_item_id, now);
+        let receipt = ComicCatalogRefreshReceipt {
+            id: ComicCatalogRefreshId::new(),
+            work_id,
+            source_key: "source".to_owned(),
+            remote_work_id: "remote-work".to_owned(),
+            status: haven_domain::comic_catalog::ComicCatalogRefreshOutcomeStatus::NeverSynced,
+            generation_before: 0,
+            generation_after: None,
+            observed_from: None,
+            observed_to: None,
+            truncated: false,
+            retained_previous_catalog: true,
+            error_code: None,
+            observed_at: now,
+        };
+        let progress = Progress {
+            id: ProgressId::new(),
+            work_id,
+            edition_id,
+            media_item_id,
+            locator: Locator::Comic(ComicLocator {
+                chapter_item_id: media_item_id,
+                page_index: 0,
+                page_progression: None,
+            }),
+            completion: CompletionState::InProgress,
+            percentage: Some(0.25),
+            last_active_at: now,
+            updated_at: now,
+            revision: None,
+            keyframe_uri: None,
+        };
+        let result = SqliteUnitOfWork::new(db.clone())
+            .run_comic_progress_subject_write(
+                &haven_application::services::ports::ComicProgressSubjectWritePlan {
+                    subject,
+                    members: vec![],
+                    page_identity_write: Some(ComicPageIdentityWriteCandidate {
+                        media_item_id,
+                        pages: vec![PageIdentity::stable("page-1")],
+                        expected_revision: None,
+                    }),
+                    progress_writes: vec![ComicProgressWriteCandidate {
+                        progress,
+                        expected_revision: None,
+                    }],
+                    migration_snapshot: None,
+                    refresh_receipt: Some(receipt.clone()),
+                },
+            )
+            .unwrap();
+        assert_eq!(result.applied_progress_revisions.len(), 1);
+        assert_eq!(result.refresh_id, Some(receipt.id));
+        assert_eq!(count_rows(&db, "comic_progress_subjects"), 1);
+        assert_eq!(count_rows(&db, "comic_catalog_refresh_outcomes"), 1);
+        assert_eq!(count_rows(&db, "comic_page_identities"), 1);
+        assert_eq!(count_rows(&db, "progress"), 1);
+    }
+
+    fn count_rows(db: &Db, table: &str) -> i64 {
+        db.lock()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
     }
 }

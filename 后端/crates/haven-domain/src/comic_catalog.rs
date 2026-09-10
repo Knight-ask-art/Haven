@@ -304,4 +304,48 @@ mod tests {
         assert!(!ComicChapterAvailability::Unknown.is_readable());
         assert!(ComicChapterAvailability::Unknown.is_probeable());
     }
+
+    #[test]
+    fn refresh_receipt_roundtrips_snake_case_without_runtime_channels() {
+        let receipt = ComicCatalogRefreshReceipt {
+            id: ComicCatalogRefreshId::new(),
+            work_id: WorkId::new(),
+            source_key: "mangadex".to_owned(),
+            remote_work_id: "remote-work-42".to_owned(),
+            status: ComicCatalogRefreshOutcomeStatus::RefreshFailed,
+            generation_before: 7,
+            generation_after: Some(8),
+            observed_from: Some("chapter-1".to_owned()),
+            observed_to: Some("chapter-12".to_owned()),
+            truncated: true,
+            retained_previous_catalog: true,
+            error_code: Some("temporarily_unavailable".to_owned()),
+            observed_at: UtcMillis(1_234),
+        };
+
+        let value = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(value["status"], "refresh_failed");
+        let restored: ComicCatalogRefreshReceipt = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(restored, receipt);
+
+        let object = value.as_object().unwrap();
+        for forbidden_field in [
+            "url",
+            "cookie",
+            "grant",
+            "request_headers",
+            "headers",
+            "local_path",
+            "path",
+        ] {
+            assert!(
+                !object.contains_key(forbidden_field),
+                "Receipt 不得序列化运行时通道字段 {forbidden_field}"
+            );
+        }
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(!serialized.contains("://"));
+        assert!(!serialized.to_ascii_lowercase().contains("cookie"));
+        assert!(!serialized.to_ascii_lowercase().contains("grant"));
+    }
 }

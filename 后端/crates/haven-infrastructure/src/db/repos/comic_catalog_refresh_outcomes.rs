@@ -254,6 +254,124 @@ mod tests {
         assert_eq!(count, 1);
     }
 
+    #[test]
+    fn comic_catalog_refresh_outcomes_uow_rolls_back_subject_member_receipt_and_progress() {
+        use crate::db::uow::SqliteUnitOfWork;
+        use haven_application::services::ports::{
+            ComicProgressSubjectWritePlan, ComicProgressWriteCandidate, UnitOfWork,
+        };
+        use haven_domain::comic_identity::ChapterEvidence;
+        use haven_domain::comic_progress_subject::{
+            ComicProgressSubject, ComicProgressSubjectMember,
+        };
+        use haven_domain::entities::Progress;
+        use haven_domain::enums::CompletionState;
+        use haven_domain::ids::{EditionId, MediaItemId, ProgressId};
+        use haven_domain::locator::{ComicLocator, Locator};
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let work_id = seed(&db);
+        let edition_id = EditionId::new();
+        let media_item_id = MediaItemId::new();
+        let now = haven_common::UtcMillis(1);
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO editions (id, work_id, title, edition_type, created_at, updated_at)
+                 VALUES (?1, ?2, '原子漫画版', 'comic', ?3, ?3)",
+                rusqlite::params![edition_id.to_string(), work_id.to_string(), now.0],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO media_items
+                    (id, edition_id, media_type, title, category, chapter, page_count,
+                     status, created_at, updated_at)
+                 VALUES (?1, ?2, 'comic', '第 1 话', 'comic', 1, 1, 'available', ?3, ?3)",
+                rusqlite::params![media_item_id.to_string(), edition_id.to_string(), now.0],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_subject_progress_write
+                 BEFORE INSERT ON progress
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected subject progress failure');
+                 END;",
+            )
+            .unwrap();
+        }
+
+        let mut subject = ComicProgressSubject::new(work_id, edition_id, media_item_id, now);
+        subject
+            .attach_member(ComicProgressSubjectMember::active(
+                subject.id,
+                media_item_id,
+                vec![ChapterEvidence::SameRemoteIdentity],
+            ))
+            .unwrap();
+        let members = subject.members().to_vec();
+        let receipt = ComicCatalogRefreshReceipt {
+            id: ComicCatalogRefreshId::new(),
+            work_id,
+            source_key: "source".to_owned(),
+            remote_work_id: "remote-work".to_owned(),
+            status: ComicCatalogRefreshOutcomeStatus::Succeeded,
+            generation_before: 0,
+            generation_after: Some(1),
+            observed_from: Some("chapter-1".to_owned()),
+            observed_to: Some("chapter-1".to_owned()),
+            truncated: false,
+            retained_previous_catalog: false,
+            error_code: None,
+            observed_at: now,
+        };
+        let progress = Progress {
+            id: ProgressId::new(),
+            work_id,
+            edition_id,
+            media_item_id,
+            locator: Locator::Comic(ComicLocator {
+                chapter_item_id: media_item_id,
+                page_index: 0,
+                page_progression: None,
+            }),
+            completion: CompletionState::InProgress,
+            percentage: Some(0.25),
+            last_active_at: now,
+            updated_at: now,
+            revision: None,
+            keyframe_uri: None,
+        };
+        let error = SqliteUnitOfWork::new(db.clone())
+            .run_comic_progress_subject_write(&ComicProgressSubjectWritePlan {
+                subject,
+                members,
+                page_identity_write: None,
+                progress_writes: vec![ComicProgressWriteCandidate {
+                    progress,
+                    expected_revision: None,
+                }],
+                migration_snapshot: None,
+                refresh_receipt: Some(receipt),
+            })
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), "DATABASE_ERROR");
+
+        for table in [
+            "comic_progress_subjects",
+            "comic_progress_subject_members",
+            "comic_catalog_refresh_outcomes",
+            "progress",
+        ] {
+            let count: i64 = db
+                .lock()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "Immediate 事务失败后 {table} 不得留下写入");
+        }
+    }
+
     #[tokio::test]
     async fn comic_catalog_refresh_outcomes_reject_unsafe_source_identity() {
         let db = Arc::new(Db::open_in_memory().unwrap());
