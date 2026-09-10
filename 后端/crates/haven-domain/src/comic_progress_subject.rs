@@ -80,6 +80,7 @@ pub enum ComicProgressSubjectError {
     DuplicateActiveMember,
     RedirectCycle,
     InvalidRedirectState,
+    UpdatedAtOverflow,
     RedirectedSubjectCannotAcceptMember,
     MemberBelongsToAnotherSubject,
     InvalidMemberRelationship,
@@ -96,6 +97,7 @@ impl fmt::Display for ComicProgressSubjectError {
             Self::InvalidRedirectState => {
                 "comic progress subject state and redirect target are inconsistent"
             }
+            Self::UpdatedAtOverflow => "comic progress subject updated_at overflow",
             Self::RedirectedSubjectCannotAcceptMember => {
                 "redirected comic progress subject cannot accept a member"
             }
@@ -292,10 +294,11 @@ impl ComicProgressSubject {
         ) {
             return Err(ComicProgressSubjectError::InvalidAuthoritativeProgressMember);
         }
+        let updated_at = next_updated_at(self.updated_at)?;
 
         self.authoritative_progress_media_item_id = proposed_authoritative_progress_media_item_id;
         self.members = proposed_members;
-        self.updated_at = next_updated_at(self.updated_at);
+        self.updated_at = updated_at;
         Ok(())
     }
 
@@ -411,22 +414,36 @@ impl ComicProgressSubject {
         if !self.authoritative_mapping_is_valid_for(&self.members) {
             return Err(ComicProgressSubjectError::InvalidAuthoritativeProgressMember);
         }
+        let updated_at = next_updated_at(self.updated_at)?;
+        let mut retired_member_updated_at = Vec::with_capacity(self.members.len());
+        for member in &self.members {
+            if member.state == ComicProgressSubjectMemberState::Active {
+                retired_member_updated_at.push(Some(next_updated_at(member.updated_at)?));
+            } else {
+                retired_member_updated_at.push(None);
+            }
+        }
+
         self.state = ComicProgressSubjectState::Redirected;
         self.redirect_subject_id = Some(target);
-        self.updated_at = next_updated_at(self.updated_at);
-        for member in &mut self.members {
-            if member.state == ComicProgressSubjectMemberState::Active {
+        self.updated_at = updated_at;
+        for (member, updated_at) in self.members.iter_mut().zip(retired_member_updated_at) {
+            if let Some(updated_at) = updated_at {
                 member.state = ComicProgressSubjectMemberState::Retired;
-                member.updated_at = next_updated_at(member.updated_at);
+                member.updated_at = updated_at;
             }
         }
         Ok(())
     }
 }
 
-fn next_updated_at(previous: UtcMillis) -> UtcMillis {
+fn next_updated_at(previous: UtcMillis) -> Result<UtcMillis, ComicProgressSubjectError> {
     let now = UtcMillis::now();
-    UtcMillis(now.0.max(previous.0.saturating_add(1)))
+    let next = previous
+        .0
+        .checked_add(1)
+        .ok_or(ComicProgressSubjectError::UpdatedAtOverflow)?;
+    Ok(UtcMillis(now.0.max(next)))
 }
 
 impl ComicProgressSubjectMember {
@@ -1010,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn subject_updates_use_a_non_decreasing_strict_step_without_clock_races() {
+    fn subject_updates_are_strict_and_reject_timestamp_overflow_without_mutation() {
         let mut subject = ComicProgressSubject::new(
             fixture_work_id(),
             fixture_edition_id(),
@@ -1035,15 +1052,50 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(subject.updated_at, UtcMillis(i64::MAX));
+        let before_subject_overflow = subject.clone();
+        assert_eq!(
+            subject.attach_member(ComicProgressSubjectMember::candidate(
+                subject.id,
+                fixture_media_item_id(),
+                fixture_low_evidence(),
+            )),
+            Err(ComicProgressSubjectError::UpdatedAtOverflow)
+        );
+        assert_eq!(subject, before_subject_overflow);
 
-        let mut redirectable = ComicProgressSubject::new(
+        let mut redirect_subject_overflow = ComicProgressSubject::new(
             fixture_work_id(),
             fixture_edition_id(),
             fixture_media_item_id(),
             fixture_now(),
         );
-        redirectable.updated_at = UtcMillis(i64::MAX - 1);
-        redirectable.redirect_to(fixture_subject_id()).unwrap();
-        assert_eq!(redirectable.updated_at, UtcMillis(i64::MAX));
+        redirect_subject_overflow.updated_at = UtcMillis(i64::MAX);
+        let before_redirect_subject_overflow = redirect_subject_overflow.clone();
+        assert_eq!(
+            redirect_subject_overflow.redirect_to(fixture_subject_id()),
+            Err(ComicProgressSubjectError::UpdatedAtOverflow)
+        );
+        assert_eq!(redirect_subject_overflow, before_redirect_subject_overflow);
+
+        let mut redirect_member_overflow = ComicProgressSubject::new(
+            fixture_work_id(),
+            fixture_edition_id(),
+            fixture_media_item_id(),
+            fixture_now(),
+        );
+        redirect_member_overflow
+            .attach_member(ComicProgressSubjectMember::active(
+                redirect_member_overflow.id,
+                fixture_media_item_id(),
+                fixture_high_evidence(),
+            ))
+            .unwrap();
+        redirect_member_overflow.members[0].updated_at = UtcMillis(i64::MAX);
+        let before_redirect_member_overflow = redirect_member_overflow.clone();
+        assert_eq!(
+            redirect_member_overflow.redirect_to(fixture_subject_id()),
+            Err(ComicProgressSubjectError::UpdatedAtOverflow)
+        );
+        assert_eq!(redirect_member_overflow, before_redirect_member_overflow);
     }
 }
