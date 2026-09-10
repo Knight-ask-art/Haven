@@ -917,6 +917,15 @@ mod tests {
             pointer_resolution.media_item_id, second_media_item_id,
             "不得用较新的非 pointer Progress 替换既有权威映射"
         );
+        let target_resolution = service
+            .read_for_media_item(first_media_item_id)
+            .await
+            .unwrap()
+            .expect("目标已有 Progress 时必须保留目标当前视角");
+        assert_eq!(
+            target_resolution.media_item_id, first_media_item_id,
+            "目标自身 Progress 不得被 Subject pointer 覆盖"
+        );
 
         // Equal timestamps use only MediaItem UUID text as the deterministic tie-breaker.
         let tied_media_item_id =

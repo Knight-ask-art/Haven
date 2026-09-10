@@ -128,16 +128,25 @@ impl ComicProgressSubjectService {
         let authoritative_progress = if let Some(authoritative_media_item_id) =
             subject.authoritative_progress_media_item_id
         {
-            // An existing pointer is the Subject's single authority.  Do not
-            // silently substitute a newer row: that would make the returned
-            // resolution disagree with the persisted mapping.  A dangling
-            // pointer is fail-closed; repairing it requires an explicit
-            // mapping decision rather than selecting an unrelated Progress.
-            Some(
-                ProgressRepository::get_for_media_item(&*self.ports, authoritative_media_item_id)
+            if target_progress.is_some() {
+                // The requested MediaItem's own Progress is always its current
+                // reading view, even if a legacy Subject pointer is dangling.
+                None
+            } else {
+                // An existing pointer is the Subject's single authority.  Do not
+                // silently substitute a newer row: that would make the returned
+                // resolution disagree with the persisted mapping.  A dangling
+                // pointer is fail-closed; repairing it requires an explicit
+                // mapping decision rather than selecting an unrelated Progress.
+                Some(
+                    ProgressRepository::get_for_media_item(
+                        &*self.ports,
+                        authoritative_media_item_id,
+                    )
                     .await?
                     .ok_or_else(authoritative_progress_missing)?,
-            )
+                )
+            }
         } else {
             let selected = self.select_authoritative_progress(&subject).await?;
             // A legacy Subject can lack a pointer.  Only add the mapping;
