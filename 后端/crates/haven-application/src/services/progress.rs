@@ -23,6 +23,9 @@ use crate::wire::{
     ProgressMarkCompletedRequest, ProgressSaveRequest, ProgressSaveResult, ProgressSummaryDto,
 };
 
+#[path = "comic_progress_subject.rs"]
+pub mod comic_progress_subject;
+
 /// ProgressService 所需端口（MediaItem + Edition 推导 + Progress 存储）。
 pub trait ProgressPorts:
     MediaItemRepository + EditionRepository + ProgressRepository + Send + Sync
@@ -182,6 +185,14 @@ impl ProgressService {
     ) -> Result<Option<ProgressSummaryDto>, AppError> {
         let progress = self.ports.get_for_media_item(media_item_id).await?;
         progress.as_ref().map(progress_summary).transpose()
+    }
+
+    /// Domain Progress 读取入口；非漫画路径保持既有 Repository 读取语义。
+    pub async fn read_for_media_item(
+        &self,
+        media_item_id: MediaItemId,
+    ) -> Result<Option<Progress>, AppError> {
+        ProgressRepository::get_for_media_item(&*self.ports, media_item_id).await
     }
 
     /// 最近活跃进度（首页 Continue 数据源）。
@@ -572,6 +583,19 @@ mod tests {
         let service = ProgressService::new(Arc::new(ports));
         let err = service.reset(media_item_id).await.unwrap_err();
         assert_eq!(err.code().as_str(), "PROGRESS_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn progress_non_comic_read_does_not_touch_subjects() {
+        let (ports, media_item_id) = mem_ports(MediaType::Movie, None);
+        let service = ProgressService::new(Arc::new(ports));
+        assert!(
+            service
+                .read_for_media_item(media_item_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

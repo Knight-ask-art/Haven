@@ -13,6 +13,7 @@ use crate::comic_identity::{
     ChapterSourceIdentity, ChapterSourceRef, ComicPageIdentitySnapshot,
     ComicProgressMigrationSnapshot, EditionProfile, PageIdentity,
 };
+use crate::comic_progress_subject::{ComicProgressSubject, ComicProgressSubjectMember};
 use crate::entities::*;
 use crate::enums::DownloadState;
 use crate::ids::*;
@@ -264,6 +265,28 @@ pub trait ComicProgressMigrationRepository: Send + Sync {
         id: ComicProgressMigrationId,
         expected_applied_revision: &str,
     ) -> Result<bool, AppError>;
+}
+
+/// 漫画进度主体与成员映射的持久化契约。
+///
+/// Subject 只保存跨 MediaItem 的连续性与权威 Progress 指针；实际阅读位置、
+/// 完成状态、时间和 revision 继续只由 `ProgressRepository` 持有。
+#[async_trait]
+pub trait ComicProgressSubjectRepository: Send + Sync {
+    async fn get(
+        &self,
+        id: ComicProgressSubjectId,
+    ) -> Result<Option<ComicProgressSubject>, AppError>;
+    async fn get_for_media_item(
+        &self,
+        media_item_id: MediaItemId,
+    ) -> Result<Option<ComicProgressSubjectMember>, AppError>;
+    async fn list_members(
+        &self,
+        subject_id: ComicProgressSubjectId,
+    ) -> Result<Vec<ComicProgressSubjectMember>, AppError>;
+    async fn save_subject(&self, subject: &ComicProgressSubject) -> Result<(), AppError>;
+    async fn save_member(&self, member: &ComicProgressSubjectMember) -> Result<(), AppError>;
 }
 
 #[async_trait]

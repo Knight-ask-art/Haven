@@ -10,6 +10,7 @@ use rusqlite::OptionalExtension;
 
 use haven_common::{AppError, ErrorKind, UtcMillis};
 use haven_domain::comic_progress_subject::{ComicProgressSubject, ComicProgressSubjectMember};
+use haven_domain::contracts::ComicProgressSubjectRepository;
 use haven_domain::ids::{ComicProgressSubjectId, EditionId, MediaItemId, WorkId};
 
 use crate::db::Db;
@@ -60,6 +61,41 @@ impl SqliteComicProgressSubjectRepository {
             .map(|id| load_subject(&conn, id))
             .collect::<Result<Vec<_>, _>>()
             .map(|subjects| subjects.into_iter().flatten().collect())
+    }
+}
+
+#[async_trait::async_trait]
+impl ComicProgressSubjectRepository for SqliteComicProgressSubjectRepository {
+    async fn get(
+        &self,
+        id: ComicProgressSubjectId,
+    ) -> Result<Option<ComicProgressSubject>, AppError> {
+        SqliteComicProgressSubjectRepository::get(self, id).await
+    }
+
+    async fn get_for_media_item(
+        &self,
+        media_item_id: MediaItemId,
+    ) -> Result<Option<ComicProgressSubjectMember>, AppError> {
+        let conn = self.db.lock();
+        load_member_for_media_item(&conn, media_item_id)
+    }
+
+    async fn list_members(
+        &self,
+        subject_id: ComicProgressSubjectId,
+    ) -> Result<Vec<ComicProgressSubjectMember>, AppError> {
+        let conn = self.db.lock();
+        load_members(&conn, &subject_id.to_string())
+    }
+
+    async fn save_subject(&self, subject: &ComicProgressSubject) -> Result<(), AppError> {
+        self.save(subject).await
+    }
+
+    async fn save_member(&self, member: &ComicProgressSubjectMember) -> Result<(), AppError> {
+        let member = member.clone();
+        self.db.with_tx(|tx| save_member_on_conn(tx, &member))
     }
 }
 
@@ -368,6 +404,27 @@ fn load_members(
         .map_err(map_db_error("查询漫画进度主体成员失败"))?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(map_db_error("查询漫画进度主体成员失败"))
+}
+
+fn load_member_for_media_item(
+    conn: &rusqlite::Connection,
+    media_item_id: MediaItemId,
+) -> Result<Option<ComicProgressSubjectMember>, AppError> {
+    let subject_id = conn
+        .query_row(
+            "SELECT subject_id FROM comic_progress_subject_members
+             WHERE media_item_id = ?1 AND state = 'active'",
+            rusqlite::params![media_item_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_db_error("查询漫画进度主体成员失败"))?;
+    let Some(subject_id) = subject_id else {
+        return Ok(None);
+    };
+    Ok(load_members(conn, &subject_id)?
+        .into_iter()
+        .find(|member| member.media_item_id == media_item_id))
 }
 
 fn validate_subject_text(value: &str, field: &'static str) -> Result<(), AppError> {

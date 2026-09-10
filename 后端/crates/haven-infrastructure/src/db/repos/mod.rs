@@ -373,6 +373,56 @@ impl haven_domain::contracts::ComicProgressMigrationRepository for SqliteReposit
 }
 
 #[async_trait::async_trait]
+impl haven_domain::contracts::ComicProgressSubjectRepository for SqliteRepositories {
+    async fn get(
+        &self,
+        id: haven_domain::ids::ComicProgressSubjectId,
+    ) -> Result<
+        Option<haven_domain::comic_progress_subject::ComicProgressSubject>,
+        haven_common::AppError,
+    > {
+        haven_domain::contracts::ComicProgressSubjectRepository::get(&self.progress_subjects, id)
+            .await
+    }
+
+    async fn get_for_media_item(
+        &self,
+        media_item_id: haven_domain::ids::MediaItemId,
+    ) -> Result<
+        Option<haven_domain::comic_progress_subject::ComicProgressSubjectMember>,
+        haven_common::AppError,
+    > {
+        self.progress_subjects
+            .get_for_media_item(media_item_id)
+            .await
+    }
+
+    async fn list_members(
+        &self,
+        subject_id: haven_domain::ids::ComicProgressSubjectId,
+    ) -> Result<
+        Vec<haven_domain::comic_progress_subject::ComicProgressSubjectMember>,
+        haven_common::AppError,
+    > {
+        self.progress_subjects.list_members(subject_id).await
+    }
+
+    async fn save_subject(
+        &self,
+        subject: &haven_domain::comic_progress_subject::ComicProgressSubject,
+    ) -> Result<(), haven_common::AppError> {
+        self.progress_subjects.save_subject(subject).await
+    }
+
+    async fn save_member(
+        &self,
+        member: &haven_domain::comic_progress_subject::ComicProgressSubjectMember,
+    ) -> Result<(), haven_common::AppError> {
+        self.progress_subjects.save_member(member).await
+    }
+}
+
+#[async_trait::async_trait]
 impl haven_domain::contracts::MediaItemRepository for SqliteRepositories {
     async fn get(
         &self,
