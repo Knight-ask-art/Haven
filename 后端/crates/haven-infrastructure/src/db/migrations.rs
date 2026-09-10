@@ -157,6 +157,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "036_comic_chapter_profile_observation",
         include_str!("../../../../migrations/036_comic_chapter_profile_observation.sql"),
     ),
+    (
+        "037_comic_progress_subjects",
+        include_str!("../../../../migrations/037_comic_progress_subjects.sql"),
+    ),
+    (
+        "038_comic_progress_subject_members",
+        include_str!("../../../../migrations/038_comic_progress_subject_members.sql"),
+    ),
+    (
+        "039_comic_catalog_refresh_outcomes",
+        include_str!("../../../../migrations/039_comic_catalog_refresh_outcomes.sql"),
+    ),
 ];
 
 pub fn run(conn: &mut Connection) -> Result<(), AppError> {
@@ -646,13 +658,16 @@ mod tests {
                      'comic_page_identities',
                      'comic_page_identity_states',
                      'comic_progress_migration_snapshots',
-                     'comic_chapter_catalog_states'
+                     'comic_chapter_catalog_states',
+                     'comic_progress_subjects',
+                     'comic_progress_subject_members',
+                     'comic_catalog_refresh_outcomes'
                  )",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(comic_tables, 6, "漫画身份和迁移表必须全部建立");
+        assert_eq!(comic_tables, 9, "漫画身份、主体和刷新结果表必须全部建立");
         let chapter_columns: Vec<String> = conn
             .prepare("PRAGMA table_info(comic_chapter_source_refs)")
             .unwrap()
@@ -667,12 +682,146 @@ mod tests {
         );
     }
 
+    fn table_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
+             )",
+            params![name],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+            != 0
+    }
+
+    fn index_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1
+             )",
+            params![name],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+            != 0
+    }
+
+    #[test]
+    fn migration_comic_progress_subject_creates_subject_member_and_refresh_tables() {
+        let mut conn = fresh();
+        run(&mut conn).unwrap();
+
+        assert!(table_exists(&conn, "comic_progress_subjects"));
+        assert!(table_exists(&conn, "comic_progress_subject_members"));
+        assert!(table_exists(&conn, "comic_catalog_refresh_outcomes"));
+        assert!(index_exists(
+            &conn,
+            "uq_comic_progress_subject_members_active_media_item"
+        ));
+    }
+
+    #[test]
+    fn migration_comic_progress_subject_write_rolls_back_subject_member_receipt_and_progress() {
+        let mut conn = fresh();
+        run(&mut conn).unwrap();
+
+        let work_id = "0196f0d2-0000-7000-8000-00000000fa01";
+        let edition_id = "0196f0d2-0000-7000-8000-00000000fa02";
+        let media_item_id = "0196f0d2-0000-7000-8000-00000000fa03";
+        let subject_id = "0196f0d2-0000-7000-8000-00000000fa04";
+        let refresh_id = "0196f0d2-0000-7000-8000-00000000fa05";
+
+        conn.execute(
+            "INSERT INTO works (id, canonical_title, work_type, status, created_at, updated_at)
+             VALUES (?1, '原子漫画作品', 'fiction', 'completed', 1, 1)",
+            params![work_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO editions (id, work_id, title, edition_type, created_at, updated_at)
+             VALUES (?1, ?2, '漫画版', 'comic', 1, 1)",
+            params![edition_id, work_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO media_items
+                (id, edition_id, media_type, title, category, chapter, page_count,
+                 status, created_at, updated_at)
+             VALUES (?1, ?2, 'comic', '第 1 话', 'comic', 1, 1, 'available', 1, 1)",
+            params![media_item_id, edition_id],
+        )
+        .unwrap();
+
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let result = (|| -> rusqlite::Result<()> {
+            tx.execute(
+                "INSERT INTO comic_progress_subjects
+                    (id, work_id, edition_id, canonical_media_item_id,
+                     authoritative_progress_media_item_id, state, created_at, updated_at,
+                     algorithm_version, redirect_subject_id)
+                 VALUES (?1, ?2, ?3, ?4, ?4, 'active', 1, 1, 'test-v1', NULL)",
+                params![subject_id, work_id, edition_id, media_item_id],
+            )?;
+            tx.execute(
+                "INSERT INTO comic_progress_subject_members
+                    (subject_id, media_item_id, relationship, confidence, evidence_json,
+                     state, algorithm_version, created_at, updated_at)
+                 VALUES (?1, ?2, 'canonical', 'high', '[]', 'active', 'test-v1', 1, 1)",
+                params![subject_id, media_item_id],
+            )?;
+            tx.execute(
+                "INSERT INTO comic_catalog_refresh_outcomes
+                    (id, work_id, source_key, remote_work_id, status,
+                     generation_before, generation_after, observed_from, observed_to,
+                     truncated, retained_previous_catalog, error_code, observed_at)
+                 VALUES (?1, ?2, 'source', 'remote-work', 'succeeded', 0, 1,
+                         'a', 'b', 0, 0, NULL, 1)",
+                params![refresh_id, work_id],
+            )?;
+            tx.execute(
+                "INSERT INTO progress
+                    (id, work_id, edition_id, media_item_id, locator_json, locator_version,
+                     completion, percentage, last_active_at, updated_at, revision)
+                 VALUES ('0196f0d2-0000-7000-8000-00000000fa06', ?1, ?2, ?3,
+                         '{}', 1, 'in_progress', 0.25, 1, 1, 'test-revision')",
+                params![work_id, edition_id, media_item_id],
+            )?;
+            Err(rusqlite::Error::InvalidQuery)
+        })();
+        assert!(result.is_err());
+        drop(tx);
+
+        for (table, id) in [
+            ("comic_progress_subjects", subject_id),
+            ("comic_progress_subject_members", subject_id),
+            ("comic_catalog_refresh_outcomes", refresh_id),
+            ("progress", media_item_id),
+        ] {
+            let key_column = match table {
+                "comic_progress_subjects" | "comic_catalog_refresh_outcomes" => "id",
+                "comic_progress_subject_members" => "subject_id",
+                "progress" => "media_item_id",
+                _ => unreachable!(),
+            };
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {key_column} = ?1"),
+                    params![id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "事务失败后 {table} 不得留下半成品");
+        }
+    }
+
     #[test]
     fn migration_034_backfills_opaque_progress_revisions() {
         let mut conn = Connection::open_in_memory().unwrap();
         // 该测试需要在 034 尚未应用时插入旧 Progress，避免 034 已经
         // 运行后再断言 backfill 失去意义；035 位于其后。
-        apply_legacy_through(&mut conn, MIGRATIONS.len() - 3);
+        apply_legacy_through(&mut conn, 33);
         let work_id = "0196f0d2-0000-7000-8000-00000000f401";
         let edition_id = "0196f0d2-0000-7000-8000-00000000f402";
         let media_item_id = "0196f0d2-0000-7000-8000-00000000f403";
@@ -722,7 +871,7 @@ mod tests {
     #[test]
     fn migration_035_backfills_page_identity_revisions_without_rewriting_pages() {
         let mut conn = Connection::open_in_memory().unwrap();
-        apply_legacy_through(&mut conn, MIGRATIONS.len() - 2);
+        apply_legacy_through(&mut conn, 34);
         let work_id = "0196f0d2-0000-7000-8000-00000000f411";
         let edition_id = "0196f0d2-0000-7000-8000-00000000f412";
         let media_item_id = "0196f0d2-0000-7000-8000-00000000f413";
@@ -793,7 +942,7 @@ mod tests {
         // Build a legacy chapter-source row before 036. Its profile observation
         // must remain NULL so Repository reads can use the historical Edition
         // projection without pretending it was a source-level observation.
-        apply_legacy_through(&mut conn, MIGRATIONS.len() - 1);
+        apply_legacy_through(&mut conn, 35);
         let work_id = "0196f0d2-0000-7000-8000-00000000f421";
         let edition_id = "0196f0d2-0000-7000-8000-00000000f422";
         let media_item_id = "0196f0d2-0000-7000-8000-00000000f423";

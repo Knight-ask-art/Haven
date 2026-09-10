@@ -12,6 +12,41 @@ use serde::{Deserialize, Serialize};
 use haven_common::UtcMillis;
 
 use crate::comic_identity::{ChapterSourceIdentity, ComicChapterMetadata};
+use crate::ids::{ComicCatalogRefreshId, WorkId};
+
+/// 漫画目录刷新的一次持久化结果。
+///
+/// 这里只保存来源的 opaque identity、刷新代际和有界观察范围；URL、Cookie、
+/// grant、请求头、本地路径等运行时授权/通道信息永不进入领域模型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComicCatalogRefreshOutcomeStatus {
+    NeverSynced,
+    Succeeded,
+    TemporarilyUnavailable,
+    ExternalOnly,
+    Unknown,
+    RefreshFailed,
+    Truncated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ComicCatalogRefreshReceipt {
+    pub id: ComicCatalogRefreshId,
+    pub work_id: WorkId,
+    pub source_key: String,
+    pub remote_work_id: String,
+    pub status: ComicCatalogRefreshOutcomeStatus,
+    pub generation_before: u64,
+    pub generation_after: Option<u64>,
+    pub observed_from: Option<String>,
+    pub observed_to: Option<String>,
+    pub truncated: bool,
+    pub retained_previous_catalog: bool,
+    pub error_code: Option<String>,
+    pub observed_at: UtcMillis,
+}
 
 /// Provider 对章节可消费性的观察结果。
 ///

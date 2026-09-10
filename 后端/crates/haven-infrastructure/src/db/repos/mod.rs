@@ -5,8 +5,10 @@
 //! - 当前查询均为短事务级操作；Tauri 接线后重查询由外层 `spawn_blocking` 承接。
 //! - Locator 序列化走 `Locator` 自身的 version + kind + data envelope（未知版本拒绝）。
 
+pub mod comic_catalog_refresh_outcomes;
 pub mod comic_identity;
 pub mod comic_progress_migrations;
+pub mod comic_progress_subjects;
 pub mod download;
 pub mod edition;
 pub mod edition_profiles;
@@ -31,8 +33,10 @@ use haven_common::AppError;
 use haven_domain::entities::ArtworkSet;
 use haven_domain::locator::Locator;
 
+pub use comic_catalog_refresh_outcomes::SqliteComicCatalogRefreshOutcomeRepository;
 pub use comic_identity::{SqliteChapterSourceRepository, SqliteComicPageIdentityRepository};
 pub use comic_progress_migrations::SqliteComicProgressMigrationRepository;
+pub use comic_progress_subjects::SqliteComicProgressSubjectRepository;
 pub use download::{SqliteDownloadBatchRepository, SqliteDownloadRepository};
 pub use edition::SqliteEditionRepository;
 pub use edition_profiles::SqliteEditionProfileRepository;
@@ -76,6 +80,8 @@ pub struct SqliteRepositories {
     pub chapter_source: SqliteChapterSourceRepository,
     pub page_identity: SqliteComicPageIdentityRepository,
     pub progress_migration: SqliteComicProgressMigrationRepository,
+    pub progress_subjects: SqliteComicProgressSubjectRepository,
+    pub catalog_refresh_outcomes: SqliteComicCatalogRefreshOutcomeRepository,
 }
 
 impl SqliteRepositories {
@@ -102,7 +108,9 @@ impl SqliteRepositories {
             work_relation: SqliteWorkRelationRepository::new(db.clone()),
             chapter_source: SqliteChapterSourceRepository::new(db.clone()),
             page_identity: SqliteComicPageIdentityRepository::new(db.clone()),
-            progress_migration: SqliteComicProgressMigrationRepository::new(db),
+            progress_migration: SqliteComicProgressMigrationRepository::new(db.clone()),
+            progress_subjects: SqliteComicProgressSubjectRepository::new(db.clone()),
+            catalog_refresh_outcomes: SqliteComicCatalogRefreshOutcomeRepository::new(db),
         }
     }
 }

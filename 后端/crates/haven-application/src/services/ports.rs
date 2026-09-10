@@ -6,16 +6,19 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use haven_common::AppError;
-use haven_domain::comic_catalog::ComicChapterCatalogState;
-use haven_domain::comic_identity::{ChapterSourceRef, EditionProfile};
+use haven_domain::comic_catalog::{ComicCatalogRefreshReceipt, ComicChapterCatalogState};
+use haven_domain::comic_identity::{
+    ChapterSourceRef, ComicProgressMigrationSnapshot, EditionProfile, PageIdentity,
+};
+use haven_domain::comic_progress_subject::{ComicProgressSubject, ComicProgressSubjectMember};
 use haven_domain::contracts::{
     ChapterSourceRepository, ComicPageIdentityRepository, ComicProgressMigrationRepository,
     EditionProfileRepository, EditionRepository, EnrichmentRepository, FavoriteRepository,
     MarkerRepository, MediaItemRepository, ProgressRepository, ResourceRepository,
     SettingsRepository, StorageLocationRepository, WorkRepository,
 };
-use haven_domain::entities::{Edition, FavoriteTarget, MediaItem, Resource, Work};
-use haven_domain::ids::WorkId;
+use haven_domain::entities::{Edition, FavoriteTarget, MediaItem, Progress, Resource, Work};
+use haven_domain::ids::{ComicCatalogRefreshId, ComicProgressMigrationId, MediaItemId, WorkId};
 
 /// LibraryService 所需端口。
 /// `Send + Sync`：默认实现方法在 `Arc<dyn LibraryPorts>` 路径下要求
@@ -222,6 +225,50 @@ pub trait UnitOfWork: Send + Sync {
             false,
         ))
     }
+
+    /// 在同一个 SQLite Immediate 事务中提交漫画进度主体、成员、页面身份、
+    /// 刷新结果、Progress CAS 和可选迁移快照。闭包/实现不得执行异步 IO。
+    fn run_comic_progress_subject_write(
+        &self,
+        _plan: &ComicProgressSubjectWritePlan,
+    ) -> Result<ComicProgressSubjectWriteResult, AppError> {
+        Err(AppError::new(
+            "COMIC_PROGRESS_SUBJECT_UOW_UNAVAILABLE",
+            haven_common::ErrorKind::Internal,
+            "当前 UnitOfWork 不支持漫画进度主体事务",
+            false,
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ComicProgressWriteCandidate {
+    pub progress: Progress,
+    pub expected_revision: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComicPageIdentityWriteCandidate {
+    pub media_item_id: MediaItemId,
+    pub pages: Vec<PageIdentity>,
+    pub expected_revision: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComicProgressSubjectWritePlan {
+    pub subject: ComicProgressSubject,
+    pub members: Vec<ComicProgressSubjectMember>,
+    pub page_identity_write: Option<ComicPageIdentityWriteCandidate>,
+    pub progress_writes: Vec<ComicProgressWriteCandidate>,
+    pub migration_snapshot: Option<ComicProgressMigrationSnapshot>,
+    pub refresh_receipt: Option<ComicCatalogRefreshReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComicProgressSubjectWriteResult {
+    pub applied_progress_revisions: Vec<String>,
+    pub migration_id: Option<ComicProgressMigrationId>,
+    pub refresh_id: Option<ComicCatalogRefreshId>,
 }
 
 /// 一个需要一起落库的漫画 Edition 及其身份画像。
