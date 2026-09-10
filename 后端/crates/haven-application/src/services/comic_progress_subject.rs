@@ -99,8 +99,14 @@ impl ComicProgressSubjectService {
             }
             None => {
                 let now = haven_common::UtcMillis::now();
-                let subject =
+                let mut subject =
                     ComicProgressSubject::new(edition.work_id, edition.id, media_item_id, now);
+                // `new` defaults to the canonical MediaItem as a convenient
+                // mapping seed.  A normal unread legacy Comic has no Progress,
+                // however, so it must persist no dangling authority pointer.
+                subject.authoritative_progress_media_item_id = target_progress
+                    .as_ref()
+                    .map(|progress| progress.media_item_id);
                 let mut member = ComicProgressSubjectMember::active(
                     subject.id,
                     media_item_id,

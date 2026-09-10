@@ -757,6 +757,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn progress_subject_backfill_unread_comic_creates_one_unpointed_subject_and_remains_readable()
+     {
+        use crate::db::uow::SqliteUnitOfWork;
+        use haven_application::services::progress::ProgressService;
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repos = Arc::new(SqliteRepositories::new(db.clone()));
+        let media_item_id = MediaItemId::new();
+        seed_real_comic_content(&repos, "未开始漫画", media_item_id).await;
+        let service = ProgressService::with_comic_progress_subjects(
+            repos.clone(),
+            Arc::new(SqliteUnitOfWork::new(db.clone())),
+        );
+
+        assert!(
+            service
+                .read_for_media_item(media_item_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "首次未开始读取必须是空进度，不得因悬空 pointer 失败"
+        );
+        assert!(
+            service
+                .read_for_media_item(media_item_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "重复读取必须继续返回空进度"
+        );
+        let member = ComicProgressSubjectRepository::get_for_media_item(&*repos, media_item_id)
+            .await
+            .unwrap()
+            .expect("首次读取必须创建 active canonical member");
+        let subject = ComicProgressSubjectRepository::get(&*repos, member.subject_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(subject.authoritative_progress_media_item_id, None);
+        let conn = db.lock();
+        let subject_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM comic_progress_subjects", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let active_member_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM comic_progress_subject_members WHERE state = 'active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let progress_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM progress", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(subject_count, 1);
+        assert_eq!(active_member_count, 1);
+        assert_eq!(progress_count, 0);
+    }
+
+    #[tokio::test]
     async fn progress_subject_backfill_multiple_active_member_progress_uses_last_active_then_media_id_and_keeps_other_rows()
      {
         use crate::db::uow::SqliteUnitOfWork;
