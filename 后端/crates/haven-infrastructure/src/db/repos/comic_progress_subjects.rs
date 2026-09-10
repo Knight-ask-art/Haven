@@ -325,9 +325,10 @@ fn load_subject(
         "redirect_subject_id": parsed_redirect,
         "members": members,
     });
-    serde_json::from_value(value)
-        .map(Some)
-        .map_err(|error| invalid_subject(error.to_string()))
+    let subject: ComicProgressSubject =
+        serde_json::from_value(value).map_err(|error| invalid_subject(error.to_string()))?;
+    ensure_subject_hierarchy(conn, &subject, subject.members())?;
+    Ok(Some(subject))
 }
 
 fn load_members(
@@ -668,6 +669,60 @@ mod tests {
 
         let repo = SqliteComicProgressSubjectRepository::new(db);
         assert!(repo.get(subject_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn comic_progress_subjects_reject_corrupt_cross_work_rows_on_get_and_list() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (work_a, edition_a, media_a) = seed(&db);
+        let (work_b, edition_b, media_b) = seed(&db);
+        let corrupt_subject_id = ComicProgressSubjectId::new();
+        let member_corrupt_subject_id = ComicProgressSubjectId::new();
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO comic_progress_subjects
+                    (id, work_id, edition_id, canonical_media_item_id,
+                     authoritative_progress_media_item_id, state, created_at, updated_at,
+                     algorithm_version, redirect_subject_id)
+                 VALUES (?1, ?2, ?3, ?4, ?4, 'active', 1, 1, 'test-v1', NULL)",
+                rusqlite::params![
+                    corrupt_subject_id.to_string(),
+                    work_a.to_string(),
+                    edition_b.to_string(),
+                    media_b.to_string()
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO comic_progress_subjects
+                    (id, work_id, edition_id, canonical_media_item_id,
+                     authoritative_progress_media_item_id, state, created_at, updated_at,
+                     algorithm_version, redirect_subject_id)
+                 VALUES (?1, ?2, ?3, ?4, ?4, 'active', 1, 1, 'test-v1', NULL)",
+                rusqlite::params![
+                    member_corrupt_subject_id.to_string(),
+                    work_a.to_string(),
+                    edition_a.to_string(),
+                    media_a.to_string()
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO comic_progress_subject_members
+                    (subject_id, media_item_id, relationship, confidence, evidence_json,
+                     state, algorithm_version, created_at, updated_at)
+                 VALUES (?1, ?2, 'candidate', 'medium', '[]', 'candidate', 'test-v1', 1, 1)",
+                rusqlite::params![member_corrupt_subject_id.to_string(), media_b.to_string()],
+            )
+            .unwrap();
+        }
+
+        let repo = SqliteComicProgressSubjectRepository::new(db);
+        assert!(repo.get(corrupt_subject_id).await.is_err());
+        assert!(repo.get(member_corrupt_subject_id).await.is_err());
+        assert!(repo.list_by_work(work_a).await.is_err());
+        assert_ne!(work_a, work_b);
     }
 
     #[test]

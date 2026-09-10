@@ -248,6 +248,11 @@ fn apply_comic_progress_subject_write(
         .load_members(plan.members.clone())
         .map_err(|error| invalid_comic_subject_plan(error.to_string()))?;
     validate_comic_subject_plan(tx, &subject, plan)?;
+    let migration_progress_write_index = plan
+        .migration_snapshot
+        .as_ref()
+        .map(|snapshot| migration_progress_write_index(plan, snapshot))
+        .transpose()?;
 
     if let Some(page_identity) = &plan.page_identity_write {
         replace_page_identities_on_conn(tx, page_identity)?;
@@ -263,7 +268,16 @@ fn apply_comic_progress_subject_write(
         applied_progress_revisions.push(revision);
     }
     if let Some(snapshot) = &plan.migration_snapshot {
-        write_migration_snapshot_on_conn(tx, snapshot)?;
+        let progress_index = migration_progress_write_index
+            .ok_or_else(|| invalid_comic_subject_plan("迁移快照缺少匹配的目标 Progress 写入"))?;
+        let actual_revision = applied_progress_revisions
+            .get(progress_index)
+            .cloned()
+            .ok_or_else(|| invalid_comic_subject_plan("迁移快照目标 Progress 写入结果缺失"))?;
+        let mut persisted_snapshot = snapshot.clone();
+        persisted_snapshot.applied_revision = Some(actual_revision.clone());
+        persisted_snapshot.new_progress.revision = Some(actual_revision);
+        write_migration_snapshot_on_conn(tx, &persisted_snapshot)?;
     }
 
     Ok(ComicProgressSubjectWriteResult {
@@ -470,16 +484,34 @@ fn validate_comic_migration_snapshot(
         ));
     }
 
-    let has_matching_progress_write = plan.progress_writes.iter().any(|candidate| {
-        candidate.progress == snapshot.new_progress
-            && candidate.expected_revision.as_deref() == snapshot.target_revision_before.as_deref()
-    });
-    if !has_matching_progress_write {
+    migration_progress_write_index(plan, snapshot)?;
+    Ok(())
+}
+
+fn migration_progress_write_index(
+    plan: &ComicProgressSubjectWritePlan,
+    snapshot: &ComicProgressMigrationSnapshot,
+) -> Result<usize, AppError> {
+    let mut matching = plan
+        .progress_writes
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.progress == snapshot.new_progress
+                && candidate.expected_revision.as_deref()
+                    == snapshot.target_revision_before.as_deref()
+        });
+    let Some((index, _)) = matching.next() else {
         return Err(invalid_comic_subject_plan(
-            "带迁移快照的 Subject 事务必须包含匹配的目标 Progress CAS 写入",
+            "带迁移快照的 Subject 事务必须包含匹配的目标 Progress 写入",
+        ));
+    };
+    if matching.next().is_some() {
+        return Err(invalid_comic_subject_plan(
+            "带迁移快照的 Subject 事务只能绑定一个目标 Progress 写入",
         ));
     }
-    Ok(())
+    Ok(index)
 }
 
 fn ensure_subject_page_identity_media_item(
