@@ -10,7 +10,9 @@ use std::sync::Arc;
 use rusqlite::Transaction;
 
 use haven_common::AppError;
-use haven_domain::comic_identity::ComicProgressMigrationSnapshot;
+use haven_domain::comic_identity::{
+    ComicProgressMigrationSnapshot, ProgressMigrationMode, ProgressMigrationState,
+};
 use haven_domain::comic_progress_subject::ComicProgressSubject;
 use haven_domain::entities::{Edition, FavoriteTarget, MediaItem, Resource, Work};
 use haven_domain::enums::MediaType;
@@ -330,7 +332,7 @@ fn validate_comic_subject_plan(
     }
 
     if let Some(page_identity) = &plan.page_identity_write {
-        ensure_comic_media_item(tx, page_identity.media_item_id)?;
+        ensure_subject_page_identity_media_item(tx, subject, plan, page_identity.media_item_id)?;
     }
     if let Some(receipt) = &plan.refresh_receipt {
         if receipt.work_id != subject.work_id {
@@ -352,6 +354,167 @@ fn validate_comic_subject_plan(
                 "Progress 必须绑定当前漫画进度主体的 MediaItem",
             ));
         }
+    }
+    if let Some(snapshot) = &plan.migration_snapshot {
+        validate_comic_migration_snapshot(tx, subject, plan, snapshot)?;
+    }
+    Ok(())
+}
+
+fn validate_comic_migration_snapshot(
+    tx: &rusqlite::Transaction<'_>,
+    subject: &ComicProgressSubject,
+    plan: &ComicProgressSubjectWritePlan,
+    snapshot: &ComicProgressMigrationSnapshot,
+) -> Result<(), AppError> {
+    if snapshot.state != ProgressMigrationState::Applied
+        || snapshot.mode == ProgressMigrationMode::None
+        || snapshot.reverted_at.is_some()
+    {
+        return Err(invalid_comic_subject_plan(
+            "漫画进度迁移快照必须是未撤销的 Applied 状态且具有迁移模式",
+        ));
+    }
+    if snapshot.source_media_item_id != snapshot.old_progress.media_item_id
+        || snapshot.target_media_item_id != snapshot.new_progress.media_item_id
+    {
+        return Err(invalid_comic_subject_plan(
+            "漫画进度迁移快照的 source/target MediaItem 与 Progress 不一致",
+        ));
+    }
+    validate_subject_text(&snapshot.source_revision, "source_revision")?;
+    if let Some(revision) = snapshot.target_revision_before.as_deref() {
+        validate_subject_text(revision, "target_revision_before")?;
+    }
+    if snapshot.old_progress.revision.as_deref() != Some(snapshot.source_revision.as_str()) {
+        return Err(invalid_comic_subject_plan(
+            "漫画进度迁移快照的 old Progress revision 与 source_revision 不一致",
+        ));
+    }
+
+    for progress in [&snapshot.old_progress, &snapshot.new_progress] {
+        ensure_comic_progress(tx, progress)?;
+        if progress.work_id != subject.work_id {
+            return Err(invalid_comic_subject_plan(
+                "漫画进度迁移快照中的 Progress 必须属于当前 Subject Work",
+            ));
+        }
+    }
+
+    if snapshot.source_media_item_id == snapshot.target_media_item_id {
+        if snapshot.target_revision_before.as_deref() != Some(snapshot.source_revision.as_str()) {
+            return Err(invalid_comic_subject_plan(
+                "同一 MediaItem 的迁移快照 target_revision_before 必须等于 source_revision",
+            ));
+        }
+        if let Some(old_target) = snapshot.old_target_progress.as_ref() {
+            ensure_comic_progress(tx, old_target)?;
+            if old_target.work_id != subject.work_id
+                || old_target.media_item_id != snapshot.target_media_item_id
+                || old_target.revision.as_deref() != snapshot.target_revision_before.as_deref()
+            {
+                return Err(invalid_comic_subject_plan(
+                    "同一 MediaItem 的 old_target Progress 与目标 revision 不一致",
+                ));
+            }
+        }
+    } else {
+        match (
+            snapshot.old_target_progress.as_ref(),
+            snapshot.target_revision_before.as_deref(),
+        ) {
+            (Some(old_target), Some(target_revision)) => {
+                ensure_comic_progress(tx, old_target)?;
+                if old_target.work_id != subject.work_id
+                    || old_target.media_item_id != snapshot.target_media_item_id
+                    || old_target.revision.as_deref() != Some(target_revision)
+                {
+                    return Err(invalid_comic_subject_plan(
+                        "跨 MediaItem 迁移快照的 old_target Progress 与目标 revision 不一致",
+                    ));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(invalid_comic_subject_plan(
+                    "跨 MediaItem 迁移快照无目标时必须同时为空",
+                ));
+            }
+        }
+    }
+
+    let source_revision_in_db: Option<String> = tx
+        .query_row(
+            "SELECT revision FROM progress WHERE media_item_id = ?1",
+            rusqlite::params![snapshot.source_media_item_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| tx_err("查询迁移快照源 Progress revision 失败", error))?;
+    if source_revision_in_db.as_deref() != Some(snapshot.source_revision.as_str()) {
+        return Err(invalid_comic_subject_plan(
+            "漫画进度迁移快照源 Progress 不存在或 revision 已变化",
+        ));
+    }
+    let target_revision_in_db: Option<String> = tx
+        .query_row(
+            "SELECT revision FROM progress WHERE media_item_id = ?1",
+            rusqlite::params![snapshot.target_media_item_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| tx_err("查询迁移快照目标 Progress revision 失败", error))?;
+    if target_revision_in_db.as_deref() != snapshot.target_revision_before.as_deref() {
+        return Err(invalid_comic_subject_plan(
+            "漫画进度迁移快照目标 Progress 与 target_revision_before 不一致",
+        ));
+    }
+
+    let has_matching_progress_write = plan.progress_writes.iter().any(|candidate| {
+        candidate.progress == snapshot.new_progress
+            && candidate.expected_revision.as_deref() == snapshot.target_revision_before.as_deref()
+    });
+    if !has_matching_progress_write {
+        return Err(invalid_comic_subject_plan(
+            "带迁移快照的 Subject 事务必须包含匹配的目标 Progress CAS 写入",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_subject_page_identity_media_item(
+    tx: &rusqlite::Transaction<'_>,
+    subject: &ComicProgressSubject,
+    plan: &ComicProgressSubjectWritePlan,
+    media_item_id: MediaItemId,
+) -> Result<(), AppError> {
+    ensure_comic_media_item(tx, media_item_id)?;
+    let belongs_to_subject_work: i64 = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM media_items m
+                 JOIN editions e ON e.id = m.edition_id
+                 WHERE m.id = ?1 AND m.media_type = 'comic' AND e.work_id = ?2
+             )",
+            rusqlite::params![media_item_id.to_string(), subject.work_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|error| tx_err("校验漫画页面身份 Work 归属失败", error))?;
+    if belongs_to_subject_work == 0 {
+        return Err(invalid_comic_subject_plan(
+            "页面身份 MediaItem 必须属于当前 Subject Work",
+        ));
+    }
+    let is_subject_media = media_item_id == subject.canonical_media_item_id
+        || plan
+            .members
+            .iter()
+            .any(|member| member.media_item_id == media_item_id);
+    if !is_subject_media {
+        return Err(invalid_comic_subject_plan(
+            "页面身份 MediaItem 必须是 Subject canonical 或成员条目",
+        ));
     }
     Ok(())
 }
@@ -541,7 +704,7 @@ fn write_migration_snapshot_on_conn(
     let old_target_progress_json = snapshot
         .old_target_progress
         .as_ref()
-        .map(|progress| serde_json::to_string(progress))
+        .map(serde_json::to_string)
         .transpose()
         .map_err(|error| serialize_tx_error("old_target_progress_json", error))?;
     let new_progress_json = serde_json::to_string(&snapshot.new_progress)

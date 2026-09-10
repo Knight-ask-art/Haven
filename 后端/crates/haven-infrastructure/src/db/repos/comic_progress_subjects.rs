@@ -75,6 +75,7 @@ pub(crate) fn save_on_conn(
     validated
         .validate()
         .map_err(|error| invalid_subject(error.to_string()))?;
+    ensure_subject_hierarchy(conn, &validated, members)?;
     validate_subject_text(&validated.algorithm_version, "algorithm_version")?;
 
     conn.execute(
@@ -117,6 +118,89 @@ pub(crate) fn save_on_conn(
     .map_err(map_db_error("替换漫画进度主体成员失败"))?;
     for member in members {
         save_member_on_conn(conn, member)?;
+    }
+    Ok(())
+}
+
+fn ensure_subject_hierarchy(
+    conn: &rusqlite::Connection,
+    subject: &ComicProgressSubject,
+    members: &[ComicProgressSubjectMember],
+) -> Result<(), AppError> {
+    let edition_matches_work: i64 = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM editions
+                 WHERE id = ?1 AND work_id = ?2
+            )",
+            rusqlite::params![subject.edition_id.to_string(), subject.work_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(map_db_error("校验漫画进度主体版本归属失败"))?;
+    if edition_matches_work == 0 {
+        return Err(invalid_subject("漫画进度主体的 Edition 不属于指定 Work"));
+    }
+
+    let canonical_matches_edition: i64 = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM media_items
+                 WHERE id = ?1 AND edition_id = ?2 AND media_type = 'comic'
+             )",
+            rusqlite::params![
+                subject.canonical_media_item_id.to_string(),
+                subject.edition_id.to_string()
+            ],
+            |row| row.get(0),
+        )
+        .map_err(map_db_error("校验漫画进度主体 canonical MediaItem 失败"))?;
+    if canonical_matches_edition == 0 {
+        return Err(invalid_subject(
+            "漫画进度主体的 canonical MediaItem 不属于指定 Edition 或不是 Comic",
+        ));
+    }
+
+    if let Some(authoritative) = subject.authoritative_progress_media_item_id {
+        let authoritative_matches_work: i64 = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM media_items m
+                     JOIN editions e ON e.id = m.edition_id
+                     WHERE m.id = ?1 AND m.media_type = 'comic' AND e.work_id = ?2
+                 )",
+                rusqlite::params![authoritative.to_string(), subject.work_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(map_db_error("校验漫画进度主体权威 MediaItem 失败"))?;
+        if authoritative_matches_work == 0 {
+            return Err(invalid_subject(
+                "漫画进度主体的 authoritative MediaItem 不属于指定 Work 或不是 Comic",
+            ));
+        }
+    }
+
+    for member in members {
+        let member_matches_work: i64 = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM media_items m
+                     JOIN editions e ON e.id = m.edition_id
+                     WHERE m.id = ?1 AND m.media_type = 'comic' AND e.work_id = ?2
+                 )",
+                rusqlite::params![
+                    member.media_item_id.to_string(),
+                    subject.work_id.to_string()
+                ],
+                |row| row.get(0),
+            )
+            .map_err(map_db_error("校验漫画进度主体成员归属失败"))?;
+        if member_matches_work == 0 {
+            return Err(invalid_subject(
+                "漫画进度主体成员必须属于相同 Work 的 Comic MediaItem",
+            ));
+        }
     }
     Ok(())
 }
@@ -226,6 +310,7 @@ fn load_subject(
         .map(|value| parse_id::<ComicProgressSubjectId>(value, "redirect_subject_id"))
         .transpose()
         .map_err(|error| invalid_subject(error.to_string()))?;
+    validate_subject_text(&version, "algorithm_version")?;
     let members = load_members(conn, &parsed_id.to_string())?;
     let value = serde_json::json!({
         "id": parsed_id,
@@ -260,8 +345,13 @@ fn load_members(
     let rows = stmt
         .query_map(rusqlite::params![subject_id], |row| {
             let evidence_json: String = row.get(4)?;
+            validate_subject_text(&evidence_json, "evidence_json")
+                .map_err(|_| invalid_row("evidence_json"))?;
             let evidence =
                 serde_json::from_str(&evidence_json).map_err(|_| invalid_row("evidence_json"))?;
+            let algorithm_version: String = row.get(6)?;
+            validate_subject_text(&algorithm_version, "algorithm_version")
+                .map_err(|_| invalid_row("algorithm_version"))?;
             Ok(ComicProgressSubjectMember {
                 subject_id: parse_id(row.get(0)?, "subject_id")?,
                 media_item_id: parse_id(row.get(1)?, "media_item_id")?,
@@ -269,7 +359,7 @@ fn load_members(
                 confidence: parse_db_enum(row.get(3)?, "confidence")?,
                 evidence,
                 state: parse_db_enum(row.get(5)?, "state")?,
-                algorithm_version: row.get(6)?,
+                algorithm_version,
                 created_at: UtcMillis(row.get(7)?),
                 updated_at: UtcMillis(row.get(8)?),
             })
@@ -491,6 +581,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn comic_progress_subjects_reject_cross_work_edition_chain_without_partial_write() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (work_a, _, _) = seed(&db);
+        let (work_b, edition_b, media_b) = seed(&db);
+        let repo = SqliteComicProgressSubjectRepository::new(db.clone());
+        let subject = ComicProgressSubject::new(work_a, edition_b, media_b, UtcMillis(1));
+
+        let error = repo.save(&subject).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        let conn = db.lock();
+        let subjects: i64 = conn
+            .query_row("SELECT COUNT(*) FROM comic_progress_subjects", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(subjects, 0);
+        assert_ne!(work_a, work_b);
+    }
+
+    #[tokio::test]
+    async fn comic_progress_subjects_reject_cross_work_member_without_partial_write() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (work_a, edition_a, media_a) = seed(&db);
+        let (work_b, _, media_b) = seed(&db);
+        let repo = SqliteComicProgressSubjectRepository::new(db.clone());
+        let mut subject = ComicProgressSubject::new(work_a, edition_a, media_a, UtcMillis(1));
+        subject
+            .attach_member(ComicProgressSubjectMember::candidate(
+                subject.id,
+                media_b,
+                vec![ChapterEvidence::EditionCompatible],
+            ))
+            .unwrap();
+
+        let error = repo.save(&subject).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        let conn = db.lock();
+        for table in ["comic_progress_subjects", "comic_progress_subject_members"] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "跨 Work 成员失败后 {table} 不得有部分写入");
+        }
+        assert_ne!(work_a, work_b);
+    }
+
+    #[tokio::test]
     async fn comic_progress_subjects_reject_unsafe_evidence_boundary() {
         let db = Arc::new(Db::open_in_memory().unwrap());
         let (work, edition, media) = seed(&db);
@@ -504,6 +643,31 @@ mod tests {
         member.algorithm_version = "https://secret.invalid".to_owned();
         subject.attach_member(member).unwrap();
         assert!(repo.save(&subject).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn comic_progress_subjects_reject_unsafe_persisted_text_on_read() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (work, edition, media) = seed(&db);
+        let subject_id = ComicProgressSubjectId::new();
+        db.lock()
+            .execute(
+                "INSERT INTO comic_progress_subjects
+                    (id, work_id, edition_id, canonical_media_item_id,
+                     authoritative_progress_media_item_id, state, created_at, updated_at,
+                     algorithm_version, redirect_subject_id)
+                 VALUES (?1, ?2, ?3, ?4, ?4, 'active', 1, 1, 'https://invalid', NULL)",
+                rusqlite::params![
+                    subject_id.to_string(),
+                    work.to_string(),
+                    edition.to_string(),
+                    media.to_string()
+                ],
+            )
+            .unwrap();
+
+        let repo = SqliteComicProgressSubjectRepository::new(db);
+        assert!(repo.get(subject_id).await.is_err());
     }
 
     #[test]
@@ -580,6 +744,71 @@ mod tests {
         assert_eq!(count_rows(&db, "comic_catalog_refresh_outcomes"), 1);
         assert_eq!(count_rows(&db, "comic_page_identities"), 1);
         assert_eq!(count_rows(&db, "progress"), 1);
+    }
+
+    #[test]
+    fn comic_progress_subjects_uow_rejects_cross_work_page_identity_without_overwrite() {
+        use crate::db::uow::SqliteUnitOfWork;
+        use haven_application::services::ports::{
+            ComicPageIdentityWriteCandidate, ComicProgressSubjectWritePlan, UnitOfWork,
+        };
+        use haven_domain::comic_identity::PageIdentity;
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (work_a, edition_a, media_a) = seed(&db);
+        let (_, _edition_b, media_b) = seed(&db);
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO comic_page_identities
+                    (media_item_id, page_index, stable_key, fingerprint, updated_at)
+                 VALUES (?1, 0, 'work-b-original', NULL, 11)",
+                rusqlite::params![media_b.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO comic_page_identity_states (media_item_id, revision, updated_at)
+                 VALUES (?1, 'work-b-revision', 11)",
+                rusqlite::params![media_b.to_string()],
+            )
+            .unwrap();
+        }
+
+        let subject = ComicProgressSubject::new(work_a, edition_a, media_a, UtcMillis(1));
+        let error = SqliteUnitOfWork::new(db.clone())
+            .run_comic_progress_subject_write(&ComicProgressSubjectWritePlan {
+                subject,
+                members: vec![],
+                page_identity_write: Some(ComicPageIdentityWriteCandidate {
+                    media_item_id: media_b,
+                    pages: vec![PageIdentity::stable("work-a-forbidden")],
+                    expected_revision: Some("work-b-revision".to_owned()),
+                }),
+                progress_writes: vec![],
+                migration_snapshot: None,
+                refresh_receipt: None,
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+
+        let conn = db.lock();
+        let page: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT stable_key, fingerprint
+                 FROM comic_page_identities WHERE media_item_id = ?1 AND page_index = 0",
+                rusqlite::params![media_b.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(page, (Some("work-b-original".to_owned()), None));
+        let revision: String = conn
+            .query_row(
+                "SELECT revision FROM comic_page_identity_states WHERE media_item_id = ?1",
+                rusqlite::params![media_b.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revision, "work-b-revision");
     }
 
     fn count_rows(db: &Db, table: &str) -> i64 {
