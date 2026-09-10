@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -39,7 +40,7 @@ pub enum ComicProgressSubjectRelationship {
 ///
 /// 主体只保存连续性关系和当前权威 Progress 行的媒体条目映射；页面索引、
 /// 比例、完成状态、keyframe 和 revision 仍属于既有 Progress/Locator。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ComicProgressSubject {
     pub id: ComicProgressSubjectId,
@@ -53,9 +54,10 @@ pub struct ComicProgressSubject {
     pub algorithm_version: String,
     pub created_at: UtcMillis,
     pub updated_at: UtcMillis,
-    /// Active 成员的唯一性由 Subject 聚合在内存中维护；持久化时成员仍是独立关系行。
-    #[serde(skip)]
-    active_member_media_item_ids: HashSet<MediaItemId>,
+    /// 成员关系是可恢复的聚合数据；SQLite 仍可把它们作为独立关系行持久化，
+    /// 加载后通过 `load_members` 重新执行同一套 Domain 校验。
+    #[serde(default)]
+    members: Vec<ComicProgressSubjectMember>,
 }
 
 /// 漫画进度主体的一条媒体条目成员关系。
@@ -78,6 +80,78 @@ pub enum ComicProgressSubjectError {
     DuplicateActiveMember,
     RedirectCycle,
     RedirectedSubjectCannotAcceptMember,
+    MemberBelongsToAnotherSubject,
+    InvalidMemberRelationship,
+    InvalidMemberConfidence,
+    InvalidMemberEvidence,
+    InvalidAuthoritativeProgressMember,
+}
+
+impl fmt::Display for ComicProgressSubjectError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::DuplicateActiveMember => "duplicate active comic progress subject member",
+            Self::RedirectCycle => "comic progress subject redirect cycle",
+            Self::RedirectedSubjectCannotAcceptMember => {
+                "redirected comic progress subject cannot accept a member"
+            }
+            Self::MemberBelongsToAnotherSubject => {
+                "comic progress subject member belongs to another subject"
+            }
+            Self::InvalidMemberRelationship => "invalid comic progress subject member relationship",
+            Self::InvalidMemberConfidence => "invalid comic progress subject member confidence",
+            Self::InvalidMemberEvidence => "invalid comic progress subject member evidence",
+            Self::InvalidAuthoritativeProgressMember => {
+                "authoritative progress media item is not an active subject member"
+            }
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for ComicProgressSubjectError {}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct ComicProgressSubjectData {
+    id: ComicProgressSubjectId,
+    work_id: WorkId,
+    edition_id: EditionId,
+    canonical_media_item_id: MediaItemId,
+    authoritative_progress_media_item_id: Option<MediaItemId>,
+    state: ComicProgressSubjectState,
+    redirect_subject_id: Option<ComicProgressSubjectId>,
+    algorithm_version: String,
+    created_at: UtcMillis,
+    updated_at: UtcMillis,
+    #[serde(default)]
+    members: Vec<ComicProgressSubjectMember>,
+}
+
+impl<'de> Deserialize<'de> for ComicProgressSubject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let data = ComicProgressSubjectData::deserialize(deserializer)?;
+        let mut subject = Self {
+            id: data.id,
+            work_id: data.work_id,
+            edition_id: data.edition_id,
+            canonical_media_item_id: data.canonical_media_item_id,
+            authoritative_progress_media_item_id: data.authoritative_progress_media_item_id,
+            state: data.state,
+            redirect_subject_id: data.redirect_subject_id,
+            algorithm_version: data.algorithm_version,
+            created_at: data.created_at,
+            updated_at: data.updated_at,
+            members: Vec::new(),
+        };
+        subject
+            .load_members(data.members)
+            .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        Ok(subject)
+    }
 }
 
 impl ComicProgressSubject {
@@ -98,8 +172,44 @@ impl ComicProgressSubject {
             algorithm_version: SUBJECT_ALGORITHM_VERSION.to_owned(),
             created_at: now,
             updated_at: now,
-            active_member_media_item_ids: HashSet::new(),
+            members: Vec::new(),
         }
+    }
+
+    /// 返回已加载并通过 Domain 校验的成员关系。
+    pub fn members(&self) -> &[ComicProgressSubjectMember] {
+        &self.members
+    }
+
+    /// 从独立持久化的 Subject member 行恢复成员关系。
+    ///
+    /// 校验在替换当前成员前完成，因此失败不会留下半加载状态。调用方应把
+    /// 持久化的全部成员行一次性交给本方法，而不是自行维护另一份唯一性缓存。
+    pub fn load_members<I>(&mut self, members: I) -> Result<(), ComicProgressSubjectError>
+    where
+        I: IntoIterator<Item = ComicProgressSubjectMember>,
+    {
+        let mut loaded_members = Vec::new();
+        let mut active_member_media_item_ids = HashSet::new();
+        for member in members {
+            self.validate_member(&member)?;
+            if member.subject_id != self.id {
+                return Err(ComicProgressSubjectError::MemberBelongsToAnotherSubject);
+            }
+            if member.state == ComicProgressSubjectMemberState::Active
+                && !active_member_media_item_ids.insert(member.media_item_id)
+            {
+                return Err(ComicProgressSubjectError::DuplicateActiveMember);
+            }
+            loaded_members.push(member);
+        }
+
+        if !self.authoritative_mapping_is_valid_for(&loaded_members) {
+            return Err(ComicProgressSubjectError::InvalidAuthoritativeProgressMember);
+        }
+
+        self.members = loaded_members;
+        Ok(())
     }
 
     pub fn attach_member(
@@ -111,19 +221,125 @@ impl ComicProgressSubject {
         }
 
         if member.subject_id != self.id {
-            return Err(ComicProgressSubjectError::DuplicateActiveMember);
+            return Err(ComicProgressSubjectError::MemberBelongsToAnotherSubject);
         }
 
+        self.validate_member(&member)?;
+
         if member.state == ComicProgressSubjectMemberState::Active
-            && !self
-                .active_member_media_item_ids
-                .insert(member.media_item_id)
+            && self.members.iter().any(|existing| {
+                existing.state == ComicProgressSubjectMemberState::Active
+                    && existing.media_item_id == member.media_item_id
+            })
         {
             return Err(ComicProgressSubjectError::DuplicateActiveMember);
         }
 
+        let has_active_member = self
+            .members
+            .iter()
+            .any(|existing| existing.state == ComicProgressSubjectMemberState::Active);
+        let proposed_authoritative_progress_media_item_id = if member.state
+            == ComicProgressSubjectMemberState::Active
+            && !has_active_member
+            && self.authoritative_progress_media_item_id == Some(self.canonical_media_item_id)
+            && member.media_item_id != self.canonical_media_item_id
+        {
+            Some(member.media_item_id)
+        } else {
+            self.authoritative_progress_media_item_id
+        };
+        let mut proposed_members = self.members.clone();
+        proposed_members.push(member);
+        if !self.authoritative_mapping_is_valid_for_with_id(
+            &proposed_members,
+            proposed_authoritative_progress_media_item_id,
+        ) {
+            return Err(ComicProgressSubjectError::InvalidAuthoritativeProgressMember);
+        }
+
+        self.authoritative_progress_media_item_id = proposed_authoritative_progress_media_item_id;
+        self.members = proposed_members;
+        self.updated_at = UtcMillis::now();
         Ok(())
     }
+
+    /// 校验当前 Subject 的成员关系和权威 Progress 映射。
+    pub fn validate(&self) -> Result<(), ComicProgressSubjectError> {
+        let mut active_member_media_item_ids = HashSet::new();
+        for member in &self.members {
+            if member.subject_id != self.id {
+                return Err(ComicProgressSubjectError::MemberBelongsToAnotherSubject);
+            }
+            self.validate_member(member)?;
+            if member.state == ComicProgressSubjectMemberState::Active
+                && !active_member_media_item_ids.insert(member.media_item_id)
+            {
+                return Err(ComicProgressSubjectError::DuplicateActiveMember);
+            }
+        }
+        if !self.authoritative_mapping_is_valid_for(&self.members) {
+            return Err(ComicProgressSubjectError::InvalidAuthoritativeProgressMember);
+        }
+        Ok(())
+    }
+
+    /// 校验当前权威 Progress 映射是否指向 Subject 的 active 成员。
+    ///
+    /// `None` 表示当前还没有既有 Progress 行，可以通过；没有任何 active
+    /// 成员时，只有 `canonical_media_item_id` 允许作为新 Subject 的初始映射。
+    /// 一旦加载 active 成员，映射必须显式指向其中一条；本方法不读取或复制
+    /// Progress 的页面、完成度、keyframe 或 revision。
+    pub fn validate_authoritative_progress_media_item_id(
+        &self,
+    ) -> Result<(), ComicProgressSubjectError> {
+        if self.authoritative_mapping_is_valid_for(&self.members) {
+            Ok(())
+        } else {
+            Err(ComicProgressSubjectError::InvalidAuthoritativeProgressMember)
+        }
+    }
+
+    fn validate_member(
+        &self,
+        member: &ComicProgressSubjectMember,
+    ) -> Result<(), ComicProgressSubjectError> {
+        member.validate()
+    }
+
+    fn authoritative_mapping_is_valid_for(&self, members: &[ComicProgressSubjectMember]) -> bool {
+        self.authoritative_mapping_is_valid_for_with_id(
+            members,
+            self.authoritative_progress_media_item_id,
+        )
+    }
+
+    fn authoritative_mapping_is_valid_for_with_id(
+        &self,
+        members: &[ComicProgressSubjectMember],
+        authoritative_progress_media_item_id: Option<MediaItemId>,
+    ) -> bool {
+        let Some(authoritative_progress_media_item_id) = authoritative_progress_media_item_id
+        else {
+            return true;
+        };
+
+        let active_members: Vec<MediaItemId> = members
+            .iter()
+            .filter(|member| member.state == ComicProgressSubjectMemberState::Active)
+            .map(|member| member.media_item_id)
+            .collect();
+        if active_members.is_empty() {
+            authoritative_progress_media_item_id == self.canonical_media_item_id
+        } else {
+            active_members.contains(&authoritative_progress_media_item_id)
+        }
+    }
+
+    /// 将本 Subject 指向另一个 Subject。
+    ///
+    /// 这里没有仓库上下文，因此只拒绝自环和重复 redirect；多个 Subject
+    /// 之间的长链/环由 `resolve_subject_redirect` 使用 visited 集合校验。
 
     pub fn redirect_to(
         &mut self,
@@ -135,6 +351,7 @@ impl ComicProgressSubject {
 
         self.state = ComicProgressSubjectState::Redirected;
         self.redirect_subject_id = Some(target);
+        self.updated_at = UtcMillis::now();
         Ok(())
     }
 }
@@ -180,6 +397,124 @@ impl ComicProgressSubjectMember {
 
     pub fn participates_in_active_progress(&self) -> bool {
         self.state == ComicProgressSubjectMemberState::Active
+            && self.relationship != ComicProgressSubjectRelationship::Candidate
+            && self.confidence == MatchConfidence::High
+            && evidence_supports_high_confidence(&self.evidence)
+    }
+
+    /// 校验公开字段构造出的成员是否与其关系、状态、置信度和证据一致。
+    pub fn validate(&self) -> Result<(), ComicProgressSubjectError> {
+        if self.evidence.is_empty() {
+            return Err(ComicProgressSubjectError::InvalidMemberEvidence);
+        }
+
+        match self.state {
+            ComicProgressSubjectMemberState::Active => {
+                if self.relationship == ComicProgressSubjectRelationship::Candidate {
+                    return Err(ComicProgressSubjectError::InvalidMemberRelationship);
+                }
+                if self.confidence != MatchConfidence::High {
+                    return Err(ComicProgressSubjectError::InvalidMemberConfidence);
+                }
+                if !evidence_supports_high_confidence(&self.evidence) {
+                    return Err(ComicProgressSubjectError::InvalidMemberEvidence);
+                }
+            }
+            ComicProgressSubjectMemberState::Candidate => {
+                if self.relationship != ComicProgressSubjectRelationship::Candidate {
+                    return Err(ComicProgressSubjectError::InvalidMemberRelationship);
+                }
+                let evidence_confidence = evidence_confidence(&self.evidence);
+                if self.confidence == MatchConfidence::High
+                    || self.confidence != evidence_confidence
+                {
+                    return Err(ComicProgressSubjectError::InvalidMemberConfidence);
+                }
+            }
+            ComicProgressSubjectMemberState::Retired => {
+                if self.confidence != evidence_confidence(&self.evidence) {
+                    return Err(ComicProgressSubjectError::InvalidMemberConfidence);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn evidence_confidence(evidence: &[ChapterEvidence]) -> MatchConfidence {
+    if evidence.iter().any(is_high_confidence_evidence) {
+        MatchConfidence::High
+    } else if evidence.iter().any(is_medium_confidence_evidence) {
+        MatchConfidence::Medium
+    } else {
+        MatchConfidence::Low
+    }
+}
+
+fn evidence_supports_high_confidence(evidence: &[ChapterEvidence]) -> bool {
+    evidence.iter().any(is_high_confidence_evidence)
+        && !evidence.iter().any(|item| {
+            matches!(
+                item,
+                ChapterEvidence::ConflictingAuthoritativeContentKey
+                    | ChapterEvidence::EditionConflict
+                    | ChapterEvidence::WeakChapterMetadata
+            )
+        })
+}
+
+fn is_high_confidence_evidence(evidence: &ChapterEvidence) -> bool {
+    matches!(
+        evidence,
+        ChapterEvidence::SameRemoteIdentity
+            | ChapterEvidence::AuthoritativeContentKey
+            | ChapterEvidence::ExactPageIdentity { matched: 1.. }
+    )
+}
+
+fn is_medium_confidence_evidence(evidence: &ChapterEvidence) -> bool {
+    matches!(
+        evidence,
+        ChapterEvidence::PartialPageIdentity { matched: 1.. }
+    )
+}
+
+/// 按 `(created_at ASC, subject_id ASC)` 选择合并 survivor。
+pub fn select_subject_survivor(
+    subjects: &[ComicProgressSubject],
+) -> Option<ComicProgressSubjectId> {
+    subjects
+        .iter()
+        .min_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        })
+        .map(|subject| subject.id)
+}
+
+/// 解析 Subject 的 redirect 链，并用 visited 集合拒绝跨 Subject 环。
+///
+/// `subjects` 是调用方当前加载到的 Subject 集合；如果 redirect target 不在
+/// 集合中，则把该 target 视为解析终点，目标存在性由 Application/Repository
+/// 另行校验。本函数只负责链路和环检测。
+pub fn resolve_subject_redirect(
+    start: ComicProgressSubjectId,
+    subjects: &[ComicProgressSubject],
+) -> Result<ComicProgressSubjectId, ComicProgressSubjectError> {
+    let mut current = start;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current) {
+            return Err(ComicProgressSubjectError::RedirectCycle);
+        }
+        let Some(subject) = subjects.iter().find(|subject| subject.id == current) else {
+            return Ok(current);
+        };
+        let Some(target) = subject.redirect_subject_id else {
+            return Ok(current);
+        };
+        current = target;
     }
 }
 
@@ -191,8 +526,9 @@ mod tests {
     };
     use crate::ids::{EditionId, MediaItemId, WorkId};
     use crate::{
-        ComicProgressSubject, ComicProgressSubjectId, ComicProgressSubjectMember,
-        ComicProgressSubjectMemberState,
+        ComicProgressSubject, ComicProgressSubjectError, ComicProgressSubjectId,
+        ComicProgressSubjectMember, ComicProgressSubjectMemberState, ComicProgressSubjectState,
+        resolve_subject_redirect, select_subject_survivor,
     };
     use haven_common::UtcMillis;
 
@@ -281,5 +617,205 @@ mod tests {
         assert_eq!(member.state, ComicProgressSubjectMemberState::Candidate);
         assert_eq!(member.confidence, MatchConfidence::Low);
         assert!(!member.participates_in_active_progress());
+    }
+
+    #[test]
+    fn serialized_subject_restores_members_and_loaded_rows_keep_active_members_unique() {
+        let mut subject = ComicProgressSubject::new(
+            fixture_work_id(),
+            fixture_edition_id(),
+            fixture_media_item_id(),
+            fixture_now(),
+        );
+        let member = ComicProgressSubjectMember::active(
+            subject.id,
+            fixture_media_item_id(),
+            fixture_high_evidence(),
+        );
+        subject.attach_member(member.clone()).unwrap();
+
+        let json = serde_json::to_string(&subject).unwrap();
+        let mut restored: ComicProgressSubject = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.members(), &[member.clone()]);
+        assert_eq!(
+            restored.attach_member(member.clone()),
+            Err(ComicProgressSubjectError::DuplicateActiveMember)
+        );
+        assert_eq!(
+            restored.load_members(vec![member.clone(), member]),
+            Err(ComicProgressSubjectError::DuplicateActiveMember)
+        );
+    }
+
+    #[test]
+    fn malformed_member_cannot_be_attached_or_drive_active_progress() {
+        let mut subject = ComicProgressSubject::new(
+            fixture_work_id(),
+            fixture_edition_id(),
+            fixture_media_item_id(),
+            fixture_now(),
+        );
+
+        let mut relationship_conflict = ComicProgressSubjectMember::active(
+            subject.id,
+            fixture_media_item_id(),
+            fixture_high_evidence(),
+        );
+        relationship_conflict.relationship = crate::ComicProgressSubjectRelationship::Candidate;
+        assert!(subject.attach_member(relationship_conflict).is_err());
+
+        let mut confidence_conflict = ComicProgressSubjectMember::active(
+            subject.id,
+            fixture_media_item_id(),
+            fixture_high_evidence(),
+        );
+        confidence_conflict.confidence = MatchConfidence::Low;
+        assert!(subject.attach_member(confidence_conflict).is_err());
+
+        let evidence_conflict = ComicProgressSubjectMember::active(
+            subject.id,
+            fixture_media_item_id(),
+            fixture_low_evidence(),
+        );
+        assert!(!evidence_conflict.participates_in_active_progress());
+        assert!(subject.attach_member(evidence_conflict).is_err());
+
+        let mut state_conflict = ComicProgressSubjectMember::candidate(
+            subject.id,
+            fixture_media_item_id(),
+            fixture_low_evidence(),
+        );
+        state_conflict.state = ComicProgressSubjectMemberState::Active;
+        assert!(!state_conflict.participates_in_active_progress());
+        assert!(subject.attach_member(state_conflict).is_err());
+    }
+
+    #[test]
+    fn redirect_updates_timestamp_and_resolver_rejects_a_two_subject_cycle() {
+        let mut left = ComicProgressSubject::new(
+            fixture_work_id(),
+            fixture_edition_id(),
+            fixture_media_item_id(),
+            fixture_now(),
+        );
+        let mut right = ComicProgressSubject::new(
+            fixture_work_id(),
+            fixture_edition_id(),
+            fixture_media_item_id(),
+            fixture_now(),
+        );
+        let before_redirect = left.updated_at;
+
+        left.redirect_to(right.id).unwrap();
+        assert_eq!(left.state, ComicProgressSubjectState::Redirected);
+        assert!(left.updated_at > before_redirect);
+        assert_eq!(
+            left.redirect_to(right.id),
+            Err(ComicProgressSubjectError::RedirectCycle)
+        );
+
+        right.redirect_to(left.id).unwrap();
+        let subjects = vec![left, right];
+        assert_eq!(
+            resolve_subject_redirect(subjects[0].id, &subjects),
+            Err(ComicProgressSubjectError::RedirectCycle)
+        );
+    }
+
+    #[test]
+    fn survivor_selection_uses_created_at_then_subject_id_and_redirect_preserves_mapping() {
+        let mut older = ComicProgressSubject::new(
+            fixture_work_id(),
+            fixture_edition_id(),
+            fixture_media_item_id(),
+            UtcMillis(1),
+        );
+        let first_tie = ComicProgressSubject::new(
+            fixture_work_id(),
+            fixture_edition_id(),
+            fixture_media_item_id(),
+            UtcMillis(2),
+        );
+        let second_tie = ComicProgressSubject::new(
+            fixture_work_id(),
+            fixture_edition_id(),
+            fixture_media_item_id(),
+            UtcMillis(2),
+        );
+        let newer = ComicProgressSubject::new(
+            fixture_work_id(),
+            fixture_edition_id(),
+            fixture_media_item_id(),
+            UtcMillis(3),
+        );
+
+        assert_eq!(
+            select_subject_survivor(&[second_tie.clone(), first_tie.clone()]),
+            Some(std::cmp::min(first_tie.id, second_tie.id))
+        );
+        assert_eq!(
+            select_subject_survivor(&[newer, second_tie, older.clone(), first_tie,]),
+            Some(older.id)
+        );
+
+        let original_authoritative = older.authoritative_progress_media_item_id;
+        let original_canonical = older.canonical_media_item_id;
+        older.redirect_to(fixture_subject_id()).unwrap();
+        assert_eq!(
+            older.authoritative_progress_media_item_id,
+            original_authoritative
+        );
+        assert_eq!(older.canonical_media_item_id, original_canonical);
+        assert_eq!(older.state, ComicProgressSubjectState::Redirected);
+    }
+
+    #[test]
+    fn authoritative_progress_mapping_requires_an_active_member_or_initial_canonical() {
+        let canonical_media_item_id = fixture_media_item_id();
+        let mut subject = ComicProgressSubject::new(
+            fixture_work_id(),
+            fixture_edition_id(),
+            canonical_media_item_id,
+            fixture_now(),
+        );
+        assert!(
+            subject
+                .validate_authoritative_progress_media_item_id()
+                .is_ok()
+        );
+
+        let canonical_member = ComicProgressSubjectMember::active(
+            subject.id,
+            canonical_media_item_id,
+            fixture_high_evidence(),
+        );
+        subject.attach_member(canonical_member).unwrap();
+        subject.authoritative_progress_media_item_id = Some(fixture_media_item_id());
+        assert!(
+            subject
+                .validate_authoritative_progress_media_item_id()
+                .is_err()
+        );
+
+        subject.authoritative_progress_media_item_id = Some(canonical_media_item_id);
+        assert!(
+            subject
+                .validate_authoritative_progress_media_item_id()
+                .is_ok()
+        );
+
+        let mut invalid_initial_mapping = ComicProgressSubject::new(
+            fixture_work_id(),
+            fixture_edition_id(),
+            fixture_media_item_id(),
+            fixture_now(),
+        );
+        invalid_initial_mapping.authoritative_progress_media_item_id =
+            Some(fixture_media_item_id());
+        assert!(
+            invalid_initial_mapping
+                .validate_authoritative_progress_media_item_id()
+                .is_err()
+        );
     }
 }
