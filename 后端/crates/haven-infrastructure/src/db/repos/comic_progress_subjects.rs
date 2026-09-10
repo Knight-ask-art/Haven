@@ -422,9 +422,11 @@ fn load_member_for_media_item(
     let Some(subject_id) = subject_id else {
         return Ok(None);
     };
-    Ok(load_members(conn, &subject_id)?
-        .into_iter()
-        .find(|member| member.media_item_id == media_item_id))
+    Ok(load_members(conn, &subject_id)?.into_iter().find(|member| {
+        member.media_item_id == media_item_id
+            && member.state
+                == haven_domain::comic_progress_subject::ComicProgressSubjectMemberState::Active
+    }))
 }
 
 fn validate_subject_text(value: &str, field: &'static str) -> Result<(), AppError> {
@@ -858,6 +860,64 @@ mod tests {
                 .is_some()
         );
 
+        // A persisted pointer remains authoritative even if another active
+        // member has a newer Progress and the requested member has none.
+        let third_media_item_id = MediaItemId::new();
+        MediaItemRepository::save(
+            &*repos,
+            &MediaItem {
+                id: third_media_item_id,
+                edition_id,
+                parent_id: None,
+                media_type: MediaType::Comic,
+                title: "第 3 话".to_owned(),
+                index: MediaIndex::Chapter {
+                    volume: None,
+                    chapter: 3.0,
+                },
+                duration_ms: None,
+                page_count: Some(10),
+                chapter_count: None,
+                published_at: None,
+                status: MediaItemStatus::Available,
+                created_at: UtcMillis(1),
+                updated_at: UtcMillis(1),
+            },
+        )
+        .await
+        .unwrap();
+        let third_member = ComicProgressSubjectMember::active(
+            subject.id,
+            third_media_item_id,
+            vec![ChapterEvidence::SameRemoteIdentity],
+        );
+        let mut pointer_subject = subject.clone();
+        pointer_subject.authoritative_progress_media_item_id = Some(second_media_item_id);
+        let mut pointer_members =
+            ComicProgressSubjectRepository::list_members(&*repos, member.subject_id)
+                .await
+                .unwrap();
+        pointer_members.push(third_member);
+        SqliteUnitOfWork::new(db.clone())
+            .run_comic_progress_subject_write(&ComicProgressSubjectWritePlan {
+                subject: pointer_subject,
+                members: pointer_members,
+                page_identity_write: None,
+                progress_writes: vec![],
+                migration_snapshot: None,
+                refresh_receipt: None,
+            })
+            .unwrap();
+        let pointer_resolution = service
+            .read_for_media_item(third_media_item_id)
+            .await
+            .unwrap()
+            .expect("目标无 Progress 时必须返回已有权威指针行");
+        assert_eq!(
+            pointer_resolution.media_item_id, second_media_item_id,
+            "不得用较新的非 pointer Progress 替换既有权威映射"
+        );
+
         // Equal timestamps use only MediaItem UUID text as the deterministic tie-breaker.
         let tied_media_item_id =
             if first_media_item_id.to_string() < second_media_item_id.to_string() {
@@ -905,6 +965,50 @@ mod tests {
             tied.authoritative_progress_media_item_id,
             Some(tied_media_item_id)
         );
+    }
+
+    #[tokio::test]
+    async fn progress_subject_backfill_get_for_media_item_prefers_active_member_over_older_candidate()
+     {
+        use crate::db::uow::SqliteUnitOfWork;
+        use haven_application::services::ports::{ComicProgressSubjectWritePlan, UnitOfWork};
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repos = Arc::new(SqliteRepositories::new(db.clone()));
+        let media_item_id = MediaItemId::new();
+        let (work_id, edition_id) =
+            seed_real_comic_content(&repos, "成员状态漫画", media_item_id).await;
+        let subject = ComicProgressSubject::new(work_id, edition_id, media_item_id, UtcMillis(1));
+        let mut candidate = ComicProgressSubjectMember::candidate(
+            subject.id,
+            media_item_id,
+            vec![ChapterEvidence::WeakChapterMetadata],
+        );
+        candidate.created_at = UtcMillis(1);
+        candidate.updated_at = UtcMillis(1);
+        let mut active = ComicProgressSubjectMember::active(
+            subject.id,
+            media_item_id,
+            vec![ChapterEvidence::SameRemoteIdentity],
+        );
+        active.relationship = ComicProgressSubjectRelationship::Canonical;
+        active.created_at = UtcMillis(2);
+        active.updated_at = UtcMillis(2);
+        SqliteUnitOfWork::new(db)
+            .run_comic_progress_subject_write(&ComicProgressSubjectWritePlan {
+                subject,
+                members: vec![candidate, active.clone()],
+                page_identity_write: None,
+                progress_writes: vec![],
+                migration_snapshot: None,
+                refresh_receipt: None,
+            })
+            .unwrap();
+        let resolved = ComicProgressSubjectRepository::get_for_media_item(&*repos, media_item_id)
+            .await
+            .unwrap()
+            .expect("存在 active 行时必须返回 active member");
+        assert_eq!(resolved, active);
     }
 
     #[tokio::test]

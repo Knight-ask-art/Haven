@@ -125,12 +125,24 @@ impl ComicProgressSubjectService {
         subject
             .load_members(members.clone())
             .map_err(|error| invalid_subject(error.to_string()))?;
-        let selected = self.select_authoritative_progress(&subject).await?;
-
-        // A legacy Subject can lack a pointer.  Only add the mapping; existing
-        // Progress rows (including their revision/history/markers) are never
-        // copied, overwritten, or deleted here.
-        if subject.authoritative_progress_media_item_id.is_none() {
+        let authoritative_progress = if let Some(authoritative_media_item_id) =
+            subject.authoritative_progress_media_item_id
+        {
+            // An existing pointer is the Subject's single authority.  Do not
+            // silently substitute a newer row: that would make the returned
+            // resolution disagree with the persisted mapping.  A dangling
+            // pointer is fail-closed; repairing it requires an explicit
+            // mapping decision rather than selecting an unrelated Progress.
+            Some(
+                ProgressRepository::get_for_media_item(&*self.ports, authoritative_media_item_id)
+                    .await?
+                    .ok_or_else(authoritative_progress_missing)?,
+            )
+        } else {
+            let selected = self.select_authoritative_progress(&subject).await?;
+            // A legacy Subject can lack a pointer.  Only add the mapping;
+            // existing Progress rows (including revision/history/markers) are
+            // never copied, overwritten, or deleted here.
             if let Some(progress) = selected.as_ref() {
                 subject.authoritative_progress_media_item_id = Some(progress.media_item_id);
                 self.unit_of_work.run_comic_progress_subject_write(
@@ -144,11 +156,16 @@ impl ComicProgressSubjectService {
                     },
                 )?;
             }
-        }
+            selected
+        };
 
         let member = members
             .iter()
-            .find(|member| member.media_item_id == media_item_id)
+            .find(|member| {
+                member.media_item_id == media_item_id
+                    && member.state
+                        == haven_domain::comic_progress_subject::ComicProgressSubjectMemberState::Active
+            })
             .cloned()
             .ok_or_else(subject_member_not_found)?;
         // When the requested MediaItem already has a Progress it is the
@@ -156,7 +173,7 @@ impl ComicProgressSubjectService {
         Ok(ComicProgressSubjectResolution {
             subject,
             member,
-            authoritative_progress: target_progress.or(selected),
+            authoritative_progress: target_progress.or(authoritative_progress),
         })
     }
 
@@ -218,6 +235,15 @@ fn subject_member_not_found() -> AppError {
         "COMIC_PROGRESS_SUBJECT_MEMBER_NOT_FOUND",
         haven_common::ErrorKind::NotFound,
         "漫画进度主体成员不存在",
+        false,
+    )
+}
+
+fn authoritative_progress_missing() -> AppError {
+    AppError::new(
+        "COMIC_PROGRESS_SUBJECT_AUTHORITATIVE_PROGRESS_MISSING",
+        haven_common::ErrorKind::NotFound,
+        "漫画进度主体的权威 Progress 不存在",
         false,
     )
 }
