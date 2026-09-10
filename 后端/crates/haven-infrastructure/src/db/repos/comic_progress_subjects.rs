@@ -480,8 +480,23 @@ fn invalid_subject(message: impl Into<String>) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::repos::SqliteRepositories;
     use haven_domain::comic_identity::ChapterEvidence;
-    use haven_domain::comic_progress_subject::ComicProgressSubject;
+    use haven_domain::comic_progress_subject::{
+        ComicProgressSubject, ComicProgressSubjectMember, ComicProgressSubjectRelationship,
+    };
+    use haven_domain::contracts::{
+        ComicProgressSubjectRepository, EditionRepository, HistoryRepository, MarkerRepository,
+        MediaItemRepository, ProgressRepository, WorkRepository,
+    };
+    use haven_domain::entities::{
+        Edition, HistoryEntry, Marker, MediaIndex, MediaItem, Progress, Work,
+    };
+    use haven_domain::enums::{
+        CompletionState, MarkerType, MediaItemStatus, MediaType, WorkStatus, WorkType,
+    };
+    use haven_domain::ids::{HistoryEntryId, MarkerId, ProgressId};
+    use haven_domain::locator::{ComicLocator, Locator};
 
     fn seed(db: &Db) -> (WorkId, EditionId, MediaItemId) {
         let work_id = WorkId::new();
@@ -510,6 +525,108 @@ mod tests {
         (work_id, edition_id, media_item_id)
     }
 
+    async fn seed_real_comic_content(
+        repos: &SqliteRepositories,
+        title: &str,
+        media_item_id: MediaItemId,
+    ) -> (WorkId, EditionId) {
+        let now = UtcMillis(1);
+        let work_id = WorkId::new();
+        let edition_id = EditionId::new();
+        WorkRepository::save(
+            repos,
+            &Work {
+                id: work_id,
+                canonical_title: title.to_owned(),
+                original_title: None,
+                sort_title: None,
+                description: None,
+                work_type: WorkType::Fiction,
+                release_year: None,
+                language: None,
+                director: None,
+                actor: None,
+                status: WorkStatus::Completed,
+                rating_value: None,
+                rating_scale: None,
+                artwork: Default::default(),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        EditionRepository::save(
+            repos,
+            &Edition {
+                id: edition_id,
+                work_id,
+                title: format!("{title} 漫画版"),
+                subtitle: None,
+                edition_type: MediaType::Comic,
+                release_date: None,
+                language: None,
+                region: None,
+                publisher_or_studio: None,
+                description: None,
+                artwork: Default::default(),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        MediaItemRepository::save(
+            repos,
+            &MediaItem {
+                id: media_item_id,
+                edition_id,
+                parent_id: None,
+                media_type: MediaType::Comic,
+                title: "第 1 话".to_owned(),
+                index: MediaIndex::Chapter {
+                    volume: None,
+                    chapter: 1.0,
+                },
+                duration_ms: None,
+                page_count: Some(10),
+                chapter_count: None,
+                published_at: None,
+                status: MediaItemStatus::Available,
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        (work_id, edition_id)
+    }
+
+    fn comic_progress(
+        work_id: WorkId,
+        edition_id: EditionId,
+        media_item_id: MediaItemId,
+        at: i64,
+    ) -> Progress {
+        Progress {
+            id: ProgressId::new(),
+            work_id,
+            edition_id,
+            media_item_id,
+            locator: Locator::Comic(ComicLocator {
+                chapter_item_id: media_item_id,
+                page_index: 3,
+                page_progression: Some(0.4),
+            }),
+            completion: CompletionState::InProgress,
+            percentage: Some(0.4),
+            last_active_at: UtcMillis(at),
+            updated_at: UtcMillis(at),
+            revision: None,
+            keyframe_uri: Some("data:image/png;base64,fixture".to_owned()),
+        }
+    }
+
     fn table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
         conn.query_row(
             "SELECT EXISTS(
@@ -532,6 +649,381 @@ mod tests {
         )
         .unwrap()
             != 0
+    }
+
+    #[tokio::test]
+    async fn progress_subject_backfill_existing_comic_progress_is_backfilled_without_copying_progress_fields()
+     {
+        use crate::db::uow::SqliteUnitOfWork;
+        use haven_application::services::progress::ProgressService;
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repos = Arc::new(SqliteRepositories::new(db.clone()));
+        let media_item_id = MediaItemId::new();
+        let (work_id, edition_id) =
+            seed_real_comic_content(&repos, "回填漫画", media_item_id).await;
+        let persisted_revision = ProgressRepository::save_if_revision(
+            &*repos,
+            &comic_progress(work_id, edition_id, media_item_id, 100),
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("Progress 应取得 revision");
+        let marker = Marker {
+            id: MarkerId::new(),
+            work_id,
+            edition_id,
+            media_item_id,
+            locator: Locator::Comic(ComicLocator {
+                chapter_item_id: media_item_id,
+                page_index: 3,
+                page_progression: Some(0.4),
+            }),
+            marker_type: MarkerType::Bookmark,
+            title: Some("保留标记".to_owned()),
+            excerpt: None,
+            note: None,
+            preview: None,
+            created_at: UtcMillis(101),
+            updated_at: UtcMillis(101),
+            deleted_at: None,
+        };
+        MarkerRepository::save(&*repos, &marker).await.unwrap();
+        let history = HistoryEntry {
+            id: HistoryEntryId::new(),
+            media_item_id,
+            work_id,
+            edition_id,
+            locator: Some(marker.locator.clone()),
+            started_at: UtcMillis(99),
+            last_active_at: UtcMillis(100),
+            completed_at: None,
+        };
+        HistoryRepository::save(&*repos, &history).await.unwrap();
+
+        let service = ProgressService::with_comic_progress_subjects(
+            repos.clone(),
+            Arc::new(SqliteUnitOfWork::new(db)),
+        );
+        let resolved = service
+            .read_for_media_item(media_item_id)
+            .await
+            .unwrap()
+            .expect("既有 Progress 必须仍可读");
+        assert_eq!(
+            resolved.revision.as_deref(),
+            Some(persisted_revision.as_str())
+        );
+        assert_eq!(resolved.locator, marker.locator);
+        let member = ComicProgressSubjectRepository::get_for_media_item(&*repos, media_item_id)
+            .await
+            .unwrap()
+            .expect("首次读取必须创建 canonical member");
+        let subject = ComicProgressSubjectRepository::get(&*repos, member.subject_id)
+            .await
+            .unwrap()
+            .expect("首次读取必须创建 Subject");
+        assert_eq!(
+            subject.authoritative_progress_media_item_id,
+            Some(media_item_id)
+        );
+        assert_eq!(
+            ProgressRepository::get_for_media_item(&*repos, media_item_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .revision
+                .as_deref(),
+            Some(persisted_revision.as_str()),
+            "Subject 回填不得改变 Progress revision"
+        );
+        assert_eq!(
+            HistoryRepository::list_for_media_item(&*repos, media_item_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            MarkerRepository::list_for_media_item(&*repos, media_item_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_subject_backfill_multiple_active_member_progress_uses_last_active_then_media_id_and_keeps_other_rows()
+     {
+        use crate::db::uow::SqliteUnitOfWork;
+        use haven_application::services::ports::{ComicProgressSubjectWritePlan, UnitOfWork};
+        use haven_application::services::progress::ProgressService;
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repos = Arc::new(SqliteRepositories::new(db.clone()));
+        let first_media_item_id = MediaItemId::new();
+        let second_media_item_id = MediaItemId::new();
+        let (work_id, edition_id) =
+            seed_real_comic_content(&repos, "权威选择漫画", first_media_item_id).await;
+        MediaItemRepository::save(
+            &*repos,
+            &MediaItem {
+                id: second_media_item_id,
+                edition_id,
+                parent_id: None,
+                media_type: MediaType::Comic,
+                title: "第 2 话".to_owned(),
+                index: MediaIndex::Chapter {
+                    volume: None,
+                    chapter: 2.0,
+                },
+                duration_ms: None,
+                page_count: Some(10),
+                chapter_count: None,
+                published_at: None,
+                status: MediaItemStatus::Available,
+                created_at: UtcMillis(1),
+                updated_at: UtcMillis(1),
+            },
+        )
+        .await
+        .unwrap();
+        for (media_item_id, at) in [(first_media_item_id, 200), (second_media_item_id, 100)] {
+            ProgressRepository::save_if_revision(
+                &*repos,
+                &comic_progress(work_id, edition_id, media_item_id, at),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("fixture Progress");
+        }
+        let mut subject =
+            ComicProgressSubject::new(work_id, edition_id, first_media_item_id, UtcMillis(1));
+        subject.authoritative_progress_media_item_id = None;
+        let mut first_member = ComicProgressSubjectMember::active(
+            subject.id,
+            first_media_item_id,
+            vec![ChapterEvidence::SameRemoteIdentity],
+        );
+        first_member.relationship = ComicProgressSubjectRelationship::Canonical;
+        let second_member = ComicProgressSubjectMember::active(
+            subject.id,
+            second_media_item_id,
+            vec![ChapterEvidence::SameRemoteIdentity],
+        );
+        SqliteUnitOfWork::new(db.clone())
+            .run_comic_progress_subject_write(&ComicProgressSubjectWritePlan {
+                subject,
+                members: vec![first_member, second_member],
+                page_identity_write: None,
+                progress_writes: vec![],
+                migration_snapshot: None,
+                refresh_receipt: None,
+            })
+            .unwrap();
+        let service = ProgressService::with_comic_progress_subjects(
+            repos.clone(),
+            Arc::new(SqliteUnitOfWork::new(db.clone())),
+        );
+        service
+            .read_for_media_item(second_media_item_id)
+            .await
+            .unwrap();
+        let member =
+            ComicProgressSubjectRepository::get_for_media_item(&*repos, first_media_item_id)
+                .await
+                .unwrap()
+                .unwrap();
+        let subject = ComicProgressSubjectRepository::get(&*repos, member.subject_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            subject.authoritative_progress_media_item_id,
+            Some(first_media_item_id)
+        );
+        assert!(
+            ProgressRepository::get_for_media_item(&*repos, first_media_item_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            ProgressRepository::get_for_media_item(&*repos, second_media_item_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Equal timestamps use only MediaItem UUID text as the deterministic tie-breaker.
+        let tied_media_item_id =
+            if first_media_item_id.to_string() < second_media_item_id.to_string() {
+                first_media_item_id
+            } else {
+                second_media_item_id
+            };
+        let mut tied_subject = subject.clone();
+        tied_subject.authoritative_progress_media_item_id = None;
+        let mut left = ProgressRepository::get_for_media_item(&*repos, first_media_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut right = ProgressRepository::get_for_media_item(&*repos, second_media_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        left.last_active_at = UtcMillis(300);
+        right.last_active_at = UtcMillis(300);
+        left.updated_at = UtcMillis(301);
+        right.updated_at = UtcMillis(301);
+        ProgressRepository::save(&*repos, &left).await.unwrap();
+        ProgressRepository::save(&*repos, &right).await.unwrap();
+        SqliteUnitOfWork::new(db.clone())
+            .run_comic_progress_subject_write(&ComicProgressSubjectWritePlan {
+                subject: tied_subject,
+                members: ComicProgressSubjectRepository::list_members(&*repos, member.subject_id)
+                    .await
+                    .unwrap(),
+                page_identity_write: None,
+                progress_writes: vec![],
+                migration_snapshot: None,
+                refresh_receipt: None,
+            })
+            .unwrap();
+        service
+            .read_for_media_item(second_media_item_id)
+            .await
+            .unwrap();
+        let tied = ComicProgressSubjectRepository::get(&*repos, member.subject_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tied.authoritative_progress_media_item_id,
+            Some(tied_media_item_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_subject_backfill_non_comic_progress_never_creates_subject_or_changes_revision()
+     {
+        use crate::db::uow::SqliteUnitOfWork;
+        use haven_application::services::progress::ProgressService;
+        use haven_domain::locator::{Locator, VideoLocator};
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repos = Arc::new(SqliteRepositories::new(db.clone()));
+        let now = UtcMillis(1);
+        let work_id = WorkId::new();
+        let edition_id = EditionId::new();
+        let media_item_id = MediaItemId::new();
+        WorkRepository::save(
+            &*repos,
+            &Work {
+                id: work_id,
+                canonical_title: "非漫画影片".to_owned(),
+                original_title: None,
+                sort_title: None,
+                description: None,
+                work_type: WorkType::Standalone,
+                release_year: None,
+                language: None,
+                director: None,
+                actor: None,
+                status: WorkStatus::Completed,
+                rating_value: None,
+                rating_scale: None,
+                artwork: Default::default(),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        EditionRepository::save(
+            &*repos,
+            &Edition {
+                id: edition_id,
+                work_id,
+                title: "影片版".to_owned(),
+                subtitle: None,
+                edition_type: MediaType::Movie,
+                release_date: None,
+                language: None,
+                region: None,
+                publisher_or_studio: None,
+                description: None,
+                artwork: Default::default(),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        MediaItemRepository::save(
+            &*repos,
+            &MediaItem {
+                id: media_item_id,
+                edition_id,
+                parent_id: None,
+                media_type: MediaType::Movie,
+                title: "正片".to_owned(),
+                index: MediaIndex::Movie,
+                duration_ms: Some(1_000),
+                page_count: None,
+                chapter_count: None,
+                published_at: None,
+                status: MediaItemStatus::Available,
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        let movie_progress = Progress {
+            id: ProgressId::new(),
+            work_id,
+            edition_id,
+            media_item_id,
+            locator: Locator::Video(VideoLocator {
+                media_item_id,
+                position_ms: 500,
+            }),
+            completion: CompletionState::InProgress,
+            percentage: Some(0.5),
+            last_active_at: now,
+            updated_at: now,
+            revision: None,
+            keyframe_uri: None,
+        };
+        let revision = ProgressRepository::save_if_revision(&*repos, &movie_progress, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let service = ProgressService::with_comic_progress_subjects(
+            repos.clone(),
+            Arc::new(SqliteUnitOfWork::new(db.clone())),
+        );
+        assert_eq!(
+            service
+                .read_for_media_item(media_item_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .revision
+                .as_deref(),
+            Some(revision.as_str())
+        );
+        let subject_count: i64 = db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM comic_progress_subjects", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(subject_count, 0);
     }
 
     #[test]

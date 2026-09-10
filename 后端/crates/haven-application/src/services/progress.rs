@@ -19,6 +19,7 @@ use haven_domain::locator::{Locator, locator_kind_compatible};
 
 use crate::mapper::progress::progress_summary;
 use crate::services::library::MAX_LIMIT;
+use crate::services::ports::UnitOfWork;
 use crate::wire::{
     ProgressMarkCompletedRequest, ProgressSaveRequest, ProgressSaveResult, ProgressSummaryDto,
 };
@@ -39,11 +40,38 @@ impl<T> ProgressPorts for T where
 #[derive(Clone)]
 pub struct ProgressService {
     ports: Arc<dyn ProgressPorts>,
+    comic_progress_subjects: Option<comic_progress_subject::ComicProgressSubjectService>,
 }
 
 impl ProgressService {
     pub fn new(ports: Arc<dyn ProgressPorts>) -> Self {
-        Self { ports }
+        Self {
+            ports,
+            comic_progress_subjects: None,
+        }
+    }
+
+    /// 构造启用漫画 Subject 兼容读取的 ProgressService。
+    ///
+    /// 现有 State 组装尚不在本任务 allowlist，因此 `new` 保持完全兼容的
+    /// 旧读取路径；任务 9 可以在 State 接线时显式选择本构造器。这里不会以
+    /// 普通 Repository 写入替代 Subject UoW：所有懒回填仍只由 SubjectService
+    /// 的 `run_comic_progress_subject_write` 提交。
+    pub fn with_comic_progress_subjects<T>(ports: Arc<T>, unit_of_work: Arc<dyn UnitOfWork>) -> Self
+    where
+        T: ProgressPorts + comic_progress_subject::ComicProgressSubjectPorts + 'static,
+    {
+        let progress_ports: Arc<dyn ProgressPorts> = ports.clone();
+        let subject_ports: Arc<dyn comic_progress_subject::ComicProgressSubjectPorts> = ports;
+        Self {
+            ports: progress_ports,
+            comic_progress_subjects: Some(
+                comic_progress_subject::ComicProgressSubjectService::new(
+                    subject_ports,
+                    unit_of_work,
+                ),
+            ),
+        }
     }
 
     /// 保存进度。workId/editionId 由 MediaItem 推导；校验 Locator 兼容性。
@@ -183,7 +211,7 @@ impl ProgressService {
         &self,
         media_item_id: MediaItemId,
     ) -> Result<Option<ProgressSummaryDto>, AppError> {
-        let progress = self.ports.get_for_media_item(media_item_id).await?;
+        let progress = self.read_for_media_item(media_item_id).await?;
         progress.as_ref().map(progress_summary).transpose()
     }
 
@@ -192,7 +220,19 @@ impl ProgressService {
         &self,
         media_item_id: MediaItemId,
     ) -> Result<Option<Progress>, AppError> {
-        ProgressRepository::get_for_media_item(&*self.ports, media_item_id).await
+        let Some(subjects) = self.comic_progress_subjects.as_ref() else {
+            return ProgressRepository::get_for_media_item(&*self.ports, media_item_id).await;
+        };
+        let media_item = MediaItemRepository::get(&*self.ports, media_item_id)
+            .await?
+            .ok_or_else(media_item_not_found)?;
+        if media_item.media_type != haven_domain::enums::MediaType::Comic {
+            return ProgressRepository::get_for_media_item(&*self.ports, media_item_id).await;
+        }
+        Ok(subjects
+            .ensure_for_media_item(media_item_id)
+            .await?
+            .authoritative_progress)
     }
 
     /// 最近活跃进度（首页 Continue 数据源）。

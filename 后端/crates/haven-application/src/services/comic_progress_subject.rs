@@ -233,8 +233,57 @@ fn invalid_subject(message: String) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    #[tokio::test]
-    async fn existing_comic_progress_is_backfilled_without_copying_progress_fields() {
-        let _ = super::ComicProgressSubjectService::new;
+    use super::*;
+    use haven_domain::comic_identity::ChapterEvidence;
+    use haven_domain::comic_progress_subject::ComicProgressSubjectRelationship;
+    use haven_domain::enums::CompletionState;
+    use haven_domain::ids::{EditionId, ProgressId, WorkId};
+    use haven_domain::locator::{ComicLocator, Locator};
+
+    #[test]
+    fn comic_progress_subject_backfill_resolution_retains_the_existing_progress_entity() {
+        let work_id = WorkId::new();
+        let edition_id = EditionId::new();
+        let media_item_id = MediaItemId::new();
+        let mut subject = ComicProgressSubject::new(
+            work_id,
+            edition_id,
+            media_item_id,
+            haven_common::UtcMillis(1),
+        );
+        let mut member = ComicProgressSubjectMember::active(
+            subject.id,
+            media_item_id,
+            vec![ChapterEvidence::SameRemoteIdentity],
+        );
+        member.relationship = ComicProgressSubjectRelationship::Canonical;
+        subject.attach_member(member.clone()).unwrap();
+        let progress = Progress {
+            id: ProgressId::new(),
+            work_id,
+            edition_id,
+            media_item_id,
+            locator: Locator::Comic(ComicLocator {
+                chapter_item_id: media_item_id,
+                page_index: 7,
+                page_progression: Some(0.7),
+            }),
+            completion: CompletionState::InProgress,
+            percentage: Some(0.7),
+            last_active_at: haven_common::UtcMillis(3),
+            updated_at: haven_common::UtcMillis(4),
+            revision: Some("existing-revision".to_owned()),
+            keyframe_uri: Some("data:image/png;base64,existing".to_owned()),
+        };
+        let resolution = ComicProgressSubjectResolution {
+            subject,
+            member,
+            authoritative_progress: Some(progress.clone()),
+        };
+        assert_eq!(resolution.authoritative_progress, Some(progress));
+        assert_eq!(
+            resolution.subject.authoritative_progress_media_item_id,
+            Some(media_item_id)
+        );
     }
 }
