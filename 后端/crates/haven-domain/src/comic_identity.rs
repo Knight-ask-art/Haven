@@ -265,6 +265,9 @@ fn compare_identity_facet(
         (IdentityFacet::NotApplicable, IdentityFacet::NotApplicable) => {
             evidence.push(EditionEvidence::Exact(facet));
         }
+        (IdentityFacet::Unknown, IdentityFacet::Unknown) => {
+            evidence.push(EditionEvidence::Unknown(facet));
+        }
         _ => {
             *has_unknown = true;
             evidence.push(EditionEvidence::Unknown(facet));
@@ -297,6 +300,9 @@ fn compare_scan_group(
         (ScanGroupFacet::NotApplicable, ScanGroupFacet::NotApplicable) => {
             evidence.push(EditionEvidence::Exact(EditionFacetKind::ScanGroup));
         }
+        (ScanGroupFacet::Unknown, ScanGroupFacet::Unknown) => {
+            evidence.push(EditionEvidence::Unknown(EditionFacetKind::ScanGroup));
+        }
         _ => {
             *has_unknown = true;
             evidence.push(EditionEvidence::Unknown(EditionFacetKind::ScanGroup));
@@ -312,6 +318,9 @@ fn compare_color_mode(
     has_unknown: &mut bool,
 ) {
     match (left, right) {
+        (ColorMode::Unknown, ColorMode::Unknown) => {
+            evidence.push(EditionEvidence::Unknown(EditionFacetKind::ColorMode));
+        }
         (ColorMode::Unknown, _) | (_, ColorMode::Unknown) => {
             *has_unknown = true;
             evidence.push(EditionEvidence::Unknown(EditionFacetKind::ColorMode));
