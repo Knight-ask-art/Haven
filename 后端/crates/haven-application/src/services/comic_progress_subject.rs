@@ -12,7 +12,9 @@ use haven_domain::entities::Progress;
 use haven_domain::enums::MediaType;
 use haven_domain::ids::MediaItemId;
 
-use crate::services::ports::{ComicProgressSubjectWritePlan, UnitOfWork};
+use crate::services::ports::{
+    ComicProgressSubjectWritePlan, ComicProgressSubjectWritePrecondition, UnitOfWork,
+};
 
 pub trait ComicProgressSubjectPorts:
     ComicProgressSubjectRepository
@@ -114,7 +116,7 @@ impl ComicProgressSubjectService {
                 );
                 member.relationship = haven_domain::comic_progress_subject::ComicProgressSubjectRelationship::Canonical;
                 let members = vec![member];
-                self.unit_of_work.run_comic_progress_subject_write(
+                let create = self.unit_of_work.run_checked_comic_progress_subject_write(
                     &ComicProgressSubjectWritePlan {
                         subject: subject.clone(),
                         members: members.clone(),
@@ -123,8 +125,32 @@ impl ComicProgressSubjectService {
                         migration_snapshot: None,
                         refresh_receipt: None,
                     },
-                )?;
-                (subject, members)
+                    &ComicProgressSubjectWritePrecondition::AbsentActiveMember { media_item_id },
+                );
+                match create {
+                    Ok(_) => (subject, members),
+                    Err(error) if error.code().as_str() == "COMIC_PROGRESS_SUBJECT_CONFLICT" => {
+                        let winner = ComicProgressSubjectRepository::get_for_media_item(
+                            &*self.ports,
+                            media_item_id,
+                        )
+                        .await?;
+                        let Some(winner) = winner else {
+                            return Err(error);
+                        };
+                        let winner_subject =
+                            ComicProgressSubjectRepository::get(&*self.ports, winner.subject_id)
+                                .await?
+                                .ok_or_else(subject_not_found)?;
+                        let winner_members = ComicProgressSubjectRepository::list_members(
+                            &*self.ports,
+                            winner.subject_id,
+                        )
+                        .await?;
+                        (winner_subject, winner_members)
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         };
 
@@ -149,8 +175,9 @@ impl ComicProgressSubjectService {
             // existing Progress rows (including revision/history/markers) are
             // never copied, overwritten, or deleted here.
             if let Some(progress) = selected.as_ref() {
+                let expected_subject = subject.clone();
                 subject.authoritative_progress_media_item_id = Some(progress.media_item_id);
-                self.unit_of_work.run_comic_progress_subject_write(
+                let update = self.unit_of_work.run_checked_comic_progress_subject_write(
                     &ComicProgressSubjectWritePlan {
                         subject: subject.clone(),
                         members: members.clone(),
@@ -159,7 +186,21 @@ impl ComicProgressSubjectService {
                         migration_snapshot: None,
                         refresh_receipt: None,
                     },
-                )?;
+                    &ComicProgressSubjectWritePrecondition::ExactSnapshot {
+                        subject: expected_subject,
+                        members: members.clone(),
+                        require_authoritative_progress_none: true,
+                    },
+                );
+                if let Err(error) = update {
+                    if error.code().as_str() == "COMIC_PROGRESS_SUBJECT_CONFLICT" {
+                        // The checked write did not mutate anything. Re-read
+                        // the winner instead of exposing a stale-snapshot
+                        // conflict or retrying the destructive old plan.
+                        return Box::pin(self.ensure_for_media_item(media_item_id)).await;
+                    }
+                    return Err(error);
+                }
             }
             selected
         };

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use rusqlite::Transaction;
 
-use haven_common::AppError;
+use haven_common::{AppError, ErrorKind};
 use haven_domain::comic_identity::{
     ComicProgressMigrationSnapshot, ProgressMigrationMode, ProgressMigrationState,
 };
@@ -22,8 +22,8 @@ use haven_domain::locator::{ComicLocator, Locator};
 use crate::db::Db;
 use haven_application::services::ports::{
     ComicChapterRefreshPlan, ComicPageIdentityWriteCandidate, ComicProgressSubjectWritePlan,
-    ComicProgressSubjectWriteResult, ComicProgressWriteCandidate, FavoriteState, FavoriteTxPorts,
-    UnitOfWork,
+    ComicProgressSubjectWritePrecondition, ComicProgressSubjectWriteResult,
+    ComicProgressWriteCandidate, FavoriteState, FavoriteTxPorts, UnitOfWork,
 };
 
 /// R-MAIN-09D：purge 中间表唯一内部名（明确 temp schema；DROP 用同一定义，避免散落字符串）。
@@ -228,11 +228,30 @@ impl UnitOfWork for SqliteUnitOfWork {
         let tx = guard
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| tx_err("开启漫画进度主体 Immediate 事务失败", e))?;
-        let result = apply_comic_progress_subject_write(&tx, plan);
+        let result = apply_comic_progress_subject_write(&tx, plan, None);
         match result {
             Ok(result) => tx
                 .commit()
                 .map_err(|e| tx_err("提交漫画进度主体事务失败", e))
+                .map(|()| result),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn run_checked_comic_progress_subject_write(
+        &self,
+        plan: &ComicProgressSubjectWritePlan,
+        precondition: &ComicProgressSubjectWritePrecondition,
+    ) -> Result<ComicProgressSubjectWriteResult, AppError> {
+        let mut guard = self.db.lock();
+        let tx = guard
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| tx_err("开启受检漫画进度主体 Immediate 事务失败", e))?;
+        let result = apply_comic_progress_subject_write(&tx, plan, Some(precondition));
+        match result {
+            Ok(result) => tx
+                .commit()
+                .map_err(|e| tx_err("提交受检漫画进度主体事务失败", e))
                 .map(|()| result),
             Err(error) => Err(error),
         }
@@ -242,7 +261,11 @@ impl UnitOfWork for SqliteUnitOfWork {
 fn apply_comic_progress_subject_write(
     tx: &rusqlite::Transaction<'_>,
     plan: &ComicProgressSubjectWritePlan,
+    precondition: Option<&ComicProgressSubjectWritePrecondition>,
 ) -> Result<ComicProgressSubjectWriteResult, AppError> {
+    if let Some(precondition) = precondition {
+        validate_subject_write_precondition(tx, precondition)?;
+    }
     let mut subject = plan.subject.clone();
     subject
         .load_members(plan.members.clone())
@@ -285,6 +308,49 @@ fn apply_comic_progress_subject_write(
         migration_id: plan.migration_snapshot.as_ref().map(|snapshot| snapshot.id),
         refresh_id: plan.refresh_receipt.as_ref().map(|receipt| receipt.id),
     })
+}
+
+fn validate_subject_write_precondition(
+    tx: &rusqlite::Transaction<'_>,
+    precondition: &ComicProgressSubjectWritePrecondition,
+) -> Result<(), AppError> {
+    match precondition {
+        ComicProgressSubjectWritePrecondition::AbsentActiveMember { media_item_id } => {
+            let exists: i64 = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM comic_progress_subject_members WHERE media_item_id = ?1 AND state = 'active')",
+                rusqlite::params![media_item_id.to_string()], |row| row.get(0),
+            ).map_err(|e| tx_err("检查漫画进度主体创建前置条件失败", e))?;
+            if exists != 0 {
+                return Err(subject_conflict());
+            }
+        }
+        ComicProgressSubjectWritePrecondition::ExactSnapshot {
+            subject,
+            members,
+            require_authoritative_progress_none,
+        } => {
+            let current = crate::db::repos::comic_progress_subjects::load_subject(tx, subject.id)
+                .map_err(|e| e)?
+                .ok_or_else(subject_conflict)?;
+            if current != *subject
+                || current.members() != members.as_slice()
+                || (*require_authoritative_progress_none
+                    && current.authoritative_progress_media_item_id.is_some())
+            {
+                return Err(subject_conflict());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn subject_conflict() -> AppError {
+    AppError::new(
+        "COMIC_PROGRESS_SUBJECT_CONFLICT",
+        ErrorKind::Conflict,
+        "漫画进度主体已被并发更新，请重新读取",
+        false,
+    )
 }
 
 fn validate_comic_subject_plan(

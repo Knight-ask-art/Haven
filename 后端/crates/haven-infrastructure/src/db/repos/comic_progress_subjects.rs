@@ -95,7 +95,20 @@ impl ComicProgressSubjectRepository for SqliteComicProgressSubjectRepository {
 
     async fn save_member(&self, member: &ComicProgressSubjectMember) -> Result<(), AppError> {
         let member = member.clone();
-        self.db.with_tx(|tx| save_member_on_conn(tx, &member))
+        self.db.with_tx(|tx| {
+            let Some(subject) = load_subject(tx, member.subject_id)? else {
+                return Err(invalid_subject("漫画进度主体不存在"));
+            };
+            let mut members = load_members(tx, &member.subject_id.to_string())?;
+            if let Some(existing) = members.iter_mut().find(|existing| {
+                existing.media_item_id == member.media_item_id && existing.state == member.state
+            }) {
+                *existing = member;
+            } else {
+                members.push(member);
+            }
+            save_on_conn(tx, &subject, &members)
+        })
     }
 }
 
@@ -287,7 +300,7 @@ pub(crate) fn save_member_on_conn(
     Ok(())
 }
 
-fn load_subject(
+pub(crate) fn load_subject(
     conn: &rusqlite::Connection,
     id: ComicProgressSubjectId,
 ) -> Result<Option<ComicProgressSubject>, AppError> {
@@ -367,7 +380,7 @@ fn load_subject(
     Ok(Some(subject))
 }
 
-fn load_members(
+pub(crate) fn load_members(
     conn: &rusqlite::Connection,
     subject_id: &str,
 ) -> Result<Vec<ComicProgressSubjectMember>, AppError> {

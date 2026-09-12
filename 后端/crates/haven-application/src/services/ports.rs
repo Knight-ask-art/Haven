@@ -239,6 +239,20 @@ pub trait UnitOfWork: Send + Sync {
             false,
         ))
     }
+
+    /// 与既有 Subject 聚合快照进行 Immediate-transaction CAS 的受检写入。
+    fn run_checked_comic_progress_subject_write(
+        &self,
+        _plan: &ComicProgressSubjectWritePlan,
+        _precondition: &ComicProgressSubjectWritePrecondition,
+    ) -> Result<ComicProgressSubjectWriteResult, AppError> {
+        Err(AppError::new(
+            "COMIC_PROGRESS_SUBJECT_UOW_UNAVAILABLE",
+            haven_common::ErrorKind::Internal,
+            "当前 UnitOfWork 不支持受检漫画进度主体事务",
+            false,
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -262,6 +276,20 @@ pub struct ComicProgressSubjectWritePlan {
     pub progress_writes: Vec<ComicProgressWriteCandidate>,
     pub migration_snapshot: Option<ComicProgressMigrationSnapshot>,
     pub refresh_receipt: Option<ComicCatalogRefreshReceipt>,
+}
+
+/// 受检 Subject 写入的事务内前置条件。不能在 Application 的异步读取点判断后
+/// 再相信旧快照；SQLite UoW 必须在同一 Immediate 事务内重新读取并比较。
+#[derive(Debug, Clone)]
+pub enum ComicProgressSubjectWritePrecondition {
+    AbsentActiveMember {
+        media_item_id: MediaItemId,
+    },
+    ExactSnapshot {
+        subject: ComicProgressSubject,
+        members: Vec<ComicProgressSubjectMember>,
+        require_authoritative_progress_none: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
