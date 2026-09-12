@@ -10,6 +10,7 @@ use std::sync::Arc;
 use rusqlite::Transaction;
 
 use haven_common::{AppError, ErrorKind};
+use haven_domain::comic_catalog::ComicCatalogRefreshReceipt;
 use haven_domain::comic_identity::{
     ComicProgressMigrationSnapshot, ProgressMigrationMode, ProgressMigrationState,
 };
@@ -122,7 +123,15 @@ impl UnitOfWork for SqliteUnitOfWork {
         let total = plan.state.total.map(i64::from);
         let truncated = i64::from(plan.state.truncated);
 
-        self.db.with_tx(|tx| {
+        // The catalog plan has already completed all provider I/O.  Take the
+        // write reservation before reading generation so two physical SQLite
+        // connections cannot both retain the same deferred snapshot and make
+        // the loser fail with BUSY_SNAPSHOT before the CAS check runs.
+        let mut guard = self.db.lock();
+        let tx = guard
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| tx_err("开启漫画章节刷新 Immediate 事务失败", e))?;
+        let result = (|| {
             let current_generation: Option<i64> = match tx.query_row(
                 "SELECT generation FROM comic_chapter_catalog_states
                  WHERE source_key = ?1 AND remote_work_id = ?2",
@@ -137,27 +146,30 @@ impl UnitOfWork for SqliteUnitOfWork {
                 return Err(comic_catalog_generation_conflict());
             }
 
-            validate_comic_refresh_plan(tx, plan)?;
-            crate::db::repos::work::save_on_conn(tx, &plan.work)?;
+            validate_comic_refresh_plan(&tx, plan)?;
+            if let Some(receipt) = &plan.refresh_receipt {
+                validate_comic_refresh_receipt(plan, receipt)?;
+            }
+            crate::db::repos::work::save_on_conn(&tx, &plan.work)?;
             crate::db::repos::work::save_source_ref_on_conn(
-                tx,
+                &tx,
                 &plan.source_key,
                 &plan.remote_work_id,
                 plan.work.id,
             )?;
             for edition in &plan.editions {
-                crate::db::repos::edition::save_on_conn(tx, &edition.edition)?;
+                crate::db::repos::edition::save_on_conn(&tx, &edition.edition)?;
                 crate::db::repos::edition_profiles::save_on_conn(
-                    tx,
+                    &tx,
                     edition.edition.id,
                     &edition.profile,
                 )?;
             }
             for item in &plan.items {
-                crate::db::repos::media_item::save_on_conn(tx, item)?;
+                crate::db::repos::media_item::save_on_conn(&tx, item)?;
             }
             for resource in &plan.resources {
-                crate::db::repos::resource::save_on_conn(tx, resource)?;
+                crate::db::repos::resource::save_on_conn(&tx, resource)?;
             }
             for reference in &plan.chapter_refs {
                 if reference.identity.source_key != plan.source_key
@@ -170,7 +182,7 @@ impl UnitOfWork for SqliteUnitOfWork {
                         false,
                     ));
                 }
-                crate::db::repos::comic_identity::save_on_conn(tx, reference)?;
+                crate::db::repos::comic_identity::save_on_conn(&tx, reference)?;
             }
 
             match current_generation {
@@ -216,8 +228,17 @@ impl UnitOfWork for SqliteUnitOfWork {
                     .map_err(|error| tx_err("创建漫画章节目录刷新状态失败", error))?;
                 }
             }
+            if let Some(receipt) = &plan.refresh_receipt {
+                crate::db::repos::comic_catalog_refresh_outcomes::save_on_conn(&tx, receipt)?;
+            }
             Ok(())
-        })
+        })();
+        match result {
+            Ok(()) => tx
+                .commit()
+                .map_err(|e| tx_err("提交漫画章节刷新事务失败", e)),
+            Err(error) => Err(error),
+        }
     }
 
     fn run_comic_progress_subject_write(
@@ -938,6 +959,32 @@ fn validate_comic_refresh_plan(
         {
             return Err(invalid_comic_refresh_plan("章节来源引用不属于当前 Work"));
         }
+    }
+    Ok(())
+}
+
+fn validate_comic_refresh_receipt(
+    plan: &ComicChapterRefreshPlan,
+    receipt: &ComicCatalogRefreshReceipt,
+) -> Result<(), AppError> {
+    if receipt.work_id != plan.work.id
+        || receipt.source_key != plan.source_key
+        || receipt.remote_work_id != plan.remote_work_id
+        || receipt.generation_before != plan.expected_generation
+        || receipt.generation_after != Some(plan.state.generation)
+    {
+        return Err(invalid_comic_refresh_plan(
+            "刷新 Receipt 与目录刷新计划不一致",
+        ));
+    }
+    if matches!(
+        receipt.status,
+        haven_domain::comic_catalog::ComicCatalogRefreshOutcomeStatus::NeverSynced
+            | haven_domain::comic_catalog::ComicCatalogRefreshOutcomeStatus::RefreshFailed
+    ) {
+        return Err(invalid_comic_refresh_plan(
+            "目录刷新事务只能提交成功或有界成功 Receipt",
+        ));
     }
     Ok(())
 }
@@ -3049,7 +3096,7 @@ mod tests {
             identity: ChapterSourceIdentity::new(
                 source_key.clone(),
                 remote_work_id.clone(),
-                remote_chapter_id,
+                remote_chapter_id.clone(),
             )
             .unwrap(),
             metadata: ComicChapterMetadata {
@@ -3066,6 +3113,21 @@ mod tests {
             source_updated_at: Some("2026-01-03T00:00:00Z".into()),
             last_seen_generation: Some(next_generation),
             updated_at: now,
+        };
+        let refresh_receipt = ComicCatalogRefreshReceipt {
+            id: haven_domain::ids::ComicCatalogRefreshId::new(),
+            work_id,
+            source_key: source_key.clone(),
+            remote_work_id: remote_work_id.clone(),
+            status: haven_domain::comic_catalog::ComicCatalogRefreshOutcomeStatus::Succeeded,
+            generation_before: expected_generation,
+            generation_after: Some(next_generation),
+            observed_from: Some(remote_chapter_id.to_owned()),
+            observed_to: Some(remote_chapter_id.to_owned()),
+            truncated: false,
+            retained_previous_catalog: false,
+            error_code: None,
+            observed_at: now,
         };
         let plan = haven_application::services::ports::ComicChapterRefreshPlan {
             source_key,
@@ -3087,6 +3149,7 @@ mod tests {
             items: vec![item],
             resources: vec![resource],
             chapter_refs: vec![reference],
+            refresh_receipt: Some(refresh_receipt),
         };
         (plan, edition_id, media_item_id, resource_id)
     }
@@ -3180,6 +3243,15 @@ mod tests {
         assert_eq!(count_rows(&db, "resources"), 1);
         assert_eq!(count_rows(&db, "comic_chapter_source_refs"), 1);
         assert_eq!(count_rows(&db, "comic_chapter_catalog_states"), 1);
+        assert_eq!(count_rows(&db, "comic_catalog_refresh_outcomes"), 1);
+        let receipt = plan.refresh_receipt.as_ref().unwrap();
+        let persisted_receipt = repos
+            .catalog_refresh_outcomes
+            .get(receipt.id)
+            .await
+            .unwrap()
+            .expect("successful catalog refresh must persist its Receipt");
+        assert_eq!(&persisted_receipt, receipt);
     }
 
     #[test]
@@ -3201,6 +3273,7 @@ mod tests {
             "resources",
             "comic_chapter_source_refs",
             "comic_chapter_catalog_states",
+            "comic_catalog_refresh_outcomes",
         ] {
             assert_eq!(count_rows(&db, table), 0, "无效计划不得写入 {table}");
         }
@@ -3233,6 +3306,7 @@ mod tests {
             "media_items",
             "resources",
             "comic_chapter_source_refs",
+            "comic_catalog_refresh_outcomes",
         ] {
             assert_eq!(count_rows(&db, table), 0, "generation 冲突不得写入 {table}");
         }
@@ -3278,8 +3352,99 @@ mod tests {
             "resources",
             "comic_chapter_source_refs",
             "comic_chapter_catalog_states",
+            "comic_catalog_refresh_outcomes",
         ] {
             assert_eq!(count_rows(&db, table), 0, "资源失败不得留下 {table}");
+        }
+    }
+
+    #[test]
+    fn comic_refresh_receipt_failure_rolls_back_every_preceding_write() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (plan, _, _, _) = comic_refresh_plan(0);
+        db.lock()
+            .execute_batch(
+                "CREATE TRIGGER fail_comic_refresh_receipt_insert
+                 BEFORE INSERT ON comic_catalog_refresh_outcomes
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected comic refresh receipt failure');
+                 END;",
+            )
+            .unwrap();
+
+        let err = SqliteUnitOfWork::new(db.clone())
+            .run_comic_chapter_refresh(&plan)
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "DATABASE_ERROR");
+        for table in [
+            "works",
+            "work_source_refs",
+            "editions",
+            "edition_profiles",
+            "media_items",
+            "resources",
+            "comic_chapter_source_refs",
+            "comic_chapter_catalog_states",
+            "comic_catalog_refresh_outcomes",
+        ] {
+            assert_eq!(count_rows(&db, table), 0, "Receipt 失败不得留下 {table}");
+        }
+    }
+
+    /// A real two-connection race must serialize at the transaction boundary:
+    /// one refresh commits and the stale plan gets a deterministic generation
+    /// conflict, without leaking any of the losing plan's rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn comic_refresh_generation_cas_is_stable_across_two_db_connections() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("comic-refresh-race.db");
+        let first_db = Arc::new(Db::open(&path).unwrap());
+        let second_db = Arc::new(Db::open(&path).unwrap());
+        let (first_plan, _, _, _) = comic_refresh_plan(0);
+        let (second_plan, _, _, _) = comic_refresh_plan(0);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let first_barrier = barrier.clone();
+        let first_task = tokio::task::spawn_blocking(move || {
+            first_barrier.wait();
+            SqliteUnitOfWork::new(first_db).run_comic_chapter_refresh(&first_plan)
+        });
+        let second_barrier = barrier;
+        let second_task = tokio::task::spawn_blocking(move || {
+            second_barrier.wait();
+            SqliteUnitOfWork::new(second_db).run_comic_chapter_refresh(&second_plan)
+        });
+
+        let (first_result, second_result) = tokio::join!(first_task, second_task);
+        let results = [first_result.unwrap(), second_result.unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let conflict_count = results
+            .iter()
+            .filter(|result| {
+                result.as_ref().err().is_some_and(|error| {
+                    error.code().as_str() == "COMIC_CATALOG_GENERATION_CONFLICT"
+                })
+            })
+            .count();
+        assert_eq!(conflict_count, 1);
+
+        let check_db = Arc::new(Db::open(&path).unwrap());
+        for table in [
+            "works",
+            "work_source_refs",
+            "editions",
+            "edition_profiles",
+            "media_items",
+            "resources",
+            "comic_chapter_source_refs",
+            "comic_chapter_catalog_states",
+            "comic_catalog_refresh_outcomes",
+        ] {
+            assert_eq!(
+                count_rows(&check_db, table),
+                1,
+                "竞争胜者应只留下一个 {table}"
+            );
         }
     }
 }

@@ -618,6 +618,7 @@ pub fn aggregate_comic_work_chapters(
             bucket.edition_id,
             refresh_status,
             current_media_item_id,
+            &refresh_receipts,
         ));
         blocks.push((start, chapters.len()));
     }
@@ -655,6 +656,7 @@ fn aggregate_edition_chapters(
     edition_id: EditionId,
     refresh_status: ComicWorkCatalogStatus,
     current_media_item_id: Option<MediaItemId>,
+    refresh_receipts: &[ComicCatalogRefreshReceipt],
 ) -> Vec<ComicWorkChapter> {
     let mut raw: Vec<RawChapter> = observations
         .into_iter()
@@ -672,6 +674,7 @@ fn aggregate_edition_chapters(
                 edition_id,
                 refresh_status,
                 current_media_item_id,
+                refresh_receipts,
             )
         })
         .collect();
@@ -891,6 +894,7 @@ fn build_merged_chapter(
     edition_id: EditionId,
     refresh_status: ComicWorkCatalogStatus,
     current_media_item_id: Option<MediaItemId>,
+    refresh_receipts: &[ComicCatalogRefreshReceipt],
 ) -> ComicWorkChapter {
     let mut ordered: Vec<&RawChapter> = members.iter().map(|index| &raw[*index]).collect();
     ordered.sort_by_key(|chapter| chapter.media_item.id);
@@ -952,7 +956,8 @@ fn build_merged_chapter(
                 .then(|| representative.media_item.title.clone())
         });
 
-    let (status, can_open) = chapter_aggregate_status(&sources, &resource_facts, refresh_status);
+    let (status, can_open) =
+        chapter_aggregate_status(&sources, &resource_facts, refresh_status, refresh_receipts);
     let sort_key = ComicChapterOrderKey {
         volume_number,
         chapter_number,
@@ -1012,6 +1017,7 @@ fn chapter_aggregate_status(
     sources: &[ComicChapterAggregateSource],
     resource_facts: &[ComicResourceAvailabilityFact],
     refresh_status: ComicWorkCatalogStatus,
+    refresh_receipts: &[ComicCatalogRefreshReceipt],
 ) -> (ComicChapterAggregateStatus, bool) {
     if has_local_readable_resource(resource_facts) {
         return (ComicChapterAggregateStatus::Available, true);
@@ -1031,14 +1037,50 @@ fn chapter_aggregate_status(
         return (ComicChapterAggregateStatus::TemporarilyUnavailable, false);
     }
     // 刷新失败或被截断时不得把章节解释成 Missing：覆盖度不足只能停在 Unknown。
-    if matches!(
-        refresh_status,
-        ComicWorkCatalogStatus::NeverSynced | ComicWorkCatalogStatus::Synced
-    ) && all(ComicChapterSourceStatus::Missing)
+    if all(ComicChapterSourceStatus::Missing)
+        && sources
+            .iter()
+            .all(|source| source_missing_is_confirmed(source, refresh_status, refresh_receipts))
     {
         return (ComicChapterAggregateStatus::Missing, false);
     }
     (ComicChapterAggregateStatus::Unknown, false)
+}
+
+/// A Work-level failure must not invalidate a complete observation made by a
+/// different source.  Match Missing eligibility to the source/work identity
+/// that produced the chapter instead of using the aggregate Work status as a
+/// global gate.  Empty receipt input retains the legacy state-only fallback
+/// used by readers assembled without the optional Receipt repository.
+fn source_missing_is_confirmed(
+    source: &ComicChapterAggregateSource,
+    refresh_status: ComicWorkCatalogStatus,
+    refresh_receipts: &[ComicCatalogRefreshReceipt],
+) -> bool {
+    let identity = &source.reference.identity;
+    let latest_receipt = refresh_receipts
+        .iter()
+        .filter(|receipt| {
+            receipt.source_key == identity.source_key
+                && receipt.remote_work_id == identity.remote_work_id
+        })
+        .max_by_key(|receipt| (receipt.observed_at, receipt.id));
+
+    match latest_receipt {
+        Some(receipt) => {
+            !receipt.truncated
+                && !matches!(
+                    receipt.status,
+                    ComicCatalogRefreshOutcomeStatus::NeverSynced
+                        | ComicCatalogRefreshOutcomeStatus::RefreshFailed
+                        | ComicCatalogRefreshOutcomeStatus::Truncated
+                )
+        }
+        None => matches!(
+            refresh_status,
+            ComicWorkCatalogStatus::NeverSynced | ComicWorkCatalogStatus::Synced
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1296,6 +1338,30 @@ mod tests {
             truncated: matches!(refresh_status, ComicWorkCatalogStatus::Truncated),
             refresh_receipts: Vec::new(),
         })
+    }
+
+    fn refresh_receipt(
+        work_id: WorkId,
+        remote_work_id: &str,
+        status: ComicCatalogRefreshOutcomeStatus,
+        observed_at: i64,
+    ) -> ComicCatalogRefreshReceipt {
+        ComicCatalogRefreshReceipt {
+            id: ComicCatalogRefreshId::new(),
+            work_id,
+            source_key: "mangadex".to_owned(),
+            remote_work_id: remote_work_id.to_owned(),
+            status,
+            generation_before: 1,
+            generation_after: Some(2),
+            observed_from: None,
+            observed_to: None,
+            truncated: status == ComicCatalogRefreshOutcomeStatus::Truncated,
+            retained_previous_catalog: status == ComicCatalogRefreshOutcomeStatus::RefreshFailed,
+            error_code: (status == ComicCatalogRefreshOutcomeStatus::RefreshFailed)
+                .then(|| "SOURCE_RATE_LIMITED".to_owned()),
+            observed_at: UtcMillis(observed_at),
+        }
     }
 
     // ---- Work 级聚合测试 -----------------------------------------------------
@@ -2180,6 +2246,91 @@ mod tests {
             assert!(!catalog.chapters[0].can_open);
             assert_eq!(catalog.refresh_status, refresh_status);
         }
+    }
+
+    #[test]
+    fn comic_work_catalog_missing_is_scoped_to_each_source_receipt() {
+        let work_id = WorkId::new();
+        let edition = EditionId::new();
+        let profile = EditionProfile::default();
+        let successful_source_item = MediaItemId::new();
+        let failed_source_item = MediaItemId::new();
+
+        let successful_source = aggregate_source(
+            successful_source_item,
+            "chapter-a",
+            0,
+            ComicChapterSourceStatus::Missing,
+            profile.clone(),
+        );
+        let mut failed_source = aggregate_source(
+            failed_source_item,
+            "chapter-b",
+            1,
+            ComicChapterSourceStatus::Missing,
+            profile.clone(),
+        );
+        failed_source.reference.identity.remote_work_id = "manga-2".to_owned();
+
+        let catalog = aggregate_comic_work_chapters(ComicWorkChapterAggregateInput {
+            work_id,
+            observations: vec![
+                observation(
+                    edition,
+                    work_media_item(edition, successful_source_item, Some(1.0)),
+                    profile.clone(),
+                    vec![successful_source],
+                ),
+                observation(
+                    edition,
+                    work_media_item(edition, failed_source_item, Some(2.0)),
+                    profile,
+                    vec![failed_source],
+                ),
+            ],
+            current_media_item_id: None,
+            refresh_status: ComicWorkCatalogStatus::RefreshFailed,
+            last_observed_at: Some(UtcMillis(200)),
+            truncated: false,
+            refresh_receipts: vec![
+                refresh_receipt(
+                    work_id,
+                    "manga-1",
+                    ComicCatalogRefreshOutcomeStatus::Succeeded,
+                    100,
+                ),
+                refresh_receipt(
+                    work_id,
+                    "manga-2",
+                    ComicCatalogRefreshOutcomeStatus::RefreshFailed,
+                    200,
+                ),
+            ],
+        });
+
+        let successful = catalog
+            .chapters
+            .iter()
+            .find(|chapter| {
+                chapter
+                    .sources
+                    .iter()
+                    .any(|source| source.identity.remote_work_id == "manga-1")
+            })
+            .expect("successful source chapter should remain in the catalog");
+        assert_eq!(successful.status, ComicChapterAggregateStatus::Missing);
+
+        let failed = catalog
+            .chapters
+            .iter()
+            .find(|chapter| {
+                chapter
+                    .sources
+                    .iter()
+                    .any(|source| source.identity.remote_work_id == "manga-2")
+            })
+            .expect("failed source chapter should remain in the catalog");
+        assert_eq!(failed.status, ComicChapterAggregateStatus::Unknown);
     }
 
     #[test]

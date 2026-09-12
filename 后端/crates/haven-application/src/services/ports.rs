@@ -128,6 +128,7 @@ pub trait SourceImportPorts:
     + MediaItemRepository
     + ResourceRepository
     + ChapterSourceRepository
+    + ComicCatalogRefreshOutcomeRepository
     + haven_domain::contracts::ImageProxyRepository
     + Send
     + Sync
@@ -167,6 +168,7 @@ impl<T> SourceImportPorts for T where
         + MediaItemRepository
         + ResourceRepository
         + ChapterSourceRepository
+        + ComicCatalogRefreshOutcomeRepository
         + haven_domain::contracts::ImageProxyRepository
         + Send
         + Sync
@@ -404,6 +406,10 @@ pub struct ComicChapterRefreshPlan {
     pub items: Vec<MediaItem>,
     pub resources: Vec<Resource>,
     pub chapter_refs: Vec<ChapterSourceRef>,
+    /// Successful refreshes append this receipt in the same SQLite
+    /// transaction as the catalog rows. Failed observations are persisted by
+    /// the application after the catalog transaction has rolled back.
+    pub refresh_receipt: Option<ComicCatalogRefreshReceipt>,
 }
 
 /// Enrichment 流水线所需端口（契约 §36.8）。

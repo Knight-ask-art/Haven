@@ -218,6 +218,24 @@ impl haven_domain::contracts::WorkRepository for SqliteRepositories {
 }
 
 #[async_trait::async_trait]
+impl haven_domain::contracts::ComicCatalogRefreshOutcomeRepository for SqliteRepositories {
+    async fn save(
+        &self,
+        receipt: &haven_domain::comic_catalog::ComicCatalogRefreshReceipt,
+    ) -> Result<(), haven_common::AppError> {
+        self.catalog_refresh_outcomes.save(receipt).await
+    }
+
+    async fn list_by_work(
+        &self,
+        work_id: haven_domain::ids::WorkId,
+    ) -> Result<Vec<haven_domain::comic_catalog::ComicCatalogRefreshReceipt>, haven_common::AppError>
+    {
+        self.catalog_refresh_outcomes.list_by_work(work_id).await
+    }
+}
+
+#[async_trait::async_trait]
 impl haven_domain::contracts::EditionRepository for SqliteRepositories {
     async fn get(
         &self,

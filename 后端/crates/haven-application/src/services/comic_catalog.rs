@@ -34,7 +34,7 @@ use haven_domain::enums::MediaType;
 use haven_domain::ids::{EditionId, MediaItemId, WorkId};
 
 use super::ports::{ComicCatalogRefreshReceiptPort, ComicCatalogWorkPorts};
-use super::source_import::SourceImportService;
+use super::source_import::{SourceImportService, is_recordable_comic_refresh_failure};
 use crate::wire::{
     ComicChapterAvailabilityDto, ComicChapterCatalogDto, ComicChapterCatalogGetRequest,
     ComicChapterCatalogItemDto, ComicChapterCatalogRefreshStateDto, ComicChapterSourceStatusDto,
@@ -50,6 +50,16 @@ use crate::wire::{
 pub struct ComicWorkChapterCatalogRequest {
     pub work_id: Option<WorkId>,
     pub media_item_id: Option<MediaItemId>,
+}
+
+/// Work 级漫画目录刷新结果。
+///
+/// `receipts` 是本次刷新完成后每个来源作品的最新观察；历史 Receipt 仍由
+/// 存储保留，但不会重复返回或参与状态推导。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComicWorkChapterCatalogRefreshResult {
+    pub catalog: ComicWorkChapterCatalog,
+    pub receipts: Vec<ComicCatalogRefreshReceipt>,
 }
 
 #[derive(Clone)]
@@ -272,6 +282,82 @@ impl ComicCatalogService {
             .comic_chapter_catalog(&request.source_id, &request.remote_work_id)
             .await?;
         Ok(catalog_to_dto(&catalog))
+    }
+
+    /// Refresh every MangaDex source attached to a Work independently.
+    ///
+    /// Each provider request and each source transaction is isolated from the
+    /// others. A remote-source observation failure is represented by its
+    /// source's RefreshFailed receipt and does not erase another source's
+    /// valid catalog. Internal, validation, security and database failures
+    /// remain fatal instead of being disguised as a source outage.
+    pub async fn work_catalog_refresh(
+        &self,
+        work_id: WorkId,
+    ) -> Result<ComicWorkChapterCatalogRefreshResult, AppError> {
+        let ports = self
+            .work_ports
+            .as_ref()
+            .ok_or_else(work_catalog_ports_unavailable)?;
+        if WorkRepository::get(ports.as_work(), work_id)
+            .await?
+            .is_none()
+        {
+            return Err(comic_not_found("COMIC_WORK_NOT_FOUND", "漫画作品不存在"));
+        }
+        let source_refs = WorkRepository::list_source_refs(ports.as_work(), work_id).await?;
+        validate_work_scope(work_id, &source_refs, &[])?;
+
+        for source_ref in source_refs
+            .iter()
+            .filter(|source_ref| source_ref.provider == "mangadex")
+        {
+            if let Err(error) = self
+                .source_import
+                .refresh_comic_chapter_catalog_for_work(
+                    work_id,
+                    &source_ref.provider,
+                    &source_ref.external_id,
+                )
+                .await
+            {
+                if error.code().as_str() == "COMIC_CATALOG_GENERATION_CONFLICT" {
+                    // Another refresh committed a newer directory for this
+                    // source. This is a retry/concurrency outcome, not a
+                    // provider outage; do not append a failure Receipt that
+                    // would mask the concurrent success.
+                    continue;
+                }
+                if !is_recordable_comic_refresh_failure(&error)
+                    || error.code().as_str() == "COMIC_REFRESH_RECEIPT_PERSIST_FAILED"
+                {
+                    return Err(error);
+                }
+                // The source service has already appended a RefreshFailed
+                // receipt for provider failures. Continue so another source
+                // can still publish its successful directory.
+            }
+        }
+
+        let mut catalog = self
+            .work_catalog_get(ComicWorkChapterCatalogRequest {
+                work_id: Some(work_id),
+                media_item_id: None,
+            })
+            .await?;
+        let receipts = self
+            .source_import
+            .comic_catalog_refresh_receipts(work_id)
+            .await?;
+        let summary = summarize_comic_work_refresh(&receipts);
+        catalog.refresh_status = summary.status;
+        catalog.last_observed_at = summary.last_observed_at;
+        catalog.truncated = summary.truncated;
+        catalog.refresh_receipts = summary.latest_receipts.clone();
+        Ok(ComicWorkChapterCatalogRefreshResult {
+            catalog,
+            receipts: summary.latest_receipts,
+        })
     }
 
     /// 读取 SQLite 中已经登记的章节，不访问 Provider，也不隐式刷新目录。

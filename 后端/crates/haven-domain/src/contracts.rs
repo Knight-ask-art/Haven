@@ -274,6 +274,20 @@ pub trait ComicProgressMigrationRepository: Send + Sync {
 /// 契约的组装层保持空 receipts，聚合根回落到 `NeverSynced`。
 #[async_trait]
 pub trait ComicCatalogRefreshOutcomeRepository: Send + Sync {
+    /// Append one refresh observation.
+    ///
+    /// The default keeps read-only test doubles and older assembly layers
+    /// source-compatible. A refresh use case must treat the default error as a
+    /// real persistence failure instead of reporting a successful refresh.
+    async fn save(&self, _receipt: &ComicCatalogRefreshReceipt) -> Result<(), AppError> {
+        Err(AppError::new(
+            "COMIC_REFRESH_RECEIPT_UNAVAILABLE",
+            ErrorKind::Unsupported,
+            "当前存储实现不支持保存漫画目录刷新结果",
+            false,
+        ))
+    }
+
     async fn list_by_work(
         &self,
         work_id: WorkId,

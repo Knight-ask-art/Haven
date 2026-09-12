@@ -9,6 +9,7 @@ use rusqlite::OptionalExtension;
 
 use haven_common::{AppError, ErrorKind};
 use haven_domain::comic_catalog::ComicCatalogRefreshReceipt;
+use haven_domain::contracts::ComicCatalogRefreshOutcomeRepository;
 use haven_domain::ids::{ComicCatalogRefreshId, WorkId};
 
 use crate::db::Db;
@@ -59,6 +60,20 @@ impl SqliteComicCatalogRefreshOutcomeRepository {
             .map(|id| load_on_conn(&conn, id))
             .collect::<Result<Vec<_>, _>>()
             .map(|receipts| receipts.into_iter().flatten().collect())
+    }
+}
+
+#[async_trait::async_trait]
+impl ComicCatalogRefreshOutcomeRepository for SqliteComicCatalogRefreshOutcomeRepository {
+    async fn save(&self, receipt: &ComicCatalogRefreshReceipt) -> Result<(), AppError> {
+        Self::save(self, receipt).await
+    }
+
+    async fn list_by_work(
+        &self,
+        work_id: WorkId,
+    ) -> Result<Vec<ComicCatalogRefreshReceipt>, AppError> {
+        Self::list_by_work(self, work_id).await
     }
 }
 
