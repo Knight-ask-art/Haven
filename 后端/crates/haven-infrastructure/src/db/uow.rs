@@ -329,8 +329,9 @@ fn validate_subject_write_precondition(
             members,
             require_authoritative_progress_none,
         } => {
-            let current = crate::db::repos::comic_progress_subjects::load_subject(tx, subject.id)
-                .map_err(|e| e)?
+            // 必须在同一个 Immediate 事务内重新读取整个聚合（含全部成员），
+            // 而不是相信 Application 在事务外读到的快照。
+            let current = crate::db::repos::comic_progress_subjects::load_subject(tx, subject.id)?
                 .ok_or_else(subject_conflict)?;
             if current != *subject
                 || current.members() != members.as_slice()

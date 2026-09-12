@@ -95,21 +95,43 @@ impl ComicProgressSubjectRepository for SqliteComicProgressSubjectRepository {
 
     async fn save_member(&self, member: &ComicProgressSubjectMember) -> Result<(), AppError> {
         let member = member.clone();
-        self.db.with_tx(|tx| {
-            let Some(subject) = load_subject(tx, member.subject_id)? else {
-                return Err(invalid_subject("漫画进度主体不存在"));
-            };
-            let mut members = load_members(tx, &member.subject_id.to_string())?;
-            if let Some(existing) = members.iter_mut().find(|existing| {
-                existing.media_item_id == member.media_item_id && existing.state == member.state
-            }) {
-                *existing = member;
-            } else {
-                members.push(member);
-            }
-            save_on_conn(tx, &subject, &members)
-        })
+        // BEGIN IMMEDIATE：先取写锁再读整个聚合。Deferred 事务会先按旧快照读
+        // Subject/成员，等到写阶段才发现并发变更；这里把"读 Subject + 全部成员 →
+        // 合并待写成员 → 完整校验 → 替换写入"放进同一个 Immediate 事务，校验
+        // 失败整笔回滚，不留下部分写入，旧聚合保持可读。
+        let mut guard = self.db.lock();
+        let tx = guard
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(map_db_error("开启漫画进度主体成员 Immediate 事务失败"))?;
+        match save_member_in_immediate_tx(&tx, &member) {
+            Ok(()) => tx
+                .commit()
+                .map_err(map_db_error("提交漫画进度主体成员事务失败")),
+            Err(error) => Err(error),
+        }
     }
+}
+
+/// 在调用方给定的连接上原子合并一个成员：连接必须已处于 Immediate 事务。
+///
+/// 聚合必须整体重写（`save_on_conn` 会先 DELETE 再插入全部成员），因此写入前
+/// 先加载 Subject 与现有全部成员，再按 `(subject_id, media_item_id, state)`
+/// 合并待写行，最后交给 `save_on_conn` 做完整校验与写入。
+fn save_member_in_immediate_tx(
+    conn: &rusqlite::Connection,
+    member: &ComicProgressSubjectMember,
+) -> Result<(), AppError> {
+    let Some(subject) = load_subject(conn, member.subject_id)? else {
+        return Err(invalid_subject("漫画进度主体不存在"));
+    };
+    let mut members = load_members(conn, &member.subject_id.to_string())?;
+    match members.iter_mut().find(|existing| {
+        existing.media_item_id == member.media_item_id && existing.state == member.state
+    }) {
+        Some(existing) => *existing = member.clone(),
+        None => members.push(member.clone()),
+    }
+    save_on_conn(conn, &subject, &members)
 }
 
 pub(crate) fn save_on_conn(
@@ -496,22 +518,31 @@ fn invalid_subject(message: impl Into<String>) -> AppError {
 mod tests {
     use super::*;
     use crate::db::repos::SqliteRepositories;
+    use crate::db::uow::SqliteUnitOfWork;
+    use haven_application::services::ports::{
+        ComicProgressSubjectWritePlan, ComicProgressSubjectWritePrecondition,
+        ComicProgressSubjectWriteResult, FavoriteTxPorts, UnitOfWork,
+    };
+    use haven_application::services::progress::comic_progress_subject::ComicProgressSubjectService;
     use haven_domain::comic_identity::ChapterEvidence;
     use haven_domain::comic_progress_subject::{
         ComicProgressSubject, ComicProgressSubjectMember, ComicProgressSubjectRelationship,
+        ComicProgressSubjectState,
     };
     use haven_domain::contracts::{
         ComicProgressSubjectRepository, EditionRepository, HistoryRepository, MarkerRepository,
         MediaItemRepository, ProgressRepository, WorkRepository,
     };
     use haven_domain::entities::{
-        Edition, HistoryEntry, Marker, MediaIndex, MediaItem, Progress, Work,
+        Edition, HistoryEntry, Marker, MediaIndex, MediaItem, Progress, Resource, Work,
     };
     use haven_domain::enums::{
         CompletionState, MarkerType, MediaItemStatus, MediaType, WorkStatus, WorkType,
     };
     use haven_domain::ids::{HistoryEntryId, MarkerId, ProgressId};
     use haven_domain::locator::{ComicLocator, Locator};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn seed(db: &Db) -> (WorkId, EditionId, MediaItemId) {
         let work_id = WorkId::new();
@@ -639,6 +670,72 @@ mod tests {
             updated_at: UtcMillis(at),
             revision: None,
             keyframe_uri: Some("data:image/png;base64,fixture".to_owned()),
+        }
+    }
+
+    /// 在既有 Edition 下追加一个 Comic MediaItem（CAS / 多成员测试复用）。
+    async fn add_comic_media_item(
+        repos: &SqliteRepositories,
+        edition_id: EditionId,
+        chapter: f32,
+    ) -> MediaItemId {
+        let media_item_id = MediaItemId::new();
+        MediaItemRepository::save(
+            repos,
+            &MediaItem {
+                id: media_item_id,
+                edition_id,
+                parent_id: None,
+                media_type: MediaType::Comic,
+                title: format!("第 {chapter} 话"),
+                index: MediaIndex::Chapter {
+                    volume: None,
+                    chapter,
+                },
+                duration_ms: None,
+                page_count: Some(10),
+                chapter_count: None,
+                published_at: None,
+                status: MediaItemStatus::Available,
+                created_at: UtcMillis(1),
+                updated_at: UtcMillis(1),
+            },
+        )
+        .await
+        .unwrap();
+        media_item_id
+    }
+
+    /// 构造一条合法 active 成员（relationship 非 candidate、confidence=high、
+    /// 证据支持高置信度），`at` 同时作为 created_at/updated_at 保证读取顺序确定。
+    fn active_subject_member(
+        subject_id: ComicProgressSubjectId,
+        media_item_id: MediaItemId,
+        relationship: ComicProgressSubjectRelationship,
+        at: i64,
+    ) -> ComicProgressSubjectMember {
+        let mut member = ComicProgressSubjectMember::active(
+            subject_id,
+            media_item_id,
+            vec![ChapterEvidence::SameRemoteIdentity],
+        );
+        member.relationship = relationship;
+        member.created_at = UtcMillis(at);
+        member.updated_at = UtcMillis(at);
+        member
+    }
+
+    fn subject_write_plan(
+        subject: ComicProgressSubject,
+        members: Vec<ComicProgressSubjectMember>,
+    ) -> haven_application::services::ports::ComicProgressSubjectWritePlan {
+        haven_application::services::ports::ComicProgressSubjectWritePlan {
+            subject,
+            members,
+            page_identity_write: None,
+            progress_writes: vec![],
+            migration_snapshot: None,
+            refresh_receipt: None,
         }
     }
 
@@ -1388,6 +1485,203 @@ mod tests {
         assert_ne!(work_a, work_b);
     }
 
+    /// `save_member` 必须在同一 Immediate 事务里加载 Subject + 全部成员、合并
+    /// 待写成员、整体校验并写入。跨 Work 成员在 `ensure_subject_hierarchy` 被
+    /// 拒绝：整笔回滚，原 Subject 仍可读，且不留下任何成员行。
+    #[tokio::test]
+    async fn comic_progress_subject_save_member_rejects_cross_work_member_without_partial_write() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (work_a, edition_a, media_a) = seed(&db);
+        let (work_b, _, media_b) = seed(&db);
+        let repos = Arc::new(SqliteRepositories::new(db.clone()));
+        let repo = SqliteComicProgressSubjectRepository::new(db.clone());
+        let mut subject = ComicProgressSubject::new(work_a, edition_a, media_a, UtcMillis(1));
+        subject.authoritative_progress_media_item_id = None;
+        repo.save(&subject).await.unwrap();
+
+        let error = repo
+            .save_member(&active_subject_member(
+                subject.id,
+                media_b,
+                ComicProgressSubjectRelationship::Equivalent,
+                1,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert_ne!(work_a, work_b);
+        assert_eq!(
+            repo.get(subject.id).await.unwrap().unwrap(),
+            subject,
+            "校验失败后旧聚合必须仍可读且未被改写"
+        );
+        assert!(
+            ComicProgressSubjectRepository::list_members(&*repos, subject.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "校验失败不得留下部分成员写入"
+        );
+    }
+
+    /// 同 Work/Edition 但非 Comic 的 MediaItem 成员同样必须被拒绝且无部分写入。
+    #[tokio::test]
+    async fn comic_progress_subject_save_member_rejects_non_comic_member_without_partial_write() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (work, edition, media) = seed(&db);
+        let repos = Arc::new(SqliteRepositories::new(db.clone()));
+        let movie_media_item_id = MediaItemId::new();
+        MediaItemRepository::save(
+            &*repos,
+            &MediaItem {
+                id: movie_media_item_id,
+                edition_id: edition,
+                parent_id: None,
+                media_type: MediaType::Movie,
+                title: "正片".to_owned(),
+                index: MediaIndex::Movie,
+                duration_ms: Some(1_000),
+                page_count: None,
+                chapter_count: None,
+                published_at: None,
+                status: MediaItemStatus::Available,
+                created_at: UtcMillis(1),
+                updated_at: UtcMillis(1),
+            },
+        )
+        .await
+        .unwrap();
+        let repo = SqliteComicProgressSubjectRepository::new(db.clone());
+        let mut subject = ComicProgressSubject::new(work, edition, media, UtcMillis(1));
+        subject.authoritative_progress_media_item_id = None;
+        repo.save(&subject).await.unwrap();
+
+        let error = repo
+            .save_member(&active_subject_member(
+                subject.id,
+                movie_media_item_id,
+                ComicProgressSubjectRelationship::Equivalent,
+                1,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+        assert_eq!(repo.get(subject.id).await.unwrap().unwrap(), subject);
+        assert!(
+            ComicProgressSubjectRepository::list_members(&*repos, subject.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Redirected Subject 不接受 active 成员：成员写入必须在写入前被拒绝，
+    /// Subject 保持 redirected 且成员表保持为空。
+    #[tokio::test]
+    async fn comic_progress_subject_save_member_rejects_redirected_subject_active_member() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (work, edition, media) = seed(&db);
+        let repos = Arc::new(SqliteRepositories::new(db.clone()));
+        let repo = SqliteComicProgressSubjectRepository::new(db.clone());
+        let target = ComicProgressSubject::new(work, edition, media, UtcMillis(1));
+        repo.save(&target).await.unwrap();
+        let redirected_id = ComicProgressSubjectId::new();
+        db.lock()
+            .execute(
+                "INSERT INTO comic_progress_subjects
+                    (id, work_id, edition_id, canonical_media_item_id,
+                     authoritative_progress_media_item_id, state, created_at, updated_at,
+                     algorithm_version, redirect_subject_id)
+                 VALUES (?1, ?2, ?3, ?4, ?4, 'redirected', 1, 1,
+                         'comic-progress-subject-v1', ?5)",
+                rusqlite::params![
+                    redirected_id.to_string(),
+                    work.to_string(),
+                    edition.to_string(),
+                    media.to_string(),
+                    target.id.to_string()
+                ],
+            )
+            .unwrap();
+
+        let error = repo
+            .save_member(&active_subject_member(
+                redirected_id,
+                media,
+                ComicProgressSubjectRelationship::Equivalent,
+                1,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Validation);
+
+        let restored = repo
+            .get(redirected_id)
+            .await
+            .unwrap()
+            .expect("被拒绝的成员写入不得破坏既有 Subject");
+        assert_eq!(restored.state, ComicProgressSubjectState::Redirected);
+        assert_eq!(restored.redirect_subject_id, Some(target.id));
+        assert!(restored.members().is_empty());
+        assert!(
+            ComicProgressSubjectRepository::list_members(&*repos, redirected_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// 同一 `(subject_id, media_item_id, state)` 的重复 `save_member` 是 upsert：
+    /// 覆盖该行而不是新增，成员行数保持 1，且改动确实落库。
+    #[tokio::test]
+    async fn comic_progress_subject_save_member_upserts_same_subject_media_state() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (work, edition, media) = seed(&db);
+        let repos = Arc::new(SqliteRepositories::new(db.clone()));
+        let repo = SqliteComicProgressSubjectRepository::new(db.clone());
+        let mut subject = ComicProgressSubject::new(work, edition, media, UtcMillis(1));
+        subject.authoritative_progress_media_item_id = None;
+        repo.save(&subject).await.unwrap();
+
+        let mut member = active_subject_member(
+            subject.id,
+            media,
+            ComicProgressSubjectRelationship::Canonical,
+            1,
+        );
+        repo.save_member(&member).await.unwrap();
+        assert_eq!(count_rows(&db, "comic_progress_subject_members"), 1);
+        let first_member = member.clone();
+        let after_first_insert = repo.get(subject.id).await.unwrap().unwrap();
+        assert_eq!(
+            after_first_insert.members(),
+            std::slice::from_ref(&first_member)
+        );
+
+        member.evidence = vec![ChapterEvidence::AuthoritativeContentKey];
+        member.updated_at = UtcMillis(5);
+        repo.save_member(&member).await.unwrap();
+
+        assert_eq!(
+            count_rows(&db, "comic_progress_subject_members"),
+            1,
+            "同 subject/media/state 的重复写入必须是 upsert"
+        );
+        let members = ComicProgressSubjectRepository::list_members(&*repos, subject.id)
+            .await
+            .unwrap();
+        assert_eq!(members, vec![member.clone()]);
+        assert_eq!(
+            members[0].evidence,
+            vec![ChapterEvidence::AuthoritativeContentKey]
+        );
+        assert_eq!(members[0].updated_at, UtcMillis(5));
+        assert_eq!(
+            repo.get(subject.id).await.unwrap().unwrap().members(),
+            std::slice::from_ref(&member)
+        );
+    }
+
     #[tokio::test]
     async fn comic_progress_subjects_reject_unsafe_evidence_boundary() {
         let db = Arc::new(Db::open_in_memory().unwrap());
@@ -1622,6 +1916,490 @@ mod tests {
             )
             .unwrap();
         assert_eq!(revision, "work-b-revision");
+    }
+
+    /// ExactSnapshot CAS：受检写入必须与**同一 Immediate 事务内重新读取**的
+    /// Subject/全部成员比较。这里先落库两个 active 成员并取旧快照，再并发提交
+    /// 新 pointer / 新 member，最后用旧快照调用受检写入：
+    /// - 必须返回 COMIC_PROGRESS_SUBJECT_CONFLICT；
+    /// - 并发写入的 pointer 与新成员必须仍然存在——即冲突发生在
+    ///   `save_on_conn` 的 DELETE members **之前**（否则旧计划的 2 条成员会
+    ///   覆盖掉并发写入的第 3 条）。
+    #[tokio::test]
+    async fn comic_progress_subject_checked_write_rejects_stale_snapshot_before_destructive_delete()
+    {
+        use crate::db::uow::SqliteUnitOfWork;
+        use haven_application::services::ports::{
+            ComicProgressSubjectWritePrecondition, UnitOfWork,
+        };
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repos = Arc::new(SqliteRepositories::new(db.clone()));
+        let first_media_item_id = MediaItemId::new();
+        let (work_id, edition_id) =
+            seed_real_comic_content(&repos, "CAS 漫画", first_media_item_id).await;
+        let second_media_item_id = add_comic_media_item(&repos, edition_id, 2.0).await;
+        let third_media_item_id = add_comic_media_item(&repos, edition_id, 3.0).await;
+
+        let mut subject =
+            ComicProgressSubject::new(work_id, edition_id, first_media_item_id, UtcMillis(1));
+        subject.authoritative_progress_media_item_id = None;
+        let first_member = active_subject_member(
+            subject.id,
+            first_media_item_id,
+            ComicProgressSubjectRelationship::Canonical,
+            1,
+        );
+        let second_member = active_subject_member(
+            subject.id,
+            second_media_item_id,
+            ComicProgressSubjectRelationship::Equivalent,
+            2,
+        );
+        let unit_of_work = SqliteUnitOfWork::new(db.clone());
+        unit_of_work
+            .run_comic_progress_subject_write(&subject_write_plan(
+                subject.clone(),
+                vec![first_member.clone(), second_member.clone()],
+            ))
+            .unwrap();
+        assert_eq!(count_rows(&db, "comic_progress_subject_members"), 2);
+
+        // 旧快照：并发写入之前读到的 Subject + 全部成员（pointer 仍为 None）。
+        let stale_subject = ComicProgressSubjectRepository::get(&*repos, subject.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let stale_members = ComicProgressSubjectRepository::list_members(&*repos, subject.id)
+            .await
+            .unwrap();
+        assert_eq!(stale_subject.authoritative_progress_media_item_id, None);
+        assert_eq!(
+            stale_members,
+            vec![first_member.clone(), second_member.clone()]
+        );
+
+        // 并发 winner 1：另一处写入把权威 pointer 指向第二个 active 成员。
+        let mut pointer_subject = stale_subject.clone();
+        pointer_subject.authoritative_progress_media_item_id = Some(second_media_item_id);
+        pointer_subject.updated_at = UtcMillis(2);
+        unit_of_work
+            .run_comic_progress_subject_write(&subject_write_plan(
+                pointer_subject.clone(),
+                stale_members.clone(),
+            ))
+            .unwrap();
+
+        // 用旧快照（pointer=None）做受检写入：必须冲突且不得破坏并发 pointer。
+        let mut stale_plan_subject = stale_subject.clone();
+        stale_plan_subject.authoritative_progress_media_item_id = Some(first_media_item_id);
+        let error = unit_of_work
+            .run_checked_comic_progress_subject_write(
+                &subject_write_plan(stale_plan_subject.clone(), stale_members.clone()),
+                &ComicProgressSubjectWritePrecondition::ExactSnapshot {
+                    subject: stale_subject.clone(),
+                    members: stale_members.clone(),
+                    require_authoritative_progress_none: true,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), "COMIC_PROGRESS_SUBJECT_CONFLICT");
+        assert_eq!(error.kind(), ErrorKind::Conflict);
+        assert_eq!(
+            ComicProgressSubjectRepository::get(&*repos, subject.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            pointer_subject,
+            "并发提交的 pointer 必须在冲突后原样保留"
+        );
+
+        // 并发 winner 2：另一处写入新增第三个 active 成员。
+        let third_member = active_subject_member(
+            subject.id,
+            third_media_item_id,
+            ComicProgressSubjectRelationship::Equivalent,
+            3,
+        );
+        let mut grown_members = stale_members.clone();
+        grown_members.push(third_member.clone());
+        let mut grown_subject = pointer_subject.clone();
+        grown_subject.updated_at = UtcMillis(3);
+        grown_subject.load_members(grown_members.clone()).unwrap();
+        unit_of_work
+            .run_comic_progress_subject_write(&subject_write_plan(
+                grown_subject.clone(),
+                grown_members.clone(),
+            ))
+            .unwrap();
+        assert_eq!(count_rows(&db, "comic_progress_subject_members"), 3);
+
+        // 旧成员快照（2 条）再次受检写入：冲突必须发生在 DELETE members 之前，
+        // 否则第 3 个成员会被旧计划的 2 条成员覆盖删除。
+        let error = unit_of_work
+            .run_checked_comic_progress_subject_write(
+                &subject_write_plan(stale_plan_subject, stale_members.clone()),
+                &ComicProgressSubjectWritePrecondition::ExactSnapshot {
+                    subject: stale_subject,
+                    members: stale_members,
+                    require_authoritative_progress_none: false,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), "COMIC_PROGRESS_SUBJECT_CONFLICT");
+        assert_eq!(count_rows(&db, "comic_progress_subject_members"), 3);
+        assert_eq!(
+            ComicProgressSubjectRepository::list_members(&*repos, subject.id)
+                .await
+                .unwrap(),
+            grown_members,
+            "并发新增的成员必须在冲突后仍可读"
+        );
+        assert_eq!(
+            ComicProgressSubjectRepository::get(&*repos, subject.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            grown_subject
+        );
+    }
+
+    // ---- 真实 Immediate 事务上的并发竞争 ---------------------------------------
+
+    /// 为 fixture MediaItem 保存一条 Comic Progress，返回持久化 revision。
+    async fn seed_comic_progress(
+        repos: &SqliteRepositories,
+        work_id: WorkId,
+        edition_id: EditionId,
+        media_item_id: MediaItemId,
+        at: i64,
+    ) -> String {
+        ProgressRepository::save_if_revision(
+            repos,
+            &comic_progress(work_id, edition_id, media_item_id, at),
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("fixture Progress 必须取得 revision")
+    }
+
+    /// 受检写入的哪一类前置条件需要被"插队"。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RaceTrigger {
+        /// 首次创建：`AbsentActiveMember`。
+        FirstCreate,
+        /// 权威 pointer 回填：`ExactSnapshot` + pointer-none。
+        PointerBackfill,
+    }
+
+    fn is_first_create(precondition: &ComicProgressSubjectWritePrecondition) -> bool {
+        matches!(
+            precondition,
+            ComicProgressSubjectWritePrecondition::AbsentActiveMember { .. }
+        )
+    }
+
+    fn is_pointer_backfill(precondition: &ComicProgressSubjectWritePrecondition) -> bool {
+        matches!(
+            precondition,
+            ComicProgressSubjectWritePrecondition::ExactSnapshot {
+                require_authoritative_progress_none: true,
+                ..
+            }
+        )
+    }
+
+    /// 只在测试中使用的确定性竞争注入器。
+    ///
+    /// 它在真实 `SqliteUnitOfWork` 外面包一层：在第一次命中 `trigger` 的受检写入
+    /// **之前**，先用真实 Immediate 事务提交一份并发 winner 计划，再原样转发
+    /// Application 的旧计划。于是该次受检写入会在自己的事务内读到 winner 并返回
+    /// `COMIC_PROGRESS_SUBJECT_CONFLICT`——这是"读取快照"与"写事务"之间被真实并发
+    /// 插队的确定性等价物：被拒绝的旧计划确实走到了生产代码的 Immediate 事务与
+    /// 事务内前置条件判定，winner 也确实由真实 `save_on_conn` 落库。
+    struct RaceUow {
+        inner: Arc<SqliteUnitOfWork>,
+        trigger: RaceTrigger,
+        winner: Mutex<Option<ComicProgressSubjectWritePlan>>,
+        conflicts_injected: AtomicUsize,
+    }
+
+    impl RaceUow {
+        fn injecting_once(
+            inner: Arc<SqliteUnitOfWork>,
+            trigger: RaceTrigger,
+            winner: ComicProgressSubjectWritePlan,
+        ) -> Self {
+            Self {
+                inner,
+                trigger,
+                winner: Mutex::new(Some(winner)),
+                conflicts_injected: AtomicUsize::new(0),
+            }
+        }
+
+        fn conflicts_injected(&self) -> usize {
+            self.conflicts_injected.load(Ordering::SeqCst)
+        }
+
+        fn should_inject(&self, precondition: &ComicProgressSubjectWritePrecondition) -> bool {
+            match self.trigger {
+                RaceTrigger::FirstCreate => is_first_create(precondition),
+                RaceTrigger::PointerBackfill => is_pointer_backfill(precondition),
+            }
+        }
+    }
+
+    impl UnitOfWork for RaceUow {
+        fn run_favorite(
+            &self,
+            f: &dyn Fn(&dyn FavoriteTxPorts) -> Result<(), AppError>,
+        ) -> Result<(), AppError> {
+            self.inner.run_favorite(f)
+        }
+
+        fn run_source_import(
+            &self,
+            provider: &str,
+            external_id: &str,
+            work: &Work,
+            edition: &Edition,
+            items: &[MediaItem],
+            resources: &[Resource],
+        ) -> Result<(), AppError> {
+            self.inner
+                .run_source_import(provider, external_id, work, edition, items, resources)
+        }
+
+        fn run_comic_progress_subject_write(
+            &self,
+            plan: &ComicProgressSubjectWritePlan,
+        ) -> Result<ComicProgressSubjectWriteResult, AppError> {
+            self.inner.run_comic_progress_subject_write(plan)
+        }
+
+        fn run_checked_comic_progress_subject_write(
+            &self,
+            plan: &ComicProgressSubjectWritePlan,
+            precondition: &ComicProgressSubjectWritePrecondition,
+        ) -> Result<ComicProgressSubjectWriteResult, AppError> {
+            if self.should_inject(precondition) {
+                if let Some(winner) = self.winner.lock().unwrap().take() {
+                    self.inner
+                        .run_comic_progress_subject_write(&winner)
+                        .expect("并发 winner 必须能在真实 SQLite 上提交");
+                    self.conflicts_injected.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            self.inner
+                .run_checked_comic_progress_subject_write(plan, precondition)
+        }
+    }
+
+    /// pointer 回填遇到一次事务内冲突后，必须在有界预算内重新读取并采用并发
+    /// winner，而不是重放旧计划或无限自递归。
+    ///
+    /// 竞争只对第一次 `ExactSnapshot`（pointer-none）受检写入注入；注入本身走真实
+    /// `SqliteUnitOfWork` 的 Immediate 事务，被拒绝的旧计划也由真实 SQLite 事务内的
+    /// 前置条件判定。winner 选择的 pointer 与本次回填按 `last_active_at` 会选出的
+    /// 成员**不同**，所以落库结果能区分"重算"与"重放旧计划"。
+    #[tokio::test]
+    async fn comic_progress_subject_backfill_pointer_conflict_rereads_winner_within_budget() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repos = Arc::new(SqliteRepositories::new(db.clone()));
+        let first_media = MediaItemId::new();
+        let (work, edition) = seed_real_comic_content(&repos, "cas", first_media).await;
+        let second_media = add_comic_media_item(&repos, edition, 2.0).await;
+        // 第二个成员有更新的 last_active_at：若重放旧计划，pointer 会指向它。
+        seed_comic_progress(&repos, work, edition, first_media, 100).await;
+        seed_comic_progress(&repos, work, edition, second_media, 200).await;
+
+        // 已存在但缺少权威 pointer 的 Subject（两个 active 成员）。
+        let mut subject = ComicProgressSubject::new(work, edition, first_media, UtcMillis(1));
+        subject.authoritative_progress_media_item_id = None;
+        let members = vec![
+            active_subject_member(
+                subject.id,
+                first_media,
+                ComicProgressSubjectRelationship::Canonical,
+                1,
+            ),
+            active_subject_member(
+                subject.id,
+                second_media,
+                ComicProgressSubjectRelationship::Equivalent,
+                2,
+            ),
+        ];
+        let uow = Arc::new(SqliteUnitOfWork::new(db.clone()));
+        uow.run_comic_progress_subject_write(&subject_write_plan(subject.clone(), members.clone()))
+            .unwrap();
+        assert_eq!(
+            ComicProgressSubjectRepository::get(&*repos, subject.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .authoritative_progress_media_item_id,
+            None
+        );
+
+        // 并发 winner：另一个 reader 已经把 pointer 指向**较旧**的第一个成员，
+        // 与旧计划按 `last_active_at` 会选出的第二个成员不同。
+        let mut winner = subject.clone();
+        winner.authoritative_progress_media_item_id = Some(first_media);
+        winner.updated_at = UtcMillis(2);
+        winner.load_members(members.clone()).unwrap();
+
+        let race = Arc::new(RaceUow::injecting_once(
+            uow,
+            RaceTrigger::PointerBackfill,
+            subject_write_plan(winner.clone(), members.clone()),
+        ));
+        let service = ComicProgressSubjectService::new(repos.clone(), race.clone());
+
+        let resolution = service
+            .ensure_for_media_item(first_media)
+            .await
+            .expect("pointer 冲突后必须在有界预算内重新解析成功");
+
+        assert_eq!(race.conflicts_injected(), 1);
+        assert_eq!(resolution.subject, winner);
+        assert_eq!(
+            resolution.subject.authoritative_progress_media_item_id,
+            Some(first_media),
+            "必须采用并发 winner 的 pointer，而不是重放旧计划按 last_active_at 选出的较新成员"
+        );
+        assert_eq!(
+            resolution
+                .authoritative_progress
+                .as_ref()
+                .unwrap()
+                .media_item_id,
+            first_media,
+            "目标自身已有 Progress 时必须保留目标视角"
+        );
+        let stored = ComicProgressSubjectRepository::get(&*repos, subject.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, winner);
+        assert_eq!(stored.members(), members.as_slice());
+    }
+
+    /// 首次创建的确定性竞争：第二个 service 的创建计划在真实 Immediate 事务内发现
+    /// 同一 MediaItem 已有 active 成员，必须重读 winner 并成功返回。
+    ///
+    /// 注入器在 `AbsentActiveMember` 受检写入之前先提交一份 winner 创建（不同的
+    /// Subject ID、同一 canonical MediaItem），再转发旧计划；
+    /// `validate_subject_write_precondition` 在同一事务内看到已提交的 active 成员
+    /// → `COMIC_PROGRESS_SUBJECT_CONFLICT` → `ensure_for_media_item` 重新读取
+    /// `get_for_media_item`/`get`/`list_members` 并返回 winner，全程只写入一次。
+    #[tokio::test]
+    async fn comic_progress_subject_backfill_first_create_conflict_recovers_winner() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repos = Arc::new(SqliteRepositories::new(db.clone()));
+        let media = MediaItemId::new();
+        let (work, edition) = seed_real_comic_content(&repos, "race", media).await;
+
+        // winner：另一个 service 先提交的 Subject（未开始阅读 → 无 pointer）。
+        let mut winner = ComicProgressSubject::new(work, edition, media, UtcMillis(1));
+        winner.authoritative_progress_media_item_id = None;
+        let member = active_subject_member(
+            winner.id,
+            media,
+            ComicProgressSubjectRelationship::Canonical,
+            1,
+        );
+        winner.load_members(vec![member.clone()]).unwrap();
+
+        let uow = Arc::new(SqliteUnitOfWork::new(db.clone()));
+        let race = Arc::new(RaceUow::injecting_once(
+            uow.clone(),
+            RaceTrigger::FirstCreate,
+            subject_write_plan(winner.clone(), vec![member.clone()]),
+        ));
+        let racing = ComicProgressSubjectService::new(repos.clone(), race.clone());
+        let sequential = ComicProgressSubjectService::new(repos.clone(), uow);
+
+        let raced = racing
+            .ensure_for_media_item(media)
+            .await
+            .expect("创建冲突后必须恢复 winner 并成功返回");
+        let repeated = sequential
+            .ensure_for_media_item(media)
+            .await
+            .expect("winner 已存在时必须继续成功读取");
+
+        assert_eq!(race.conflicts_injected(), 1);
+        assert_eq!(raced.subject.id, winner.id);
+        assert_eq!(repeated.subject.id, winner.id);
+        assert_eq!(raced.member, member);
+        assert_eq!(raced.authoritative_progress, None);
+        assert_eq!(
+            count_rows(&db, "comic_progress_subjects"),
+            1,
+            "竞争创建只允许留下一个 Subject"
+        );
+        assert_eq!(
+            count_rows(&db, "comic_progress_subject_members"),
+            1,
+            "竞争创建只允许留下一个 active 成员"
+        );
+        let owner = ComicProgressSubjectRepository::get_for_media_item(&*repos, media)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner.subject_id, winner.id);
+    }
+
+    /// 真实并发：两个 `Db` 连接（同一临时库文件）上的两个 service 同时读取同一
+    /// Comic，两个调用都必须成功，且最终只有一个 Subject、一个 active 成员。
+    ///
+    /// 两个连接都会先读到"没有成员"再各自 `BEGIN IMMEDIATE`：后到的事务在
+    /// busy_timeout 内等待先到者提交，然后在自己的事务内看到已提交成员并返回
+    /// `COMIC_PROGRESS_SUBJECT_CONFLICT`，service 据此重读 winner。即使调度让两次
+    /// 调用完全串行完成，不变量也必须成立。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn comic_progress_subject_backfill_concurrent_first_reads_keep_one_subject_and_member() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("comic-subject-race.db");
+        let first_db = Arc::new(Db::open(&path).unwrap());
+        let second_db = Arc::new(Db::open(&path).unwrap());
+        let first_repos = Arc::new(SqliteRepositories::new(first_db.clone()));
+        let media = MediaItemId::new();
+        seed_real_comic_content(&first_repos, "shared", media).await;
+
+        let first_service = ComicProgressSubjectService::new(
+            first_repos.clone(),
+            Arc::new(SqliteUnitOfWork::new(first_db.clone())),
+        );
+        let second_service = ComicProgressSubjectService::new(
+            Arc::new(SqliteRepositories::new(second_db.clone())),
+            Arc::new(SqliteUnitOfWork::new(second_db.clone())),
+        );
+
+        let spawned_first = {
+            let service = first_service.clone();
+            tokio::spawn(async move { service.ensure_for_media_item(media).await })
+        };
+        let spawned_second = {
+            let service = second_service.clone();
+            tokio::spawn(async move { service.ensure_for_media_item(media).await })
+        };
+        let first = spawned_first.await.unwrap().unwrap();
+        let second = spawned_second.await.unwrap().unwrap();
+
+        assert_eq!(first.subject.id, second.subject.id);
+        assert_eq!(first.authoritative_progress, None);
+        assert_eq!(second.authoritative_progress, None);
+        assert_eq!(count_rows(&first_db, "comic_progress_subjects"), 1);
+        assert_eq!(count_rows(&first_db, "comic_progress_subject_members"), 1);
+        let owner = ComicProgressSubjectRepository::get_for_media_item(&*first_repos, media)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner.subject_id, first.subject.id);
     }
 
     fn count_rows(db: &Db, table: &str) -> i64 {
