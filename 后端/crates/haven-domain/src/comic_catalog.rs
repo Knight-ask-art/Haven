@@ -11,7 +11,7 @@
 //! 排序辅助值，不是 Wire 字段承诺。
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -367,6 +367,8 @@ pub struct ComicWorkChapterCatalog {
     pub refresh_status: ComicWorkCatalogStatus,
     pub last_observed_at: Option<UtcMillis>,
     pub truncated: bool,
+    /// 每个来源作品的最新 Receipt（见 [`latest_receipts_by_source`]）；历史
+    /// Receipt 仍留在存储中，但既不回放也不参与状态推导。
     pub refresh_receipts: Vec<ComicCatalogRefreshReceipt>,
 }
 
@@ -447,20 +449,76 @@ pub struct ComicWorkChapterAggregateInput {
     pub refresh_receipts: Vec<ComicCatalogRefreshReceipt>,
 }
 
-/// 由刷新 Receipt 推导聚合根状态：失败优先于截断，截断优先于成功。
+/// Work 级刷新 Receipt 的聚合摘要。
+///
+/// `latest_receipts` 是每个来源作品（`source_key` + `remote_work_id`）的最新一条
+/// Receipt；`status`/`truncated`/`last_observed_at` 全部只用这份最新观察推导，
+/// 因此历史旧失败或旧截断不会永久遮蔽该来源后来的成功。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComicWorkRefreshSummary {
+    pub status: ComicWorkCatalogStatus,
+    pub last_observed_at: Option<UtcMillis>,
+    pub truncated: bool,
+    pub latest_receipts: Vec<ComicCatalogRefreshReceipt>,
+}
+
+/// 每个来源作品只保留最新 Receipt：先比 `observed_at`，再比 `id` 作稳定 tie-breaker。
+///
+/// 返回顺序按来源键升序，保证同一批 Receipt 的摘要结果可复现。
+pub fn latest_receipts_by_source(
+    receipts: &[ComicCatalogRefreshReceipt],
+) -> Vec<ComicCatalogRefreshReceipt> {
+    let mut latest: BTreeMap<(&str, &str), &ComicCatalogRefreshReceipt> = BTreeMap::new();
+    for receipt in receipts {
+        let key = (receipt.source_key.as_str(), receipt.remote_work_id.as_str());
+        let is_newer = latest.get(&key).is_none_or(|current| {
+            (receipt.observed_at, receipt.id) > (current.observed_at, current.id)
+        });
+        if is_newer {
+            latest.insert(key, receipt);
+        }
+    }
+    latest.into_values().cloned().collect()
+}
+
+/// 由每个来源的最新 Receipt 推导聚合根状态：失败优先于截断，截断优先于成功。
 pub fn comic_work_catalog_status_from_receipts(
     receipts: &[ComicCatalogRefreshReceipt],
 ) -> ComicWorkCatalogStatus {
-    if receipts.is_empty() {
+    catalog_status_from_latest(&latest_receipts_by_source(receipts))
+}
+
+/// 统一计算聚合根刷新状态、覆盖度和最近观察时间。
+pub fn summarize_comic_work_refresh(
+    receipts: &[ComicCatalogRefreshReceipt],
+) -> ComicWorkRefreshSummary {
+    let latest_receipts = latest_receipts_by_source(receipts);
+    ComicWorkRefreshSummary {
+        status: catalog_status_from_latest(&latest_receipts),
+        last_observed_at: latest_receipts
+            .iter()
+            .map(|receipt| receipt.observed_at)
+            .max(),
+        truncated: latest_receipts.iter().any(|receipt| {
+            receipt.truncated || receipt.status == ComicCatalogRefreshOutcomeStatus::Truncated
+        }),
+        latest_receipts,
+    }
+}
+
+fn catalog_status_from_latest(
+    latest_receipts: &[ComicCatalogRefreshReceipt],
+) -> ComicWorkCatalogStatus {
+    if latest_receipts.is_empty() {
         return ComicWorkCatalogStatus::NeverSynced;
     }
-    if receipts
+    if latest_receipts
         .iter()
         .any(|receipt| receipt.status == ComicCatalogRefreshOutcomeStatus::RefreshFailed)
     {
         return ComicWorkCatalogStatus::RefreshFailed;
     }
-    if receipts.iter().any(|receipt| {
+    if latest_receipts.iter().any(|receipt| {
         receipt.truncated || receipt.status == ComicCatalogRefreshOutcomeStatus::Truncated
     }) {
         return ComicWorkCatalogStatus::Truncated;
@@ -526,12 +584,18 @@ pub fn aggregate_comic_work_chapters(
 
     let mut buckets: Vec<EditionBucket> = Vec::new();
     for observation in observations {
+        // 新观察只有在与桶内**所有**已有观察的画像都能共享容器时才入桶。
+        // MirrorLabel 的单次比较是放宽规则，只对一次比较成立；若只和桶内首个
+        // 画像比较，"MirrorLabel -> ContentLine(A) -> ContentLine(B)" 会把两个
+        // 真实冲突的内容线并进同一个 Edition 容器。
         let compatible = buckets.iter_mut().find(|bucket| {
             bucket.edition_id == observation.edition_id
-                && edition_profiles_can_share_container(
-                    &bucket.profile,
-                    &observation.edition_profile,
-                )
+                && bucket.observations.iter().all(|existing| {
+                    edition_profiles_can_share_container(
+                        &existing.edition_profile,
+                        &observation.edition_profile,
+                    )
+                })
         });
         match compatible {
             Some(bucket) => bucket.observations.push(observation),
@@ -553,6 +617,7 @@ pub fn aggregate_comic_work_chapters(
             bucket.observations,
             bucket.edition_id,
             refresh_status,
+            current_media_item_id,
         ));
         blocks.push((start, chapters.len()));
     }
@@ -589,6 +654,7 @@ fn aggregate_edition_chapters(
     observations: Vec<ComicWorkChapterObservation>,
     edition_id: EditionId,
     refresh_status: ComicWorkCatalogStatus,
+    current_media_item_id: Option<MediaItemId>,
 ) -> Vec<ComicWorkChapter> {
     let mut raw: Vec<RawChapter> = observations
         .into_iter()
@@ -599,7 +665,15 @@ fn aggregate_edition_chapters(
     let groups = merge_groups(&raw);
     let mut chapters: Vec<ComicWorkChapter> = groups
         .iter()
-        .map(|group| build_merged_chapter(group, &raw, edition_id, refresh_status))
+        .map(|group| {
+            build_merged_chapter(
+                group,
+                &raw,
+                edition_id,
+                refresh_status,
+                current_media_item_id,
+            )
+        })
         .collect();
 
     // 不能归并的章节仍然保留 Candidate 证据：Candidate 只描述匹配证据，
@@ -740,19 +814,87 @@ fn match_strength(kind: ChapterMatchKind) -> u8 {
     }
 }
 
+fn chapter_has_projection(chapter: &RawChapter) -> bool {
+    chapter.progress.is_some() || chapter.subject_id.is_some()
+}
+
+/// 代表成员优先级：本地可打开且有投影 → 本地可打开 → 有投影 → 兜底。
+fn representative_priority(chapter: &RawChapter) -> u8 {
+    match (
+        has_local_readable_resource(&chapter.resource_facts),
+        chapter_has_projection(chapter),
+    ) {
+        (true, true) => 0,
+        (true, false) => 1,
+        (false, true) => 2,
+        (false, false) => 3,
+    }
+}
+
+/// 归并组内的代表成员，决定 `ComicWorkChapter::media_item_id`。
+///
+/// 规则按优先级：
+/// 1. `current_media_item_id` 命中的成员——它是当前读取上下文，也必然是本地真实
+///    MediaItem，因此优先让它代表这一章，前端才能用返回的 `media_item_id` 定位
+///    当前项；
+/// 2. 有本地可打开资源且有 Progress/active Subject 投影的成员；
+/// 3. 有本地可打开资源的成员；
+/// 4. 有 Progress/active Subject 投影的成员；
+/// 5. 其余成员按稳定 MediaItem ID 取最小。
+fn select_representative<'a>(
+    ordered: &[&'a RawChapter],
+    current_media_item_id: Option<MediaItemId>,
+) -> &'a RawChapter {
+    if let Some(current) = current_media_item_id {
+        if let Some(representative) = ordered
+            .iter()
+            .find(|chapter| chapter.media_item.id == current)
+        {
+            return representative;
+        }
+    }
+    ordered
+        .iter()
+        .min_by_key(|chapter| (representative_priority(chapter), chapter.media_item.id))
+        .copied()
+        .expect("归并组至少有一个成员")
+}
+
+/// Progress/Subject 的唯一投影成员。
+///
+/// 代表成员自身有投影时直接取它的原值；否则（例如当前读取上下文命中了没有本行
+/// 进度的一侧）回退到同一个投影成员，Progress 与 Subject 必须同源，不能让两个
+/// 独立标准各自挑一个 MediaItem。回退只选择投影成员，返回的 Progress 始终是原
+/// 行，locator/revision/last_active_at 一律不改写。
+fn select_projection_member<'a>(
+    ordered: &[&'a RawChapter],
+    representative: &'a RawChapter,
+) -> Option<&'a RawChapter> {
+    if chapter_has_projection(representative) {
+        return Some(representative);
+    }
+    ordered
+        .iter()
+        .copied()
+        .filter(|chapter| chapter_has_projection(chapter))
+        .min_by_key(|chapter| {
+            (
+                !has_local_readable_resource(&chapter.resource_facts),
+                chapter.media_item.id,
+            )
+        })
+}
+
 fn build_merged_chapter(
     members: &[usize],
     raw: &[RawChapter],
     edition_id: EditionId,
     refresh_status: ComicWorkCatalogStatus,
+    current_media_item_id: Option<MediaItemId>,
 ) -> ComicWorkChapter {
     let mut ordered: Vec<&RawChapter> = members.iter().map(|index| &raw[*index]).collect();
     ordered.sort_by_key(|chapter| chapter.media_item.id);
-    let representative = ordered
-        .iter()
-        .find(|chapter| has_local_readable_resource(&chapter.resource_facts))
-        .copied()
-        .unwrap_or(ordered[0]);
+    let representative = select_representative(&ordered, current_media_item_id);
 
     let mut sources: Vec<ComicChapterAggregateSource> = Vec::new();
     for chapter in &ordered {
@@ -771,8 +913,9 @@ fn build_merged_chapter(
         .iter()
         .flat_map(|chapter| chapter.resource_facts.iter().copied())
         .collect();
-    let progress = ordered.iter().find_map(|chapter| chapter.progress.clone());
-    let subject_id = ordered.iter().find_map(|chapter| chapter.subject_id);
+    let projection_member = select_projection_member(&ordered, representative);
+    let progress = projection_member.and_then(|chapter| chapter.progress.clone());
+    let subject_id = projection_member.and_then(|chapter| chapter.subject_id);
 
     let mut match_result: Option<ChapterMatch> = None;
     for left in 0..ordered.len() {
@@ -1340,6 +1483,370 @@ mod tests {
         assert!([variant_left, variant_right].contains(&variant_chapter.media_item_id));
     }
 
+    /// 归并测试需要可控的 MediaItem 顺序，因此用固定 UUID 而不是随机 v7。
+    fn fixed_media_item_id(value: u128) -> MediaItemId {
+        MediaItemId::from_uuid(uuid::Uuid::from_u128(value))
+    }
+
+    fn content_keyed_source(
+        media_item_id: MediaItemId,
+        remote_chapter_id: &str,
+        source_order: u32,
+        profile: EditionProfile,
+    ) -> ComicChapterAggregateSource {
+        let mut source = aggregate_source(
+            media_item_id,
+            remote_chapter_id,
+            source_order,
+            ComicChapterSourceStatus::Available,
+            profile,
+        );
+        source.reference.metadata.authoritative_content_key = Some("content-key".to_owned());
+        source
+    }
+
+    fn comic_progress(media_item_id: MediaItemId, edition_id: EditionId) -> Progress {
+        Progress {
+            id: ProgressId::new(),
+            work_id: WorkId::new(),
+            edition_id,
+            media_item_id,
+            locator: Locator::Comic(ComicLocator {
+                chapter_item_id: media_item_id,
+                page_index: 3,
+                page_progression: Some(0.25),
+            }),
+            completion: CompletionState::InProgress,
+            percentage: Some(0.25),
+            last_active_at: UtcMillis(777),
+            updated_at: UtcMillis(777),
+            revision: Some("revision-3".to_owned()),
+            keyframe_uri: None,
+        }
+    }
+
+    #[test]
+    fn comic_work_catalog_keeps_the_current_media_item_as_representative_after_merge() {
+        let edition = EditionId::new();
+        let profile = EditionProfile::default();
+        let current = fixed_media_item_id(1);
+        let sibling = fixed_media_item_id(2);
+        let subject_id = ComicProgressSubjectId::new();
+        let sibling_progress = comic_progress(sibling, edition);
+
+        // 两条 MediaItem 通过同一权威内容 key 真正归并（SameContent）。
+        let current_observation = observation(
+            edition,
+            work_media_item(edition, current, Some(1.0)),
+            profile.clone(),
+            vec![content_keyed_source(
+                current,
+                "content-a",
+                0,
+                profile.clone(),
+            )],
+        );
+        let mut sibling_observation = observation(
+            edition,
+            work_media_item(edition, sibling, Some(1.0)),
+            profile.clone(),
+            vec![content_keyed_source(sibling, "content-b", 1, profile)],
+        );
+        sibling_observation.resource_facts = vec![resource_fact(
+            ResourceType::ComicArchive,
+            Availability::Available,
+            true,
+        )];
+        sibling_observation.progress = Some(sibling_progress.clone());
+        sibling_observation.subject_id = Some(subject_id);
+
+        let catalog = aggregate_comic_work_chapters(ComicWorkChapterAggregateInput {
+            work_id: WorkId::new(),
+            observations: vec![current_observation, sibling_observation],
+            current_media_item_id: Some(current),
+            refresh_status: ComicWorkCatalogStatus::Synced,
+            last_observed_at: None,
+            truncated: false,
+            refresh_receipts: Vec::new(),
+        });
+
+        assert_eq!(catalog.chapters.len(), 1, "内容证据必须归并两条 MediaItem");
+        let chapter = &catalog.chapters[0];
+        assert_eq!(
+            chapter.media_item_id, current,
+            "当前读取上下文必须代表该章，即使另一个成员才有本地资源"
+        );
+        assert_eq!(catalog.current_media_item_id, Some(current));
+        assert!(
+            catalog
+                .chapters
+                .iter()
+                .any(|chapter| chapter.media_item_id == current),
+            "media_item 请求必须能在返回数组里定位当前项"
+        );
+        // 当前成员没有投影：Progress/Subject 回退到同一个投影成员，仍是原行。
+        assert_eq!(chapter.progress.as_ref(), Some(&sibling_progress));
+        assert_eq!(chapter.subject_id, Some(subject_id));
+        assert_eq!(chapter.progress.as_ref().unwrap().media_item_id, sibling);
+        assert_eq!(
+            chapter.progress.as_ref().unwrap().locator,
+            Locator::Comic(ComicLocator {
+                chapter_item_id: sibling,
+                page_index: 3,
+                page_progression: Some(0.25),
+            })
+        );
+        assert_eq!(
+            chapter.progress.as_ref().unwrap().revision.as_deref(),
+            Some("revision-3")
+        );
+        assert_eq!(
+            chapter.progress.as_ref().unwrap().last_active_at,
+            UtcMillis(777)
+        );
+    }
+
+    #[test]
+    fn comic_work_catalog_prefers_the_readable_projection_member_as_representative() {
+        let edition = EditionId::new();
+        let profile = EditionProfile::default();
+        let plain = fixed_media_item_id(1);
+        let readable = fixed_media_item_id(2);
+        let readable_with_progress = fixed_media_item_id(3);
+        let progress = comic_progress(readable_with_progress, edition);
+
+        let with_resource = |mut observed: ComicWorkChapterObservation| {
+            observed.resource_facts = vec![resource_fact(
+                ResourceType::ComicArchive,
+                Availability::Available,
+                true,
+            )];
+            observed
+        };
+
+        let catalog = aggregate_for_test(
+            vec![
+                observation(
+                    edition,
+                    work_media_item(edition, plain, Some(1.0)),
+                    profile.clone(),
+                    vec![content_keyed_source(plain, "content-a", 0, profile.clone())],
+                ),
+                with_resource(observation(
+                    edition,
+                    work_media_item(edition, readable, Some(1.0)),
+                    profile.clone(),
+                    vec![content_keyed_source(
+                        readable,
+                        "content-b",
+                        1,
+                        profile.clone(),
+                    )],
+                )),
+                with_resource({
+                    let mut observed = observation(
+                        edition,
+                        work_media_item(edition, readable_with_progress, Some(1.0)),
+                        profile.clone(),
+                        vec![content_keyed_source(
+                            readable_with_progress,
+                            "content-c",
+                            2,
+                            profile,
+                        )],
+                    );
+                    observed.progress = Some(progress.clone());
+                    observed
+                }),
+            ],
+            ComicWorkCatalogStatus::Synced,
+        );
+
+        assert_eq!(catalog.chapters.len(), 1);
+        let chapter = &catalog.chapters[0];
+        assert_eq!(
+            chapter.media_item_id, readable_with_progress,
+            "本地可打开且有投影的成员优先代表该章"
+        );
+        assert_eq!(
+            chapter.progress.as_ref(),
+            Some(&progress),
+            "代表成员自身的 Progress 原值优先"
+        );
+        assert_eq!(
+            chapter.progress.as_ref().unwrap().media_item_id,
+            chapter.media_item_id,
+            "代表成员自身有投影时，Reading 入口与 locator 必须指向同一 MediaItem"
+        );
+    }
+
+    #[test]
+    fn comic_work_catalog_takes_progress_and_subject_from_one_projection_member() {
+        let edition = EditionId::new();
+        let profile = EditionProfile::default();
+        let readable = fixed_media_item_id(1);
+        let progress_only = fixed_media_item_id(2);
+        let subject_only = fixed_media_item_id(3);
+        let progress = comic_progress(progress_only, edition);
+        let subject_id = ComicProgressSubjectId::new();
+
+        let mut progress_observation = observation(
+            edition,
+            work_media_item(edition, progress_only, Some(1.0)),
+            profile.clone(),
+            vec![content_keyed_source(
+                progress_only,
+                "content-b",
+                1,
+                profile.clone(),
+            )],
+        );
+        progress_observation.progress = Some(progress.clone());
+
+        let mut subject_observation = observation(
+            edition,
+            work_media_item(edition, subject_only, Some(1.0)),
+            profile.clone(),
+            vec![content_keyed_source(
+                subject_only,
+                "content-c",
+                2,
+                profile.clone(),
+            )],
+        );
+        subject_observation.subject_id = Some(subject_id);
+
+        let mut readable_observation = observation(
+            edition,
+            work_media_item(edition, readable, Some(1.0)),
+            profile.clone(),
+            vec![content_keyed_source(readable, "content-a", 0, profile)],
+        );
+        readable_observation.resource_facts = vec![resource_fact(
+            ResourceType::ComicArchive,
+            Availability::Available,
+            true,
+        )];
+
+        let catalog = aggregate_for_test(
+            vec![
+                readable_observation,
+                progress_observation,
+                subject_observation,
+            ],
+            ComicWorkCatalogStatus::Synced,
+        );
+
+        assert_eq!(catalog.chapters.len(), 1);
+        let chapter = &catalog.chapters[0];
+        assert_eq!(
+            chapter.media_item_id, readable,
+            "没有 current 时本地可打开成员优先"
+        );
+        assert_eq!(chapter.progress.as_ref(), Some(&progress));
+        assert_eq!(
+            chapter.progress.as_ref().unwrap().media_item_id,
+            progress_only
+        );
+        assert_eq!(
+            chapter.subject_id, None,
+            "Subject 必须与 Progress 取自同一个投影成员，不能各自挑一个 MediaItem"
+        );
+    }
+
+    #[test]
+    fn comic_work_catalog_splits_conflicting_content_lines_behind_mirror_label() {
+        let edition = EditionId::new();
+        let mirror = catalog_profile(
+            "zh-cn",
+            "line-a",
+            ScanGroupFacet::mirror_label("mirror-a"),
+            ColorMode::Grayscale,
+        );
+        let line_a = catalog_profile(
+            "zh-cn",
+            "line-a",
+            ScanGroupFacet::content_line("scan-a"),
+            ColorMode::Grayscale,
+        );
+        let line_b = catalog_profile(
+            "zh-cn",
+            "line-a",
+            ScanGroupFacet::content_line("scan-b"),
+            ColorMode::Grayscale,
+        );
+        let mirror_item = fixed_media_item_id(1);
+        let line_a_item = fixed_media_item_id(2);
+        let line_b_item = fixed_media_item_id(3);
+
+        let catalog = aggregate_for_test(
+            vec![
+                observation(
+                    edition,
+                    work_media_item(edition, mirror_item, Some(1.0)),
+                    mirror.clone(),
+                    vec![aggregate_source(
+                        mirror_item,
+                        "m-1",
+                        0,
+                        ComicChapterSourceStatus::Available,
+                        mirror,
+                    )],
+                ),
+                observation(
+                    edition,
+                    work_media_item(edition, line_a_item, Some(2.0)),
+                    line_a.clone(),
+                    vec![aggregate_source(
+                        line_a_item,
+                        "a-1",
+                        1,
+                        ComicChapterSourceStatus::Available,
+                        line_a,
+                    )],
+                ),
+                observation(
+                    edition,
+                    work_media_item(edition, line_b_item, Some(3.0)),
+                    line_b.clone(),
+                    vec![aggregate_source(
+                        line_b_item,
+                        "b-1",
+                        2,
+                        ComicChapterSourceStatus::Available,
+                        line_b,
+                    )],
+                ),
+            ],
+            ComicWorkCatalogStatus::Synced,
+        );
+
+        assert_eq!(
+            catalog.editions.len(),
+            2,
+            "MirrorLabel 只对单次比较放宽，不能把两个真实冲突的内容线并进同一容器"
+        );
+        let chapter = |id: MediaItemId| {
+            catalog
+                .chapters
+                .iter()
+                .find(|chapter| chapter.media_item_id == id)
+                .unwrap()
+        };
+        assert_eq!(chapter(mirror_item).next_media_item_id, Some(line_a_item));
+        assert_eq!(
+            chapter(line_a_item).previous_media_item_id,
+            Some(mirror_item)
+        );
+        assert_eq!(chapter(line_a_item).next_media_item_id, None);
+        assert_eq!(
+            chapter(line_b_item).previous_media_item_id,
+            None,
+            "冲突的内容线必须单独成块，不得跨错误桶互连"
+        );
+        assert_eq!(chapter(line_b_item).next_media_item_id, None);
+    }
+
     #[test]
     fn comic_work_catalog_respects_edition_profile_boundaries() {
         let shared_edition = EditionId::new();
@@ -1676,14 +2183,18 @@ mod tests {
     }
 
     #[test]
-    fn comic_work_catalog_status_prioritizes_failure_over_truncation() {
+    fn comic_work_catalog_status_uses_only_the_latest_receipt_per_source() {
         let work_id = WorkId::new();
-        let receipt = |status: ComicCatalogRefreshOutcomeStatus, truncated: bool| {
+        let receipt = |source_key: &str,
+                       remote_work_id: &str,
+                       status: ComicCatalogRefreshOutcomeStatus,
+                       truncated: bool,
+                       observed_at: i64| {
             ComicCatalogRefreshReceipt {
                 id: ComicCatalogRefreshId::new(),
                 work_id,
-                source_key: "mangadex".to_owned(),
-                remote_work_id: "manga-1".to_owned(),
+                source_key: source_key.to_owned(),
+                remote_work_id: remote_work_id.to_owned(),
                 status,
                 generation_before: 1,
                 generation_after: Some(2),
@@ -1692,7 +2203,7 @@ mod tests {
                 truncated,
                 retained_previous_catalog: false,
                 error_code: None,
-                observed_at: UtcMillis(99),
+                observed_at: UtcMillis(observed_at),
             }
         };
 
@@ -1702,24 +2213,174 @@ mod tests {
         );
         assert_eq!(
             comic_work_catalog_status_from_receipts(&[receipt(
+                "mangadex",
+                "manga-1",
                 ComicCatalogRefreshOutcomeStatus::Succeeded,
                 false,
+                10,
             )]),
             ComicWorkCatalogStatus::Synced
         );
         assert_eq!(
             comic_work_catalog_status_from_receipts(&[receipt(
+                "mangadex",
+                "manga-1",
                 ComicCatalogRefreshOutcomeStatus::Succeeded,
                 true,
+                10,
             )]),
             ComicWorkCatalogStatus::Truncated
         );
+
+        // 同一来源：历史失败不再遮蔽后来的成功。
+        let old_failure = receipt(
+            "mangadex",
+            "manga-1",
+            ComicCatalogRefreshOutcomeStatus::RefreshFailed,
+            false,
+            100,
+        );
+        let newer_success = receipt(
+            "mangadex",
+            "manga-1",
+            ComicCatalogRefreshOutcomeStatus::Succeeded,
+            false,
+            200,
+        );
+        assert_eq!(
+            comic_work_catalog_status_from_receipts(&[old_failure.clone(), newer_success.clone()]),
+            ComicWorkCatalogStatus::Synced
+        );
+
+        // 同一来源：最新一次失败仍然优先于更早的截断成功。
+        let older_truncated = receipt(
+            "mangadex",
+            "manga-1",
+            ComicCatalogRefreshOutcomeStatus::Succeeded,
+            true,
+            100,
+        );
+        let newer_failure = receipt(
+            "mangadex",
+            "manga-1",
+            ComicCatalogRefreshOutcomeStatus::RefreshFailed,
+            false,
+            200,
+        );
         assert_eq!(
             comic_work_catalog_status_from_receipts(&[
-                receipt(ComicCatalogRefreshOutcomeStatus::RefreshFailed, false),
-                receipt(ComicCatalogRefreshOutcomeStatus::Succeeded, true),
+                older_truncated.clone(),
+                newer_failure.clone(),
             ]),
             ComicWorkCatalogStatus::RefreshFailed
+        );
+
+        // 不同来源：任一来源的最新观察是失败，聚合根就是失败。
+        let failed_source = receipt(
+            "other-source",
+            "manga-9",
+            ComicCatalogRefreshOutcomeStatus::RefreshFailed,
+            false,
+            300,
+        );
+        assert_eq!(
+            comic_work_catalog_status_from_receipts(&[
+                newer_success.clone(),
+                failed_source.clone()
+            ]),
+            ComicWorkCatalogStatus::RefreshFailed
+        );
+
+        let summary = summarize_comic_work_refresh(&[
+            receipt(
+                "mangadex",
+                "manga-1",
+                ComicCatalogRefreshOutcomeStatus::RefreshFailed,
+                false,
+                100,
+            ),
+            receipt(
+                "mangadex",
+                "manga-1",
+                ComicCatalogRefreshOutcomeStatus::Succeeded,
+                false,
+                300,
+            ),
+            receipt(
+                "other-source",
+                "manga-9",
+                ComicCatalogRefreshOutcomeStatus::Succeeded,
+                true,
+                50,
+            ),
+            receipt(
+                "other-source",
+                "manga-9",
+                ComicCatalogRefreshOutcomeStatus::Succeeded,
+                false,
+                200,
+            ),
+        ]);
+        assert_eq!(
+            summary.latest_receipts.len(),
+            2,
+            "两个来源各只保留最新一条 Receipt"
+        );
+        assert_eq!(
+            summary.status,
+            ComicWorkCatalogStatus::Synced,
+            "mangadex 的历史失败被它自己的新成功取代"
+        );
+        assert!(
+            !summary.truncated,
+            "旧截断不能进入摘要：只有每个来源的最新观察决定覆盖度"
+        );
+        assert_eq!(summary.last_observed_at, Some(UtcMillis(300)));
+        assert_eq!(summary.latest_receipts[0].source_key, "mangadex");
+        assert_eq!(summary.latest_receipts[0].observed_at, UtcMillis(300));
+        assert_eq!(summary.latest_receipts[1].source_key, "other-source");
+        assert_eq!(summary.latest_receipts[1].observed_at, UtcMillis(200));
+    }
+
+    #[test]
+    fn comic_work_catalog_latest_receipt_tie_breaks_on_stable_id() {
+        let work_id = WorkId::new();
+        let mut older_id = ComicCatalogRefreshId::new();
+        let mut newer_id = ComicCatalogRefreshId::new();
+        if older_id > newer_id {
+            std::mem::swap(&mut older_id, &mut newer_id);
+        }
+        let receipt = |id: ComicCatalogRefreshId, status: ComicCatalogRefreshOutcomeStatus| {
+            ComicCatalogRefreshReceipt {
+                id,
+                work_id,
+                source_key: "mangadex".to_owned(),
+                remote_work_id: "manga-1".to_owned(),
+                status,
+                generation_before: 1,
+                generation_after: Some(2),
+                observed_from: None,
+                observed_to: None,
+                truncated: false,
+                retained_previous_catalog: false,
+                error_code: None,
+                // 同一时间戳：只有 id 能决定谁是最新观察。
+                observed_at: UtcMillis(500),
+            }
+        };
+
+        let latest = latest_receipts_by_source(&[
+            receipt(older_id, ComicCatalogRefreshOutcomeStatus::RefreshFailed),
+            receipt(newer_id, ComicCatalogRefreshOutcomeStatus::Succeeded),
+        ]);
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].id, newer_id);
+        assert_eq!(
+            comic_work_catalog_status_from_receipts(&[
+                receipt(older_id, ComicCatalogRefreshOutcomeStatus::RefreshFailed),
+                receipt(newer_id, ComicCatalogRefreshOutcomeStatus::Succeeded),
+            ]),
+            ComicWorkCatalogStatus::Synced
         );
     }
 

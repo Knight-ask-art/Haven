@@ -9,15 +9,16 @@
 //! Subject/Progress 和刷新 Receipt，然后把事实交给纯 Domain 聚合。顺序、上一章/
 //! 下一章和当前项全部由后端确定，前端不得自行推导。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use haven_common::{AppError, ErrorKind, UtcMillis};
 use haven_domain::comic_catalog::{
-    ComicCatalogRefreshOutcomeStatus, ComicChapterAggregateSource, ComicChapterAvailability,
+    ComicCatalogRefreshReceipt, ComicChapterAggregateSource, ComicChapterAvailability,
     ComicChapterCatalog, ComicChapterCatalogState, ComicChapterSourceStatus,
     ComicResourceAvailabilityFact, ComicWorkCatalogStatus, ComicWorkChapterAggregateInput,
     ComicWorkChapterCatalog, ComicWorkChapterObservation, aggregate_comic_work_chapters,
-    comic_work_catalog_status_from_receipts,
+    summarize_comic_work_refresh,
 };
 use haven_domain::comic_identity::{
     ChapterSourceRef, ColorMode, EditionProfile, IdentityFacet, ScanGroupFacet,
@@ -28,8 +29,9 @@ use haven_domain::contracts::{
     EditionRepository, MediaItemRepository, ProgressRepository, ResourceRepository, WorkRepository,
     WorkSourceRef,
 };
+use haven_domain::entities::{Edition, MediaItem};
 use haven_domain::enums::MediaType;
-use haven_domain::ids::{MediaItemId, WorkId};
+use haven_domain::ids::{EditionId, MediaItemId, WorkId};
 
 use super::ports::{ComicCatalogRefreshReceiptPort, ComicCatalogWorkPorts};
 use super::source_import::SourceImportService;
@@ -133,33 +135,77 @@ impl ComicCatalogService {
             Some(port) => port.list_by_work(work_id).await?,
             None => Vec::new(),
         };
-        let (refresh_status, last_observed_at, truncated) = if self.refresh_receipts.is_some() {
-            (
-                comic_work_catalog_status_from_receipts(&receipts),
-                receipts.iter().map(|receipt| receipt.observed_at).max(),
-                receipts.iter().any(|receipt| {
-                    receipt.truncated
-                        || receipt.status == ComicCatalogRefreshOutcomeStatus::Truncated
-                }),
-            )
-        } else {
-            refresh_status_from_source_states(&**ports, &source_refs).await?
-        };
+        // 归属校验先于任何投影和状态推导：越界的来源引用/Receipt 不得进入结果，
+        // 也不得污染 refresh_status。
+        validate_work_scope(work_id, &source_refs, &receipts)?;
 
-        let mut observations: Vec<ComicWorkChapterObservation> = Vec::new();
-        for edition in EditionRepository::list_by_work(ports.as_edition(), work_id).await? {
-            if edition.work_id != work_id || edition.edition_type != MediaType::Comic {
-                continue;
-            }
+        let (refresh_status, last_observed_at, truncated, refresh_receipts) =
+            if self.refresh_receipts.is_some() {
+                let summary = summarize_comic_work_refresh(&receipts);
+                (
+                    summary.status,
+                    summary.last_observed_at,
+                    summary.truncated,
+                    summary.latest_receipts,
+                )
+            } else {
+                let (status, last_observed_at, truncated) =
+                    refresh_status_from_source_states(&**ports, &source_refs).await?;
+                (status, last_observed_at, truncated, Vec::new())
+            };
+
+        let editions: Vec<Edition> = EditionRepository::list_by_work(ports.as_edition(), work_id)
+            .await?
+            .into_iter()
+            .filter(|edition| {
+                edition.work_id == work_id && edition.edition_type == MediaType::Comic
+            })
+            .collect();
+
+        let mut profiles: HashMap<EditionId, EditionProfile> =
+            HashMap::with_capacity(editions.len());
+        for edition in &editions {
             let profile = EditionProfileRepository::get(ports.as_edition_profile(), edition.id)
                 .await?
                 .unwrap_or_else(|| EditionProfile::from_language(edition.language.as_deref()));
-            for item in
-                MediaItemRepository::list_by_edition(ports.as_media_item(), edition.id).await?
-            {
-                if item.edition_id != edition.id || item.media_type != MediaType::Comic {
-                    continue;
-                }
+            profiles.insert(edition.id, profile);
+        }
+
+        // 条目和进度批量读取，避免 Work 目录千章级串行 N+1；仍按 Edition 分组，
+        // 保持与逐 Edition 读取相同的观察顺序。
+        let edition_ids: Vec<EditionId> = editions.iter().map(|edition| edition.id).collect();
+        let mut items_by_edition: HashMap<EditionId, Vec<MediaItem>> = HashMap::new();
+        for item in
+            MediaItemRepository::list_by_editions(ports.as_media_item(), &edition_ids).await?
+        {
+            if item.media_type != MediaType::Comic || !profiles.contains_key(&item.edition_id) {
+                continue;
+            }
+            items_by_edition
+                .entry(item.edition_id)
+                .or_default()
+                .push(item);
+        }
+
+        let media_item_ids: Vec<MediaItemId> = editions
+            .iter()
+            .flat_map(|edition| {
+                items_by_edition
+                    .get(&edition.id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+            })
+            .map(|item| item.id)
+            .collect();
+        let mut progress_by_item =
+            ProgressRepository::get_for_media_items(ports.as_progress(), &media_item_ids).await?;
+
+        let mut observations: Vec<ComicWorkChapterObservation> = Vec::new();
+        for edition in &editions {
+            let Some(profile) = profiles.get(&edition.id) else {
+                continue;
+            };
+            for item in items_by_edition.remove(&edition.id).unwrap_or_default() {
                 let sources = ChapterSourceRepository::list_for_media_item(
                     ports.as_chapter_source(),
                     item.id,
@@ -167,8 +213,6 @@ impl ComicCatalogService {
                 .await?;
                 let resources =
                     ResourceRepository::list_by_media_item(ports.as_resource(), item.id).await?;
-                let progress =
-                    ProgressRepository::get_for_media_item(ports.as_progress(), item.id).await?;
                 // Subject 只是投影：Candidate 成员不是 active 归属，必须为 None。
                 let subject_id = ComicProgressSubjectRepository::get_for_media_item(
                     ports.as_comic_progress_subject(),
@@ -177,6 +221,7 @@ impl ComicCatalogService {
                 .await?
                 .filter(|member| member.participates_in_active_progress())
                 .map(|member| member.subject_id);
+                let progress = progress_by_item.remove(&item.id);
 
                 observations.push(ComicWorkChapterObservation {
                     media_item: item,
@@ -213,7 +258,7 @@ impl ComicCatalogService {
                 refresh_status,
                 last_observed_at,
                 truncated,
-                refresh_receipts: receipts,
+                refresh_receipts,
             },
         ))
     }
@@ -278,6 +323,30 @@ fn work_catalog_ports_unavailable() -> AppError {
 
 fn comic_not_found(code: &'static str, message: &'static str) -> AppError {
     AppError::new(code, ErrorKind::NotFound, message, false)
+}
+
+/// 读取层返回的行与查询范围不一致：只暴露稳定的可重试数据库错误，
+/// 不把越界的来源、远端标识或错误码泄漏到结果。
+fn database_inconsistency(message: &'static str) -> AppError {
+    AppError::new("DATABASE_ERROR", ErrorKind::Database, message, true)
+}
+
+/// 校验 Work 级聚合读到的来源引用与刷新 Receipt 都属于请求的 Work。
+fn validate_work_scope(
+    work_id: WorkId,
+    source_refs: &[WorkSourceRef],
+    receipts: &[ComicCatalogRefreshReceipt],
+) -> Result<(), AppError> {
+    if source_refs
+        .iter()
+        .any(|reference| reference.work_id != work_id)
+    {
+        return Err(database_inconsistency("漫画来源引用归属与作品不一致"));
+    }
+    if receipts.iter().any(|receipt| receipt.work_id != work_id) {
+        return Err(database_inconsistency("漫画刷新 Receipt 归属与作品不一致"));
+    }
+    Ok(())
 }
 
 fn invalid_comic_target(message: &'static str) -> AppError {
@@ -364,22 +433,14 @@ pub fn registered_catalog_to_dto(
         chapter.identity.source_key != source_id
             || chapter.identity.remote_work_id != remote_work_id
     }) {
-        return Err(AppError::new(
-            "DATABASE_ERROR",
-            haven_common::ErrorKind::Database,
+        return Err(database_inconsistency(
             "已登记漫画章节的来源身份与查询不一致",
-            true,
         ));
     }
     if state.is_some_and(|state| {
         state.source_key != source_id || state.remote_work_id != remote_work_id
     }) {
-        return Err(AppError::new(
-            "DATABASE_ERROR",
-            haven_common::ErrorKind::Database,
-            "已登记漫画章节目录状态与查询不一致",
-            true,
-        ));
+        return Err(database_inconsistency("已登记漫画章节目录状态与查询不一致"));
     }
     Ok(ComicRegisteredChapterCatalogDto {
         schema_version: 1,
@@ -655,7 +716,10 @@ mod tests {
         Availability, AvailabilitySource, CompletionState, MediaItemStatus, MediaType,
         ResourceType, WorkStatus, WorkType,
     };
-    use haven_domain::ids::{ComicCatalogRefreshId, EditionId, ProgressId, ResourceId, WorkId};
+    use haven_domain::ids::{
+        ComicCatalogRefreshId, ComicProgressSubjectId, EditionId, ProgressId, ResourceId,
+        StorageLocationId, WorkId,
+    };
     use haven_domain::locator::{ComicLocator, Locator};
     use haven_infrastructure::Db;
     use haven_infrastructure::db::repos::SqliteRepositories;
@@ -736,6 +800,15 @@ mod tests {
         repos: Arc<SqliteRepositories>,
         receipts: Option<Vec<ComicCatalogRefreshReceipt>>,
     ) -> ComicCatalogService {
+        work_catalog_service_over_ports(repos.clone(), repos, receipts)
+    }
+
+    /// 组装 Work 级聚合读取服务；`work_ports` 可替换为只读替身。
+    fn work_catalog_service_over_ports(
+        repos: Arc<SqliteRepositories>,
+        work_ports: Arc<dyn ComicCatalogWorkPorts>,
+        receipts: Option<Vec<ComicCatalogRefreshReceipt>>,
+    ) -> ComicCatalogService {
         let registered_chapters: Arc<dyn ChapterSourceRepository> = repos.clone();
         let import_ports: Arc<dyn crate::services::ports::SourceImportPorts> = repos.clone();
         let registry_ports: Arc<dyn crate::services::ports::SourceRegistryPorts> = repos.clone();
@@ -746,7 +819,6 @@ mod tests {
             registry,
             Arc::new(UnusedCatalogProvider),
         );
-        let work_ports: Arc<dyn ComicCatalogWorkPorts> = repos;
         let service = ComicCatalogService::new(source_import, registered_chapters)
             .with_work_catalog_ports(work_ports);
         match receipts {
@@ -757,31 +829,32 @@ mod tests {
         }
     }
 
-    async fn seed_work(repos: &SqliteRepositories, title: &str, id: WorkId) {
+    fn test_work(id: WorkId) -> Work {
         let now = UtcMillis(1);
-        WorkRepository::save(
-            repos,
-            &Work {
-                id,
-                canonical_title: title.to_owned(),
-                original_title: None,
-                sort_title: None,
-                description: None,
-                work_type: WorkType::Fiction,
-                release_year: None,
-                language: None,
-                director: None,
-                actor: None,
-                status: WorkStatus::Completed,
-                rating_value: None,
-                rating_scale: None,
-                artwork: ArtworkSet::default(),
-                created_at: now,
-                updated_at: now,
-            },
-        )
-        .await
-        .unwrap();
+        Work {
+            id,
+            canonical_title: "漫画".to_owned(),
+            original_title: None,
+            sort_title: None,
+            description: None,
+            work_type: WorkType::Fiction,
+            release_year: None,
+            language: None,
+            director: None,
+            actor: None,
+            status: WorkStatus::Completed,
+            rating_value: None,
+            rating_scale: None,
+            artwork: ArtworkSet::default(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    async fn seed_work(repos: &SqliteRepositories, title: &str, id: WorkId) {
+        let mut work = test_work(id);
+        work.canonical_title = title.to_owned();
+        WorkRepository::save(repos, &work).await.unwrap();
     }
 
     async fn seed_edition(
@@ -921,11 +994,29 @@ mod tests {
         truncated: bool,
         observed_at: i64,
     ) -> ComicCatalogRefreshReceipt {
+        receipt_for_source(
+            work_id,
+            "mangadex",
+            "manga-1",
+            status,
+            truncated,
+            observed_at,
+        )
+    }
+
+    fn receipt_for_source(
+        work_id: WorkId,
+        source_key: &str,
+        remote_work_id: &str,
+        status: ComicCatalogRefreshOutcomeStatus,
+        truncated: bool,
+        observed_at: i64,
+    ) -> ComicCatalogRefreshReceipt {
         ComicCatalogRefreshReceipt {
             id: ComicCatalogRefreshId::new(),
             work_id,
-            source_key: "mangadex".to_owned(),
-            remote_work_id: "manga-1".to_owned(),
+            source_key: source_key.to_owned(),
+            remote_work_id: remote_work_id.to_owned(),
             status,
             generation_before: 1,
             generation_after: Some(2),
@@ -1309,16 +1400,22 @@ mod tests {
 
         assert_eq!(
             catalog.refresh_status,
-            ComicWorkCatalogStatus::RefreshFailed
+            ComicWorkCatalogStatus::Truncated,
+            "同一来源的旧失败不能遮蔽它自己的最新观察"
         );
         assert!(catalog.truncated);
         assert_eq!(catalog.last_observed_at, Some(UtcMillis(1000)));
-        assert_eq!(catalog.refresh_receipts.len(), 2);
+        assert_eq!(
+            catalog.refresh_receipts.len(),
+            1,
+            "对外只返回每个来源的最新 Receipt"
+        );
+        assert_eq!(catalog.refresh_receipts[0].observed_at, UtcMillis(1000));
         let chapter = &catalog.chapters[0];
         assert_eq!(
             chapter.status,
             ComicChapterAggregateStatus::Available,
-            "离线可用资源仍然可打开，刷新失败不得改写有效章节"
+            "离线可用资源仍然可打开，刷新状态不得改写有效章节"
         );
         assert!(chapter.can_open);
         assert_ne!(chapter.status, ComicChapterAggregateStatus::Missing);
@@ -1326,6 +1423,508 @@ mod tests {
             chapter.sources[0].observed_at,
             Some(UtcMillis(5)),
             "来源摘要保留自身观察时间"
+        );
+    }
+
+    #[tokio::test]
+    async fn comic_catalog_work_level_derives_status_from_latest_receipt_per_source() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repos = Arc::new(SqliteRepositories::new(db));
+
+        let work_id = WorkId::new();
+        seed_work(&repos, "漫画 D", work_id).await;
+
+        // 一失败一成功：失败来源的最新观察仍是失败，聚合根就是失败。
+        let service = work_catalog_service(
+            repos.clone(),
+            Some(vec![
+                receipt_for_source(
+                    work_id,
+                    "mangadex",
+                    "manga-1",
+                    ComicCatalogRefreshOutcomeStatus::RefreshFailed,
+                    false,
+                    100,
+                ),
+                receipt_for_source(
+                    work_id,
+                    "other-source",
+                    "manga-9",
+                    ComicCatalogRefreshOutcomeStatus::Succeeded,
+                    false,
+                    200,
+                ),
+            ]),
+        );
+        let catalog = service
+            .work_catalog_get(ComicWorkChapterCatalogRequest {
+                work_id: Some(work_id),
+                media_item_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog.refresh_status,
+            ComicWorkCatalogStatus::RefreshFailed
+        );
+        assert!(!catalog.truncated);
+        assert_eq!(catalog.last_observed_at, Some(UtcMillis(200)));
+        assert_eq!(catalog.refresh_receipts.len(), 2);
+
+        // 同一来源的旧失败被它自己的新成功取代。
+        let service = work_catalog_service(
+            repos,
+            Some(vec![
+                receipt_for_source(
+                    work_id,
+                    "mangadex",
+                    "manga-1",
+                    ComicCatalogRefreshOutcomeStatus::RefreshFailed,
+                    false,
+                    100,
+                ),
+                receipt_for_source(
+                    work_id,
+                    "mangadex",
+                    "manga-1",
+                    ComicCatalogRefreshOutcomeStatus::Succeeded,
+                    true,
+                    300,
+                ),
+            ]),
+        );
+        let catalog = service
+            .work_catalog_get(ComicWorkChapterCatalogRequest {
+                work_id: Some(work_id),
+                media_item_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(catalog.refresh_status, ComicWorkCatalogStatus::Truncated);
+        assert!(catalog.truncated);
+        assert_eq!(catalog.last_observed_at, Some(UtcMillis(300)));
+        assert_eq!(catalog.refresh_receipts.len(), 1);
+    }
+
+    #[test]
+    fn work_scope_validation_rejects_foreign_rows() {
+        let work_id = WorkId::new();
+        let own = WorkSourceRef {
+            provider: "mangadex".to_owned(),
+            external_id: "manga-1".to_owned(),
+            work_id,
+        };
+        let foreign = WorkSourceRef {
+            provider: "mangadex".to_owned(),
+            external_id: "manga-2".to_owned(),
+            work_id: WorkId::new(),
+        };
+        let own_receipt = receipt(
+            work_id,
+            ComicCatalogRefreshOutcomeStatus::Succeeded,
+            false,
+            10,
+        );
+        let foreign_receipt = receipt(
+            WorkId::new(),
+            ComicCatalogRefreshOutcomeStatus::Succeeded,
+            false,
+            10,
+        );
+
+        validate_work_scope(work_id, std::slice::from_ref(&own), &[own_receipt.clone()]).unwrap();
+
+        for error in [
+            validate_work_scope(work_id, &[foreign], &[own_receipt]).unwrap_err(),
+            validate_work_scope(work_id, std::slice::from_ref(&own), &[foreign_receipt])
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.code().as_str(), "DATABASE_ERROR");
+            assert_eq!(error.kind(), ErrorKind::Database);
+            assert!(error.retryable());
+        }
+    }
+
+    #[tokio::test]
+    async fn comic_catalog_work_level_rejects_receipts_from_another_work() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repos = Arc::new(SqliteRepositories::new(db));
+
+        let work_id = WorkId::new();
+        seed_work(&repos, "漫画 E", work_id).await;
+
+        let service = work_catalog_service(
+            repos,
+            Some(vec![receipt(
+                WorkId::new(),
+                ComicCatalogRefreshOutcomeStatus::Succeeded,
+                false,
+                100,
+            )]),
+        );
+        let error = service
+            .work_catalog_get(ComicWorkChapterCatalogRequest {
+                work_id: Some(work_id),
+                media_item_id: None,
+            })
+            .await
+            .expect_err("越界 Receipt 必须返回稳定错误");
+        assert_eq!(error.code().as_str(), "DATABASE_ERROR");
+        assert_eq!(error.kind(), ErrorKind::Database);
+        assert!(error.retryable());
+    }
+
+    fn test_port_unused() -> AppError {
+        AppError::new(
+            "UNUSED_TEST_PORT",
+            ErrorKind::Internal,
+            "测试替身不执行该操作",
+            false,
+        )
+    }
+
+    /// 只用于触发「来源引用归属不一致」的领域端口替身。
+    ///
+    /// `work_catalog_get` 读到 Work 后必须立刻校验来源引用归属，因此实际只会调用
+    /// `get` 与 `list_source_refs`；其余方法一律返回明确错误，这样一旦归属校验被
+    /// 挪到 Edition/MediaItem 读取之后，本测试会以 `UNUSED_TEST_PORT` 而不是静默
+    /// 通过来暴露问题。
+    struct ForeignSourceRefPorts {
+        work: Work,
+        source_refs: Vec<WorkSourceRef>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkRepository for ForeignSourceRefPorts {
+        async fn get(&self, id: WorkId) -> Result<Option<Work>, AppError> {
+            Ok((self.work.id == id).then(|| self.work.clone()))
+        }
+        async fn list_source_refs(&self, _work_id: WorkId) -> Result<Vec<WorkSourceRef>, AppError> {
+            Ok(self.source_refs.clone())
+        }
+        async fn save(&self, _work: &Work) -> Result<(), AppError> {
+            Err(test_port_unused())
+        }
+        async fn list(&self, _limit: u32, _offset: u32) -> Result<Vec<Work>, AppError> {
+            Err(test_port_unused())
+        }
+        async fn list_sorted(
+            &self,
+            _order: haven_domain::contracts::WorkOrder,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<Vec<Work>, AppError> {
+            Err(test_port_unused())
+        }
+        async fn list_filtered(
+            &self,
+            _order: haven_domain::contracts::WorkOrder,
+            _category: Option<haven_domain::enums::ContentCategory>,
+            _media_types: Option<&[MediaType]>,
+            _query: Option<&str>,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<Vec<Work>, AppError> {
+            Err(test_port_unused())
+        }
+        async fn count_filtered(
+            &self,
+            _category: Option<haven_domain::enums::ContentCategory>,
+            _media_types: Option<&[MediaType]>,
+            _query: Option<&str>,
+        ) -> Result<u64, AppError> {
+            Err(test_port_unused())
+        }
+        async fn delete(&self, _id: WorkId) -> Result<bool, AppError> {
+            Err(test_port_unused())
+        }
+        async fn id_for_source_ref(
+            &self,
+            _provider: &str,
+            _external_id: &str,
+        ) -> Result<Option<WorkId>, AppError> {
+            Err(test_port_unused())
+        }
+        async fn has_any_source_ref(&self, _id: WorkId) -> Result<bool, AppError> {
+            Err(test_port_unused())
+        }
+        async fn save_source_ref(
+            &self,
+            _provider: &str,
+            _external_id: &str,
+            _work_id: WorkId,
+        ) -> Result<(), AppError> {
+            Err(test_port_unused())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EditionRepository for ForeignSourceRefPorts {
+        async fn get(&self, _id: EditionId) -> Result<Option<Edition>, AppError> {
+            Err(test_port_unused())
+        }
+        async fn save(&self, _edition: &Edition) -> Result<(), AppError> {
+            Err(test_port_unused())
+        }
+        async fn list_by_work(&self, _work_id: WorkId) -> Result<Vec<Edition>, AppError> {
+            Err(test_port_unused())
+        }
+        async fn delete(&self, _id: EditionId) -> Result<bool, AppError> {
+            Err(test_port_unused())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EditionProfileRepository for ForeignSourceRefPorts {
+        async fn get(&self, _edition_id: EditionId) -> Result<Option<EditionProfile>, AppError> {
+            Err(test_port_unused())
+        }
+        async fn save(
+            &self,
+            _edition_id: EditionId,
+            _profile: &EditionProfile,
+        ) -> Result<(), AppError> {
+            Err(test_port_unused())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MediaItemRepository for ForeignSourceRefPorts {
+        async fn get(&self, _id: MediaItemId) -> Result<Option<MediaItem>, AppError> {
+            Err(test_port_unused())
+        }
+        async fn save(&self, _item: &MediaItem) -> Result<(), AppError> {
+            Err(test_port_unused())
+        }
+        async fn list_by_edition(
+            &self,
+            _edition_id: EditionId,
+        ) -> Result<Vec<MediaItem>, AppError> {
+            Err(test_port_unused())
+        }
+        async fn delete(&self, _id: MediaItemId) -> Result<bool, AppError> {
+            Err(test_port_unused())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChapterSourceRepository for ForeignSourceRefPorts {
+        async fn get(
+            &self,
+            _identity: &ChapterSourceIdentity,
+        ) -> Result<Option<ChapterSourceRef>, AppError> {
+            Err(test_port_unused())
+        }
+        async fn list_for_media_item(
+            &self,
+            _media_item_id: MediaItemId,
+        ) -> Result<Vec<ChapterSourceRef>, AppError> {
+            Err(test_port_unused())
+        }
+        async fn list_for_source_work(
+            &self,
+            _source_key: &str,
+            _remote_work_id: &str,
+        ) -> Result<Vec<ChapterSourceRef>, AppError> {
+            Err(test_port_unused())
+        }
+        async fn refresh_state(
+            &self,
+            _source_key: &str,
+            _remote_work_id: &str,
+        ) -> Result<Option<haven_domain::comic_catalog::ComicChapterCatalogState>, AppError>
+        {
+            Err(test_port_unused())
+        }
+        async fn save(&self, _reference: &ChapterSourceRef) -> Result<(), AppError> {
+            Err(test_port_unused())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ResourceRepository for ForeignSourceRefPorts {
+        async fn get(&self, _id: ResourceId) -> Result<Option<Resource>, AppError> {
+            Err(test_port_unused())
+        }
+        async fn save(&self, _resource: &Resource) -> Result<(), AppError> {
+            Err(test_port_unused())
+        }
+        async fn list_by_media_item(
+            &self,
+            _media_item_id: MediaItemId,
+        ) -> Result<Vec<Resource>, AppError> {
+            Err(test_port_unused())
+        }
+        async fn delete(&self, _id: ResourceId) -> Result<bool, AppError> {
+            Err(test_port_unused())
+        }
+        async fn mark_unavailable_by_storage(
+            &self,
+            _storage_location_id: StorageLocationId,
+            _availability: Availability,
+        ) -> Result<u64, AppError> {
+            Err(test_port_unused())
+        }
+        async fn delete_by_storage(
+            &self,
+            _storage_location_id: StorageLocationId,
+        ) -> Result<u64, AppError> {
+            Err(test_port_unused())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ComicProgressSubjectRepository for ForeignSourceRefPorts {
+        async fn get(
+            &self,
+            _id: ComicProgressSubjectId,
+        ) -> Result<Option<ComicProgressSubject>, AppError> {
+            Err(test_port_unused())
+        }
+        async fn get_for_media_item(
+            &self,
+            _media_item_id: MediaItemId,
+        ) -> Result<Option<ComicProgressSubjectMember>, AppError> {
+            Err(test_port_unused())
+        }
+        async fn list_members(
+            &self,
+            _subject_id: ComicProgressSubjectId,
+        ) -> Result<Vec<ComicProgressSubjectMember>, AppError> {
+            Err(test_port_unused())
+        }
+        async fn save_subject(&self, _subject: &ComicProgressSubject) -> Result<(), AppError> {
+            Err(test_port_unused())
+        }
+        async fn save_member(&self, _member: &ComicProgressSubjectMember) -> Result<(), AppError> {
+            Err(test_port_unused())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProgressRepository for ForeignSourceRefPorts {
+        async fn get_for_media_item(
+            &self,
+            _media_item_id: MediaItemId,
+        ) -> Result<Option<Progress>, AppError> {
+            Err(test_port_unused())
+        }
+        async fn save(&self, _progress: &Progress) -> Result<(), AppError> {
+            Err(test_port_unused())
+        }
+        async fn save_if_revision(
+            &self,
+            _progress: &Progress,
+            _expected_revision: Option<&str>,
+        ) -> Result<Option<String>, AppError> {
+            Err(test_port_unused())
+        }
+        async fn mark_completed(&self, _progress: &Progress) -> Result<String, AppError> {
+            Err(test_port_unused())
+        }
+        async fn recent(&self, _limit: u32) -> Result<Vec<Progress>, AppError> {
+            Err(test_port_unused())
+        }
+    }
+
+    #[tokio::test]
+    async fn comic_catalog_work_level_rejects_source_refs_from_another_work() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repos = Arc::new(SqliteRepositories::new(db));
+
+        let work_id = WorkId::new();
+        let foreign_work_id = WorkId::new();
+        let service = work_catalog_service_over_ports(
+            repos,
+            Arc::new(ForeignSourceRefPorts {
+                work: test_work(work_id),
+                source_refs: vec![WorkSourceRef {
+                    provider: "mangadex".to_owned(),
+                    external_id: "manga-1".to_owned(),
+                    work_id: foreign_work_id,
+                }],
+            }),
+            None,
+        );
+
+        let error = service
+            .work_catalog_get(ComicWorkChapterCatalogRequest {
+                work_id: Some(work_id),
+                media_item_id: None,
+            })
+            .await
+            .expect_err("越界来源引用必须返回稳定错误");
+        assert_eq!(error.code().as_str(), "DATABASE_ERROR");
+        assert_eq!(error.kind(), ErrorKind::Database);
+        assert!(error.retryable());
+        // 错误本身不得泄漏其它 Work 的来源身份。
+        let reported = format!("{error}");
+        assert!(!reported.contains("manga-1"));
+        assert!(!reported.contains(&foreign_work_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn comic_catalog_work_level_keeps_current_media_item_after_content_merge() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repos = Arc::new(SqliteRepositories::new(db));
+        let service = work_catalog_service(repos.clone(), None);
+
+        let work_id = WorkId::new();
+        seed_work(&repos, "漫画 F", work_id).await;
+        let edition_id = EditionId::new();
+        seed_edition(&repos, work_id, MediaType::Comic, Some("zh-cn"), edition_id).await;
+
+        let current = MediaItemId::new();
+        let mirrored = MediaItemId::new();
+        seed_media_item(&repos, edition_id, MediaType::Comic, current, Some(1.0)).await;
+        seed_media_item(&repos, edition_id, MediaType::Comic, mirrored, Some(1.0)).await;
+        // 同一权威内容 key：两条 MediaItem 真正归并。
+        seed_source_ref(
+            &repos,
+            current,
+            "chapter-a",
+            0,
+            ComicChapterSourceStatus::Available,
+            Some("content-key"),
+        )
+        .await;
+        seed_source_ref(
+            &repos,
+            mirrored,
+            "chapter-b",
+            1,
+            ComicChapterSourceStatus::Available,
+            Some("content-key"),
+        )
+        .await;
+        // 本地可打开资源只落在另一个成员上，确保“当前项代表该章”必须真的生效。
+        seed_local_resource(&repos, mirrored, Availability::Available).await;
+
+        let catalog = service
+            .work_catalog_get(ComicWorkChapterCatalogRequest {
+                work_id: None,
+                media_item_id: Some(current),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(catalog.current_media_item_id, Some(current));
+        assert_eq!(
+            catalog.chapters.len(),
+            1,
+            "权威内容 key 相同必须归并为一个章节"
+        );
+        assert_eq!(catalog.chapters[0].sources.len(), 2);
+        assert!(
+            catalog
+                .chapters
+                .iter()
+                .any(|chapter| chapter.media_item_id == current),
+            "media_item 请求必须能在返回章节里定位当前项"
+        );
+        assert_eq!(
+            catalog.chapters[0].media_item_id, current,
+            "当前读取上下文优先代表该章，即使本地资源在另一个成员上"
         );
     }
 
