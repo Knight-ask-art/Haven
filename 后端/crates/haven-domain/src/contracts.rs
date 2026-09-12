@@ -8,7 +8,7 @@ use async_trait::async_trait;
 
 use haven_common::{AppError, ErrorKind};
 
-use crate::comic_catalog::ComicChapterCatalogState;
+use crate::comic_catalog::{ComicCatalogRefreshReceipt, ComicChapterCatalogState};
 use crate::comic_identity::{
     ChapterSourceIdentity, ChapterSourceRef, ComicPageIdentitySnapshot,
     ComicProgressMigrationSnapshot, EditionProfile, PageIdentity,
@@ -265,6 +265,19 @@ pub trait ComicProgressMigrationRepository: Send + Sync {
         id: ComicProgressMigrationId,
         expected_applied_revision: &str,
     ) -> Result<bool, AppError>;
+}
+
+/// 漫画目录刷新 Receipt 的只读契约。
+///
+/// Receipt 是 append-only 的来源观察事实。Work 级章节聚合只读取它来投影
+/// 聚合根的刷新状态/覆盖度，不会因为读取而触发或伪造一次刷新；没有实现该
+/// 契约的组装层保持空 receipts，聚合根回落到 `NeverSynced`。
+#[async_trait]
+pub trait ComicCatalogRefreshOutcomeRepository: Send + Sync {
+    async fn list_by_work(
+        &self,
+        work_id: WorkId,
+    ) -> Result<Vec<ComicCatalogRefreshReceipt>, AppError>;
 }
 
 /// 漫画进度主体与成员映射的持久化契约。

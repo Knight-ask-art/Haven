@@ -12,10 +12,11 @@ use haven_domain::comic_identity::{
 };
 use haven_domain::comic_progress_subject::{ComicProgressSubject, ComicProgressSubjectMember};
 use haven_domain::contracts::{
-    ChapterSourceRepository, ComicPageIdentityRepository, ComicProgressMigrationRepository,
-    EditionProfileRepository, EditionRepository, EnrichmentRepository, FavoriteRepository,
-    MarkerRepository, MediaItemRepository, ProgressRepository, ResourceRepository,
-    SettingsRepository, StorageLocationRepository, WorkRepository,
+    ChapterSourceRepository, ComicCatalogRefreshOutcomeRepository, ComicPageIdentityRepository,
+    ComicProgressMigrationRepository, ComicProgressSubjectRepository, EditionProfileRepository,
+    EditionRepository, EnrichmentRepository, FavoriteRepository, MarkerRepository,
+    MediaItemRepository, ProgressRepository, ResourceRepository, SettingsRepository,
+    StorageLocationRepository, WorkRepository,
 };
 use haven_domain::entities::{Edition, FavoriteTarget, MediaItem, Progress, Resource, Work};
 use haven_domain::ids::{ComicCatalogRefreshId, ComicProgressMigrationId, MediaItemId, WorkId};
@@ -169,6 +170,87 @@ impl<T> SourceImportPorts for T where
         + haven_domain::contracts::ImageProxyRepository
         + Send
         + Sync
+{
+}
+
+/// Work 级漫画章节只读聚合所需端口。
+///
+/// 聚合只读取 Work（含 `list_source_refs`）、Edition 画像、MediaItem、
+/// ChapterSourceRef、Resource、ComicProgressSubject、Progress 和刷新 Receipt；
+/// 任何写入、事务或网络读取都不在该用例内。MSRV 1.85 无 trait upcasting，因此
+/// 逐个提供 `as_*` 访问方法（与 `SourceRegistryPorts::as_settings` 同规则）。
+pub trait ComicCatalogWorkPorts:
+    WorkRepository
+    + EditionRepository
+    + EditionProfileRepository
+    + MediaItemRepository
+    + ChapterSourceRepository
+    + ResourceRepository
+    + ComicProgressSubjectRepository
+    + ProgressRepository
+    + Send
+    + Sync
+{
+    fn as_work(&self) -> &(dyn WorkRepository + Send + Sync);
+    fn as_edition(&self) -> &dyn EditionRepository;
+    fn as_edition_profile(&self) -> &dyn EditionProfileRepository;
+    fn as_media_item(&self) -> &dyn MediaItemRepository;
+    fn as_chapter_source(&self) -> &dyn ChapterSourceRepository;
+    fn as_resource(&self) -> &(dyn ResourceRepository + Send + Sync);
+    fn as_comic_progress_subject(&self) -> &dyn ComicProgressSubjectRepository;
+    fn as_progress(&self) -> &(dyn ProgressRepository + Send + Sync);
+}
+
+impl<T> ComicCatalogWorkPorts for T
+where
+    T: WorkRepository
+        + EditionRepository
+        + EditionProfileRepository
+        + MediaItemRepository
+        + ChapterSourceRepository
+        + ResourceRepository
+        + ComicProgressSubjectRepository
+        + ProgressRepository
+        + Send
+        + Sync,
+{
+    fn as_work(&self) -> &(dyn WorkRepository + Send + Sync) {
+        self
+    }
+    fn as_edition(&self) -> &dyn EditionRepository {
+        self
+    }
+    fn as_edition_profile(&self) -> &dyn EditionProfileRepository {
+        self
+    }
+    fn as_media_item(&self) -> &dyn MediaItemRepository {
+        self
+    }
+    fn as_chapter_source(&self) -> &dyn ChapterSourceRepository {
+        self
+    }
+    fn as_resource(&self) -> &(dyn ResourceRepository + Send + Sync) {
+        self
+    }
+    fn as_comic_progress_subject(&self) -> &dyn ComicProgressSubjectRepository {
+        self
+    }
+    fn as_progress(&self) -> &(dyn ProgressRepository + Send + Sync) {
+        self
+    }
+}
+
+/// 可选的漫画目录刷新 Receipt 读取端口。
+///
+/// 没有实现 `ComicCatalogRefreshOutcomeRepository` 的组装层不注入该端口，
+/// 聚合根保持空 receipts 并回落到 `NeverSynced`（或按 refresh_state 推导）。
+pub trait ComicCatalogRefreshReceiptPort:
+    ComicCatalogRefreshOutcomeRepository + Send + Sync
+{
+}
+
+impl<T> ComicCatalogRefreshReceiptPort for T where
+    T: ComicCatalogRefreshOutcomeRepository + Send + Sync
 {
 }
 
