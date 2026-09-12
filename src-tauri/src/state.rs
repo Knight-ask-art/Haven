@@ -26,8 +26,9 @@ use haven_application::services::history::HistoryService;
 use haven_application::services::home::HomeService;
 use haven_application::services::library::LibraryService;
 use haven_application::services::marker::MarkerService;
-use haven_application::services::ports::SourceImportPorts;
-use haven_application::services::ports::SourceRegistryPorts;
+use haven_application::services::ports::{
+    ComicCatalogRefreshReceiptPort, ComicCatalogWorkPorts, SourceImportPorts, SourceRegistryPorts,
+};
 use haven_application::services::progress::ProgressService;
 use haven_application::services::reader_search::ReaderSearchService;
 use haven_application::services::reader_toc::ReaderTocService;
@@ -322,7 +323,11 @@ impl AppState {
         );
         let registered_chapters: Arc<dyn haven_domain::contracts::ChapterSourceRepository> =
             repos.clone();
-        let comic_catalog = ComicCatalogService::new(source_import.clone(), registered_chapters);
+        let comic_catalog_ports: Arc<dyn ComicCatalogWorkPorts> = repos.clone();
+        let comic_catalog_receipts: Arc<dyn ComicCatalogRefreshReceiptPort> = repos.clone();
+        let comic_catalog = ComicCatalogService::new(source_import.clone(), registered_chapters)
+            .with_work_catalog_ports(comic_catalog_ports)
+            .with_refresh_receipt_port(comic_catalog_receipts);
         // V2-F（契约 §36.8）：enrichment 流水线 + 扫描 Completed 钩子。
         let enrich_ports: Arc<dyn haven_application::services::ports::EnrichmentPorts> =
             repos.clone();

@@ -41,6 +41,8 @@
     "allow-session-open",
     "allow-session-close",
     "allow-comic-page-manifest-get",
+    "allow-comic-work-chapter-catalog-get",
+    "allow-comic-work-chapter-catalog-refresh",
     "allow-comic-chapter-catalog-get",
     "allow-comic-chapter-catalog-registered-get",
     "allow-comic-chapter-catalog-refresh",

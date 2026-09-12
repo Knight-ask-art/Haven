@@ -172,6 +172,16 @@ define_commands!(
         commands::comic::comic_page_manifest_get
     ),
     (
+        "comic_work_chapter_catalog_get",
+        "allow-comic-work-chapter-catalog-get",
+        commands::comic::comic_work_chapter_catalog_get
+    ),
+    (
+        "comic_work_chapter_catalog_refresh",
+        "allow-comic-work-chapter-catalog-refresh",
+        commands::comic::comic_work_chapter_catalog_refresh
+    ),
+    (
         "comic_chapter_catalog_get",
         "allow-comic-chapter-catalog-get",
         commands::comic::comic_chapter_catalog_get
@@ -432,3 +442,25 @@ define_commands!(
         commands::video_screenshot::video_screenshot_cancel
     )
 );
+
+#[cfg(test)]
+mod command_manifest_tests {
+    #[test]
+    fn comic_work_catalog_commands_are_registered_once() {
+        let names: Vec<&str> = super::TARGET_COMMAND_NAMES.to_vec();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| **name == "comic_work_chapter_catalog_get")
+                .count(),
+            1
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| **name == "comic_work_chapter_catalog_refresh")
+                .count(),
+            1
+        );
+    }
+}

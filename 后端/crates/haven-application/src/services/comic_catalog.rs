@@ -114,26 +114,11 @@ impl ComicCatalogService {
         &self,
         request: ComicWorkChapterCatalogRequest,
     ) -> Result<ComicWorkChapterCatalog, AppError> {
+        let (work_id, current_media_item_id) = self.resolve_work_target(request).await?;
         let ports = self
             .work_ports
             .as_ref()
             .ok_or_else(work_catalog_ports_unavailable)?;
-
-        let (work_id, current_media_item_id) = match (request.work_id, request.media_item_id) {
-            (Some(work_id), None) => (work_id, None),
-            (None, Some(media_item_id)) => (
-                resolve_work_for_comic_media_item(&**ports, media_item_id).await?,
-                Some(media_item_id),
-            ),
-            _ => {
-                return Err(AppError::new(
-                    "INVALID_ARGUMENT",
-                    ErrorKind::Validation,
-                    "work_id 与 media_item_id 必须严格二选一",
-                    false,
-                ));
-            }
-        };
 
         if WorkRepository::get(ports.as_work(), work_id)
             .await?
@@ -364,6 +349,20 @@ impl ComicCatalogService {
         })
     }
 
+    /// Refresh the Work addressed by a local WorkId or MediaItemId request.
+    ///
+    /// The command boundary parses the strings into canonical local IDs; this
+    /// method repeats the strict target resolution in Application so callers
+    /// cannot accidentally refresh a different Work or bypass the comic
+    /// MediaItem ownership checks.
+    pub async fn work_catalog_refresh_for_target(
+        &self,
+        request: ComicWorkChapterCatalogRequest,
+    ) -> Result<ComicWorkChapterCatalogRefreshResult, AppError> {
+        let (work_id, _) = self.resolve_work_target(request).await?;
+        self.work_catalog_refresh(work_id).await
+    }
+
     /// 读取 SQLite 中已经登记的章节，不访问 Provider，也不隐式刷新目录。
     ///
     /// 该查询故意与 Provider 观察目录分开：前者可能包含尚未入库的章节，
@@ -399,6 +398,36 @@ impl ComicCatalogService {
             .refresh_comic_chapter_catalog(&request.source_id, &request.remote_work_id)
             .await?;
         Ok(catalog_to_dto(&catalog))
+    }
+
+    /// Resolve exactly one local Work/MediaItem target and, for the latter,
+    /// verify that its Edition is a comic Edition before returning its Work.
+    async fn resolve_work_target(
+        &self,
+        request: ComicWorkChapterCatalogRequest,
+    ) -> Result<(WorkId, Option<MediaItemId>), AppError> {
+        match (request.work_id, request.media_item_id) {
+            (Some(work_id), None) => {
+                self.work_ports
+                    .as_ref()
+                    .ok_or_else(work_catalog_ports_unavailable)?;
+                Ok((work_id, None))
+            }
+            (None, Some(media_item_id)) => {
+                let ports = self
+                    .work_ports
+                    .as_ref()
+                    .ok_or_else(work_catalog_ports_unavailable)?;
+                let work_id = resolve_work_for_comic_media_item(&**ports, media_item_id).await?;
+                Ok((work_id, Some(media_item_id)))
+            }
+            _ => Err(AppError::new(
+                "INVALID_ARGUMENT",
+                ErrorKind::Validation,
+                "work_id 与 media_item_id 必须严格二选一",
+                false,
+            )),
+        }
     }
 }
 
