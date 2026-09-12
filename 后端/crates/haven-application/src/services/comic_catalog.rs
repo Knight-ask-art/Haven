@@ -33,13 +33,17 @@ use haven_domain::entities::{Edition, MediaItem};
 use haven_domain::enums::MediaType;
 use haven_domain::ids::{EditionId, MediaItemId, WorkId};
 
+use super::comic_progress_migration::{chapter_match_to_dto, source_identity_to_dto};
 use super::ports::{ComicCatalogRefreshReceiptPort, ComicCatalogWorkPorts};
 use super::source_import::{SourceImportService, is_recordable_comic_refresh_failure};
 use crate::wire::{
-    ComicChapterAvailabilityDto, ComicChapterCatalogDto, ComicChapterCatalogGetRequest,
-    ComicChapterCatalogItemDto, ComicChapterCatalogRefreshStateDto, ComicChapterSourceStatusDto,
-    ComicColorModeDto, ComicEditionFacetKindDto, ComicEditionProfileDto,
-    ComicRegisteredChapterCatalogDto, ComicRegisteredChapterCatalogItemDto, ComicScanGroupKindDto,
+    ComicCatalogRefreshOutcomeStatusDto, ComicCatalogRefreshReceiptDto,
+    ComicChapterAggregateStatusDto, ComicChapterAvailabilityDto, ComicChapterCatalogDto,
+    ComicChapterCatalogGetRequest, ComicChapterCatalogItemDto, ComicChapterCatalogRefreshStateDto,
+    ComicChapterSourceStatusDto, ComicChapterSourceSummaryDto, ComicColorModeDto,
+    ComicEditionFacetKindDto, ComicEditionProfileDto, ComicRegisteredChapterCatalogDto,
+    ComicRegisteredChapterCatalogItemDto, ComicScanGroupKindDto, ComicWorkCatalogStatusDto,
+    ComicWorkChapterCatalogDto, ComicWorkChapterDto, ComicWorkEditionDto,
 };
 
 /// Work 级漫画章节只读聚合的请求。
@@ -506,6 +510,214 @@ pub fn catalog_to_dto(catalog: &ComicChapterCatalog) -> ComicChapterCatalogDto {
         total: catalog.total,
         truncated: catalog.truncated,
         chapters: catalog.chapters.iter().map(chapter_to_dto).collect(),
+    }
+}
+
+/// 将 Work 级领域聚合投影成 Reader 与 Media Detail 共用的安全 DTO。
+///
+/// Domain 已经计算好了章节顺序、来源归并和导航关系；这里仅做字段投影，绝不
+/// 重新排序或依据章节号推导上一章/下一章。Progress 通过既有安全 mapper 投影，
+/// 因此 locator 仍只会是受控的漫画页位置，不会把 Resource 或 Provider 运行时
+/// 数据带入 Wire。
+pub fn work_catalog_to_dto(
+    catalog: &ComicWorkChapterCatalog,
+) -> Result<ComicWorkChapterCatalogDto, AppError> {
+    let editions = catalog
+        .editions
+        .iter()
+        .map(|(edition_id, profile)| {
+            let chapter_count = catalog
+                .chapters
+                .iter()
+                .filter(|chapter| chapter.edition_id == *edition_id)
+                .count();
+            Ok(ComicWorkEditionDto {
+                edition_id: edition_id.to_string(),
+                profile: profile_to_dto(profile),
+                display_label: edition_display_label(profile),
+                chapter_count: u32::try_from(chapter_count).map_err(|_| {
+                    AppError::new(
+                        "COMIC_CATALOG_TOO_LARGE",
+                        ErrorKind::Validation,
+                        "漫画版本章节数量超出范围",
+                        false,
+                    )
+                })?,
+            })
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+
+    let chapters = catalog
+        .chapters
+        .iter()
+        .map(work_chapter_to_dto)
+        .collect::<Result<Vec<_>, AppError>>()?;
+
+    Ok(ComicWorkChapterCatalogDto {
+        schema_version: 1,
+        work_id: catalog.work_id.to_string(),
+        current_media_item_id: catalog.current_media_item_id.map(|id| id.to_string()),
+        editions,
+        chapters,
+        refresh_status: work_catalog_status_to_dto(catalog.refresh_status),
+        last_observed_at: catalog
+            .last_observed_at
+            .map(crate::mapper::time::utc_millis_to_rfc3339),
+        truncated: catalog.truncated,
+        refresh_receipts: catalog
+            .refresh_receipts
+            .iter()
+            .map(refresh_receipt_to_dto)
+            .collect(),
+    })
+}
+
+fn work_chapter_to_dto(
+    chapter: &haven_domain::comic_catalog::ComicWorkChapter,
+) -> Result<ComicWorkChapterDto, AppError> {
+    Ok(ComicWorkChapterDto {
+        media_item_id: chapter.media_item_id.to_string(),
+        edition_id: chapter.edition_id.to_string(),
+        subject_id: chapter.subject_id.map(|id| id.to_string()),
+        chapter_number: chapter.chapter_number,
+        volume_number: chapter.volume_number,
+        title: chapter.title.clone(),
+        published_at: chapter.published_at.clone(),
+        page_count: chapter.page_count,
+        status: chapter_aggregate_status_to_dto(chapter.status),
+        can_open: chapter.can_open,
+        sources: chapter.sources.iter().map(source_summary_to_dto).collect(),
+        match_result: chapter
+            .match_result
+            .clone()
+            .map(chapter_match_to_dto)
+            .transpose()?,
+        progress: chapter
+            .progress
+            .as_ref()
+            .map(crate::mapper::progress::progress_summary)
+            .transpose()?,
+        previous_media_item_id: chapter.previous_media_item_id.map(|id| id.to_string()),
+        next_media_item_id: chapter.next_media_item_id.map(|id| id.to_string()),
+        backend_order: chapter.backend_order,
+    })
+}
+
+fn source_summary_to_dto(
+    source: &haven_domain::comic_catalog::ComicChapterSourceSummary,
+) -> ComicChapterSourceSummaryDto {
+    ComicChapterSourceSummaryDto {
+        source: source_identity_to_dto(&source.identity),
+        status: source_status_to_dto(source.status),
+        mirror_label: source.mirror_label.clone(),
+        observed_at: source
+            .observed_at
+            .map(crate::mapper::time::utc_millis_to_rfc3339),
+        source_order: source.source_order,
+    }
+}
+
+fn refresh_receipt_to_dto(receipt: &ComicCatalogRefreshReceipt) -> ComicCatalogRefreshReceiptDto {
+    ComicCatalogRefreshReceiptDto {
+        refresh_id: receipt.id.to_string(),
+        work_id: receipt.work_id.to_string(),
+        source_id: receipt.source_key.clone(),
+        remote_work_id: receipt.remote_work_id.clone(),
+        status: refresh_outcome_status_to_dto(receipt.status),
+        generation_before: receipt.generation_before,
+        generation_after: receipt.generation_after,
+        observed_from: receipt.observed_from.clone(),
+        observed_to: receipt.observed_to.clone(),
+        truncated: receipt.truncated,
+        retained_previous_catalog: receipt.retained_previous_catalog,
+        error_code: receipt.error_code.clone(),
+        observed_at: crate::mapper::time::utc_millis_to_rfc3339(receipt.observed_at),
+    }
+}
+
+fn edition_display_label(profile: &EditionProfile) -> String {
+    let mut parts = Vec::new();
+    if let IdentityFacet::Known(value) = &profile.language {
+        parts.push(value.clone());
+    }
+    if let IdentityFacet::Known(value) = &profile.translation_line {
+        parts.push(value.clone());
+    }
+    match &profile.scan_group {
+        ScanGroupFacet::ContentLine(value) | ScanGroupFacet::MirrorLabel(value) => {
+            parts.push(value.clone())
+        }
+        ScanGroupFacet::Unknown | ScanGroupFacet::NotApplicable => {}
+    }
+    match profile.color_mode {
+        ColorMode::FullColor => parts.push("color".to_owned()),
+        ColorMode::Grayscale => parts.push("grayscale".to_owned()),
+        ColorMode::Mixed => parts.push("mixed".to_owned()),
+        ColorMode::Unknown => {}
+    }
+    if parts.is_empty() {
+        "Unspecified edition".to_owned()
+    } else {
+        parts.join(" / ")
+    }
+}
+
+fn chapter_aggregate_status_to_dto(
+    value: haven_domain::comic_catalog::ComicChapterAggregateStatus,
+) -> ComicChapterAggregateStatusDto {
+    match value {
+        haven_domain::comic_catalog::ComicChapterAggregateStatus::Available => {
+            ComicChapterAggregateStatusDto::Available
+        }
+        haven_domain::comic_catalog::ComicChapterAggregateStatus::TemporarilyUnavailable => {
+            ComicChapterAggregateStatusDto::TemporarilyUnavailable
+        }
+        haven_domain::comic_catalog::ComicChapterAggregateStatus::ExternalOnly => {
+            ComicChapterAggregateStatusDto::ExternalOnly
+        }
+        haven_domain::comic_catalog::ComicChapterAggregateStatus::Unknown => {
+            ComicChapterAggregateStatusDto::Unknown
+        }
+        haven_domain::comic_catalog::ComicChapterAggregateStatus::Missing => {
+            ComicChapterAggregateStatusDto::Missing
+        }
+    }
+}
+
+fn refresh_outcome_status_to_dto(
+    value: haven_domain::comic_catalog::ComicCatalogRefreshOutcomeStatus,
+) -> ComicCatalogRefreshOutcomeStatusDto {
+    match value {
+        haven_domain::comic_catalog::ComicCatalogRefreshOutcomeStatus::NeverSynced => {
+            ComicCatalogRefreshOutcomeStatusDto::NeverSynced
+        }
+        haven_domain::comic_catalog::ComicCatalogRefreshOutcomeStatus::Succeeded => {
+            ComicCatalogRefreshOutcomeStatusDto::Succeeded
+        }
+        haven_domain::comic_catalog::ComicCatalogRefreshOutcomeStatus::TemporarilyUnavailable => {
+            ComicCatalogRefreshOutcomeStatusDto::TemporarilyUnavailable
+        }
+        haven_domain::comic_catalog::ComicCatalogRefreshOutcomeStatus::ExternalOnly => {
+            ComicCatalogRefreshOutcomeStatusDto::ExternalOnly
+        }
+        haven_domain::comic_catalog::ComicCatalogRefreshOutcomeStatus::Unknown => {
+            ComicCatalogRefreshOutcomeStatusDto::Unknown
+        }
+        haven_domain::comic_catalog::ComicCatalogRefreshOutcomeStatus::RefreshFailed => {
+            ComicCatalogRefreshOutcomeStatusDto::RefreshFailed
+        }
+        haven_domain::comic_catalog::ComicCatalogRefreshOutcomeStatus::Truncated => {
+            ComicCatalogRefreshOutcomeStatusDto::Truncated
+        }
+    }
+}
+
+fn work_catalog_status_to_dto(value: ComicWorkCatalogStatus) -> ComicWorkCatalogStatusDto {
+    match value {
+        ComicWorkCatalogStatus::NeverSynced => ComicWorkCatalogStatusDto::NeverSynced,
+        ComicWorkCatalogStatus::Synced => ComicWorkCatalogStatusDto::Synced,
+        ComicWorkCatalogStatus::RefreshFailed => ComicWorkCatalogStatusDto::RefreshFailed,
+        ComicWorkCatalogStatus::Truncated => ComicWorkCatalogStatusDto::Truncated,
     }
 }
 

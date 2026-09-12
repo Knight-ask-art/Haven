@@ -7,16 +7,14 @@
 use std::sync::Arc;
 
 use haven_common::{AppError, ErrorKind, UtcMillis};
-use haven_domain::comic_identity::{
-    PageIdentity, PageMappingConfidence, PageMappingStrategy, PageMigration,
-    has_opaque_control_character,
-};
+use haven_domain::comic_identity::{PageIdentity, has_opaque_control_character};
 use haven_domain::contracts::ComicPageIdentityRepository;
 use haven_domain::ids::MediaItemId;
 
 use super::comic::PreparedComicPage;
 use super::comic_progress_migration::{
     ComicPageProgressRemapRequest, ComicProgressMigrationResult, ComicProgressMigrationService,
+    unchanged_migration_result,
 };
 use super::ports::ComicProgressMigrationPorts;
 
@@ -75,7 +73,7 @@ impl ComicPageIdentityService {
         if old_snapshot.pages == new_pages {
             return Ok(ComicPageIdentitySyncResult {
                 changed: false,
-                migration: unchanged_result(),
+                migration: unchanged_result(media_item_id),
             });
         }
 
@@ -134,19 +132,8 @@ impl ComicPageIdentityService {
     }
 }
 
-fn unchanged_result() -> ComicProgressMigrationResult {
-    ComicProgressMigrationResult {
-        status: super::comic_progress_migration::ComicProgressMigrationStatus::Unchanged,
-        match_result: None,
-        page_migration: PageMigration {
-            target_page_index: None,
-            confidence: PageMappingConfidence::Low,
-            strategy: PageMappingStrategy::NoTarget,
-            reversible: true,
-        },
-        snapshot_id: None,
-        applied_revision: None,
-    }
+fn unchanged_result(media_item_id: MediaItemId) -> ComicProgressMigrationResult {
+    unchanged_migration_result(media_item_id)
 }
 
 fn validate_expected_revision(value: String) -> Result<String, AppError> {
