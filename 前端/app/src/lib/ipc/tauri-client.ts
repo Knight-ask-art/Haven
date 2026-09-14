@@ -54,6 +54,8 @@ import type {
   ComicChapterCatalogGetRequest,
   ComicChapterCatalogDto,
   ComicRegisteredChapterCatalogDto,
+  ComicWorkChapterCatalogRequestDto,
+  ComicWorkChapterCatalogDto,
   ComicChapterSourceCandidatesDto,
   ComicChapterSourceCandidatesGetRequestDto,
   ComicProgressMigrationRequestDto,
@@ -249,6 +251,26 @@ export class TauriHavenClient implements HavenClient {
   ): Promise<ComicChapterCatalogDto> {
     try {
       return await invoke<ComicChapterCatalogDto>("comic_chapter_catalog_refresh", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async comicWorkChapterCatalogGet(
+    request: ComicWorkChapterCatalogRequestDto,
+  ): Promise<ComicWorkChapterCatalogDto> {
+    try {
+      return await invoke<ComicWorkChapterCatalogDto>("comic_work_chapter_catalog_get", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async comicWorkChapterCatalogRefresh(
+    request: ComicWorkChapterCatalogRequestDto,
+  ): Promise<ComicWorkChapterCatalogDto> {
+    try {
+      return await invoke<ComicWorkChapterCatalogDto>("comic_work_chapter_catalog_refresh", { request });
     } catch (error) {
       throw toHavenError(error);
     }

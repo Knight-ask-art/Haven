@@ -304,7 +304,7 @@ mod tests {
             std::env::temp_dir().join("haven-app-info-cache"),
         );
         let facts = provider.get().unwrap();
-        assert_eq!(facts.database_version, "039_comic_catalog_refresh_outcomes");
+        assert_eq!(facts.database_version, "040_periodicals");
         assert_eq!(facts.source_pack_version.as_deref(), Some("builtin-1"));
         assert!(facts.third_party_notices.is_empty());
         assert_eq!(facts.app_license.as_deref(), Some("MIT"));

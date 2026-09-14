@@ -22,7 +22,8 @@ use haven_domain::comic_identity::{
 };
 use haven_domain::contracts::{
     ChapterSourceRepository, ComicCatalogRefreshOutcomeRepository, EditionProfileRepository,
-    EditionRepository, MediaItemRepository, ResourceRepository, WorkRepository,
+    EditionRepository, MediaItemRepository, PeriodicalRepository, ResourceRepository,
+    WorkRepository,
 };
 use haven_domain::entities::{Edition, MediaIndex, MediaItem, Resource, ResourceLocator, Work};
 use haven_domain::enums::{
@@ -30,12 +31,21 @@ use haven_domain::enums::{
     WorkType,
 };
 use haven_domain::ids::{
-    ComicCatalogRefreshId, EditionId, MediaItemId, ResourceId, SourceId, WorkId,
+    ComicCatalogRefreshId, EditionId, MediaItemId, PeriodicalArticleId, PeriodicalId,
+    PeriodicalIssueId, PeriodicalVolumeId, ResourceId, SourceId, WorkId,
+};
+use haven_domain::periodical::{
+    Issn, Periodical, PeriodicalArticle, PeriodicalArticleSourceIdentity, PeriodicalIssue,
+    PeriodicalPlacement, PeriodicalVolume, normalize_identity_label, periodical_source_ref_key,
 };
 use uuid::Uuid;
 
+use crate::services::periodical::{
+    EUROPE_PMC_SOURCE_KEY, PeriodicalArticleRecord, PeriodicalIssueTree, PeriodicalJournalRecord,
+    PeriodicalProvider, PeriodicalTree, PeriodicalVolumeTree,
+};
 use crate::services::ports::{
-    ComicChapterRefreshPlan, ComicEditionWrite, SourceImportPorts, UnitOfWork,
+    ComicChapterRefreshPlan, ComicEditionWrite, PeriodicalImportPlan, SourceImportPorts, UnitOfWork,
 };
 use crate::services::source_registry::SourceRegistryService;
 use crate::wire::ContentCategory;
@@ -138,6 +148,16 @@ pub struct SourceImportService {
     uow: Arc<dyn UnitOfWork>,
     registry: SourceRegistryService,
     catalog: Arc<dyn SourceCatalogProvider>,
+    /// 专用报刊 Provider + 期刊 Repository。两者必须一起注入：只注入其一会让
+    /// 导入路径既不能建立真实层级，也不能验证既有归属。
+    periodical: Option<PeriodicalImportDeps>,
+}
+
+/// 专用报刊导入依赖（Provider 负责网络，Repository 负责归属读取）。
+#[derive(Clone)]
+struct PeriodicalImportDeps {
+    provider: Arc<dyn PeriodicalProvider>,
+    repository: Arc<dyn PeriodicalRepository>,
 }
 
 /// 入库结果：作品与首个可消费媒体条目。
@@ -170,6 +190,13 @@ pub const CONTENT_CANDIDATE_PREFIX: &str = "content-candidate-";
 /// at this application boundary.
 pub const M3U_SOURCE_ID: &str = "m3u";
 
+/// Periodical imports may race while the first article establishes the
+/// journal's ISSN source reference.  Rebuild the plan once after observing a
+/// write conflict so the loser can converge on the Work/volume/issue that the
+/// winner just committed.  The article record is already provider-validated;
+/// the retry performs no additional network request.
+const MAX_PERIODICAL_IMPORT_ATTEMPTS: usize = 2;
+
 impl SourceImportService {
     pub fn new(
         ports: Arc<dyn SourceImportPorts>,
@@ -182,6 +209,30 @@ impl SourceImportService {
             uow,
             registry,
             catalog,
+            periodical: None,
+        }
+    }
+
+    /// 注入专用报刊 Provider 与期刊 Repository（组合根必须同时提供）。
+    ///
+    /// 未注入时 `europepmc` 保持既有的单篇文章导入行为，不会伪造期刊层级。
+    pub fn with_periodical_source(
+        mut self,
+        provider: Arc<dyn PeriodicalProvider>,
+        repository: Arc<dyn PeriodicalRepository>,
+    ) -> Self {
+        self.periodical = Some(PeriodicalImportDeps {
+            provider,
+            repository,
+        });
+        self
+    }
+
+    fn periodical_deps(&self, source_key: &str) -> Option<&PeriodicalImportDeps> {
+        if source_key == EUROPE_PMC_SOURCE_KEY {
+            self.periodical.as_ref()
+        } else {
+            None
         }
     }
 
@@ -535,6 +586,17 @@ impl SourceImportService {
             WorkRepository::id_for_source_ref(&*self.ports, source_id, external_id).await?
         {
             return self.existing_identity(work_id).await;
+        }
+
+        // 专用报刊来源：先按 期刊 → 卷 → 期 → 文章 建立真实归属。来源没有给出
+        // 可用期刊身份（缺 ISSN/期刊名）时返回 None，回退到既有单篇文章导入，
+        // 绝不按标题推断期刊。
+        if self.periodical_deps(source_id).is_some()
+            && let Some(imported) = self
+                .try_import_periodical_article(source_id, external_id)
+                .await?
+        {
+            return Ok(imported);
         }
 
         // 固定公开来源不使用用户端点；传入空端点只作为 trait 的兼容参数，
@@ -1636,6 +1698,651 @@ impl SourceImportService {
             true,
         ))
     }
+
+    /// 尝试按 期刊 → 卷 → 期 → 文章 建立真实归属。
+    ///
+    /// 返回 `Ok(None)` 表示该来源没有给出可用的期刊身份（缺期刊名或 ISSN），
+    /// 调用方必须回退到既有单篇文章导入，而不是按标题猜期刊。已经导入过的
+    /// 来源文章直接返回既有身份，不重复请求 Provider。
+    async fn try_import_periodical_article(
+        &self,
+        source_key: &str,
+        remote_article_id: &str,
+    ) -> Result<Option<ImportedWork>, AppError> {
+        let Some(deps) = self.periodical_deps(source_key) else {
+            return Ok(None);
+        };
+        if let Some(placement) = deps
+            .repository
+            .find_article_by_source(source_key, remote_article_id)
+            .await?
+        {
+            return Ok(Some(ImportedWork {
+                work_id: placement.work_id(),
+                media_item_id: placement.article.media_item_id,
+            }));
+        }
+
+        let record = deps.provider.article(source_key, remote_article_id).await?;
+        record.validate_identity(source_key, remote_article_id)?;
+        // 期刊身份只能由 ISSN 建立：来源没有给出可用 ISSN 时回退到既有单篇
+        // 导入，绝不按标题猜期刊。
+        if !record
+            .journal
+            .as_ref()
+            .is_some_and(PeriodicalJournalRecord::has_stable_identity)
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.import_periodical_article(deps, source_key, remote_article_id, &record)
+                .await?,
+        ))
+    }
+
+    async fn import_periodical_article(
+        &self,
+        deps: &PeriodicalImportDeps,
+        source_key: &str,
+        remote_article_id: &str,
+        record: &PeriodicalArticleRecord,
+    ) -> Result<ImportedWork, AppError> {
+        for attempt in 0..MAX_PERIODICAL_IMPORT_ATTEMPTS {
+            match self
+                .import_periodical_article_once(deps, source_key, remote_article_id, record)
+                .await
+            {
+                Ok(imported) => return Ok(imported),
+                Err(error) if is_periodical_import_retryable_conflict(&error) => {
+                    // A concurrent import may have committed the same source article before
+                    // returning its conflict to this caller.  Recover that identity first;
+                    // this also makes the retry idempotent for a custom UoW that reports a
+                    // post-commit conflict.
+                    if let Some(placement) = deps
+                        .repository
+                        .find_article_by_source(source_key, remote_article_id)
+                        .await?
+                    {
+                        return Ok(ImportedWork {
+                            work_id: placement.work_id(),
+                            media_item_id: placement.article.media_item_id,
+                        });
+                    }
+                    if attempt + 1 < MAX_PERIODICAL_IMPORT_ATTEMPTS {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("periodical import attempts must be non-zero")
+    }
+
+    /// Build and commit one periodical import plan.  This method intentionally
+    /// has no conflict recovery of its own; the caller owns the single bounded
+    /// retry so every retry rebuilds the identity/volume/issue plan from the
+    /// latest committed database state.
+    async fn import_periodical_article_once(
+        &self,
+        deps: &PeriodicalImportDeps,
+        source_key: &str,
+        remote_article_id: &str,
+        record: &PeriodicalArticleRecord,
+    ) -> Result<ImportedWork, AppError> {
+        let journal = record
+            .journal
+            .as_ref()
+            .ok_or_else(|| source_unavailable("来源报刊条目缺少期刊身份"))?;
+        let now = UtcMillis::now();
+
+        // 同一条目可能先后只带 print 或只带 electronic ISSN，因此两种观察到的
+        // 身份都必须参与匹配：先按来源绑定身份，再按 ISSN 收敛。不能在命中第一个
+        // ISSN 后停止，否则「print 已落在 Work A、electronic 已落在 Work B」时会
+        // 静默选中其中一棵树，把同一期刊拆成两个 Work。
+        let resolved = self
+            .resolve_periodical_identity(deps, source_key, journal)
+            .await?;
+
+        let (work, periodical) = match resolved {
+            // 命中既有期刊时用本次观察补齐缺失的身份/展示事实：后导入的文章
+            // 常常才带来 electronic ISSN 或出版方，收敛必须落在这一个期刊上。
+            Some((work, existing)) => {
+                let enriched = self.enrich_periodical(deps, existing, journal, now).await?;
+                (work, enriched)
+            }
+            None => {
+                let work = new_periodical_work(journal, now);
+                let periodical = Periodical {
+                    id: PeriodicalId::new(),
+                    work_id: work.id,
+                    title: journal.title.clone(),
+                    issn_print: journal.issn_print.clone(),
+                    issn_electronic: journal.issn_electronic.clone(),
+                    publisher: journal.publisher.clone(),
+                    created_at: now,
+                    updated_at: now,
+                };
+                (work, periodical)
+            }
+        };
+
+        // 来源绑定身份必须由**收敛后**的期刊全部身份派生：同一期刊无论来源先给出
+        // print、electronic 还是两者，都绑定到同一个 Work，并且两个 ISSN 都保留。
+        let journal_source_refs = periodical
+            .identities()
+            .into_iter()
+            .map(|issn| {
+                periodical_source_ref_key(source_key, issn)
+                    .ok_or_else(|| source_unavailable("来源期刊身份非法"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if journal_source_refs.is_empty() {
+            return Err(source_unavailable("来源期刊身份非法"));
+        }
+
+        let edition = self.resolve_periodical_edition(&work, now).await?;
+        let volume = deps.resolve_volume(&periodical, record, now).await?;
+        let issue = deps.resolve_issue(&volume, record, now).await?;
+
+        let readable = record.is_readable();
+        let item = MediaItem {
+            id: MediaItemId::new(),
+            edition_id: edition.id,
+            parent_id: None,
+            media_type: MediaType::Article,
+            title: record.title.clone(),
+            index: MediaIndex::Article {
+                ordinal: record.ordinal,
+            },
+            duration_ms: None,
+            page_count: None,
+            chapter_count: None,
+            published_at: issue.publication_date.clone(),
+            status: if readable {
+                MediaItemStatus::Available
+            } else {
+                MediaItemStatus::Unavailable
+            },
+            created_at: now,
+            updated_at: now,
+        };
+        let source_uuid = stable_source_id(source_key)?;
+        validate_remote_source_object(
+            source_key,
+            ResourceType::ArticleSnapshot,
+            remote_article_id,
+        )?;
+        let resource = Resource {
+            id: ResourceId::new(),
+            media_item_id: item.id,
+            resource_type: ResourceType::ArticleSnapshot,
+            source_id: Some(source_uuid),
+            storage_location_id: None,
+            locator: ResourceLocator::SourceObject {
+                source_id: source_uuid,
+                remote_id: remote_article_id.to_owned(),
+            },
+            // 元数据条目没有可读的正文快照，不声明 MIME 也不声明可用。
+            mime_type: if readable {
+                record
+                    .mime_type
+                    .clone()
+                    .or_else(|| Some("text/html; charset=utf-8".to_owned()))
+            } else {
+                None
+            },
+            size: None,
+            hash: None,
+            // 只有来源明确提供全文时才声明可用；metadata-only 条目不得被宣称可读。
+            availability: if readable {
+                Availability::Available
+            } else {
+                Availability::SourceUnavailable
+            },
+            availability_source: AvailabilitySource::User,
+            modified_ms: None,
+            fingerprint_first: None,
+            fingerprint_last: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let article = PeriodicalArticle {
+            id: PeriodicalArticleId::new(),
+            issue_id: issue.id,
+            media_item_id: item.id,
+            ordinal: record.ordinal,
+            title: record.title.clone(),
+            doi: record.doi.clone(),
+            page_range: record.page_range.clone(),
+            source: PeriodicalArticleSourceIdentity::new(source_key, remote_article_id)
+                .ok_or_else(|| source_unavailable("文章来源身份非法"))?,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let plan = PeriodicalImportPlan {
+            source_key: source_key.to_owned(),
+            journal_source_refs,
+            work: Work {
+                updated_at: now,
+                ..work
+            },
+            edition,
+            periodical,
+            volume,
+            issue,
+            article,
+            item,
+            resource,
+        };
+        let work_id = plan.work.id;
+        let media_item_id = plan.item.id;
+        self.uow
+            .run_periodical_import(&plan)
+            .map(|()| ImportedWork {
+                work_id,
+                media_item_id,
+            })
+    }
+
+    /// 用来源本次观察到的期刊事实补齐既有期刊缺失的身份与展示事实。
+    ///
+    /// 只填空缺：既有的 ISSN、标题与出版方是已经建立的身份，不能被后来的观察
+    /// 改写。若某个 ISSN 已被**另一个**期刊占用，必须返回显式身份冲突——把两个
+    /// 期刊合并成一个超出本路径的职责，静默跳过则会让来源引用与期刊身份分裂。
+    async fn enrich_periodical(
+        &self,
+        deps: &PeriodicalImportDeps,
+        existing: Periodical,
+        journal: &PeriodicalJournalRecord,
+        now: UtcMillis,
+    ) -> Result<Periodical, AppError> {
+        let mut enriched = existing.clone();
+        if let Some(issn) = journal.issn_print.as_ref() {
+            match enriched.issn_print.as_ref() {
+                Some(current) if current != issn => {
+                    return Err(periodical_identity_conflict(
+                        "同一期刊的 print ISSN 观察互相冲突",
+                    ));
+                }
+                None => {
+                    self.ensure_journal_issn_available(deps, issn, existing.id)
+                        .await?;
+                    enriched.issn_print = Some(issn.clone());
+                }
+                _ => {}
+            }
+        }
+        if let Some(issn) = journal.issn_electronic.as_ref() {
+            match enriched.issn_electronic.as_ref() {
+                Some(current) if current != issn => {
+                    return Err(periodical_identity_conflict(
+                        "同一期刊的 electronic ISSN 观察互相冲突",
+                    ));
+                }
+                None => {
+                    self.ensure_journal_issn_available(deps, issn, existing.id)
+                        .await?;
+                    enriched.issn_electronic = Some(issn.clone());
+                }
+                _ => {}
+            }
+        }
+        if enriched.issn_print.is_some() && enriched.issn_print == enriched.issn_electronic {
+            return Err(periodical_identity_conflict(
+                "print 与 electronic ISSN 不能是同一个身份",
+            ));
+        }
+        if enriched.publisher.is_none() {
+            enriched.publisher = journal.publisher.clone();
+        }
+        if enriched != existing {
+            enriched.updated_at = now;
+        }
+        Ok(enriched)
+    }
+
+    async fn ensure_journal_issn_available(
+        &self,
+        deps: &PeriodicalImportDeps,
+        issn: &Issn,
+        journal_id: PeriodicalId,
+    ) -> Result<(), AppError> {
+        if deps
+            .repository
+            .find_by_issn(issn)
+            .await?
+            .is_some_and(|other| other.id != journal_id)
+        {
+            return Err(periodical_identity_conflict(
+                "该 ISSN 已属于另一个期刊 Work",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 收集本次观察的全部期刊身份候选。
+    ///
+    /// 来源引用和 ISSN 查询都必须完整扫描，任何候选指向不同 Work/Periodical
+    /// 都是可见的身份冲突；只有没有任何候选时才允许创建新期刊。
+    async fn resolve_periodical_identity(
+        &self,
+        deps: &PeriodicalImportDeps,
+        source_key: &str,
+        journal: &PeriodicalJournalRecord,
+    ) -> Result<Option<(Work, Periodical)>, AppError> {
+        let mut resolved: Option<(Work, Periodical)> = None;
+        for issn in journal_identities(journal) {
+            let source_ref = periodical_source_ref_key(source_key, issn)
+                .ok_or_else(|| source_unavailable("来源期刊身份非法"))?;
+            if let Some(work_id) =
+                WorkRepository::id_for_source_ref(&*self.ports, source_key, &source_ref).await?
+            {
+                let work = self.periodical_journal_work(work_id).await?;
+                let periodical = deps
+                    .repository
+                    .find_by_work(work_id)
+                    .await?
+                    .ok_or_else(|| periodical_hierarchy_missing("期刊来源引用缺少期刊层级"))?;
+                merge_periodical_identity_candidate(&mut resolved, work, periodical)?;
+            }
+
+            if let Some(periodical) = deps.repository.find_by_issn(issn).await? {
+                let work = self.periodical_journal_work(periodical.work_id).await?;
+                merge_periodical_identity_candidate(&mut resolved, work, periodical)?;
+            }
+        }
+        Ok(resolved)
+    }
+
+    async fn periodical_journal_work(&self, work_id: WorkId) -> Result<Work, AppError> {
+        WorkRepository::get(&*self.ports, work_id)
+            .await?
+            .ok_or_else(|| periodical_hierarchy_missing("期刊来源引用指向不存在的作品"))
+    }
+
+    /// 期刊的文章 Edition：同一期刊复用同一个 Article Edition。
+    async fn resolve_periodical_edition(
+        &self,
+        work: &Work,
+        now: UtcMillis,
+    ) -> Result<Edition, AppError> {
+        let existing = EditionRepository::list_by_work(&*self.ports, work.id)
+            .await?
+            .into_iter()
+            .filter(|edition| edition.edition_type == MediaType::Article)
+            .min_by_key(|edition| (edition.created_at.0, edition.id.to_string()));
+        Ok(existing.unwrap_or_else(|| Edition {
+            id: EditionId::new(),
+            work_id: work.id,
+            title: work.canonical_title.clone(),
+            subtitle: None,
+            edition_type: MediaType::Article,
+            release_date: None,
+            language: work.language.clone(),
+            region: None,
+            publisher_or_studio: None,
+            description: work.description.clone(),
+            artwork: Default::default(),
+            created_at: now,
+            updated_at: now,
+        }))
+    }
+
+    /// 读取一篇来源文章的完整期刊归属链（只读；不触发网络）。
+    pub async fn periodical_placement(
+        &self,
+        source_key: &str,
+        remote_article_id: &str,
+    ) -> Result<Option<PeriodicalPlacement>, AppError> {
+        let Some(deps) = self.periodical_deps(source_key) else {
+            return Ok(None);
+        };
+        deps.repository
+            .find_article_by_source(source_key, remote_article_id)
+            .await
+    }
+
+    /// 读取一个作品的期刊层级（只读；不触发网络）。
+    ///
+    /// 这是应用内部的查询能力：公开 Wire 仍然保持既有的搜索/导入形状，不在这里
+    /// 伪造"已接入"的返回树。
+    pub async fn periodical_tree(
+        &self,
+        work_id: WorkId,
+    ) -> Result<Option<PeriodicalTree>, AppError> {
+        let Some(deps) = self.periodical.as_ref() else {
+            return Ok(None);
+        };
+        let Some(periodical) = deps.repository.find_by_work(work_id).await? else {
+            return Ok(None);
+        };
+        let mut volumes = Vec::new();
+        for volume in deps.repository.list_volumes(periodical.id).await? {
+            let mut issues = Vec::new();
+            for issue in deps.repository.list_issues(volume.id).await? {
+                let articles = deps.repository.list_articles(issue.id).await?;
+                issues.push(PeriodicalIssueTree { issue, articles });
+            }
+            volumes.push(PeriodicalVolumeTree { volume, issues });
+        }
+        Ok(Some(PeriodicalTree {
+            periodical,
+            volumes,
+        }))
+    }
+}
+
+impl PeriodicalImportDeps {
+    /// 卷身份由领域层计算；已存在同一身份的卷必须复用，否则重复导入会制造
+    /// 同一卷的多个容器。
+    async fn resolve_volume(
+        &self,
+        periodical: &Periodical,
+        record: &PeriodicalArticleRecord,
+        now: UtcMillis,
+    ) -> Result<PeriodicalVolume, AppError> {
+        let existing = self.repository.list_volumes(periodical.id).await?;
+        let ordinal = u32::try_from(existing.len()).unwrap_or(u32::MAX);
+        let candidate = PeriodicalVolume {
+            id: PeriodicalVolumeId::new(),
+            periodical_id: periodical.id,
+            label: record
+                .volume
+                .as_ref()
+                .and_then(|volume| volume.label.clone()),
+            number: record.volume.as_ref().and_then(|volume| volume.number),
+            year: record
+                .volume
+                .as_ref()
+                .and_then(|volume| volume.year)
+                .or_else(|| {
+                    record
+                        .issue
+                        .as_ref()
+                        .and_then(|issue| issue.publication_year())
+                }),
+            ordinal,
+            created_at: now,
+            updated_at: now,
+        };
+        let matches: Vec<&PeriodicalVolume> = existing
+            .iter()
+            .filter(|volume| periodical_volume_identity_matches(volume, &candidate))
+            .collect();
+        match matches.as_slice() {
+            [] => Ok(candidate),
+            [existing] => merge_periodical_volume(existing, candidate, now),
+            _ => Err(periodical_identity_conflict(
+                "同一期刊的卷身份观察无法唯一收敛",
+            )),
+        }
+    }
+
+    async fn resolve_issue(
+        &self,
+        volume: &PeriodicalVolume,
+        record: &PeriodicalArticleRecord,
+        now: UtcMillis,
+    ) -> Result<PeriodicalIssue, AppError> {
+        let existing = self.repository.list_issues(volume.id).await?;
+        let ordinal = u32::try_from(existing.len()).unwrap_or(u32::MAX);
+        let candidate = PeriodicalIssue {
+            id: PeriodicalIssueId::new(),
+            volume_id: volume.id,
+            label: record.issue.as_ref().and_then(|issue| issue.label.clone()),
+            number: record.issue.as_ref().and_then(|issue| issue.number),
+            publication_date: record
+                .issue
+                .as_ref()
+                .and_then(|issue| issue.publication_date.clone()),
+            ordinal,
+            created_at: now,
+            updated_at: now,
+        };
+        let matches: Vec<&PeriodicalIssue> = existing
+            .iter()
+            .filter(|issue| periodical_issue_identity_matches(issue, &candidate))
+            .collect();
+        match matches.as_slice() {
+            [] => Ok(candidate),
+            [existing] => merge_periodical_issue(existing, candidate, now),
+            _ => Err(periodical_identity_conflict(
+                "同一卷的期号身份观察无法唯一收敛",
+            )),
+        }
+    }
+}
+
+/// 只把确定描述并发/唯一身份竞争的错误交给期刊导入的单次重建。
+///
+/// `ErrorKind::Database` 过于宽泛：触发器、外键、磁盘满、数据库损坏等都属于
+/// 不应重复执行的真实故障；它们必须原样返回，不能被伪装成并发冲突。SQLite
+/// 期刊表的唯一键冲突在 Repository 中会被映射为 `PERIODICAL_IMPORT_CONFLICT`，
+/// 来源引用和文章身份冲突则使用各自的稳定错误码。
+fn is_periodical_import_retryable_conflict(error: &AppError) -> bool {
+    matches!(
+        error.code().as_str(),
+        "SOURCE_REF_CONFLICT" | "PERIODICAL_ARTICLE_IMPORT_CONFLICT" | "PERIODICAL_IMPORT_CONFLICT"
+    )
+}
+
+fn periodical_volume_identity_matches(left: &PeriodicalVolume, right: &PeriodicalVolume) -> bool {
+    if left.number.is_some() && right.number.is_some() && left.identity() == right.identity() {
+        return true;
+    }
+    let labels_match = left
+        .label
+        .as_deref()
+        .map(normalize_identity_label)
+        .zip(right.label.as_deref().map(normalize_identity_label))
+        .is_some_and(|(left, right)| !left.is_empty() && left == right);
+    labels_match
+        || (left.number.is_none()
+            && left.label.is_none()
+            && right.number.is_none()
+            && right.label.is_none())
+}
+
+fn merge_periodical_volume(
+    existing: &PeriodicalVolume,
+    candidate: PeriodicalVolume,
+    now: UtcMillis,
+) -> Result<PeriodicalVolume, AppError> {
+    if existing.periodical_id != candidate.periodical_id {
+        return Err(periodical_identity_conflict("卷的期刊归属观察互相冲突"));
+    }
+    if let (Some(_current), Some(_observed)) = (existing.number, candidate.number)
+        && existing.identity() != candidate.identity()
+    {
+        return Err(periodical_identity_conflict("同一卷的卷号观察互相冲突"));
+    }
+    if let (Some(current), Some(observed)) = (existing.year, candidate.year)
+        && current != observed
+    {
+        return Err(periodical_identity_conflict("同一卷的年份观察互相冲突"));
+    }
+
+    let mut merged = existing.clone();
+    if merged.label.is_none() {
+        merged.label = candidate.label;
+    }
+    if merged.number.is_none() {
+        merged.number = candidate.number;
+    }
+    if merged.year.is_none() {
+        merged.year = candidate.year;
+    }
+    if merged != *existing {
+        merged.updated_at = now;
+    }
+    Ok(merged)
+}
+
+fn periodical_issue_identity_matches(left: &PeriodicalIssue, right: &PeriodicalIssue) -> bool {
+    if left.number.is_some() && right.number.is_some() && left.identity() == right.identity() {
+        return true;
+    }
+    let labels_match = left
+        .label
+        .as_deref()
+        .map(normalize_identity_label)
+        .zip(right.label.as_deref().map(normalize_identity_label))
+        .is_some_and(|(left, right)| !left.is_empty() && left == right);
+    labels_match
+        || (left.number.is_none()
+            && left.label.is_none()
+            && right.number.is_none()
+            && right.label.is_none())
+}
+
+fn merge_periodical_issue(
+    existing: &PeriodicalIssue,
+    candidate: PeriodicalIssue,
+    now: UtcMillis,
+) -> Result<PeriodicalIssue, AppError> {
+    if existing.volume_id != candidate.volume_id {
+        return Err(periodical_identity_conflict("期号的卷归属观察互相冲突"));
+    }
+    if let (Some(_current), Some(_observed)) = (existing.number, candidate.number)
+        && existing.identity() != candidate.identity()
+    {
+        return Err(periodical_identity_conflict("同一期的期号观察互相冲突"));
+    }
+
+    let mut merged = existing.clone();
+    if merged.label.is_none() {
+        merged.label = candidate.label;
+    }
+    if merged.number.is_none() {
+        merged.number = candidate.number;
+    }
+    merged.publication_date =
+        merge_publication_date(merged.publication_date, candidate.publication_date)?;
+    if merged != *existing {
+        merged.updated_at = now;
+    }
+    Ok(merged)
+}
+
+/// 同一期号的来源可能先给年份、后给月份或完整日期。只在两者是同一日期的
+/// 不同精度时取更精确值；月份/日期互相冲突必须显式失败。
+fn merge_publication_date(
+    current: Option<String>,
+    observed: Option<String>,
+) -> Result<Option<String>, AppError> {
+    match (current, observed) {
+        (None, value) | (value, None) => Ok(value),
+        (Some(current), Some(observed)) if current == observed => Ok(Some(current)),
+        (Some(current), Some(observed)) if observed.starts_with(&format!("{current}-")) => {
+            Ok(Some(observed))
+        }
+        (Some(current), Some(observed)) if current.starts_with(&format!("{observed}-")) => {
+            Ok(Some(current))
+        }
+        (Some(_), Some(_)) => Err(periodical_identity_conflict("同一期的发行日期观察互相冲突")),
+    }
 }
 
 /// 分类名 → 媒介类型：含"电影"为电影；单集亦按电影处理，其余按剧集。
@@ -1785,6 +2492,83 @@ fn new_comic_work(
         created_at: now,
         updated_at: now,
     }
+}
+
+/// 来源本次观察到的期刊身份（electronic 优先，去重）。
+///
+/// 匹配顺序只影响「先试哪个绑定键」，不改变身份集合：任何一个观察到的 ISSN
+/// 命中既有期刊都必须收敛到那一个期刊。
+fn journal_identities(journal: &PeriodicalJournalRecord) -> Vec<&Issn> {
+    let mut identities: Vec<&Issn> = Vec::with_capacity(2);
+    if let Some(issn) = journal.issn_electronic.as_ref() {
+        identities.push(issn);
+    }
+    if let Some(issn) = journal.issn_print.as_ref()
+        && !identities.contains(&issn)
+    {
+        identities.push(issn);
+    }
+    identities
+}
+
+/// 期刊本身是 Haven 的 Work：文章是其 Edition/MediaItem，而不是把期刊降级成
+/// 某篇文章的父节点。
+fn new_periodical_work(journal: &PeriodicalJournalRecord, now: UtcMillis) -> Work {
+    Work {
+        id: WorkId::new(),
+        canonical_title: journal.title.clone(),
+        original_title: None,
+        sort_title: None,
+        description: None,
+        work_type: WorkType::Standalone,
+        release_year: None,
+        language: None,
+        director: None,
+        actor: None,
+        // 期刊持续出版，因此默认状态是连载中而不是已完成。
+        status: WorkStatus::Ongoing,
+        rating_value: None,
+        rating_scale: None,
+        artwork: Default::default(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// 期刊层级与来源引用不一致属于数据完整性问题，必须显式失败而不是重建层级。
+fn periodical_hierarchy_missing(message: &'static str) -> AppError {
+    AppError::new(
+        "PERIODICAL_HIERARCHY_MISSING",
+        ErrorKind::Database,
+        message,
+        true,
+    )
+}
+
+fn periodical_identity_conflict(message: &'static str) -> AppError {
+    AppError::new(
+        "PERIODICAL_IDENTITY_CONFLICT",
+        ErrorKind::Conflict,
+        message,
+        false,
+    )
+}
+
+fn merge_periodical_identity_candidate(
+    resolved: &mut Option<(Work, Periodical)>,
+    work: Work,
+    periodical: Periodical,
+) -> Result<(), AppError> {
+    if let Some((existing_work, existing_periodical)) = resolved.as_ref() {
+        if existing_work.id != work.id || existing_periodical.id != periodical.id {
+            return Err(periodical_identity_conflict(
+                "同一次来源观察的 ISSN 指向多个期刊 Work",
+            ));
+        }
+        return Ok(());
+    }
+    *resolved = Some((work, periodical));
+    Ok(())
 }
 
 fn new_comic_edition(

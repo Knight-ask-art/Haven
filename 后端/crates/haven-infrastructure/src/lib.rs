@@ -14,6 +14,7 @@ mod http_security;
 pub mod metadata_sources;
 pub mod online_sources;
 pub mod opds;
+pub mod periodical;
 pub mod reader_search;
 pub mod scanner;
 pub mod trending;

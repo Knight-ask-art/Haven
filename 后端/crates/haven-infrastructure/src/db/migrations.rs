@@ -169,6 +169,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "039_comic_catalog_refresh_outcomes",
         include_str!("../../../../migrations/039_comic_catalog_refresh_outcomes.sql"),
     ),
+    (
+        "040_periodicals",
+        include_str!("../../../../migrations/040_periodicals.sql"),
+    ),
 ];
 
 pub fn run(conn: &mut Connection) -> Result<(), AppError> {
@@ -680,6 +684,247 @@ mod tests {
                 .iter()
                 .any(|column| column == "observed_edition_profile")
         );
+
+        let periodical_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN (
+                     'periodicals',
+                     'periodical_volumes',
+                     'periodical_issues',
+                     'periodical_articles'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(periodical_tables, 4, "报刊层级表必须全部建立");
+    }
+
+    /// 040 的 schema 语义：逐级 FK、ISSN 部分唯一索引、卷/期 identity_key
+    /// 唯一（NULL 不参与比较）、文章来源身份唯一、删除父级级联清理子级。
+    #[test]
+    fn migration_040_builds_periodical_hierarchy_constraints() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        let now = haven_common::UtcMillis::now().0;
+        conn.execute(
+            "INSERT INTO works (id, canonical_title, work_type, status, created_at, updated_at)
+             VALUES ('0196f0d2-0000-7000-8000-000000000e01', '报刊作品', 'standalone', 'completed', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO editions (id, work_id, title, edition_type, created_at, updated_at)
+             VALUES ('0196f0d2-0000-7000-8000-000000000e02', '0196f0d2-0000-7000-8000-000000000e01', '报刊版本', 'article', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO media_items
+                (id, edition_id, media_type, title, status, created_at, updated_at)
+             VALUES ('0196f0d2-0000-7000-8000-000000000e03', '0196f0d2-0000-7000-8000-000000000e02', 'article', '文章', 'available', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO periodicals (id, work_id, title, issn_print, issn_electronic, publisher, created_at, updated_at)
+             VALUES ('0196f0d2-0000-7000-8000-000000000e04', '0196f0d2-0000-7000-8000-000000000e01',
+                     'Nature Communications', '2041-1723', NULL, NULL, ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO works (id, canonical_title, work_type, status, created_at, updated_at)
+             VALUES ('0196f0d2-0000-7000-8000-000000000e0d', '无 ISSN 作品', 'standalone', 'completed', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        let missing_issn = conn.execute(
+            "INSERT INTO periodicals (id, work_id, title, issn_print, issn_electronic, publisher, created_at, updated_at)
+             VALUES ('0196f0d2-0000-7000-8000-000000000e0e', '0196f0d2-0000-7000-8000-000000000e0d',
+                     '没有稳定身份的期刊', NULL, NULL, NULL, ?1, ?1)",
+            params![now],
+        );
+        assert!(missing_issn.is_err(), "没有 ISSN 的期刊不能进入持久化模型");
+
+        let negative_volume_number = conn.execute(
+            "INSERT INTO periodical_volumes
+                (id, periodical_id, label, number, year, ordinal, identity_key, created_at, updated_at)
+             VALUES ('0196f0d2-0000-7000-8000-000000000e0f', '0196f0d2-0000-7000-8000-000000000e04',
+                     '-1', -1, 2024, 0, 'number:-1000', ?1, ?1)",
+            params![now],
+        );
+        assert!(negative_volume_number.is_err(), "负卷号不能进入持久化模型");
+
+        conn.execute(
+            "INSERT INTO periodical_volumes
+                (id, periodical_id, label, number, year, ordinal, identity_key, created_at, updated_at)
+             VALUES ('0196f0d2-0000-7000-8000-000000000e05', '0196f0d2-0000-7000-8000-000000000e04',
+                     NULL, NULL, NULL, 0, 'unassigned', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO periodical_issues
+                (id, volume_id, label, number, publication_date, ordinal, identity_key, created_at, updated_at)
+             VALUES ('0196f0d2-0000-7000-8000-000000000e06', '0196f0d2-0000-7000-8000-000000000e05',
+                     '3-4', NULL, '2024-03-15', 0, 'label:3-4', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO periodical_articles
+                (id, issue_id, media_item_id, ordinal, title, doi, page_range_start, page_range_end,
+                 source_key, remote_article_id, created_at, updated_at)
+             VALUES ('0196f0d2-0000-7000-8000-000000000e07', '0196f0d2-0000-7000-8000-000000000e06',
+                     '0196f0d2-0000-7000-8000-000000000e03', 12, '文章标题', '10.1038/x', 'e12345', NULL,
+                     'europepmc', 'PMC1', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+
+        // 卷身份键唯一：'unassigned' 不能重复建立第二个「来源未给出」的卷。
+        let duplicate_volume = conn.execute(
+            "INSERT INTO periodical_volumes
+                (id, periodical_id, label, number, year, ordinal, identity_key, created_at, updated_at)
+             VALUES ('0196f0d2-0000-7000-8000-000000000e08', '0196f0d2-0000-7000-8000-000000000e04',
+                     NULL, NULL, NULL, 1, 'unassigned', 1, 1)",
+            [],
+        );
+        assert!(
+            duplicate_volume
+                .expect_err("同一期刊不能有两个相同身份键的卷")
+                .to_string()
+                .contains("UNIQUE")
+        );
+
+        // 来源身份唯一：重复 PMCID 不能建立第二篇文章。
+        let duplicate_article = conn.execute(
+            "INSERT INTO periodical_articles
+                (id, issue_id, media_item_id, ordinal, title, doi, page_range_start, page_range_end,
+                 source_key, remote_article_id, created_at, updated_at)
+             VALUES ('0196f0d2-0000-7000-8000-000000000e09', '0196f0d2-0000-7000-8000-000000000e06',
+                     '0196f0d2-0000-7000-8000-000000000e03', NULL, '另一标题', NULL, NULL, NULL,
+                     'europepmc', 'PMC1', 1, 1)",
+            [],
+        );
+        assert!(
+            duplicate_article
+                .expect_err("同一来源身份不得重复入库")
+                .to_string()
+                .contains("UNIQUE")
+        );
+
+        // MediaItem 唯一：同一 MediaItem 不得被两条文章行绑定，否则阅读、进度与
+        // 资源归属会同时属于两个互相矛盾的期刊归属。这里来源身份是新的，因此
+        // 只有 media_item_id 唯一约束能拒绝它。
+        let duplicate_media_item = conn.execute(
+            "INSERT INTO periodical_articles
+                (id, issue_id, media_item_id, ordinal, title, doi, page_range_start, page_range_end,
+                 source_key, remote_article_id, created_at, updated_at)
+             VALUES ('0196f0d2-0000-7000-8000-000000000e0c', '0196f0d2-0000-7000-8000-000000000e06',
+                     '0196f0d2-0000-7000-8000-000000000e03', NULL, '另一来源标题', NULL, NULL, NULL,
+                     'europepmc', 'PMC2', 1, 1)",
+            [],
+        );
+        assert!(
+            duplicate_media_item
+                .expect_err("同一 MediaItem 不得被两条文章行绑定")
+                .to_string()
+                .contains("periodical_articles.media_item_id"),
+            "拒绝原因必须是 media_item_id 的唯一约束"
+        );
+
+        // ISSN 部分唯一索引：同一个 print ISSN 不能属于两个期刊。
+        let duplicate_issn = conn.execute(
+            "INSERT INTO periodicals (id, work_id, title, issn_print, issn_electronic, publisher, created_at, updated_at)
+             VALUES ('0196f0d2-0000-7000-8000-000000000e0a', '0196f0d2-0000-7000-8000-000000000e01',
+                     '另一个期刊', '2041-1723', NULL, NULL, 1, 1)",
+            [],
+        );
+        assert!(
+            duplicate_issn
+                .expect_err("print ISSN 必须唯一")
+                .to_string()
+                .contains("UNIQUE")
+        );
+
+        // 层级 FK：卷必须指向存在的期刊。
+        let orphan_volume = conn.execute(
+            "INSERT INTO periodical_volumes
+                (id, periodical_id, label, number, year, ordinal, identity_key, created_at, updated_at)
+             VALUES ('0196f0d2-0000-7000-8000-000000000e0b', '0196f0d2-0000-7000-8000-00000000dead',
+                     NULL, 1, NULL, 0, 'number:1000', 1, 1)",
+            [],
+        );
+        assert!(orphan_volume.is_err(), "孤儿卷必须被外键拒绝");
+
+        // 删除期刊级联清理卷/期；文章绑定 MediaItem，删除文章行不删除内容。
+        conn.execute(
+            "DELETE FROM periodicals WHERE id = '0196f0d2-0000-7000-8000-000000000e04'",
+            [],
+        )
+        .unwrap();
+        for table in [
+            "periodical_volumes",
+            "periodical_issues",
+            "periodical_articles",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "删除期刊后 {table} 必须级联清理");
+        }
+        let media_items: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(media_items, 1, "级联不得删除文章内容本身");
+    }
+
+    /// 039 → 040 真实 runner 升级：既有内容不受影响，040 恰好应用一次。
+    #[test]
+    fn legacy_039_upgrades_to_040_without_touching_existing_content() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_legacy_through(&mut conn, 39);
+        let now = haven_common::UtcMillis::now().0;
+        conn.execute(
+            "INSERT INTO works (id, canonical_title, work_type, status, created_at, updated_at)
+             VALUES ('0196f0d2-0000-7000-8000-000000000f01', '旧作品', 'standalone', 'completed', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        let before = recorded_checksum(&conn, "039_comic_catalog_refresh_outcomes").unwrap();
+
+        run(&mut conn).unwrap();
+
+        let applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = '040_periodicals'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, 1, "040 必须恰好应用一次");
+        assert_eq!(
+            recorded_checksum(&conn, "039_comic_catalog_refresh_outcomes").as_deref(),
+            Some(before.as_str()),
+            "039 的注册内容不得变化"
+        );
+        let works: i64 = conn
+            .query_row("SELECT COUNT(*) FROM works", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(works, 1, "升级不得触碰既有作品");
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(total as usize, MIGRATIONS.len());
     }
 
     #[test]
