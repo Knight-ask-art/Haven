@@ -12,6 +12,8 @@ import {
   loadDemoBookReaderBookmarks,
   recordDemoBookReaderHistory,
   resolveBookReaderRuntimeState,
+  selectDemoBookReaderKind,
+  type DemoBookReaderKind,
 } from "../lib/book-reader-runtime-state"
 import { selectReaderSessionView } from "../lib/reader-session-view"
 import { bookResumeProgression, createBookProgressController, restoreBookProgress, type BookProgressController } from "../lib/book-progress-controller"
@@ -145,6 +147,117 @@ const BOOK_CHAPTERS: BookChapter[] = [
 ]
 const EMPTY_BOOK_CHAPTERS: BookChapter[] = []
 
+const PERIODICAL_CHAPTERS: BookChapter[] = [
+  {
+    id: "periodical-cover",
+    kicker: "National Geographic · 2024.08",
+    title: "深海热泉与极地雪鸮",
+    paragraphs: [
+      "八月号从太平洋海底的黑暗开始。没有阳光的热泉周围，细菌、管虫与甲壳类动物组成了另一套繁盛的生态系统，生命不必总是从地表的光线出发。",
+      "本期的摄影与文字沿着海底热流继续向北，记录极地雪原上短暂而精确的夏季。对读者而言，这不是一张景观清单，而是一条穿过不同尺度生命的观察路径。",
+    ],
+    quote: "在最不容易被看见的地方，生命仍然保持着自己的节奏。",
+  },
+  {
+    id: "periodical-ocean",
+    kicker: "Field Notes · 01",
+    title: "海底火山的冷光",
+    paragraphs: [
+      "研究团队使用潜水器沿着海沟缓慢下降。每一次灯光扫过岩壁，都会揭开一层新的纹理：矿物沉积、微小生物留下的轨迹，以及水流在岩石上写下的方向。",
+      "这种探索需要耐心。深海并不急于向人类解释自己，科学家只能把片段带回实验室，再用多年时间将片段拼成可以理解的故事。",
+    ],
+  },
+  {
+    id: "periodical-polar",
+    kicker: "Wildlife · 02",
+    title: "雪线之上的夏天",
+    paragraphs: [
+      "极地的夏天只有几周，却足以让雪鸮完成迁徙、求偶与育雏。白色羽毛在雪地上几乎隐形，只有飞行时展开的翅膀，才会显出一道干净的弧线。",
+      "气候变化改变了雪线的边界，也改变了猎物出现的时间。保护一个物种，往往意味着同时保护它所依赖的整条季节链。",
+    ],
+  },
+  {
+    id: "periodical-archive",
+    kicker: "Archive · 03",
+    title: "把一册杂志读成一张地图",
+    paragraphs: [
+      "从海底热泉到冰原边缘，本期文章看似分散，却共同指向一个问题：当环境发生变化，生命如何重新安排自己的位置。阅读一册期刊，也是在不同地点之间建立联系。",
+      "你可以从目录跳到任意专题，也可以沿着页面继续向下，让照片、数据与叙事慢慢形成自己的秩序。下一次打开时，栖阅会从上次留下的阅读位置继续。",
+    ],
+  },
+]
+
+const DOCUMENT_CHAPTERS: BookChapter[] = [
+  {
+    id: "document-overview",
+    kicker: "Apple HIG · Part 1",
+    title: "空间计算与界面层级",
+    paragraphs: [
+      "设计总则不是一组必须服从的装饰规则，而是帮助产品在不同设备、距离与环境中保持可理解性的共同语言。界面应当先建立层级，再决定细节。",
+      "在空间计算中，内容与用户之间的距离会不断变化。稳定的视觉层级、清晰的反馈和可预期的动作，构成了用户信任系统的基础。",
+    ],
+  },
+  {
+    id: "document-type",
+    kicker: "Apple HIG · Part 2",
+    title: "动态字阶与可读性",
+    paragraphs: [
+      "动态字阶让文本能够适应不同的阅读距离与辅助功能设置。字号变化不应破坏信息层级，行距、截断与容器宽度需要一起被设计。",
+      "可读性是一种系统属性，而不是单个组件的颜色选择。每个标题、说明和正文段落都应当在上下文中承担明确的阅读任务。",
+    ],
+  },
+  {
+    id: "document-navigation",
+    kicker: "Apple HIG · Part 3",
+    title: "TabBar、浮动导航与返回路径",
+    paragraphs: [
+      "导航的价值在于让用户知道自己在哪里、还能去哪里，以及返回后会回到什么位置。浮动导航可以减少层级跳转，但不能隐藏当前上下文。",
+      "当一份规范被拆成多个章节时，目录、章节标题和最近阅读位置必须保持一致。结构化内容的可读性，来自这些小而稳定的锚点。",
+    ],
+  },
+  {
+    id: "document-accessibility",
+    kicker: "Apple HIG · Part 4",
+    title: "无障碍访问与持续验证",
+    paragraphs: [
+      "无障碍不是发布前的一次检查，而是设计、实现和测试共同维护的约束。可感知、可操作、可理解与兼容性应当进入每一次组件迭代。",
+      "一份好的设计规范最终会回到真实阅读场景：用户能否快速定位信息，能否调整呈现方式，能否在中断后准确地继续。",
+    ],
+  },
+]
+
+interface DemoBookReaderPresentation {
+  title: string
+  byline: string
+  label: string
+  format: string
+  chapters: BookChapter[]
+}
+
+const DEMO_BOOK_READER_PRESENTATIONS: Record<DemoBookReaderKind, DemoBookReaderPresentation> = {
+  book: {
+    title: "史蒂夫·乔布斯传",
+    byline: "Steve Jobs · Walter Isaacson",
+    label: "BOOK · LOCAL READER",
+    format: "EPUB",
+    chapters: BOOK_CHAPTERS,
+  },
+  periodical: {
+    title: "National Geographic · 2024.08",
+    byline: "国家地理学会 · 月刊",
+    label: "PERIODICAL · LOCAL READER",
+    format: "PDF",
+    chapters: PERIODICAL_CHAPTERS,
+  },
+  document: {
+    title: "Apple Human Interface Guidelines",
+    byline: "Apple Human Interface Team · v18.2",
+    label: "DOCUMENT · LOCAL READER",
+    format: "PDF / EPUB",
+    chapters: DOCUMENT_CHAPTERS,
+  },
+}
+
 const THEME_OPTIONS: Array<{ id: ReaderTheme; label: string; color: string }> = [
   { id: "paper", label: "纸白", color: "#fcfcfc" },
   { id: "warm", label: "暖纸", color: "#f5efe3" },
@@ -203,6 +316,8 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
   const tauriRuntime = runtimeState === "production"
   const demoRuntime = runtimeState === "demo"
   const storageId = mediaItemId || "book-jobs"
+  const demoKind = selectDemoBookReaderKind(clientMode, storageId) ?? "book"
+  const demoPresentation = DEMO_BOOK_READER_PRESENTATIONS[demoKind]
   const bookmarkStorageKey = `haven:bookmarks:${storageId}`
 
   // Session + 进度：Tauri 环境接真实 useMediaSession（engine=reader）；
@@ -233,7 +348,7 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
   const [searchStatus, setSearchStatus] = useState<"idle" | "searching" | "done">("idle")
   const [highlightedHitKey, setHighlightedHitKey] = useState<string | null>(null)
   const [readingProgress, setReadingProgress] = useState(0)
-  const [activeChapterId, setActiveChapterId] = useState(() => demoRuntime ? BOOK_CHAPTERS[0].id : "")
+  const [activeChapterId, setActiveChapterId] = useState(() => demoRuntime ? demoPresentation.chapters[0].id : "")
   const [bookmarks, setBookmarks] = useState<BookmarkType[]>(() => (
     loadDemoBookReaderBookmarks(clientMode, () => readBookmarks(bookmarkStorageKey))
   ))
@@ -313,11 +428,11 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
   const contentMatchesSession = contentState.status !== "idle"
     && contentState.contentUri === sessionContentUri
   const chapters = demoRuntime
-    ? BOOK_CHAPTERS
+    ? demoPresentation.chapters
     : (contentState.status === "ready" && contentMatchesSession ? contentState.chapters : EMPTY_BOOK_CHAPTERS)
   const currentChapter = chapters.find((chapter) => chapter.id === activeChapterId) || chapters[0]
   const parsedBookTitle = contentState.status === "ready" && contentMatchesSession ? contentState.title : null
-  const bookTitle = demoRuntime ? "史蒂夫·乔布斯传" : parsedBookTitle || "本地图书"
+  const bookTitle = demoRuntime ? demoPresentation.title : parsedBookTitle || "本地图书"
   const contentReady = demoRuntime
     || (sessionView.status === "ready" && (contentState.status === "ready" || contentState.status === "pdf_ready") && contentMatchesSession)
   const headerContext = resolveBookReaderHeaderContext({
@@ -419,7 +534,10 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
     setSessionMarkers([])
     setIsBookmarkPending(false)
     setMarkersLoaded(false)
-  }, [mediaItemId, sessionContentUri, tauriRuntime])
+    setReadingProgress(0)
+    setActiveChapterId(demoRuntime ? demoPresentation.chapters[0].id : "")
+    setBookmarks(loadDemoBookReaderBookmarks(clientMode, () => readBookmarks(bookmarkStorageKey)))
+  }, [bookmarkStorageKey, clientMode, demoPresentation.chapters, demoRuntime, mediaItemId, sessionContentUri, tauriRuntime])
 
   useEffect(() => {
     const requestId = ++markerListRequestRef.current
@@ -1151,10 +1269,10 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
         {contentReady && !pdfSource && <div ref={readerScrollRef} style={readerFrameStyle} className={cn("h-full overscroll-contain scroll-smooth [scrollbar-width:none] [&::-webkit-scrollbar]:hidden", isTextPagination ? "overflow-x-auto overflow-y-hidden" : "overflow-x-hidden overflow-y-auto")} aria-label={isTextPagination ? "图书分页阅读区" : "图书纵向阅读区"}>
           <article ref={articleRef} className={cn("mx-auto w-full select-text pb-[128px] pt-14 sm:pt-[80px]", isTextPagination ? "px-6" : "px-6 sm:px-10", FONT_CLASSES[fontFamily], isTextPagination && "break-inside-avoid")} style={articleStyle}>
             <header className="break-inside-avoid border-b border-current/15 pb-[48px]">
-              <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-primary">BOOK · LOCAL READER</p>
+              <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-primary">{demoRuntime ? demoPresentation.label : "BOOK · LOCAL READER"}</p>
               <h1 className="mt-6 text-4xl font-semibold leading-[1.08] tracking-[-0.055em] sm:text-6xl">{bookTitle}</h1>
-              {demoRuntime && <p className="mt-[16px] text-[0.9em] opacity-55">Steve Jobs · Walter Isaacson</p>}
-              <div className="mt-7 flex flex-wrap gap-x-3 gap-y-1 text-[11px] font-medium opacity-45"><span>{demoRuntime || bookFormat === "epub" ? "EPUB" : bookFormat === "markdown" ? "MARKDOWN" : "TXT"}</span><span>·</span><span>{chapters.length} 章</span><span>·</span><span>阅读进度 {readingProgress}%</span></div>
+              {demoRuntime && <p className="mt-[16px] text-[0.9em] opacity-55">{demoPresentation.byline}</p>}
+              <div className="mt-7 flex flex-wrap gap-x-3 gap-y-1 text-[11px] font-medium opacity-45"><span>{demoRuntime ? demoPresentation.format : bookFormat === "epub" ? "EPUB" : bookFormat === "markdown" ? "MARKDOWN" : "TXT"}</span><span>·</span><span>{chapters.length} 章</span><span>·</span><span>阅读进度 {readingProgress}%</span></div>
             </header>
 
             <div className="mt-14 space-y-[80px]">

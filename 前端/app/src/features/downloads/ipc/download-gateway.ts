@@ -118,10 +118,52 @@ export async function getMediaItemDownloadInfo(
   mediaItemId: string,
   client = getHavenClient(),
 ): Promise<MediaItemDownloadInfo> {
+  const projected = await getMediaItemsDownloadInfo([mediaItemId], client)
+  return projected.get(mediaItemId) ?? emptyMediaItemDownloadInfo()
+}
+
+/**
+ * Read capability projections for several MediaItems while sharing the
+ * complete download-task scan. Edition pages often contain many rows and
+ * `listDownloads` is paginated, so doing that scan once is materially cheaper
+ * than calling the single-item helper in a loop.
+ */
+export async function getMediaItemsDownloadInfo(
+  mediaItemIds: readonly string[],
+  client = getHavenClient(),
+): Promise<Map<string, MediaItemDownloadInfo>> {
+  const uniqueMediaItemIds = [...new Set(mediaItemIds)]
+  if (uniqueMediaItemIds.length === 0) return new Map()
+
   const [tasks, resources] = await Promise.all([
     listDownloads(client),
-    client.resourceListByMediaItem({ mediaItemId }),
+    Promise.all(uniqueMediaItemIds.map((mediaItemId) => (
+      client.resourceListByMediaItem({ mediaItemId })
+    ))),
   ])
+
+  return new Map(uniqueMediaItemIds.map((mediaItemId, index) => [
+    mediaItemId,
+    projectMediaItemDownloadInfo(mediaItemId, tasks, resources[index]),
+  ]))
+}
+
+function emptyMediaItemDownloadInfo(): MediaItemDownloadInfo {
+  return {
+    status: "idle",
+    canDownload: false,
+    hasOfflineResource: false,
+    canOnlineRead: false,
+    sourceResourceId: null,
+    taskId: null,
+  }
+}
+
+function projectMediaItemDownloadInfo(
+  mediaItemId: string,
+  tasks: DownloadTaskDto[],
+  resources: ResourceListDto,
+): MediaItemDownloadInfo {
   const offlineResourceIds = new Set(resources.items
     .filter((item) => item.isOffline && item.availability === "offline_available")
     .map((item) => item.resourceId))

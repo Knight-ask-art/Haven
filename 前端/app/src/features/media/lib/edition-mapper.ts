@@ -1,6 +1,9 @@
 import type { PrimaryActionDto } from "@/lib/ipc/generated/wire"
 import type { EditionListByWorkResultDto, EditionSummaryDto } from "../ipc/edition-wire"
 import type { MediaDetailData } from "../pages/MediaDetailPage"
+import { mediaTypeLabel } from "./periodical-presentation"
+
+export { mediaTypeLabel } from "./periodical-presentation"
 
 export interface EditionListItem {
   id: string
@@ -16,22 +19,6 @@ export interface EditionGroup {
   mediaType: string
   label: string
   items: EditionListItem[]
-}
-
-const MEDIA_TYPE_LABELS: Record<string, string> = {
-  movie: "电影",
-  series: "剧集",
-  episode: "单集",
-  book: "图书",
-  document: "资料",
-  comic: "漫画",
-  article: "文章",
-  audio: "音频",
-  unknown: "未知",
-}
-
-export function mediaTypeLabel(mediaType: string): string {
-  return MEDIA_TYPE_LABELS[mediaType] ?? mediaType
 }
 
 /** 固定展示顺序的媒体类型分组（“分页后分组”：只分组当前已加载的一页，O(n)）。 */

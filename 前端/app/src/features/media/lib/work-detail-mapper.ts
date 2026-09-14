@@ -22,6 +22,7 @@ export function mapWorkDetailHeaderToMediaDetail(dto: WorkDetailHeaderDto): Medi
     title: dto.title,
     originalTitle: dto.originalTitle ?? undefined,
     type: deriveType(dto.availableMediaTypes, dto.categories),
+    categories: dto.categories,
     year: dto.releaseYear ?? 0,
     backdropUrl,
     posterUrl: artworkRequestUri(dto.posterUri),
