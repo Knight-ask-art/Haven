@@ -172,10 +172,6 @@ pub(crate) fn migration_receipt(input: ComicProgressReceiptInput) -> ComicProgre
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "match receipt keeps the migration decision inputs explicit"
-)]
 fn receipt_for_match(
     match_result: &ChapterMatch,
     mut input: ComicProgressReceiptInput,

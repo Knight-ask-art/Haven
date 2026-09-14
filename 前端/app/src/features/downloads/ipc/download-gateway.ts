@@ -179,11 +179,6 @@ function projectMediaItemDownloadInfo(
     && task.state !== "cancelled"
     && task.state !== "failed"
   ))
-  const completedOfflineTask = tasks.find((task) => (
-    task.mediaItemId === mediaItemId
-    && task.state === "completed"
-    && task.offlineResourceId !== null
-  ))
   const offlineResource = resources.items.some((item) => (
     item.isOffline && item.availability === "offline_available"
   ))

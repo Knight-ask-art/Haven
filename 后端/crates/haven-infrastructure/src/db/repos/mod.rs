@@ -113,7 +113,7 @@ impl SqliteRepositories {
             page_identity: SqliteComicPageIdentityRepository::new(db.clone()),
             progress_migration: SqliteComicProgressMigrationRepository::new(db.clone()),
             progress_subjects: SqliteComicProgressSubjectRepository::new(db.clone()),
-            catalog_refresh_outcomes: SqliteComicCatalogRefreshOutcomeRepository::new(db),
+            catalog_refresh_outcomes: SqliteComicCatalogRefreshOutcomeRepository::new(db.clone()),
             periodical: SqlitePeriodicalRepository::new(db),
         }
     }
