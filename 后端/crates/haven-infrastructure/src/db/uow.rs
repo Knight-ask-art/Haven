@@ -563,7 +563,7 @@ fn validate_subject_write_precondition(
             // 而不是相信 Application 在事务外读到的快照。
             let current = crate::db::repos::comic_progress_subjects::load_subject(tx, subject.id)?
                 .ok_or_else(subject_conflict)?;
-            if current != *subject
+            if current != *subject.as_ref()
                 || current.members() != members.as_slice()
                 || (*require_authoritative_progress_none
                     && current.authoritative_progress_media_item_id.is_some())

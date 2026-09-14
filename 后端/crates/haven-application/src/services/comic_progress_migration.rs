@@ -137,67 +137,49 @@ pub(crate) fn migration_result_with_receipt(
     }
 }
 
-pub(crate) fn migration_receipt(
-    migration_id: ComicProgressMigrationId,
-    source_media_item_id: MediaItemId,
-    target_media_item_id: MediaItemId,
-    strategy: PageMappingStrategy,
-    confidence: PageMappingConfidence,
-    evidence: Vec<ChapterEvidence>,
-    source_progress_snapshot: Option<ComicProgressSnapshotView>,
-    target_progress_before: Option<ComicProgressSnapshotView>,
-    target_progress_after: Option<ComicProgressSnapshotView>,
-    page_mapping: PageMigration,
-    created_at: UtcMillis,
-    undoable: bool,
-    applied_revision: Option<String>,
-) -> ComicProgressMigrationReceipt {
+pub(crate) struct ComicProgressReceiptInput {
+    pub migration_id: ComicProgressMigrationId,
+    pub source_media_item_id: MediaItemId,
+    pub target_media_item_id: MediaItemId,
+    pub strategy: PageMappingStrategy,
+    pub confidence: PageMappingConfidence,
+    pub evidence: Vec<ChapterEvidence>,
+    pub source_progress_snapshot: Option<ComicProgressSnapshotView>,
+    pub target_progress_before: Option<ComicProgressSnapshotView>,
+    pub target_progress_after: Option<ComicProgressSnapshotView>,
+    pub page_mapping: PageMigration,
+    pub created_at: UtcMillis,
+    pub undoable: bool,
+    pub applied_revision: Option<String>,
+}
+
+pub(crate) fn migration_receipt(input: ComicProgressReceiptInput) -> ComicProgressMigrationReceipt {
     ComicProgressMigrationReceipt {
-        migration_id,
-        source_media_item_id,
-        target_media_item_id,
-        strategy,
-        confidence,
-        evidence,
-        source_progress_snapshot,
-        target_progress_before,
-        target_progress_after,
-        page_mapping,
+        migration_id: input.migration_id,
+        source_media_item_id: input.source_media_item_id,
+        target_media_item_id: input.target_media_item_id,
+        strategy: input.strategy,
+        confidence: input.confidence,
+        evidence: input.evidence,
+        source_progress_snapshot: input.source_progress_snapshot,
+        target_progress_before: input.target_progress_before,
+        target_progress_after: input.target_progress_after,
+        page_mapping: input.page_mapping,
         algorithm_version: COMIC_PROGRESS_MIGRATION_ALGORITHM_VERSION.to_owned(),
-        created_at,
-        undoable,
-        applied_revision,
+        created_at: input.created_at,
+        undoable: input.undoable,
+        applied_revision: input.applied_revision,
     }
 }
 
 fn receipt_for_match(
-    source_media_item_id: MediaItemId,
-    target_media_item_id: MediaItemId,
     match_result: &ChapterMatch,
-    page_mapping: PageMigration,
-    source_progress_snapshot: Option<ComicProgressSnapshotView>,
-    target_progress_before: Option<ComicProgressSnapshotView>,
-    target_progress_after: Option<ComicProgressSnapshotView>,
-    migration_id: ComicProgressMigrationId,
-    created_at: UtcMillis,
-    undoable: bool,
-    applied_revision: Option<String>,
+    mut input: ComicProgressReceiptInput,
 ) -> ComicProgressMigrationReceipt {
-    migration_receipt(
-        migration_id,
-        source_media_item_id,
-        target_media_item_id,
-        page_mapping.strategy,
-        match_confidence(match_result.confidence),
-        match_result.evidence.clone(),
-        source_progress_snapshot,
-        target_progress_before,
-        target_progress_after,
-        page_mapping,
-        created_at,
-        undoable,
-        applied_revision,
-    )
+    input.strategy = input.page_mapping.strategy;
+    input.confidence = match_confidence(match_result.confidence);
+    input.evidence = match_result.evidence.clone();
+    migration_receipt(input)
 }
 
 pub(crate) fn unchanged_migration_result(
@@ -205,21 +187,21 @@ pub(crate) fn unchanged_migration_result(
 ) -> ComicProgressMigrationResult {
     let page_mapping = no_target_page_migration();
     let migration_id = ComicProgressMigrationId::new();
-    let receipt = migration_receipt(
+    let receipt = migration_receipt(ComicProgressReceiptInput {
         migration_id,
-        media_item_id,
-        media_item_id,
-        page_mapping.strategy,
-        PageMappingConfidence::Low,
-        Vec::new(),
-        None,
-        None,
-        None,
-        page_mapping.clone(),
-        UtcMillis::now(),
-        false,
-        None,
-    );
+        source_media_item_id: media_item_id,
+        target_media_item_id: media_item_id,
+        strategy: page_mapping.strategy,
+        confidence: PageMappingConfidence::Low,
+        evidence: Vec::new(),
+        source_progress_snapshot: None,
+        target_progress_before: None,
+        target_progress_after: None,
+        page_mapping: page_mapping.clone(),
+        created_at: UtcMillis::now(),
+        undoable: false,
+        applied_revision: None,
+    });
     migration_result_with_receipt(
         ComicProgressMigrationStatus::Unchanged,
         None,
@@ -486,17 +468,22 @@ impl ComicProgressMigrationService {
                 if source_ref.media_item_id == target_ref.media_item_id =>
             {
                 let receipt = receipt_for_match(
-                    source_ref.media_item_id,
-                    target_ref.media_item_id,
                     &match_result,
-                    no_page.clone(),
-                    None,
-                    None,
-                    None,
-                    ComicProgressMigrationId::new(),
-                    UtcMillis::now(),
-                    false,
-                    None,
+                    ComicProgressReceiptInput {
+                        migration_id: ComicProgressMigrationId::new(),
+                        source_media_item_id: source_ref.media_item_id,
+                        target_media_item_id: target_ref.media_item_id,
+                        strategy: no_page.strategy,
+                        confidence: PageMappingConfidence::Low,
+                        evidence: Vec::new(),
+                        source_progress_snapshot: None,
+                        target_progress_before: None,
+                        target_progress_after: None,
+                        page_mapping: no_page.clone(),
+                        created_at: UtcMillis::now(),
+                        undoable: false,
+                        applied_revision: None,
+                    },
                 );
                 return Ok(migration_result_with_receipt(
                     ComicProgressMigrationStatus::SharedContent,
@@ -509,17 +496,22 @@ impl ComicProgressMigrationService {
             }
             ProgressMigrationMode::None => {
                 let receipt = receipt_for_match(
-                    source_ref.media_item_id,
-                    target_ref.media_item_id,
                     &match_result,
-                    no_page.clone(),
-                    None,
-                    None,
-                    None,
-                    ComicProgressMigrationId::new(),
-                    UtcMillis::now(),
-                    false,
-                    None,
+                    ComicProgressReceiptInput {
+                        migration_id: ComicProgressMigrationId::new(),
+                        source_media_item_id: source_ref.media_item_id,
+                        target_media_item_id: target_ref.media_item_id,
+                        strategy: no_page.strategy,
+                        confidence: PageMappingConfidence::Low,
+                        evidence: Vec::new(),
+                        source_progress_snapshot: None,
+                        target_progress_before: None,
+                        target_progress_after: None,
+                        page_mapping: no_page.clone(),
+                        created_at: UtcMillis::now(),
+                        undoable: false,
+                        applied_revision: None,
+                    },
                 );
                 return Ok(migration_result_with_receipt(
                     ComicProgressMigrationStatus::NotApplicable,
@@ -532,17 +524,22 @@ impl ComicProgressMigrationService {
             }
             ProgressMigrationMode::Suggested if !request.allow_best_effort => {
                 let receipt = receipt_for_match(
-                    source_ref.media_item_id,
-                    target_ref.media_item_id,
                     &match_result,
-                    no_page.clone(),
-                    None,
-                    None,
-                    None,
-                    ComicProgressMigrationId::new(),
-                    UtcMillis::now(),
-                    false,
-                    None,
+                    ComicProgressReceiptInput {
+                        migration_id: ComicProgressMigrationId::new(),
+                        source_media_item_id: source_ref.media_item_id,
+                        target_media_item_id: target_ref.media_item_id,
+                        strategy: no_page.strategy,
+                        confidence: PageMappingConfidence::Low,
+                        evidence: Vec::new(),
+                        source_progress_snapshot: None,
+                        target_progress_before: None,
+                        target_progress_after: None,
+                        page_mapping: no_page.clone(),
+                        created_at: UtcMillis::now(),
+                        undoable: false,
+                        applied_revision: None,
+                    },
                 );
                 return Ok(migration_result_with_receipt(
                     ComicProgressMigrationStatus::Suggested,
@@ -568,17 +565,22 @@ impl ComicProgressMigrationService {
             ProgressRepository::get_for_media_item(&*self.ports, source_ref.media_item_id).await?;
         let Some(source_progress) = source_progress else {
             let receipt = receipt_for_match(
-                source_ref.media_item_id,
-                target_ref.media_item_id,
                 &match_result,
-                no_page.clone(),
-                None,
-                None,
-                None,
-                ComicProgressMigrationId::new(),
-                UtcMillis::now(),
-                false,
-                None,
+                ComicProgressReceiptInput {
+                    migration_id: ComicProgressMigrationId::new(),
+                    source_media_item_id: source_ref.media_item_id,
+                    target_media_item_id: target_ref.media_item_id,
+                    strategy: no_page.strategy,
+                    confidence: PageMappingConfidence::Low,
+                    evidence: Vec::new(),
+                    source_progress_snapshot: None,
+                    target_progress_before: None,
+                    target_progress_after: None,
+                    page_mapping: no_page.clone(),
+                    created_at: UtcMillis::now(),
+                    undoable: false,
+                    applied_revision: None,
+                },
             );
             return Ok(migration_result_with_receipt(
                 ComicProgressMigrationStatus::NoSourceProgress,
@@ -602,17 +604,22 @@ impl ComicProgressMigrationService {
         let page_migration = migrate_page_index(&source_pages, &target_pages, old_page_index);
         let Some(target_page_index) = page_migration.target_page_index else {
             let receipt = receipt_for_match(
-                source_ref.media_item_id,
-                target_ref.media_item_id,
                 &match_result,
-                page_migration.clone(),
-                progress_snapshot_view(Some(&source_progress)),
-                None,
-                None,
-                ComicProgressMigrationId::new(),
-                UtcMillis::now(),
-                false,
-                None,
+                ComicProgressReceiptInput {
+                    migration_id: ComicProgressMigrationId::new(),
+                    source_media_item_id: source_ref.media_item_id,
+                    target_media_item_id: target_ref.media_item_id,
+                    strategy: page_migration.strategy,
+                    confidence: PageMappingConfidence::Low,
+                    evidence: Vec::new(),
+                    source_progress_snapshot: progress_snapshot_view(Some(&source_progress)),
+                    target_progress_before: None,
+                    target_progress_after: None,
+                    page_mapping: page_migration.clone(),
+                    created_at: UtcMillis::now(),
+                    undoable: false,
+                    applied_revision: None,
+                },
             );
             return Ok(migration_result_with_receipt(
                 ComicProgressMigrationStatus::NoTargetPage,
@@ -634,19 +641,24 @@ impl ComicProgressMigrationService {
             && !request.allow_target_overwrite
         {
             let receipt = receipt_for_match(
-                source_ref.media_item_id,
-                target_ref.media_item_id,
                 &match_result,
-                page_migration.clone(),
-                progress_snapshot_view(Some(&source_progress)),
-                target_progress
-                    .as_ref()
-                    .and_then(|progress| progress_snapshot_view(Some(progress))),
-                None,
-                ComicProgressMigrationId::new(),
-                UtcMillis::now(),
-                false,
-                None,
+                ComicProgressReceiptInput {
+                    migration_id: ComicProgressMigrationId::new(),
+                    source_media_item_id: source_ref.media_item_id,
+                    target_media_item_id: target_ref.media_item_id,
+                    strategy: page_migration.strategy,
+                    confidence: PageMappingConfidence::Low,
+                    evidence: Vec::new(),
+                    source_progress_snapshot: progress_snapshot_view(Some(&source_progress)),
+                    target_progress_before: target_progress
+                        .as_ref()
+                        .and_then(|progress| progress_snapshot_view(Some(progress))),
+                    target_progress_after: None,
+                    page_mapping: page_migration.clone(),
+                    created_at: UtcMillis::now(),
+                    undoable: false,
+                    applied_revision: None,
+                },
             );
             return Ok(migration_result_with_receipt(
                 ComicProgressMigrationStatus::TargetProgressPreserved,
@@ -723,19 +735,24 @@ impl ComicProgressMigrationService {
         let mut applied_progress = snapshot.new_progress.clone();
         applied_progress.revision = Some(applied_revision.clone());
         let receipt = receipt_for_match(
-            source_ref.media_item_id,
-            target_ref.media_item_id,
             &match_result,
-            page_migration.clone(),
-            progress_snapshot_view(Some(&source_progress)),
-            target_progress
-                .as_ref()
-                .and_then(|progress| progress_snapshot_view(Some(progress))),
-            progress_snapshot_view(Some(&applied_progress)),
-            migration_id,
-            snapshot.created_at,
-            true,
-            Some(applied_revision.clone()),
+            ComicProgressReceiptInput {
+                migration_id,
+                source_media_item_id: source_ref.media_item_id,
+                target_media_item_id: target_ref.media_item_id,
+                strategy: page_migration.strategy,
+                confidence: PageMappingConfidence::Low,
+                evidence: Vec::new(),
+                source_progress_snapshot: progress_snapshot_view(Some(&source_progress)),
+                target_progress_before: target_progress
+                    .as_ref()
+                    .and_then(|progress| progress_snapshot_view(Some(progress))),
+                target_progress_after: progress_snapshot_view(Some(&applied_progress)),
+                page_mapping: page_migration.clone(),
+                created_at: snapshot.created_at,
+                undoable: true,
+                applied_revision: Some(applied_revision.clone()),
+            },
         );
         Ok(migration_result_with_receipt(
             ComicProgressMigrationStatus::Applied,
@@ -764,21 +781,21 @@ impl ComicProgressMigrationService {
         let Some(source_progress) = source_progress else {
             let page_migration = no_target_page_migration();
             let migration_id = ComicProgressMigrationId::new();
-            let receipt = migration_receipt(
+            let receipt = migration_receipt(ComicProgressReceiptInput {
                 migration_id,
-                item.id,
-                item.id,
-                page_migration.strategy,
-                page_migration.confidence,
-                Vec::new(),
-                None,
-                None,
-                None,
-                page_migration.clone(),
-                UtcMillis::now(),
-                false,
-                None,
-            );
+                source_media_item_id: item.id,
+                target_media_item_id: item.id,
+                strategy: page_migration.strategy,
+                confidence: page_migration.confidence,
+                evidence: Vec::new(),
+                source_progress_snapshot: None,
+                target_progress_before: None,
+                target_progress_after: None,
+                page_mapping: page_migration.clone(),
+                created_at: UtcMillis::now(),
+                undoable: false,
+                applied_revision: None,
+            });
             return Ok(migration_result_with_receipt(
                 ComicProgressMigrationStatus::NoSourceProgress,
                 None,
@@ -796,21 +813,21 @@ impl ComicProgressMigrationService {
             comic_page_index(&source_progress)?,
         );
         let Some(target_page_index) = page_migration.target_page_index else {
-            let receipt = migration_receipt(
-                ComicProgressMigrationId::new(),
-                item.id,
-                item.id,
-                page_migration.strategy,
-                page_migration.confidence,
-                Vec::new(),
-                source_snapshot.clone(),
-                source_snapshot,
-                None,
-                page_migration.clone(),
-                UtcMillis::now(),
-                false,
-                None,
-            );
+            let receipt = migration_receipt(ComicProgressReceiptInput {
+                migration_id: ComicProgressMigrationId::new(),
+                source_media_item_id: item.id,
+                target_media_item_id: item.id,
+                strategy: page_migration.strategy,
+                confidence: page_migration.confidence,
+                evidence: Vec::new(),
+                source_progress_snapshot: source_snapshot.clone(),
+                target_progress_before: source_snapshot,
+                target_progress_after: None,
+                page_mapping: page_migration.clone(),
+                created_at: UtcMillis::now(),
+                undoable: false,
+                applied_revision: None,
+            });
             return Ok(migration_result_with_receipt(
                 ComicProgressMigrationStatus::NoTargetPage,
                 None,
@@ -863,21 +880,21 @@ impl ComicProgressMigrationService {
         .ok_or_else(revision_conflict)?;
         let mut applied_progress = snapshot.new_progress.clone();
         applied_progress.revision = Some(applied_revision.clone());
-        let receipt = migration_receipt(
+        let receipt = migration_receipt(ComicProgressReceiptInput {
             migration_id,
-            item.id,
-            item.id,
-            page_migration.strategy,
-            page_migration.confidence,
-            Vec::new(),
-            source_snapshot.clone(),
-            source_snapshot,
-            progress_snapshot_view(Some(&applied_progress)),
-            page_migration.clone(),
-            snapshot.created_at,
-            true,
-            Some(applied_revision.clone()),
-        );
+            source_media_item_id: item.id,
+            target_media_item_id: item.id,
+            strategy: page_migration.strategy,
+            confidence: page_migration.confidence,
+            evidence: Vec::new(),
+            source_progress_snapshot: source_snapshot.clone(),
+            target_progress_before: source_snapshot,
+            target_progress_after: progress_snapshot_view(Some(&applied_progress)),
+            page_mapping: page_migration.clone(),
+            created_at: snapshot.created_at,
+            undoable: true,
+            applied_revision: Some(applied_revision.clone()),
+        });
         Ok(migration_result_with_receipt(
             ComicProgressMigrationStatus::Applied,
             None,

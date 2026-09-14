@@ -2157,7 +2157,7 @@ mod tests {
             .run_checked_comic_progress_subject_write(
                 &subject_write_plan(stale_plan_subject.clone(), stale_members.clone()),
                 &ComicProgressSubjectWritePrecondition::ExactSnapshot {
-                    subject: stale_subject.clone(),
+                    subject: Box::new(stale_subject.clone()),
                     members: stale_members.clone(),
                     require_authoritative_progress_none: true,
                     require_progress_absent_for_media_item: None,
@@ -2202,7 +2202,7 @@ mod tests {
             .run_checked_comic_progress_subject_write(
                 &subject_write_plan(stale_plan_subject, stale_members.clone()),
                 &ComicProgressSubjectWritePrecondition::ExactSnapshot {
-                    subject: stale_subject,
+                    subject: Box::new(stale_subject),
                     members: stale_members,
                     require_authoritative_progress_none: false,
                     require_progress_absent_for_media_item: None,
@@ -2732,7 +2732,7 @@ mod tests {
                     refresh_receipt: None,
                 },
                 &ComicProgressSubjectWritePrecondition::ExactSnapshot {
-                    subject: stale_subject.clone(),
+                    subject: Box::new(stale_subject.clone()),
                     members: stale_members.clone(),
                     require_authoritative_progress_none: false,
                     require_progress_absent_for_media_item: Some(target_media_item_id),

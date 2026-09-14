@@ -27,9 +27,9 @@ use haven_domain::locator::{ComicLocator, Locator};
 use crate::mapper::progress::progress_summary;
 use crate::services::comic_progress_migration::{
     COMIC_PROGRESS_MIGRATION_ALGORITHM_VERSION, ComicProgressMigrationReceipt,
-    ComicProgressMigrationResult, ComicProgressMigrationStatus, migration_receipt,
-    migration_result_with_receipt, no_target_page_migration, progress_snapshot_view,
-    revision_conflict, translated_progress,
+    ComicProgressMigrationResult, ComicProgressMigrationStatus, ComicProgressReceiptInput,
+    migration_receipt, migration_result_with_receipt, no_target_page_migration,
+    progress_snapshot_view, revision_conflict, translated_progress,
 };
 use crate::services::ports::{
     ComicProgressSubjectMergeExpected, ComicProgressSubjectMergePlan,
@@ -283,7 +283,7 @@ impl ComicProgressSubjectService {
                 refresh_receipt: None,
             },
             &ComicProgressSubjectWritePrecondition::ExactSnapshot {
-                subject: source_subject,
+                subject: Box::new(source_subject),
                 members,
                 require_authoritative_progress_none: false,
                 require_progress_absent_for_media_item: target_progress
@@ -357,7 +357,7 @@ impl ComicProgressSubjectService {
                     refresh_receipt: None,
                 },
                 &ComicProgressSubjectWritePrecondition::ExactSnapshot {
-                    subject: source.clone(),
+                    subject: Box::new(source.clone()),
                     members: source.members().to_vec(),
                     require_authoritative_progress_none: false,
                     require_progress_absent_for_media_item: None,
@@ -412,7 +412,7 @@ impl ComicProgressSubjectService {
                     refresh_receipt: None,
                 },
                 &ComicProgressSubjectWritePrecondition::ExactSnapshot {
-                    subject: existing,
+                    subject: Box::new(existing),
                     members: old_members,
                     require_authoritative_progress_none: false,
                     require_progress_absent_for_media_item: None,
@@ -732,7 +732,7 @@ impl ComicProgressSubjectService {
                 refresh_receipt: None,
             },
             &ComicProgressSubjectWritePrecondition::ExactSnapshot {
-                subject: resolution.subject.clone(),
+                subject: Box::new(resolution.subject.clone()),
                 members: resolution.subject.members().to_vec(),
                 require_authoritative_progress_none: false,
                 require_progress_absent_for_media_item: Some(target_item.id),
@@ -795,7 +795,7 @@ impl ComicProgressSubjectService {
         {
             let members = subject.members().to_vec();
             let precondition = ComicProgressSubjectWritePrecondition::ExactSnapshot {
-                subject: subject.clone(),
+                subject: Box::new(subject.clone()),
                 members: members.clone(),
                 require_authoritative_progress_none: false,
                 require_progress_absent_for_media_item: None,
@@ -845,21 +845,21 @@ impl ComicProgressSubjectService {
                 expected_page_revision,
             )
             .await?;
-            let receipt = migration_receipt(
-                ComicProgressMigrationId::new(),
-                media_item_id,
-                media_item_id,
-                page_migration.strategy,
-                page_migration.confidence,
-                target_member.evidence.clone(),
-                None,
-                None,
-                None,
-                page_migration.clone(),
-                UtcMillis::now(),
-                false,
-                None,
-            );
+            let receipt = migration_receipt(ComicProgressReceiptInput {
+                migration_id: ComicProgressMigrationId::new(),
+                source_media_item_id: media_item_id,
+                target_media_item_id: media_item_id,
+                strategy: page_migration.strategy,
+                confidence: page_migration.confidence,
+                evidence: target_member.evidence.clone(),
+                source_progress_snapshot: None,
+                target_progress_before: None,
+                target_progress_after: None,
+                page_mapping: page_migration.clone(),
+                created_at: UtcMillis::now(),
+                undoable: false,
+                applied_revision: None,
+            });
             return Ok(migration_result_with_receipt(
                 ComicProgressMigrationStatus::NoSourceProgress,
                 None,
@@ -916,21 +916,21 @@ impl ComicProgressSubjectService {
                 expected_page_revision,
             )
             .await?;
-            let receipt = migration_receipt(
-                ComicProgressMigrationId::new(),
-                source_progress.media_item_id,
-                media_item_id,
-                page_migration.strategy,
-                page_migration.confidence,
-                target_member.evidence.clone(),
-                source_snapshot,
-                target_before,
-                None,
-                page_migration.clone(),
-                UtcMillis::now(),
-                false,
-                None,
-            );
+            let receipt = migration_receipt(ComicProgressReceiptInput {
+                migration_id: ComicProgressMigrationId::new(),
+                source_media_item_id: source_progress.media_item_id,
+                target_media_item_id: media_item_id,
+                strategy: page_migration.strategy,
+                confidence: page_migration.confidence,
+                evidence: target_member.evidence.clone(),
+                source_progress_snapshot: source_snapshot,
+                target_progress_before: target_before,
+                target_progress_after: None,
+                page_mapping: page_migration.clone(),
+                created_at: UtcMillis::now(),
+                undoable: false,
+                applied_revision: None,
+            });
             return Ok(migration_result_with_receipt(
                 ComicProgressMigrationStatus::NoTargetPage,
                 None,
@@ -1034,21 +1034,21 @@ impl ComicProgressSubjectService {
             .cloned()
             .ok_or_else(|| invalid_subject_write("页面身份迁移未返回 Progress revision"))?;
         projected.revision = Some(applied_revision.clone());
-        let receipt = migration_receipt(
+        let receipt = migration_receipt(ComicProgressReceiptInput {
             migration_id,
-            source_progress.media_item_id,
-            media_item_id,
-            page_migration.strategy,
-            page_migration.confidence,
-            target_member.evidence,
-            source_snapshot,
-            target_before,
-            progress_snapshot_view(Some(&projected)),
-            page_migration.clone(),
+            source_media_item_id: source_progress.media_item_id,
+            target_media_item_id: media_item_id,
+            strategy: page_migration.strategy,
+            confidence: page_migration.confidence,
+            evidence: target_member.evidence,
+            source_progress_snapshot: source_snapshot,
+            target_progress_before: target_before,
+            target_progress_after: progress_snapshot_view(Some(&projected)),
+            page_mapping: page_migration.clone(),
             created_at,
-            true,
-            Some(applied_revision.clone()),
-        );
+            undoable: true,
+            applied_revision: Some(applied_revision.clone()),
+        });
         Ok(migration_result_with_receipt(
             ComicProgressMigrationStatus::Applied,
             None,
@@ -1145,7 +1145,7 @@ impl ComicProgressSubjectService {
                 refresh_receipt: None,
             },
             &ComicProgressSubjectWritePrecondition::ExactSnapshot {
-                subject: resolution.subject.clone(),
+                subject: Box::new(resolution.subject.clone()),
                 members: resolution.subject.members().to_vec(),
                 require_authoritative_progress_none: false,
                 require_progress_absent_for_media_item: target_was_absent
@@ -1214,7 +1214,7 @@ impl ComicProgressSubjectService {
             return ProgressRepository::get_for_media_item(&*self.ports, media_item_id)
                 .await?
                 .map(Some)
-                .ok_or_else(|| authoritative_progress_missing());
+                .ok_or_else(authoritative_progress_missing);
         }
         self.select_authoritative_progress(subject).await
     }
@@ -1313,7 +1313,7 @@ impl ComicProgressSubjectService {
                 refresh_receipt: None,
             },
             &ComicProgressSubjectWritePrecondition::ExactSnapshot {
-                subject: resolution.subject.clone(),
+                subject: Box::new(resolution.subject.clone()),
                 members: resolution.subject.members().to_vec(),
                 require_authoritative_progress_none: false,
                 require_progress_absent_for_media_item: None,
@@ -1440,7 +1440,7 @@ impl ComicProgressSubjectService {
                         refresh_receipt: None,
                     },
                     &ComicProgressSubjectWritePrecondition::ExactSnapshot {
-                        subject: expected_subject,
+                        subject: Box::new(expected_subject),
                         members: members.clone(),
                         require_authoritative_progress_none: true,
                         require_progress_absent_for_media_item: None,
