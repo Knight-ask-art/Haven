@@ -23,6 +23,7 @@ describe("mapWorkDetailHeaderToMediaDetail", () => {
       id: "work-1",
       title: "权威作品",
       originalTitle: "Authoritative Work",
+      categories: ["book"],
       type: "book",
       year: 2024,
       backdropUrl: "haven://poster/1",

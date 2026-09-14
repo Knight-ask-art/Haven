@@ -41,6 +41,10 @@ import {
   type MediaItemDownloadInfo,
   type DownloadStatus,
 } from "@/features/downloads/ipc/download-gateway"
+import {
+  contentCategoryLabel,
+  mediaPresentationLabel,
+} from "../lib/periodical-presentation"
 import { resetProgress } from "@/features/progress/ipc/progress-gateway"
 
 export interface MediaDetailData {
@@ -48,6 +52,7 @@ export interface MediaDetailData {
   title: string
   originalTitle?: string
   type: "movie" | "tv" | "book" | "comic" | "periodical" | "document" | "article"
+  categories?: Array<"video" | "book" | "comic" | "periodical">
   year: number
   rating?: string
   quality?: string
@@ -1231,6 +1236,7 @@ function MediaDetailExperience({ production }: { production: boolean }) {
 
   // 媒介图标/按钮文案适配
   const primaryAction = production ? authoritativeItem?.primaryAction : undefined
+  const isPeriodical = media.type === "periodical" || media.categories?.includes("periodical") === true
 
   const getPrimaryActionLabel = () => {
     if (production) {
@@ -1241,27 +1247,19 @@ function MediaDetailExperience({ production }: { production: boolean }) {
     }
     if (media.progress && media.progress > 0) {
       if (media.type === "movie" || media.type === "tv") return "继续播放"
-      if (media.type === "periodical") return "继续翻阅"
+      if (isPeriodical) return "继续翻阅"
       if (media.type === "document") return "继续查阅"
       return "继续阅读"
     }
     if (media.type === "movie" || media.type === "tv") return "播放"
-    if (media.type === "periodical") return "翻阅"
+    if (isPeriodical) return "翻阅"
     if (media.type === "document") return "查阅"
     return "阅读"
   }
 
   const getTypeLabel = () => {
-    switch (media.type) {
-      case "movie": return "电影"
-      case "tv": return "剧集"
-      case "book": return "图书"
-      case "comic": return "漫画"
-      case "periodical": return "报刊"
-      case "document": return "资料"
-      case "article": return "文章"
-      default: return "媒体"
-    }
+    if (media.type === "periodical") return contentCategoryLabel("periodical")
+    return mediaPresentationLabel(media.type, media.categories?.[0])
   }
 
   const getTabContentsLabel = () => {
@@ -1269,11 +1267,11 @@ function MediaDetailExperience({ production }: { production: boolean }) {
       case "tv": return "剧集与选集"
       case "comic": return "单行本与话数"
       case "movie": return "影片资源"
-      case "periodical": return "往期刊物与分册"
       case "document": return "文档目录与附录"
       default: return "章节与目录"
     }
   }
+  const tabContentsLabel = isPeriodical ? "往期刊物与分册" : getTabContentsLabel()
 
   const detailState: WorkDetailState = !production
     ? "data"
@@ -1293,8 +1291,10 @@ function MediaDetailExperience({ production }: { production: boolean }) {
   // in place but fail closed until that capability has been resolved; this is
   // what turns download-only providers (for example OPDS/Gutenberg EPUBs)
   // into an explicit "download first" state instead of a dead reader route.
-  const primaryActionTarget = production && onlineReadCapability === "available"
+  const primaryActionTarget = production && primaryAction?.kind === "open_edition"
     ? primaryActionRoute(primaryAction)
+    : production && (onlineReadCapability === "available" || hasOfflineResource)
+      ? primaryActionRoute(primaryAction)
     : !production
       ? getConsumeRoute(media.type, media.id)
       : null
@@ -1731,7 +1731,7 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                 : "text-muted-foreground border-transparent hover:text-foreground"
             )}
           >
-            {getTabContentsLabel()}
+            {tabContentsLabel}
           </button>
           <button
             onClick={() => setActiveTab("overview")}

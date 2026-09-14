@@ -36,7 +36,8 @@ vi.mock("../lib/media-detail-runtime-state", () => ({ resolveMediaDetailRuntimeS
 vi.mock("../ipc/work-gateway", () => work)
 vi.mock("../lib/work-detail-mapper", () => ({
   mapWorkDetailHeaderToMediaDetail: (header: { id: string }) => ({
-    id: header.id, title: `作品 ${header.id}`, type: detailType.value, year: 2026, backdropUrl: "cover", posterUrl: "cover",
+    id: header.id, title: `作品 ${header.id}`, type: header.id === "periodical" ? "document" : detailType.value, year: 2026, backdropUrl: "cover", posterUrl: "cover",
+    ...(header.id === "periodical" ? { categories: ["periodical"] } : {}),
     description: "", favorite: false,
     primaryAction: { kind: "playback", mediaItemId: `media-${header.id}`, labelHint: "start", locator: null },
   }),
@@ -125,6 +126,13 @@ describe("MediaDetailPage download lifecycle", () => {
     renderPage()
 
     expect(screen.queryByRole("img", { name: "作品信息暂不可用" })).toBeNull()
+  })
+
+  it("uses periodical labels when the Work category is periodical and the item is a document", async () => {
+    renderPage("/work/periodical")
+
+    expect(await screen.findByText("报刊资料")).toBeTruthy()
+    expect(screen.getByRole("button", { name: "往期刊物与分册" })).toBeTruthy()
   })
 
   it("refreshes the full download projection when creation returns completed", async () => {
