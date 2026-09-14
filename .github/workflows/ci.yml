@@ -28,6 +28,7 @@ jobs:
       backend: ${{ steps.scope.outputs.backend }}
       tauri: ${{ steps.scope.outputs.tauri }}
       film_tv: ${{ steps.scope.outputs.film_tv }}
+      fixtures: ${{ steps.scope.outputs.fixtures }}
       full: ${{ steps.scope.outputs.full }}
     steps:
       - name: Checkout
@@ -51,6 +52,7 @@ jobs:
               echo 'backend=true'
               echo 'tauri=true'
               echo 'film_tv=true'
+              echo 'fixtures=true'
               echo 'full=true'
             } >> "$GITHUB_OUTPUT"
             exit 0
@@ -61,6 +63,7 @@ jobs:
           backend=false
           tauri=false
           film_tv=false
+          fixtures=false
           full=false
 
           for path in "${changed[@]}"; do
@@ -82,6 +85,10 @@ jobs:
               film_tv=true
             fi
 
+            if [[ "$lower" =~ (^|/)(fixture|fixtures)([/._-]|$) ]]; then
+              fixtures=true
+            fi
+
             # Workflow, dependency, build, and release-policy changes can
             # affect every layer even when their path is not component code.
             case "$path" in
@@ -95,6 +102,7 @@ jobs:
             backend=true
             tauri=true
             film_tv=true
+            fixtures=true
           fi
 
           {
@@ -102,6 +110,7 @@ jobs:
             echo "backend=$backend"
             echo "tauri=$tauri"
             echo "film_tv=$film_tv"
+            echo "fixtures=$fixtures"
             echo "full=$full"
           } >> "$GITHUB_OUTPUT"
 
@@ -192,6 +201,7 @@ jobs:
         run: npm run governance:check
 
       - name: Frontend fixture contract
+        if: needs.changes.outputs.fixtures == 'true'
         working-directory: 前端/app
         run: npm run fixtures:check
 
