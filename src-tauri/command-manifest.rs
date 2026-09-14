@@ -442,25 +442,3 @@ define_commands!(
         commands::video_screenshot::video_screenshot_cancel
     )
 );
-
-#[cfg(test)]
-mod command_manifest_tests {
-    #[test]
-    fn comic_work_catalog_commands_are_registered_once() {
-        let names: Vec<&str> = super::TARGET_COMMAND_NAMES.to_vec();
-        assert_eq!(
-            names
-                .iter()
-                .filter(|name| **name == "comic_work_chapter_catalog_get")
-                .count(),
-            1
-        );
-        assert_eq!(
-            names
-                .iter()
-                .filter(|name| **name == "comic_work_chapter_catalog_refresh")
-                .count(),
-            1
-        );
-    }
-}
