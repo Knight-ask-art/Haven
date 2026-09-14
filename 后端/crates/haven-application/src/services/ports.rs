@@ -390,7 +390,7 @@ pub enum ComicProgressSubjectWritePrecondition {
         media_item_ids: Vec<MediaItemId>,
     },
     ExactSnapshot {
-        subject: ComicProgressSubject,
+        subject: Box<ComicProgressSubject>,
         members: Vec<ComicProgressSubjectMember>,
         require_authoritative_progress_none: bool,
         /// When present, the checked transaction must also prove that this

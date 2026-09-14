@@ -1906,7 +1906,12 @@ mod tests {
             10,
         );
 
-        validate_work_scope(work_id, std::slice::from_ref(&own), &[own_receipt.clone()]).unwrap();
+        validate_work_scope(
+            work_id,
+            std::slice::from_ref(&own),
+            std::slice::from_ref(&own_receipt),
+        )
+        .unwrap();
 
         for error in [
             validate_work_scope(work_id, &[foreign], &[own_receipt]).unwrap_err(),

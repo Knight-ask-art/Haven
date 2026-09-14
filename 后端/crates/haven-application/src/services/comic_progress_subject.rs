@@ -283,7 +283,7 @@ impl ComicProgressSubjectService {
                 refresh_receipt: None,
             },
             &ComicProgressSubjectWritePrecondition::ExactSnapshot {
-                subject: source_subject,
+                subject: Box::new(source_subject),
                 members,
                 require_authoritative_progress_none: false,
                 require_progress_absent_for_media_item: target_progress
@@ -357,7 +357,7 @@ impl ComicProgressSubjectService {
                     refresh_receipt: None,
                 },
                 &ComicProgressSubjectWritePrecondition::ExactSnapshot {
-                    subject: source.clone(),
+                    subject: Box::new(source.clone()),
                     members: source.members().to_vec(),
                     require_authoritative_progress_none: false,
                     require_progress_absent_for_media_item: None,
@@ -412,7 +412,7 @@ impl ComicProgressSubjectService {
                     refresh_receipt: None,
                 },
                 &ComicProgressSubjectWritePrecondition::ExactSnapshot {
-                    subject: existing,
+                    subject: Box::new(existing),
                     members: old_members,
                     require_authoritative_progress_none: false,
                     require_progress_absent_for_media_item: None,
@@ -732,7 +732,7 @@ impl ComicProgressSubjectService {
                 refresh_receipt: None,
             },
             &ComicProgressSubjectWritePrecondition::ExactSnapshot {
-                subject: resolution.subject.clone(),
+                subject: Box::new(resolution.subject.clone()),
                 members: resolution.subject.members().to_vec(),
                 require_authoritative_progress_none: false,
                 require_progress_absent_for_media_item: Some(target_item.id),
@@ -795,7 +795,7 @@ impl ComicProgressSubjectService {
         {
             let members = subject.members().to_vec();
             let precondition = ComicProgressSubjectWritePrecondition::ExactSnapshot {
-                subject: subject.clone(),
+                subject: Box::new(subject.clone()),
                 members: members.clone(),
                 require_authoritative_progress_none: false,
                 require_progress_absent_for_media_item: None,
@@ -1145,7 +1145,7 @@ impl ComicProgressSubjectService {
                 refresh_receipt: None,
             },
             &ComicProgressSubjectWritePrecondition::ExactSnapshot {
-                subject: resolution.subject.clone(),
+                subject: Box::new(resolution.subject.clone()),
                 members: resolution.subject.members().to_vec(),
                 require_authoritative_progress_none: false,
                 require_progress_absent_for_media_item: target_was_absent
@@ -1214,7 +1214,7 @@ impl ComicProgressSubjectService {
             return ProgressRepository::get_for_media_item(&*self.ports, media_item_id)
                 .await?
                 .map(Some)
-                .ok_or_else(|| authoritative_progress_missing());
+                .ok_or_else(authoritative_progress_missing);
         }
         self.select_authoritative_progress(subject).await
     }
@@ -1313,7 +1313,7 @@ impl ComicProgressSubjectService {
                 refresh_receipt: None,
             },
             &ComicProgressSubjectWritePrecondition::ExactSnapshot {
-                subject: resolution.subject.clone(),
+                subject: Box::new(resolution.subject.clone()),
                 members: resolution.subject.members().to_vec(),
                 require_authoritative_progress_none: false,
                 require_progress_absent_for_media_item: None,
@@ -1440,7 +1440,7 @@ impl ComicProgressSubjectService {
                         refresh_receipt: None,
                     },
                     &ComicProgressSubjectWritePrecondition::ExactSnapshot {
-                        subject: expected_subject,
+                        subject: Box::new(expected_subject),
                         members: members.clone(),
                         require_authoritative_progress_none: true,
                         require_progress_absent_for_media_item: None,

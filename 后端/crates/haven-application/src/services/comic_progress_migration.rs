@@ -137,6 +137,7 @@ pub(crate) fn migration_result_with_receipt(
     }
 }
 
+#[expect(clippy::too_many_arguments, reason = "receipt fields mirror the persisted migration receipt contract")]
 pub(crate) fn migration_receipt(
     migration_id: ComicProgressMigrationId,
     source_media_item_id: MediaItemId,
@@ -170,6 +171,7 @@ pub(crate) fn migration_receipt(
     }
 }
 
+#[expect(clippy::too_many_arguments, reason = "match receipt keeps the migration decision inputs explicit")]
 fn receipt_for_match(
     source_media_item_id: MediaItemId,
     target_media_item_id: MediaItemId,
