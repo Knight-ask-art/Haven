@@ -54,9 +54,11 @@ class PublicSnapshotTreeTests(unittest.TestCase):
             "src-tauri/diagnostics/session.json",
             "data/library.sqlite3",
             "captures/browser.har",
+            ".env",
+            "config/private.key",
         )
 
-        self.assertEqual(len(errors), 9)
+        self.assertEqual(len(errors), 11)
 
 
 if __name__ == "__main__":

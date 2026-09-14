@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: public-ci-${{ github.workflow }}-${{ github.ref }}
@@ -75,7 +76,7 @@ jobs:
 
             # Film/TV evidence is tied to the public contract, its checker,
             # and media-specific implementation/fixture paths.
-            if [[ "$lower" =~ (^|/)(film-tv|film_tv|video|movie|tv)(/|\.|-|$) ]] ||
+            if [[ "$lower" =~ (^|/)(film-tv|film_tv|film|video|movie|tv)([/._-]|$) ]] ||
                [[ "$path" == contracts/film-tv/* ]] ||
                [[ "$path" == tools/film-tv/* ]]; then
               film_tv=true
@@ -125,12 +126,33 @@ jobs:
       - name: Check public snapshot and forbidden artifacts
         run: python tools/release/public-snapshot-check.py
 
+      - name: Check committed secret markers
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep the detector focused on credential formats rather than words
+          # such as `token` used legitimately in application code/tests.
+          if git grep -nI -E -- \
+            '-----BEGIN (RSA|EC|OPENSSH|DSA|PRIVATE) KEY-----|(^|[^[:alnum:]])(ghp|gho|ghs|ghu|ghr)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[0-9A-Za-z-]{20,}'; then
+            echo "committed credential marker detected" >&2
+            exit 1
+          fi
+
       - name: Check release versions
         run: python tools/release/version-check.py --version 0.1.0-beta.1
 
       - name: Check repository whitespace integrity
         shell: pwsh
-        run: git diff --check HEAD^ HEAD
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if (${env:EVENT_NAME} -eq "pull_request") {
+            git diff --check "${env:BASE_SHA}" "${env:HEAD_SHA}"
+          } else {
+            git diff --check HEAD^ HEAD
+          }
 
   frontend:
     name: Frontend checks
@@ -292,6 +314,9 @@ jobs:
       - name: Film/TV fixture contract
         working-directory: 前端/app
         run: npm run fixtures:check
+
+      - name: Film/TV evidence contract
+        run: python tools/film-tv/evidence-check.py --layer contract
 
       - name: Test film/TV evidence checker
         run: python tools/film-tv/evidence-check.test.py

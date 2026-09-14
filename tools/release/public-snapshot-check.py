@@ -70,7 +70,18 @@ FORBIDDEN_SUFFIXES = (
     ".db",
     ".sqlite",
     ".sqlite3",
+    ".pem",
+    ".key",
+    ".p12",
+    ".pfx",
 )
+FORBIDDEN_FILE_NAMES = {
+    ".env",
+    ".env.local",
+    ".env.development",
+    ".env.production",
+    ".npmrc",
+}
 FORBIDDEN_STATUS_WORDS = (
     "目录登记",
     "待接入",
@@ -125,6 +136,8 @@ def check_public_tree(root: Path, files: list[str], errors: list[str]) -> None:
         if any(part.lower() in forbidden_directory_names for part in path.parts):
             add_error(errors, f"local diagnostic directory is tracked: {normalized}")
         lower = normalized.lower()
+        if path.name.lower() in FORBIDDEN_FILE_NAMES:
+            add_error(errors, f"local secret configuration is tracked: {normalized}")
         if any(lower.endswith(suffix) for suffix in FORBIDDEN_SUFFIXES):
             add_error(errors, f"diagnostic or source-map artifact is tracked: {normalized}")
 
