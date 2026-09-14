@@ -15,6 +15,8 @@
 PR Gate 会根据实际 diff 再次分类；此处勾选用于审查说明，不能绕过自动检查。
 所有 PR 都运行公共策略与仓库完整性检查。相关模块的严格 lint/build/test
 以及 Film/TV evidence 会阻塞合并；CodeQL Gate 只分析受影响语言。
+当前 `Protect main` 规则集保持 0 个必需 approval；未来改为 1 个 approval
+只需调整规则集参数，`CODEOWNERS` 与这些自动化 Gate 无需改动。
 -->
 
 ## 验证
