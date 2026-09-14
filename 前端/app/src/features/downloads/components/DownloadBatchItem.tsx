@@ -1,18 +1,49 @@
 import type { DownloadTaskDto } from "@/lib/ipc/generated/wire"
 import { cn } from "@/lib/utils"
+import { DownloadTaskList } from "./DownloadTaskList"
 
 interface DownloadBatchItemProps {
   batchId: string
   title: string
   tasks: DownloadTaskDto[]
+  pendingTaskIds?: ReadonlySet<string>
+  onPause?: (id: string) => void
+  onResume?: (id: string) => void
+  onCancel?: (id: string) => void
+  onRetry?: (id: string) => void
+  onOpen?: (task: DownloadTaskDto) => void
+  onRemoveRecord?: (id: string) => void
+  onDeleteOffline?: (id: string) => void
+  onRevealOffline?: (id: string) => void
 }
 
-export function DownloadBatchItem({ title, tasks }: DownloadBatchItemProps) {
+const ACTIVE_STATES = new Set<DownloadTaskDto["state"]>(["queued", "resolving", "downloading", "paused", "verifying"])
+
+export function summarizeDownloadBatch(tasks: DownloadTaskDto[]) {
   const total = tasks.length
-  const completed = tasks.filter((t) => t.state === "completed").length
-  const failed = tasks.filter((t) => t.state === "failed").length
-  const downloading = tasks.filter((t) => t.state === "downloading" || t.state === "queued").length
-  const progress = total === 0 ? 0 : Math.round((completed / total) * 100)
+  const completed = tasks.filter((task) => task.state === "completed").length
+  const failed = tasks.filter((task) => task.state === "failed" || task.state === "interrupted").length
+  const active = tasks.filter((task) => ACTIVE_STATES.has(task.state)).length
+  const progress = total === 0 ? 0 : Math.round(tasks.reduce((sum, task) => (
+    sum + (task.state === "completed" ? 1 : Math.max(0, Math.min(1, task.progressRatio ?? 0)))
+  ), 0) / total * 100)
+  return { total, completed, failed, active, progress }
+}
+
+export function DownloadBatchItem({
+  title,
+  tasks,
+  pendingTaskIds,
+  onPause,
+  onResume,
+  onCancel,
+  onRetry,
+  onOpen,
+  onRemoveRecord,
+  onDeleteOffline,
+  onRevealOffline,
+}: DownloadBatchItemProps) {
+  const { total, completed, failed, active, progress } = summarizeDownloadBatch(tasks)
   const isCompleted = completed === total && total > 0
   const isFailed = failed > 0 && completed + failed === total
 
@@ -33,22 +64,24 @@ export function DownloadBatchItem({ title, tasks }: DownloadBatchItemProps) {
         />
       </div>
       <div className="mt-2 text-xs text-muted-foreground">
-        {downloading > 0 ? `${downloading} 正在下载` : isCompleted ? "全部完成" : `${failed > 0 ? `${failed} 失败` : ""}`}
+        {active > 0 ? `${active} 正在处理` : isCompleted ? "全部完成" : `${failed > 0 ? `${failed} 失败` : ""}`}
       </div>
       <details className="mt-3">
         <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground">展开 {total} 个子任务</summary>
-        <ul className="mt-2 space-y-1">
-          {tasks.map((task) => (
-            <li key={task.taskId} className="flex items-center justify-between text-xs">
-              <span className="truncate" title={task.title}>
-                {task.title}
-              </span>
-              <span className={cn("ml-2 shrink-0 rounded px-1.5 py-0.5", task.state === "completed" ? "bg-green-100 text-green-700" : task.state === "failed" ? "bg-red-100 text-red-700" : "bg-muted")}>
-                {task.state}
-              </span>
-            </li>
-          ))}
-        </ul>
+        <div className="mt-3">
+          <DownloadTaskList
+            tasks={tasks}
+            pendingTaskIds={pendingTaskIds}
+            onPause={onPause}
+            onResume={onResume}
+            onCancel={onCancel}
+            onRetry={onRetry}
+            onOpen={onOpen}
+            onRemoveRecord={onRemoveRecord}
+            onDeleteOffline={onDeleteOffline}
+            onRevealOffline={onRevealOffline}
+          />
+        </div>
       </details>
     </div>
   )

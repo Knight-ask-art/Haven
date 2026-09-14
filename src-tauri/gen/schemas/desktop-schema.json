@@ -261,6 +261,18 @@
           "markdownDescription": "Enables the comic_progress_revert command without any pre-configured scope."
         },
         {
+          "description": "Enables the comic_work_chapter_catalog_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-comic-work-chapter-catalog-get",
+          "markdownDescription": "Enables the comic_work_chapter_catalog_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the comic_work_chapter_catalog_refresh command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-comic-work-chapter-catalog-refresh",
+          "markdownDescription": "Enables the comic_work_chapter_catalog_refresh command without any pre-configured scope."
+        },
+        {
           "description": "Enables the credential_delete command without any pre-configured scope.",
           "type": "string",
           "const": "allow-credential-delete",
@@ -475,6 +487,12 @@
           "type": "string",
           "const": "allow-preference-update",
           "markdownDescription": "Enables the preference_update command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the progress_mark_completed command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-progress-mark-completed",
+          "markdownDescription": "Enables the progress_mark_completed command without any pre-configured scope."
         },
         {
           "description": "Enables the progress_recent command without any pre-configured scope.",
@@ -819,6 +837,18 @@
           "markdownDescription": "Denies the comic_progress_revert command without any pre-configured scope."
         },
         {
+          "description": "Denies the comic_work_chapter_catalog_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-comic-work-chapter-catalog-get",
+          "markdownDescription": "Denies the comic_work_chapter_catalog_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the comic_work_chapter_catalog_refresh command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-comic-work-chapter-catalog-refresh",
+          "markdownDescription": "Denies the comic_work_chapter_catalog_refresh command without any pre-configured scope."
+        },
+        {
           "description": "Denies the credential_delete command without any pre-configured scope.",
           "type": "string",
           "const": "deny-credential-delete",
@@ -1033,6 +1063,12 @@
           "type": "string",
           "const": "deny-preference-update",
           "markdownDescription": "Denies the preference_update command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the progress_mark_completed command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-progress-mark-completed",
+          "markdownDescription": "Denies the progress_mark_completed command without any pre-configured scope."
         },
         {
           "description": "Denies the progress_recent command without any pre-configured scope.",

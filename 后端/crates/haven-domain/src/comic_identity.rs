@@ -159,8 +159,8 @@ pub struct EditionMatch {
 
 /// 比较两个 Edition 画像。
 ///
-/// 已知强字段冲突优先于其他证据；未知字段只会把结果降级为 Candidate，
-/// 不会自动匹配到任意已知值。
+/// 已知强字段冲突优先于其他证据；两个字段都未知时可以视为相同，
+/// 但未知与已知值不会自动匹配，只会降级为 Candidate。
 pub fn compare_edition_profiles(left: &EditionProfile, right: &EditionProfile) -> EditionMatch {
     let mut evidence = Vec::new();
     let mut has_conflict = false;
@@ -265,6 +265,9 @@ fn compare_identity_facet(
         (IdentityFacet::NotApplicable, IdentityFacet::NotApplicable) => {
             evidence.push(EditionEvidence::Exact(facet));
         }
+        (IdentityFacet::Unknown, IdentityFacet::Unknown) => {
+            evidence.push(EditionEvidence::Unknown(facet));
+        }
         _ => {
             *has_unknown = true;
             evidence.push(EditionEvidence::Unknown(facet));
@@ -297,6 +300,9 @@ fn compare_scan_group(
         (ScanGroupFacet::NotApplicable, ScanGroupFacet::NotApplicable) => {
             evidence.push(EditionEvidence::Exact(EditionFacetKind::ScanGroup));
         }
+        (ScanGroupFacet::Unknown, ScanGroupFacet::Unknown) => {
+            evidence.push(EditionEvidence::Unknown(EditionFacetKind::ScanGroup));
+        }
         _ => {
             *has_unknown = true;
             evidence.push(EditionEvidence::Unknown(EditionFacetKind::ScanGroup));
@@ -312,6 +318,9 @@ fn compare_color_mode(
     has_unknown: &mut bool,
 ) {
     match (left, right) {
+        (ColorMode::Unknown, ColorMode::Unknown) => {
+            evidence.push(EditionEvidence::Unknown(EditionFacetKind::ColorMode));
+        }
         (ColorMode::Unknown, _) | (_, ColorMode::Unknown) => {
             *has_unknown = true;
             evidence.push(EditionEvidence::Unknown(EditionFacetKind::ColorMode));

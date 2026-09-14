@@ -3,8 +3,8 @@
 use tauri::State;
 
 use haven_application::wire::{
-    ErrorDto, ProgressRecentRequest, ProgressResetRequest, ProgressSaveRequest, ProgressSaveResult,
-    ProgressSummaryDto,
+    ErrorDto, ProgressMarkCompletedRequest, ProgressRecentRequest, ProgressResetRequest,
+    ProgressSaveRequest, ProgressSaveResult, ProgressSummaryDto,
 };
 use haven_domain::ids::MediaItemId;
 
@@ -41,6 +41,27 @@ pub async fn progress_save(
 ) -> Result<ProgressSaveResult, ErrorDto> {
     let state = (*state.inner()).clone();
     run_blocking(move || async move { run_progress_save(&state, request).await }).await
+}
+
+pub async fn run_progress_mark_completed(
+    state: &AppState,
+    request: ProgressMarkCompletedRequest,
+) -> Result<ProgressSaveResult, ErrorDto> {
+    validate_canonical_media_item_id(&request.media_item_id)?;
+    state
+        .progress
+        .mark_completed(request)
+        .await
+        .map_err(|error| to_error_dto(&error))
+}
+
+#[tauri::command]
+pub async fn progress_mark_completed(
+    state: State<'_, AppState>,
+    request: ProgressMarkCompletedRequest,
+) -> Result<ProgressSaveResult, ErrorDto> {
+    let state = (*state.inner()).clone();
+    run_blocking(move || async move { run_progress_mark_completed(&state, request).await }).await
 }
 
 pub async fn run_progress_recent(
@@ -214,6 +235,41 @@ mod tests {
         stale.expected_revision = Some(first.revision);
         let error = run_progress_save(&state, stale).await.unwrap_err();
         assert_eq!(error.code, "REVISION_CONFLICT");
+    }
+
+    #[tokio::test]
+    async fn progress_mark_completed_preserves_the_persisted_locator() {
+        let state = AppState::new(Arc::new(Db::open_in_memory().unwrap()));
+        let media_item_id = seed_movie(&state).await;
+        run_progress_save(&state, request(media_item_id, 20_000))
+            .await
+            .unwrap();
+
+        let result = run_progress_mark_completed(
+            &state,
+            ProgressMarkCompletedRequest {
+                media_item_id: media_item_id.to_string(),
+                // This simulates the old locator still held by a library card.
+                initial_locator: LocatorDto::Video(VideoLocatorDto { position_ms: 0 }),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!result.revision.is_empty());
+
+        let stored = state
+            .progress
+            .get(media_item_id)
+            .await
+            .unwrap()
+            .expect("completed progress exists");
+        assert_eq!(stored.completion, CompletionWire::Completed);
+        assert_eq!(
+            stored.locator,
+            LocatorDto::Video(VideoLocatorDto {
+                position_ms: 20_000
+            }),
+        );
     }
 
     #[tokio::test]

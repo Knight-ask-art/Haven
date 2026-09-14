@@ -76,6 +76,11 @@ define_commands!(
     ),
     ("library_list", "allow-library-list", commands::library::library_list),
     ("progress_save", "allow-progress-save", commands::progress::progress_save),
+    (
+        "progress_mark_completed",
+        "allow-progress-mark-completed",
+        commands::progress::progress_mark_completed
+    ),
     ("favorite_set", "allow-favorite-set", commands::favorite::favorite_set),
     ("home_get", "allow-home-get", commands::home::home_get),
     (
@@ -165,6 +170,16 @@ define_commands!(
         "comic_page_manifest_get",
         "allow-comic-page-manifest-get",
         commands::comic::comic_page_manifest_get
+    ),
+    (
+        "comic_work_chapter_catalog_get",
+        "allow-comic-work-chapter-catalog-get",
+        commands::comic::comic_work_chapter_catalog_get
+    ),
+    (
+        "comic_work_chapter_catalog_refresh",
+        "allow-comic-work-chapter-catalog-refresh",
+        commands::comic::comic_work_chapter_catalog_refresh
     ),
     (
         "comic_chapter_catalog_get",

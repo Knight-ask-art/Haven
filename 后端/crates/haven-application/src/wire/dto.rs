@@ -1057,6 +1057,16 @@ pub struct ProgressSaveRequest {
     pub keyframe: Option<String>,
 }
 
+/// `progress_mark_completed` 请求。`initial_locator` 只用于尚无 Progress
+/// 时创建安全起点；已有记录时后端原子保留其 Locator 与 percentage。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ProgressMarkCompletedRequest {
+    pub media_item_id: String,
+    pub initial_locator: LocatorDto,
+}
+
 /// `progress_save` 结果：新 Revision（opaque；语义由 BE-REVISION-001 正式化）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -1077,6 +1087,10 @@ pub struct HistoryEntryDto {
     pub started_at: String,
     pub last_active_at: String,
     pub completed_at: Option<String>,
+    /// 精确指向此历史条目的消费目标；绝不能从同一 Work 的首集或当前卡片投影推断。
+    pub primary_action: Option<PrimaryActionDto>,
+    /// 此历史条目 MediaItem 的当前进度（如有）；展示时不得以另一集的进度替代。
+    pub progress: Option<ProgressSummaryDto>,
 }
 
 /// `history_list` 请求（契约 §23.1）：最近活跃历史。
@@ -1494,6 +1508,170 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"sort\":\"recently_added\""), "{json}");
     }
+
+    #[test]
+    fn comic_work_catalog_wire_preserves_backend_order_and_receipts() {
+        let value = serde_json::to_value(ComicWorkChapterCatalogDto {
+            schema_version: 1,
+            work_id: "work-1".into(),
+            current_media_item_id: Some("media-1".into()),
+            editions: vec![ComicWorkEditionDto {
+                edition_id: "edition-1".into(),
+                profile: ComicEditionProfileDto {
+                    language: Some("zh-Hans".into()),
+                    language_kind: ComicEditionFacetKindDto::Known,
+                    translation_line: None,
+                    translation_line_kind: ComicEditionFacetKindDto::Unknown,
+                    scan_group: Some("group-a".into()),
+                    scan_group_kind: ComicScanGroupKindDto::ContentLine,
+                    color_mode: ComicColorModeDto::FullColor,
+                },
+                display_label: "zh-Hans / group-a / color".into(),
+                chapter_count: 1,
+            }],
+            chapters: vec![ComicWorkChapterDto {
+                media_item_id: "media-1".into(),
+                edition_id: "edition-1".into(),
+                subject_id: None,
+                chapter_number: Some(1.0),
+                volume_number: None,
+                title: Some("第一话".into()),
+                published_at: None,
+                page_count: Some(20),
+                status: ComicChapterAggregateStatusDto::Available,
+                can_open: true,
+                sources: vec![],
+                match_result: None,
+                progress: None,
+                previous_media_item_id: None,
+                next_media_item_id: Some("media-2".into()),
+                backend_order: 0,
+            }],
+            refresh_status: ComicWorkCatalogStatusDto::Synced,
+            last_observed_at: Some("2026-09-12T00:00:00Z".into()),
+            truncated: false,
+            refresh_receipts: vec![ComicCatalogRefreshReceiptDto {
+                refresh_id: "refresh-1".into(),
+                work_id: "work-1".into(),
+                source_id: "mangadex".into(),
+                remote_work_id: "remote-work-1".into(),
+                status: ComicCatalogRefreshOutcomeStatusDto::Succeeded,
+                generation_before: 0,
+                generation_after: Some(1),
+                observed_from: Some("chapter-1".into()),
+                observed_to: Some("chapter-1".into()),
+                truncated: false,
+                retained_previous_catalog: false,
+                error_code: None,
+                observed_at: "2026-09-12T00:00:00Z".into(),
+            }],
+        })
+        .unwrap();
+
+        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["chapters"][0]["mediaItemId"], "media-1");
+        assert_eq!(value["chapters"][0]["nextMediaItemId"], "media-2");
+        assert_eq!(value["refreshReceipts"][0]["status"], "succeeded");
+        assert!(value["chapters"][0].get("providerUrl").is_none());
+    }
+
+    #[test]
+    fn comic_work_catalog_request_rejects_unknown_fields_and_preserves_local_ids() {
+        let both = serde_json::json!({
+            "workId": "work-1",
+            "mediaItemId": "media-1"
+        });
+        let decoded = serde_json::from_value::<ComicWorkChapterCatalogRequestDto>(both).unwrap();
+        assert_eq!(decoded.work_id.as_deref(), Some("work-1"));
+        assert_eq!(decoded.media_item_id.as_deref(), Some("media-1"));
+
+        let extra = serde_json::json!({
+            "workId": "work-1",
+            "pageUrl": "https://example.invalid/page"
+        });
+        assert!(serde_json::from_value::<ComicWorkChapterCatalogRequestDto>(extra).is_err());
+    }
+
+    #[test]
+    fn comic_progress_migration_receipt_wire_contains_explainable_snapshots() {
+        let receipt = ComicProgressMigrationReceiptDto {
+            migration_id: "migration-1".into(),
+            source_media_item_id: "source-1".into(),
+            target_media_item_id: "target-1".into(),
+            strategy: ComicPageMappingStrategyDto::ContentFingerprint,
+            confidence: ComicPageMappingConfidenceDto::Medium,
+            evidence: vec![ComicChapterEvidenceDto {
+                kind: ComicChapterEvidenceKindDto::MatchingChapterMetadata,
+                matched: None,
+            }],
+            source_progress_snapshot: Some(ComicProgressSnapshotDto {
+                media_item_id: "source-1".into(),
+                page_index: Some(2),
+                page_progression: Some(0.5),
+                completion: CompletionWire::InProgress,
+                percentage: Some(0.5),
+                revision: Some("revision-1".into()),
+                updated_at: Some("2026-09-12T00:00:00Z".into()),
+            }),
+            target_progress_before: None,
+            target_progress_after: None,
+            page_mapping: ComicPageMigrationDto {
+                target_page_index: Some(3),
+                confidence: ComicPageMappingConfidenceDto::Medium,
+                strategy: ComicPageMappingStrategyDto::ContentFingerprint,
+                reversible: true,
+            },
+            algorithm_version: "comic-progress/v2".into(),
+            created_at: "2026-09-12T00:00:00Z".into(),
+            undoable: false,
+            applied_revision: None,
+        };
+        let value = serde_json::to_value(&receipt).unwrap();
+        for field in [
+            "migrationId",
+            "sourceMediaItemId",
+            "targetMediaItemId",
+            "strategy",
+            "confidence",
+            "evidence",
+            "sourceProgressSnapshot",
+            "targetProgressBefore",
+            "targetProgressAfter",
+            "pageMapping",
+            "algorithmVersion",
+            "createdAt",
+            "undoable",
+            "appliedRevision",
+        ] {
+            assert!(value.get(field).is_some(), "receipt 缺少字段 {field}");
+        }
+        assert!(value.get("locator").is_none());
+        assert!(value.get("pageId").is_none());
+        assert!(value.get("grant").is_none());
+        assert!(value.get("url").is_none());
+    }
+
+    #[test]
+    fn source_work_import_target_is_backward_compatible_and_local_only() {
+        let request: SourceWorkImportRequest = serde_json::from_value(serde_json::json!({
+            "operationId": "operation-1",
+            "index": 0
+        }))
+        .unwrap();
+        assert_eq!(request.target_work_id, None);
+
+        let request_with_target: SourceWorkImportRequest =
+            serde_json::from_value(serde_json::json!({
+                "operationId": "operation-1",
+                "index": 0,
+                "targetWorkId": "work-1"
+            }))
+            .unwrap();
+        assert_eq!(
+            request_with_target.target_work_id.as_deref(),
+            Some("work-1")
+        );
+    }
 }
 
 /// Continue 条目（首页 `home_get`；NOTE-7 契约定义）。
@@ -1796,6 +1974,130 @@ pub struct ComicRegisteredChapterCatalogDto {
     pub chapters: Vec<ComicRegisteredChapterCatalogItemDto>,
 }
 
+/// Work 级漫画目录请求。这里只携带本地 Work/MediaItem 身份；二选一的业务
+/// 约束由命令/Application 核心校验，serde 层只负责字段闭合和兼容反序列化。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicWorkChapterCatalogRequestDto {
+    pub work_id: Option<String>,
+    pub media_item_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum ComicChapterAggregateStatusDto {
+    Available,
+    TemporarilyUnavailable,
+    ExternalOnly,
+    Unknown,
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicWorkEditionDto {
+    pub edition_id: String,
+    pub profile: ComicEditionProfileDto,
+    pub display_label: String,
+    pub chapter_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicChapterSourceSummaryDto {
+    pub source: ComicChapterSourceIdentityDto,
+    pub status: ComicChapterSourceStatusDto,
+    pub mirror_label: Option<String>,
+    pub observed_at: Option<String>,
+    pub source_order: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicWorkChapterDto {
+    pub media_item_id: String,
+    pub edition_id: String,
+    pub subject_id: Option<String>,
+    pub chapter_number: Option<f64>,
+    pub volume_number: Option<f64>,
+    pub title: Option<String>,
+    pub published_at: Option<String>,
+    pub page_count: Option<u32>,
+    pub status: ComicChapterAggregateStatusDto,
+    pub can_open: bool,
+    pub sources: Vec<ComicChapterSourceSummaryDto>,
+    pub match_result: Option<ComicChapterMatchDto>,
+    pub progress: Option<ProgressSummaryDto>,
+    pub previous_media_item_id: Option<String>,
+    pub next_media_item_id: Option<String>,
+    pub backend_order: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum ComicCatalogRefreshOutcomeStatusDto {
+    NeverSynced,
+    Succeeded,
+    TemporarilyUnavailable,
+    ExternalOnly,
+    Unknown,
+    RefreshFailed,
+    Truncated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicCatalogRefreshReceiptDto {
+    pub refresh_id: String,
+    pub work_id: String,
+    pub source_id: String,
+    pub remote_work_id: String,
+    pub status: ComicCatalogRefreshOutcomeStatusDto,
+    #[ts(type = "number")]
+    pub generation_before: u64,
+    #[ts(type = "number | null")]
+    pub generation_after: Option<u64>,
+    pub observed_from: Option<String>,
+    pub observed_to: Option<String>,
+    pub truncated: bool,
+    pub retained_previous_catalog: bool,
+    pub error_code: Option<String>,
+    pub observed_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum ComicWorkCatalogStatusDto {
+    NeverSynced,
+    Synced,
+    RefreshFailed,
+    Truncated,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicWorkChapterCatalogDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub work_id: String,
+    pub current_media_item_id: Option<String>,
+    pub editions: Vec<ComicWorkEditionDto>,
+    pub chapters: Vec<ComicWorkChapterDto>,
+    pub refresh_status: ComicWorkCatalogStatusDto,
+    pub last_observed_at: Option<String>,
+    pub truncated: bool,
+    pub refresh_receipts: Vec<ComicCatalogRefreshReceiptDto>,
+}
+
 /// 获取当前章节已经登记的其他来源候选。请求中的来源身份必须先在
 /// SQLite 中解析，前端不能用它直接构造 Provider URL 或资源定位器。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -1990,7 +2292,7 @@ pub struct ComicPageMigrationDto {
 
 /// 章节换源/页面重定位的统一结果。低置信度自动迁移也必须带 snapshotId，
 /// 以便用户在目标进度未被后续写入时撤销。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 #[ts(export, rename_all = "camelCase")]
 pub struct ComicProgressMigrationResultDto {
@@ -1998,6 +2300,40 @@ pub struct ComicProgressMigrationResultDto {
     pub match_result: Option<ComicChapterMatchDto>,
     pub page_migration: ComicPageMigrationDto,
     pub snapshot_id: Option<String>,
+    pub applied_revision: Option<String>,
+    pub receipt: ComicProgressMigrationReceiptDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicProgressSnapshotDto {
+    pub media_item_id: String,
+    pub page_index: Option<u32>,
+    pub page_progression: Option<f64>,
+    pub completion: CompletionWire,
+    pub percentage: Option<f64>,
+    pub revision: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ComicProgressMigrationReceiptDto {
+    pub migration_id: String,
+    pub source_media_item_id: String,
+    pub target_media_item_id: String,
+    pub strategy: ComicPageMappingStrategyDto,
+    pub confidence: ComicPageMappingConfidenceDto,
+    pub evidence: Vec<ComicChapterEvidenceDto>,
+    pub source_progress_snapshot: Option<ComicProgressSnapshotDto>,
+    pub target_progress_before: Option<ComicProgressSnapshotDto>,
+    pub target_progress_after: Option<ComicProgressSnapshotDto>,
+    pub page_mapping: ComicPageMigrationDto,
+    pub algorithm_version: String,
+    pub created_at: String,
+    pub undoable: bool,
     pub applied_revision: Option<String>,
 }
 
@@ -2237,6 +2573,7 @@ pub struct DownloadCreateRequest {
 #[ts(export, rename_all = "camelCase")]
 pub struct DownloadListRequest {
     pub limit: Option<u32>,
+    pub offset: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -2551,6 +2888,10 @@ pub struct SourceSetCredentialRequest {
 pub struct SourceWorkImportRequest {
     pub operation_id: String,
     pub index: u32,
+    /// null/缺省保持“导入为新 Work”；非 null 只能是本地 WorkId。
+    #[serde(default)]
+    #[ts(optional)]
+    pub target_work_id: Option<String>,
 }
 
 /// `source_work_import` 结果：入库后的真实身份（可路由播放）。

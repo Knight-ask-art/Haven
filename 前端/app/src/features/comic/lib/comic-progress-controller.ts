@@ -84,8 +84,13 @@ export function restoreComicProgress(
 ): { pageIndex: number; pageProgression: number | null } | null {
   if (!session.progress) return null
   if (session.progress.locator.kind !== "comic") return null
+  if (!Number.isInteger(totalPages) || totalPages <= 0) return null
   const identity = `${session.sessionId}:${session.mediaItemId}:${session.contentUri}`
   if (restored?.current === identity) return null
+  if (session.progress.completion === "not_started") {
+    if (restored) restored.current = identity
+    return { pageIndex: 1, pageProgression: null }
+  }
   const data = session.progress.locator.data
   if (!Number.isInteger(data.pageIndex) || data.pageIndex < 0 || data.pageIndex >= totalPages) return null
   if (restored) restored.current = identity

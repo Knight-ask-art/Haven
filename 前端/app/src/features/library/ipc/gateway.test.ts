@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import type { HavenClient } from "@/lib/ipc/client"
 import type { EditionListByWorkRequest, EditionListByWorkResultDto } from "@/features/media/ipc/edition-wire"
 import type {
@@ -15,7 +15,13 @@ import type {
   ResourceListByMediaItemRequest,
   ResourceListDto,
 } from "@/lib/ipc/generated/wire"
-import { acceptLibraryCursor, findLibraryItemById, loadAllLibraryPages } from "./gateway"
+const { markCompletedProgress } = vi.hoisted(() => ({
+  markCompletedProgress: vi.fn().mockResolvedValue({ revision: "revision-2" }),
+}))
+
+vi.mock("@/features/progress/ipc/progress-gateway", () => ({ markCompletedProgress }))
+
+import { acceptLibraryCursor, defaultCompletionLocator, findLibraryItemById, loadAllLibraryPages, markLibraryItemCompleted } from "./gateway"
 
 function fakeClient(pages: Array<PageDto<WorkCardDto>>): HavenClient {
   let calls = 0
@@ -153,5 +159,66 @@ describe("library cursor pagination", () => {
 
     const items = await loadAllLibraryPages(fakeClient([page([document, article], null)]))
     expect(items.map((item) => item.type)).toEqual(["document", "article"])
+  })
+
+  it("uses the completion-only command so a listed locator cannot overwrite newer progress", async () => {
+    const item = {
+      id: "work-1",
+      title: "作品",
+      type: "video",
+      year: 2026,
+      imageUrl: "",
+      progressMediaItemId: "11111111-1111-4111-8111-111111111111",
+      progressLocator: { version: 1 as const, kind: "video" as const, data: { positionMs: 12_000 } },
+    }
+
+    await markLibraryItemCompleted(item)
+
+    expect(markCompletedProgress).toHaveBeenCalledWith({
+      mediaItemId: item.progressMediaItemId,
+      initialLocator: item.progressLocator,
+    })
+  })
+
+  it("derives safe start locators when a consumable item has no saved progress", async () => {
+    const mediaItemId = "11111111-1111-4111-8111-111111111111"
+    const cases: Array<[WorkCardDto["availableMediaTypes"][number], string, unknown]> = [
+      ["movie", "video", { positionMs: 0 }],
+      ["document", "pdf", { pageIndex: 0, x: null, y: null, zoom: null, textAnchor: null }],
+      ["comic", "comic", { chapterItemId: mediaItemId, pageIndex: 0, pageProgression: null }],
+      ["article", "article", { blockId: null, progression: 0, textAnchor: null }],
+    ]
+
+    for (const [mediaType, kind, data] of cases) {
+      const candidate = card(mediaType)
+      candidate.availableMediaTypes = [mediaType]
+      candidate.primaryAction = {
+        kind: mediaType === "comic" ? "comic" : mediaType === "article" ? "article" : mediaType === "document" ? "reader" : "playback",
+        labelHint: "start",
+        editionId: "22222222-2222-4222-8222-222222222222",
+        mediaItemId,
+        locator: null,
+      }
+      expect(defaultCompletionLocator(candidate)).toEqual({ version: 1, kind, data })
+    }
+  })
+
+  it("does not invent a publication resource for an unpositioned book", () => {
+    const candidate = card("book")
+    candidate.availableMediaTypes = ["book"]
+    candidate.primaryAction = {
+      kind: "open_edition",
+      labelHint: "start",
+      editionId: "22222222-2222-4222-8222-222222222222",
+      mediaItemId: "11111111-1111-4111-8111-111111111111",
+      locator: null,
+    }
+    expect(defaultCompletionLocator(candidate)).toBeNull()
+  })
+
+  it("rejects batch completion when the authoritative locator is missing", async () => {
+    await expect(markLibraryItemCompleted({ id: "work-2", title: "无定位作品", type: "book", year: 2026, imageUrl: "" }))
+      .rejects.toThrow("没有可用的阅读定位")
+    expect(markCompletedProgress).not.toHaveBeenCalledWith(expect.objectContaining({ mediaItemId: "work-2" }))
   })
 })

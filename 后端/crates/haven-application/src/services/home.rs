@@ -15,10 +15,12 @@ use haven_common::AppError;
 use haven_domain::contracts::{
     EditionRepository, FavoriteRepository, MediaItemRepository, ProgressRepository, WorkRepository,
 };
+use haven_domain::enums::MediaType;
 
 use crate::mapper::progress::progress_summary;
 use crate::mapper::work_card::{WorkCardInput, primary_action, work_card};
 use crate::services::ports::LibraryPorts;
+use crate::services::progress::comic_progress_subject::ComicProgressSubjectService;
 use crate::wire::{
     ContinueItemDto, HomeDto, LabelHint, LibraryListRequest, LibraryListSort, PrimaryActionDto,
     QueryCategory, ShelfDto, WorkCardDto,
@@ -32,11 +34,22 @@ const FAVORITES_PREVIEW_LIMIT: u32 = 20;
 #[derive(Clone)]
 pub struct HomeService {
     ports: Arc<dyn LibraryPorts>,
+    comic_progress_subjects: Option<ComicProgressSubjectService>,
 }
 
 impl HomeService {
     pub fn new(ports: Arc<dyn LibraryPorts>) -> Self {
-        Self { ports }
+        Self {
+            ports,
+            comic_progress_subjects: None,
+        }
+    }
+
+    /// 启用漫画 Subject 的只读首页投影；不会因加载首页而创建 Subject 或
+    /// 物化目标 Progress。
+    pub fn with_comic_progress_subjects(mut self, subjects: ComicProgressSubjectService) -> Self {
+        self.comic_progress_subjects = Some(subjects);
+        self
     }
 
     /// `home_get`：聚合 Continue + RecentlyAdded + Shelves 为单次首页投影。
@@ -54,7 +67,8 @@ impl HomeService {
 
     /// Continue 分组：`progress_recent` 联查 Work/Edition/MediaItem 组装 ContinueItemDto。
     async fn build_continue_items(&self) -> Result<Vec<ContinueItemDto>, AppError> {
-        let progress_items = ProgressRepository::recent(&*self.ports, CONTINUE_LIMIT).await?;
+        let raw_progress_items = ProgressRepository::recent(&*self.ports, CONTINUE_LIMIT).await?;
+        let progress_items = self.resolve_continue_progress(raw_progress_items).await?;
         if progress_items.is_empty() {
             return Ok(Vec::new());
         }
@@ -227,12 +241,27 @@ impl HomeService {
         for m in media_items {
             media_by_edition.entry(m.edition_id).or_default().push(m);
         }
-        let first_media_ids: Vec<_> = editions_by_work
-            .iter()
-            .flat_map(|(_, es)| es.iter())
-            .filter_map(|e| media_by_edition.get(&e.id)?.first().map(|m| m.id))
+        let media_ids: Vec<_> = media_by_edition
+            .values()
+            .flatten()
+            .map(|media_item| media_item.id)
             .collect();
-        let progress_map = self.ports.get_for_media_items(&first_media_ids).await?;
+        let mut progress_map = self.ports.get_for_media_items(&media_ids).await?;
+        if let Some(subjects) = self.comic_progress_subjects.as_ref() {
+            for media_item in media_by_edition.values().flatten() {
+                if media_item.media_type != MediaType::Comic {
+                    continue;
+                }
+                match subjects.progress_for_media_item(media_item.id).await? {
+                    Some(progress) => {
+                        progress_map.insert(media_item.id, progress);
+                    }
+                    None => {
+                        progress_map.remove(&media_item.id);
+                    }
+                }
+            }
+        }
         let favorites = self
             .ports
             .is_favorite_many(
@@ -252,7 +281,14 @@ impl HomeService {
                     work_media.extend(ms.iter().cloned());
                 }
             }
-            let progress = work_media.first().and_then(|m| progress_map.get(&m.id));
+            // Work 卡片必须展示该 Work 下实际最近消费的 MediaItem；固定取首项会
+            // 让后续章节的进度从 Recently Added/Shelf 投影中消失。与
+            // `ProgressRepository::recent` 和 LibraryService 保持相同的稳定排序：
+            // 先按 last_active_at，再按持久化 Progress ID 处理同一时间点。
+            let progress = work_media
+                .iter()
+                .filter_map(|media_item| progress_map.get(&media_item.id))
+                .max_by_key(|progress| (progress.last_active_at, progress.id));
             items.push(work_card(&WorkCardInput {
                 work,
                 editions: &work_editions,
@@ -262,6 +298,52 @@ impl HomeService {
             })?);
         }
         Ok(items)
+    }
+
+    /// Resolve the home Continue source through the authoritative Subject row and
+    /// suppress duplicate raw Progress rows from equivalent comic MediaItems.
+    async fn resolve_continue_progress(
+        &self,
+        raw: Vec<haven_domain::entities::Progress>,
+    ) -> Result<Vec<haven_domain::entities::Progress>, AppError> {
+        let Some(subjects) = self.comic_progress_subjects.as_ref() else {
+            return Ok(raw);
+        };
+        let mut seen_subjects = HashSet::new();
+        let mut resolved = Vec::with_capacity(raw.len());
+        for progress in raw {
+            let media_item = MediaItemRepository::get(&*self.ports, progress.media_item_id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::new(
+                        "MEDIA_ITEM_NOT_FOUND",
+                        haven_common::ErrorKind::NotFound,
+                        "媒体条目不存在",
+                        false,
+                    )
+                })?;
+            if media_item.media_type != MediaType::Comic {
+                resolved.push(progress);
+                continue;
+            }
+            let Some(subject_id) = subjects
+                .subject_id_for_media_item(progress.media_item_id)
+                .await?
+            else {
+                resolved.push(progress);
+                continue;
+            };
+            if !seen_subjects.insert(subject_id) {
+                continue;
+            }
+            if let Some(progress) = subjects
+                .authoritative_progress_for_media_item(progress.media_item_id)
+                .await?
+            {
+                resolved.push(progress);
+            }
+        }
+        Ok(resolved)
     }
 }
 
@@ -447,6 +529,12 @@ mod tests {
         ) -> Result<Option<String>, AppError> {
             Ok(None)
         }
+        async fn mark_completed(&self, progress: &Progress) -> Result<String, AppError> {
+            Ok(progress
+                .revision
+                .clone()
+                .unwrap_or_else(|| "test-revision".into()))
+        }
         async fn recent(&self, limit: u32) -> Result<Vec<Progress>, AppError> {
             Ok(self.progress.iter().take(limit as usize).cloned().collect())
         }
@@ -592,6 +680,39 @@ mod tests {
         assert!(continue_item.progress.progress_ratio.is_some());
         assert_eq!(home.recently_added.len(), 1);
         assert_eq!(home.recently_added[0].work_id, work.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn home_recently_added_projects_the_most_recent_progress_media_item() {
+        let work = sample_work(WorkId::new(), "首页多集作品");
+        let edition = sample_edition(work.id);
+        let first = sample_item(edition.id);
+        let second = sample_item(edition.id);
+        let progress = sample_progress(work.id, edition.id, second.id);
+        let ports = Arc::new(
+            MemPorts::new(vec![work.clone()])
+                .with_edition(edition)
+                .with_item(first)
+                .with_item(second.clone())
+                .with_progress(progress),
+        );
+
+        let home = HomeService::new(ports).get().await.unwrap();
+
+        let card = &home.recently_added[0];
+        let second_id = second.id.to_string();
+        assert_eq!(
+            card.progress.as_ref().unwrap().media_item_id,
+            second_id,
+            "首页卡片必须跟随实际最近消费的后续 MediaItem"
+        );
+        assert_eq!(
+            card.primary_action
+                .as_ref()
+                .and_then(|action| action.media_item_id.as_deref()),
+            Some(second_id.as_str()),
+            "首页继续操作必须绑定同一条后续 MediaItem"
+        );
     }
 
     #[tokio::test]

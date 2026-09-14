@@ -5,7 +5,7 @@
 //! - WorkCardDto 组装：editions/media_items/progress/favorite 聚合后走 mapper。
 //! - 组装为批量查询（list_by_works/list_by_editions/get_for_media_items/is_favorite_many），
 //!   每页固定 5 次查询，与页大小无关（N+1 已清偿，2026-08-13）。
-//! - progress 投影取"首个 media_item"（完整最近活跃语义为后续任务）。
+//! - progress 投影取 Work 下真实最近活跃的 media_item，主操作与该进度严格配对。
 
 use std::sync::Arc;
 
@@ -13,6 +13,7 @@ use haven_common::AppError;
 
 use crate::mapper::work_card::{WorkCardInput, work_card};
 use crate::services::ports::LibraryPorts;
+use crate::services::progress::comic_progress_subject::ComicProgressSubjectService;
 use crate::wire::{LibraryListRequest, LibraryListSort, PageDto, WorkCardDto};
 
 /// 服务端强制上限（契约要求限制 limit）。
@@ -21,11 +22,22 @@ pub const MAX_LIMIT: u32 = 200;
 #[derive(Clone)]
 pub struct LibraryService {
     ports: Arc<dyn LibraryPorts>,
+    comic_progress_subjects: Option<ComicProgressSubjectService>,
 }
 
 impl LibraryService {
     pub fn new(ports: Arc<dyn LibraryPorts>) -> Self {
-        Self { ports }
+        Self {
+            ports,
+            comic_progress_subjects: None,
+        }
+    }
+
+    /// 启用漫画 Subject 的只读列表投影。列表加载只解析已有 Subject/Progress，
+    /// 不创建 Subject、不回填 pointer，也不物化新的 Progress。
+    pub fn with_comic_progress_subjects(mut self, subjects: ComicProgressSubjectService) -> Self {
+        self.comic_progress_subjects = Some(subjects);
+        self
     }
 
     pub async fn list(
@@ -220,12 +232,29 @@ impl LibraryService {
             media_by_edition.entry(m.edition_id).or_default().push(m);
         }
 
-        let first_media_ids: Vec<_> = editions_by_work
-            .iter()
-            .flat_map(|(_, es)| es.iter())
-            .filter_map(|e| media_by_edition.get(&e.id)?.first().map(|m| m.id))
+        // Work 卡片必须投影实际最近消费的媒体项。只查询每个 Edition 的首项会让
+        // 多集/多版本作品中后续集的进度无法和卡片关联，进而从继续阅读中消失。
+        let media_ids: Vec<_> = media_by_edition
+            .values()
+            .flatten()
+            .map(|media_item| media_item.id)
             .collect();
-        let progress_map = self.ports.get_for_media_items(&first_media_ids).await?;
+        let mut progress_map = self.ports.get_for_media_items(&media_ids).await?;
+        if let Some(subjects) = self.comic_progress_subjects.as_ref() {
+            for media_item in work_media_items(&media_by_edition, &editions_by_work, works) {
+                if media_item.media_type != haven_domain::enums::MediaType::Comic {
+                    continue;
+                }
+                match subjects.progress_for_media_item(media_item.id).await? {
+                    Some(progress) => {
+                        progress_map.insert(media_item.id, progress);
+                    }
+                    None => {
+                        progress_map.remove(&media_item.id);
+                    }
+                }
+            }
+        }
 
         let favorites = self
             .ports
@@ -247,7 +276,16 @@ impl LibraryService {
                     work_media.extend(ms.iter().cloned());
                 }
             }
-            let progress = work_media.first().and_then(|m| progress_map.get(&m.id));
+            let progress = work_media
+                .iter()
+                .filter_map(|media_item| progress_map.get(&media_item.id))
+                .max_by_key(|progress| {
+                    // Keep work-card identity in lockstep with
+                    // `ProgressRepository::recent`: equal activity timestamps
+                    // are ordered by persisted Progress ID, not a card-local
+                    // updated-time heuristic.
+                    (progress.last_active_at, progress.id)
+                });
             items.push(work_card(&WorkCardInput {
                 work,
                 editions: &work_editions,
@@ -270,9 +308,33 @@ impl LibraryService {
         for edition in &editions {
             media_items.extend(self.ports.list_by_edition(edition.id).await?);
         }
-        let progress = match media_items.first() {
-            Some(item) => self.ports.get_for_media_item(item.id).await?,
-            None => None,
+        let media_item_ids: Vec<_> = media_items.iter().map(|item| item.id).collect();
+        let progress = self
+            .ports
+            .get_for_media_items(&media_item_ids)
+            .await?
+            .into_values()
+            .max_by_key(|progress| (progress.last_active_at, progress.id));
+
+        let progress = if let Some(subjects) = self.comic_progress_subjects.as_ref() {
+            let mut resolved = None;
+            for media_item in &media_items {
+                if media_item.media_type == haven_domain::enums::MediaType::Comic {
+                    if let Some(progress) = subjects.progress_for_media_item(media_item.id).await? {
+                        if resolved.as_ref().is_none_or(
+                            |current: &haven_domain::entities::Progress| {
+                                (progress.last_active_at, progress.id)
+                                    > (current.last_active_at, current.id)
+                            },
+                        ) {
+                            resolved = Some(progress);
+                        }
+                    }
+                }
+            }
+            resolved.or(progress)
+        } else {
+            progress
         };
         let favorite = self
             .ports
@@ -287,6 +349,27 @@ impl LibraryService {
             favorite,
         })
     }
+}
+
+/// Flatten the already loaded Work → Edition → MediaItem maps without issuing
+/// additional repository queries. This keeps Subject list projection read-only
+/// while retaining the existing batched repository access pattern.
+fn work_media_items<'a>(
+    media_by_edition: &'a std::collections::HashMap<
+        haven_domain::ids::EditionId,
+        Vec<haven_domain::entities::MediaItem>,
+    >,
+    editions_by_work: &std::collections::HashMap<
+        haven_domain::ids::WorkId,
+        Vec<haven_domain::entities::Edition>,
+    >,
+    works: &'a [haven_domain::entities::Work],
+) -> Vec<&'a haven_domain::entities::MediaItem> {
+    works
+        .iter()
+        .flat_map(|work| editions_by_work.get(&work.id).into_iter().flatten())
+        .flat_map(|edition| media_by_edition.get(&edition.id).into_iter().flatten())
+        .collect()
 }
 
 /// cursor 为 opaque string；第一版解析为数字 offset（契约要求前端不得解析，
@@ -367,7 +450,7 @@ mod tests {
         Edition, Favorite, FavoriteTarget, MediaIndex, MediaItem, Progress, Work,
     };
     use haven_domain::enums::{MediaItemStatus, MediaType, WorkStatus, WorkType};
-    use haven_domain::ids::{EditionId, MediaItemId, WorkId};
+    use haven_domain::ids::{EditionId, MediaItemId, ProgressId, WorkId};
 
     /// 内存端口（测试替身）：满足 LibraryPorts。
     struct MemPorts {
@@ -537,6 +620,12 @@ mod tests {
         ) -> Result<Option<String>, AppError> {
             Ok(progress.revision.clone())
         }
+        async fn mark_completed(&self, progress: &Progress) -> Result<String, AppError> {
+            Ok(progress
+                .revision
+                .clone()
+                .unwrap_or_else(|| "test-revision".into()))
+        }
         async fn recent(&self, _limit: u32) -> Result<Vec<Progress>, AppError> {
             Ok(self.progress.clone())
         }
@@ -618,6 +707,31 @@ mod tests {
         }
     }
 
+    fn sample_progress(
+        work_id: WorkId,
+        edition_id: EditionId,
+        media_item_id: MediaItemId,
+        completion: haven_domain::enums::CompletionState,
+        last_active_at: i64,
+    ) -> Progress {
+        Progress {
+            id: haven_domain::ids::ProgressId::new(),
+            work_id,
+            edition_id,
+            media_item_id,
+            locator: haven_domain::locator::Locator::Video(haven_domain::locator::VideoLocator {
+                media_item_id,
+                position_ms: 60_000,
+            }),
+            completion,
+            percentage: Some(0.5),
+            last_active_at: UtcMillis(last_active_at),
+            updated_at: UtcMillis(last_active_at),
+            revision: Some(format!("revision-{last_active_at}")),
+            keyframe_uri: None,
+        }
+    }
+
     #[tokio::test]
     async fn list_assembles_full_cards() {
         let work = sample_work(WorkId::new(), "三体");
@@ -656,6 +770,232 @@ mod tests {
         let action = card.primary_action.as_ref().unwrap();
         assert_eq!(action.kind, crate::wire::PrimaryActionKind::Playback);
         assert_eq!(action.label_hint, crate::wire::LabelHint::Start);
+    }
+
+    #[tokio::test]
+    async fn list_projects_the_most_recent_progress_media_item_not_the_first_item() {
+        let work = sample_work(WorkId::new(), "多集作品");
+        let edition = sample_edition(work.id);
+        let first = sample_item(edition.id);
+        let second = sample_item(edition.id);
+        let mut ports = MemPorts::new(vec![work.clone()])
+            .with_edition(edition.clone())
+            .with_item(first.clone())
+            .with_item(second.clone());
+        ports.progress.push(sample_progress(
+            work.id,
+            edition.id,
+            first.id,
+            haven_domain::enums::CompletionState::InProgress,
+            10,
+        ));
+        ports.progress.push(sample_progress(
+            work.id,
+            edition.id,
+            second.id,
+            haven_domain::enums::CompletionState::InProgress,
+            20,
+        ));
+
+        let page = LibraryService::new(Arc::new(ports))
+            .list(LibraryListRequest {
+                category: crate::wire::QueryCategory::All,
+                media_types: None,
+                query: None,
+                sort: LibraryListSort::Title,
+                cursor: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        let expected_media_item_id = second.id.to_string();
+        let card = &page.items[0];
+        assert_eq!(
+            card.progress.as_ref().unwrap().media_item_id,
+            expected_media_item_id
+        );
+        let action = card.primary_action.as_ref().unwrap();
+        assert_eq!(
+            action.media_item_id.as_deref(),
+            Some(expected_media_item_id.as_str())
+        );
+        assert_eq!(action.label_hint, crate::wire::LabelHint::Continue);
+    }
+
+    #[tokio::test]
+    async fn list_uses_the_same_progress_tie_breaker_as_progress_recent() {
+        let work = sample_work(WorkId::new(), "同秒多集作品");
+        let edition = sample_edition(work.id);
+        let first = sample_item(edition.id);
+        let second = sample_item(edition.id);
+        let mut ports = MemPorts::new(vec![work.clone()])
+            .with_edition(edition.clone())
+            .with_item(first.clone())
+            .with_item(second.clone());
+        let mut older_progress_id = sample_progress(
+            work.id,
+            edition.id,
+            first.id,
+            haven_domain::enums::CompletionState::InProgress,
+            10,
+        );
+        // `progress_recent` orders equal activity timestamps by Progress ID,
+        // not by `updated_at`. Deliberately make the older ID look newer by
+        // updated time so this catches a card-only tie-breaker drift.
+        older_progress_id.updated_at = UtcMillis(99);
+        older_progress_id.id = ProgressId::from_uuid(uuid::Uuid::from_u128(1));
+        let mut newer_progress_id = sample_progress(
+            work.id,
+            edition.id,
+            second.id,
+            haven_domain::enums::CompletionState::InProgress,
+            10,
+        );
+        newer_progress_id.id = ProgressId::from_uuid(uuid::Uuid::from_u128(2));
+        ports.progress.push(older_progress_id);
+        ports.progress.push(newer_progress_id);
+
+        let page = LibraryService::new(Arc::new(ports))
+            .list(LibraryListRequest {
+                category: crate::wire::QueryCategory::All,
+                media_types: None,
+                query: None,
+                sort: LibraryListSort::Title,
+                cursor: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            page.items[0].progress.as_ref().unwrap().media_item_id,
+            second.id.to_string(),
+            "card projection must choose the same media item as progress_recent"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_without_progress_keeps_first_media_item_start_action() {
+        let work = sample_work(WorkId::new(), "未开始作品");
+        let edition = sample_edition(work.id);
+        let first = sample_item(edition.id);
+        let second = sample_item(edition.id);
+        let ports = Arc::new(
+            MemPorts::new(vec![work])
+                .with_edition(edition)
+                .with_item(first.clone())
+                .with_item(second),
+        );
+
+        let page = LibraryService::new(ports)
+            .list(LibraryListRequest {
+                category: crate::wire::QueryCategory::All,
+                media_types: None,
+                query: None,
+                sort: LibraryListSort::Title,
+                cursor: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        let expected_media_item_id = first.id.to_string();
+        let card = &page.items[0];
+        assert!(card.progress.is_none());
+        let action = card.primary_action.as_ref().unwrap();
+        assert_eq!(
+            action.media_item_id.as_deref(),
+            Some(expected_media_item_id.as_str())
+        );
+        assert_eq!(action.label_hint, crate::wire::LabelHint::Start);
+    }
+
+    #[tokio::test]
+    async fn list_pairs_recent_progress_with_its_own_edition_for_multi_version_work() {
+        let work = sample_work(WorkId::new(), "多版本作品");
+        let first_edition = sample_edition(work.id);
+        let second_edition = sample_edition(work.id);
+        let first = sample_item(first_edition.id);
+        let second = sample_item(second_edition.id);
+        let mut ports = MemPorts::new(vec![work.clone()])
+            .with_edition(first_edition.clone())
+            .with_edition(second_edition.clone())
+            .with_item(first)
+            .with_item(second.clone());
+        ports.progress.push(sample_progress(
+            work.id,
+            second_edition.id,
+            second.id,
+            haven_domain::enums::CompletionState::InProgress,
+            40,
+        ));
+
+        let page = LibraryService::new(Arc::new(ports))
+            .list(LibraryListRequest {
+                category: crate::wire::QueryCategory::All,
+                media_types: None,
+                query: None,
+                sort: LibraryListSort::Title,
+                cursor: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        let action = page.items[0].primary_action.as_ref().unwrap();
+        let expected_media_item_id = second.id.to_string();
+        assert_eq!(action.edition_id, second_edition.id.to_string());
+        assert_eq!(
+            action.media_item_id.as_deref(),
+            Some(expected_media_item_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn list_keeps_completed_progress_and_its_media_item_in_the_card_projection() {
+        let work = sample_work(WorkId::new(), "已完成作品");
+        let edition = sample_edition(work.id);
+        let first = sample_item(edition.id);
+        let second = sample_item(edition.id);
+        let mut ports = MemPorts::new(vec![work.clone()])
+            .with_edition(edition.clone())
+            .with_item(first)
+            .with_item(second.clone());
+        ports.progress.push(sample_progress(
+            work.id,
+            edition.id,
+            second.id,
+            haven_domain::enums::CompletionState::Completed,
+            30,
+        ));
+
+        let page = LibraryService::new(Arc::new(ports))
+            .list(LibraryListRequest {
+                category: crate::wire::QueryCategory::All,
+                media_types: None,
+                query: None,
+                sort: LibraryListSort::Title,
+                cursor: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+
+        let expected_media_item_id = second.id.to_string();
+        let card = &page.items[0];
+        assert_eq!(
+            card.progress.as_ref().unwrap().completion,
+            crate::wire::CompletionWire::Completed
+        );
+        assert_eq!(
+            card.primary_action
+                .as_ref()
+                .unwrap()
+                .media_item_id
+                .as_deref(),
+            Some(expected_media_item_id.as_str())
+        );
     }
 
     #[tokio::test]

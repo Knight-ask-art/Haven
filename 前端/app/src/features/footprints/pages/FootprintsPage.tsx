@@ -7,7 +7,6 @@ import { ArtworkImage } from "@/components/ui/haven/ArtworkImage"
 import { defaultCoverCategoryForMediaType } from "@/lib/default-cover"
 import { ArrowRight, Bookmark, Heart, Trash2 } from "lucide-react"
 import type { MediaCardProps } from "@/components/ui/haven/MediaCard"
-import { primaryActionRoute } from "@/features/media/lib/primary-action-route"
 import { setFavorite } from "@/features/media/ipc/favorite-gateway"
 import { createDownloadForMediaItem, deleteOfflineDownload, getMediaItemDownloadInfo, revealOfflineDownload, subscribeDownloadEvents, type MediaItemDownloadInfo } from "@/features/downloads/ipc/download-gateway"
 import type { DownloadEvent } from "@/lib/ipc/generated/wire"
@@ -24,6 +23,7 @@ import {
   resolveFootprintsRuntimeState,
 } from "../lib/footprints-runtime-state"
 import { selectLatestUnfinished } from "../lib/select-latest-continue"
+import { resolveFootprintOpen } from "../lib/open-footprint-action"
 
 const HIDDEN_MARKERS_KEY = "haven:hidden-markers"
 
@@ -224,9 +224,17 @@ export function FootprintsPage() {
   const recentRequestRef = useRef(0)
   const [heroDownloadInfo, setHeroDownloadInfo] = useState<MediaItemDownloadInfo | null>(null)
   const [heroDownloadMediaItemId, setHeroDownloadMediaItemId] = useState<string | null>(null)
+  const [heroDownloadRefreshErrorMediaItemId, setHeroDownloadRefreshErrorMediaItemId] = useState<string | null>(null)
+  const [heroDownloadRefreshPending, setHeroDownloadRefreshPending] = useState(false)
   const [heroActionPending, setHeroActionPending] = useState(false)
   const heroActionGenerationRef = useRef(0)
   const heroDownloadRequestRef = useRef(0)
+  const heroDownloadTaskIdRef = useRef<string | null>(null)
+  const heroDownloadCreationPendingRef = useRef(false)
+  const heroDownloadEventsDuringCreationRef = useRef(new Set<string>())
+  const heroDownloadMutationRef = useRef(false)
+  const heroDownloadEventEpochRef = useRef(0)
+  const openActionGenerationRef = useRef(0)
   const loadRecent = useCallback(async () => {
     const requestId = ++recentRequestRef.current
     setRecentLoading(true)
@@ -271,8 +279,12 @@ export function FootprintsPage() {
     if (!productionMode) return
     let unlisten: (() => void) | null = null
     let disposed = false
-    onFavoriteChanged(() => {
-      if (!disposed) void loadFavorites()
+    onFavoriteChanged((event) => {
+      if (disposed) return
+      setContinueItems((items) => items.map((item) => item.workId === event.workId ? { ...item, favorite: event.favorite } : item))
+      setRecentItems((items) => items.map((item) => item.workId === event.workId ? { ...item, favorite: event.favorite } : item))
+      setFavoriteItems((items) => items.map((item) => item.workId === event.workId ? { ...item, favorite: event.favorite } : item))
+      void loadFavorites()
     })
       .then((fn) => {
         if (disposed) fn()
@@ -371,19 +383,28 @@ export function FootprintsPage() {
   }, [isEmptyState, productionHero, productionMode])
   useEffect(() => {
     heroActionGenerationRef.current += 1
+    heroDownloadTaskIdRef.current = null
+    heroDownloadCreationPendingRef.current = false
+    heroDownloadEventsDuringCreationRef.current.clear()
+    heroDownloadMutationRef.current = false
+    heroDownloadEventEpochRef.current += 1
     setHeroActionPending(false)
   }, [productionHero?.id, heroMediaItemId, productionMode])
   useEffect(() => {
     const requestId = ++heroDownloadRequestRef.current
     setHeroDownloadInfo(null)
     setHeroDownloadMediaItemId(null)
+    setHeroDownloadRefreshErrorMediaItemId(null)
+    setHeroDownloadRefreshPending(false)
     if (productionMode && heroMediaItemId) {
       void getMediaItemDownloadInfo(heroMediaItemId).then((info) => {
         if (heroDownloadRequestRef.current !== requestId) return
+        heroDownloadTaskIdRef.current = info.taskId
         setHeroDownloadInfo(info)
         setHeroDownloadMediaItemId(heroMediaItemId)
       }).catch(() => {
         if (heroDownloadRequestRef.current !== requestId) return
+        heroDownloadTaskIdRef.current = null
         setHeroDownloadInfo(null)
         setHeroDownloadMediaItemId(null)
       })
@@ -394,15 +415,64 @@ export function FootprintsPage() {
   }, [heroMediaItemId, productionMode])
   useEffect(() => {
     if (!productionMode || !heroMediaItemId) return
+    const eventEpoch = heroDownloadEventEpochRef.current
     let mounted = true
     let dispose: (() => Promise<void>) | null = null
-    const onEvent = (_event: DownloadEvent) => {
+    let refreshInFlight = false
+    let refreshRequested = false
+    const refreshHeroDownloadInfo = () => {
+      if (
+        !mounted
+        || heroDownloadMutationRef.current
+        || heroDownloadEventEpochRef.current !== eventEpoch
+      ) return
+      if (refreshInFlight) {
+        refreshRequested = true
+        return
+      }
+      refreshInFlight = true
       const requestId = ++heroDownloadRequestRef.current
-      void getMediaItemDownloadInfo(heroMediaItemId).then((info) => {
-        if (!mounted || heroDownloadRequestRef.current !== requestId) return
-        setHeroDownloadInfo(info)
-        setHeroDownloadMediaItemId(heroMediaItemId)
-      }).catch(() => {})
+      void getMediaItemDownloadInfo(heroMediaItemId)
+        .then((info) => {
+          if (
+            !mounted
+            || heroDownloadMutationRef.current
+            || heroDownloadEventEpochRef.current !== eventEpoch
+            || heroDownloadRequestRef.current !== requestId
+          ) return
+          heroDownloadTaskIdRef.current = info.taskId
+          setHeroDownloadInfo(info)
+          setHeroDownloadMediaItemId(heroMediaItemId)
+        })
+        .catch(() => {})
+        .finally(() => {
+          refreshInFlight = false
+          if (
+            !mounted
+            || heroDownloadMutationRef.current
+            || heroDownloadEventEpochRef.current !== eventEpoch
+            || heroDownloadRequestRef.current !== requestId
+          ) {
+            refreshRequested = false
+            return
+          }
+          if (!refreshRequested) return
+          refreshRequested = false
+          refreshHeroDownloadInfo()
+        })
+    }
+    const onEvent = (event: DownloadEvent) => {
+      if (event.data.taskId !== heroDownloadTaskIdRef.current) {
+        if (heroDownloadCreationPendingRef.current) {
+          heroDownloadEventsDuringCreationRef.current.add(event.data.taskId)
+        }
+        return
+      }
+      if (
+        heroDownloadMutationRef.current
+        || heroDownloadEventEpochRef.current !== eventEpoch
+      ) return
+      refreshHeroDownloadInfo()
     }
     void subscribeDownloadEvents(onEvent).then((cleanup) => {
       if (!mounted) void cleanup().catch(() => undefined)
@@ -432,26 +502,50 @@ export function FootprintsPage() {
   }
   const [batchActionMessage, setBatchActionMessage] = useState<string | null>(null)
   async function openFootprintAction(card: Pick<FootprintActionCard, "primaryAction" | "mediaItemId">) {
-    const target = primaryActionRoute(card.primaryAction)
-    if (!target) {
-      showMessage("当前内容暂不可打开")
-      return
+    const generation = ++openActionGenerationRef.current
+    try {
+      const result = await resolveFootprintOpen(card)
+      if (generation !== openActionGenerationRef.current) return
+      if (result.kind === "open") navigate(result.route)
+      else showMessage(result.message)
+    } catch (error) {
+      if (generation === openActionGenerationRef.current) {
+        showMessage(error instanceof HavenError ? error.dto.userMessage : "读取内容能力失败，请重试")
+      }
     }
-    if (card.primaryAction?.kind === "open_edition") {
-      navigate(target)
-      return
-    }
-    const mediaItemId = card.primaryAction?.mediaItemId ?? card.mediaItemId
-    if (!mediaItemId) {
-      showMessage("当前内容缺少可用版本")
-      return
-    }
+  }
+  useEffect(() => () => { openActionGenerationRef.current += 1 }, [])
+  const retryHeroDownloadRefresh = async () => {
+    const mediaItemId = productionHero?.mediaItemId
+    if (
+      !mediaItemId
+      || heroDownloadRefreshErrorMediaItemId !== mediaItemId
+      || heroDownloadRefreshPending
+    ) return
+    const actionGeneration = heroActionGenerationRef.current
+    const requestId = ++heroDownloadRequestRef.current
+    const isCurrent = () => (
+      heroActionGenerationRef.current === actionGeneration
+      && heroDownloadRequestRef.current === requestId
+    )
+    setHeroDownloadRefreshPending(true)
+    setHeroDownloadRefreshErrorMediaItemId(null)
     try {
       const info = await getMediaItemDownloadInfo(mediaItemId)
-      if (info.canOnlineRead || info.hasOfflineResource) navigate(target)
-      else showMessage(info.canDownload ? "该内容需要下载后阅读" : "当前内容暂不可用")
-    } catch (error) {
-      showMessage(error instanceof HavenError ? error.dto.userMessage : "读取内容能力失败，请重试")
+      if (!isCurrent()) return
+      heroDownloadTaskIdRef.current = info.taskId
+      setHeroDownloadInfo(info)
+      setHeroDownloadMediaItemId(mediaItemId)
+      showMessage("离线内容状态已更新")
+    } catch {
+      if (!isCurrent()) return
+      heroDownloadTaskIdRef.current = null
+      setHeroDownloadInfo(null)
+      setHeroDownloadMediaItemId(null)
+      setHeroDownloadRefreshErrorMediaItemId(mediaItemId)
+      showMessage("离线内容已删除，状态刷新失败")
+    } finally {
+      if (isCurrent()) setHeroDownloadRefreshPending(false)
     }
   }
   const handleHeroAction = async (action: string) => {
@@ -459,6 +553,8 @@ export function FootprintsPage() {
     const actionGeneration = heroActionGenerationRef.current
     const isCurrent = () => heroActionGenerationRef.current === actionGeneration
     const actionMediaItemId = productionHero.mediaItemId
+    let deletedOffline = false
+    let deletionRefreshRequestId: number | null = null
     setHeroActionPending(true)
     try {
       if (action === "heart") {
@@ -470,15 +566,43 @@ export function FootprintsPage() {
       } else if (action === "download") {
         const mediaItemId = actionMediaItemId
         if (!mediaItemId) throw new Error("当前内容没有可下载的媒体版本")
+        const requestId = ++heroDownloadRequestRef.current
         const info = await getMediaItemDownloadInfo(mediaItemId)
-        if (!isCurrent()) return
+        if (!isCurrent() || heroDownloadRequestRef.current !== requestId) return
+        let createdTaskId: string | null = null
+        let earlyCreatedTaskEvent = false
         if (info.hasOfflineResource && info.taskId) await revealOfflineDownload(info.taskId)
-        else if (!info.hasOfflineResource) await createDownloadForMediaItem(mediaItemId)
-        if (!isCurrent()) return
+        else if (info.hasOfflineResource) throw new Error("当前离线内容没有可定位的下载任务")
+        else if (!info.hasOfflineResource) {
+          heroDownloadCreationPendingRef.current = true
+          heroDownloadEventsDuringCreationRef.current.clear()
+          try {
+            const createdTask = await createDownloadForMediaItem(mediaItemId)
+            if (!isCurrent() || heroDownloadRequestRef.current !== requestId) return
+            createdTaskId = createdTask.taskId
+            heroDownloadTaskIdRef.current = createdTask.taskId
+            earlyCreatedTaskEvent = heroDownloadEventsDuringCreationRef.current.has(createdTask.taskId)
+          } finally {
+            heroDownloadCreationPendingRef.current = false
+            heroDownloadEventsDuringCreationRef.current.clear()
+          }
+        }
+        if (!isCurrent() || heroDownloadRequestRef.current !== requestId) return
         const refreshedInfo = await getMediaItemDownloadInfo(mediaItemId)
-        if (!isCurrent()) return
+        if (!isCurrent() || heroDownloadRequestRef.current !== requestId) return
+        // A just-created task may not be visible in the first projection yet.
+        // Keep its identity subscribed until the server returns an identity of
+        // its own, otherwise a subsequent completion event would be discarded.
+        heroDownloadTaskIdRef.current = refreshedInfo.taskId ?? createdTaskId
         setHeroDownloadInfo(refreshedInfo)
         setHeroDownloadMediaItemId(mediaItemId)
+        if (earlyCreatedTaskEvent) {
+          const completedInfo = await getMediaItemDownloadInfo(mediaItemId)
+          if (!isCurrent() || heroDownloadRequestRef.current !== requestId) return
+          heroDownloadTaskIdRef.current = completedInfo.taskId
+          setHeroDownloadInfo(completedInfo)
+          setHeroDownloadMediaItemId(mediaItemId)
+        }
         showMessage(info.hasOfflineResource ? "已打开本地文件夹" : "已加入下载队列")
       } else if (action === "reset") {
         const mediaItemId = actionMediaItemId
@@ -497,18 +621,47 @@ export function FootprintsPage() {
         if (heroDownloadMediaItemId !== productionHero.mediaItemId || !heroDownloadInfo?.hasOfflineResource || !heroDownloadInfo.taskId) throw new Error("当前没有可删除的离线内容")
         if (!actionMediaItemId) throw new Error("当前内容没有可删除的媒体版本")
         if (!window.confirm("确定删除这个作品的离线内容吗？此操作不会删除媒体库记录。")) return
-        await deleteOfflineDownload(heroDownloadInfo.taskId)
+        const deletedTaskId = heroDownloadInfo.taskId
+        heroDownloadMutationRef.current = true
+        await deleteOfflineDownload(deletedTaskId)
         if (!isCurrent()) return
+        deletedOffline = true
+        // A success means callbacks bound to the deleted task can never be authoritative again.
+        heroDownloadEventEpochRef.current += 1
+        const requestId = ++heroDownloadRequestRef.current
+        deletionRefreshRequestId = requestId
+        setHeroDownloadInfo(null)
+        heroDownloadTaskIdRef.current = null
+        setHeroDownloadMediaItemId(null)
+        setHeroDownloadRefreshErrorMediaItemId(null)
         const info = await getMediaItemDownloadInfo(actionMediaItemId)
-        if (!isCurrent()) return
+        if (!isCurrent() || heroDownloadRequestRef.current !== requestId) return
+        heroDownloadTaskIdRef.current = info.taskId
         setHeroDownloadInfo(info)
         setHeroDownloadMediaItemId(actionMediaItemId)
         showMessage("已删除离线内容")
       }
     } catch (error) {
-      if (isCurrent()) showMessage(error instanceof HavenError ? error.dto.userMessage : "操作失败，请重试")
+      if (!isCurrent()) return
+      if (
+        action === "delete"
+        && deletedOffline
+        && deletionRefreshRequestId !== null
+        && heroDownloadRequestRef.current === deletionRefreshRequestId
+      ) {
+        setHeroDownloadInfo(null)
+        heroDownloadTaskIdRef.current = null
+        setHeroDownloadMediaItemId(null)
+        setHeroDownloadRefreshErrorMediaItemId(actionMediaItemId)
+        showMessage("离线内容已删除，状态刷新失败")
+      } else {
+        showMessage(error instanceof HavenError ? error.dto.userMessage : "操作失败，请重试")
+      }
     } finally {
-      if (isCurrent()) setHeroActionPending(false)
+      if (isCurrent()) {
+        if (action === "delete") heroDownloadMutationRef.current = false
+        setHeroActionPending(false)
+      }
     }
   }
 
@@ -558,7 +711,21 @@ export function FootprintsPage() {
           onAction={(action) => console.log("Action clicked:", action)}
         />
       )}
-      {batchActionMessage && <div role="status" className="fixed top-6 left-1/2 z-[100] -translate-x-1/2 rounded-full bg-zinc-950/90 px-5 py-3 text-sm font-semibold text-white shadow-xl">{batchActionMessage}</div>}
+      {batchActionMessage && (
+        <div role="status" className="fixed top-6 left-1/2 z-[100] flex -translate-x-1/2 items-center gap-3 rounded-full bg-zinc-950/90 px-5 py-3 text-sm font-semibold text-white shadow-xl">
+          <span>{batchActionMessage}</span>
+          {heroDownloadRefreshErrorMediaItemId === productionHero?.mediaItemId && (
+            <button
+              type="button"
+              disabled={heroDownloadRefreshPending}
+              onClick={() => void retryHeroDownloadRefresh()}
+              className="underline underline-offset-2 transition-colors hover:text-white/75 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              重试
+            </button>
+          )}
+        </div>
+      )}
       {unavailableMode ? (
         <UnavailableFootprintsState />
       ) : (

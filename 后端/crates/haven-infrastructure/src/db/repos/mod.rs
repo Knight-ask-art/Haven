@@ -5,8 +5,10 @@
 //! - 当前查询均为短事务级操作；Tauri 接线后重查询由外层 `spawn_blocking` 承接。
 //! - Locator 序列化走 `Locator` 自身的 version + kind + data envelope（未知版本拒绝）。
 
+pub mod comic_catalog_refresh_outcomes;
 pub mod comic_identity;
 pub mod comic_progress_migrations;
+pub mod comic_progress_subjects;
 pub mod download;
 pub mod edition;
 pub mod edition_profiles;
@@ -31,8 +33,10 @@ use haven_common::AppError;
 use haven_domain::entities::ArtworkSet;
 use haven_domain::locator::Locator;
 
+pub use comic_catalog_refresh_outcomes::SqliteComicCatalogRefreshOutcomeRepository;
 pub use comic_identity::{SqliteChapterSourceRepository, SqliteComicPageIdentityRepository};
 pub use comic_progress_migrations::SqliteComicProgressMigrationRepository;
+pub use comic_progress_subjects::SqliteComicProgressSubjectRepository;
 pub use download::{SqliteDownloadBatchRepository, SqliteDownloadRepository};
 pub use edition::SqliteEditionRepository;
 pub use edition_profiles::SqliteEditionProfileRepository;
@@ -76,6 +80,8 @@ pub struct SqliteRepositories {
     pub chapter_source: SqliteChapterSourceRepository,
     pub page_identity: SqliteComicPageIdentityRepository,
     pub progress_migration: SqliteComicProgressMigrationRepository,
+    pub progress_subjects: SqliteComicProgressSubjectRepository,
+    pub catalog_refresh_outcomes: SqliteComicCatalogRefreshOutcomeRepository,
 }
 
 impl SqliteRepositories {
@@ -102,7 +108,9 @@ impl SqliteRepositories {
             work_relation: SqliteWorkRelationRepository::new(db.clone()),
             chapter_source: SqliteChapterSourceRepository::new(db.clone()),
             page_identity: SqliteComicPageIdentityRepository::new(db.clone()),
-            progress_migration: SqliteComicProgressMigrationRepository::new(db),
+            progress_migration: SqliteComicProgressMigrationRepository::new(db.clone()),
+            progress_subjects: SqliteComicProgressSubjectRepository::new(db.clone()),
+            catalog_refresh_outcomes: SqliteComicCatalogRefreshOutcomeRepository::new(db),
         }
     }
 }
@@ -191,6 +199,12 @@ impl haven_domain::contracts::WorkRepository for SqliteRepositories {
     ) -> Result<bool, haven_common::AppError> {
         self.work.has_any_source_ref(id).await
     }
+    async fn list_source_refs(
+        &self,
+        work_id: haven_domain::ids::WorkId,
+    ) -> Result<Vec<haven_domain::contracts::WorkSourceRef>, haven_common::AppError> {
+        self.work.list_source_refs(work_id).await
+    }
     async fn save_source_ref(
         &self,
         provider: &str,
@@ -200,6 +214,24 @@ impl haven_domain::contracts::WorkRepository for SqliteRepositories {
         self.work
             .save_source_ref(provider, external_id, work_id)
             .await
+    }
+}
+
+#[async_trait::async_trait]
+impl haven_domain::contracts::ComicCatalogRefreshOutcomeRepository for SqliteRepositories {
+    async fn save(
+        &self,
+        receipt: &haven_domain::comic_catalog::ComicCatalogRefreshReceipt,
+    ) -> Result<(), haven_common::AppError> {
+        self.catalog_refresh_outcomes.save(receipt).await
+    }
+
+    async fn list_by_work(
+        &self,
+        work_id: haven_domain::ids::WorkId,
+    ) -> Result<Vec<haven_domain::comic_catalog::ComicCatalogRefreshReceipt>, haven_common::AppError>
+    {
+        self.catalog_refresh_outcomes.list_by_work(work_id).await
     }
 }
 
@@ -359,6 +391,56 @@ impl haven_domain::contracts::ComicProgressMigrationRepository for SqliteReposit
 }
 
 #[async_trait::async_trait]
+impl haven_domain::contracts::ComicProgressSubjectRepository for SqliteRepositories {
+    async fn get(
+        &self,
+        id: haven_domain::ids::ComicProgressSubjectId,
+    ) -> Result<
+        Option<haven_domain::comic_progress_subject::ComicProgressSubject>,
+        haven_common::AppError,
+    > {
+        haven_domain::contracts::ComicProgressSubjectRepository::get(&self.progress_subjects, id)
+            .await
+    }
+
+    async fn get_for_media_item(
+        &self,
+        media_item_id: haven_domain::ids::MediaItemId,
+    ) -> Result<
+        Option<haven_domain::comic_progress_subject::ComicProgressSubjectMember>,
+        haven_common::AppError,
+    > {
+        self.progress_subjects
+            .get_for_media_item(media_item_id)
+            .await
+    }
+
+    async fn list_members(
+        &self,
+        subject_id: haven_domain::ids::ComicProgressSubjectId,
+    ) -> Result<
+        Vec<haven_domain::comic_progress_subject::ComicProgressSubjectMember>,
+        haven_common::AppError,
+    > {
+        self.progress_subjects.list_members(subject_id).await
+    }
+
+    async fn save_subject(
+        &self,
+        subject: &haven_domain::comic_progress_subject::ComicProgressSubject,
+    ) -> Result<(), haven_common::AppError> {
+        self.progress_subjects.save_subject(subject).await
+    }
+
+    async fn save_member(
+        &self,
+        member: &haven_domain::comic_progress_subject::ComicProgressSubjectMember,
+    ) -> Result<(), haven_common::AppError> {
+        self.progress_subjects.save_member(member).await
+    }
+}
+
+#[async_trait::async_trait]
 impl haven_domain::contracts::MediaItemRepository for SqliteRepositories {
     async fn get(
         &self,
@@ -414,6 +496,12 @@ impl haven_domain::contracts::ProgressRepository for SqliteRepositories {
         self.progress
             .save_if_revision(progress, expected_revision)
             .await
+    }
+    async fn mark_completed(
+        &self,
+        progress: &haven_domain::entities::Progress,
+    ) -> Result<String, haven_common::AppError> {
+        self.progress.mark_completed(progress).await
     }
     async fn recent(
         &self,
@@ -743,8 +831,9 @@ impl haven_domain::contracts::DownloadRepository for SqliteRepositories {
     async fn list(
         &self,
         limit: u32,
+        offset: u32,
     ) -> Result<Vec<haven_domain::entities::DownloadTask>, haven_common::AppError> {
-        self.download.list(limit).await
+        self.download.list(limit, offset).await
     }
     async fn find_active(
         &self,

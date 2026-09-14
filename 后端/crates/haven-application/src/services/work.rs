@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
 use haven_common::AppError;
-use haven_domain::contracts::{StorageLocationRepository, WorkRepository};
-use haven_domain::entities::{FavoriteTarget, Resource, ResourceLocator};
+use haven_domain::contracts::{ProgressRepository, StorageLocationRepository, WorkRepository};
+use haven_domain::entities::{FavoriteTarget, MediaItem, Progress, Resource, ResourceLocator};
 use haven_domain::enums::{Availability, MediaType, StorageProviderType, StorageStatus};
 use haven_domain::ids::WorkId;
 
 use crate::mapper::work_card::{WorkCardInput, work_card};
 use crate::services::ports::WorkGetPorts;
+use crate::services::progress::comic_progress_subject::ComicProgressSubjectService;
 use crate::wire::{
     EditionAvailabilityDto, EditionDetailDto, EditionGetRequest, EditionListByWorkRequest,
     EditionSummaryDto, MediaItemStatusDto, MediaItemSummaryDto, PageDto, WorkDetailCountsDto,
@@ -19,11 +20,22 @@ const EDITION_MAX_LIMIT: u32 = 200;
 #[derive(Clone)]
 pub struct WorkService {
     ports: Arc<dyn WorkGetPorts>,
+    comic_progress_subjects: Option<ComicProgressSubjectService>,
 }
 
 impl WorkService {
     pub fn new(ports: Arc<dyn WorkGetPorts>) -> Self {
-        Self { ports }
+        Self {
+            ports,
+            comic_progress_subjects: None,
+        }
+    }
+
+    /// 启用漫画 Subject 的只读详情投影；History/Marker 仍由各自的
+    /// MediaItem 键读取，只有 Progress 走 Subject 解析。
+    pub fn with_comic_progress_subjects(mut self, subjects: ComicProgressSubjectService) -> Self {
+        self.comic_progress_subjects = Some(subjects);
+        self
     }
 
     pub async fn get(&self, work_id: WorkId) -> Result<WorkDetailHeaderDto, AppError> {
@@ -57,7 +69,7 @@ impl WorkService {
         }
 
         let progress = match selected {
-            Some(item) => self.ports.get_for_media_item(item.id).await?,
+            Some(item) => self.progress_for_media_item(item).await?,
             None => None,
         };
         let favorite = self
@@ -183,7 +195,7 @@ impl WorkService {
                 }
             }
             let progress = match action_item {
-                Some(item) => self.ports.get_for_media_item(item.id).await?,
+                Some(item) => self.progress_for_media_item(item).await?,
                 None => None,
             };
             let primary_action = match action_item {
@@ -260,7 +272,7 @@ impl WorkService {
                     available_resource_count += 1;
                 }
             }
-            let progress_domain = self.ports.get_for_media_item(item.id).await?;
+            let progress_domain = self.progress_for_media_item(&item).await?;
             let primary_action = if available_resource_count > 0 {
                 crate::mapper::work_card::primary_action(&WorkCardInput {
                     work: &work,
@@ -309,6 +321,18 @@ impl WorkService {
             description: edition.description,
             items,
         })
+    }
+
+    async fn progress_for_media_item(
+        &self,
+        item: &MediaItem,
+    ) -> Result<Option<Progress>, AppError> {
+        if item.media_type == MediaType::Comic {
+            if let Some(subjects) = self.comic_progress_subjects.as_ref() {
+                return subjects.progress_for_media_item(item.id).await;
+            }
+        }
+        ProgressRepository::get_for_media_item(&*self.ports, item.id).await
     }
 
     /// 合并两个 Work（去重）：将 loser 的所有 Edition（含 MediaItem/Resource）重定向至 survivor，
