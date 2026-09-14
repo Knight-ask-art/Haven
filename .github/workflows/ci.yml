@@ -286,6 +286,22 @@ jobs:
           toolchain: 1.94.1
           components: rustfmt, clippy
 
+      # The custom-protocol build embeds the frontendDist directory.  A clean
+      # Tauri-only checkout does not contain the ignored frontend dist output,
+      # so create it here without running the unrelated frontend test suite.
+      - name: Setup Node.js for Tauri bundle
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: 前端/app/package-lock.json
+
+      - name: Build frontend assets for Tauri
+        working-directory: 前端/app
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
       - name: Tauri format
         working-directory: src-tauri
         run: cargo fmt --all -- --check
