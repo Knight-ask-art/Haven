@@ -10,6 +10,7 @@ pub mod entities;
 pub mod enums;
 pub mod ids;
 pub mod locator;
+pub mod periodical;
 pub mod settings;
 
 pub use comic_catalog::*;
@@ -21,4 +22,5 @@ pub use entities::*;
 pub use enums::*;
 pub use ids::*;
 pub use locator::*;
+pub use periodical::*;
 pub use settings::*;

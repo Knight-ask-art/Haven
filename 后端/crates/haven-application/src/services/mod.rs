@@ -23,6 +23,7 @@ pub mod history;
 pub mod home;
 pub mod library;
 pub mod marker;
+pub mod periodical;
 pub mod ports;
 pub mod progress;
 pub mod reader_search;
@@ -70,6 +71,11 @@ pub use history::{HistoryPorts, HistoryService};
 pub use home::HomeService;
 pub use library::LibraryService;
 pub use marker::{MarkerPorts, MarkerService};
+pub use periodical::{
+    EUROPE_PMC_SOURCE_KEY, PeriodicalArticleAvailability, PeriodicalArticleRecord,
+    PeriodicalIssueRecord, PeriodicalIssueTree, PeriodicalJournalRecord, PeriodicalProvider,
+    PeriodicalTree, PeriodicalVolumeRecord, PeriodicalVolumeTree,
+};
 pub use ports::ComicProgressMigrationPorts;
 pub use ports::SessionOpenPorts;
 pub use ports::{FavoritePorts, LibraryPorts};

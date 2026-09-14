@@ -19,6 +19,7 @@ pub mod history;
 pub mod image_proxy;
 pub mod marker;
 pub mod media_item;
+pub mod periodicals;
 pub mod progress;
 pub mod resource;
 pub mod resource_preferences;
@@ -46,6 +47,7 @@ pub use history::SqliteHistoryRepository;
 pub use image_proxy::SqliteImageProxyRepository;
 pub use marker::SqliteMarkerRepository;
 pub use media_item::SqliteMediaItemRepository;
+pub use periodicals::SqlitePeriodicalRepository;
 pub use progress::SqliteProgressRepository;
 pub use resource::SqliteResourceRepository;
 pub use resource_preferences::SqliteResourcePreferenceRepository;
@@ -82,6 +84,7 @@ pub struct SqliteRepositories {
     pub progress_migration: SqliteComicProgressMigrationRepository,
     pub progress_subjects: SqliteComicProgressSubjectRepository,
     pub catalog_refresh_outcomes: SqliteComicCatalogRefreshOutcomeRepository,
+    pub periodical: SqlitePeriodicalRepository,
 }
 
 impl SqliteRepositories {
@@ -111,6 +114,7 @@ impl SqliteRepositories {
             progress_migration: SqliteComicProgressMigrationRepository::new(db.clone()),
             progress_subjects: SqliteComicProgressSubjectRepository::new(db.clone()),
             catalog_refresh_outcomes: SqliteComicCatalogRefreshOutcomeRepository::new(db),
+            periodical: SqlitePeriodicalRepository::new(db),
         }
     }
 }
@@ -1109,5 +1113,88 @@ impl haven_domain::contracts::WorkRelationRepository for SqliteRepositories {
     }
     async fn delete_relation(&self, id: String) -> Result<bool, haven_common::AppError> {
         self.work_relation.delete_relation(id).await
+    }
+}
+
+#[async_trait::async_trait]
+impl haven_domain::contracts::PeriodicalRepository for SqliteRepositories {
+    async fn get(
+        &self,
+        id: haven_domain::ids::PeriodicalId,
+    ) -> Result<Option<haven_domain::periodical::Periodical>, haven_common::AppError> {
+        self.periodical.get(id).await
+    }
+
+    async fn find_by_work(
+        &self,
+        work_id: haven_domain::ids::WorkId,
+    ) -> Result<Option<haven_domain::periodical::Periodical>, haven_common::AppError> {
+        self.periodical.find_by_work(work_id).await
+    }
+
+    async fn find_by_issn(
+        &self,
+        issn: &haven_domain::periodical::Issn,
+    ) -> Result<Option<haven_domain::periodical::Periodical>, haven_common::AppError> {
+        self.periodical.find_by_issn(issn).await
+    }
+
+    async fn list_volumes(
+        &self,
+        periodical_id: haven_domain::ids::PeriodicalId,
+    ) -> Result<Vec<haven_domain::periodical::PeriodicalVolume>, haven_common::AppError> {
+        self.periodical.list_volumes(periodical_id).await
+    }
+
+    async fn list_issues(
+        &self,
+        volume_id: haven_domain::ids::PeriodicalVolumeId,
+    ) -> Result<Vec<haven_domain::periodical::PeriodicalIssue>, haven_common::AppError> {
+        self.periodical.list_issues(volume_id).await
+    }
+
+    async fn list_articles(
+        &self,
+        issue_id: haven_domain::ids::PeriodicalIssueId,
+    ) -> Result<Vec<haven_domain::periodical::PeriodicalArticle>, haven_common::AppError> {
+        self.periodical.list_articles(issue_id).await
+    }
+
+    async fn find_article_by_source(
+        &self,
+        source_key: &str,
+        remote_article_id: &str,
+    ) -> Result<Option<haven_domain::periodical::PeriodicalPlacement>, haven_common::AppError> {
+        self.periodical
+            .find_article_by_source(source_key, remote_article_id)
+            .await
+    }
+
+    async fn save(
+        &self,
+        periodical: &haven_domain::periodical::Periodical,
+    ) -> Result<(), haven_common::AppError> {
+        self.periodical.save(periodical).await
+    }
+
+    async fn save_volume(
+        &self,
+        volume: &haven_domain::periodical::PeriodicalVolume,
+    ) -> Result<(), haven_common::AppError> {
+        self.periodical.save_volume(volume).await
+    }
+
+    async fn save_issue(
+        &self,
+        issue: &haven_domain::periodical::PeriodicalIssue,
+    ) -> Result<(), haven_common::AppError> {
+        self.periodical.save_issue(issue).await
+    }
+
+    async fn save_article(
+        &self,
+        article: &haven_domain::periodical::PeriodicalArticle,
+    ) -> Result<(), haven_common::AppError> {
+        self.periodical.save_article(article).await
     }
 }

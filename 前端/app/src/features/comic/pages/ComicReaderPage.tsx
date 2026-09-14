@@ -8,6 +8,7 @@ import {
   Grid,
   Maximize2,
   Minimize2,
+  RotateCw,
   X,
   Check
 } from "lucide-react"
@@ -23,8 +24,21 @@ import { createDemoComicPageSequence, mapComicPageManifest, pageAt, pageNumbersA
 import { ComicPageResourcePool, type ComicPageResource } from "../lib/comic-page-resource-pool"
 import { resolveComicReaderRuntimeState } from "../lib/comic-reader-runtime-state"
 import { useComicSettings } from "../lib/useComicSettings"
+import { useComicWorkCatalog } from "../lib/useComicWorkCatalog"
+import {
+  comicChapterDisplayTitle,
+  comicChapterNumberLabel,
+  comicChapterPageCountLabel,
+  comicChapterProgressRatio,
+  comicChapterStatusLabel,
+  comicWorkCatalogStatusLabel,
+  currentComicWorkChapter,
+  hasSuggestedProgressMigration,
+  resolveComicChapterNeighbour,
+  selectComicWorkChapters,
+} from "../lib/comic-work-catalog-view"
 import { comicMarkerLocator, createMarker, deleteMarker, listMarkers } from "@/features/markers/ipc/marker-gateway"
-import type { MarkerDto } from "@/lib/ipc/generated/wire"
+import type { ComicWorkChapterDto, MarkerDto } from "@/lib/ipc/generated/wire"
 
 type ViewMode = "single" | "double" | "strip"
 type ReadDirection = "rtl" | "ltr" // rtl: 日漫从右往左, ltr: 国漫/美漫从左往右
@@ -216,6 +230,107 @@ function ComicManifestStatus({
   )
 }
 
+const CHAPTER_STATUS_TONES: Record<ComicWorkChapterDto["status"], string> = {
+  available: "bg-emerald-500/15 text-emerald-300",
+  temporarily_unavailable: "bg-amber-500/15 text-amber-300",
+  external_only: "bg-sky-500/15 text-sky-300",
+  unknown: "bg-white/10 text-white/60",
+  missing: "bg-rose-500/15 text-rose-300",
+}
+
+/** Edition 筛选项。只展示后端给出的 displayLabel 与 chapterCount。 */
+function ComicEditionChip({
+  label,
+  count,
+  active,
+  onClick,
+}: {
+  label: string
+  count: number
+  active: boolean
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={active}
+      onClick={onClick}
+      className={cn(
+        "flex max-w-[170px] cursor-pointer items-center gap-1.5 rounded-full px-3 py-1.5 text-[11px] font-semibold transition-colors",
+        active ? "bg-white text-black" : "bg-white/10 text-white/70 hover:bg-white/20 hover:text-white"
+      )}
+    >
+      <span className="truncate">{label}</span>
+      <span className="shrink-0 tabular-nums opacity-60">{count}</span>
+    </button>
+  )
+}
+
+/**
+ * 一个后端章节的卡片。
+ *
+ * 可打开状态、状态标签、进度和后端匹配提示全部来自 DTO；卡片不推导章节号，
+ * 也不在本地写入任何进度或迁移决策。
+ */
+function ComicWorkChapterCard({
+  chapter,
+  isCurrent,
+  onOpen,
+}: {
+  chapter: ComicWorkChapterDto
+  isCurrent: boolean
+  onOpen: (mediaItemId: string) => void
+}) {
+  const progress = comicChapterProgressRatio(chapter)
+  const meta = [comicChapterNumberLabel(chapter), comicChapterPageCountLabel(chapter)]
+    .filter((value): value is string => value !== null)
+    .join(" · ")
+  return (
+    <button
+      type="button"
+      disabled={!chapter.canOpen || isCurrent}
+      onClick={() => onOpen(chapter.mediaItemId)}
+      aria-current={isCurrent ? "true" : undefined}
+      className={cn(
+        "relative w-full overflow-hidden rounded-2xl border p-[16px] text-left transition-all",
+        isCurrent ? "border-white/20 bg-white/10 text-white shadow-lg" : "border-transparent bg-white/5 text-white/70",
+        chapter.canOpen && !isCurrent && "cursor-pointer hover:bg-white/10 hover:text-white",
+        !chapter.canOpen && "cursor-not-allowed opacity-60"
+      )}
+    >
+      {isCurrent && <div className="absolute bottom-0 left-0 top-0 w-1 bg-primary" />}
+      <div className="mb-1 flex items-start justify-between gap-3">
+        <p className={cn("text-sm", isCurrent ? "font-bold" : "font-semibold")}>
+          {comicChapterDisplayTitle(chapter, "未命名章节")}
+        </p>
+        <span className={cn("shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold", CHAPTER_STATUS_TONES[chapter.status])}>
+          {comicChapterStatusLabel(chapter.status)}
+        </span>
+      </div>
+      <div className="mt-[8px] flex items-center justify-between gap-2">
+        <p className="truncate text-xs text-white/40">{meta}</p>
+        {isCurrent && (
+          <span className="shrink-0 rounded-full bg-primary/10 px-[8px] py-0.5 text-[10px] font-bold text-primary">
+            当前阅读
+          </span>
+        )}
+      </div>
+      {hasSuggestedProgressMigration(chapter) && (
+        <p className="mt-2 rounded-lg bg-amber-500/10 px-2 py-1 text-[10px] font-semibold text-amber-200/90">
+          跨来源匹配待确认（后端未自动迁移进度）
+        </p>
+      )}
+      <div className="mt-3 h-1 w-full overflow-hidden rounded-full bg-white/5">
+        <div
+          className={cn("h-full rounded-full transition-all duration-300", isCurrent ? "bg-primary" : "bg-white/20")}
+          style={{ width: `${progress === null ? 0 : Math.round(progress * 100)}%` }}
+        />
+      </div>
+    </button>
+  )
+}
+
 function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
   const navigate = useNavigate()
   const { mediaItemId } = useParams<{ mediaItemId?: string }>()
@@ -231,6 +346,20 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     : undefined
   const comicSettingsState = useComicSettings(mediaItemId, preferenceEditionId)
   const readerSessionIdentity = demoMode ? "demo" : sessionIdentity
+  // 生产章节事实来自后端 Work 聚合；Demo 分支不请求该目录。
+  const workCatalogController = useComicWorkCatalog({ enabled: !demoMode, mediaItemId })
+  const workCatalog = workCatalogController.state.status === "ready"
+    ? workCatalogController.state.catalog
+    : null
+  const [editionFilter, setEditionFilter] = useState<string | null>(null)
+  const currentChapter = workCatalog ? currentComicWorkChapter(workCatalog, mediaItemId) : null
+  const previousChapter = workCatalog && currentChapter
+    ? resolveComicChapterNeighbour(workCatalog, currentChapter.previousMediaItemId)
+    : null
+  const nextChapter = workCatalog && currentChapter
+    ? resolveComicChapterNeighbour(workCatalog, currentChapter.nextMediaItemId)
+    : null
+  const visibleWorkChapters = workCatalog ? selectComicWorkChapters(workCatalog, editionFilter) : []
   // Demo sequence construction must remain inside the browser Mock branch;
   // Tauri production only consumes the session-issued page manifest.
   const demoSequence = useMemo(
@@ -296,11 +425,9 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
 
   const [showTools, setShowTools] = useState(true)
   const [isDrawerOpen, setIsDrawerOpen] = useState(false)
+  // 生产模式的章节 Tab 消费后端 Work 目录；Demo 分支保留自身的演示章节。
   const [activeTab, setActiveTab] = useState<"pages" | "chapters">("pages")
-  useEffect(() => {
-    if (!demoMode && activeTab !== "pages") setActiveTab("pages")
-  }, [activeTab, demoMode])
-  const visibleTab = demoMode ? activeTab : "pages"
+  const visibleTab = activeTab
   const [isBookmarked, setIsBookmarked] = useState(false)
   /** Tauri 环境创建成功后的后端标记 ID（供取消书签时软删除）。 */
   const [comicMarkerId, setComicMarkerId] = useState<string | null>(null)
@@ -363,6 +490,7 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     stripModeInitializedRef.current = false
     previousStripOffsetsRef.current = null
     previousStripAnchorPageRef.current = null
+    setEditionFilter(null)
   }, [readerSessionIdentity])
 
   useEffect(() => {
@@ -394,6 +522,13 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     sessionSettingsTouchedRef.current = true
     setDirection(next)
   }, [])
+
+  // 章节跳转只使用后端给出的 mediaItemId；路由形状由 router 固定，不由章节号推导。
+  const openChapter = useCallback((targetMediaItemId: string) => {
+    setIsDrawerOpen(false)
+    if (targetMediaItemId === (workCatalog?.currentMediaItemId ?? mediaItemId)) return
+    navigate(`/comic/${targetMediaItemId}`)
+  }, [mediaItemId, navigate, workCatalog])
 
   useEffect(() => {
     const requestId = ++markerListRequestRef.current
@@ -1322,7 +1457,7 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
         <div className="flex flex-col pt-3 pb-[8px] px-6 border-b border-white/10">
           <div className="w-10 h-1 bg-white/20 rounded-full mx-auto mb-[16px]" /> {/* Drag indicator */}
           <div className="flex items-center justify-between">
-            <span className="text-sm font-bold text-white">{demoMode ? "页面与章节" : "漫画页面"}</span>
+            <span className="text-sm font-bold text-white">页面与章节</span>
             <button
               onClick={() => setIsDrawerOpen(false)}
               className="flex items-center gap-1 bg-white/10 hover:bg-white/20 px-3 py-1.5 rounded-full text-xs font-medium text-white transition-colors cursor-pointer"
@@ -1345,21 +1480,18 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
             >
               全页缩略图
             </button>
-            {demoMode && (
-              <button
-                onClick={() => setActiveTab("chapters")}
-                className={cn(
-                  "flex-1 py-1.5 text-xs font-semibold rounded-lg z-10 transition-colors cursor-pointer",
-                  visibleTab === "chapters" ? "text-black" : "text-white/70 hover:text-white"
-                )}
-              >
-                话数列表
-              </button>
-            )}
+            <button
+              onClick={() => setActiveTab("chapters")}
+              className={cn(
+                "flex-1 py-1.5 text-xs font-semibold rounded-lg z-10 transition-colors cursor-pointer",
+                visibleTab === "chapters" ? "text-black" : "text-white/70 hover:text-white"
+              )}
+            >
+              话数列表
+            </button>
             {/* Animated background pill */}
             <div className={cn(
-               "absolute top-1 bottom-1 bg-white rounded-lg transition-transform duration-300 ease-out",
-               demoMode ? "w-[calc(50%-4px)]" : "left-1 right-1",
+               "absolute top-1 bottom-1 w-[calc(50%-4px)] bg-white rounded-lg transition-transform duration-300 ease-out",
                visibleTab === "pages" ? "translate-x-0" : "translate-x-full"
             )} />
           </div>
@@ -1422,7 +1554,113 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
           </div>
         )}
 
-        {/* Tab 2: 章节列表 (Elegant Cards) */}
+        {/* Tab 2 (生产): 后端 Work 级章节目录 */}
+        {!demoMode && visibleTab === "chapters" && (
+          <div className="flex-1 overflow-y-auto px-6 pb-6 custom-scrollbar">
+            <div className="mb-3 flex items-center justify-between gap-2">
+              <span className="text-[11px] font-semibold text-white/55">
+                {workCatalog ? comicWorkCatalogStatusLabel(workCatalog.refreshStatus) : "章节目录"}
+              </span>
+              <button
+                type="button"
+                onClick={workCatalogController.refresh}
+                disabled={workCatalogController.refreshing || workCatalogController.state.status === "loading"}
+                className="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full bg-white/10 px-3 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-white/20 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <RotateCw size={12} className={cn("shrink-0", workCatalogController.refreshing && "animate-spin")} />
+                {workCatalogController.refreshing ? "刷新中" : "刷新目录"}
+              </button>
+            </div>
+
+            {workCatalog?.truncated === true && (
+              <p className="mb-3 rounded-xl bg-amber-500/10 px-3 py-2 text-[11px] font-medium text-amber-200/90">
+                后端目录被截断，这里只显示本次返回的章节。
+              </p>
+            )}
+            {workCatalogController.refreshError !== null && (
+              <p className="mb-3 rounded-xl bg-red-500/10 px-3 py-2 text-[11px] font-medium text-red-200/90">
+                {workCatalogController.refreshError}
+              </p>
+            )}
+
+            {workCatalogController.state.status === "loading" && (
+              <p className="py-6 text-center text-xs text-white/50">正在读取章节目录…</p>
+            )}
+
+            {workCatalogController.state.status === "error" && (
+              <div className="rounded-2xl bg-white/5 px-4 py-4 text-center">
+                <p className="text-xs text-white/70">{workCatalogController.state.message}</p>
+                {workCatalogController.state.retryable && (
+                  <button
+                    type="button"
+                    onClick={workCatalogController.retry}
+                    className="mt-3 cursor-pointer rounded-full bg-white px-4 py-1.5 text-[11px] font-semibold text-black hover:bg-white/85"
+                  >
+                    重试
+                  </button>
+                )}
+              </div>
+            )}
+
+            {workCatalog && (
+              <>
+                {workCatalog.editions.length > 1 && (
+                  <div className="mb-3 flex flex-wrap gap-2">
+                    <ComicEditionChip
+                      label="全部"
+                      count={workCatalog.chapters.length}
+                      active={editionFilter === null}
+                      onClick={() => setEditionFilter(null)}
+                    />
+                    {workCatalog.editions.map((edition) => (
+                      <ComicEditionChip
+                        key={edition.editionId}
+                        label={edition.displayLabel}
+                        count={edition.chapterCount}
+                        active={editionFilter === edition.editionId}
+                        onClick={() => setEditionFilter(edition.editionId)}
+                      />
+                    ))}
+                  </div>
+                )}
+
+                {(previousChapter !== null || nextChapter !== null) && (
+                  <div className="mb-3 flex gap-2">
+                    {([["上一章", previousChapter], ["下一章", nextChapter]] as const).map(([label, neighbour]) => (
+                      <button
+                        key={label}
+                        type="button"
+                        disabled={neighbour === null || !neighbour.canOpen}
+                        onClick={() => { if (neighbour) openChapter(neighbour.mediaItemId) }}
+                        title={neighbour ? comicChapterDisplayTitle(neighbour, label) : `${label}（后端未提供）`}
+                        className="flex-1 cursor-pointer rounded-full bg-white/10 px-3 py-2 text-[11px] font-semibold text-white transition-colors hover:bg-white/20 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {visibleWorkChapters.length === 0 && (
+                  <p className="py-6 text-center text-xs text-white/50">该版本没有可显示的章节</p>
+                )}
+
+                <div className="space-y-3">
+                  {visibleWorkChapters.map((chapter) => (
+                    <ComicWorkChapterCard
+                      key={chapter.mediaItemId}
+                      chapter={chapter}
+                      isCurrent={currentChapter?.mediaItemId === chapter.mediaItemId}
+                      onOpen={openChapter}
+                    />
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* Tab 2 (Demo): 章节列表 (Elegant Cards) */}
         {demoMode && visibleTab === "chapters" && (
           <div className="flex-1 overflow-y-auto px-6 pb-6 space-y-3 custom-scrollbar">
             {DEMO_CHAPTERS.map((chapter) => {

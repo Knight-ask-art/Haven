@@ -15,8 +15,10 @@ use haven_domain::comic_identity::{
     ComicProgressMigrationSnapshot, ProgressMigrationMode, ProgressMigrationState,
 };
 use haven_domain::comic_progress_subject::ComicProgressSubject;
-use haven_domain::entities::{Edition, FavoriteTarget, MediaItem, Resource, Work};
-use haven_domain::enums::MediaType;
+use haven_domain::entities::{
+    Edition, FavoriteTarget, MediaIndex, MediaItem, Resource, ResourceLocator, Work,
+};
+use haven_domain::enums::{MediaType, ResourceType};
 use haven_domain::ids::{MediaItemId, WorkId};
 use haven_domain::locator::{ComicLocator, Locator};
 
@@ -25,7 +27,7 @@ use haven_application::services::ports::{
     ComicChapterRefreshPlan, ComicPageIdentityWriteCandidate, ComicProgressSubjectMergePlan,
     ComicProgressSubjectWritePlan, ComicProgressSubjectWritePrecondition,
     ComicProgressSubjectWriteResult, ComicProgressWriteCandidate, FavoriteState, FavoriteTxPorts,
-    UnitOfWork,
+    PeriodicalImportPlan, UnitOfWork,
 };
 
 /// R-MAIN-09D：purge 中间表唯一内部名（明确 temp schema；DROP 用同一定义，避免散落字符串）。
@@ -296,6 +298,144 @@ impl UnitOfWork for SqliteUnitOfWork {
             Err(error) => Err(error),
         }
     }
+
+    fn run_periodical_import(&self, plan: &PeriodicalImportPlan) -> Result<(), AppError> {
+        let mut guard = self.db.lock();
+        let tx = guard
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| tx_err("开启报刊导入 Immediate 事务失败", e))?;
+        let result = apply_periodical_import(&tx, plan);
+        match result {
+            Ok(()) => tx.commit().map_err(|e| tx_err("提交报刊导入事务失败", e)),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// 在单一事务内写入一次报刊文章导入的全部行。
+///
+/// 归属校验在这里重新执行（不相信 Application 在事务外读到的快照），并保证：
+/// - 期刊层级逐级一致、期刊来源绑定身份由 ISSN 派生；
+/// - Work/Edition/MediaItem/Resource 与期刊层级指向同一批身份；
+/// - 同一来源身份已存在时必须是同一篇文章，避免重复导入制造孤儿层级。
+fn apply_periodical_import(
+    tx: &rusqlite::Transaction<'_>,
+    plan: &PeriodicalImportPlan,
+) -> Result<(), AppError> {
+    let placement = haven_domain::periodical::PeriodicalPlacement {
+        periodical: plan.periodical.clone(),
+        volume: plan.volume.clone(),
+        issue: plan.issue.clone(),
+        article: plan.article.clone(),
+    };
+    placement
+        .validate()
+        .map_err(|error| invalid_periodical_plan(error.to_string()))?;
+
+    if plan.article.source.source_key != plan.source_key {
+        return Err(invalid_periodical_plan("文章来源身份与导入来源不一致"));
+    }
+    let expected_source_id =
+        haven_application::services::source_import::stable_source_id(&plan.source_key)
+            .map_err(|error| invalid_periodical_plan(error.to_string()))?;
+    let expected_refs = plan
+        .periodical
+        .identities()
+        .into_iter()
+        .map(|issn| haven_domain::periodical::periodical_source_ref_key(&plan.source_key, issn))
+        .collect::<Option<Vec<_>>>();
+    if expected_refs.as_ref() != Some(&plan.journal_source_refs)
+        || plan.journal_source_refs.is_empty()
+    {
+        return Err(invalid_periodical_plan(
+            "期刊来源绑定身份必须完整且由该期刊的 ISSN 派生",
+        ));
+    }
+    if plan.periodical.work_id != plan.work.id
+        || plan.edition.work_id != plan.work.id
+        || plan.item.edition_id != plan.edition.id
+        || plan.resource.media_item_id != plan.item.id
+        || plan.article.media_item_id != plan.item.id
+    {
+        return Err(invalid_periodical_plan(
+            "报刊导入计划的 Work/Edition/MediaItem/Resource 归属不一致",
+        ));
+    }
+    if plan.edition.edition_type != MediaType::Article
+        || plan.item.media_type != MediaType::Article
+        || !matches!(
+            &plan.item.index,
+            MediaIndex::Article { ordinal } if *ordinal == plan.article.ordinal
+        )
+        || plan.resource.resource_type != ResourceType::ArticleSnapshot
+        || plan.resource.source_id != Some(expected_source_id)
+        || !matches!(
+            &plan.resource.locator,
+            ResourceLocator::SourceObject { source_id, remote_id }
+                if *source_id == expected_source_id
+                    && remote_id == &plan.article.source.remote_article_id
+        )
+    {
+        return Err(invalid_periodical_plan(
+            "报刊导入计划必须使用 Article/ArticleSnapshot 与匹配的来源对象",
+        ));
+    }
+
+    if let Some(existing_article_id) =
+        crate::db::repos::periodicals::existing_article_id_on_conn(tx, &plan.article.source)?
+        && existing_article_id != plan.article.id
+    {
+        return Err(AppError::new(
+            "PERIODICAL_ARTICLE_IMPORT_CONFLICT",
+            ErrorKind::Conflict,
+            "该来源文章已导入为其他条目，请重新读取",
+            false,
+        ));
+    }
+
+    // 一个 MediaItem 只能被一条文章行绑定（040 的唯一索引）。并发导入可能在我们
+    // 读取归属之后才提交，这里必须给出可解释的冲突而不是 SQLite 约束错误。
+    if let Some(existing_article_id) =
+        crate::db::repos::periodicals::existing_article_id_for_media_item_on_conn(
+            tx,
+            plan.article.media_item_id,
+        )?
+        && existing_article_id != plan.article.id
+    {
+        return Err(AppError::new(
+            "PERIODICAL_ARTICLE_IMPORT_CONFLICT",
+            ErrorKind::Conflict,
+            "该媒体条目已绑定其他期刊文章，请重新读取",
+            false,
+        ));
+    }
+
+    crate::db::repos::work::save_on_conn(tx, &plan.work)?;
+    for source_ref in &plan.journal_source_refs {
+        crate::db::repos::work::save_source_ref_on_conn(
+            tx,
+            &plan.source_key,
+            source_ref,
+            plan.work.id,
+        )?;
+    }
+    crate::db::repos::edition::save_on_conn(tx, &plan.edition)?;
+    crate::db::repos::media_item::save_on_conn(tx, &plan.item)?;
+    crate::db::repos::resource::save_on_conn(tx, &plan.resource)?;
+    crate::db::repos::periodicals::save_on_conn(tx, &plan.periodical)?;
+    crate::db::repos::periodicals::save_volume_on_conn(tx, &plan.volume)?;
+    crate::db::repos::periodicals::save_issue_on_conn(tx, &plan.issue)?;
+    crate::db::repos::periodicals::save_article_on_conn(tx, &plan.article)?;
+    Ok(())
+}
+
+fn invalid_periodical_plan(message: impl Into<String>) -> AppError {
+    AppError::new(
+        "PERIODICAL_IMPORT_PLAN_INVALID",
+        ErrorKind::Validation,
+        message,
+        false,
+    )
 }
 
 fn apply_comic_progress_subject_write(
