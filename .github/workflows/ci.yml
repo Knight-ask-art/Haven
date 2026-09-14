@@ -330,6 +330,19 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Configure ASCII Cargo target directory
+        # Keep native build outputs and temporary files outside the Chinese
+        # checkout path. Some Rust/C build scripts fail when output paths are
+        # non-ASCII, which would otherwise make the Film/TV evidence job fail
+        # before it can report the actual evidence result.
+        shell: pwsh
+        run: |
+          $temp = Join-Path $env:RUNNER_TEMP "haven-film-tv-temp"
+          New-Item -ItemType Directory -Force -Path $temp | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$env:RUNNER_TEMP/haven-film-tv-target"
+          Add-Content -Path $env:GITHUB_ENV -Value "TEMP=$temp"
+          Add-Content -Path $env:GITHUB_ENV -Value "TMP=$temp"
+
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
@@ -341,6 +354,12 @@ jobs:
         uses: actions/setup-python@v7
         with:
           python-version: "3.x"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
 
       - name: Install frontend dependencies
         working-directory: 前端/app
