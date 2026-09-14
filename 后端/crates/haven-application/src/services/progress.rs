@@ -13,7 +13,7 @@ use std::sync::Arc;
 use haven_common::AppError;
 use haven_domain::contracts::{EditionRepository, MediaItemRepository, ProgressRepository};
 use haven_domain::entities::Progress;
-use haven_domain::enums::CompletionState;
+use haven_domain::enums::{CompletionState, MediaType};
 use haven_domain::ids::{MediaItemId, ProgressId};
 use haven_domain::locator::{Locator, locator_kind_compatible};
 
@@ -51,12 +51,10 @@ impl ProgressService {
         }
     }
 
-    /// 构造启用漫画 Subject 兼容读取的 ProgressService。
+    /// 构造启用漫画 Subject 兼容读取/写入的 ProgressService。
     ///
-    /// 现有 State 组装尚不在本任务 allowlist，因此 `new` 保持完全兼容的
-    /// 旧读取路径；任务 9 可以在 State 接线时显式选择本构造器。这里不会以
-    /// 普通 Repository 写入替代 Subject UoW：所有懒回填仍只由 SubjectService
-    /// 的 `run_comic_progress_subject_write` 提交。
+    /// `new` 仍保留旧组合根使用的 Repository 语义；生产组合根应显式使用本
+    /// 构造器，以便漫画路径和非漫画路径在同一个服务实例中分流。
     pub fn with_comic_progress_subjects<T>(ports: Arc<T>, unit_of_work: Arc<dyn UnitOfWork>) -> Self
     where
         T: ProgressPorts + comic_progress_subject::ComicProgressSubjectPorts + 'static,
@@ -144,13 +142,29 @@ impl ProgressService {
             revision: None,
             keyframe_uri,
         };
-        let revision = ProgressRepository::save_if_revision(
-            &*self.ports,
-            &progress,
-            request.expected_revision.as_deref(),
-        )
-        .await?
-        .ok_or_else(revision_conflict)?;
+        let revision = if media_item.media_type == MediaType::Comic {
+            if let Some(subjects) = self.comic_progress_subjects.as_ref() {
+                subjects
+                    .save_progress_for_media_item(progress, request.expected_revision.as_deref())
+                    .await?
+            } else {
+                ProgressRepository::save_if_revision(
+                    &*self.ports,
+                    &progress,
+                    request.expected_revision.as_deref(),
+                )
+                .await?
+                .ok_or_else(revision_conflict)?
+            }
+        } else {
+            ProgressRepository::save_if_revision(
+                &*self.ports,
+                &progress,
+                request.expected_revision.as_deref(),
+            )
+            .await?
+            .ok_or_else(revision_conflict)?
+        };
 
         Ok(ProgressSaveResult { revision })
     }
@@ -203,7 +217,16 @@ impl ProgressService {
             revision: None,
             keyframe_uri: None,
         };
-        let revision = ProgressRepository::mark_completed(&*self.ports, &candidate).await?;
+        let revision = if media_item.media_type == MediaType::Comic {
+            if let Some(subjects) = self.comic_progress_subjects.as_ref() {
+                self.mark_completed_comic(subjects, media_item_id, candidate)
+                    .await?
+            } else {
+                ProgressRepository::mark_completed(&*self.ports, &candidate).await?
+            }
+        } else {
+            ProgressRepository::mark_completed(&*self.ports, &candidate).await?
+        };
         Ok(ProgressSaveResult { revision })
     }
 
@@ -229,16 +252,45 @@ impl ProgressService {
         if media_item.media_type != haven_domain::enums::MediaType::Comic {
             return ProgressRepository::get_for_media_item(&*self.ports, media_item_id).await;
         }
-        Ok(subjects
-            .ensure_for_media_item(media_item_id)
-            .await?
-            .authoritative_progress)
+        subjects.ensure_for_media_item(media_item_id).await?;
+        subjects.progress_for_media_item(media_item_id).await
     }
 
     /// 最近活跃进度（首页 Continue 数据源）。
     pub async fn recent(&self, limit: u32) -> Result<Vec<ProgressSummaryDto>, AppError> {
         let items = self.ports.recent(limit.min(MAX_LIMIT)).await?;
-        items.iter().map(progress_summary).collect()
+        let Some(subjects) = self.comic_progress_subjects.as_ref() else {
+            return items.iter().map(progress_summary).collect();
+        };
+
+        let mut summaries = Vec::with_capacity(items.len());
+        let mut seen_subjects = std::collections::HashSet::new();
+        for item in items {
+            let media = MediaItemRepository::get(&*self.ports, item.media_item_id)
+                .await?
+                .ok_or_else(media_item_not_found)?;
+            if media.media_type != MediaType::Comic {
+                summaries.push(progress_summary(&item)?);
+                continue;
+            }
+            let Some(subject_id) = subjects
+                .subject_id_for_media_item(item.media_item_id)
+                .await?
+            else {
+                summaries.push(progress_summary(&item)?);
+                continue;
+            };
+            if !seen_subjects.insert(subject_id) {
+                continue;
+            }
+            if let Some(authoritative) = subjects
+                .authoritative_progress_for_media_item(item.media_item_id)
+                .await?
+            {
+                summaries.push(progress_summary(&authoritative)?);
+            }
+        }
+        Ok(summaries)
     }
 
     /// `progress_reset`（契约 §23.2）：业务操作，不删除任何实体。
@@ -246,10 +298,52 @@ impl ProgressService {
     /// **last_active_at 保留原值**（reset 不是新的观看/阅读活动，不得被 recent/LastActive
     /// 重排）；updated_at 由 Repository 单调推进（不回退）。
     pub async fn reset(&self, media_item_id: MediaItemId) -> Result<(), AppError> {
-        let mut progress = self
-            .ports
-            .get_for_media_item(media_item_id)
+        let Some(subjects) = self.comic_progress_subjects.as_ref() else {
+            let mut progress = self
+                .ports
+                .get_for_media_item(media_item_id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::new(
+                        "PROGRESS_NOT_FOUND",
+                        haven_common::ErrorKind::NotFound,
+                        "进度不存在",
+                        false,
+                    )
+                })?;
+            progress.completion = CompletionState::NotStarted;
+            progress.percentage = None;
+            progress.keyframe_uri = None;
+            // 保留 last_active_at；Repository 负责把 updated_at 单调推进。
+            return ProgressRepository::save(&*self.ports, &progress).await;
+        };
+
+        let media_item = MediaItemRepository::get(&*self.ports, media_item_id)
             .await?
+            .ok_or_else(progress_not_found)?;
+        if media_item.media_type != MediaType::Comic {
+            let mut progress = self
+                .ports
+                .get_for_media_item(media_item_id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::new(
+                        "PROGRESS_NOT_FOUND",
+                        haven_common::ErrorKind::NotFound,
+                        "进度不存在",
+                        false,
+                    )
+                })?;
+            progress.completion = CompletionState::NotStarted;
+            progress.percentage = None;
+            progress.keyframe_uri = None;
+            return ProgressRepository::save(&*self.ports, &progress).await;
+        }
+
+        let materialized = subjects.materialize_for_media_item(media_item_id).await?;
+        let mut progress = materialized
+            .progress
+            .or(ProgressRepository::get_for_media_item(&*self.ports, media_item_id).await?)
             .ok_or_else(|| {
                 AppError::new(
                     "PROGRESS_NOT_FOUND",
@@ -261,8 +355,57 @@ impl ProgressService {
         progress.completion = CompletionState::NotStarted;
         progress.percentage = None;
         progress.keyframe_uri = None;
-        progress.updated_at = haven_common::UtcMillis::now();
-        ProgressRepository::save(&*self.ports, &progress).await
+        // `save_progress_for_media_item(None)` 使用候选的旧 updated_at 与新的
+        // Subject pointer 一起提交；SQLite 会单调推进 updated_at，但保留
+        // last_active_at，不会把 reset 重新排到 Continue 顶部。
+        subjects
+            .save_progress_for_media_item(progress, None)
+            .await
+            .map(|_| ())
+    }
+
+    async fn mark_completed_comic(
+        &self,
+        subjects: &comic_progress_subject::ComicProgressSubjectService,
+        media_item_id: MediaItemId,
+        initial: Progress,
+    ) -> Result<String, AppError> {
+        const MAX_ATTEMPTS: usize = 3;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let materialized = subjects.materialize_for_media_item(media_item_id).await?;
+            let Some(mut current) = materialized
+                .progress
+                .or(ProgressRepository::get_for_media_item(&*self.ports, media_item_id).await?)
+            else {
+                let mut candidate = initial.clone();
+                candidate.completion = CompletionState::Completed;
+                return subjects.save_progress_for_media_item(candidate, None).await;
+            };
+
+            // Existing Progress 的 Locator、percentage、keyframe 和
+            // last_active_at 必须来自最新数据库行；这里只改变 completion。
+            let expected_revision = current.revision.clone().ok_or_else(|| {
+                AppError::new(
+                    "PROGRESS_REVISION_MISSING",
+                    haven_common::ErrorKind::Database,
+                    "Progress 缺少持久化 revision",
+                    false,
+                )
+            })?;
+            current.completion = CompletionState::Completed;
+            match subjects
+                .save_progress_for_media_item(current, Some(&expected_revision))
+                .await
+            {
+                Ok(revision) => return Ok(revision),
+                Err(error)
+                    if error.code().as_str() == "COMIC_PROGRESS_REVISION_CONFLICT"
+                        && attempts < MAX_ATTEMPTS => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 
@@ -356,6 +499,15 @@ fn media_item_not_found() -> AppError {
         "MEDIA_ITEM_NOT_FOUND",
         haven_common::ErrorKind::NotFound,
         "媒体条目不存在",
+        false,
+    )
+}
+
+fn progress_not_found() -> AppError {
+    AppError::new(
+        "PROGRESS_NOT_FOUND",
+        haven_common::ErrorKind::NotFound,
+        "进度不存在",
         false,
     )
 }

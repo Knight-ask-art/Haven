@@ -337,6 +337,20 @@ pub trait UnitOfWork: Send + Sync {
             false,
         ))
     }
+
+    /// 原子合并两个或多个已有 Subject；默认实现供不支持事务的测试替身
+    /// 明确返回 unsupported，避免静默退化为多次独立写入。
+    fn run_comic_progress_subject_merge(
+        &self,
+        _plan: &ComicProgressSubjectMergePlan,
+    ) -> Result<ComicProgressSubjectWriteResult, AppError> {
+        Err(AppError::new(
+            "COMIC_PROGRESS_SUBJECT_UOW_UNAVAILABLE",
+            haven_common::ErrorKind::Internal,
+            "当前 UnitOfWork 不支持漫画进度主体合并事务",
+            false,
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -369,10 +383,24 @@ pub enum ComicProgressSubjectWritePrecondition {
     AbsentActiveMember {
         media_item_id: MediaItemId,
     },
+    /// 首次建立一个跨来源 Subject 时，所有待绑定 MediaItem 都必须仍然没有
+    /// active member。这样来源/目标两条成员的首次合并也有明确的事务内 CAS
+    /// 前置条件，而不是把第二条成员的唯一索引错误当作并发协议。
+    AbsentActiveMembers {
+        media_item_ids: Vec<MediaItemId>,
+    },
     ExactSnapshot {
         subject: ComicProgressSubject,
         members: Vec<ComicProgressSubjectMember>,
         require_authoritative_progress_none: bool,
+        /// When present, the checked transaction must also prove that this
+        /// MediaItem still has no Progress row before applying the plan.
+        require_progress_absent_for_media_item: Option<MediaItemId>,
+        /// When present, the checked transaction must also prove that the
+        /// specified Progress owner still has this revision. This is used by
+        /// a read-only cross-MediaItem projection: the wire revision belongs
+        /// to the source row, while the write plan inserts a new target row.
+        require_progress_revision_for_media_item: Option<(MediaItemId, String)>,
     },
 }
 
@@ -381,6 +409,31 @@ pub struct ComicProgressSubjectWriteResult {
     pub applied_progress_revisions: Vec<String>,
     pub migration_id: Option<ComicProgressMigrationId>,
     pub refresh_id: Option<ComicCatalogRefreshId>,
+}
+
+/// 参与 Subject 合并的旧聚合快照。
+///
+/// `expected_subject`/`expected_members` 只用于 Immediate 事务内 CAS；真正写入
+/// 的新状态位于 [`ComicProgressSubjectMergePlan`] 的 survivor/redirected_subjects。
+#[derive(Debug, Clone)]
+pub struct ComicProgressSubjectMergeExpected {
+    pub expected_subject: ComicProgressSubject,
+    pub expected_members: Vec<ComicProgressSubjectMember>,
+}
+
+/// 两个或多个已有 Subject 的原子合并计划。
+///
+/// loser 不会被删除：Application 先把它们变为 Redirected，并将 active member
+/// 退休；survivor 再吸收这些成员。可选的 Progress/snapshot 写入与这组 Subject
+/// 状态共享同一个 Immediate 事务。
+#[derive(Debug, Clone)]
+pub struct ComicProgressSubjectMergePlan {
+    pub survivor: ComicProgressSubject,
+    pub survivor_members: Vec<ComicProgressSubjectMember>,
+    pub redirected_subjects: Vec<ComicProgressSubject>,
+    pub expected_subjects: Vec<ComicProgressSubjectMergeExpected>,
+    pub progress_writes: Vec<ComicProgressWriteCandidate>,
+    pub migration_snapshot: Option<ComicProgressMigrationSnapshot>,
 }
 
 /// 一个需要一起落库的漫画 Edition 及其身份画像。

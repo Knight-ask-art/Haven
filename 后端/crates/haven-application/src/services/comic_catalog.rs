@@ -9,7 +9,7 @@
 //! Subject/Progress 和刷新 Receipt，然后把事实交给纯 Domain 聚合。顺序、上一章/
 //! 下一章和当前项全部由后端确定，前端不得自行推导。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use haven_common::{AppError, ErrorKind, UtcMillis};
@@ -551,6 +551,7 @@ pub fn catalog_to_dto(catalog: &ComicChapterCatalog) -> ComicChapterCatalogDto {
 pub fn work_catalog_to_dto(
     catalog: &ComicWorkChapterCatalog,
 ) -> Result<ComicWorkChapterCatalogDto, AppError> {
+    validate_work_catalog(catalog)?;
     let editions = catalog
         .editions
         .iter()
@@ -599,6 +600,29 @@ pub fn work_catalog_to_dto(
             .map(refresh_receipt_to_dto)
             .collect(),
     })
+}
+
+/// `EditionId` 是本地版本的唯一身份。冲突的来源画像可以在 Domain 聚合中
+/// 暂时保留为互不导航的内部块，等待上层诊断；但不能越过 Application wire
+/// 边界，序列化成两个相同 `editionId` 的版本。否则前端的版本筛选和
+/// `chapterCount` 都无法确定其语义。
+fn validate_work_catalog(catalog: &ComicWorkChapterCatalog) -> Result<(), AppError> {
+    let mut edition_ids = HashSet::with_capacity(catalog.editions.len());
+    for (edition_id, _) in &catalog.editions {
+        if !edition_ids.insert(*edition_id) {
+            return Err(database_inconsistency("漫画目录包含重复 Edition 身份"));
+        }
+    }
+    if catalog
+        .chapters
+        .iter()
+        .any(|chapter| !edition_ids.contains(&chapter.edition_id))
+    {
+        return Err(database_inconsistency(
+            "漫画章节引用了未返回的 Edition 身份",
+        ));
+    }
+    Ok(())
 }
 
 fn work_chapter_to_dto(
@@ -1021,6 +1045,29 @@ mod tests {
         let json = serde_json::to_string(&dto).unwrap();
         assert!(!json.contains("internal-only"));
         assert!(!json.contains("authoritative"));
+    }
+
+    #[test]
+    fn work_catalog_dto_rejects_duplicate_local_edition_identity() {
+        let edition_id = EditionId::new();
+        let catalog = ComicWorkChapterCatalog {
+            work_id: WorkId::new(),
+            current_media_item_id: None,
+            editions: vec![
+                (edition_id, EditionProfile::default()),
+                (edition_id, EditionProfile::from_language(Some("ja"))),
+            ],
+            chapters: Vec::new(),
+            refresh_status: ComicWorkCatalogStatus::NeverSynced,
+            last_observed_at: None,
+            truncated: false,
+            refresh_receipts: Vec::new(),
+        };
+
+        let error =
+            work_catalog_to_dto(&catalog).expect_err("同一个本地 EditionId 不能映射成两个版本 DTO");
+        assert_eq!(error.code().as_str(), "DATABASE_ERROR");
+        assert_eq!(error.kind(), ErrorKind::Database);
     }
 
     // ---- Work 级聚合（真实 SQLite + 内存 Receipt 端口） ----------------------

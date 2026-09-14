@@ -343,8 +343,7 @@ mod tests {
         state: &AppState,
     ) -> (ChapterSourceIdentity, ChapterSourceIdentity, MediaItemId) {
         let work_id = WorkId::new();
-        let source_edition_id = EditionId::new();
-        let target_edition_id = EditionId::new();
+        let edition_id = EditionId::new();
         let source_media_item_id = MediaItemId::new();
         let target_media_item_id = MediaItemId::new();
         let now = haven_common::UtcMillis(1);
@@ -372,34 +371,29 @@ mod tests {
             })
             .await
             .unwrap();
-        for (id, title) in [
-            (source_edition_id, "IPC 源版本"),
-            (target_edition_id, "IPC 目标版本"),
-        ] {
-            state
-                .repos
-                .edition
-                .save(&Edition {
-                    id,
-                    work_id,
-                    title: title.into(),
-                    subtitle: None,
-                    edition_type: MediaType::Comic,
-                    release_date: None,
-                    language: Some("zh-cn".into()),
-                    region: None,
-                    publisher_or_studio: None,
-                    description: None,
-                    artwork: ArtworkSet::default(),
-                    created_at: now,
-                    updated_at: now,
-                })
-                .await
-                .unwrap();
-        }
+        state
+            .repos
+            .edition
+            .save(&Edition {
+                id: edition_id,
+                work_id,
+                title: "IPC 漫画版本".into(),
+                subtitle: None,
+                edition_type: MediaType::Comic,
+                release_date: None,
+                language: Some("zh-cn".into()),
+                region: None,
+                publisher_or_studio: None,
+                description: None,
+                artwork: ArtworkSet::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
         for (id, edition_id) in [
-            (source_media_item_id, source_edition_id),
-            (target_media_item_id, target_edition_id),
+            (source_media_item_id, edition_id),
+            (target_media_item_id, edition_id),
         ] {
             state
                 .repos
@@ -491,7 +485,7 @@ mod tests {
                 &Progress {
                     id: ProgressId::new(),
                     work_id,
-                    edition_id: source_edition_id,
+                    edition_id,
                     media_item_id: source_media_item_id,
                     locator: Locator::Comic(ComicLocator {
                         chapter_item_id: source_media_item_id,

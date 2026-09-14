@@ -28,6 +28,7 @@ use haven_domain::ids::{ComicProgressMigrationId, MediaItemId, ProgressId};
 use haven_domain::locator::{ComicLocator, Locator};
 
 use crate::services::ports::ComicProgressMigrationPorts;
+use crate::services::progress::comic_progress_subject::ComicProgressSubjectService;
 use crate::wire::{
     ComicChapterEvidenceDto, ComicChapterEvidenceKindDto, ComicChapterMatchDto,
     ComicChapterMatchKindDto, ComicChapterSourceCandidateDto, ComicChapterSourceCandidatesDto,
@@ -118,7 +119,7 @@ pub struct ComicProgressMigrationReceipt {
     pub applied_revision: Option<String>,
 }
 
-fn migration_result_with_receipt(
+pub(crate) fn migration_result_with_receipt(
     status: ComicProgressMigrationStatus,
     match_result: Option<ChapterMatch>,
     page_migration: PageMigration,
@@ -136,7 +137,7 @@ fn migration_result_with_receipt(
     }
 }
 
-fn migration_receipt(
+pub(crate) fn migration_receipt(
     migration_id: ComicProgressMigrationId,
     source_media_item_id: MediaItemId,
     target_media_item_id: MediaItemId,
@@ -229,7 +230,7 @@ pub(crate) fn unchanged_migration_result(
     )
 }
 
-fn no_target_page_migration() -> PageMigration {
+pub(crate) fn no_target_page_migration() -> PageMigration {
     PageMigration {
         target_page_index: None,
         confidence: PageMappingConfidence::Low,
@@ -241,11 +242,23 @@ fn no_target_page_migration() -> PageMigration {
 #[derive(Clone)]
 pub struct ComicProgressMigrationService {
     ports: Arc<dyn ComicProgressMigrationPorts>,
+    subject_service: Option<ComicProgressSubjectService>,
 }
 
 impl ComicProgressMigrationService {
     pub fn new(ports: Arc<dyn ComicProgressMigrationPorts>) -> Self {
-        Self { ports }
+        Self {
+            ports,
+            subject_service: None,
+        }
+    }
+
+    /// 注入组合根共享的 Subject service。未注入时保留旧的 source-level
+    /// migration repository 路径，方便不启用漫画连续性的测试/旧组装层；生产
+    /// 组合根必须注入它，确保章节关系和目标 Progress 使用同一套 Subject 事实。
+    pub fn with_subject_service(mut self, subject_service: ComicProgressSubjectService) -> Self {
+        self.subject_service = Some(subject_service);
+        self
     }
 
     /// IPC 入口：把安全 Wire 请求转换为领域请求，再执行一次章节换源迁移。
@@ -428,6 +441,9 @@ impl ComicProgressMigrationService {
         if source_edition.work_id != target_edition.work_id {
             return Err(comic_work_mismatch());
         }
+        if source_item.edition_id != target_item.edition_id {
+            return Err(comic_edition_mismatch());
+        }
         let source_page_identities =
             ComicPageIdentityRepository::list(&*self.ports, source_ref.media_item_id).await?;
         let target_page_identities =
@@ -450,6 +466,18 @@ impl ComicProgressMigrationService {
                 &target_ref.metadata,
                 &target_page_identities,
             )
+        };
+        // 先把章节来源关系收敛到 Subject。低置信度结果会留下 Candidate，
+        // 高置信度结果会把不同远端 ID 合并到同一个 active Subject；没有注入
+        // Subject 的旧组装层继续只执行原有迁移契约。
+        let _subject_reconciliation = if let Some(subject_service) = &self.subject_service {
+            Some(
+                subject_service
+                    .reconcile_chapters(request.source.clone(), request.target.clone())
+                    .await?,
+            )
+        } else {
+            None
         };
         let no_page = no_target_page_migration();
 
@@ -673,14 +701,25 @@ impl ComicProgressMigrationService {
             state: ProgressMigrationState::Applied,
             reverted_at: None,
         };
-        let applied_revision = ComicProgressMigrationRepository::apply(
-            &*self.ports,
-            &snapshot,
-            &source_revision,
-            target_revision.as_deref(),
-        )
-        .await?
-        .ok_or_else(revision_conflict)?;
+        let applied_revision = if let Some(subject_service) = &self.subject_service {
+            subject_service
+                .apply_migration_progress(
+                    source_progress.clone(),
+                    target_progress.clone(),
+                    snapshot.new_progress.clone(),
+                    snapshot.clone(),
+                )
+                .await?
+        } else {
+            ComicProgressMigrationRepository::apply(
+                &*self.ports,
+                &snapshot,
+                &source_revision,
+                target_revision.as_deref(),
+            )
+            .await?
+            .ok_or_else(revision_conflict)?
+        };
         let mut applied_progress = snapshot.new_progress.clone();
         applied_progress.revision = Some(applied_revision.clone());
         let receipt = receipt_for_match(
@@ -863,7 +902,7 @@ impl ComicProgressMigrationService {
     }
 }
 
-fn translated_progress(
+pub(crate) fn translated_progress(
     old: &Progress,
     target_item: &MediaItem,
     target_work_id: haven_domain::ids::WorkId,
@@ -1328,7 +1367,16 @@ fn comic_work_mismatch() -> AppError {
     )
 }
 
-fn revision_conflict() -> AppError {
+fn comic_edition_mismatch() -> AppError {
+    AppError::new(
+        "EDITION_CONFLICT",
+        ErrorKind::Conflict,
+        "漫画来源章节属于不同 Edition，拒绝迁移进度",
+        false,
+    )
+}
+
+pub(crate) fn revision_conflict() -> AppError {
     AppError::new(
         "REVISION_CONFLICT",
         ErrorKind::Conflict,
@@ -1369,7 +1417,10 @@ mod tests {
         let repositories = Arc::new(SqliteRepositories::new(db));
         let work_id = WorkId::new();
         let source_edition = EditionId::new();
-        let target_edition = EditionId::new();
+        // The source-level compatibility path follows the same Edition
+        // boundary as the Subject-aware production path. A separate Edition
+        // is created explicitly by the cross-Edition regression test below.
+        let target_edition = source_edition;
         repositories
             .work
             .save(&Work {
@@ -1392,27 +1443,25 @@ mod tests {
             })
             .await
             .unwrap();
-        for (id, title) in [(source_edition, "源版本"), (target_edition, "目标版本")] {
-            repositories
-                .edition
-                .save(&Edition {
-                    id,
-                    work_id,
-                    title: title.into(),
-                    subtitle: None,
-                    edition_type: MediaType::Comic,
-                    release_date: None,
-                    language: Some("zh-cn".into()),
-                    region: None,
-                    publisher_or_studio: None,
-                    description: None,
-                    artwork: ArtworkSet::default(),
-                    created_at: UtcMillis(1),
-                    updated_at: UtcMillis(1),
-                })
-                .await
-                .unwrap();
-        }
+        repositories
+            .edition
+            .save(&Edition {
+                id: source_edition,
+                work_id,
+                title: "换源版本".into(),
+                subtitle: None,
+                edition_type: MediaType::Comic,
+                release_date: None,
+                language: Some("zh-cn".into()),
+                region: None,
+                publisher_or_studio: None,
+                description: None,
+                artwork: ArtworkSet::default(),
+                created_at: UtcMillis(1),
+                updated_at: UtcMillis(1),
+            })
+            .await
+            .unwrap();
         let source_media = MediaItemId::new();
         let target_media = MediaItemId::new();
         for (id, edition_id) in [
@@ -2020,6 +2069,68 @@ mod tests {
             repositories
                 .progress
                 .get_for_media_item(other_item.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_rejects_chapters_from_different_local_editions() {
+        let (
+            repositories,
+            source,
+            target,
+            work_id,
+            source_edition,
+            target_edition,
+            source_media,
+            target_media,
+        ) = seed_fixture().await;
+        let (service, repositories) = configure_fixture(
+            repositories,
+            source.clone(),
+            target.clone(),
+            work_id,
+            source_edition,
+            source_media,
+            target_media,
+        )
+        .await;
+
+        let mut alternate_edition = repositories
+            .edition
+            .get(target_edition)
+            .await
+            .unwrap()
+            .expect("fixture Edition must exist");
+        alternate_edition.id = EditionId::new();
+        repositories.edition.save(&alternate_edition).await.unwrap();
+
+        let mut target_item = repositories
+            .media_item
+            .get(target_media)
+            .await
+            .unwrap()
+            .expect("fixture target MediaItem must exist");
+        target_item.edition_id = alternate_edition.id;
+        repositories.media_item.save(&target_item).await.unwrap();
+
+        let error = service
+            .migrate(ComicProgressMigrationRequest {
+                source,
+                target,
+                allow_best_effort: true,
+                allow_target_overwrite: true,
+            })
+            .await
+            .expect_err("不同本地 Edition 不能通过兼容路径迁移进度");
+        assert_eq!(error.code().as_str(), "EDITION_CONFLICT");
+        assert_eq!(error.kind(), ErrorKind::Conflict);
+        assert!(
+            repositories
+                .progress
+                .get_for_media_item(target_media)
                 .await
                 .unwrap()
                 .is_none()

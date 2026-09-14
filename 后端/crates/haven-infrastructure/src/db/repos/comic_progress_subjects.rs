@@ -520,18 +520,23 @@ mod tests {
     use crate::db::repos::SqliteRepositories;
     use crate::db::uow::SqliteUnitOfWork;
     use haven_application::services::ports::{
-        ComicProgressSubjectWritePlan, ComicProgressSubjectWritePrecondition,
-        ComicProgressSubjectWriteResult, FavoriteTxPorts, UnitOfWork,
+        ComicPageIdentityWriteCandidate, ComicProgressSubjectWritePlan,
+        ComicProgressSubjectWritePrecondition, ComicProgressSubjectWriteResult,
+        ComicProgressWriteCandidate, FavoriteTxPorts, UnitOfWork,
     };
     use haven_application::services::progress::comic_progress_subject::ComicProgressSubjectService;
-    use haven_domain::comic_identity::ChapterEvidence;
+    use haven_domain::comic_identity::{
+        ChapterEvidence, ChapterSourceIdentity, ChapterSourceRef, ComicChapterMetadata,
+        EditionProfile, IdentityFacet, PageIdentity, PageMappingStrategy,
+    };
     use haven_domain::comic_progress_subject::{
-        ComicProgressSubject, ComicProgressSubjectMember, ComicProgressSubjectRelationship,
-        ComicProgressSubjectState,
+        ComicProgressSubject, ComicProgressSubjectMember, ComicProgressSubjectMemberState,
+        ComicProgressSubjectRelationship, ComicProgressSubjectState,
     };
     use haven_domain::contracts::{
-        ComicProgressSubjectRepository, EditionRepository, HistoryRepository, MarkerRepository,
-        MediaItemRepository, ProgressRepository, WorkRepository,
+        ChapterSourceRepository, ComicPageIdentityRepository, ComicProgressSubjectRepository,
+        EditionRepository, HistoryRepository, MarkerRepository, MediaItemRepository,
+        ProgressRepository, WorkRepository,
     };
     use haven_domain::entities::{
         Edition, HistoryEntry, Marker, MediaIndex, MediaItem, Progress, Resource, Work,
@@ -736,6 +741,24 @@ mod tests {
             progress_writes: vec![],
             migration_snapshot: None,
             refresh_receipt: None,
+        }
+    }
+
+    fn chapter_source_ref(
+        media_item_id: MediaItemId,
+        identity: ChapterSourceIdentity,
+        metadata: ComicChapterMetadata,
+    ) -> ChapterSourceRef {
+        ChapterSourceRef {
+            media_item_id,
+            identity,
+            metadata,
+            source_order: 0,
+            availability: haven_domain::comic_catalog::ComicChapterSourceStatus::Available,
+            published_at: None,
+            source_updated_at: None,
+            last_seen_generation: None,
+            updated_at: UtcMillis(2),
         }
     }
 
@@ -1079,13 +1102,33 @@ mod tests {
                 refresh_receipt: None,
             })
             .unwrap();
+        let persisted_pointer_subject =
+            ComicProgressSubjectRepository::get(&*repos, member.subject_id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            persisted_pointer_subject.authoritative_progress_media_item_id,
+            Some(second_media_item_id),
+            "写入测试前置条件必须把 pointer 指向 second"
+        );
         let pointer_resolution = service
             .read_for_media_item(third_media_item_id)
             .await
             .unwrap()
-            .expect("目标无 Progress 时必须返回已有权威指针行");
+            .expect("目标无 Progress 时必须返回当前 MediaItem 视角投影");
         assert_eq!(
-            pointer_resolution.media_item_id, second_media_item_id,
+            pointer_resolution.media_item_id, third_media_item_id,
+            "只读读取必须把权威进度投影到当前 MediaItem"
+        );
+        let stored_after_projection =
+            ComicProgressSubjectRepository::get(&*repos, member.subject_id)
+                .await
+                .unwrap()
+                .expect("Subject 必须仍可读取");
+        assert_eq!(
+            stored_after_projection.authoritative_progress_media_item_id,
+            Some(second_media_item_id),
             "不得用较新的非 pointer Progress 替换既有权威映射"
         );
         let target_resolution = service
@@ -1167,6 +1210,123 @@ mod tests {
             tied.authoritative_progress_media_item_id,
             Some(tied_media_item_id)
         );
+    }
+
+    /// 只读跨 MediaItem 投影必须有可传回客户端的来源 freshness token，但该
+    /// token 不能被当作尚不存在的目标 Progress 行 revision。显式保存时应把
+    /// 它转换为源行 CAS，并在同一事务中安全创建目标行。
+    #[tokio::test]
+    async fn read_only_cross_media_projection_exposes_source_revision_and_save_materializes_target()
+    {
+        use haven_application::services::progress::ProgressService;
+        use haven_application::wire::{
+            ComicLocatorDto, CompletionWire, LocatorDto, ProgressSaveRequest,
+        };
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repos = Arc::new(SqliteRepositories::new(db.clone()));
+        let source_media_item_id = MediaItemId::new();
+        let (work_id, edition_id) =
+            seed_real_comic_content(&repos, "只读投影 revision", source_media_item_id).await;
+        let target_media_item_id = add_comic_media_item(&repos, edition_id, 2.0).await;
+
+        let source_before = comic_progress(work_id, edition_id, source_media_item_id, 100);
+        let source_revision = ProgressRepository::save_if_revision(&*repos, &source_before, None)
+            .await
+            .unwrap()
+            .expect("源 Progress 必须取得 revision");
+
+        let mut subject =
+            ComicProgressSubject::new(work_id, edition_id, source_media_item_id, UtcMillis(1));
+        subject.authoritative_progress_media_item_id = Some(source_media_item_id);
+        let members = vec![
+            active_subject_member(
+                subject.id,
+                source_media_item_id,
+                ComicProgressSubjectRelationship::Canonical,
+                1,
+            ),
+            active_subject_member(
+                subject.id,
+                target_media_item_id,
+                ComicProgressSubjectRelationship::Equivalent,
+                2,
+            ),
+        ];
+        subject.load_members(members.clone()).unwrap();
+        SqliteUnitOfWork::new(db.clone())
+            .run_comic_progress_subject_write(&subject_write_plan(subject, members))
+            .unwrap();
+
+        let subjects = ComicProgressSubjectService::new(
+            repos.clone(),
+            Arc::new(SqliteUnitOfWork::new(db.clone())),
+        );
+        let projection = subjects
+            .progress_summary_for_media_item(target_media_item_id)
+            .await
+            .unwrap()
+            .expect("目标无行时必须返回当前 MediaItem 视角投影");
+        assert_eq!(projection.media_item_id, target_media_item_id.to_string());
+        assert_eq!(projection.revision, source_revision);
+        assert!(matches!(
+            projection.locator,
+            LocatorDto::Comic(ComicLocatorDto {
+                chapter_item_id,
+                page_index: 3,
+                ..
+            }) if chapter_item_id == target_media_item_id.to_string()
+        ));
+        assert!(
+            ProgressRepository::get_for_media_item(&*repos, target_media_item_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "只读列表投影不得物化目标 Progress"
+        );
+
+        let progress_service = ProgressService::with_comic_progress_subjects(
+            repos.clone(),
+            Arc::new(SqliteUnitOfWork::new(db.clone())),
+        );
+        let result = progress_service
+            .save(ProgressSaveRequest {
+                media_item_id: target_media_item_id.to_string(),
+                locator: LocatorDto::Comic(ComicLocatorDto {
+                    chapter_item_id: target_media_item_id.to_string(),
+                    page_index: 5,
+                    page_progression: Some(0.6),
+                }),
+                completion: Some(CompletionWire::InProgress),
+                expected_revision: Some(projection.revision),
+                keyframe: None,
+            })
+            .await
+            .unwrap();
+        assert!(!result.revision.is_empty());
+
+        let target_after = ProgressRepository::get_for_media_item(&*repos, target_media_item_id)
+            .await
+            .unwrap()
+            .expect("保存投影视图必须创建目标 Progress");
+        assert_eq!(target_after.revision, Some(result.revision));
+        assert!(matches!(
+            target_after.locator,
+            Locator::Comic(ComicLocator {
+                chapter_item_id,
+                page_index: 5,
+                ..
+            }) if chapter_item_id == target_media_item_id
+        ));
+        let source_after = ProgressRepository::get_for_media_item(&*repos, source_media_item_id)
+            .await
+            .unwrap()
+            .expect("源 Progress 必须保留");
+        assert_eq!(
+            source_after.revision.as_deref(),
+            Some(source_revision.as_str())
+        );
+        assert_eq!(source_after.locator, source_before.locator);
     }
 
     #[tokio::test]
@@ -2000,6 +2160,8 @@ mod tests {
                     subject: stale_subject.clone(),
                     members: stale_members.clone(),
                     require_authoritative_progress_none: true,
+                    require_progress_absent_for_media_item: None,
+                    require_progress_revision_for_media_item: None,
                 },
             )
             .unwrap_err();
@@ -2043,6 +2205,8 @@ mod tests {
                     subject: stale_subject,
                     members: stale_members,
                     require_authoritative_progress_none: false,
+                    require_progress_absent_for_media_item: None,
+                    require_progress_revision_for_media_item: None,
                 },
             )
             .unwrap_err();
@@ -2091,6 +2255,8 @@ mod tests {
         FirstCreate,
         /// 权威 pointer 回填：`ExactSnapshot` + pointer-none。
         PointerBackfill,
+        /// 跨 MediaItem 物化：`ExactSnapshot` + target Progress 仍不存在。
+        TargetProgressAbsent,
     }
 
     fn is_first_create(precondition: &ComicProgressSubjectWritePrecondition) -> bool {
@@ -2105,6 +2271,16 @@ mod tests {
             precondition,
             ComicProgressSubjectWritePrecondition::ExactSnapshot {
                 require_authoritative_progress_none: true,
+                ..
+            }
+        )
+    }
+
+    fn is_target_progress_absent(precondition: &ComicProgressSubjectWritePrecondition) -> bool {
+        matches!(
+            precondition,
+            ComicProgressSubjectWritePrecondition::ExactSnapshot {
+                require_progress_absent_for_media_item: Some(_),
                 ..
             }
         )
@@ -2147,6 +2323,7 @@ mod tests {
             match self.trigger {
                 RaceTrigger::FirstCreate => is_first_create(precondition),
                 RaceTrigger::PointerBackfill => is_pointer_backfill(precondition),
+                RaceTrigger::TargetProgressAbsent => is_target_progress_absent(precondition),
             }
         }
     }
@@ -2287,6 +2464,502 @@ mod tests {
         assert_eq!(stored.members(), members.as_slice());
     }
 
+    /// 跨 MediaItem 物化时，若目标 Progress 在读取快照后先被另一会话创建，
+    /// 受检写入必须在同一 Immediate 事务内返回稳定的 revision conflict。
+    ///
+    /// winner 只提交目标 Progress，并保留 Subject 的旧 pointer。这样可以精确
+    /// 区分“目标行竞争”与 Subject 快照竞争：旧计划的 Subject 快照仍然匹配，
+    /// 但目标 Progress 缺失前置条件已经失效。断言还覆盖整笔旧计划没有留下
+    /// pointer、页面身份或迁移快照的部分写入。
+    #[tokio::test]
+    async fn comic_progress_subject_materialize_target_progress_race_is_revision_conflict() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repos = Arc::new(SqliteRepositories::new(db.clone()));
+        let source_media_item_id = MediaItemId::new();
+        let (work_id, edition_id) =
+            seed_real_comic_content(&repos, "目标 Progress 竞争", source_media_item_id).await;
+        let target_media_item_id = add_comic_media_item(&repos, edition_id, 2.0).await;
+
+        let source_before = comic_progress(work_id, edition_id, source_media_item_id, 100);
+        let source_revision = ProgressRepository::save_if_revision(&*repos, &source_before, None)
+            .await
+            .unwrap()
+            .expect("源 Progress 必须取得 revision");
+
+        let mut subject =
+            ComicProgressSubject::new(work_id, edition_id, source_media_item_id, UtcMillis(1));
+        subject.authoritative_progress_media_item_id = Some(source_media_item_id);
+        let members = vec![
+            active_subject_member(
+                subject.id,
+                source_media_item_id,
+                ComicProgressSubjectRelationship::Canonical,
+                1,
+            ),
+            active_subject_member(
+                subject.id,
+                target_media_item_id,
+                ComicProgressSubjectRelationship::Equivalent,
+                2,
+            ),
+        ];
+        subject.load_members(members.clone()).unwrap();
+
+        let unit_of_work = Arc::new(SqliteUnitOfWork::new(db.clone()));
+        unit_of_work
+            .run_comic_progress_subject_write(&subject_write_plan(subject.clone(), members.clone()))
+            .unwrap();
+
+        // winner：目标行先被另一个会话正常创建，但没有切换 Subject pointer。
+        let mut winner_progress = comic_progress(work_id, edition_id, target_media_item_id, 200);
+        winner_progress.locator = Locator::Comic(ComicLocator {
+            chapter_item_id: target_media_item_id,
+            page_index: 8,
+            page_progression: Some(0.8),
+        });
+        winner_progress.percentage = Some(0.8);
+        winner_progress.keyframe_uri = Some("data:image/png;base64,winner".to_owned());
+        let winner_plan = ComicProgressSubjectWritePlan {
+            subject: subject.clone(),
+            members: members.clone(),
+            page_identity_write: None,
+            progress_writes: vec![ComicProgressWriteCandidate {
+                progress: winner_progress.clone(),
+                expected_revision: None,
+            }],
+            migration_snapshot: None,
+            refresh_receipt: None,
+        };
+        let race = Arc::new(RaceUow::injecting_once(
+            unit_of_work,
+            RaceTrigger::TargetProgressAbsent,
+            winner_plan,
+        ));
+        let service = ComicProgressSubjectService::new(repos.clone(), race.clone());
+
+        let error = service
+            .materialize_for_media_item(target_media_item_id)
+            .await
+            .expect_err("目标 Progress 竞争必须拒绝旧物化计划");
+        assert_eq!(error.code().as_str(), "COMIC_PROGRESS_REVISION_CONFLICT");
+        assert_eq!(error.kind(), ErrorKind::Conflict);
+        assert_eq!(race.conflicts_injected(), 1);
+
+        let target_after = repos
+            .progress
+            .get_for_media_item(target_media_item_id)
+            .await
+            .unwrap()
+            .expect("并发 winner 的目标 Progress 必须保留");
+        assert_eq!(target_after.locator, winner_progress.locator);
+        assert_eq!(target_after.percentage, winner_progress.percentage);
+        assert_eq!(target_after.keyframe_uri, winner_progress.keyframe_uri);
+        assert!(target_after.revision.is_some());
+
+        let source_after = repos
+            .progress
+            .get_for_media_item(source_media_item_id)
+            .await
+            .unwrap()
+            .expect("源 Progress 必须保留");
+        assert_eq!(source_after.revision, Some(source_revision));
+        assert_eq!(source_after.locator, source_before.locator);
+        assert_eq!(source_after.percentage, source_before.percentage);
+        assert_eq!(source_after.keyframe_uri, source_before.keyframe_uri);
+
+        let stored_subject = repos
+            .progress_subjects
+            .get(subject.id)
+            .await
+            .unwrap()
+            .expect("Subject 必须保留");
+        assert_eq!(stored_subject, subject);
+        assert_eq!(stored_subject.members(), members.as_slice());
+        assert_eq!(count_rows(&db, "comic_page_identities"), 0);
+        assert_eq!(count_rows(&db, "comic_progress_migration_snapshots"), 0);
+    }
+
+    /// 只读跨 MediaItem projection 携带的是源 Progress revision。源行在
+    /// Application 读取后被另一个 SQLite 连接推进时，受检 UoW 必须在
+    /// `BEGIN IMMEDIATE` 内拒绝旧计划，而且拒绝发生在页面身份、Subject、目标
+    /// Progress 和迁移快照任何一项写入之前。
+    #[tokio::test]
+    async fn comic_progress_subject_checked_write_rejects_stale_source_revision_before_any_write() {
+        use haven_domain::comic_identity::{
+            ComicProgressMigrationSnapshot, PageIdentity, PageMappingConfidence,
+            PageMappingStrategy, ProgressMigrationMode, ProgressMigrationState,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("comic-source-revision-race.db");
+        let first_db = Arc::new(Db::open(&path).unwrap());
+        let first_repos = Arc::new(SqliteRepositories::new(first_db.clone()));
+        let source_media_item_id = MediaItemId::new();
+        let (work_id, edition_id) =
+            seed_real_comic_content(&first_repos, "源 revision 竞争", source_media_item_id).await;
+        let target_media_item_id = add_comic_media_item(&first_repos, edition_id, 2.0).await;
+
+        let source_before = comic_progress(work_id, edition_id, source_media_item_id, 100);
+        let source_revision =
+            ProgressRepository::save_if_revision(&*first_repos, &source_before, None)
+                .await
+                .unwrap()
+                .expect("源 Progress 必须取得 revision");
+        let source_snapshot = first_repos
+            .progress
+            .get_for_media_item(source_media_item_id)
+            .await
+            .unwrap()
+            .expect("源 Progress 必须可重新读取");
+
+        first_repos
+            .page_identity
+            .replace(
+                target_media_item_id,
+                &[PageIdentity::stable("old-target")],
+                UtcMillis(2),
+            )
+            .await
+            .unwrap();
+        let old_page_revision = first_repos
+            .page_identity
+            .get_snapshot(target_media_item_id)
+            .await
+            .unwrap()
+            .revision;
+
+        let mut subject =
+            ComicProgressSubject::new(work_id, edition_id, source_media_item_id, UtcMillis(1));
+        subject.authoritative_progress_media_item_id = Some(source_media_item_id);
+        let members = vec![
+            active_subject_member(
+                subject.id,
+                source_media_item_id,
+                ComicProgressSubjectRelationship::Canonical,
+                1,
+            ),
+            active_subject_member(
+                subject.id,
+                target_media_item_id,
+                ComicProgressSubjectRelationship::Equivalent,
+                2,
+            ),
+        ];
+        subject.load_members(members.clone()).unwrap();
+        let subject_id = subject.id;
+        let unit_of_work = SqliteUnitOfWork::new(first_db.clone());
+        unit_of_work
+            .run_comic_progress_subject_write(&subject_write_plan(subject.clone(), members.clone()))
+            .unwrap();
+        let stale_subject = first_repos
+            .progress_subjects
+            .get(subject_id)
+            .await
+            .unwrap()
+            .expect("Subject 必须存在");
+        let stale_members = first_repos
+            .progress_subjects
+            .list_members(subject_id)
+            .await
+            .unwrap();
+
+        // 第二个真实 SQLite 连接先推进源行，令 projection 中携带的 token 失效。
+        let second_db = Arc::new(Db::open(&path).unwrap());
+        let second_repos = Arc::new(SqliteRepositories::new(second_db));
+        let mut winner = source_snapshot.clone();
+        winner.locator = Locator::Comic(ComicLocator {
+            chapter_item_id: source_media_item_id,
+            page_index: 8,
+            page_progression: Some(0.8),
+        });
+        winner.percentage = Some(0.8);
+        winner.updated_at = UtcMillis(3_000);
+        winner.last_active_at = UtcMillis(3_000);
+        let winner_revision =
+            ProgressRepository::save_if_revision(&*second_repos, &winner, Some(&source_revision))
+                .await
+                .unwrap()
+                .expect("第二个 SQLite 连接必须成功推进源行");
+
+        let mut projected = comic_progress(work_id, edition_id, target_media_item_id, 200);
+        projected.locator = Locator::Comic(ComicLocator {
+            chapter_item_id: target_media_item_id,
+            page_index: 2,
+            page_progression: Some(0.3),
+        });
+        projected.percentage = Some(0.3);
+        projected.keyframe_uri = None;
+        let migration_snapshot = ComicProgressMigrationSnapshot {
+            id: haven_domain::ids::ComicProgressMigrationId::new(),
+            source_media_item_id,
+            target_media_item_id,
+            source_revision: source_revision.clone(),
+            target_revision_before: None,
+            old_progress: source_snapshot,
+            old_target_progress: None,
+            new_progress: projected.clone(),
+            mode: ProgressMigrationMode::OneTime,
+            confidence: PageMappingConfidence::Low,
+            strategy: PageMappingStrategy::ProportionalFallback,
+            evidence: vec![ChapterEvidence::AuthoritativeContentKey],
+            created_at: UtcMillis(4_000),
+            applied_revision: None,
+            state: ProgressMigrationState::Applied,
+            reverted_at: None,
+        };
+
+        let mut next_subject = stale_subject.clone();
+        next_subject.authoritative_progress_media_item_id = Some(target_media_item_id);
+        next_subject.updated_at = UtcMillis(4_000);
+        let error = unit_of_work
+            .run_checked_comic_progress_subject_write(
+                &ComicProgressSubjectWritePlan {
+                    subject: next_subject,
+                    members: stale_members.clone(),
+                    page_identity_write: Some(ComicPageIdentityWriteCandidate {
+                        media_item_id: target_media_item_id,
+                        pages: vec![
+                            PageIdentity::stable("new-target-0"),
+                            PageIdentity::stable("new-target-1"),
+                        ],
+                        expected_revision: old_page_revision,
+                    }),
+                    progress_writes: vec![ComicProgressWriteCandidate {
+                        progress: projected,
+                        expected_revision: None,
+                    }],
+                    migration_snapshot: Some(migration_snapshot),
+                    refresh_receipt: None,
+                },
+                &ComicProgressSubjectWritePrecondition::ExactSnapshot {
+                    subject: stale_subject.clone(),
+                    members: stale_members.clone(),
+                    require_authoritative_progress_none: false,
+                    require_progress_absent_for_media_item: Some(target_media_item_id),
+                    require_progress_revision_for_media_item: Some((
+                        source_media_item_id,
+                        source_revision.clone(),
+                    )),
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code().as_str(), "COMIC_PROGRESS_REVISION_CONFLICT");
+        assert_eq!(error.kind(), ErrorKind::Conflict);
+        assert_eq!(
+            first_repos
+                .progress_subjects
+                .get(subject_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            stale_subject,
+            "旧源 token 冲突不得切换 Subject pointer"
+        );
+        assert_eq!(
+            first_repos
+                .progress_subjects
+                .list_members(subject_id)
+                .await
+                .unwrap(),
+            stale_members,
+            "旧源 token 冲突不得改写成员"
+        );
+        assert_eq!(
+            first_repos
+                .page_identity
+                .list(target_media_item_id)
+                .await
+                .unwrap(),
+            vec![PageIdentity::stable("old-target")],
+            "旧源 token 冲突不得先替换页面身份"
+        );
+        assert!(
+            first_repos
+                .progress
+                .get_for_media_item(target_media_item_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            count_rows(&first_db, "comic_progress_migration_snapshots"),
+            0
+        );
+
+        let source_after = first_repos
+            .progress
+            .get_for_media_item(source_media_item_id)
+            .await
+            .unwrap()
+            .expect("源胜者必须保留");
+        assert_eq!(source_after.locator, winner.locator);
+        assert_eq!(source_after.percentage, winner.percentage);
+        assert_eq!(
+            source_after.revision.as_deref(),
+            Some(winner_revision.as_str())
+        );
+    }
+
+    /// 页面身份同步与跨 MediaItem 物化共用同一受检 Immediate UoW。目标原本没有
+    /// Progress、但另一个写入者在计划提交前先创建目标行时，页面身份、Subject、
+    /// 迁移快照和旧计划都必须整体回滚，目标胜者保持不变。
+    #[tokio::test]
+    async fn comic_progress_subject_page_identity_target_progress_race_is_revision_conflict_and_atomic()
+     {
+        use haven_application::services::ports::ComicProgressSubjectWritePlan;
+        use haven_domain::comic_identity::PageIdentity;
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repositories = Arc::new(SqliteRepositories::new(db.clone()));
+        let source_media_item_id = MediaItemId::new();
+        let (work_id, edition_id) =
+            seed_real_comic_content(&repositories, "页面同步目标竞争", source_media_item_id).await;
+        let target_media_item_id = add_comic_media_item(&repositories, edition_id, 2.0).await;
+
+        let source_before = comic_progress(work_id, edition_id, source_media_item_id, 100);
+        let source_revision =
+            ProgressRepository::save_if_revision(&*repositories, &source_before, None)
+                .await
+                .unwrap()
+                .expect("源 Progress 必须取得 revision");
+        repositories
+            .page_identity
+            .replace(
+                source_media_item_id,
+                &[
+                    PageIdentity::stable("source-0"),
+                    PageIdentity::stable("source-1"),
+                    PageIdentity::stable("source-2"),
+                    PageIdentity::stable("source-3"),
+                ],
+                UtcMillis(2),
+            )
+            .await
+            .unwrap();
+        repositories
+            .page_identity
+            .replace(
+                target_media_item_id,
+                &[PageIdentity::stable("old-target")],
+                UtcMillis(2),
+            )
+            .await
+            .unwrap();
+        let target_page_snapshot = repositories
+            .page_identity
+            .get_snapshot(target_media_item_id)
+            .await
+            .unwrap();
+
+        let mut subject =
+            ComicProgressSubject::new(work_id, edition_id, source_media_item_id, UtcMillis(1));
+        subject.authoritative_progress_media_item_id = Some(source_media_item_id);
+        let members = vec![
+            active_subject_member(
+                subject.id,
+                source_media_item_id,
+                ComicProgressSubjectRelationship::Canonical,
+                1,
+            ),
+            active_subject_member(
+                subject.id,
+                target_media_item_id,
+                ComicProgressSubjectRelationship::Equivalent,
+                2,
+            ),
+        ];
+        subject.load_members(members.clone()).unwrap();
+        SqliteUnitOfWork::new(db.clone())
+            .run_comic_progress_subject_write(&subject_write_plan(subject.clone(), members.clone()))
+            .unwrap();
+
+        let mut winner_progress = comic_progress(work_id, edition_id, target_media_item_id, 200);
+        winner_progress.locator = Locator::Comic(ComicLocator {
+            chapter_item_id: target_media_item_id,
+            page_index: 8,
+            page_progression: Some(0.8),
+        });
+        winner_progress.percentage = Some(0.8);
+        winner_progress.keyframe_uri = Some("data:image/png;base64,target-winner".to_owned());
+        let winner_plan = ComicProgressSubjectWritePlan {
+            subject: subject.clone(),
+            members: members.clone(),
+            page_identity_write: None,
+            progress_writes: vec![ComicProgressWriteCandidate {
+                progress: winner_progress.clone(),
+                expected_revision: None,
+            }],
+            migration_snapshot: None,
+            refresh_receipt: None,
+        };
+        let unit_of_work = Arc::new(SqliteUnitOfWork::new(db.clone()));
+        let race = Arc::new(RaceUow::injecting_once(
+            unit_of_work,
+            RaceTrigger::TargetProgressAbsent,
+            winner_plan,
+        ));
+        let service = ComicProgressSubjectService::new(repositories.clone(), race.clone());
+
+        let error = service
+            .synchronize_page_identities_for_media_item(
+                target_media_item_id,
+                target_page_snapshot.pages.clone(),
+                vec![
+                    PageIdentity::stable("new-target-0"),
+                    PageIdentity::stable("old-target"),
+                    PageIdentity::stable("new-target-1"),
+                ],
+                target_page_snapshot.revision,
+                None,
+            )
+            .await
+            .expect_err("目标行竞争必须拒绝页面身份同步旧计划");
+
+        assert_eq!(error.code().as_str(), "COMIC_PROGRESS_REVISION_CONFLICT");
+        assert_eq!(error.kind(), ErrorKind::Conflict);
+        assert_eq!(race.conflicts_injected(), 1);
+        assert_eq!(
+            repositories
+                .page_identity
+                .list(target_media_item_id)
+                .await
+                .unwrap(),
+            vec![PageIdentity::stable("old-target")],
+            "目标行竞争不得先替换页面身份"
+        );
+        let target_after = repositories
+            .progress
+            .get_for_media_item(target_media_item_id)
+            .await
+            .unwrap()
+            .expect("并发目标 Progress 胜者必须保留");
+        assert_eq!(target_after.locator, winner_progress.locator);
+        assert_eq!(target_after.percentage, winner_progress.percentage);
+        assert_eq!(target_after.keyframe_uri, winner_progress.keyframe_uri);
+        assert_eq!(
+            repositories
+                .progress
+                .get_for_media_item(source_media_item_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .revision
+                .as_deref(),
+            Some(source_revision.as_str()),
+            "源 Progress 不得被页面同步旧计划改写"
+        );
+        let stored_subject = repositories
+            .progress_subjects
+            .get(subject.id)
+            .await
+            .unwrap()
+            .expect("Subject 必须保留");
+        assert_eq!(stored_subject, subject);
+        assert_eq!(stored_subject.members(), members.as_slice());
+        assert_eq!(count_rows(&db, "comic_progress_migration_snapshots"), 0);
+    }
+
     /// 首次创建的确定性竞争：第二个 service 的创建计划在真实 Immediate 事务内发现
     /// 同一 MediaItem 已有 active 成员，必须重读 winner 并成功返回。
     ///
@@ -2400,6 +3073,1432 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(owner.subject_id, first.subject.id);
+    }
+
+    #[tokio::test]
+    async fn page_identity_change_materializes_authoritative_subject_progress_for_target() {
+        use haven_application::services::comic::{
+            PreparedComicPage, PreparedComicPageAvailability, PreparedComicPageSource,
+        };
+        use haven_application::services::comic_page_identity::ComicPageIdentityService;
+        use haven_application::services::comic_progress_migration::{
+            ComicProgressMigrationService, ComicProgressMigrationStatus,
+        };
+        use haven_application::services::progress::comic_progress_subject::ComicProgressSubjectService;
+        use haven_domain::comic_identity::PageIdentity;
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repositories = Arc::new(SqliteRepositories::new(db.clone()));
+        let source_media_item_id = MediaItemId::new();
+        let (work_id, edition_id) =
+            seed_real_comic_content(&repositories, "页面身份 Subject", source_media_item_id).await;
+        let target_media_item_id = add_comic_media_item(&repositories, edition_id, 1.0).await;
+
+        ProgressRepository::save_if_revision(
+            &*repositories,
+            &comic_progress(work_id, edition_id, source_media_item_id, 100),
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("源 Progress 必须取得 revision");
+        repositories
+            .page_identity
+            .replace(
+                source_media_item_id,
+                &[
+                    PageIdentity::stable("a"),
+                    PageIdentity::stable("b"),
+                    PageIdentity::stable("c"),
+                    PageIdentity::stable("d"),
+                ],
+                UtcMillis(2),
+            )
+            .await
+            .unwrap();
+        repositories
+            .page_identity
+            .replace(
+                target_media_item_id,
+                &[
+                    PageIdentity::stable("old-0"),
+                    PageIdentity::stable("old-1"),
+                    PageIdentity::stable("old-2"),
+                    PageIdentity::stable("old-3"),
+                ],
+                UtcMillis(2),
+            )
+            .await
+            .unwrap();
+
+        let mut subject =
+            ComicProgressSubject::new(work_id, edition_id, source_media_item_id, UtcMillis(1));
+        subject.authoritative_progress_media_item_id = Some(source_media_item_id);
+        let source_member = active_subject_member(
+            subject.id,
+            source_media_item_id,
+            ComicProgressSubjectRelationship::Canonical,
+            1,
+        );
+        let target_member = active_subject_member(
+            subject.id,
+            target_media_item_id,
+            ComicProgressSubjectRelationship::Equivalent,
+            2,
+        );
+        let members = vec![source_member, target_member];
+        subject.load_members(members.clone()).unwrap();
+        SqliteUnitOfWork::new(db.clone())
+            .run_comic_progress_subject_write(&subject_write_plan(subject, members))
+            .unwrap();
+
+        let subjects = ComicProgressSubjectService::new(
+            repositories.clone(),
+            Arc::new(SqliteUnitOfWork::new(db.clone())),
+        );
+        let migration = ComicProgressMigrationService::new(repositories.clone());
+        let result = ComicPageIdentityService::new(repositories.clone(), migration)
+            .with_comic_progress_subjects(subjects)
+            .synchronize_prepared_pages(
+                target_media_item_id,
+                &[
+                    PreparedComicPage {
+                        availability: PreparedComicPageAvailability::Ready,
+                        identity: PageIdentity::stable("intro"),
+                        source: PreparedComicPageSource::RemotePage {
+                            page_name: "intro".to_owned(),
+                        },
+                    },
+                    PreparedComicPage {
+                        availability: PreparedComicPageAvailability::Ready,
+                        identity: PageIdentity::stable("a"),
+                        source: PreparedComicPageSource::RemotePage {
+                            page_name: "a".to_owned(),
+                        },
+                    },
+                    PreparedComicPage {
+                        availability: PreparedComicPageAvailability::Ready,
+                        identity: PageIdentity::stable("b"),
+                        source: PreparedComicPageSource::RemotePage {
+                            page_name: "b".to_owned(),
+                        },
+                    },
+                    PreparedComicPage {
+                        availability: PreparedComicPageAvailability::Ready,
+                        identity: PageIdentity::stable("c"),
+                        source: PreparedComicPageSource::RemotePage {
+                            page_name: "c".to_owned(),
+                        },
+                    },
+                    PreparedComicPage {
+                        availability: PreparedComicPageAvailability::Ready,
+                        identity: PageIdentity::stable("d"),
+                        source: PreparedComicPageSource::RemotePage {
+                            page_name: "d".to_owned(),
+                        },
+                    },
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.changed);
+        assert_eq!(
+            result.migration.status,
+            ComicProgressMigrationStatus::Applied
+        );
+        assert_eq!(
+            result.migration.page_migration.strategy,
+            PageMappingStrategy::StableKey
+        );
+        assert_eq!(result.migration.page_migration.target_page_index, Some(4));
+        assert!(result.migration.snapshot_id.is_some());
+
+        let target_progress = repositories
+            .progress
+            .get_for_media_item(target_media_item_id)
+            .await
+            .unwrap()
+            .expect("页面身份变化必须为当前目标物化 Subject 进度");
+        assert_eq!(target_progress.media_item_id, target_media_item_id);
+        assert!(matches!(
+            target_progress.locator,
+            Locator::Comic(ComicLocator {
+                chapter_item_id,
+                page_index: 4,
+                ..
+            }) if chapter_item_id == target_media_item_id
+        ));
+        assert_eq!(
+            target_progress.percentage,
+            Some(1.0),
+            "迁移后的 percentage 必须按实际新页面序列计算"
+        );
+
+        let target_member = repositories
+            .progress_subjects
+            .get_for_media_item(target_media_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_subject = repositories
+            .progress_subjects
+            .get(target_member.subject_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored_subject.authoritative_progress_media_item_id,
+            Some(target_media_item_id)
+        );
+        assert_eq!(
+            db.lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM comic_progress_migration_snapshots",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "Subject、Progress、页面身份变化必须同时留下一个迁移快照"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_identity_change_repositions_existing_target_progress_without_source_overwrite() {
+        use haven_application::services::comic_progress_migration::ComicProgressMigrationStatus;
+        use haven_application::services::progress::comic_progress_subject::ComicProgressSubjectService;
+        use haven_domain::locator::{ComicLocator, Locator};
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repositories = Arc::new(SqliteRepositories::new(db.clone()));
+        let source_media_item_id = MediaItemId::new();
+        let (work_id, edition_id) =
+            seed_real_comic_content(&repositories, "目标进度优先", source_media_item_id).await;
+        let target_media_item_id = add_comic_media_item(&repositories, edition_id, 1.0).await;
+
+        let source_before = comic_progress(work_id, edition_id, source_media_item_id, 100);
+        ProgressRepository::save_if_revision(&*repositories, &source_before, None)
+            .await
+            .unwrap()
+            .expect("源 Progress 必须取得 revision");
+        let mut target_before = comic_progress(work_id, edition_id, target_media_item_id, 200);
+        target_before.locator = Locator::Comic(ComicLocator {
+            chapter_item_id: target_media_item_id,
+            page_index: 1,
+            page_progression: Some(0.2),
+        });
+        target_before.percentage = Some(0.2);
+        target_before.keyframe_uri = Some("data:image/png;base64,target".to_owned());
+        let target_revision =
+            ProgressRepository::save_if_revision(&*repositories, &target_before, None)
+                .await
+                .unwrap()
+                .expect("目标 Progress 必须取得 revision");
+
+        repositories
+            .page_identity
+            .replace(
+                source_media_item_id,
+                &[
+                    PageIdentity::stable("source-0"),
+                    PageIdentity::stable("source-1"),
+                    PageIdentity::stable("source-2"),
+                    PageIdentity::stable("source-3"),
+                ],
+                UtcMillis(2),
+            )
+            .await
+            .unwrap();
+        repositories
+            .page_identity
+            .replace(
+                target_media_item_id,
+                &[
+                    PageIdentity::stable("old-0"),
+                    PageIdentity::stable("old-1"),
+                    PageIdentity::stable("old-2"),
+                    PageIdentity::stable("old-3"),
+                ],
+                UtcMillis(2),
+            )
+            .await
+            .unwrap();
+
+        let mut subject =
+            ComicProgressSubject::new(work_id, edition_id, source_media_item_id, UtcMillis(1));
+        subject.authoritative_progress_media_item_id = Some(source_media_item_id);
+        let source_member = active_subject_member(
+            subject.id,
+            source_media_item_id,
+            ComicProgressSubjectRelationship::Canonical,
+            1,
+        );
+        let target_member = active_subject_member(
+            subject.id,
+            target_media_item_id,
+            ComicProgressSubjectRelationship::Equivalent,
+            2,
+        );
+        let members = vec![source_member, target_member];
+        subject.load_members(members.clone()).unwrap();
+        SqliteUnitOfWork::new(db.clone())
+            .run_comic_progress_subject_write(&subject_write_plan(subject, members))
+            .unwrap();
+
+        let target_page_snapshot = repositories
+            .page_identity
+            .get_snapshot(target_media_item_id)
+            .await
+            .unwrap();
+        let service = ComicProgressSubjectService::new(
+            repositories.clone(),
+            Arc::new(SqliteUnitOfWork::new(db.clone())),
+        );
+        let result = service
+            .synchronize_page_identities_for_media_item(
+                target_media_item_id,
+                target_page_snapshot.pages.clone(),
+                vec![
+                    PageIdentity::stable("intro"),
+                    PageIdentity::stable("old-0"),
+                    PageIdentity::stable("old-1"),
+                    PageIdentity::stable("old-2"),
+                    PageIdentity::stable("old-3"),
+                ],
+                target_page_snapshot.revision,
+                Some(target_revision),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ComicProgressMigrationStatus::Applied);
+        assert_eq!(
+            result.page_migration.strategy,
+            PageMappingStrategy::StableKey
+        );
+        assert_eq!(result.page_migration.target_page_index, Some(2));
+        let target_after = repositories
+            .progress
+            .get_for_media_item(target_media_item_id)
+            .await
+            .unwrap()
+            .expect("目标 Progress 必须仍存在");
+        assert!(matches!(
+            target_after.locator,
+            Locator::Comic(ComicLocator {
+                chapter_item_id,
+                page_index: 2,
+                ..
+            }) if chapter_item_id == target_media_item_id
+        ));
+        assert_eq!(target_after.percentage, Some(0.6));
+        assert_eq!(target_after.keyframe_uri, None);
+
+        let source_after = repositories
+            .progress
+            .get_for_media_item(source_media_item_id)
+            .await
+            .unwrap()
+            .expect("源 Progress 不能被页面身份同步删除");
+        assert_eq!(source_after.locator, source_before.locator);
+        assert_eq!(source_after.percentage, source_before.percentage);
+        let stored_subject = repositories
+            .progress_subjects
+            .get(
+                repositories
+                    .progress_subjects
+                    .get_for_media_item(target_media_item_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .subject_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored_subject.authoritative_progress_media_item_id,
+            Some(target_media_item_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_page_observation_persists_identity_without_materializing_progress() {
+        use haven_application::services::comic_progress_migration::ComicProgressMigrationStatus;
+        use haven_application::services::progress::comic_progress_subject::ComicProgressSubjectService;
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repositories = Arc::new(SqliteRepositories::new(db.clone()));
+        let source_media_item_id = MediaItemId::new();
+        let (work_id, edition_id) =
+            seed_real_comic_content(&repositories, "空页面不伪造进度", source_media_item_id).await;
+        let target_media_item_id = add_comic_media_item(&repositories, edition_id, 1.0).await;
+        let source_before = comic_progress(work_id, edition_id, source_media_item_id, 100);
+        ProgressRepository::save_if_revision(&*repositories, &source_before, None)
+            .await
+            .unwrap()
+            .expect("源 Progress 必须取得 revision");
+
+        repositories
+            .page_identity
+            .replace(
+                source_media_item_id,
+                &[
+                    PageIdentity::stable("source-0"),
+                    PageIdentity::stable("source-1"),
+                    PageIdentity::stable("source-2"),
+                    PageIdentity::stable("source-3"),
+                ],
+                UtcMillis(2),
+            )
+            .await
+            .unwrap();
+        repositories
+            .page_identity
+            .replace(
+                target_media_item_id,
+                &[PageIdentity::stable("old-0")],
+                UtcMillis(2),
+            )
+            .await
+            .unwrap();
+        let target_page_snapshot = repositories
+            .page_identity
+            .get_snapshot(target_media_item_id)
+            .await
+            .unwrap();
+
+        let mut subject =
+            ComicProgressSubject::new(work_id, edition_id, source_media_item_id, UtcMillis(1));
+        subject.authoritative_progress_media_item_id = Some(source_media_item_id);
+        let members = vec![
+            active_subject_member(
+                subject.id,
+                source_media_item_id,
+                ComicProgressSubjectRelationship::Canonical,
+                1,
+            ),
+            active_subject_member(
+                subject.id,
+                target_media_item_id,
+                ComicProgressSubjectRelationship::Equivalent,
+                2,
+            ),
+        ];
+        subject.load_members(members.clone()).unwrap();
+        SqliteUnitOfWork::new(db.clone())
+            .run_comic_progress_subject_write(&subject_write_plan(subject, members))
+            .unwrap();
+
+        let service = ComicProgressSubjectService::new(
+            repositories.clone(),
+            Arc::new(SqliteUnitOfWork::new(db.clone())),
+        );
+        let result = service
+            .synchronize_page_identities_for_media_item(
+                target_media_item_id,
+                target_page_snapshot.pages,
+                Vec::new(),
+                target_page_snapshot.revision,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ComicProgressMigrationStatus::NoTargetPage);
+        assert_eq!(
+            result.page_migration.strategy,
+            PageMappingStrategy::NoTarget
+        );
+        assert_eq!(result.page_migration.target_page_index, None);
+        assert!(result.snapshot_id.is_none());
+        assert!(
+            repositories
+                .progress
+                .get_for_media_item(target_media_item_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            repositories
+                .page_identity
+                .list(target_media_item_id)
+                .await
+                .unwrap(),
+            Vec::<PageIdentity>::new()
+        );
+        assert_eq!(
+            repositories
+                .progress
+                .get_for_media_item(source_media_item_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .locator,
+            source_before.locator
+        );
+        let stored_subject = repositories
+            .progress_subjects
+            .get(
+                repositories
+                    .progress_subjects
+                    .get_for_media_item(target_media_item_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .subject_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored_subject.authoritative_progress_media_item_id,
+            Some(source_media_item_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn comic_progress_subject_uow_rolls_back_page_subject_and_progress_on_late_cas_conflict()
+    {
+        use haven_application::services::ports::{
+            ComicPageIdentityWriteCandidate, ComicProgressSubjectWritePlan,
+            ComicProgressWriteCandidate, UnitOfWork,
+        };
+        use haven_domain::comic_identity::PageIdentity;
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repositories = Arc::new(SqliteRepositories::new(db.clone()));
+        let source_media_item_id = MediaItemId::new();
+        let (work_id, edition_id) =
+            seed_real_comic_content(&repositories, "漫画 Subject 事务回滚", source_media_item_id)
+                .await;
+        let target_media_item_id = add_comic_media_item(&repositories, edition_id, 1.0).await;
+        let source_before = comic_progress(work_id, edition_id, source_media_item_id, 100);
+        let source_revision =
+            ProgressRepository::save_if_revision(&*repositories, &source_before, None)
+                .await
+                .unwrap()
+                .expect("源 Progress 必须取得 revision");
+        repositories
+            .page_identity
+            .replace(
+                target_media_item_id,
+                &[PageIdentity::stable("old")],
+                UtcMillis(2),
+            )
+            .await
+            .unwrap();
+        let old_page_revision = repositories
+            .page_identity
+            .get_snapshot(target_media_item_id)
+            .await
+            .unwrap()
+            .revision;
+
+        let mut subject =
+            ComicProgressSubject::new(work_id, edition_id, source_media_item_id, UtcMillis(1));
+        subject.authoritative_progress_media_item_id = Some(source_media_item_id);
+        let members = vec![
+            active_subject_member(
+                subject.id,
+                source_media_item_id,
+                ComicProgressSubjectRelationship::Canonical,
+                1,
+            ),
+            active_subject_member(
+                subject.id,
+                target_media_item_id,
+                ComicProgressSubjectRelationship::Equivalent,
+                2,
+            ),
+        ];
+        subject.load_members(members.clone()).unwrap();
+        let unit_of_work = SqliteUnitOfWork::new(db.clone());
+        unit_of_work
+            .run_comic_progress_subject_write(&subject_write_plan(subject.clone(), members.clone()))
+            .unwrap();
+
+        let subject_id = subject.id;
+        let mut next_subject = subject;
+        next_subject.authoritative_progress_media_item_id = Some(target_media_item_id);
+        let mut target_progress = comic_progress(work_id, edition_id, target_media_item_id, 300);
+        target_progress.locator = Locator::Comic(ComicLocator {
+            chapter_item_id: target_media_item_id,
+            page_index: 1,
+            page_progression: Some(0.2),
+        });
+        target_progress.percentage = Some(0.2);
+        let mut stale_source = source_before.clone();
+        stale_source.percentage = Some(0.9);
+
+        let error = unit_of_work
+            .run_comic_progress_subject_write(&ComicProgressSubjectWritePlan {
+                subject: next_subject,
+                members,
+                page_identity_write: Some(ComicPageIdentityWriteCandidate {
+                    media_item_id: target_media_item_id,
+                    pages: vec![PageIdentity::stable("new")],
+                    expected_revision: old_page_revision,
+                }),
+                progress_writes: vec![
+                    ComicProgressWriteCandidate {
+                        progress: target_progress,
+                        expected_revision: None,
+                    },
+                    ComicProgressWriteCandidate {
+                        progress: stale_source,
+                        expected_revision: Some("stale-revision".to_owned()),
+                    },
+                ],
+                migration_snapshot: None,
+                refresh_receipt: None,
+            })
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), "COMIC_PROGRESS_REVISION_CONFLICT");
+
+        assert_eq!(
+            repositories
+                .page_identity
+                .list(target_media_item_id)
+                .await
+                .unwrap(),
+            vec![PageIdentity::stable("old")]
+        );
+        let stored_subject = repositories
+            .progress_subjects
+            .get(subject_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored_subject.authoritative_progress_media_item_id,
+            Some(source_media_item_id)
+        );
+        let source_after = repositories
+            .progress
+            .get_for_media_item(source_media_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source_after.revision, Some(source_revision));
+        assert_eq!(source_after.percentage, source_before.percentage);
+        assert!(
+            repositories
+                .progress
+                .get_for_media_item(target_media_item_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(count_rows(&db, "comic_progress_migration_snapshots"), 0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_merges_existing_subjects_and_preserves_history_progress_and_sources() {
+        use haven_domain::comic_progress_subject::resolve_subject_redirect;
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repositories = Arc::new(SqliteRepositories::new(db.clone()));
+        let source_media_item_id = MediaItemId::new();
+        let (work_id, edition_id) =
+            seed_real_comic_content(&repositories, "已有主体合并", source_media_item_id).await;
+        let target_media_item_id = add_comic_media_item(&repositories, edition_id, 1.0).await;
+
+        let source_progress = comic_progress(work_id, edition_id, source_media_item_id, 100);
+        let source_revision =
+            ProgressRepository::save_if_revision(&*repositories, &source_progress, None)
+                .await
+                .unwrap()
+                .expect("源 Progress 必须取得 revision");
+        let target_progress = comic_progress(work_id, edition_id, target_media_item_id, 200);
+        let target_revision =
+            ProgressRepository::save_if_revision(&*repositories, &target_progress, None)
+                .await
+                .unwrap()
+                .expect("目标 Progress 必须取得 revision");
+        let source_persisted_progress = repositories
+            .progress
+            .get_for_media_item(source_media_item_id)
+            .await
+            .unwrap()
+            .expect("源 Progress 必须存在");
+        let target_persisted_progress = repositories
+            .progress
+            .get_for_media_item(target_media_item_id)
+            .await
+            .unwrap()
+            .expect("目标 Progress 必须存在");
+        assert_eq!(
+            source_persisted_progress.revision.as_deref(),
+            Some(source_revision.as_str())
+        );
+        assert_eq!(
+            target_persisted_progress.revision.as_deref(),
+            Some(target_revision.as_str())
+        );
+
+        let source_marker = Marker {
+            id: MarkerId::new(),
+            work_id,
+            edition_id,
+            media_item_id: source_media_item_id,
+            locator: source_progress.locator.clone(),
+            marker_type: MarkerType::Bookmark,
+            title: Some("源标记".to_owned()),
+            excerpt: None,
+            note: None,
+            preview: None,
+            created_at: UtcMillis(101),
+            updated_at: UtcMillis(101),
+            deleted_at: None,
+        };
+        MarkerRepository::save(&*repositories, &source_marker)
+            .await
+            .unwrap();
+        let target_marker = Marker {
+            id: MarkerId::new(),
+            work_id,
+            edition_id,
+            media_item_id: target_media_item_id,
+            locator: target_progress.locator.clone(),
+            marker_type: MarkerType::Bookmark,
+            title: Some("目标标记".to_owned()),
+            excerpt: None,
+            note: None,
+            preview: None,
+            created_at: UtcMillis(201),
+            updated_at: UtcMillis(201),
+            deleted_at: None,
+        };
+        MarkerRepository::save(&*repositories, &target_marker)
+            .await
+            .unwrap();
+
+        let source_history = HistoryEntry {
+            id: HistoryEntryId::new(),
+            media_item_id: source_media_item_id,
+            work_id,
+            edition_id,
+            locator: Some(source_progress.locator.clone()),
+            started_at: UtcMillis(99),
+            last_active_at: UtcMillis(100),
+            completed_at: None,
+        };
+        HistoryRepository::save(&*repositories, &source_history)
+            .await
+            .unwrap();
+        let target_history = HistoryEntry {
+            id: HistoryEntryId::new(),
+            media_item_id: target_media_item_id,
+            work_id,
+            edition_id,
+            locator: Some(target_progress.locator.clone()),
+            started_at: UtcMillis(199),
+            last_active_at: UtcMillis(200),
+            completed_at: None,
+        };
+        HistoryRepository::save(&*repositories, &target_history)
+            .await
+            .unwrap();
+
+        let source_identity =
+            ChapterSourceIdentity::new("source-a", "remote-work-a", "remote-chapter-a").unwrap();
+        let target_identity =
+            ChapterSourceIdentity::new("source-b", "remote-work-b", "remote-chapter-b").unwrap();
+        let metadata = ComicChapterMetadata {
+            chapter_number: Some(1.0),
+            page_count: Some(10),
+            authoritative_content_key: Some("merge-authoritative-key".to_owned()),
+            ..ComicChapterMetadata::default()
+        };
+        let source_ref = chapter_source_ref(
+            source_media_item_id,
+            source_identity.clone(),
+            metadata.clone(),
+        );
+        let target_ref =
+            chapter_source_ref(target_media_item_id, target_identity.clone(), metadata);
+        repositories.chapter_source.save(&source_ref).await.unwrap();
+        repositories.chapter_source.save(&target_ref).await.unwrap();
+
+        let mut source_subject =
+            ComicProgressSubject::new(work_id, edition_id, source_media_item_id, UtcMillis(10));
+        source_subject.authoritative_progress_media_item_id = Some(source_media_item_id);
+        let source_member = active_subject_member(
+            source_subject.id,
+            source_media_item_id,
+            ComicProgressSubjectRelationship::Canonical,
+            10,
+        );
+        source_subject
+            .load_members(vec![source_member.clone()])
+            .unwrap();
+
+        let mut target_subject =
+            ComicProgressSubject::new(work_id, edition_id, target_media_item_id, UtcMillis(20));
+        target_subject.authoritative_progress_media_item_id = Some(target_media_item_id);
+        let target_member = active_subject_member(
+            target_subject.id,
+            target_media_item_id,
+            ComicProgressSubjectRelationship::Canonical,
+            20,
+        );
+        target_subject
+            .load_members(vec![target_member.clone()])
+            .unwrap();
+
+        let unit_of_work = SqliteUnitOfWork::new(db.clone());
+        unit_of_work
+            .run_comic_progress_subject_write(&subject_write_plan(
+                source_subject.clone(),
+                vec![source_member],
+            ))
+            .unwrap();
+        unit_of_work
+            .run_comic_progress_subject_write(&subject_write_plan(
+                target_subject.clone(),
+                vec![target_member],
+            ))
+            .unwrap();
+
+        let service = ComicProgressSubjectService::new(
+            repositories.clone(),
+            Arc::new(SqliteUnitOfWork::new(db.clone())),
+        );
+        let result = service
+            .reconcile_chapters(source_identity.clone(), target_identity.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(result.subject_id, source_subject.id);
+        assert_eq!(
+            result.relationship,
+            ComicProgressSubjectRelationship::Equivalent
+        );
+        assert_eq!(
+            result.confidence,
+            haven_domain::comic_identity::MatchConfidence::High
+        );
+
+        let survivor = repositories
+            .progress_subjects
+            .get(source_subject.id)
+            .await
+            .unwrap()
+            .expect("最老 Subject 必须成为 survivor");
+        let loser = repositories
+            .progress_subjects
+            .get(target_subject.id)
+            .await
+            .unwrap()
+            .expect("较新的 Subject 必须保留为 loser");
+        assert_eq!(survivor.state, ComicProgressSubjectState::Active);
+        assert_eq!(survivor.redirect_subject_id, None);
+        assert_eq!(
+            survivor.authoritative_progress_media_item_id,
+            Some(target_media_item_id)
+        );
+        assert_eq!(
+            survivor
+                .members()
+                .iter()
+                .filter(|member| member.state == ComicProgressSubjectMemberState::Active)
+                .count(),
+            2
+        );
+        assert_eq!(loser.state, ComicProgressSubjectState::Redirected);
+        assert_eq!(loser.redirect_subject_id, Some(survivor.id));
+        assert!(
+            loser
+                .members()
+                .iter()
+                .all(|member| member.state == ComicProgressSubjectMemberState::Retired)
+        );
+        assert_eq!(
+            resolve_subject_redirect(loser.id, &[survivor.clone(), loser.clone()],).unwrap(),
+            survivor.id
+        );
+        assert_eq!(
+            resolve_subject_redirect(survivor.id, &[survivor.clone(), loser.clone()],).unwrap(),
+            survivor.id
+        );
+
+        let source_member = repositories
+            .progress_subjects
+            .get_for_media_item(source_media_item_id)
+            .await
+            .unwrap()
+            .expect("源 MediaItem 必须仍属于 survivor");
+        let target_member = repositories
+            .progress_subjects
+            .get_for_media_item(target_media_item_id)
+            .await
+            .unwrap()
+            .expect("目标 MediaItem 必须仍属于 survivor");
+        assert_eq!(source_member.subject_id, survivor.id);
+        assert_eq!(target_member.subject_id, survivor.id);
+        assert_eq!(
+            survivor
+                .members()
+                .iter()
+                .filter(|member| member.state == ComicProgressSubjectMemberState::Active)
+                .map(|member| member.media_item_id)
+                .collect::<std::collections::HashSet<_>>(),
+            [source_media_item_id, target_media_item_id]
+                .into_iter()
+                .collect()
+        );
+
+        assert_eq!(
+            repositories
+                .progress
+                .get_for_media_item(source_media_item_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            source_persisted_progress
+        );
+        assert_eq!(
+            repositories
+                .progress
+                .get_for_media_item(target_media_item_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            target_persisted_progress
+        );
+        assert_eq!(
+            repositories
+                .history
+                .list_for_media_item(source_media_item_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![source_history.id]
+        );
+        assert_eq!(
+            repositories
+                .history
+                .list_for_media_item(target_media_item_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![target_history.id]
+        );
+        assert_eq!(
+            repositories
+                .marker
+                .list_for_media_item(source_media_item_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|marker| marker.id)
+                .collect::<Vec<_>>(),
+            vec![source_marker.id]
+        );
+        assert_eq!(
+            repositories
+                .marker
+                .list_for_media_item(target_media_item_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|marker| marker.id)
+                .collect::<Vec<_>>(),
+            vec![target_marker.id]
+        );
+        assert_eq!(
+            repositories
+                .chapter_source
+                .get(&source_identity)
+                .await
+                .unwrap(),
+            Some(source_ref)
+        );
+        assert_eq!(
+            repositories
+                .chapter_source
+                .get(&target_identity)
+                .await
+                .unwrap(),
+            Some(target_ref)
+        );
+        assert_eq!(count_rows(&db, "comic_progress_subjects"), 2);
+        assert_eq!(count_rows(&db, "comic_progress_subject_members"), 3);
+        assert_eq!(count_rows(&db, "comic_progress_migration_snapshots"), 0);
+    }
+
+    #[tokio::test]
+    async fn subject_merge_rolls_back_all_subject_changes_when_late_progress_write_fails() {
+        use haven_application::services::ports::{
+            ComicProgressSubjectMergeExpected, ComicProgressSubjectMergePlan,
+        };
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repositories = Arc::new(SqliteRepositories::new(db.clone()));
+        let source_media_item_id = MediaItemId::new();
+        let (work_id, edition_id) =
+            seed_real_comic_content(&repositories, "主体合并回滚", source_media_item_id).await;
+        let target_media_item_id = add_comic_media_item(&repositories, edition_id, 1.0).await;
+
+        let source_progress = comic_progress(work_id, edition_id, source_media_item_id, 100);
+        ProgressRepository::save_if_revision(&*repositories, &source_progress, None)
+            .await
+            .unwrap()
+            .expect("源 Progress 必须取得 revision");
+        let target_progress = comic_progress(work_id, edition_id, target_media_item_id, 200);
+        ProgressRepository::save_if_revision(&*repositories, &target_progress, None)
+            .await
+            .unwrap()
+            .expect("目标 Progress 必须取得 revision");
+        let target_before_merge = repositories
+            .progress
+            .get_for_media_item(target_media_item_id)
+            .await
+            .unwrap()
+            .expect("目标 Progress 必须存在");
+
+        let mut source_subject =
+            ComicProgressSubject::new(work_id, edition_id, source_media_item_id, UtcMillis(10));
+        source_subject.authoritative_progress_media_item_id = Some(source_media_item_id);
+        let source_member = active_subject_member(
+            source_subject.id,
+            source_media_item_id,
+            ComicProgressSubjectRelationship::Canonical,
+            10,
+        );
+        source_subject
+            .load_members(vec![source_member.clone()])
+            .unwrap();
+        let mut target_subject =
+            ComicProgressSubject::new(work_id, edition_id, target_media_item_id, UtcMillis(20));
+        target_subject.authoritative_progress_media_item_id = Some(target_media_item_id);
+        let target_member = active_subject_member(
+            target_subject.id,
+            target_media_item_id,
+            ComicProgressSubjectRelationship::Canonical,
+            20,
+        );
+        target_subject
+            .load_members(vec![target_member.clone()])
+            .unwrap();
+
+        let unit_of_work = SqliteUnitOfWork::new(db.clone());
+        unit_of_work
+            .run_comic_progress_subject_write(&subject_write_plan(
+                source_subject.clone(),
+                vec![source_member.clone()],
+            ))
+            .unwrap();
+        unit_of_work
+            .run_comic_progress_subject_write(&subject_write_plan(
+                target_subject.clone(),
+                vec![target_member.clone()],
+            ))
+            .unwrap();
+
+        let mut survivor = source_subject.clone();
+        let survivor_members = vec![
+            active_subject_member(
+                survivor.id,
+                source_media_item_id,
+                ComicProgressSubjectRelationship::Canonical,
+                10,
+            ),
+            active_subject_member(
+                survivor.id,
+                target_media_item_id,
+                ComicProgressSubjectRelationship::Equivalent,
+                20,
+            ),
+        ];
+        survivor.authoritative_progress_media_item_id = Some(target_media_item_id);
+        survivor.load_members(survivor_members.clone()).unwrap();
+        let mut redirected = target_subject.clone();
+        redirected.redirect_to(survivor.id).unwrap();
+        let mut candidate_progress = target_progress.clone();
+        candidate_progress.percentage = Some(0.95);
+        candidate_progress.updated_at = UtcMillis(300);
+
+        let error = unit_of_work
+            .run_comic_progress_subject_merge(&ComicProgressSubjectMergePlan {
+                survivor,
+                survivor_members,
+                redirected_subjects: vec![redirected],
+                expected_subjects: vec![
+                    ComicProgressSubjectMergeExpected {
+                        expected_subject: source_subject.clone(),
+                        expected_members: source_subject.members().to_vec(),
+                    },
+                    ComicProgressSubjectMergeExpected {
+                        expected_subject: target_subject.clone(),
+                        expected_members: target_subject.members().to_vec(),
+                    },
+                ],
+                progress_writes: vec![ComicProgressWriteCandidate {
+                    progress: candidate_progress,
+                    expected_revision: Some("stale-revision".to_owned()),
+                }],
+                migration_snapshot: None,
+            })
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), "COMIC_PROGRESS_REVISION_CONFLICT");
+
+        assert_eq!(
+            repositories
+                .progress_subjects
+                .get(source_subject.id)
+                .await
+                .unwrap(),
+            Some(source_subject.clone())
+        );
+        assert_eq!(
+            repositories
+                .progress_subjects
+                .get(target_subject.id)
+                .await
+                .unwrap(),
+            Some(target_subject.clone())
+        );
+        assert_eq!(
+            repositories
+                .progress_subjects
+                .get_for_media_item(source_media_item_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .subject_id,
+            source_subject.id
+        );
+        assert_eq!(
+            repositories
+                .progress_subjects
+                .get_for_media_item(target_media_item_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .subject_id,
+            target_subject.id
+        );
+        assert_eq!(
+            repositories
+                .progress
+                .get_for_media_item(target_media_item_id)
+                .await
+                .unwrap(),
+            Some(target_before_merge)
+        );
+        assert_eq!(count_rows(&db, "comic_progress_subjects"), 2);
+        assert_eq!(count_rows(&db, "comic_progress_subject_members"), 2);
+        assert_eq!(count_rows(&db, "comic_progress_migration_snapshots"), 0);
+    }
+
+    #[tokio::test]
+    async fn different_remote_chapter_ids_with_authoritative_content_key_share_one_subject() {
+        use haven_application::services::progress::comic_progress_subject::ComicProgressSubjectService;
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repositories = Arc::new(SqliteRepositories::new(db.clone()));
+        let source_media_item_id = MediaItemId::new();
+        let (work_id, edition_id) =
+            seed_real_comic_content(&repositories, "远端章节身份收敛", source_media_item_id).await;
+        let target_media_item_id = add_comic_media_item(&repositories, edition_id, 1.0).await;
+        let source_identity =
+            ChapterSourceIdentity::new("mangadex", "remote-work-a", "remote-chapter-a").unwrap();
+        let target_identity =
+            ChapterSourceIdentity::new("another-source", "remote-work-b", "remote-chapter-b")
+                .unwrap();
+        let metadata = ComicChapterMetadata {
+            chapter_number: Some(1.0),
+            page_count: Some(10),
+            authoritative_content_key: Some("authoritative-content-1".to_owned()),
+            ..ComicChapterMetadata::default()
+        };
+        repositories
+            .chapter_source
+            .save(&chapter_source_ref(
+                source_media_item_id,
+                source_identity.clone(),
+                metadata.clone(),
+            ))
+            .await
+            .unwrap();
+        repositories
+            .chapter_source
+            .save(&chapter_source_ref(
+                target_media_item_id,
+                target_identity.clone(),
+                metadata,
+            ))
+            .await
+            .unwrap();
+
+        let service = ComicProgressSubjectService::new(
+            repositories.clone(),
+            Arc::new(SqliteUnitOfWork::new(db.clone())),
+        );
+        let result = service
+            .reconcile_chapters(source_identity.clone(), target_identity.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.relationship,
+            ComicProgressSubjectRelationship::Equivalent
+        );
+        assert_eq!(
+            result.confidence,
+            haven_domain::comic_identity::MatchConfidence::High
+        );
+        let source_member = repositories
+            .progress_subjects
+            .get_for_media_item(source_media_item_id)
+            .await
+            .unwrap()
+            .expect("源章节必须有 active Subject member");
+        let target_member = repositories
+            .progress_subjects
+            .get_for_media_item(target_media_item_id)
+            .await
+            .unwrap()
+            .expect("不同远端 ID 的目标章节必须有 active Subject member");
+        assert_eq!(source_member.subject_id, result.subject_id);
+        assert_eq!(target_member.subject_id, result.subject_id);
+        let subject = repositories
+            .progress_subjects
+            .get(result.subject_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            subject
+                .members()
+                .iter()
+                .filter(|member| member.state == ComicProgressSubjectMemberState::Active)
+                .count(),
+            2
+        );
+        assert_eq!(count_rows(&db, "comic_progress_subjects"), 1);
+        assert_eq!(count_rows(&db, "comic_progress_subject_members"), 2);
+        assert!(
+            repositories
+                .chapter_source
+                .get(&source_identity)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            repositories
+                .chapter_source
+                .get(&target_identity)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(work_id, subject.work_id);
+    }
+
+    #[tokio::test]
+    async fn metadata_candidate_requires_explicit_best_effort_and_never_becomes_active_subject() {
+        use haven_application::services::comic_progress_migration::{
+            ComicProgressMigrationRequest, ComicProgressMigrationService,
+            ComicProgressMigrationStatus,
+        };
+        use haven_application::services::progress::comic_progress_subject::ComicProgressSubjectService;
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repositories = Arc::new(SqliteRepositories::new(db.clone()));
+        let source_media_item_id = MediaItemId::new();
+        let (work_id, edition_id) =
+            seed_real_comic_content(&repositories, "元数据候选关系", source_media_item_id).await;
+        let target_media_item_id = add_comic_media_item(&repositories, edition_id, 1.0).await;
+        let source_identity =
+            ChapterSourceIdentity::new("source-a", "work-a", "chapter-a").unwrap();
+        let target_identity =
+            ChapterSourceIdentity::new("source-b", "work-b", "chapter-b").unwrap();
+        let metadata = ComicChapterMetadata {
+            chapter_number: Some(1.0),
+            title: Some("第 1 话".to_owned()),
+            page_count: Some(10),
+            ..ComicChapterMetadata::default()
+        };
+        repositories
+            .chapter_source
+            .save(&chapter_source_ref(
+                source_media_item_id,
+                source_identity.clone(),
+                metadata.clone(),
+            ))
+            .await
+            .unwrap();
+        repositories
+            .chapter_source
+            .save(&chapter_source_ref(
+                target_media_item_id,
+                target_identity.clone(),
+                metadata,
+            ))
+            .await
+            .unwrap();
+        ProgressRepository::save_if_revision(
+            &*repositories,
+            &comic_progress(work_id, edition_id, source_media_item_id, 100),
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("源 Progress 必须取得 revision");
+
+        let subjects = ComicProgressSubjectService::new(
+            repositories.clone(),
+            Arc::new(SqliteUnitOfWork::new(db.clone())),
+        );
+        let migration =
+            ComicProgressMigrationService::new(repositories.clone()).with_subject_service(subjects);
+        let suggested = migration
+            .migrate(ComicProgressMigrationRequest {
+                source: source_identity.clone(),
+                target: target_identity.clone(),
+                allow_best_effort: false,
+                allow_target_overwrite: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(suggested.status, ComicProgressMigrationStatus::Suggested);
+        assert!(
+            repositories
+                .progress
+                .get_for_media_item(target_media_item_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repositories
+                .progress_subjects
+                .get_for_media_item(target_media_item_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let source_member = repositories
+            .progress_subjects
+            .get_for_media_item(source_media_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let suggested_subject = repositories
+            .progress_subjects
+            .get(source_member.subject_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(suggested_subject.members().iter().any(|member| {
+            member.media_item_id == target_media_item_id
+                && member.state == ComicProgressSubjectMemberState::Candidate
+                && member.relationship == ComicProgressSubjectRelationship::Candidate
+        }));
+
+        let applied = migration
+            .migrate(ComicProgressMigrationRequest {
+                source: source_identity,
+                target: target_identity,
+                allow_best_effort: true,
+                allow_target_overwrite: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(applied.status, ComicProgressMigrationStatus::Applied);
+        assert_eq!(
+            applied.page_migration.confidence,
+            haven_domain::comic_identity::PageMappingConfidence::Low
+        );
+        assert!(
+            repositories
+                .progress
+                .get_for_media_item(target_media_item_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            repositories
+                .progress_subjects
+                .get_for_media_item(target_media_item_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "最佳努力迁移不能把 Candidate 提升为 active Subject member"
+        );
+    }
+
+    #[tokio::test]
+    async fn known_language_conflict_never_shares_progress_subject() {
+        use haven_application::services::progress::comic_progress_subject::ComicProgressSubjectService;
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let repositories = Arc::new(SqliteRepositories::new(db.clone()));
+        let source_media_item_id = MediaItemId::new();
+        let (_work_id, edition_id) =
+            seed_real_comic_content(&repositories, "版本画像冲突", source_media_item_id).await;
+        let target_media_item_id = add_comic_media_item(&repositories, edition_id, 1.0).await;
+        let source_identity =
+            ChapterSourceIdentity::new("source-a", "work-a", "chapter-a").unwrap();
+        let target_identity =
+            ChapterSourceIdentity::new("source-b", "work-b", "chapter-b").unwrap();
+        let source_metadata = ComicChapterMetadata {
+            edition_profile: EditionProfile {
+                language: IdentityFacet::known("zh-hans"),
+                ..EditionProfile::default()
+            },
+            authoritative_content_key: Some("same-key".to_owned()),
+            ..ComicChapterMetadata::default()
+        };
+        let target_metadata = ComicChapterMetadata {
+            edition_profile: EditionProfile {
+                language: IdentityFacet::known("ja"),
+                ..EditionProfile::default()
+            },
+            authoritative_content_key: Some("same-key".to_owned()),
+            ..ComicChapterMetadata::default()
+        };
+        repositories
+            .chapter_source
+            .save(&chapter_source_ref(
+                source_media_item_id,
+                source_identity.clone(),
+                source_metadata,
+            ))
+            .await
+            .unwrap();
+        repositories
+            .chapter_source
+            .save(&chapter_source_ref(
+                target_media_item_id,
+                target_identity.clone(),
+                target_metadata,
+            ))
+            .await
+            .unwrap();
+        let service = ComicProgressSubjectService::new(
+            repositories.clone(),
+            Arc::new(SqliteUnitOfWork::new(db.clone())),
+        );
+        let error = service
+            .reconcile_chapters(source_identity, target_identity)
+            .await
+            .expect_err("已知语言冲突不能共享 Subject");
+        assert_eq!(error.code().as_str(), "EDITION_CONFLICT");
+        assert_eq!(count_rows(&db, "comic_progress_subjects"), 0);
+        assert_eq!(count_rows(&db, "comic_progress_subject_members"), 0);
     }
 
     fn count_rows(db: &Db, table: &str) -> i64 {
