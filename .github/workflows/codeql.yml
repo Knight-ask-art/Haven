@@ -68,7 +68,7 @@ jobs:
                 javascript=true ;;
             esac
             case "$path" in
-              .github/*|build.ps1|tools/release/*|contracts/ipc/*|前端/app/package.json|前端/app/package-lock.json)
+              .github/*|.gitignore|build.ps1|tools/release/*|contracts/ipc/*|前端/app/package.json|前端/app/package-lock.json)
                 full=true ;;
             esac
           done
