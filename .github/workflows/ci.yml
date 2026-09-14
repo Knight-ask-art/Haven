@@ -79,7 +79,7 @@ jobs:
 
             # Film/TV evidence is tied to the public contract, its checker,
             # and media-specific implementation/fixture paths.
-            if [[ "$lower" =~ (^|/)(film-tv|film_tv|film|video|movie|tv)([/._-]|$) ]] ||
+            if [[ "$lower" =~ (^|/)[^/]*(film-tv|film_tv|film|video|movie|tv)[^/]*(/|$) ]] ||
                [[ "$path" == contracts/film-tv/* ]] ||
                [[ "$path" == tools/film-tv/* ]]; then
               film_tv=true
