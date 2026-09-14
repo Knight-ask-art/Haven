@@ -727,7 +727,7 @@ mod tests {
 
         let json = serde_json::to_string(&subject).unwrap();
         let mut restored: ComicProgressSubject = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.members(), &[member.clone()]);
+        assert_eq!(restored.members(), std::slice::from_ref(&member));
         assert_eq!(
             restored.attach_member(member.clone()),
             Err(ComicProgressSubjectError::DuplicateActiveMember)

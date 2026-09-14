@@ -726,7 +726,7 @@ fn merge_groups(raw: &[RawChapter]) -> Vec<Vec<usize>> {
     groups
 }
 
-fn find(parent: &mut Vec<usize>, index: usize) -> usize {
+fn find(parent: &mut [usize], index: usize) -> usize {
     let mut current = index;
     while parent[current] != current {
         parent[current] = parent[parent[current]];
@@ -735,7 +735,7 @@ fn find(parent: &mut Vec<usize>, index: usize) -> usize {
     current
 }
 
-fn union(parent: &mut Vec<usize>, left: usize, right: usize) {
+fn union(parent: &mut [usize], left: usize, right: usize) {
     let left_root = find(parent, left);
     let right_root = find(parent, right);
     if left_root != right_root {
@@ -1008,9 +1008,7 @@ fn source_summary(source: &ComicChapterAggregateSource) -> ComicChapterSourceSum
 }
 
 fn has_local_readable_resource(facts: &[ComicResourceAvailabilityFact]) -> bool {
-    facts
-        .iter()
-        .any(|fact| resource_fact_allows_local_open(fact))
+    facts.iter().any(resource_fact_allows_local_open)
 }
 
 fn chapter_aggregate_status(
