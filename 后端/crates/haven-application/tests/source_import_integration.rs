@@ -4,11 +4,13 @@
 //! `SourceObject` 身份。它不能偷偷获取正文、创建本地文件或产生 Offline
 //! Resource；只有后续显式 `download_create` 流程才允许落盘。
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use haven_application::services::ports::SourceImportPorts;
+use haven_application::services::comic_catalog::ComicCatalogService;
+use haven_application::services::ports::{FavoriteTxPorts, SourceImportPorts, UnitOfWork};
 use haven_application::services::source_import::{
     ImportedWork, RemoteContentRef, SourceCatalogEntry, SourceCatalogProvider, SourceImportService,
 };
@@ -16,7 +18,8 @@ use haven_application::services::source_registry::SourceRegistryService;
 use haven_common::AppError;
 use haven_common::UtcMillis;
 use haven_domain::comic_catalog::{
-    ComicChapterAvailability, ComicChapterCatalog, ComicChapterCatalogEntry,
+    ComicCatalogRefreshOutcomeStatus, ComicChapterAvailability, ComicChapterCatalog,
+    ComicChapterCatalogEntry,
 };
 use haven_domain::comic_identity::{ChapterSourceIdentity, ComicChapterMetadata};
 use haven_domain::contracts::{
@@ -31,6 +34,7 @@ use haven_infrastructure::Db;
 use haven_infrastructure::db::repos::SqliteRepositories;
 
 const MANGA_ID: &str = "00000000-0000-0000-0000-000000000001";
+const MANGA_ID_2: &str = "00000000-0000-0000-0000-000000000004";
 const MANGA_CHAPTER_ID: &str = "00000000-0000-0000-0000-000000000002";
 const MANGA_CHAPTER_ID_2: &str = "00000000-0000-0000-0000-000000000003";
 const MANGA_REMOTE_ID: &str =
@@ -45,7 +49,87 @@ const M3U_CANDIDATE: &str = "content-candidate-m3u-Fixture%20Stream%01https%3A%2
 struct FakeCatalog {
     detail_calls: Mutex<Vec<(String, String, String)>>,
     comic_catalog: Mutex<Option<ComicChapterCatalog>>,
+    comic_catalogs: Mutex<HashMap<String, ComicChapterCatalog>>,
+    comic_errors: Mutex<HashSet<String>>,
     comic_catalog_calls: Mutex<usize>,
+    detail_includes_comic_catalog: Mutex<bool>,
+}
+
+struct UnavailableRefreshUnitOfWork;
+struct GenerationConflictRefreshUnitOfWork;
+
+impl UnitOfWork for UnavailableRefreshUnitOfWork {
+    fn run_favorite(
+        &self,
+        _f: &dyn Fn(&dyn FavoriteTxPorts) -> Result<(), AppError>,
+    ) -> Result<(), AppError> {
+        Err(AppError::new(
+            "UNUSED_TEST_OPERATION",
+            haven_common::ErrorKind::Internal,
+            "测试替身不执行该操作",
+            false,
+        ))
+    }
+
+    fn run_source_import(
+        &self,
+        _provider: &str,
+        _external_id: &str,
+        _work: &haven_domain::entities::Work,
+        _edition: &Edition,
+        _items: &[MediaItem],
+        _resources: &[haven_domain::entities::Resource],
+    ) -> Result<(), AppError> {
+        Err(AppError::new(
+            "UNUSED_TEST_OPERATION",
+            haven_common::ErrorKind::Internal,
+            "测试替身不执行该操作",
+            false,
+        ))
+    }
+}
+
+impl UnitOfWork for GenerationConflictRefreshUnitOfWork {
+    fn run_favorite(
+        &self,
+        _f: &dyn Fn(&dyn FavoriteTxPorts) -> Result<(), AppError>,
+    ) -> Result<(), AppError> {
+        Err(AppError::new(
+            "UNUSED_TEST_OPERATION",
+            haven_common::ErrorKind::Internal,
+            "测试替身不执行该操作",
+            false,
+        ))
+    }
+
+    fn run_source_import(
+        &self,
+        _provider: &str,
+        _external_id: &str,
+        _work: &haven_domain::entities::Work,
+        _edition: &Edition,
+        _items: &[MediaItem],
+        _resources: &[haven_domain::entities::Resource],
+    ) -> Result<(), AppError> {
+        Err(AppError::new(
+            "UNUSED_TEST_OPERATION",
+            haven_common::ErrorKind::Internal,
+            "测试替身不执行该操作",
+            false,
+        ))
+    }
+
+    fn run_comic_chapter_refresh(
+        &self,
+        _plan: &haven_application::services::ports::ComicChapterRefreshPlan,
+    ) -> Result<(), AppError> {
+        Err(AppError::new(
+            "COMIC_CATALOG_GENERATION_CONFLICT",
+            haven_common::ErrorKind::Conflict,
+            "测试替身模拟并发刷新冲突",
+            false,
+        ))
+    }
 }
 
 impl FakeCatalog {
@@ -61,6 +145,27 @@ impl FakeCatalog {
             .comic_catalog
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(catalog);
+    }
+
+    fn set_comic_catalog_for_work(&self, catalog: ComicChapterCatalog) {
+        self.comic_catalogs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(catalog.remote_work_id.clone(), catalog);
+    }
+
+    fn set_comic_error_for_work(&self, remote_work_id: &str) {
+        self.comic_errors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(remote_work_id.to_owned());
+    }
+
+    fn set_detail_includes_comic_catalog(&self, enabled: bool) {
+        *self
+            .detail_includes_comic_catalog
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = enabled;
     }
 
     fn comic_catalog_count(&self) -> usize {
@@ -108,6 +213,26 @@ impl SourceCatalogProvider for FakeCatalog {
         } else {
             external_id.to_owned()
         };
+        let comic_catalog = if source_id == "mangadex"
+            && *self
+                .detail_includes_comic_catalog
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            self.comic_catalogs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(external_id)
+                .cloned()
+                .or_else(|| {
+                    self.comic_catalog
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone()
+                })
+        } else {
+            None
+        };
         Ok(SourceCatalogEntry {
             external_id: external_id.to_owned(),
             title: format!("测试条目 {external_id}"),
@@ -126,7 +251,7 @@ impl SourceCatalogProvider for FakeCatalog {
                 media_type,
                 mime_type: Some(mime_type.to_owned()),
             }),
-            comic_catalog: None,
+            comic_catalog,
         })
     }
 
@@ -143,6 +268,28 @@ impl SourceCatalogProvider for FakeCatalog {
             .comic_catalog_calls
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+        if self
+            .comic_errors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(external_id)
+        {
+            return Err(AppError::new(
+                "SOURCE_RATE_LIMITED",
+                haven_common::ErrorKind::Network,
+                "测试来源暂时不可用",
+                true,
+            ));
+        }
+        if let Some(catalog) = self
+            .comic_catalogs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(external_id)
+            .cloned()
+        {
+            return Ok(Some(catalog));
+        }
         if let Some(catalog) = self
             .comic_catalog
             .lock()
@@ -175,11 +322,15 @@ impl SourceCatalogProvider for FakeCatalog {
     }
 }
 
-fn manga_catalog(chapters: Vec<(&str, f64)>, truncated: bool) -> ComicChapterCatalog {
+fn manga_catalog_for_work(
+    remote_work_id: &str,
+    chapters: Vec<(&str, f64)>,
+    truncated: bool,
+) -> ComicChapterCatalog {
     let entries: Vec<ComicChapterCatalogEntry> = chapters
         .into_iter()
         .map(|(chapter_id, number)| ComicChapterCatalogEntry {
-            identity: ChapterSourceIdentity::new("mangadex", MANGA_ID, chapter_id).unwrap(),
+            identity: ChapterSourceIdentity::new("mangadex", remote_work_id, chapter_id).unwrap(),
             metadata: ComicChapterMetadata {
                 chapter_number: Some(number),
                 title: Some(format!("第 {number} 话")),
@@ -193,13 +344,17 @@ fn manga_catalog(chapters: Vec<(&str, f64)>, truncated: bool) -> ComicChapterCat
         .collect();
     ComicChapterCatalog::new_with_coverage(
         "mangadex",
-        MANGA_ID,
+        remote_work_id,
         entries.clone(),
         UtcMillis::now(),
         Some(entries.len() as u32),
         truncated,
     )
     .unwrap()
+}
+
+fn manga_catalog(chapters: Vec<(&str, f64)>, truncated: bool) -> ComicChapterCatalog {
+    manga_catalog_for_work(MANGA_ID, chapters, truncated)
 }
 
 struct Fixture {
@@ -230,6 +385,29 @@ fn fixture() -> Fixture {
         repos,
         registry,
         catalog,
+    }
+}
+
+impl Fixture {
+    fn comic_catalog_service(&self) -> ComicCatalogService {
+        self.comic_catalog_service_with_uow(Arc::new(
+            haven_infrastructure::db::uow::SqliteUnitOfWork::new(self.db.clone()),
+        ))
+    }
+
+    fn comic_catalog_service_with_uow(&self, uow: Arc<dyn UnitOfWork>) -> ComicCatalogService {
+        let registered_chapters: Arc<dyn ChapterSourceRepository> = self.repos.clone();
+        let work_ports: Arc<dyn haven_application::services::ports::ComicCatalogWorkPorts> =
+            self.repos.clone();
+        let import_ports: Arc<dyn SourceImportPorts> = self.repos.clone();
+        let registry_ports: Arc<dyn haven_application::services::ports::SourceRegistryPorts> =
+            self.repos.clone();
+        let registry = SourceRegistryService::new(registry_ports);
+        let source_import =
+            SourceImportService::new(import_ports, uow, registry, self.catalog.clone());
+        ComicCatalogService::new(source_import, registered_chapters)
+            .with_work_catalog_ports(work_ports)
+            .with_refresh_receipt_port(self.repos.clone())
     }
 }
 
@@ -611,6 +789,415 @@ async fn truncated_comic_refresh_does_not_mark_omitted_chapters_missing() {
         references[0].availability,
         haven_domain::comic_catalog::ComicChapterSourceStatus::Available
     ));
+}
+
+#[tokio::test]
+async fn work_refresh_keeps_successful_source_when_another_source_fails() {
+    let fixture = fixture();
+    let first = fixture
+        .service
+        .import_content_candidate("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    let second_handle = format!("content-candidate-mangadex-{MANGA_ID_2}");
+    fixture
+        .service
+        .import_candidate_into_work(&second_handle, Some(first.work_id))
+        .await
+        .expect("second MangaDex source should bind to the same Work");
+
+    fixture
+        .catalog
+        .set_comic_catalog_for_work(manga_catalog_for_work(
+            MANGA_ID,
+            vec![(MANGA_CHAPTER_ID, 1.0), (MANGA_CHAPTER_ID_2, 2.0)],
+            false,
+        ));
+    fixture.catalog.set_comic_error_for_work(MANGA_ID_2);
+
+    let result = fixture
+        .comic_catalog_service()
+        .work_catalog_refresh(first.work_id)
+        .await
+        .expect("one source failure must not fail the Work refresh");
+
+    assert_eq!(result.receipts.len(), 2);
+    assert!(
+        result
+            .receipts
+            .iter()
+            .any(|receipt| receipt.remote_work_id == MANGA_ID
+                && receipt.status == ComicCatalogRefreshOutcomeStatus::Succeeded)
+    );
+    assert!(
+        result
+            .receipts
+            .iter()
+            .any(|receipt| receipt.remote_work_id == MANGA_ID_2
+                && receipt.status == ComicCatalogRefreshOutcomeStatus::RefreshFailed)
+    );
+    assert!(result.catalog.chapters.iter().any(|chapter| {
+        chapter
+            .sources
+            .iter()
+            .any(|source| source.identity.remote_work_id == MANGA_ID)
+    }));
+
+    let failed_source_refs = fixture
+        .repos
+        .chapter_source
+        .list_for_source_work("mangadex", MANGA_ID_2)
+        .await
+        .unwrap();
+    assert_eq!(failed_source_refs.len(), 1);
+    assert_eq!(
+        failed_source_refs[0].availability,
+        haven_domain::comic_catalog::ComicChapterSourceStatus::Available,
+        "失败来源必须保留最近一次有效章节状态"
+    );
+    assert!(
+        result.catalog.refresh_status
+            == haven_domain::comic_catalog::ComicWorkCatalogStatus::RefreshFailed
+    );
+}
+
+#[tokio::test]
+async fn work_refresh_scopes_missing_to_the_source_with_a_complete_observation() {
+    let fixture = fixture();
+    let first = fixture
+        .service
+        .import_content_candidate("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    let second_handle = format!("content-candidate-mangadex-{MANGA_ID_2}");
+    fixture
+        .service
+        .import_candidate_into_work(&second_handle, Some(first.work_id))
+        .await
+        .unwrap();
+
+    fixture
+        .catalog
+        .set_comic_catalog_for_work(manga_catalog_for_work(MANGA_ID, vec![], false));
+    fixture.catalog.set_comic_error_for_work(MANGA_ID_2);
+
+    let result = fixture
+        .comic_catalog_service()
+        .work_catalog_refresh(first.work_id)
+        .await
+        .unwrap();
+
+    let complete_source_chapter = result
+        .catalog
+        .chapters
+        .iter()
+        .find(|chapter| {
+            chapter
+                .sources
+                .iter()
+                .any(|source| source.identity.remote_work_id == MANGA_ID)
+        })
+        .expect("complete source chapter should remain visible");
+    assert_eq!(
+        complete_source_chapter.status,
+        haven_domain::comic_catalog::ComicChapterAggregateStatus::Missing,
+        "one failed source must not erase another source's complete Missing observation"
+    );
+}
+
+#[tokio::test]
+async fn work_refresh_propagates_internal_refresh_transaction_failure() {
+    let fixture = fixture();
+    let imported = fixture
+        .service
+        .import_content_candidate("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    let before_receipts = fixture
+        .repos
+        .catalog_refresh_outcomes
+        .list_by_work(imported.work_id)
+        .await
+        .unwrap();
+
+    let error = fixture
+        .comic_catalog_service_with_uow(Arc::new(UnavailableRefreshUnitOfWork))
+        .work_catalog_refresh(imported.work_id)
+        .await
+        .expect_err("an unavailable refresh transaction is an internal failure");
+    assert_eq!(error.code().as_str(), "COMIC_REFRESH_UOW_UNAVAILABLE");
+    assert_eq!(
+        fixture
+            .repos
+            .catalog_refresh_outcomes
+            .list_by_work(imported.work_id)
+            .await
+            .unwrap(),
+        before_receipts,
+        "internal refresh failures must not be converted into source outage Receipts"
+    );
+}
+
+#[tokio::test]
+async fn work_refresh_generation_conflict_does_not_create_failure_receipt() {
+    let fixture = fixture();
+    let imported = fixture
+        .service
+        .import_content_candidate("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    let before_receipts = fixture
+        .repos
+        .catalog_refresh_outcomes
+        .list_by_work(imported.work_id)
+        .await
+        .unwrap();
+
+    let result = fixture
+        .comic_catalog_service_with_uow(Arc::new(GenerationConflictRefreshUnitOfWork))
+        .work_catalog_refresh(imported.work_id)
+        .await
+        .expect("a concurrent refresh winner must not turn the loser into a source failure");
+
+    assert_eq!(
+        fixture
+            .repos
+            .catalog_refresh_outcomes
+            .list_by_work(imported.work_id)
+            .await
+            .unwrap(),
+        before_receipts,
+        "generation conflict must not append a RefreshFailed Receipt"
+    );
+    assert_eq!(result.receipts, before_receipts);
+    assert!(
+        result
+            .receipts
+            .iter()
+            .all(|receipt| receipt.status != ComicCatalogRefreshOutcomeStatus::RefreshFailed)
+    );
+    assert_eq!(
+        result.catalog.refresh_status,
+        haven_domain::comic_catalog::ComicWorkCatalogStatus::Synced
+    );
+}
+
+#[tokio::test]
+async fn work_refresh_complete_observation_marks_omitted_chapter_missing() {
+    let fixture = fixture();
+    let imported = fixture
+        .service
+        .import_content_candidate("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    fixture
+        .catalog
+        .set_comic_catalog(manga_catalog(vec![], false));
+
+    let result = fixture
+        .comic_catalog_service()
+        .work_catalog_refresh(imported.work_id)
+        .await
+        .unwrap();
+
+    let references = fixture
+        .repos
+        .chapter_source
+        .list_for_source_work("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    assert_eq!(references.len(), 1);
+    assert_eq!(
+        references[0].availability,
+        haven_domain::comic_catalog::ComicChapterSourceStatus::Missing
+    );
+    assert_eq!(
+        result.receipts[0].status,
+        ComicCatalogRefreshOutcomeStatus::Succeeded
+    );
+}
+
+#[tokio::test]
+async fn work_refresh_truncated_observation_keeps_omitted_chapter_available() {
+    let fixture = fixture();
+    let imported = fixture
+        .service
+        .import_content_candidate("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    fixture
+        .catalog
+        .set_comic_catalog(manga_catalog(vec![], true));
+
+    let result = fixture
+        .comic_catalog_service()
+        .work_catalog_refresh(imported.work_id)
+        .await
+        .unwrap();
+
+    let references = fixture
+        .repos
+        .chapter_source
+        .list_for_source_work("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    assert_eq!(references.len(), 1);
+    assert_eq!(
+        references[0].availability,
+        haven_domain::comic_catalog::ComicChapterSourceStatus::Available
+    );
+    assert_eq!(
+        result.receipts[0].status,
+        ComicCatalogRefreshOutcomeStatus::Truncated
+    );
+    assert!(result.receipts[0].truncated);
+}
+
+#[tokio::test]
+async fn binding_existing_source_is_idempotent_without_refetching() {
+    let fixture = fixture();
+    let imported = fixture
+        .service
+        .import_content_candidate("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    let detail_calls = fixture.catalog.detail_count();
+    let catalog_calls = fixture.catalog.comic_catalog_count();
+    let handle = format!("content-candidate-mangadex-{MANGA_ID}");
+
+    let repeated = fixture
+        .service
+        .import_candidate_into_work(&handle, Some(imported.work_id))
+        .await
+        .unwrap();
+
+    assert_eq!(repeated, imported);
+    assert_eq!(fixture.catalog.detail_count(), detail_calls);
+    assert_eq!(fixture.catalog.comic_catalog_count(), catalog_calls);
+    assert_eq!(table_count(&fixture.db, "works"), 1);
+    assert_eq!(table_count(&fixture.db, "work_source_refs"), 1);
+}
+
+#[tokio::test]
+async fn binding_failure_does_not_leave_a_receipt_for_an_unbound_source() {
+    let fixture = fixture();
+    let first = fixture
+        .service
+        .import_content_candidate("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    fixture.catalog.set_comic_error_for_work(MANGA_ID_2);
+
+    let handle = format!("content-candidate-mangadex-{MANGA_ID_2}");
+    let error = fixture
+        .service
+        .import_candidate_into_work(&handle, Some(first.work_id))
+        .await
+        .expect_err("a failed first observation must not bind the source");
+    assert_eq!(error.code().as_str(), "SOURCE_RATE_LIMITED");
+    assert_eq!(
+        fixture
+            .repos
+            .id_for_source_ref("mangadex", MANGA_ID_2)
+            .await
+            .unwrap(),
+        None
+    );
+
+    let receipts = fixture
+        .repos
+        .catalog_refresh_outcomes
+        .list_by_work(first.work_id)
+        .await
+        .unwrap();
+    assert!(
+        receipts
+            .iter()
+            .all(|receipt| receipt.remote_work_id != MANGA_ID_2),
+        "a source must be bound before its RefreshFailed Receipt can enter the Work"
+    );
+}
+
+#[tokio::test]
+async fn binding_reuses_a_catalog_embedded_in_the_detail_response() {
+    let fixture = fixture();
+    let first = fixture
+        .service
+        .import_content_candidate("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    fixture
+        .catalog
+        .set_comic_catalog_for_work(manga_catalog_for_work(
+            MANGA_ID_2,
+            vec![(MANGA_CHAPTER_ID_2, 2.0)],
+            false,
+        ));
+    fixture.catalog.set_detail_includes_comic_catalog(true);
+    let detail_calls = fixture.catalog.detail_count();
+    let comic_catalog_calls = fixture.catalog.comic_catalog_count();
+
+    fixture
+        .service
+        .import_candidate_into_work(
+            &format!("content-candidate-mangadex-{MANGA_ID_2}"),
+            Some(first.work_id),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(fixture.catalog.detail_count(), detail_calls + 1);
+    assert_eq!(
+        fixture.catalog.comic_catalog_count(),
+        comic_catalog_calls,
+        "the target binding must reuse the catalog returned by MangaDex detail"
+    );
+}
+
+#[tokio::test]
+async fn binding_source_already_owned_by_other_work_returns_conflict_without_mutation() {
+    let fixture = fixture();
+    let first = fixture
+        .service
+        .import_content_candidate("mangadex", MANGA_ID)
+        .await
+        .unwrap();
+    let second = fixture
+        .service
+        .import_content_candidate("mangadex", MANGA_ID_2)
+        .await
+        .unwrap();
+    let before_works = table_count(&fixture.db, "works");
+    let before_refs = table_count(&fixture.db, "work_source_refs");
+    let handle = format!("content-candidate-mangadex-{MANGA_ID}");
+
+    let error = fixture
+        .service
+        .import_candidate_into_work(&handle, Some(second.work_id))
+        .await
+        .expect_err("a source identity cannot move to a second Work");
+
+    assert_eq!(error.code().as_str(), "SOURCE_REF_CONFLICT");
+    assert_eq!(
+        fixture
+            .repos
+            .id_for_source_ref("mangadex", MANGA_ID)
+            .await
+            .unwrap(),
+        Some(first.work_id)
+    );
+    assert_eq!(table_count(&fixture.db, "works"), before_works);
+    assert_eq!(table_count(&fixture.db, "work_source_refs"), before_refs);
+    assert_eq!(
+        fixture
+            .repos
+            .list_by_work(second.work_id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "冲突绑定不得向目标 Work 写入新版本"
+    );
 }
 
 #[tokio::test]

@@ -172,6 +172,16 @@ define_commands!(
         commands::comic::comic_page_manifest_get
     ),
     (
+        "comic_work_chapter_catalog_get",
+        "allow-comic-work-chapter-catalog-get",
+        commands::comic::comic_work_chapter_catalog_get
+    ),
+    (
+        "comic_work_chapter_catalog_refresh",
+        "allow-comic-work-chapter-catalog-refresh",
+        commands::comic::comic_work_chapter_catalog_refresh
+    ),
+    (
         "comic_chapter_catalog_get",
         "allow-comic-chapter-catalog-get",
         commands::comic::comic_chapter_catalog_get

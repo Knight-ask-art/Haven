@@ -3,6 +3,7 @@
 
 pub mod comic_catalog;
 pub mod comic_identity;
+pub mod comic_progress_subject;
 pub mod contracts;
 pub mod credential;
 pub mod entities;
@@ -13,6 +14,7 @@ pub mod settings;
 
 pub use comic_catalog::*;
 pub use comic_identity::*;
+pub use comic_progress_subject::*;
 pub use contracts::*;
 pub use credential::*;
 pub use entities::*;

@@ -66,6 +66,7 @@ import type {
   ComicChapterSourceCandidatesGetRequestDto,
   ComicChapterSourceCandidatesDto,
   ComicProgressMigrationRequestDto,
+  ComicProgressMigrationReceiptDto,
   ComicProgressMigrationResultDto,
   ComicPageProgressRemapRequestDto,
   ComicProgressMigrationRevertRequestDto,
@@ -179,6 +180,28 @@ import { HavenError } from "./errors.js";
 
 const RESOURCE_FIXTURE_MEDIA_ITEM_ID = "0196f0d2-0000-7000-8000-000000000000";
 const MEDIA_ITEM_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const MOCK_COMIC_NO_SOURCE_PROGRESS_RECEIPT: ComicProgressMigrationReceiptDto = {
+  migrationId: "0196f0d2-0000-7000-8000-00000000c001",
+  sourceMediaItemId: RESOURCE_FIXTURE_MEDIA_ITEM_ID,
+  targetMediaItemId: RESOURCE_FIXTURE_MEDIA_ITEM_ID,
+  strategy: "no_target",
+  confidence: "low",
+  evidence: [],
+  sourceProgressSnapshot: null,
+  targetProgressBefore: null,
+  targetProgressAfter: null,
+  pageMapping: {
+    targetPageIndex: null,
+    confidence: "low",
+    strategy: "no_target",
+    reversible: true,
+  },
+  algorithmVersion: "comic-progress/v2",
+  createdAt: "2026-01-01T00:00:00.000Z",
+  undoable: false,
+  appliedRevision: null,
+};
 
 // Browser-only demo content. Production receives an opaque haven-resource URI from Tauri.
 const DEMO_SESSION_CONTENT: Record<string, string> = {
@@ -578,6 +601,7 @@ export class MockHavenClient implements HavenClient {
       },
       snapshotId: null,
       appliedRevision: null,
+      receipt: MOCK_COMIC_NO_SOURCE_PROGRESS_RECEIPT,
     };
   }
 
@@ -595,6 +619,7 @@ export class MockHavenClient implements HavenClient {
       },
       snapshotId: null,
       appliedRevision: null,
+      receipt: MOCK_COMIC_NO_SOURCE_PROGRESS_RECEIPT,
     };
   }
 

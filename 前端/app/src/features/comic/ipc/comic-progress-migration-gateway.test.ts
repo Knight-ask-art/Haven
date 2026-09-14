@@ -3,6 +3,7 @@ import type { HavenClient } from "@/lib/ipc/client"
 import { HavenError } from "@/lib/ipc/errors"
 import type {
   ComicPageProgressRemapRequestDto,
+  ComicProgressMigrationReceiptDto,
   ComicProgressMigrationRequestDto,
   ComicProgressMigrationResultDto,
   ComicProgressMigrationRevertResultDto,
@@ -36,25 +37,85 @@ const remapRequest: ComicPageProgressRemapRequestDto = {
   expectedRevision: "123",
 }
 
+const migrationEvidence = [
+  { kind: "edition_compatible", matched: null },
+  { kind: "partial_page_identity", matched: 1 },
+] as const
+
+const appliedPageMigration = {
+  targetPageIndex: 1,
+  confidence: "medium",
+  strategy: "nearest_surviving_page",
+  reversible: true,
+} as const
+
+const appliedReceipt: ComicProgressMigrationReceiptDto = {
+  migrationId: "dddddddd-dddd-4ddd-8000-dddddddddddd",
+  sourceMediaItemId: "source-media-1",
+  targetMediaItemId: "target-media-1",
+  strategy: "nearest_surviving_page",
+  confidence: "medium",
+  evidence: [...migrationEvidence],
+  sourceProgressSnapshot: {
+    mediaItemId: "source-media-1",
+    pageIndex: 1,
+    pageProgression: 0.5,
+    completion: "in_progress",
+    percentage: 0.5,
+    revision: "123",
+    updatedAt: "2026-09-12T00:00:00.000Z",
+  },
+  targetProgressBefore: null,
+  targetProgressAfter: {
+    mediaItemId: "target-media-1",
+    pageIndex: 1,
+    pageProgression: 0.5,
+    completion: "in_progress",
+    percentage: 0.5,
+    revision: "456",
+    updatedAt: "2026-09-12T00:00:00.000Z",
+  },
+  pageMapping: { ...appliedPageMigration },
+  algorithmVersion: "comic-progress/v2",
+  createdAt: "2026-09-12T00:00:00.000Z",
+  undoable: true,
+  appliedRevision: "456",
+}
+
 const appliedResult: ComicProgressMigrationResultDto = {
   status: "applied",
   matchResult: {
     kind: "same_logical_chapter_variant",
     confidence: "medium",
     progressMigration: "one_time",
-    evidence: [
-      { kind: "edition_compatible", matched: null },
-      { kind: "partial_page_identity", matched: 1 },
-    ],
+    evidence: [...migrationEvidence],
   },
-  pageMigration: {
-    targetPageIndex: 1,
-    confidence: "medium",
-    strategy: "nearest_surviving_page",
-    reversible: true,
-  },
+  pageMigration: { ...appliedPageMigration },
   snapshotId: "dddddddd-dddd-4ddd-8000-dddddddddddd",
   appliedRevision: "456",
+  receipt: appliedReceipt,
+}
+
+const noProgressReceipt: ComicProgressMigrationReceiptDto = {
+  migrationId: "eeeeeeee-eeee-4eee-8000-eeeeeeeeeeee",
+  sourceMediaItemId: "source-media-1",
+  targetMediaItemId: "target-media-1",
+  strategy: "no_target",
+  confidence: "low",
+  evidence: [],
+  sourceProgressSnapshot: null,
+  targetProgressBefore: null,
+  targetProgressAfter: null,
+  pageMapping: {
+    targetPageIndex: null,
+    confidence: "low",
+    strategy: "no_target",
+    reversible: true,
+  },
+  algorithmVersion: "comic-progress/v2",
+  createdAt: "2026-09-12T00:00:00.000Z",
+  undoable: false,
+  appliedRevision: null,
 }
 
 const noProgressResult: ComicProgressMigrationResultDto = {
@@ -68,6 +129,7 @@ const noProgressResult: ComicProgressMigrationResultDto = {
   },
   snapshotId: null,
   appliedRevision: null,
+  receipt: noProgressReceipt,
 }
 
 const nonAppliedStatuses: Array<ComicProgressMigrationResultDto["status"]> = [

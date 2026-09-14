@@ -12,23 +12,26 @@ use async_trait::async_trait;
 use haven_common::network::{HttpUrlPolicy, parse_http_url};
 use haven_common::{AppError, ErrorKind, UtcMillis};
 use haven_domain::comic_catalog::{
-    ComicChapterAvailability, ComicChapterCatalog, ComicChapterCatalogEntry,
-    ComicChapterCatalogState, ComicChapterSourceStatus,
+    ComicCatalogRefreshOutcomeStatus, ComicCatalogRefreshReceipt, ComicChapterAvailability,
+    ComicChapterCatalog, ComicChapterCatalogEntry, ComicChapterCatalogState,
+    ComicChapterSourceStatus,
 };
 use haven_domain::comic_identity::{
     ChapterSourceIdentity, ChapterSourceRef, ColorMode, EditionProfile, IdentityFacet,
     ScanGroupFacet, edition_profiles_can_share_container,
 };
 use haven_domain::contracts::{
-    ChapterSourceRepository, EditionProfileRepository, EditionRepository, MediaItemRepository,
-    ResourceRepository, WorkRepository,
+    ChapterSourceRepository, ComicCatalogRefreshOutcomeRepository, EditionProfileRepository,
+    EditionRepository, MediaItemRepository, ResourceRepository, WorkRepository,
 };
 use haven_domain::entities::{Edition, MediaIndex, MediaItem, Resource, ResourceLocator, Work};
 use haven_domain::enums::{
     Availability, AvailabilitySource, MediaItemStatus, MediaType, ResourceType, WorkStatus,
     WorkType,
 };
-use haven_domain::ids::{EditionId, MediaItemId, ResourceId, SourceId, WorkId};
+use haven_domain::ids::{
+    ComicCatalogRefreshId, EditionId, MediaItemId, ResourceId, SourceId, WorkId,
+};
 use uuid::Uuid;
 
 use crate::services::ports::{
@@ -423,6 +426,91 @@ impl SourceImportService {
         ))
     }
 
+    /// Import an opaque source candidate into an existing local Work.
+    ///
+    /// The target form is intentionally narrower than [`Self::import_candidate`]:
+    /// only a MangaDex content candidate can add chapters to an existing comic
+    /// Work. The candidate is decoded and validated here, so a caller cannot
+    /// turn this method into an arbitrary remote-id or URL router.
+    pub async fn import_candidate_into_work(
+        &self,
+        candidate_handle: &str,
+        target_work_id: Option<WorkId>,
+    ) -> Result<ImportedWork, AppError> {
+        let Some(target_work_id) = target_work_id else {
+            return self.import_candidate(candidate_handle).await;
+        };
+
+        let target_work = WorkRepository::get(&*self.ports, target_work_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::new(
+                    "WORK_NOT_FOUND",
+                    ErrorKind::NotFound,
+                    "目标漫画作品不存在",
+                    false,
+                )
+            })?;
+        let has_comic_edition = EditionRepository::list_by_work(&*self.ports, target_work.id)
+            .await?
+            .into_iter()
+            .any(|edition| edition.edition_type == MediaType::Comic);
+        if !has_comic_edition {
+            return Err(AppError::new(
+                "WORK_NOT_COMIC",
+                ErrorKind::Validation,
+                "目标作品没有漫画版本",
+                false,
+            ));
+        }
+
+        let remote_work_id = decode_mangadex_content_candidate(candidate_handle)?;
+        if let Some(bound_work_id) =
+            WorkRepository::id_for_source_ref(&*self.ports, "mangadex", &remote_work_id).await?
+        {
+            if bound_work_id != target_work.id {
+                return Err(AppError::new(
+                    "SOURCE_REF_CONFLICT",
+                    ErrorKind::Conflict,
+                    "来源作品已经绑定其他 Work",
+                    false,
+                ));
+            }
+            return self.existing_comic_identity(target_work.id).await;
+        }
+
+        // Resolve the candidate through the allowlisted MangaDex provider
+        // before attaching it. This validates the provider-owned remote
+        // identity without exposing its URL or request channels to the caller.
+        let entry = self.catalog.detail("mangadex", "", &remote_work_id).await?;
+        let remote = entry.remote.as_ref().ok_or_else(|| {
+            AppError::new(
+                "SOURCE_UNAVAILABLE",
+                ErrorKind::Network,
+                "该来源暂时没有可用的远端漫画身份",
+                true,
+            )
+        })?;
+        if remote.source_key != "mangadex" || remote.media_type != MediaType::Comic {
+            return Err(AppError::new(
+                "SOURCE_UNAVAILABLE",
+                ErrorKind::Network,
+                "来源远端身份无效",
+                true,
+            ));
+        }
+
+        self.refresh_comic_chapter_catalog_for_work_with_catalog(
+            target_work.id,
+            "mangadex",
+            &remote_work_id,
+            entry.comic_catalog.clone(),
+            false,
+        )
+        .await?;
+        self.existing_comic_identity(target_work.id).await
+    }
+
     /// 导入固定在线正文来源。
     ///
     /// 这里严格只登记元数据和 `SourceObject` 远端身份，不获取正文、不创建
@@ -523,13 +611,71 @@ impl SourceImportService {
                     false,
                 )
             })?;
+        self.refresh_comic_chapter_catalog_for_work(work_id, source_id, remote_work_id)
+            .await
+    }
+
+    /// Refresh one source already attached to, or being attached to, a local
+    /// Work. The source reference check is deliberately repeated here so a
+    /// caller cannot redirect an existing provider identity to another Work.
+    pub async fn refresh_comic_chapter_catalog_for_work(
+        &self,
+        work_id: WorkId,
+        source_id: &str,
+        remote_work_id: &str,
+    ) -> Result<ComicChapterCatalog, AppError> {
+        self.refresh_comic_chapter_catalog_for_work_with_catalog(
+            work_id,
+            source_id,
+            remote_work_id,
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Refresh one source with an optional provider response already fetched by
+    /// the caller.  Binding a candidate uses this path so a MangaDex detail
+    /// response's embedded catalog is not fetched a second time.  The
+    /// `record_failure` switch is false for a not-yet-bound source: until the
+    /// source reference is committed, a failed observation must not create a
+    /// Work-level Receipt for a source that does not belong to that Work.
+    async fn refresh_comic_chapter_catalog_for_work_with_catalog(
+        &self,
+        work_id: WorkId,
+        source_id: &str,
+        remote_work_id: &str,
+        prefetched_catalog: Option<ComicChapterCatalog>,
+        record_failure: bool,
+    ) -> Result<ComicChapterCatalog, AppError> {
+        if source_id != "mangadex" {
+            return Err(AppError::new(
+                "SOURCE_CATALOG_UNSUPPORTED",
+                ErrorKind::Unsupported,
+                "该来源暂不支持漫画章节目录",
+                false,
+            ));
+        }
+        validate_remote_candidate_id(source_id, remote_work_id)?;
+        if let Some(bound_work_id) =
+            WorkRepository::id_for_source_ref(&*self.ports, source_id, remote_work_id).await?
+        {
+            if bound_work_id != work_id {
+                return Err(AppError::new(
+                    "SOURCE_REF_CONFLICT",
+                    ErrorKind::Conflict,
+                    "来源作品已经绑定其他 Work",
+                    false,
+                ));
+            }
+        }
         let work = WorkRepository::get(&*self.ports, work_id)
             .await?
             .ok_or_else(|| {
                 AppError::new(
                     "WORK_NOT_FOUND",
                     ErrorKind::NotFound,
-                    "来源作品不存在",
+                    "目标作品不存在",
                     false,
                 )
             })?;
@@ -539,9 +685,48 @@ impl SourceImportService {
             .as_ref()
             .map(|state| state.generation)
             .unwrap_or(0);
-        let catalog = self
-            .comic_chapter_catalog(source_id, remote_work_id)
+        let result = self
+            .refresh_comic_chapter_catalog_inner(
+                work_id,
+                source_id,
+                remote_work_id,
+                work,
+                expected_generation,
+                prefetched_catalog,
+            )
+            .await;
+        if record_failure
+            && let Err(error) = &result
+            && is_recordable_comic_refresh_failure(error)
+        {
+            self.persist_refresh_failure(
+                work_id,
+                source_id,
+                remote_work_id,
+                expected_generation,
+                error,
+            )
             .await?;
+        }
+        result
+    }
+
+    async fn refresh_comic_chapter_catalog_inner(
+        &self,
+        work_id: WorkId,
+        source_id: &str,
+        remote_work_id: &str,
+        work: Work,
+        expected_generation: u64,
+        prefetched_catalog: Option<ComicChapterCatalog>,
+    ) -> Result<ComicChapterCatalog, AppError> {
+        let catalog = match prefetched_catalog {
+            Some(catalog) => catalog,
+            None => {
+                self.comic_chapter_catalog(source_id, remote_work_id)
+                    .await?
+            }
+        };
         ensure_catalog_identity(&catalog, source_id, remote_work_id)?;
         let next_generation = expected_generation.checked_add(1).ok_or_else(|| {
             AppError::new(
@@ -744,6 +929,14 @@ impl SourceImportService {
         resources.sort_by_key(|resource| resource.id.to_string());
         let mut refreshed_work = work;
         refreshed_work.updated_at = catalog.fetched_at;
+        let refresh_receipt = Some(success_refresh_receipt(
+            work_id,
+            source_id,
+            remote_work_id,
+            expected_generation,
+            next_generation,
+            &catalog,
+        ));
         let plan = ComicChapterRefreshPlan {
             source_key: source_id.to_owned(),
             remote_work_id: remote_work_id.to_owned(),
@@ -761,6 +954,7 @@ impl SourceImportService {
             items,
             resources,
             chapter_refs,
+            refresh_receipt,
         };
         self.uow.run_comic_chapter_refresh(&plan)?;
         Ok(catalog)
@@ -1352,6 +1546,53 @@ impl SourceImportService {
             None => Ok(None),
         }
     }
+
+    /// Read all persisted refresh observations for a Work. The catalog service
+    /// uses this after a multi-source refresh to return the latest receipt for
+    /// each source, even when its optional read port was not wired separately.
+    pub async fn comic_catalog_refresh_receipts(
+        &self,
+        work_id: WorkId,
+    ) -> Result<Vec<ComicCatalogRefreshReceipt>, AppError> {
+        ComicCatalogRefreshOutcomeRepository::list_by_work(&*self.ports, work_id).await
+    }
+
+    async fn persist_refresh_failure(
+        &self,
+        work_id: WorkId,
+        source_id: &str,
+        remote_work_id: &str,
+        expected_generation: u64,
+        error: &AppError,
+    ) -> Result<(), AppError> {
+        let receipt = ComicCatalogRefreshReceipt {
+            id: ComicCatalogRefreshId::new(),
+            work_id,
+            source_key: source_id.to_owned(),
+            remote_work_id: remote_work_id.to_owned(),
+            status: ComicCatalogRefreshOutcomeStatus::RefreshFailed,
+            generation_before: expected_generation,
+            generation_after: None,
+            observed_from: None,
+            observed_to: None,
+            truncated: false,
+            retained_previous_catalog: true,
+            error_code: Some(stable_refresh_error_code(error)),
+            observed_at: UtcMillis::now(),
+        };
+        ComicCatalogRefreshOutcomeRepository::save(&*self.ports, &receipt)
+            .await
+            .map_err(|persist_error| {
+                AppError::new(
+                    "COMIC_REFRESH_RECEIPT_PERSIST_FAILED",
+                    ErrorKind::Database,
+                    "漫画目录刷新失败结果无法保存",
+                    true,
+                )
+                .with_source(persist_error)
+            })
+    }
+
     async fn existing_identity(&self, work_id: WorkId) -> Result<ImportedWork, AppError> {
         let editions = EditionRepository::list_by_work(&*self.ports, work_id).await?;
         for edition in editions {
@@ -1367,6 +1608,31 @@ impl SourceImportService {
             "DATABASE_ERROR",
             ErrorKind::Database,
             "来源引用指向的作品缺少可消费单元",
+            true,
+        ))
+    }
+
+    async fn existing_comic_identity(&self, work_id: WorkId) -> Result<ImportedWork, AppError> {
+        let editions = EditionRepository::list_by_work(&*self.ports, work_id).await?;
+        for edition in editions {
+            if edition.edition_type != MediaType::Comic {
+                continue;
+            }
+            let items = MediaItemRepository::list_by_edition(&*self.ports, edition.id).await?;
+            if let Some(item) = items
+                .into_iter()
+                .find(|item| item.media_type == MediaType::Comic)
+            {
+                return Ok(ImportedWork {
+                    work_id,
+                    media_item_id: item.id,
+                });
+            }
+        }
+        Err(AppError::new(
+            "DATABASE_ERROR",
+            ErrorKind::Database,
+            "漫画来源引用指向的作品缺少可消费章节",
             true,
         ))
     }
@@ -1395,6 +1661,100 @@ fn ensure_catalog_identity(
         "来源章节目录身份与请求不一致",
         true,
     ))
+}
+
+fn success_refresh_receipt(
+    work_id: WorkId,
+    source_id: &str,
+    remote_work_id: &str,
+    generation_before: u64,
+    generation_after: u64,
+    catalog: &ComicChapterCatalog,
+) -> ComicCatalogRefreshReceipt {
+    let status = catalog_refresh_status(catalog);
+    ComicCatalogRefreshReceipt {
+        id: ComicCatalogRefreshId::new(),
+        work_id,
+        source_key: source_id.to_owned(),
+        remote_work_id: remote_work_id.to_owned(),
+        status,
+        generation_before,
+        generation_after: Some(generation_after),
+        observed_from: catalog
+            .chapters
+            .first()
+            .map(|chapter| chapter.identity.remote_chapter_id.clone()),
+        observed_to: catalog
+            .chapters
+            .last()
+            .map(|chapter| chapter.identity.remote_chapter_id.clone()),
+        truncated: catalog.truncated,
+        retained_previous_catalog: catalog.truncated
+            || status != ComicCatalogRefreshOutcomeStatus::Succeeded,
+        error_code: None,
+        observed_at: catalog.fetched_at,
+    }
+}
+
+fn catalog_refresh_status(catalog: &ComicChapterCatalog) -> ComicCatalogRefreshOutcomeStatus {
+    if catalog.truncated {
+        return ComicCatalogRefreshOutcomeStatus::Truncated;
+    }
+    let Some(first) = catalog.chapters.first() else {
+        return ComicCatalogRefreshOutcomeStatus::Succeeded;
+    };
+    if catalog
+        .chapters
+        .iter()
+        .all(|chapter| chapter.availability == ComicChapterAvailability::ExternalOnly)
+    {
+        ComicCatalogRefreshOutcomeStatus::ExternalOnly
+    } else if catalog
+        .chapters
+        .iter()
+        .all(|chapter| chapter.availability == ComicChapterAvailability::TemporarilyUnavailable)
+    {
+        ComicCatalogRefreshOutcomeStatus::TemporarilyUnavailable
+    } else if catalog
+        .chapters
+        .iter()
+        .all(|chapter| chapter.availability == ComicChapterAvailability::Unknown)
+    {
+        ComicCatalogRefreshOutcomeStatus::Unknown
+    } else if first.availability == ComicChapterAvailability::Available {
+        ComicCatalogRefreshOutcomeStatus::Succeeded
+    } else {
+        // A mixed catalog is still a successful directory observation; the
+        // per-chapter availability carries the finer-grained state.
+        ComicCatalogRefreshOutcomeStatus::Succeeded
+    }
+}
+
+fn stable_refresh_error_code(error: &AppError) -> String {
+    let code = error.code().as_str();
+    if !code.is_empty()
+        && code.len() <= 128
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        code.to_owned()
+    } else {
+        "COMIC_REFRESH_FAILED".to_owned()
+    }
+}
+
+/// Only errors that describe the remote source observation itself may be
+/// converted into a source-level RefreshFailed Receipt.  Database, UoW,
+/// validation, security and generation-conflict failures are
+/// application/infrastructure or concurrency outcomes; recording them as an
+/// ordinary source outage would hide a broken write path or mask a newer
+/// successful Receipt.
+pub(crate) fn is_recordable_comic_refresh_failure(error: &AppError) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::Network | ErrorKind::Timeout | ErrorKind::Parse | ErrorKind::Source
+    )
 }
 
 fn new_comic_work(
@@ -1629,6 +1989,8 @@ fn new_comic_catalog_plan(
 
     let first_media_item_id =
         first_media_item_id.ok_or_else(|| source_unavailable("来源作品没有可阅读章节"))?;
+    let refresh_receipt =
+        success_refresh_receipt(work.id, source_key, remote_work_id, 0, 1, &catalog);
     Ok((
         ComicChapterRefreshPlan {
             source_key: source_key.to_owned(),
@@ -1647,6 +2009,7 @@ fn new_comic_catalog_plan(
             items,
             resources,
             chapter_refs,
+            refresh_receipt: Some(refresh_receipt),
         },
         first_media_item_id,
     ))
@@ -1993,6 +2356,32 @@ fn decode_candidate_component(value: &str) -> Result<String, AppError> {
         ));
     }
     Ok(value)
+}
+
+fn decode_mangadex_content_candidate(handle: &str) -> Result<String, AppError> {
+    let handle = handle.trim();
+    let Some(rest) = handle.strip_prefix(CONTENT_CANDIDATE_PREFIX) else {
+        return Err(AppError::new(
+            "SOURCE_IMPORT_UNSUPPORTED",
+            ErrorKind::Unsupported,
+            "绑定导入只支持 MangaDex 漫画候选",
+            false,
+        ));
+    };
+    let Some((source_id, encoded_external_id)) = rest.split_once('-') else {
+        return Err(invalid_remote_candidate_id());
+    };
+    if source_id != "mangadex" {
+        return Err(AppError::new(
+            "SOURCE_IMPORT_UNSUPPORTED",
+            ErrorKind::Unsupported,
+            "绑定导入只支持 MangaDex 漫画候选",
+            false,
+        ));
+    }
+    let external_id = decode_candidate_component(encoded_external_id)?;
+    validate_remote_candidate_id(source_id, &external_id)?;
+    Ok(external_id)
 }
 
 fn hex_value(value: u8) -> Option<u8> {

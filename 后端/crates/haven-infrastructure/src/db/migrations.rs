@@ -157,6 +157,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "036_comic_chapter_profile_observation",
         include_str!("../../../../migrations/036_comic_chapter_profile_observation.sql"),
     ),
+    (
+        "037_comic_progress_subjects",
+        include_str!("../../../../migrations/037_comic_progress_subjects.sql"),
+    ),
+    (
+        "038_comic_progress_subject_members",
+        include_str!("../../../../migrations/038_comic_progress_subject_members.sql"),
+    ),
+    (
+        "039_comic_catalog_refresh_outcomes",
+        include_str!("../../../../migrations/039_comic_catalog_refresh_outcomes.sql"),
+    ),
 ];
 
 pub fn run(conn: &mut Connection) -> Result<(), AppError> {
@@ -646,13 +658,16 @@ mod tests {
                      'comic_page_identities',
                      'comic_page_identity_states',
                      'comic_progress_migration_snapshots',
-                     'comic_chapter_catalog_states'
+                     'comic_chapter_catalog_states',
+                     'comic_progress_subjects',
+                     'comic_progress_subject_members',
+                     'comic_catalog_refresh_outcomes'
                  )",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(comic_tables, 6, "漫画身份和迁移表必须全部建立");
+        assert_eq!(comic_tables, 9, "漫画身份、主体和刷新结果表必须全部建立");
         let chapter_columns: Vec<String> = conn
             .prepare("PRAGMA table_info(comic_chapter_source_refs)")
             .unwrap()
@@ -672,7 +687,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         // 该测试需要在 034 尚未应用时插入旧 Progress，避免 034 已经
         // 运行后再断言 backfill 失去意义；035 位于其后。
-        apply_legacy_through(&mut conn, MIGRATIONS.len() - 3);
+        apply_legacy_through(&mut conn, 33);
         let work_id = "0196f0d2-0000-7000-8000-00000000f401";
         let edition_id = "0196f0d2-0000-7000-8000-00000000f402";
         let media_item_id = "0196f0d2-0000-7000-8000-00000000f403";
@@ -722,7 +737,7 @@ mod tests {
     #[test]
     fn migration_035_backfills_page_identity_revisions_without_rewriting_pages() {
         let mut conn = Connection::open_in_memory().unwrap();
-        apply_legacy_through(&mut conn, MIGRATIONS.len() - 2);
+        apply_legacy_through(&mut conn, 34);
         let work_id = "0196f0d2-0000-7000-8000-00000000f411";
         let edition_id = "0196f0d2-0000-7000-8000-00000000f412";
         let media_item_id = "0196f0d2-0000-7000-8000-00000000f413";
@@ -793,7 +808,7 @@ mod tests {
         // Build a legacy chapter-source row before 036. Its profile observation
         // must remain NULL so Repository reads can use the historical Edition
         // projection without pretending it was a source-level observation.
-        apply_legacy_through(&mut conn, MIGRATIONS.len() - 1);
+        apply_legacy_through(&mut conn, 35);
         let work_id = "0196f0d2-0000-7000-8000-00000000f421";
         let edition_id = "0196f0d2-0000-7000-8000-00000000f422";
         let media_item_id = "0196f0d2-0000-7000-8000-00000000f423";

@@ -9,14 +9,23 @@ use std::sync::Arc;
 
 use rusqlite::Transaction;
 
-use haven_common::AppError;
+use haven_common::{AppError, ErrorKind};
+use haven_domain::comic_catalog::ComicCatalogRefreshReceipt;
+use haven_domain::comic_identity::{
+    ComicProgressMigrationSnapshot, ProgressMigrationMode, ProgressMigrationState,
+};
+use haven_domain::comic_progress_subject::ComicProgressSubject;
 use haven_domain::entities::{Edition, FavoriteTarget, MediaItem, Resource, Work};
 use haven_domain::enums::MediaType;
-use haven_domain::ids::WorkId;
+use haven_domain::ids::{MediaItemId, WorkId};
+use haven_domain::locator::{ComicLocator, Locator};
 
 use crate::db::Db;
 use haven_application::services::ports::{
-    ComicChapterRefreshPlan, FavoriteState, FavoriteTxPorts, UnitOfWork,
+    ComicChapterRefreshPlan, ComicPageIdentityWriteCandidate, ComicProgressSubjectMergePlan,
+    ComicProgressSubjectWritePlan, ComicProgressSubjectWritePrecondition,
+    ComicProgressSubjectWriteResult, ComicProgressWriteCandidate, FavoriteState, FavoriteTxPorts,
+    UnitOfWork,
 };
 
 /// R-MAIN-09D：purge 中间表唯一内部名（明确 temp schema；DROP 用同一定义，避免散落字符串）。
@@ -115,7 +124,15 @@ impl UnitOfWork for SqliteUnitOfWork {
         let total = plan.state.total.map(i64::from);
         let truncated = i64::from(plan.state.truncated);
 
-        self.db.with_tx(|tx| {
+        // The catalog plan has already completed all provider I/O.  Take the
+        // write reservation before reading generation so two physical SQLite
+        // connections cannot both retain the same deferred snapshot and make
+        // the loser fail with BUSY_SNAPSHOT before the CAS check runs.
+        let mut guard = self.db.lock();
+        let tx = guard
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| tx_err("开启漫画章节刷新 Immediate 事务失败", e))?;
+        let result = (|| {
             let current_generation: Option<i64> = match tx.query_row(
                 "SELECT generation FROM comic_chapter_catalog_states
                  WHERE source_key = ?1 AND remote_work_id = ?2",
@@ -130,27 +147,30 @@ impl UnitOfWork for SqliteUnitOfWork {
                 return Err(comic_catalog_generation_conflict());
             }
 
-            validate_comic_refresh_plan(tx, plan)?;
-            crate::db::repos::work::save_on_conn(tx, &plan.work)?;
+            validate_comic_refresh_plan(&tx, plan)?;
+            if let Some(receipt) = &plan.refresh_receipt {
+                validate_comic_refresh_receipt(plan, receipt)?;
+            }
+            crate::db::repos::work::save_on_conn(&tx, &plan.work)?;
             crate::db::repos::work::save_source_ref_on_conn(
-                tx,
+                &tx,
                 &plan.source_key,
                 &plan.remote_work_id,
                 plan.work.id,
             )?;
             for edition in &plan.editions {
-                crate::db::repos::edition::save_on_conn(tx, &edition.edition)?;
+                crate::db::repos::edition::save_on_conn(&tx, &edition.edition)?;
                 crate::db::repos::edition_profiles::save_on_conn(
-                    tx,
+                    &tx,
                     edition.edition.id,
                     &edition.profile,
                 )?;
             }
             for item in &plan.items {
-                crate::db::repos::media_item::save_on_conn(tx, item)?;
+                crate::db::repos::media_item::save_on_conn(&tx, item)?;
             }
             for resource in &plan.resources {
-                crate::db::repos::resource::save_on_conn(tx, resource)?;
+                crate::db::repos::resource::save_on_conn(&tx, resource)?;
             }
             for reference in &plan.chapter_refs {
                 if reference.identity.source_key != plan.source_key
@@ -163,7 +183,7 @@ impl UnitOfWork for SqliteUnitOfWork {
                         false,
                     ));
                 }
-                crate::db::repos::comic_identity::save_on_conn(tx, reference)?;
+                crate::db::repos::comic_identity::save_on_conn(&tx, reference)?;
             }
 
             match current_generation {
@@ -209,9 +229,917 @@ impl UnitOfWork for SqliteUnitOfWork {
                     .map_err(|error| tx_err("创建漫画章节目录刷新状态失败", error))?;
                 }
             }
+            if let Some(receipt) = &plan.refresh_receipt {
+                crate::db::repos::comic_catalog_refresh_outcomes::save_on_conn(&tx, receipt)?;
+            }
             Ok(())
-        })
+        })();
+        match result {
+            Ok(()) => tx
+                .commit()
+                .map_err(|e| tx_err("提交漫画章节刷新事务失败", e)),
+            Err(error) => Err(error),
+        }
     }
+
+    fn run_comic_progress_subject_write(
+        &self,
+        plan: &ComicProgressSubjectWritePlan,
+    ) -> Result<ComicProgressSubjectWriteResult, AppError> {
+        let mut guard = self.db.lock();
+        let tx = guard
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| tx_err("开启漫画进度主体 Immediate 事务失败", e))?;
+        let result = apply_comic_progress_subject_write(&tx, plan, None);
+        match result {
+            Ok(result) => tx
+                .commit()
+                .map_err(|e| tx_err("提交漫画进度主体事务失败", e))
+                .map(|()| result),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn run_checked_comic_progress_subject_write(
+        &self,
+        plan: &ComicProgressSubjectWritePlan,
+        precondition: &ComicProgressSubjectWritePrecondition,
+    ) -> Result<ComicProgressSubjectWriteResult, AppError> {
+        let mut guard = self.db.lock();
+        let tx = guard
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| tx_err("开启受检漫画进度主体 Immediate 事务失败", e))?;
+        let result = apply_comic_progress_subject_write(&tx, plan, Some(precondition));
+        match result {
+            Ok(result) => tx
+                .commit()
+                .map_err(|e| tx_err("提交受检漫画进度主体事务失败", e))
+                .map(|()| result),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn run_comic_progress_subject_merge(
+        &self,
+        plan: &ComicProgressSubjectMergePlan,
+    ) -> Result<ComicProgressSubjectWriteResult, AppError> {
+        let mut guard = self.db.lock();
+        let tx = guard
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| tx_err("开启漫画进度主体合并 Immediate 事务失败", e))?;
+        let result = apply_comic_progress_subject_merge(&tx, plan);
+        match result {
+            Ok(result) => tx
+                .commit()
+                .map_err(|e| tx_err("提交漫画进度主体合并事务失败", e))
+                .map(|()| result),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn apply_comic_progress_subject_write(
+    tx: &rusqlite::Transaction<'_>,
+    plan: &ComicProgressSubjectWritePlan,
+    precondition: Option<&ComicProgressSubjectWritePrecondition>,
+) -> Result<ComicProgressSubjectWriteResult, AppError> {
+    if let Some(precondition) = precondition {
+        validate_subject_write_precondition(tx, precondition)?;
+    }
+    let mut subject = plan.subject.clone();
+    subject
+        .load_members(plan.members.clone())
+        .map_err(|error| invalid_comic_subject_plan(error.to_string()))?;
+    validate_comic_subject_plan(tx, &subject, plan)?;
+    let migration_progress_write_index = plan
+        .migration_snapshot
+        .as_ref()
+        .map(|snapshot| migration_progress_write_index(plan, snapshot))
+        .transpose()?;
+
+    if let Some(page_identity) = &plan.page_identity_write {
+        replace_page_identities_on_conn(tx, page_identity)?;
+    }
+    crate::db::repos::comic_progress_subjects::save_on_conn(tx, &subject, &plan.members)?;
+    if let Some(receipt) = &plan.refresh_receipt {
+        crate::db::repos::comic_catalog_refresh_outcomes::save_on_conn(tx, receipt)?;
+    }
+
+    let mut applied_progress_revisions = Vec::with_capacity(plan.progress_writes.len());
+    for candidate in &plan.progress_writes {
+        let revision = write_progress_if_revision_on_conn(tx, candidate)?;
+        applied_progress_revisions.push(revision);
+    }
+    if let Some(snapshot) = &plan.migration_snapshot {
+        let progress_index = migration_progress_write_index
+            .ok_or_else(|| invalid_comic_subject_plan("迁移快照缺少匹配的目标 Progress 写入"))?;
+        let actual_revision = applied_progress_revisions
+            .get(progress_index)
+            .cloned()
+            .ok_or_else(|| invalid_comic_subject_plan("迁移快照目标 Progress 写入结果缺失"))?;
+        let mut persisted_snapshot = snapshot.clone();
+        persisted_snapshot.applied_revision = Some(actual_revision.clone());
+        persisted_snapshot.new_progress.revision = Some(actual_revision);
+        write_migration_snapshot_on_conn(tx, &persisted_snapshot)?;
+    }
+
+    Ok(ComicProgressSubjectWriteResult {
+        applied_progress_revisions,
+        migration_id: plan.migration_snapshot.as_ref().map(|snapshot| snapshot.id),
+        refresh_id: plan.refresh_receipt.as_ref().map(|receipt| receipt.id),
+    })
+}
+
+fn apply_comic_progress_subject_merge(
+    tx: &rusqlite::Transaction<'_>,
+    plan: &ComicProgressSubjectMergePlan,
+) -> Result<ComicProgressSubjectWriteResult, AppError> {
+    validate_subject_merge_plan(tx, plan)?;
+
+    // 先在事务内验证所有旧聚合，再进行任何 destructive replacement。Immediate
+    // 已经拿到写锁，因此验证通过后不会出现旧快照被插入的窗口。
+    for expected in &plan.expected_subjects {
+        let current = crate::db::repos::comic_progress_subjects::load_subject(
+            tx,
+            expected.expected_subject.id,
+        )?
+        .ok_or_else(subject_conflict)?;
+        if current != expected.expected_subject
+            || current.members() != expected.expected_members.as_slice()
+        {
+            return Err(subject_conflict());
+        }
+    }
+
+    let mut survivor = plan.survivor.clone();
+    survivor
+        .load_members(plan.survivor_members.clone())
+        .map_err(|error| invalid_comic_subject_plan(error.to_string()))?;
+    let write_plan = ComicProgressSubjectWritePlan {
+        subject: survivor.clone(),
+        members: plan.survivor_members.clone(),
+        page_identity_write: None,
+        progress_writes: plan.progress_writes.clone(),
+        migration_snapshot: plan.migration_snapshot.clone(),
+        refresh_receipt: None,
+    };
+    validate_comic_subject_plan(tx, &survivor, &write_plan)?;
+
+    // loser 先 Redirected + Retired，释放全局 active-member 唯一约束后，
+    // survivor 才吸收对应 active member。任一步失败都会由外层 tx 回滚。
+    for redirected in &plan.redirected_subjects {
+        crate::db::repos::comic_progress_subjects::save_on_conn(
+            tx,
+            redirected,
+            redirected.members(),
+        )?;
+    }
+    crate::db::repos::comic_progress_subjects::save_on_conn(tx, &survivor, &plan.survivor_members)?;
+
+    let mut applied_progress_revisions = Vec::with_capacity(plan.progress_writes.len());
+    for candidate in &plan.progress_writes {
+        applied_progress_revisions.push(write_progress_if_revision_on_conn(tx, candidate)?);
+    }
+    if let Some(snapshot) = &plan.migration_snapshot {
+        let progress_index = migration_progress_write_index(&write_plan, snapshot)?;
+        let actual_revision = applied_progress_revisions
+            .get(progress_index)
+            .cloned()
+            .ok_or_else(|| invalid_comic_subject_plan("迁移快照目标 Progress 写入结果缺失"))?;
+        let mut persisted_snapshot = snapshot.clone();
+        persisted_snapshot.applied_revision = Some(actual_revision.clone());
+        persisted_snapshot.new_progress.revision = Some(actual_revision);
+        write_migration_snapshot_on_conn(tx, &persisted_snapshot)?;
+    }
+
+    Ok(ComicProgressSubjectWriteResult {
+        applied_progress_revisions,
+        migration_id: plan.migration_snapshot.as_ref().map(|snapshot| snapshot.id),
+        refresh_id: None,
+    })
+}
+
+fn validate_subject_merge_plan(
+    tx: &rusqlite::Transaction<'_>,
+    plan: &ComicProgressSubjectMergePlan,
+) -> Result<(), AppError> {
+    if plan.survivor.state
+        != haven_domain::comic_progress_subject::ComicProgressSubjectState::Active
+        || plan.survivor.redirect_subject_id.is_some()
+    {
+        return Err(invalid_comic_subject_plan(
+            "Subject 合并 survivor 必须保持 Active",
+        ));
+    }
+    plan.survivor
+        .validate_redirect_state()
+        .map_err(|error| invalid_comic_subject_plan(error.to_string()))?;
+    if plan.redirected_subjects.is_empty() {
+        return Err(invalid_comic_subject_plan(
+            "Subject 合并至少需要一个 redirected loser",
+        ));
+    }
+    if plan
+        .redirected_subjects
+        .iter()
+        .any(|subject| subject.id == plan.survivor.id)
+    {
+        return Err(invalid_comic_subject_plan(
+            "Subject 合并不能把 survivor 重定向到自身",
+        ));
+    }
+    if plan.expected_subjects.len() != plan.redirected_subjects.len() + 1 {
+        return Err(invalid_comic_subject_plan(
+            "Subject 合并预期快照数量与参与者不一致",
+        ));
+    }
+    let expected_survivor = plan
+        .expected_subjects
+        .iter()
+        .find(|expected| expected.expected_subject.id == plan.survivor.id)
+        .ok_or_else(|| invalid_comic_subject_plan("Subject 合并缺少 survivor 快照"))?;
+    if expected_survivor.expected_subject.state
+        != haven_domain::comic_progress_subject::ComicProgressSubjectState::Active
+    {
+        return Err(invalid_comic_subject_plan(
+            "Subject 合并的旧 survivor 必须保持 Active",
+        ));
+    }
+    for redirected in &plan.redirected_subjects {
+        if redirected.state
+            != haven_domain::comic_progress_subject::ComicProgressSubjectState::Redirected
+            || redirected.redirect_subject_id != Some(plan.survivor.id)
+        {
+            return Err(invalid_comic_subject_plan(
+                "Subject 合并 loser 必须指向 survivor",
+            ));
+        }
+        redirected
+            .validate()
+            .map_err(|error| invalid_comic_subject_plan(error.to_string()))?;
+    }
+    for expected in &plan.expected_subjects {
+        if expected.expected_subject.work_id != plan.survivor.work_id
+            || expected.expected_subject.edition_id != plan.survivor.edition_id
+        {
+            return Err(invalid_comic_subject_plan(
+                "Subject 合并参与者必须属于同一个 Work/Edition",
+            ));
+        }
+        expected
+            .expected_subject
+            .clone()
+            .load_members(expected.expected_members.clone())
+            .map_err(|error| invalid_comic_subject_plan(error.to_string()))?;
+    }
+    let _ = tx;
+    Ok(())
+}
+
+fn validate_subject_write_precondition(
+    tx: &rusqlite::Transaction<'_>,
+    precondition: &ComicProgressSubjectWritePrecondition,
+) -> Result<(), AppError> {
+    match precondition {
+        ComicProgressSubjectWritePrecondition::AbsentActiveMember { media_item_id } => {
+            let exists: i64 = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM comic_progress_subject_members WHERE media_item_id = ?1 AND state = 'active')",
+                rusqlite::params![media_item_id.to_string()], |row| row.get(0),
+            ).map_err(|e| tx_err("检查漫画进度主体创建前置条件失败", e))?;
+            if exists != 0 {
+                return Err(subject_conflict());
+            }
+        }
+        ComicProgressSubjectWritePrecondition::AbsentActiveMembers { media_item_ids } => {
+            for media_item_id in media_item_ids {
+                let exists: i64 = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM comic_progress_subject_members
+                         WHERE media_item_id = ?1 AND state = 'active')",
+                        rusqlite::params![media_item_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| tx_err("检查漫画进度主体创建前置条件失败", error))?;
+                if exists != 0 {
+                    return Err(subject_conflict());
+                }
+            }
+        }
+        ComicProgressSubjectWritePrecondition::ExactSnapshot {
+            subject,
+            members,
+            require_authoritative_progress_none,
+            require_progress_absent_for_media_item,
+            require_progress_revision_for_media_item,
+        } => {
+            if let Some(media_item_id) = require_progress_absent_for_media_item {
+                let exists: i64 = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM progress WHERE media_item_id = ?1)",
+                        rusqlite::params![media_item_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| tx_err("检查目标漫画 Progress 前置条件失败", error))?;
+                if exists != 0 {
+                    return Err(progress_revision_conflict());
+                }
+            }
+            if let Some((media_item_id, expected_revision)) =
+                require_progress_revision_for_media_item
+            {
+                let current_revision: Option<String> = tx
+                    .query_row(
+                        "SELECT revision FROM progress WHERE media_item_id = ?1",
+                        rusqlite::params![media_item_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| tx_err("检查源漫画 Progress revision 前置条件失败", error))?;
+                if current_revision.as_deref() != Some(expected_revision.as_str()) {
+                    return Err(progress_revision_conflict());
+                }
+            }
+            // 必须在同一个 Immediate 事务内重新读取整个聚合（含全部成员），
+            // 而不是相信 Application 在事务外读到的快照。
+            let current = crate::db::repos::comic_progress_subjects::load_subject(tx, subject.id)?
+                .ok_or_else(subject_conflict)?;
+            if current != **subject
+                || current.members() != members.as_slice()
+                || (*require_authoritative_progress_none
+                    && current.authoritative_progress_media_item_id.is_some())
+            {
+                return Err(subject_conflict());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn subject_conflict() -> AppError {
+    AppError::new(
+        "COMIC_PROGRESS_SUBJECT_CONFLICT",
+        ErrorKind::Conflict,
+        "漫画进度主体已被并发更新，请重新读取",
+        false,
+    )
+}
+
+fn progress_revision_conflict() -> AppError {
+    AppError::new(
+        "COMIC_PROGRESS_REVISION_CONFLICT",
+        ErrorKind::Conflict,
+        "漫画 Progress revision 已被其他会话更新，请刷新后重试",
+        false,
+    )
+}
+
+fn validate_comic_subject_plan(
+    tx: &rusqlite::Transaction<'_>,
+    subject: &ComicProgressSubject,
+    plan: &ComicProgressSubjectWritePlan,
+) -> Result<(), AppError> {
+    subject
+        .validate()
+        .map_err(|error| invalid_comic_subject_plan(error.to_string()))?;
+    validate_subject_text(&subject.algorithm_version, "algorithm_version")?;
+
+    let subject_chain_exists: i64 = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM works w
+                 JOIN editions e ON e.work_id = w.id
+                 JOIN media_items m ON m.edition_id = e.id
+                 WHERE w.id = ?1 AND e.id = ?2 AND m.id = ?3
+                   AND m.media_type = 'comic'
+             )",
+            rusqlite::params![
+                subject.work_id.to_string(),
+                subject.edition_id.to_string(),
+                subject.canonical_media_item_id.to_string(),
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|error| tx_err("验证漫画进度主体归属失败", error))?;
+    if subject_chain_exists == 0 {
+        return Err(invalid_comic_subject_plan(
+            "漫画进度主体的 Work、Edition 和 canonical MediaItem 归属不一致",
+        ));
+    }
+
+    for member in &plan.members {
+        if member.subject_id != subject.id {
+            return Err(invalid_comic_subject_plan("漫画进度主体成员 ID 不一致"));
+        }
+        let belongs_to_work: i64 = tx
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM media_items m
+                     JOIN editions e ON e.id = m.edition_id
+                     WHERE m.id = ?1 AND e.work_id = ?2 AND m.media_type = 'comic'
+                 )",
+                rusqlite::params![
+                    member.media_item_id.to_string(),
+                    subject.work_id.to_string()
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| tx_err("验证漫画进度主体成员归属失败", error))?;
+        if belongs_to_work == 0 {
+            return Err(invalid_comic_subject_plan(
+                "漫画进度主体成员必须属于相同 Work 的漫画 MediaItem",
+            ));
+        }
+    }
+
+    if let Some(page_identity) = &plan.page_identity_write {
+        ensure_subject_page_identity_media_item(tx, subject, plan, page_identity.media_item_id)?;
+    }
+    if let Some(receipt) = &plan.refresh_receipt {
+        if receipt.work_id != subject.work_id {
+            return Err(invalid_comic_subject_plan(
+                "漫画目录刷新结果必须属于当前 Subject 的 Work",
+            ));
+        }
+    }
+    for candidate in &plan.progress_writes {
+        ensure_comic_progress(tx, &candidate.progress)?;
+        let is_subject_media = candidate.progress.work_id == subject.work_id
+            && (candidate.progress.media_item_id == subject.canonical_media_item_id
+                || plan
+                    .members
+                    .iter()
+                    .any(|member| member.media_item_id == candidate.progress.media_item_id));
+        if !is_subject_media {
+            return Err(invalid_comic_subject_plan(
+                "Progress 必须绑定当前漫画进度主体的 MediaItem",
+            ));
+        }
+    }
+    if let Some(snapshot) = &plan.migration_snapshot {
+        validate_comic_migration_snapshot(tx, subject, plan, snapshot)?;
+    }
+    Ok(())
+}
+
+fn validate_comic_migration_snapshot(
+    tx: &rusqlite::Transaction<'_>,
+    subject: &ComicProgressSubject,
+    plan: &ComicProgressSubjectWritePlan,
+    snapshot: &ComicProgressMigrationSnapshot,
+) -> Result<(), AppError> {
+    if snapshot.state != ProgressMigrationState::Applied
+        || snapshot.mode == ProgressMigrationMode::None
+        || snapshot.reverted_at.is_some()
+    {
+        return Err(invalid_comic_subject_plan(
+            "漫画进度迁移快照必须是未撤销的 Applied 状态且具有迁移模式",
+        ));
+    }
+    if snapshot.source_media_item_id != snapshot.old_progress.media_item_id
+        || snapshot.target_media_item_id != snapshot.new_progress.media_item_id
+    {
+        return Err(invalid_comic_subject_plan(
+            "漫画进度迁移快照的 source/target MediaItem 与 Progress 不一致",
+        ));
+    }
+    validate_subject_text(&snapshot.source_revision, "source_revision")?;
+    if let Some(revision) = snapshot.target_revision_before.as_deref() {
+        validate_subject_text(revision, "target_revision_before")?;
+    }
+    if snapshot.old_progress.revision.as_deref() != Some(snapshot.source_revision.as_str()) {
+        return Err(invalid_comic_subject_plan(
+            "漫画进度迁移快照的 old Progress revision 与 source_revision 不一致",
+        ));
+    }
+
+    for progress in [&snapshot.old_progress, &snapshot.new_progress] {
+        ensure_comic_progress(tx, progress)?;
+        if progress.work_id != subject.work_id {
+            return Err(invalid_comic_subject_plan(
+                "漫画进度迁移快照中的 Progress 必须属于当前 Subject Work",
+            ));
+        }
+    }
+
+    if snapshot.source_media_item_id == snapshot.target_media_item_id {
+        if snapshot.target_revision_before.as_deref() != Some(snapshot.source_revision.as_str()) {
+            return Err(invalid_comic_subject_plan(
+                "同一 MediaItem 的迁移快照 target_revision_before 必须等于 source_revision",
+            ));
+        }
+        if let Some(old_target) = snapshot.old_target_progress.as_ref() {
+            ensure_comic_progress(tx, old_target)?;
+            if old_target.work_id != subject.work_id
+                || old_target.media_item_id != snapshot.target_media_item_id
+                || old_target.revision.as_deref() != snapshot.target_revision_before.as_deref()
+            {
+                return Err(invalid_comic_subject_plan(
+                    "同一 MediaItem 的 old_target Progress 与目标 revision 不一致",
+                ));
+            }
+        }
+    } else {
+        match (
+            snapshot.old_target_progress.as_ref(),
+            snapshot.target_revision_before.as_deref(),
+        ) {
+            (Some(old_target), Some(target_revision)) => {
+                ensure_comic_progress(tx, old_target)?;
+                if old_target.work_id != subject.work_id
+                    || old_target.media_item_id != snapshot.target_media_item_id
+                    || old_target.revision.as_deref() != Some(target_revision)
+                {
+                    return Err(invalid_comic_subject_plan(
+                        "跨 MediaItem 迁移快照的 old_target Progress 与目标 revision 不一致",
+                    ));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(invalid_comic_subject_plan(
+                    "跨 MediaItem 迁移快照无目标时必须同时为空",
+                ));
+            }
+        }
+    }
+
+    let source_revision_in_db: Option<String> = tx
+        .query_row(
+            "SELECT revision FROM progress WHERE media_item_id = ?1",
+            rusqlite::params![snapshot.source_media_item_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| tx_err("查询迁移快照源 Progress revision 失败", error))?;
+    if source_revision_in_db.as_deref() != Some(snapshot.source_revision.as_str()) {
+        return Err(invalid_comic_subject_plan(
+            "漫画进度迁移快照源 Progress 不存在或 revision 已变化",
+        ));
+    }
+    let target_revision_in_db: Option<String> = tx
+        .query_row(
+            "SELECT revision FROM progress WHERE media_item_id = ?1",
+            rusqlite::params![snapshot.target_media_item_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| tx_err("查询迁移快照目标 Progress revision 失败", error))?;
+    if target_revision_in_db.as_deref() != snapshot.target_revision_before.as_deref() {
+        return Err(invalid_comic_subject_plan(
+            "漫画进度迁移快照目标 Progress 与 target_revision_before 不一致",
+        ));
+    }
+
+    migration_progress_write_index(plan, snapshot)?;
+    Ok(())
+}
+
+fn migration_progress_write_index(
+    plan: &ComicProgressSubjectWritePlan,
+    snapshot: &ComicProgressMigrationSnapshot,
+) -> Result<usize, AppError> {
+    let mut matching = plan
+        .progress_writes
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.progress == snapshot.new_progress
+                && candidate.expected_revision.as_deref()
+                    == snapshot.target_revision_before.as_deref()
+        });
+    let Some((index, _)) = matching.next() else {
+        return Err(invalid_comic_subject_plan(
+            "带迁移快照的 Subject 事务必须包含匹配的目标 Progress 写入",
+        ));
+    };
+    if matching.next().is_some() {
+        return Err(invalid_comic_subject_plan(
+            "带迁移快照的 Subject 事务只能绑定一个目标 Progress 写入",
+        ));
+    }
+    Ok(index)
+}
+
+fn ensure_subject_page_identity_media_item(
+    tx: &rusqlite::Transaction<'_>,
+    subject: &ComicProgressSubject,
+    plan: &ComicProgressSubjectWritePlan,
+    media_item_id: MediaItemId,
+) -> Result<(), AppError> {
+    ensure_comic_media_item(tx, media_item_id)?;
+    let belongs_to_subject_work: i64 = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM media_items m
+                 JOIN editions e ON e.id = m.edition_id
+                 WHERE m.id = ?1 AND m.media_type = 'comic' AND e.work_id = ?2
+             )",
+            rusqlite::params![media_item_id.to_string(), subject.work_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|error| tx_err("校验漫画页面身份 Work 归属失败", error))?;
+    if belongs_to_subject_work == 0 {
+        return Err(invalid_comic_subject_plan(
+            "页面身份 MediaItem 必须属于当前 Subject Work",
+        ));
+    }
+    let is_subject_media = media_item_id == subject.canonical_media_item_id
+        || plan
+            .members
+            .iter()
+            .any(|member| member.media_item_id == media_item_id);
+    if !is_subject_media {
+        return Err(invalid_comic_subject_plan(
+            "页面身份 MediaItem 必须是 Subject canonical 或成员条目",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_comic_media_item(
+    conn: &rusqlite::Connection,
+    media_item_id: MediaItemId,
+) -> Result<(), AppError> {
+    let is_comic: i64 = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM media_items WHERE id = ?1 AND media_type = 'comic'
+             )",
+            rusqlite::params![media_item_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|error| tx_err("检查漫画媒体条目失败", error))?;
+    if is_comic == 0 {
+        return Err(invalid_comic_subject_plan("页面身份只能绑定漫画 MediaItem"));
+    }
+    Ok(())
+}
+
+fn ensure_comic_progress(
+    conn: &rusqlite::Connection,
+    progress: &haven_domain::entities::Progress,
+) -> Result<(), AppError> {
+    crate::db::repos::progress::validate_progress(conn, progress)?;
+    ensure_comic_media_item(conn, progress.media_item_id)?;
+    if !matches!(
+        &progress.locator,
+        Locator::Comic(ComicLocator { chapter_item_id, .. })
+            if *chapter_item_id == progress.media_item_id
+    ) {
+        return Err(invalid_comic_subject_plan(
+            "漫画进度必须使用与 MediaItem 一致的 Comic Locator",
+        ));
+    }
+    Ok(())
+}
+
+fn replace_page_identities_on_conn(
+    tx: &rusqlite::Transaction<'_>,
+    candidate: &ComicPageIdentityWriteCandidate,
+) -> Result<(), AppError> {
+    ensure_comic_media_item(tx, candidate.media_item_id)?;
+    for page in &candidate.pages {
+        if let Some(value) = page.stable_key.as_deref() {
+            validate_subject_text(value, "stable_key")?;
+        }
+        if let Some(value) = page.fingerprint.as_deref() {
+            validate_subject_text(value, "fingerprint")?;
+        }
+    }
+    let current_revision: Option<String> = tx
+        .query_row(
+            "SELECT revision FROM comic_page_identity_states WHERE media_item_id = ?1",
+            rusqlite::params![candidate.media_item_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| tx_err("查询漫画页面身份 revision 失败", error))?;
+    if current_revision != candidate.expected_revision {
+        return Err(comic_page_identity_conflict());
+    }
+    let revision = uuid::Uuid::new_v4().to_string();
+    tx.execute(
+        "DELETE FROM comic_page_identities WHERE media_item_id = ?1",
+        rusqlite::params![candidate.media_item_id.to_string()],
+    )
+    .map_err(|error| tx_err("替换漫画页面身份失败", error))?;
+    for (index, page) in candidate.pages.iter().enumerate() {
+        let page_index = i64::try_from(index)
+            .map_err(|_| invalid_comic_subject_plan("页面身份索引超出数据库范围"))?;
+        tx.execute(
+            "INSERT INTO comic_page_identities
+                (media_item_id, page_index, stable_key, fingerprint, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                candidate.media_item_id.to_string(),
+                page_index,
+                page.stable_key,
+                page.fingerprint,
+                haven_common::UtcMillis::now().0,
+            ],
+        )
+        .map_err(|error| tx_err("保存漫画页面身份失败", error))?;
+    }
+    tx.execute(
+        "INSERT INTO comic_page_identity_states (media_item_id, revision, updated_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(media_item_id) DO UPDATE SET
+             revision = excluded.revision, updated_at = excluded.updated_at",
+        rusqlite::params![
+            candidate.media_item_id.to_string(),
+            revision,
+            haven_common::UtcMillis::now().0,
+        ],
+    )
+    .map_err(|error| tx_err("保存漫画页面身份 revision 失败", error))?;
+    Ok(())
+}
+
+fn write_progress_if_revision_on_conn(
+    tx: &rusqlite::Transaction<'_>,
+    candidate: &ComicProgressWriteCandidate,
+) -> Result<String, AppError> {
+    let progress = &candidate.progress;
+    let locator_json = crate::db::repos::locator_to_json(&progress.locator)?;
+    let completion = crate::db::repos::enum_to_db_str(&progress.completion)?;
+    let percentage = progress.percentage.map(f64::from);
+    let revision = crate::db::repos::progress::new_revision();
+    let result = match candidate.expected_revision.as_deref() {
+        Some(expected) => tx
+            .query_row(
+                "UPDATE progress SET
+                     work_id = ?1, edition_id = ?2, locator_json = ?4,
+                     locator_version = ?5, completion = ?6, percentage = ?7,
+                     keyframe_uri = ?8, revision = ?9,
+                     last_active_at = CASE WHEN ?10 <= last_active_at THEN last_active_at ELSE ?10 END,
+                     updated_at = CASE WHEN ?10 <= updated_at THEN updated_at + 1 ELSE ?10 END
+                 WHERE media_item_id = ?3 AND revision = ?11
+                 RETURNING revision",
+                rusqlite::params![
+                    progress.work_id.to_string(),
+                    progress.edition_id.to_string(),
+                    progress.media_item_id.to_string(),
+                    locator_json,
+                    progress.locator.version(),
+                    completion,
+                    percentage,
+                    progress.keyframe_uri,
+                    revision,
+                    progress.updated_at.0,
+                    expected,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| tx_err("条件写入漫画 Progress 失败", error))?,
+        None => tx
+            .query_row(
+                "INSERT INTO progress
+                    (id, work_id, edition_id, media_item_id, locator_json, locator_version,
+                     completion, percentage, last_active_at, updated_at, revision, keyframe_uri)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT(media_item_id) DO UPDATE SET
+                     work_id = excluded.work_id,
+                     edition_id = excluded.edition_id,
+                     locator_json = excluded.locator_json,
+                     locator_version = excluded.locator_version,
+                     completion = excluded.completion,
+                     percentage = excluded.percentage,
+                     keyframe_uri = excluded.keyframe_uri,
+                     revision = excluded.revision,
+                     last_active_at = CASE
+                         WHEN excluded.last_active_at <= progress.last_active_at
+                         THEN progress.last_active_at
+                         ELSE excluded.last_active_at
+                     END,
+                     updated_at = CASE
+                         WHEN excluded.updated_at <= progress.updated_at
+                         THEN progress.updated_at + 1
+                         ELSE excluded.updated_at
+                     END
+                 RETURNING revision",
+                rusqlite::params![
+                    progress.id.to_string(),
+                    progress.work_id.to_string(),
+                    progress.edition_id.to_string(),
+                    progress.media_item_id.to_string(),
+                    locator_json,
+                    progress.locator.version(),
+                    completion,
+                    percentage,
+                    progress.last_active_at.0,
+                    progress.updated_at.0,
+                    revision,
+                    progress.keyframe_uri,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| tx_err("保存漫画 Progress 失败", error))?,
+    };
+    result.ok_or_else(|| {
+        AppError::new(
+            "COMIC_PROGRESS_REVISION_CONFLICT",
+            haven_common::ErrorKind::Conflict,
+            "漫画 Progress revision 已被其他会话更新，请刷新后重试",
+            false,
+        )
+    })
+}
+
+fn write_migration_snapshot_on_conn(
+    tx: &rusqlite::Transaction<'_>,
+    snapshot: &ComicProgressMigrationSnapshot,
+) -> Result<(), AppError> {
+    let mode = crate::db::repos::enum_to_db_str(&snapshot.mode)?;
+    let confidence = crate::db::repos::enum_to_db_str(&snapshot.confidence)?;
+    let strategy = crate::db::repos::enum_to_db_str(&snapshot.strategy)?;
+    let state = crate::db::repos::enum_to_db_str(&snapshot.state)?;
+    let old_progress_json = serde_json::to_string(&snapshot.old_progress)
+        .map_err(|error| serialize_tx_error("old_progress_json", error))?;
+    let old_target_progress_json = snapshot
+        .old_target_progress
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| serialize_tx_error("old_target_progress_json", error))?;
+    let new_progress_json = serde_json::to_string(&snapshot.new_progress)
+        .map_err(|error| serialize_tx_error("new_progress_json", error))?;
+    let evidence_json = serde_json::to_string(&snapshot.evidence)
+        .map_err(|error| serialize_tx_error("evidence_json", error))?;
+    tx.execute(
+        "INSERT INTO comic_progress_migration_snapshots
+            (id, source_media_item_id, target_media_item_id, source_revision,
+             target_revision_before, old_progress_json, old_target_progress_json,
+             new_progress_json, mode, confidence, strategy, evidence_json,
+             created_at, applied_revision, state, reverted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        rusqlite::params![
+            snapshot.id.to_string(),
+            snapshot.source_media_item_id.to_string(),
+            snapshot.target_media_item_id.to_string(),
+            snapshot.source_revision,
+            snapshot.target_revision_before,
+            old_progress_json,
+            old_target_progress_json,
+            new_progress_json,
+            mode,
+            confidence,
+            strategy,
+            evidence_json,
+            snapshot.created_at.0,
+            snapshot.applied_revision,
+            state,
+            snapshot.reverted_at.map(|value| value.0),
+        ],
+    )
+    .map_err(|error| tx_err("保存漫画进度迁移快照失败", error))?;
+    Ok(())
+}
+
+fn validate_subject_text(value: &str, field: &'static str) -> Result<(), AppError> {
+    if value.trim().is_empty()
+        || value.len() > 4096
+        || value
+            .chars()
+            .any(|ch| (ch as u32) <= 0x1f || ch == '\u{7f}')
+        || value.contains("://")
+        || value.to_ascii_lowercase().starts_with("data:")
+    {
+        return Err(invalid_comic_subject_plan(format!(
+            "漫画进度主体字段 {field} 非法"
+        )));
+    }
+    Ok(())
+}
+
+fn serialize_tx_error(field: &'static str, error: serde_json::Error) -> AppError {
+    AppError::new(
+        "SERIALIZE_FAILED",
+        haven_common::ErrorKind::Validation,
+        format!("漫画进度迁移快照字段 {field} 序列化失败"),
+        false,
+    )
+    .with_source(error)
+}
+
+fn invalid_comic_subject_plan(message: impl Into<String>) -> AppError {
+    AppError::new(
+        "COMIC_PROGRESS_SUBJECT_PLAN_INVALID",
+        haven_common::ErrorKind::Validation,
+        message,
+        false,
+    )
+}
+
+fn comic_page_identity_conflict() -> AppError {
+    AppError::new(
+        "COMIC_PAGE_IDENTITY_REVISION_CONFLICT",
+        haven_common::ErrorKind::Conflict,
+        "漫画页面身份已被其他会话更新，请刷新后重试",
+        false,
+    )
 }
 
 fn validate_comic_refresh_plan(
@@ -268,6 +1196,32 @@ fn validate_comic_refresh_plan(
         {
             return Err(invalid_comic_refresh_plan("章节来源引用不属于当前 Work"));
         }
+    }
+    Ok(())
+}
+
+fn validate_comic_refresh_receipt(
+    plan: &ComicChapterRefreshPlan,
+    receipt: &ComicCatalogRefreshReceipt,
+) -> Result<(), AppError> {
+    if receipt.work_id != plan.work.id
+        || receipt.source_key != plan.source_key
+        || receipt.remote_work_id != plan.remote_work_id
+        || receipt.generation_before != plan.expected_generation
+        || receipt.generation_after != Some(plan.state.generation)
+    {
+        return Err(invalid_comic_refresh_plan(
+            "刷新 Receipt 与目录刷新计划不一致",
+        ));
+    }
+    if matches!(
+        receipt.status,
+        haven_domain::comic_catalog::ComicCatalogRefreshOutcomeStatus::NeverSynced
+            | haven_domain::comic_catalog::ComicCatalogRefreshOutcomeStatus::RefreshFailed
+    ) {
+        return Err(invalid_comic_refresh_plan(
+            "目录刷新事务只能提交成功或有界成功 Receipt",
+        ));
     }
     Ok(())
 }
@@ -2379,7 +3333,7 @@ mod tests {
             identity: ChapterSourceIdentity::new(
                 source_key.clone(),
                 remote_work_id.clone(),
-                remote_chapter_id,
+                remote_chapter_id.clone(),
             )
             .unwrap(),
             metadata: ComicChapterMetadata {
@@ -2396,6 +3350,21 @@ mod tests {
             source_updated_at: Some("2026-01-03T00:00:00Z".into()),
             last_seen_generation: Some(next_generation),
             updated_at: now,
+        };
+        let refresh_receipt = ComicCatalogRefreshReceipt {
+            id: haven_domain::ids::ComicCatalogRefreshId::new(),
+            work_id,
+            source_key: source_key.clone(),
+            remote_work_id: remote_work_id.clone(),
+            status: haven_domain::comic_catalog::ComicCatalogRefreshOutcomeStatus::Succeeded,
+            generation_before: expected_generation,
+            generation_after: Some(next_generation),
+            observed_from: Some(remote_chapter_id.to_owned()),
+            observed_to: Some(remote_chapter_id.to_owned()),
+            truncated: false,
+            retained_previous_catalog: false,
+            error_code: None,
+            observed_at: now,
         };
         let plan = haven_application::services::ports::ComicChapterRefreshPlan {
             source_key,
@@ -2417,6 +3386,7 @@ mod tests {
             items: vec![item],
             resources: vec![resource],
             chapter_refs: vec![reference],
+            refresh_receipt: Some(refresh_receipt),
         };
         (plan, edition_id, media_item_id, resource_id)
     }
@@ -2510,6 +3480,15 @@ mod tests {
         assert_eq!(count_rows(&db, "resources"), 1);
         assert_eq!(count_rows(&db, "comic_chapter_source_refs"), 1);
         assert_eq!(count_rows(&db, "comic_chapter_catalog_states"), 1);
+        assert_eq!(count_rows(&db, "comic_catalog_refresh_outcomes"), 1);
+        let receipt = plan.refresh_receipt.as_ref().unwrap();
+        let persisted_receipt = repos
+            .catalog_refresh_outcomes
+            .get(receipt.id)
+            .await
+            .unwrap()
+            .expect("successful catalog refresh must persist its Receipt");
+        assert_eq!(&persisted_receipt, receipt);
     }
 
     #[test]
@@ -2531,6 +3510,7 @@ mod tests {
             "resources",
             "comic_chapter_source_refs",
             "comic_chapter_catalog_states",
+            "comic_catalog_refresh_outcomes",
         ] {
             assert_eq!(count_rows(&db, table), 0, "无效计划不得写入 {table}");
         }
@@ -2563,6 +3543,7 @@ mod tests {
             "media_items",
             "resources",
             "comic_chapter_source_refs",
+            "comic_catalog_refresh_outcomes",
         ] {
             assert_eq!(count_rows(&db, table), 0, "generation 冲突不得写入 {table}");
         }
@@ -2608,8 +3589,99 @@ mod tests {
             "resources",
             "comic_chapter_source_refs",
             "comic_chapter_catalog_states",
+            "comic_catalog_refresh_outcomes",
         ] {
             assert_eq!(count_rows(&db, table), 0, "资源失败不得留下 {table}");
+        }
+    }
+
+    #[test]
+    fn comic_refresh_receipt_failure_rolls_back_every_preceding_write() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (plan, _, _, _) = comic_refresh_plan(0);
+        db.lock()
+            .execute_batch(
+                "CREATE TRIGGER fail_comic_refresh_receipt_insert
+                 BEFORE INSERT ON comic_catalog_refresh_outcomes
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected comic refresh receipt failure');
+                 END;",
+            )
+            .unwrap();
+
+        let err = SqliteUnitOfWork::new(db.clone())
+            .run_comic_chapter_refresh(&plan)
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "DATABASE_ERROR");
+        for table in [
+            "works",
+            "work_source_refs",
+            "editions",
+            "edition_profiles",
+            "media_items",
+            "resources",
+            "comic_chapter_source_refs",
+            "comic_chapter_catalog_states",
+            "comic_catalog_refresh_outcomes",
+        ] {
+            assert_eq!(count_rows(&db, table), 0, "Receipt 失败不得留下 {table}");
+        }
+    }
+
+    /// A real two-connection race must serialize at the transaction boundary:
+    /// one refresh commits and the stale plan gets a deterministic generation
+    /// conflict, without leaking any of the losing plan's rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn comic_refresh_generation_cas_is_stable_across_two_db_connections() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("comic-refresh-race.db");
+        let first_db = Arc::new(Db::open(&path).unwrap());
+        let second_db = Arc::new(Db::open(&path).unwrap());
+        let (first_plan, _, _, _) = comic_refresh_plan(0);
+        let (second_plan, _, _, _) = comic_refresh_plan(0);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let first_barrier = barrier.clone();
+        let first_task = tokio::task::spawn_blocking(move || {
+            first_barrier.wait();
+            SqliteUnitOfWork::new(first_db).run_comic_chapter_refresh(&first_plan)
+        });
+        let second_barrier = barrier;
+        let second_task = tokio::task::spawn_blocking(move || {
+            second_barrier.wait();
+            SqliteUnitOfWork::new(second_db).run_comic_chapter_refresh(&second_plan)
+        });
+
+        let (first_result, second_result) = tokio::join!(first_task, second_task);
+        let results = [first_result.unwrap(), second_result.unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let conflict_count = results
+            .iter()
+            .filter(|result| {
+                result.as_ref().err().is_some_and(|error| {
+                    error.code().as_str() == "COMIC_CATALOG_GENERATION_CONFLICT"
+                })
+            })
+            .count();
+        assert_eq!(conflict_count, 1);
+
+        let check_db = Arc::new(Db::open(&path).unwrap());
+        for table in [
+            "works",
+            "work_source_refs",
+            "editions",
+            "edition_profiles",
+            "media_items",
+            "resources",
+            "comic_chapter_source_refs",
+            "comic_chapter_catalog_states",
+            "comic_catalog_refresh_outcomes",
+        ] {
+            assert_eq!(
+                count_rows(&check_db, table),
+                1,
+                "竞争胜者应只留下一个 {table}"
+            );
         }
     }
 }

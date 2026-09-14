@@ -65,17 +65,24 @@ pnpm-debug.log*
 # Local planning material (kept on developer machines, never committed)
 plan/
 
-# Project tracking, ADRs and acceptance evidence are maintained locally.
-/docs/
+# Public documentation is allowed in ``docs/``. Keep project tracking and
+# internal review/planning material local and outside the public snapshot.
+/docs/internal/
+/docs/private/
+/docs/reviews/
+/docs/superpowers/
+/docs/drafts/
+/docs/project/
+/docs/tmp/
+/docs/.tmp/
 
 # Haven v0.1.0 is a Windows desktop release; mobile icon bundles are not
 # generated or distributed with the public source snapshot.
 /src-tauri/icons/android/
 /src-tauri/icons/ios/
 
-# Public release curation: source maps and local project tracking stay local.
+# Public release curation: source maps stay local.
 **/*.map
-/docs/project/
 
 # Internal-only helper documentation is not part of the public release snapshot.
 **/AGENTS.md

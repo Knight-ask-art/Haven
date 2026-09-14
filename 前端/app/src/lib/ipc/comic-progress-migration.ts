@@ -9,12 +9,15 @@ import type {
   ComicPageMigrationDto,
   ComicPageProgressRemapRequestDto,
   ComicProgressMigrationModeDto,
+  ComicProgressMigrationReceiptDto,
   ComicProgressMigrationRequestDto,
   ComicProgressMigrationResultDto,
   ComicProgressMigrationRevertRequestDto,
   ComicProgressMigrationRevertResultDto,
+  ComicProgressSnapshotDto,
   ComicProgressMigrationStatusDto,
   ComicMatchConfidenceDto,
+  CompletionWire,
 } from "./generated/wire"
 
 const CANONICAL_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
@@ -200,6 +203,73 @@ function isPageMigration(value: unknown): value is ComicPageMigrationDto {
     && typeof value.reversible === "boolean"
 }
 
+function isCompletion(value: unknown): value is CompletionWire {
+  return isOneOf(value, ["not_started", "in_progress", "completed", "abandoned"])
+}
+
+function isProgressRatio(value: unknown): value is number {
+  return typeof value === "number"
+    && Number.isFinite(value)
+    && value >= 0
+    && value <= 1
+}
+
+function isProgressSnapshot(value: unknown): value is ComicProgressSnapshotDto {
+  return isRecord(value)
+    && hasExactKeys(value, [
+      "mediaItemId",
+      "pageIndex",
+      "pageProgression",
+      "completion",
+      "percentage",
+      "revision",
+      "updatedAt",
+    ])
+    && isSafeOpaque(value.mediaItemId)
+    && (value.pageIndex === null || isSafeCount(value.pageIndex))
+    && (value.pageProgression === null || isProgressRatio(value.pageProgression))
+    && isCompletion(value.completion)
+    && (value.percentage === null || isProgressRatio(value.percentage))
+    && (value.revision === null || isRevision(value.revision))
+    && (value.updatedAt === null || isSafeOpaque(value.updatedAt, 128))
+}
+
+function isMigrationReceipt(value: unknown): value is ComicProgressMigrationReceiptDto {
+  return isRecord(value)
+    && hasExactKeys(value, [
+      "migrationId",
+      "sourceMediaItemId",
+      "targetMediaItemId",
+      "strategy",
+      "confidence",
+      "evidence",
+      "sourceProgressSnapshot",
+      "targetProgressBefore",
+      "targetProgressAfter",
+      "pageMapping",
+      "algorithmVersion",
+      "createdAt",
+      "undoable",
+      "appliedRevision",
+    ])
+    && isCanonicalUuid(value.migrationId)
+    && isSafeOpaque(value.sourceMediaItemId)
+    && isSafeOpaque(value.targetMediaItemId)
+    && isMappingStrategy(value.strategy)
+    && isMappingConfidence(value.confidence)
+    && Array.isArray(value.evidence)
+    && value.evidence.length <= MAX_PAGE_IDENTITIES
+    && value.evidence.every(isEvidence)
+    && (value.sourceProgressSnapshot === null || isProgressSnapshot(value.sourceProgressSnapshot))
+    && (value.targetProgressBefore === null || isProgressSnapshot(value.targetProgressBefore))
+    && (value.targetProgressAfter === null || isProgressSnapshot(value.targetProgressAfter))
+    && isPageMigration(value.pageMapping)
+    && isSafeOpaque(value.algorithmVersion, 128)
+    && isSafeOpaque(value.createdAt, 128)
+    && typeof value.undoable === "boolean"
+    && (value.appliedRevision === null || isRevision(value.appliedRevision))
+}
+
 export function isComicProgressMigrationResultDto(
   value: unknown,
 ): value is ComicProgressMigrationResultDto {
@@ -209,22 +279,29 @@ export function isComicProgressMigrationResultDto(
     "pageMigration",
     "snapshotId",
     "appliedRevision",
+    "receipt",
   ])) return false
 
   if (!isMigrationStatus(value.status)
     || !(value.matchResult === null || isMatch(value.matchResult))
     || !isPageMigration(value.pageMigration)
     || !(value.snapshotId === null || isCanonicalUuid(value.snapshotId))
-    || !(value.appliedRevision === null || isRevision(value.appliedRevision))) {
+    || !(value.appliedRevision === null || isRevision(value.appliedRevision))
+    || !isMigrationReceipt(value.receipt)) {
     return false
   }
 
   // `applied` is the only status that mutates Progress and therefore must expose
   // both rollback identity and the CAS revision used for the write.
   if (value.status === "applied") {
-    return value.snapshotId !== null && value.appliedRevision !== null
+    return value.snapshotId !== null
+      && value.appliedRevision !== null
+      && value.receipt.migrationId === value.snapshotId
+      && value.receipt.appliedRevision === value.appliedRevision
   }
-  return value.snapshotId === null && value.appliedRevision === null
+  return value.snapshotId === null
+    && value.appliedRevision === null
+    && value.receipt.appliedRevision === null
 }
 
 export function isComicProgressMigrationRevertResultDto(

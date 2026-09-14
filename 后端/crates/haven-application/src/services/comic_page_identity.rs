@@ -7,18 +7,17 @@
 use std::sync::Arc;
 
 use haven_common::{AppError, ErrorKind, UtcMillis};
-use haven_domain::comic_identity::{
-    PageIdentity, PageMappingConfidence, PageMappingStrategy, PageMigration,
-    has_opaque_control_character,
-};
+use haven_domain::comic_identity::{PageIdentity, has_opaque_control_character};
 use haven_domain::contracts::ComicPageIdentityRepository;
 use haven_domain::ids::MediaItemId;
 
 use super::comic::PreparedComicPage;
 use super::comic_progress_migration::{
     ComicPageProgressRemapRequest, ComicProgressMigrationResult, ComicProgressMigrationService,
+    unchanged_migration_result,
 };
 use super::ports::ComicProgressMigrationPorts;
+use super::progress::comic_progress_subject::ComicProgressSubjectService;
 
 /// 一次页面身份同步的结果。调用方通常只需要继续使用新的运行时页面
 /// 清单；迁移结果保留下来供测试、日志或未来的 UI 提示使用。
@@ -32,6 +31,7 @@ pub struct ComicPageIdentitySyncResult {
 pub struct ComicPageIdentityService {
     ports: Arc<dyn ComicProgressMigrationPorts>,
     progress_migration: ComicProgressMigrationService,
+    comic_progress_subjects: Option<ComicProgressSubjectService>,
 }
 
 impl ComicPageIdentityService {
@@ -42,7 +42,15 @@ impl ComicPageIdentityService {
         Self {
             ports,
             progress_migration,
+            comic_progress_subjects: None,
         }
+    }
+
+    /// 接入 Subject 级页面迁移。启用后，页面身份、Subject pointer、目标
+    /// Progress 和迁移快照由同一个 Immediate 事务提交。
+    pub fn with_comic_progress_subjects(mut self, subjects: ComicProgressSubjectService) -> Self {
+        self.comic_progress_subjects = Some(subjects);
+        self
     }
 
     /// 将后端刚刚生成的页面身份写入持久化表，并在页面序列发生变化时
@@ -75,7 +83,23 @@ impl ComicPageIdentityService {
         if old_snapshot.pages == new_pages {
             return Ok(ComicPageIdentitySyncResult {
                 changed: false,
-                migration: unchanged_result(),
+                migration: unchanged_result(media_item_id),
+            });
+        }
+
+        if let Some(subjects) = self.comic_progress_subjects.as_ref() {
+            let migration = subjects
+                .synchronize_page_identities_for_media_item(
+                    media_item_id,
+                    old_snapshot.pages,
+                    new_pages,
+                    old_snapshot.revision,
+                    expected_revision,
+                )
+                .await?;
+            return Ok(ComicPageIdentitySyncResult {
+                changed: true,
+                migration,
             });
         }
 
@@ -134,19 +158,8 @@ impl ComicPageIdentityService {
     }
 }
 
-fn unchanged_result() -> ComicProgressMigrationResult {
-    ComicProgressMigrationResult {
-        status: super::comic_progress_migration::ComicProgressMigrationStatus::Unchanged,
-        match_result: None,
-        page_migration: PageMigration {
-            target_page_index: None,
-            confidence: PageMappingConfidence::Low,
-            strategy: PageMappingStrategy::NoTarget,
-            reversible: true,
-        },
-        snapshot_id: None,
-        applied_revision: None,
-    }
+fn unchanged_result(media_item_id: MediaItemId) -> ComicProgressMigrationResult {
+    unchanged_migration_result(media_item_id)
 }
 
 fn validate_expected_revision(value: String) -> Result<String, AppError> {
@@ -208,9 +221,14 @@ mod tests {
     use crate::services::comic_progress_migration::ComicProgressMigrationStatus;
 
     async fn seed_fixture(with_progress: bool) -> (Arc<SqliteRepositories>, MediaItemId) {
-        let repositories = Arc::new(SqliteRepositories::new(Arc::new(
-            Db::open_in_memory().unwrap(),
-        )));
+        seed_fixture_with_db(Arc::new(Db::open_in_memory().unwrap()), with_progress).await
+    }
+
+    async fn seed_fixture_with_db(
+        db: Arc<Db>,
+        with_progress: bool,
+    ) -> (Arc<SqliteRepositories>, MediaItemId) {
+        let repositories = Arc::new(SqliteRepositories::new(db.clone()));
         let work_id = WorkId::new();
         let edition_id = EditionId::new();
         let media_item_id = MediaItemId::new();

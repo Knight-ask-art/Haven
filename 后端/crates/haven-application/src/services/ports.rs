@@ -6,16 +6,20 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use haven_common::AppError;
-use haven_domain::comic_catalog::ComicChapterCatalogState;
-use haven_domain::comic_identity::{ChapterSourceRef, EditionProfile};
-use haven_domain::contracts::{
-    ChapterSourceRepository, ComicPageIdentityRepository, ComicProgressMigrationRepository,
-    EditionProfileRepository, EditionRepository, EnrichmentRepository, FavoriteRepository,
-    MarkerRepository, MediaItemRepository, ProgressRepository, ResourceRepository,
-    SettingsRepository, StorageLocationRepository, WorkRepository,
+use haven_domain::comic_catalog::{ComicCatalogRefreshReceipt, ComicChapterCatalogState};
+use haven_domain::comic_identity::{
+    ChapterSourceRef, ComicProgressMigrationSnapshot, EditionProfile, PageIdentity,
 };
-use haven_domain::entities::{Edition, FavoriteTarget, MediaItem, Resource, Work};
-use haven_domain::ids::WorkId;
+use haven_domain::comic_progress_subject::{ComicProgressSubject, ComicProgressSubjectMember};
+use haven_domain::contracts::{
+    ChapterSourceRepository, ComicCatalogRefreshOutcomeRepository, ComicPageIdentityRepository,
+    ComicProgressMigrationRepository, ComicProgressSubjectRepository, EditionProfileRepository,
+    EditionRepository, EnrichmentRepository, FavoriteRepository, MarkerRepository,
+    MediaItemRepository, ProgressRepository, ResourceRepository, SettingsRepository,
+    StorageLocationRepository, WorkRepository,
+};
+use haven_domain::entities::{Edition, FavoriteTarget, MediaItem, Progress, Resource, Work};
+use haven_domain::ids::{ComicCatalogRefreshId, ComicProgressMigrationId, MediaItemId, WorkId};
 
 /// LibraryService 所需端口。
 /// `Send + Sync`：默认实现方法在 `Arc<dyn LibraryPorts>` 路径下要求
@@ -124,6 +128,7 @@ pub trait SourceImportPorts:
     + MediaItemRepository
     + ResourceRepository
     + ChapterSourceRepository
+    + ComicCatalogRefreshOutcomeRepository
     + haven_domain::contracts::ImageProxyRepository
     + Send
     + Sync
@@ -163,9 +168,91 @@ impl<T> SourceImportPorts for T where
         + MediaItemRepository
         + ResourceRepository
         + ChapterSourceRepository
+        + ComicCatalogRefreshOutcomeRepository
         + haven_domain::contracts::ImageProxyRepository
         + Send
         + Sync
+{
+}
+
+/// Work 级漫画章节只读聚合所需端口。
+///
+/// 聚合只读取 Work（含 `list_source_refs`）、Edition 画像、MediaItem、
+/// ChapterSourceRef、Resource、ComicProgressSubject、Progress 和刷新 Receipt；
+/// 任何写入、事务或网络读取都不在该用例内。MSRV 1.85 无 trait upcasting，因此
+/// 逐个提供 `as_*` 访问方法（与 `SourceRegistryPorts::as_settings` 同规则）。
+pub trait ComicCatalogWorkPorts:
+    WorkRepository
+    + EditionRepository
+    + EditionProfileRepository
+    + MediaItemRepository
+    + ChapterSourceRepository
+    + ResourceRepository
+    + ComicProgressSubjectRepository
+    + ProgressRepository
+    + Send
+    + Sync
+{
+    fn as_work(&self) -> &(dyn WorkRepository + Send + Sync);
+    fn as_edition(&self) -> &dyn EditionRepository;
+    fn as_edition_profile(&self) -> &dyn EditionProfileRepository;
+    fn as_media_item(&self) -> &dyn MediaItemRepository;
+    fn as_chapter_source(&self) -> &dyn ChapterSourceRepository;
+    fn as_resource(&self) -> &(dyn ResourceRepository + Send + Sync);
+    fn as_comic_progress_subject(&self) -> &dyn ComicProgressSubjectRepository;
+    fn as_progress(&self) -> &(dyn ProgressRepository + Send + Sync);
+}
+
+impl<T> ComicCatalogWorkPorts for T
+where
+    T: WorkRepository
+        + EditionRepository
+        + EditionProfileRepository
+        + MediaItemRepository
+        + ChapterSourceRepository
+        + ResourceRepository
+        + ComicProgressSubjectRepository
+        + ProgressRepository
+        + Send
+        + Sync,
+{
+    fn as_work(&self) -> &(dyn WorkRepository + Send + Sync) {
+        self
+    }
+    fn as_edition(&self) -> &dyn EditionRepository {
+        self
+    }
+    fn as_edition_profile(&self) -> &dyn EditionProfileRepository {
+        self
+    }
+    fn as_media_item(&self) -> &dyn MediaItemRepository {
+        self
+    }
+    fn as_chapter_source(&self) -> &dyn ChapterSourceRepository {
+        self
+    }
+    fn as_resource(&self) -> &(dyn ResourceRepository + Send + Sync) {
+        self
+    }
+    fn as_comic_progress_subject(&self) -> &dyn ComicProgressSubjectRepository {
+        self
+    }
+    fn as_progress(&self) -> &(dyn ProgressRepository + Send + Sync) {
+        self
+    }
+}
+
+/// 可选的漫画目录刷新 Receipt 读取端口。
+///
+/// 没有实现 `ComicCatalogRefreshOutcomeRepository` 的组装层不注入该端口，
+/// 聚合根保持空 receipts 并回落到 `NeverSynced`（或按 refresh_state 推导）。
+pub trait ComicCatalogRefreshReceiptPort:
+    ComicCatalogRefreshOutcomeRepository + Send + Sync
+{
+}
+
+impl<T> ComicCatalogRefreshReceiptPort for T where
+    T: ComicCatalogRefreshOutcomeRepository + Send + Sync
 {
 }
 
@@ -222,6 +309,131 @@ pub trait UnitOfWork: Send + Sync {
             false,
         ))
     }
+
+    /// 在同一个 SQLite Immediate 事务中提交漫画进度主体、成员、页面身份、
+    /// 刷新结果、Progress CAS 和可选迁移快照。闭包/实现不得执行异步 IO。
+    fn run_comic_progress_subject_write(
+        &self,
+        _plan: &ComicProgressSubjectWritePlan,
+    ) -> Result<ComicProgressSubjectWriteResult, AppError> {
+        Err(AppError::new(
+            "COMIC_PROGRESS_SUBJECT_UOW_UNAVAILABLE",
+            haven_common::ErrorKind::Internal,
+            "当前 UnitOfWork 不支持漫画进度主体事务",
+            false,
+        ))
+    }
+
+    /// 与既有 Subject 聚合快照进行 Immediate-transaction CAS 的受检写入。
+    fn run_checked_comic_progress_subject_write(
+        &self,
+        _plan: &ComicProgressSubjectWritePlan,
+        _precondition: &ComicProgressSubjectWritePrecondition,
+    ) -> Result<ComicProgressSubjectWriteResult, AppError> {
+        Err(AppError::new(
+            "COMIC_PROGRESS_SUBJECT_UOW_UNAVAILABLE",
+            haven_common::ErrorKind::Internal,
+            "当前 UnitOfWork 不支持受检漫画进度主体事务",
+            false,
+        ))
+    }
+
+    /// 原子合并两个或多个已有 Subject；默认实现供不支持事务的测试替身
+    /// 明确返回 unsupported，避免静默退化为多次独立写入。
+    fn run_comic_progress_subject_merge(
+        &self,
+        _plan: &ComicProgressSubjectMergePlan,
+    ) -> Result<ComicProgressSubjectWriteResult, AppError> {
+        Err(AppError::new(
+            "COMIC_PROGRESS_SUBJECT_UOW_UNAVAILABLE",
+            haven_common::ErrorKind::Internal,
+            "当前 UnitOfWork 不支持漫画进度主体合并事务",
+            false,
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ComicProgressWriteCandidate {
+    pub progress: Progress,
+    pub expected_revision: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComicPageIdentityWriteCandidate {
+    pub media_item_id: MediaItemId,
+    pub pages: Vec<PageIdentity>,
+    pub expected_revision: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComicProgressSubjectWritePlan {
+    pub subject: ComicProgressSubject,
+    pub members: Vec<ComicProgressSubjectMember>,
+    pub page_identity_write: Option<ComicPageIdentityWriteCandidate>,
+    pub progress_writes: Vec<ComicProgressWriteCandidate>,
+    pub migration_snapshot: Option<ComicProgressMigrationSnapshot>,
+    pub refresh_receipt: Option<ComicCatalogRefreshReceipt>,
+}
+
+/// 受检 Subject 写入的事务内前置条件。不能在 Application 的异步读取点判断后
+/// 再相信旧快照；SQLite UoW 必须在同一 Immediate 事务内重新读取并比较。
+#[derive(Debug, Clone)]
+pub enum ComicProgressSubjectWritePrecondition {
+    AbsentActiveMember {
+        media_item_id: MediaItemId,
+    },
+    /// 首次建立一个跨来源 Subject 时，所有待绑定 MediaItem 都必须仍然没有
+    /// active member。这样来源/目标两条成员的首次合并也有明确的事务内 CAS
+    /// 前置条件，而不是把第二条成员的唯一索引错误当作并发协议。
+    AbsentActiveMembers {
+        media_item_ids: Vec<MediaItemId>,
+    },
+    ExactSnapshot {
+        subject: Box<ComicProgressSubject>,
+        members: Vec<ComicProgressSubjectMember>,
+        require_authoritative_progress_none: bool,
+        /// When present, the checked transaction must also prove that this
+        /// MediaItem still has no Progress row before applying the plan.
+        require_progress_absent_for_media_item: Option<MediaItemId>,
+        /// When present, the checked transaction must also prove that the
+        /// specified Progress owner still has this revision. This is used by
+        /// a read-only cross-MediaItem projection: the wire revision belongs
+        /// to the source row, while the write plan inserts a new target row.
+        require_progress_revision_for_media_item: Option<(MediaItemId, String)>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComicProgressSubjectWriteResult {
+    pub applied_progress_revisions: Vec<String>,
+    pub migration_id: Option<ComicProgressMigrationId>,
+    pub refresh_id: Option<ComicCatalogRefreshId>,
+}
+
+/// 参与 Subject 合并的旧聚合快照。
+///
+/// `expected_subject`/`expected_members` 只用于 Immediate 事务内 CAS；真正写入
+/// 的新状态位于 [`ComicProgressSubjectMergePlan`] 的 survivor/redirected_subjects。
+#[derive(Debug, Clone)]
+pub struct ComicProgressSubjectMergeExpected {
+    pub expected_subject: ComicProgressSubject,
+    pub expected_members: Vec<ComicProgressSubjectMember>,
+}
+
+/// 两个或多个已有 Subject 的原子合并计划。
+///
+/// loser 不会被删除：Application 先把它们变为 Redirected，并将 active member
+/// 退休；survivor 再吸收这些成员。可选的 Progress/snapshot 写入与这组 Subject
+/// 状态共享同一个 Immediate 事务。
+#[derive(Debug, Clone)]
+pub struct ComicProgressSubjectMergePlan {
+    pub survivor: ComicProgressSubject,
+    pub survivor_members: Vec<ComicProgressSubjectMember>,
+    pub redirected_subjects: Vec<ComicProgressSubject>,
+    pub expected_subjects: Vec<ComicProgressSubjectMergeExpected>,
+    pub progress_writes: Vec<ComicProgressWriteCandidate>,
+    pub migration_snapshot: Option<ComicProgressMigrationSnapshot>,
 }
 
 /// 一个需要一起落库的漫画 Edition 及其身份画像。
@@ -247,6 +459,10 @@ pub struct ComicChapterRefreshPlan {
     pub items: Vec<MediaItem>,
     pub resources: Vec<Resource>,
     pub chapter_refs: Vec<ChapterSourceRef>,
+    /// Successful refreshes append this receipt in the same SQLite
+    /// transaction as the catalog rows. Failed observations are persisted by
+    /// the application after the catalog transaction has rolled back.
+    pub refresh_receipt: Option<ComicCatalogRefreshReceipt>,
 }
 
 /// Enrichment 流水线所需端口（契约 §36.8）。

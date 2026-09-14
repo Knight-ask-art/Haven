@@ -26,8 +26,10 @@ use haven_application::services::history::HistoryService;
 use haven_application::services::home::HomeService;
 use haven_application::services::library::LibraryService;
 use haven_application::services::marker::MarkerService;
-use haven_application::services::ports::SourceImportPorts;
-use haven_application::services::ports::SourceRegistryPorts;
+use haven_application::services::ports::{
+    ComicCatalogRefreshReceiptPort, ComicCatalogWorkPorts, SourceImportPorts, SourceRegistryPorts,
+};
+use haven_application::services::progress::comic_progress_subject::ComicProgressSubjectService;
 use haven_application::services::progress::ProgressService;
 use haven_application::services::reader_search::ReaderSearchService;
 use haven_application::services::reader_toc::ReaderTocService;
@@ -162,8 +164,15 @@ impl AppState {
         let download_batch = Arc::new(DownloadBatchService::new(repos.clone()));
         let unit_of_work = Arc::new(SqliteUnitOfWork::new(db.clone()));
         let favorite = FavoriteService::new(repos.clone(), unit_of_work.clone());
-        let progress = ProgressService::new(repos.clone());
-        let library = LibraryService::new(repos.clone());
+        // 漫画 Progress 的连续性解析必须是组合根共享的同一个服务实例。
+        // 各 Application service 只持有它的 Clone，不得在命令内临时创建
+        // 第二套 Subject repository/UoW。
+        let comic_progress_subjects =
+            ComicProgressSubjectService::new(repos.clone(), unit_of_work.clone());
+        let progress =
+            ProgressService::with_comic_progress_subjects(repos.clone(), unit_of_work.clone());
+        let library = LibraryService::new(repos.clone())
+            .with_comic_progress_subjects(comic_progress_subjects.clone());
         let storage_location =
             StorageLocationService::new(Arc::new(SqliteStorageUoW::new(db.clone())));
         let search_history = SearchHistoryService::new(repos.clone());
@@ -197,7 +206,8 @@ impl AppState {
         let comic_pages = comic_pages.with_remote_provider(online_catalog.clone());
         let history = HistoryService::new(repos.clone(), Arc::new(settings.clone()));
         let marker = MarkerService::new(repos.clone());
-        let home = HomeService::new(repos.clone());
+        let home = HomeService::new(repos.clone())
+            .with_comic_progress_subjects(comic_progress_subjects.clone());
         // v0.2 来源批次（契约 §36.2/§36.3/§36.5）：
         // - 来源注册表：静态内置目录 + settings KV 持久化启用状态与端点。
         // - 渐进式搜索：固定公开 metadata、CMS10、M3U 与已验证 OPDS 参与者均已接入；
@@ -279,12 +289,17 @@ impl AppState {
             opds_catalog.clone(),
             online_catalog.clone(),
         ));
-        let comic_progress_migration = ComicProgressMigrationService::new(repos.clone());
+        let comic_progress_migration = ComicProgressMigrationService::new(repos.clone())
+            .with_subject_service(comic_progress_subjects.clone());
         let comic_page_identity =
-            ComicPageIdentityService::new(repos.clone(), comic_progress_migration.clone());
+            ComicPageIdentityService::new(repos.clone(), comic_progress_migration.clone())
+                .with_comic_progress_subjects(comic_progress_subjects.clone());
         let session =
             SessionService::new_with_remote(repos.clone(), comic_pages.clone(), remote_session)
-                .with_comic_page_identity_sync(comic_page_identity.clone());
+                .with_comic_page_identity_sync(comic_page_identity.clone())
+                .with_comic_progress_subjects(comic_progress_subjects.clone());
+        let work =
+            WorkService::new(repos.clone()).with_comic_progress_subjects(comic_progress_subjects);
         let online_catalog_source: Arc<dyn haven_application::services::SourceCatalogProvider> =
             online_catalog.clone();
         let remote_acquisition = Arc::new(
@@ -322,7 +337,11 @@ impl AppState {
         );
         let registered_chapters: Arc<dyn haven_domain::contracts::ChapterSourceRepository> =
             repos.clone();
-        let comic_catalog = ComicCatalogService::new(source_import.clone(), registered_chapters);
+        let comic_catalog_ports: Arc<dyn ComicCatalogWorkPorts> = repos.clone();
+        let comic_catalog_receipts: Arc<dyn ComicCatalogRefreshReceiptPort> = repos.clone();
+        let comic_catalog = ComicCatalogService::new(source_import.clone(), registered_chapters)
+            .with_work_catalog_ports(comic_catalog_ports)
+            .with_refresh_receipt_port(comic_catalog_receipts);
         // V2-F（契约 §36.8）：enrichment 流水线 + 扫描 Completed 钩子。
         let enrich_ports: Arc<dyn haven_application::services::ports::EnrichmentPorts> =
             repos.clone();
@@ -449,7 +468,7 @@ impl AppState {
             cache,
             scan,
             scan_sink,
-            work: WorkService::new(repos.clone()),
+            work,
             resource: ResourceService::new(repos),
             comic_pages,
             comic_catalog,

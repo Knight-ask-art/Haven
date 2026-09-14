@@ -24,6 +24,7 @@ use crate::services::comic_page_identity::ComicPageIdentityService;
 use crate::services::ports::{
     RemoteByteRange, RemoteSessionBody, RemoteSessionPort, SessionOpenPorts,
 };
+use crate::services::progress::comic_progress_subject::ComicProgressSubjectService;
 use crate::services::source_import::{source_key_for_id, validate_remote_source_object};
 use crate::wire::{ProgressSummaryDto, SessionEngineDto, SessionOpenRequest, SubtitleFormatDto};
 
@@ -80,6 +81,7 @@ pub struct SessionService {
     ports: Arc<dyn SessionOpenPorts>,
     comic_pages: ComicPageService,
     comic_page_identities: Option<ComicPageIdentityService>,
+    comic_progress_subjects: Option<ComicProgressSubjectService>,
     remote: Option<Arc<dyn RemoteSessionPort>>,
 }
 
@@ -89,6 +91,7 @@ impl SessionService {
             ports,
             comic_pages,
             comic_page_identities: None,
+            comic_progress_subjects: None,
             remote: None,
         }
     }
@@ -105,6 +108,7 @@ impl SessionService {
             ports,
             comic_pages,
             comic_page_identities: None,
+            comic_progress_subjects: None,
             remote: Some(remote),
         }
     }
@@ -114,6 +118,14 @@ impl SessionService {
     /// without requiring the migration repositories.
     pub fn with_comic_page_identity_sync(mut self, synchronizer: ComicPageIdentityService) -> Self {
         self.comic_page_identities = Some(synchronizer);
+        self
+    }
+
+    /// Attach the production ComicProgressSubject resolver. Session is an
+    /// explicit consumption path, so it may materialize the current MediaItem
+    /// view after page identities have been synchronized.
+    pub fn with_comic_progress_subjects(mut self, subjects: ComicProgressSubjectService) -> Self {
+        self.comic_progress_subjects = Some(subjects);
         self
     }
 
@@ -262,11 +274,15 @@ impl SessionService {
             // → RESOURCE_NOT_FOUND，由上层决定是否回退受控流会话。
             return Err(rejected.unwrap_or_else(resource_not_found));
         };
-        let progress = ProgressRepository::get_for_media_item(&*self.ports, media_item_id)
-            .await?
-            .as_ref()
-            .map(progress_summary)
-            .transpose()?;
+        let progress = if media_item.media_type == MediaType::Comic {
+            None
+        } else {
+            ProgressRepository::get_for_media_item(&*self.ports, media_item_id)
+                .await?
+                .as_ref()
+                .map(progress_summary)
+                .transpose()?
+        };
 
         let subtitle_tracks = if request.engine == SessionEngineDto::Playback
             && matches!(
@@ -333,10 +349,20 @@ impl SessionService {
                 synchronizer
                     .synchronize_prepared_pages(media_item_id, &pages, None)
                     .await?;
+            }
+            if let Some(subjects) = &self.comic_progress_subjects {
+                // Page identity synchronization must complete before explicit
+                // Subject materialization so the projection uses the current
+                // page sequence. The optional receipt is intentionally kept
+                // server-side until the Session wire contract grows it.
+                let _ = subjects.materialize_for_media_item(media_item_id).await?;
+                prepared.progress = subjects
+                    .progress_summary_for_media_item(media_item_id)
+                    .await?;
+            } else {
                 // Page identity synchronization may remap Progress and issue a
                 // new revision. Re-read after the write so both the IPC result
-                // and the registered session expose the state that will be
-                // used by the reader, rather than the pre-inspection snapshot.
+                // and the registered session expose the state used by Reader.
                 prepared.progress =
                     ProgressRepository::get_for_media_item(&*self.ports, media_item_id)
                         .await?
