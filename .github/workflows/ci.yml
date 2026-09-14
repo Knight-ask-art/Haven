@@ -161,10 +161,13 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
           HEAD_SHA: ${{ github.sha }}
         run: |
           if (${env:EVENT_NAME} -eq "pull_request") {
             git diff --check "${env:BASE_SHA}" "${env:HEAD_SHA}"
+          } elseif ($env:BEFORE_SHA -and $env:BEFORE_SHA -notmatch '^0+$') {
+            git diff --check "${env:BEFORE_SHA}" "${env:HEAD_SHA}"
           } else {
             git diff --check HEAD^ HEAD
           }
