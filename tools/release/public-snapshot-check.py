@@ -37,7 +37,19 @@ REQUIRED_FILES = {
     "tools/film-tv/evidence-check.py",
     "tools/film-tv/evidence-check.test.py",
 }
-FORBIDDEN_ROOT_SEGMENTS = {"docs", "plan", "测试", "参考项目", "logs", "tmp", ".tmp"}
+# Public documentation is allowed.  Keep the internal planning/review material
+# out of release snapshots by naming the private directories explicitly rather
+# than treating the whole top-level ``docs/`` tree as forbidden.
+FORBIDDEN_ROOT_SEGMENTS = {"plan", "测试", "参考项目", "logs", "tmp", ".tmp"}
+FORBIDDEN_DOCUMENT_PREFIXES = (
+    "docs/internal/",
+    "docs/private/",
+    "docs/reviews/",
+    "docs/superpowers/",
+    "docs/drafts/",
+    "docs/tmp/",
+    "docs/.tmp/",
+)
 FORBIDDEN_PUBLIC_PREFIXES = (
     "src-tauri/icons/android/",
     "src-tauri/icons/ios/",
@@ -96,6 +108,8 @@ def check_public_tree(root: Path, files: list[str], errors: list[str]) -> None:
         normalized = relative.replace("\\", "/")
         if path.parts and path.parts[0] in FORBIDDEN_ROOT_SEGMENTS:
             add_error(errors, f"forbidden public root path is tracked: {normalized}")
+        if any(normalized.lower().startswith(prefix) for prefix in FORBIDDEN_DOCUMENT_PREFIXES):
+            add_error(errors, f"forbidden internal document path is tracked: {normalized}")
         if any(normalized.startswith(prefix) for prefix in FORBIDDEN_PUBLIC_PREFIXES):
             add_error(errors, f"unsupported mobile asset is tracked: {normalized}")
         if any(normalized.startswith(prefix) for prefix in FORBIDDEN_LOCAL_ONLY_PREFIXES):
