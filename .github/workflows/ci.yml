@@ -126,6 +126,12 @@ jobs:
       - name: Check public snapshot and forbidden artifacts
         run: python tools/release/public-snapshot-check.py
 
+      - name: Test public snapshot policy
+        run: python tools/release/public-snapshot-check.test.py
+
+      - name: Test release version policy
+        run: python tools/release/version-check.test.py
+
       - name: Check committed secret markers
         shell: bash
         run: |
