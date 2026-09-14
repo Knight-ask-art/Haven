@@ -17,8 +17,168 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  film-tv-evidence:
-    name: Film/TV local and CI evidence
+  # This job always runs. Only this aggregate check should be required by the
+  # main ruleset; component jobs may legitimately be skipped for docs-only PRs.
+  changes:
+    name: Classify changed scope
+    runs-on: ubuntu-latest
+    outputs:
+      frontend: ${{ steps.scope.outputs.frontend }}
+      backend: ${{ steps.scope.outputs.backend }}
+      tauri: ${{ steps.scope.outputs.tauri }}
+      film_tv: ${{ steps.scope.outputs.film_tv }}
+      full: ${{ steps.scope.outputs.full }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify changed paths
+        id: scope
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" != "pull_request" ]]; then
+            {
+              echo 'frontend=true'
+              echo 'backend=true'
+              echo 'tauri=true'
+              echo 'film_tv=true'
+              echo 'full=true'
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          mapfile -t changed < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          frontend=false
+          backend=false
+          tauri=false
+          film_tv=false
+          full=false
+
+          for path in "${changed[@]}"; do
+            lower="${path,,}"
+            case "$path" in
+              前端/*|.node-version)
+                frontend=true ;;
+              后端/*|rust-toolchain.toml|Cargo.toml|Cargo.lock)
+                backend=true ;;
+              src-tauri/*|rust-toolchain.toml)
+                tauri=true ;;
+            esac
+
+            # Film/TV evidence is tied to the public contract, its checker,
+            # and media-specific implementation/fixture paths.
+            if [[ "$lower" =~ (^|/)(film-tv|film_tv|video|movie|tv)(/|\.|-|$) ]] ||
+               [[ "$path" == contracts/film-tv/* ]] ||
+               [[ "$path" == tools/film-tv/* ]]; then
+              film_tv=true
+            fi
+
+            # Workflow, dependency, build, and release-policy changes can
+            # affect every layer even when their path is not component code.
+            case "$path" in
+              .github/*|build.ps1|tools/release/*|contracts/ipc/*|前端/app/package.json|前端/app/package-lock.json)
+                full=true ;;
+            esac
+          done
+
+          if [[ "$full" == true ]]; then
+            frontend=true
+            backend=true
+            tauri=true
+            film_tv=true
+          fi
+
+          {
+            echo "frontend=$frontend"
+            echo "backend=$backend"
+            echo "tauri=$tauri"
+            echo "film_tv=$film_tv"
+            echo "full=$full"
+          } >> "$GITHUB_OUTPUT"
+
+  base-checks:
+    name: Public policy and repository integrity
+    needs: changes
+    if: always()
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
+      - name: Check public snapshot and forbidden artifacts
+        run: python tools/release/public-snapshot-check.py
+
+      - name: Check release versions
+        run: python tools/release/version-check.py --version 0.1.0-beta.1
+
+      - name: Check repository whitespace integrity
+        shell: pwsh
+        run: git diff --check HEAD^ HEAD
+
+  frontend:
+    name: Frontend checks
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: 前端/app/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: 前端/app
+        run: npm ci --no-audit --no-fund
+
+      - name: Frontend lint
+        working-directory: 前端/app
+        run: npm run lint
+
+      - name: Frontend governance
+        working-directory: 前端/app
+        run: npm run governance:check
+
+      - name: Frontend fixture contract
+        working-directory: 前端/app
+        run: npm run fixtures:check
+
+      - name: Frontend tests
+        working-directory: 前端/app
+        run: npm run test
+
+      - name: Frontend build
+        working-directory: 前端/app
+        run: npm run build
+
+  backend:
+    name: Backend Rust checks
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -30,11 +190,88 @@ jobs:
       - name: Configure ASCII Cargo target directory
         shell: pwsh
         run: |
-          $temp = Join-Path $env:RUNNER_TEMP "haven-film-tv-temp"
+          $temp = Join-Path $env:RUNNER_TEMP "haven-backend-temp"
           New-Item -ItemType Directory -Force -Path $temp | Out-Null
-          Add-Content -Path $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$env:RUNNER_TEMP/haven-film-tv-target"
+          Add-Content -Path $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$env:RUNNER_TEMP/haven-backend-target"
           Add-Content -Path $env:GITHUB_ENV -Value "TEMP=$temp"
           Add-Content -Path $env:GITHUB_ENV -Value "TMP=$temp"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+
+      - name: Backend format
+        working-directory: 后端
+        run: cargo fmt --all -- --check
+
+      - name: Backend clippy
+        working-directory: 后端
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Backend build
+        working-directory: 后端
+        run: cargo build --workspace --locked
+
+      - name: Backend tests
+        working-directory: 后端
+        run: cargo test --workspace --locked
+
+  tauri:
+    name: Tauri checks
+    needs: changes
+    if: needs.changes.outputs.tauri == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Configure ASCII Cargo target directory
+        shell: pwsh
+        run: |
+          $temp = Join-Path $env:RUNNER_TEMP "haven-tauri-temp"
+          New-Item -ItemType Directory -Force -Path $temp | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$env:RUNNER_TEMP/haven-tauri-target"
+          Add-Content -Path $env:GITHUB_ENV -Value "TEMP=$temp"
+          Add-Content -Path $env:GITHUB_ENV -Value "TMP=$temp"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+
+      - name: Tauri format
+        working-directory: src-tauri
+        run: cargo fmt --all -- --check
+
+      - name: Tauri clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tauri custom-protocol build
+        working-directory: src-tauri
+        run: cargo build --locked --features custom-protocol
+
+      - name: Tauri tests
+        working-directory: src-tauri
+        run: cargo test --locked
+
+  film-tv-evidence:
+    name: Film/TV blocking evidence
+    needs: changes
+    if: needs.changes.outputs.film_tv == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -44,19 +281,17 @@ jobs:
           cache-dependency-path: 前端/app/package-lock.json
 
       - name: Setup Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        uses: actions/setup-python@v7
         with:
           python-version: "3.x"
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.94.1
-          components: rustfmt, clippy
 
       - name: Install frontend dependencies
         working-directory: 前端/app
         run: npm ci --no-audit --no-fund
+
+      - name: Film/TV fixture contract
+        working-directory: 前端/app
+        run: npm run fixtures:check
 
       - name: Test film/TV evidence checker
         run: python tools/film-tv/evidence-check.test.py
@@ -75,106 +310,42 @@ jobs:
           path: ${{ runner.temp }}/film-tv-ci-evidence.json
           if-no-files-found: error
 
-  build-and-check:
-    name: Public build and release checks
-    runs-on: windows-latest
-    timeout-minutes: 45
+  pr-gate:
+    name: PR Gate
+    needs: [changes, base-checks, frontend, backend, tauri, film-tv-evidence]
+    if: always()
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      - name: Configure ASCII Cargo target directory
-        # Keep native build outputs outside the Chinese checkout path. Some
-        # third-party C/assembly build scripts (notably aws-lc-sys) still fail
-        # when their output path contains non-ASCII characters.
-        shell: pwsh
+      - name: Require applicable checks to pass
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          BASE_RESULT: ${{ needs['base-checks'].result }}
+          FRONTEND_RESULT: ${{ needs.frontend.result }}
+          BACKEND_RESULT: ${{ needs.backend.result }}
+          TAURI_RESULT: ${{ needs.tauri.result }}
+          FILM_TV_RESULT: ${{ needs['film-tv-evidence'].result }}
+          FRONTEND_REQUIRED: ${{ needs.changes.outputs.frontend }}
+          BACKEND_REQUIRED: ${{ needs.changes.outputs.backend }}
+          TAURI_REQUIRED: ${{ needs.changes.outputs.tauri }}
+          FILM_TV_REQUIRED: ${{ needs.changes.outputs.film_tv }}
         run: |
-          $temp = Join-Path $env:RUNNER_TEMP "haven-temp"
-          New-Item -ItemType Directory -Force -Path $temp | Out-Null
-          Add-Content -Path $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$env:RUNNER_TEMP/haven-target"
-          # Keep tempfile paths stable and free of Windows 8.3 aliases. The
-          # storage-location integration tests compare canonical paths.
-          Add-Content -Path $env:GITHUB_ENV -Value "TEMP=$temp"
-          Add-Content -Path $env:GITHUB_ENV -Value "TMP=$temp"
+          set -euo pipefail
+          [[ "$CHANGES_RESULT" == success ]] || { echo "scope classification failed"; exit 1; }
+          [[ "$BASE_RESULT" == success ]] || { echo "base checks failed"; exit 1; }
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version-file: .node-version
-          cache: npm
-          cache-dependency-path: 前端/app/package-lock.json
+          require_if_selected() {
+            local selected="$1" result="$2" label="$3"
+            if [[ "$selected" == true && "$result" != success ]]; then
+              echo "$label is required but finished with $result"
+              return 1
+            fi
+            if [[ "$selected" != true && "$result" != skipped && "$result" != success ]]; then
+              echo "$label was not selected but finished with $result"
+              return 1
+            fi
+          }
 
-      - name: Setup Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.x"
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.94.1
-          components: rustfmt, clippy
-
-      - name: Check public snapshot
-        run: python tools/release/public-snapshot-check.py
-
-      - name: Check release versions
-        run: python tools/release/version-check.py --version 0.1.0-beta.1
-
-      - name: Install frontend dependencies
-        working-directory: 前端/app
-        run: npm ci --no-audit --no-fund
-
-      - name: Frontend lint
-        working-directory: 前端/app
-        run: npm run lint
-
-      - name: Frontend governance
-        working-directory: 前端/app
-        run: npm run governance:check
-
-      - name: Film/TV fixture contract
-        working-directory: 前端/app
-        run: npm run fixtures:check
-
-      - name: Frontend tests
-        working-directory: 前端/app
-        run: npm run test
-
-      - name: Frontend build
-        working-directory: 前端/app
-        run: npm run build
-
-      - name: Backend format
-        working-directory: 后端
-        run: cargo fmt --all -- --check
-
-      - name: Backend clippy
-        working-directory: 后端
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Backend build
-        working-directory: 后端
-        run: cargo build --workspace
-
-      - name: Backend tests
-        working-directory: 后端
-        run: cargo test --workspace --locked
-
-      - name: Tauri format
-        working-directory: src-tauri
-        run: cargo fmt --all -- --check
-
-      - name: Tauri clippy
-        working-directory: src-tauri
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Tauri custom-protocol build
-        working-directory: src-tauri
-        run: cargo build --locked --features custom-protocol
-
-      - name: Tauri tests
-        working-directory: src-tauri
-        run: cargo test --locked
+          require_if_selected "$FRONTEND_REQUIRED" "$FRONTEND_RESULT" frontend
+          require_if_selected "$BACKEND_REQUIRED" "$BACKEND_RESULT" backend
+          require_if_selected "$TAURI_REQUIRED" "$TAURI_RESULT" tauri
+          require_if_selected "$FILM_TV_REQUIRED" "$FILM_TV_RESULT" film-tv

@@ -21,13 +21,77 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: Classify analysis scope
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.scope.outputs.rust }}
+      tauri: ${{ steps.scope.outputs.tauri }}
+      javascript: ${{ steps.scope.outputs.javascript }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify changed paths
+        id: scope
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" != "pull_request" ]]; then
+            echo 'rust=true' >> "$GITHUB_OUTPUT"
+            echo 'tauri=true' >> "$GITHUB_OUTPUT"
+            echo 'javascript=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          mapfile -t changed < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          rust=false
+          tauri=false
+          javascript=false
+          full=false
+          for path in "${changed[@]}"; do
+            case "$path" in
+              后端/*|src-tauri/*|Cargo.toml|Cargo.lock|rust-toolchain.toml)
+                rust=true ;;
+            esac
+            case "$path" in
+              src-tauri/*|rust-toolchain.toml)
+                tauri=true ;;
+              前端/*|.node-version|*.js|*.jsx|*.ts|*.tsx|*.mjs|*.cjs)
+                javascript=true ;;
+            esac
+            case "$path" in
+              .github/*|build.ps1|tools/release/*|contracts/ipc/*|前端/app/package.json|前端/app/package-lock.json)
+                full=true ;;
+            esac
+          done
+          if [[ "$full" == true ]]; then
+            rust=true
+            tauri=true
+            javascript=true
+          fi
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "tauri=$tauri" >> "$GITHUB_OUTPUT"
+          echo "javascript=$javascript" >> "$GITHUB_OUTPUT"
+
   analyze-rust:
     name: Analyze Rust
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Configure ASCII Cargo target directory
         run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/haven-target" >> "$GITHUB_ENV"
@@ -49,6 +113,11 @@ jobs:
         working-directory: 后端
         run: cargo build --workspace --locked
 
+      - name: Build Tauri for CodeQL extraction
+        if: needs.changes.outputs.tauri == 'true'
+        working-directory: src-tauri
+        run: cargo build --locked --features custom-protocol
+
       - name: Analyze
         uses: github/codeql-action/analyze@v4
         with:
@@ -56,18 +125,68 @@ jobs:
 
   analyze-javascript:
     name: Analyze JavaScript and TypeScript
+    needs: changes
+    if: needs.changes.outputs.javascript == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: 前端/app/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: 前端/app
+        run: npm ci --no-audit --no-fund
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
           languages: javascript-typescript
 
+      - name: Build frontend for CodeQL extraction
+        working-directory: 前端/app
+        run: npm run build
+
       - name: Analyze
         uses: github/codeql-action/analyze@v4
         with:
           category: /language:javascript-typescript
+
+  codeql-gate:
+    name: CodeQL Gate
+    needs: [changes, analyze-rust, analyze-javascript]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require applicable analyses to pass
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          RUST_RESULT: ${{ needs.analyze-rust.result }}
+          JAVASCRIPT_RESULT: ${{ needs['analyze-javascript'].result }}
+          RUST_REQUIRED: ${{ needs.changes.outputs.rust }}
+          TAURI_REQUIRED: ${{ needs.changes.outputs.tauri }}
+          JAVASCRIPT_REQUIRED: ${{ needs.changes.outputs.javascript }}
+        run: |
+          set -euo pipefail
+          [[ "$CHANGES_RESULT" == success ]] || { echo "analysis scope classification failed"; exit 1; }
+          require_if_selected() {
+            local selected="$1" result="$2" label="$3"
+            if [[ "$selected" == true && "$result" != success ]]; then
+              echo "$label CodeQL analysis is required but finished with $result"
+              return 1
+            fi
+            if [[ "$selected" != true && "$result" != skipped && "$result" != success ]]; then
+              echo "$label CodeQL analysis was not selected but finished with $result"
+              return 1
+            fi
+          }
+          require_if_selected "$RUST_REQUIRED" "$RUST_RESULT" Rust
+          require_if_selected "$JAVASCRIPT_REQUIRED" "$JAVASCRIPT_RESULT" JavaScript/TypeScript
