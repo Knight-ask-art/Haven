@@ -39,12 +39,14 @@ class PublicSnapshotTreeTests(unittest.TestCase):
             "docs/project/roadmap.md",
             "docs/tmp/session.md",
             "docs/.tmp/diagnostic.md",
+            "DOCS/PRIVATE/uppercase.md",
+            "PLAN/uppercase.md",
         )
 
         internal_errors = [
             error for error in errors if "forbidden internal document path" in error
         ]
-        self.assertEqual(len(internal_errors), 8)
+        self.assertEqual(len(internal_errors), 9)
 
     def test_existing_non_document_security_boundaries_remain_forbidden(self) -> None:
         errors = self._errors(

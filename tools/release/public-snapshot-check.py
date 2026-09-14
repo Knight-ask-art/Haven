@@ -36,6 +36,9 @@ REQUIRED_FILES = {
     "contracts/film-tv/acceptance-matrix.json",
     "tools/film-tv/evidence-check.py",
     "tools/film-tv/evidence-check.test.py",
+    "tools/release/public-snapshot-check.test.py",
+    "tools/release/version-check.py",
+    "tools/release/version-check.test.py",
 }
 # Public documentation is allowed.  Keep the internal planning/review material
 # out of release snapshots by naming the private directories explicitly rather
@@ -50,6 +53,9 @@ FORBIDDEN_DOCUMENT_PREFIXES = (
     "docs/project/",
     "docs/tmp/",
     "docs/.tmp/",
+)
+FORBIDDEN_ROOT_SEGMENTS_CASEFOLDED = frozenset(
+    segment.casefold() for segment in FORBIDDEN_ROOT_SEGMENTS
 )
 FORBIDDEN_PUBLIC_PREFIXES = (
     "src-tauri/icons/android/",
@@ -118,13 +124,14 @@ def check_public_tree(root: Path, files: list[str], errors: list[str]) -> None:
     for relative in files:
         path = Path(relative)
         normalized = relative.replace("\\", "/")
-        if path.parts and path.parts[0] in FORBIDDEN_ROOT_SEGMENTS:
+        normalized_casefold = normalized.casefold()
+        if path.parts and path.parts[0].casefold() in FORBIDDEN_ROOT_SEGMENTS_CASEFOLDED:
             add_error(errors, f"forbidden public root path is tracked: {normalized}")
-        if any(normalized.lower().startswith(prefix) for prefix in FORBIDDEN_DOCUMENT_PREFIXES):
+        if any(normalized_casefold.startswith(prefix.casefold()) for prefix in FORBIDDEN_DOCUMENT_PREFIXES):
             add_error(errors, f"forbidden internal document path is tracked: {normalized}")
-        if any(normalized.startswith(prefix) for prefix in FORBIDDEN_PUBLIC_PREFIXES):
+        if any(normalized_casefold.startswith(prefix.casefold()) for prefix in FORBIDDEN_PUBLIC_PREFIXES):
             add_error(errors, f"unsupported mobile asset is tracked: {normalized}")
-        if any(normalized.startswith(prefix) for prefix in FORBIDDEN_LOCAL_ONLY_PREFIXES):
+        if any(normalized_casefold.startswith(prefix.casefold()) for prefix in FORBIDDEN_LOCAL_ONLY_PREFIXES):
             add_error(errors, f"local-only diagnostic or upstream test is tracked: {normalized}")
         forbidden_directory_names = {
             "diagnostics",
@@ -135,7 +142,7 @@ def check_public_tree(root: Path, files: list[str], errors: list[str]) -> None:
         }
         if any(part.lower() in forbidden_directory_names for part in path.parts):
             add_error(errors, f"local diagnostic directory is tracked: {normalized}")
-        lower = normalized.lower()
+        lower = normalized_casefold
         if path.name.lower() in FORBIDDEN_FILE_NAMES:
             add_error(errors, f"local secret configuration is tracked: {normalized}")
         if any(lower.endswith(suffix) for suffix in FORBIDDEN_SUFFIXES):
