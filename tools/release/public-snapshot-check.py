@@ -47,6 +47,7 @@ FORBIDDEN_DOCUMENT_PREFIXES = (
     "docs/reviews/",
     "docs/superpowers/",
     "docs/drafts/",
+    "docs/project/",
     "docs/tmp/",
     "docs/.tmp/",
 )
