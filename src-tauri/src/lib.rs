@@ -19,6 +19,8 @@ pub mod stream_registry;
 include!("../command-manifest.rs");
 pub const COMMAND_MANIFEST: &[(&str, &str)] = TARGET_COMMANDS;
 
+// 供 main.rs 调用的 std::sync::Arc 别名（Rust 1.85 无 std Arc 需显式 use）。
+use std::sync::Arc;
 use tauri::Manager;
 
 use haven_infrastructure::Db;
@@ -93,5 +95,24 @@ pub fn run() {
     .expect("运行栖阅 Haven 失败");
 }
 
-// 供 main.rs 调用的 std::sync::Arc 别名（Rust 1.85 无 std Arc 需显式 use）。
-use std::sync::Arc;
+#[cfg(test)]
+mod command_manifest_tests {
+    #[test]
+    fn comic_work_catalog_commands_are_registered_once() {
+        let names: Vec<&str> = super::TARGET_COMMAND_NAMES.to_vec();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| **name == "comic_work_chapter_catalog_get")
+                .count(),
+            1
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| **name == "comic_work_chapter_catalog_refresh")
+                .count(),
+            1
+        );
+    }
+}

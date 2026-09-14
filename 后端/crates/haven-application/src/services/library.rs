@@ -13,6 +13,7 @@ use haven_common::AppError;
 
 use crate::mapper::work_card::{WorkCardInput, work_card};
 use crate::services::ports::LibraryPorts;
+use crate::services::progress::comic_progress_subject::ComicProgressSubjectService;
 use crate::wire::{LibraryListRequest, LibraryListSort, PageDto, WorkCardDto};
 
 /// 服务端强制上限（契约要求限制 limit）。
@@ -21,11 +22,22 @@ pub const MAX_LIMIT: u32 = 200;
 #[derive(Clone)]
 pub struct LibraryService {
     ports: Arc<dyn LibraryPorts>,
+    comic_progress_subjects: Option<ComicProgressSubjectService>,
 }
 
 impl LibraryService {
     pub fn new(ports: Arc<dyn LibraryPorts>) -> Self {
-        Self { ports }
+        Self {
+            ports,
+            comic_progress_subjects: None,
+        }
+    }
+
+    /// 启用漫画 Subject 的只读列表投影。列表加载只解析已有 Subject/Progress，
+    /// 不创建 Subject、不回填 pointer，也不物化新的 Progress。
+    pub fn with_comic_progress_subjects(mut self, subjects: ComicProgressSubjectService) -> Self {
+        self.comic_progress_subjects = Some(subjects);
+        self
     }
 
     pub async fn list(
@@ -227,7 +239,22 @@ impl LibraryService {
             .flatten()
             .map(|media_item| media_item.id)
             .collect();
-        let progress_map = self.ports.get_for_media_items(&media_ids).await?;
+        let mut progress_map = self.ports.get_for_media_items(&media_ids).await?;
+        if let Some(subjects) = self.comic_progress_subjects.as_ref() {
+            for media_item in work_media_items(&media_by_edition, &editions_by_work, works) {
+                if media_item.media_type != haven_domain::enums::MediaType::Comic {
+                    continue;
+                }
+                match subjects.progress_for_media_item(media_item.id).await? {
+                    Some(progress) => {
+                        progress_map.insert(media_item.id, progress);
+                    }
+                    None => {
+                        progress_map.remove(&media_item.id);
+                    }
+                }
+            }
+        }
 
         let favorites = self
             .ports
@@ -288,6 +315,27 @@ impl LibraryService {
             .await?
             .into_values()
             .max_by_key(|progress| (progress.last_active_at, progress.id));
+
+        let progress = if let Some(subjects) = self.comic_progress_subjects.as_ref() {
+            let mut resolved = None;
+            for media_item in &media_items {
+                if media_item.media_type == haven_domain::enums::MediaType::Comic {
+                    if let Some(progress) = subjects.progress_for_media_item(media_item.id).await? {
+                        if resolved.as_ref().is_none_or(
+                            |current: &haven_domain::entities::Progress| {
+                                (progress.last_active_at, progress.id)
+                                    > (current.last_active_at, current.id)
+                            },
+                        ) {
+                            resolved = Some(progress);
+                        }
+                    }
+                }
+            }
+            resolved.or(progress)
+        } else {
+            progress
+        };
         let favorite = self
             .ports
             .is_favorite(&haven_domain::entities::FavoriteTarget::Work(work.id))
@@ -301,6 +349,27 @@ impl LibraryService {
             favorite,
         })
     }
+}
+
+/// Flatten the already loaded Work → Edition → MediaItem maps without issuing
+/// additional repository queries. This keeps Subject list projection read-only
+/// while retaining the existing batched repository access pattern.
+fn work_media_items<'a>(
+    media_by_edition: &'a std::collections::HashMap<
+        haven_domain::ids::EditionId,
+        Vec<haven_domain::entities::MediaItem>,
+    >,
+    editions_by_work: &std::collections::HashMap<
+        haven_domain::ids::WorkId,
+        Vec<haven_domain::entities::Edition>,
+    >,
+    works: &'a [haven_domain::entities::Work],
+) -> Vec<&'a haven_domain::entities::MediaItem> {
+    works
+        .iter()
+        .flat_map(|work| editions_by_work.get(&work.id).into_iter().flatten())
+        .flat_map(|edition| media_by_edition.get(&edition.id).into_iter().flatten())
+        .collect()
 }
 
 /// cursor 为 opaque string；第一版解析为数字 offset（契约要求前端不得解析，
