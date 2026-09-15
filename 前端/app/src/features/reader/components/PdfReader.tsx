@@ -139,7 +139,7 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
     void loadPdfDocument(documentSource, { signal: abortController.signal })
       .then((document) => {
         if (!active || requestRef.current !== requestId) {
-          void document.destroy()
+          void destroyPdfDocument(document)
           return
         }
         loadedDocument = document
@@ -230,7 +230,7 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
         if (!context) throw new Error("PDF canvas unavailable")
         context.clearRect(0, 0, canvas.width, canvas.height)
         const renderTask = page.render({
-          canvasContext: context,
+          canvas,
           viewport,
           transform: outputScale === 1 ? undefined : [outputScale, 0, 0, outputScale, 0, 0],
         })
