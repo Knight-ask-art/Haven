@@ -14,6 +14,7 @@ import { getHavenClient, getHavenClientMode } from "@/lib/ipc/runtime"
 import { artworkRequestUri } from "@/lib/artwork-url"
 import { pickCardImage } from "@/lib/artwork-policy"
 import { defaultCoverCategoryForMediaType } from "@/lib/default-cover"
+import { contentCategoryLabel } from "@/features/media/lib/periodical-presentation"
 
 import type {
 
@@ -64,7 +65,7 @@ const CATEGORY_LABELS: Record<string, string> = {
 }
 
 function categoryLabel(card: WorkCardDto): string {
-  return CATEGORY_LABELS[card.categories[0]] ?? card.categories[0] ?? "媒体"
+  return CATEGORY_LABELS[card.categories[0]] ?? contentCategoryLabel(card.categories[0])
 }
 
 export type FootprintActionCard = MediaCardProps & {
@@ -123,6 +124,8 @@ export async function getFavoriteFootprintItems(): Promise<FootprintActionCard[]
 const PROGRESS_LABEL: Record<string, string> = {
   video: "继续观看",
   book: "继续阅读",
+  periodical: "继续翻阅",
+  document: "继续查阅",
   comic: "继续阅读",
   article: "继续阅读",
 }
@@ -138,9 +141,11 @@ function buildMediaItemIndex(cards: WorkCardDto[]): Map<string, WorkCardDto> {
 }
 
 function deriveMediaType(card: WorkCardDto): string {
+  if (card.categories.includes("periodical")) return "periodical"
   const media = card.availableMediaTypes
   if (media.includes("movie") || media.includes("series") || media.includes("episode")) return "video"
-  if (media.includes("book") || media.includes("document")) return "book"
+  if (media.includes("document")) return "document"
+  if (media.includes("book")) return "book"
   if (media.includes("comic")) return "comic"
   if (media.includes("article")) return "article"
   return card.categories[0] ?? "video"

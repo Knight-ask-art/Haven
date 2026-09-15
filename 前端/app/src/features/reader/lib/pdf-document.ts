@@ -53,6 +53,7 @@ export interface PdfSessionSource {
 export type PdfDocumentSource = ArrayBuffer | PdfSessionSource
 
 let workerConfigured = false
+const loadingTasks = new WeakMap<PDFDocumentProxy, PDFDocumentLoadingTask>()
 
 function configurePdfWorker(): void {
   if (workerConfigured) return
@@ -154,7 +155,6 @@ class SessionPdfRangeTransport extends PDFDataRangeTransport {
           throw new PdfReaderError("PDF_RANGE_FAILED", "PDF 分段读取返回了无效范围")
         }
         this.onDataRange(begin, new Uint8Array(payload.bytes))
-        this.onDataProgress(range.end + 1, range.total)
       })
       .catch((error: unknown) => {
         if (this.aborted || controller.signal.aborted) return
@@ -196,26 +196,24 @@ export async function loadPdfDocument(
   const rangeTransport = isBytesSource
     ? null
     : new SessionPdfRangeTransport(source.totalBytes, source.contentUri, source.initialData, options.signal)
-  let loadingTask: PDFDocumentLoadingTask | null = null
+  const loadingTask: PDFDocumentLoadingTask = isBytesSource
+    ? getDocument({ data: new Uint8Array(source) })
+    : getDocument({
+        range: rangeTransport ?? undefined,
+        disableStream: true,
+        disableAutoFetch: true,
+        rangeChunkSize: PDF_RANGE_CHUNK_SIZE,
+      })
   let abortHandler: (() => void) | null = null
   let documentLoaded = false
   try {
-    loadingTask = isBytesSource
-      ? getDocument({ data: new Uint8Array(source) })
-      : getDocument({
-          range: rangeTransport ?? undefined,
-          disableStream: true,
-          disableAutoFetch: true,
-          rangeChunkSize: PDF_RANGE_CHUNK_SIZE,
-        })
-    abortHandler = () => {
-      void loadingTask?.destroy()
-    }
+    abortHandler = () => { void loadingTask.destroy() }
     options.signal?.addEventListener("abort", abortHandler, { once: true })
     const document = await loadingTask.promise
     documentLoaded = true
+    loadingTasks.set(document, loadingTask)
     if (options.signal?.aborted) {
-      await document.destroy()
+      await destroyPdfDocument(document)
       throw createCancelledError()
     }
     return document
@@ -231,5 +229,11 @@ export async function loadPdfDocument(
 
 export async function destroyPdfDocument(document: PDFDocumentProxy | null | undefined): Promise<void> {
   if (!document) return
-  await document.destroy()
+  const loadingTask = loadingTasks.get(document)
+  loadingTasks.delete(document)
+  if (loadingTask) {
+    await loadingTask.destroy()
+    return
+  }
+  await document.cleanup()
 }

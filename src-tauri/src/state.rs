@@ -201,8 +201,15 @@ impl AppState {
             })?,
         );
         let online_catalog = Arc::new(
-            haven_infrastructure::online_sources::OnlineCatalogProvider::new(online_client),
+            haven_infrastructure::online_sources::OnlineCatalogProvider::new(online_client.clone()),
         );
+        // 专用报刊 Provider：与正文 Provider 共享同一条固定主机客户端，
+        // 不建立第二套 HTTP 栈；期刊 Repository 与 AppState 的 SqliteRepositories 同源。
+        let periodical_provider = Arc::new(
+            haven_infrastructure::periodical::EuropePmcPeriodicalProvider::new(online_client),
+        );
+        let periodical_repository: Arc<dyn haven_domain::contracts::PeriodicalRepository> =
+            repos.clone();
         let comic_pages = comic_pages.with_remote_provider(online_catalog.clone());
         let history = HistoryService::new(repos.clone(), Arc::new(settings.clone()));
         let marker = MarkerService::new(repos.clone());
@@ -334,7 +341,8 @@ impl AppState {
             unit_of_work.clone(),
             source_registry.clone(),
             catalog_router.clone(),
-        );
+        )
+        .with_periodical_source(periodical_provider.clone(), periodical_repository.clone());
         let registered_chapters: Arc<dyn haven_domain::contracts::ChapterSourceRepository> =
             repos.clone();
         let comic_catalog_ports: Arc<dyn ComicCatalogWorkPorts> = repos.clone();
@@ -354,7 +362,8 @@ impl AppState {
                 unit_of_work.clone(),
                 source_registry.clone(),
                 catalog_router.clone(),
-            ),
+            )
+            .with_periodical_source(periodical_provider, periodical_repository),
         );
         {
             let enrichment = enrichment.clone();

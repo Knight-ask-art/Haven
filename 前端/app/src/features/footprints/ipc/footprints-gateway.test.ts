@@ -219,4 +219,21 @@ describe("footprints gateway runtime boundary", () => {
       progress: 40,
     }))
   })
+
+  it("renders periodical cards with the product label instead of the raw enum", async () => {
+    mocks.getHavenClientMode.mockReturnValue("tauri")
+    const card = workCard()
+    card.categories = ["periodical"]
+    card.availableMediaTypes = ["document"]
+    mocks.getHavenClient.mockReturnValue({
+      libraryList: vi.fn().mockResolvedValue(page([card])),
+    })
+
+    await expect(getFavoriteFootprintItems()).resolves.toEqual([
+      expect.objectContaining({
+        subtitle: "已收藏 · 报刊资料",
+        typeBadge: "报刊资料",
+      }),
+    ])
+  })
 })

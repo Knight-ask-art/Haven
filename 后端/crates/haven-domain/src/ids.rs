@@ -86,6 +86,10 @@ id_type!(ProgressId, "进度 ID");
 id_type!(ComicProgressMigrationId, "漫画进度迁移 ID");
 id_type!(ComicProgressSubjectId, "漫画进度主体 ID");
 id_type!(ComicCatalogRefreshId, "漫画目录刷新结果 ID");
+id_type!(PeriodicalId, "期刊 ID");
+id_type!(PeriodicalVolumeId, "期刊卷 ID");
+id_type!(PeriodicalIssueId, "期刊期号 ID");
+id_type!(PeriodicalArticleId, "期刊文章 ID");
 
 /// 指向系统凭据存储的引用（不存明文凭据本身）。
 ///

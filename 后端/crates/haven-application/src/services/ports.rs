@@ -20,6 +20,7 @@ use haven_domain::contracts::{
 };
 use haven_domain::entities::{Edition, FavoriteTarget, MediaItem, Progress, Resource, Work};
 use haven_domain::ids::{ComicCatalogRefreshId, ComicProgressMigrationId, MediaItemId, WorkId};
+use haven_domain::periodical::{Periodical, PeriodicalArticle, PeriodicalIssue, PeriodicalVolume};
 
 /// LibraryService 所需端口。
 /// `Send + Sync`：默认实现方法在 `Arc<dyn LibraryPorts>` 路径下要求
@@ -351,6 +352,43 @@ pub trait UnitOfWork: Send + Sync {
             false,
         ))
     }
+
+    /// 在同一个 SQLite 事务中提交 期刊 → 卷 → 期 → 文章 与
+    /// Work → Edition → MediaItem → Resource 的整条导入链。
+    ///
+    /// 不允许用多次独立 save 假装原子：任一层的失败都必须回滚整次导入，
+    /// 不留下来源引用或孤儿层级。默认实现给不支持该事务的测试替身返回
+    /// 明确的 Unsupported。
+    fn run_periodical_import(&self, _plan: &PeriodicalImportPlan) -> Result<(), AppError> {
+        Err(AppError::new(
+            "PERIODICAL_IMPORT_UOW_UNAVAILABLE",
+            haven_common::ErrorKind::Internal,
+            "当前 UnitOfWork 不支持报刊导入事务",
+            false,
+        ))
+    }
+}
+
+/// 一次报刊文章导入的完整原子写入计划。
+///
+/// 计划已包含 Work → Edition → MediaItem → Resource 与 期刊 → 卷 → 期 → 文章
+/// 的全部行；Application 在事务外完成 Provider 校验与身份匹配，SQLite UoW 在
+/// 单一事务内写入并重新校验归属与来源一致性。计划不携带 URL、Cookie、请求头
+/// 或本地路径。
+#[derive(Debug, Clone)]
+pub struct PeriodicalImportPlan {
+    pub source_key: String,
+    /// 期刊的全部来源绑定身份（由 print/electronic ISSN 派生）：同一个 Work
+    /// 可以保留多个同来源身份，重复导入同一期刊必须命中同一 Work。
+    pub journal_source_refs: Vec<String>,
+    pub work: Work,
+    pub edition: Edition,
+    pub periodical: Periodical,
+    pub volume: PeriodicalVolume,
+    pub issue: PeriodicalIssue,
+    pub article: PeriodicalArticle,
+    pub item: MediaItem,
+    pub resource: Resource,
 }
 
 #[derive(Debug, Clone)]

@@ -63,6 +63,8 @@ import type {
   ComicChapterCatalogGetRequest,
   ComicChapterCatalogDto,
   ComicRegisteredChapterCatalogDto,
+  ComicWorkChapterCatalogRequestDto,
+  ComicWorkChapterCatalogDto,
   ComicChapterSourceCandidatesGetRequestDto,
   ComicChapterSourceCandidatesDto,
   ComicProgressMigrationRequestDto,
@@ -157,6 +159,7 @@ import workGetNormal from "../../../../../contracts/ipc/v1/fixtures/work/get.nor
 import workGetNotFound from "../../../../../contracts/ipc/v1/fixtures/work/get.error-work-not-found.json" with { type: "json" };
 import resourceMixedAvailability from "../../../../../contracts/ipc/v1/fixtures/resource/list.mixed-availability.json" with { type: "json" };
 import comicCatalogNormal from "../../../../../contracts/ipc/v1/fixtures/comic/chapter-catalog.normal.json" with { type: "json" };
+import comicWorkCatalogNormal from "../../../../../contracts/ipc/v1/fixtures/comic/work-chapter-catalog.normal.json" with { type: "json" };
 import settingsGeneralDefault from "../../../../../contracts/ipc/v1/fixtures/settings/general.default.json" with { type: "json" };
 import settingsAppearanceDefault from "../../../../../contracts/ipc/v1/fixtures/settings/appearance.default.json" with { type: "json" };
 import settingsGeneralSaved from "../../../../../contracts/ipc/v1/fixtures/settings/general.saved.json" with { type: "json" };
@@ -180,6 +183,20 @@ import { HavenError } from "./errors.js";
 
 const RESOURCE_FIXTURE_MEDIA_ITEM_ID = "0196f0d2-0000-7000-8000-000000000000";
 const MEDIA_ITEM_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const CANONICAL_LOCAL_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** Demo 只接受规范小写 UUID；缺省与非法值分别返回 null 与显式错误。 */
+function requireLocalUuid(value: string | null, label: string): string | null {
+  if (value === null) return null;
+  if (!CANONICAL_LOCAL_ID_PATTERN.test(value)) {
+    throw new HavenError({
+      code: "INVALID_ID",
+      userMessage: `${label}标识格式非法`,
+      retryable: false,
+    });
+  }
+  return value;
+}
 
 const MOCK_COMIC_NO_SOURCE_PROGRESS_RECEIPT: ComicProgressMigrationReceiptDto = {
   migrationId: "0196f0d2-0000-7000-8000-00000000c001",
@@ -570,6 +587,42 @@ export class MockHavenClient implements HavenClient {
     request: ComicChapterCatalogGetRequest,
   ): Promise<ComicChapterCatalogDto> {
     return this.comicChapterCatalogGet(request);
+  }
+
+  /**
+   * Browser Demo 的 Work 级漫画目录。
+   *
+   * Demo 只持有一份确定性 fixture；这里回显请求里的本地 Work/MediaItem 身份，
+   * 不构造 Provider URL、页面授权、远端章节 ID 或后端未给出的上一章/下一章。
+   */
+  async comicWorkChapterCatalogGet(
+    request: ComicWorkChapterCatalogRequestDto,
+  ): Promise<ComicWorkChapterCatalogDto> {
+    const catalog = comicWorkCatalogNormal as ComicWorkChapterCatalogDto;
+    const workId = requireLocalUuid(request.workId, "作品");
+    const mediaItemId = requireLocalUuid(request.mediaItemId, "章节");
+    if ((workId === null) === (mediaItemId === null)) {
+      throw new HavenError({
+        code: "INVALID_ARGUMENT",
+        userMessage: "作品与章节必须二选一",
+        retryable: false,
+      });
+    }
+    return {
+      ...catalog,
+      workId: workId ?? catalog.workId,
+      currentMediaItemId: workId === null ? mediaItemId : null,
+      refreshReceipts: catalog.refreshReceipts.map((receipt) => ({
+        ...receipt,
+        workId: workId ?? catalog.workId,
+      })),
+    };
+  }
+
+  async comicWorkChapterCatalogRefresh(
+    request: ComicWorkChapterCatalogRequestDto,
+  ): Promise<ComicWorkChapterCatalogDto> {
+    return this.comicWorkChapterCatalogGet(request);
   }
 
   /** Browser Demo 没有持久化的来源引用图谱；返回明确的空候选投影。 */

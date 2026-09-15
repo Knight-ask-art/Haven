@@ -39,9 +39,27 @@ function isNullableTextAnchor(value: unknown): boolean {
   return value === null || isTextAnchor(value)
 }
 
+const LOCATOR_ENVELOPE_KEYS: readonly string[] = ["version", "kind", "data"]
+
+/**
+ * Locator 顶层必须是恰好 `version`/`kind`/`data` 三个自有键的对象。
+ *
+ * 旧守卫只检查这三个键"存在且类型可用"，因此 `{version, kind, data, extra}`
+ * 这类带未知键的结构会被当成合法 Locator 继续透传。这里补上外层闭合检查：
+ * 缺键和未知键都必须拒绝，且必须是自己持有的键，不能靠原型链补齐。
+ */
+function hasExactLocatorEnvelope(locator: Record<string, unknown>): boolean {
+  const ownKeys = Reflect.ownKeys(locator)
+  if (ownKeys.length !== LOCATOR_ENVELOPE_KEYS.length) return false
+  return ownKeys.every(
+    (key) => typeof key === "string" && LOCATOR_ENVELOPE_KEYS.includes(key),
+  )
+}
+
 function isLocator(value: unknown): value is LocatorDto {
   if (typeof value !== "object" || value === null) return false
   const locator = value as Record<string, unknown>
+  if (!hasExactLocatorEnvelope(locator)) return false
   if (locator.version !== 1 || typeof locator.kind !== "string" || typeof locator.data !== "object" || locator.data === null) {
     return false
   }

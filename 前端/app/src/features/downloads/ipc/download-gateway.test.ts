@@ -2,7 +2,12 @@ import { describe, expect, it, vi } from "vitest"
 
 import type { HavenClient } from "@/lib/ipc/client"
 import type { DownloadTaskDto, ResourceListDto, ResourceSummaryDto, StorageLocationDto } from "@/lib/ipc/generated/wire"
-import { createDownloadForMediaItem, getMediaItemDownloadInfo, getWorkDownloadState } from "./download-gateway"
+import {
+  createDownloadForMediaItem,
+  getMediaItemDownloadInfo,
+  getMediaItemsDownloadInfo,
+  getWorkDownloadState,
+} from "./download-gateway"
 
 const BASE_TASK: DownloadTaskDto = {
   schemaVersion: 1,
@@ -322,5 +327,46 @@ describe("getWorkDownloadState", () => {
       hasOfflineResource: false,
       sourceResourceId: null,
     })
+  })
+  it("shares the complete download list when projecting several media items", async () => {
+    const resourcesByMediaItem: Record<string, ResourceListDto> = {
+      "media-1": EMPTY_RESOURCES,
+      "media-2": {
+        schemaVersion: 1,
+        items: [{
+          resourceId: "remote-2",
+          resourceType: "publication_file",
+          availability: "available",
+          mimeType: "application/pdf",
+          size: null,
+          storageDisplayName: null,
+          sourceDisplayName: "期刊来源",
+          isOffline: false,
+          isLocal: false,
+          requiresReauthorization: false,
+          canDownload: true,
+          canOnlineRead: false,
+          streamKind: null,
+        }],
+      },
+    }
+    const downloadList = vi.fn(async () => [{
+      ...BASE_TASK,
+      mediaItemId: "media-2",
+      state: "downloading" as const,
+      offlineResourceId: null,
+    }])
+    const resourceListByMediaItem = vi.fn(async ({ mediaItemId }: { mediaItemId: string }) => (
+      resourcesByMediaItem[mediaItemId] ?? EMPTY_RESOURCES
+    ))
+    const client = clientWith([], EMPTY_RESOURCES, [], downloadList)
+    client.resourceListByMediaItem = resourceListByMediaItem
+
+    const projected = await getMediaItemsDownloadInfo(["media-1", "media-2"], client)
+
+    expect(downloadList).toHaveBeenCalledOnce()
+    expect(resourceListByMediaItem).toHaveBeenCalledTimes(2)
+    expect(projected.get("media-1")).toMatchObject({ status: "idle", canDownload: false })
+    expect(projected.get("media-2")).toMatchObject({ status: "queued", canDownload: true })
   })
 })

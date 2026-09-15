@@ -17,6 +17,9 @@ use crate::comic_progress_subject::{ComicProgressSubject, ComicProgressSubjectMe
 use crate::entities::*;
 use crate::enums::DownloadState;
 use crate::ids::*;
+use crate::periodical::{
+    Issn, Periodical, PeriodicalArticle, PeriodicalIssue, PeriodicalPlacement, PeriodicalVolume,
+};
 use crate::settings::PreferenceData;
 
 /// Work 列表排序（domain 概念；wire `LibraryListSort` 由 mapper 转换）。
@@ -184,6 +187,42 @@ pub trait ChapterSourceRepository: Send + Sync {
         remote_work_id: &str,
     ) -> Result<Option<ComicChapterCatalogState>, AppError>;
     async fn save(&self, reference: &ChapterSourceRef) -> Result<(), AppError>;
+}
+
+/// 报刊（期刊）层级持久化契约。
+///
+/// 只表达 期刊 → 卷 → 期 → 文章 的显式归属。文章通过 `media_item_id` 复用既有
+/// MediaItem，因此本契约不重复实现阅读、进度、资源或下载语义；期刊身份由 ISSN
+/// 建立（print / electronic 独立），标题只作展示事实。
+#[async_trait]
+pub trait PeriodicalRepository: Send + Sync {
+    async fn get(&self, id: PeriodicalId) -> Result<Option<Periodical>, AppError>;
+    /// 按 Work 反查期刊（期刊本身是作品）。
+    async fn find_by_work(&self, work_id: WorkId) -> Result<Option<Periodical>, AppError>;
+    /// 按 ISSN 反查期刊：print 与 electronic 都参与匹配。
+    async fn find_by_issn(&self, issn: &Issn) -> Result<Option<Periodical>, AppError>;
+    async fn list_volumes(
+        &self,
+        periodical_id: PeriodicalId,
+    ) -> Result<Vec<PeriodicalVolume>, AppError>;
+    async fn list_issues(
+        &self,
+        volume_id: PeriodicalVolumeId,
+    ) -> Result<Vec<PeriodicalIssue>, AppError>;
+    async fn list_articles(
+        &self,
+        issue_id: PeriodicalIssueId,
+    ) -> Result<Vec<PeriodicalArticle>, AppError>;
+    /// 按来源 opaque 身份反查文章及其完整归属链（导入幂等与增量读取共用）。
+    async fn find_article_by_source(
+        &self,
+        source_key: &str,
+        remote_article_id: &str,
+    ) -> Result<Option<PeriodicalPlacement>, AppError>;
+    async fn save(&self, periodical: &Periodical) -> Result<(), AppError>;
+    async fn save_volume(&self, volume: &PeriodicalVolume) -> Result<(), AppError>;
+    async fn save_issue(&self, issue: &PeriodicalIssue) -> Result<(), AppError>;
+    async fn save_article(&self, article: &PeriodicalArticle) -> Result<(), AppError>;
 }
 
 /// 漫画页面序列的稳定身份持久化契约。

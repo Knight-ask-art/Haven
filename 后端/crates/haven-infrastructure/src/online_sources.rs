@@ -43,10 +43,11 @@ use zip::{CompressionMethod, ZipWriter};
 
 use crate::comic::page_identity_for_provider;
 use crate::http_security::{pin_client_builder, resolve_public_http_target};
+use crate::periodical::parse_europe_pmc_article;
 
 const MANGADEX_API: &str = "https://api.mangadex.org";
 const ARXIV_API: &str = "https://export.arxiv.org";
-const EUROPE_PMC_API: &str = "https://www.ebi.ac.uk/europepmc/webservices/rest";
+pub(crate) const EUROPE_PMC_API: &str = "https://www.ebi.ac.uk/europepmc/webservices/rest";
 const WIKISOURCE_API: &str = "https://zh.wikisource.org/w/api.php";
 
 const MAX_REDIRECTS: usize = 3;
@@ -65,7 +66,7 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(3);
 const USER_AGENT: &str = "Haven/0.1.0 (offline content importer)";
 
 #[derive(Debug, Clone, Copy)]
-enum HostPolicy {
+pub(crate) enum HostPolicy {
     MangadexApi,
     MangadexCdn,
     Arxiv,
@@ -83,12 +84,15 @@ impl OnlineContentClient {
         Ok(Self)
     }
 
-    async fn json(&self, url: &str, policy: HostPolicy) -> Result<Value, AppError> {
+    pub(crate) async fn json(&self, url: &str, policy: HostPolicy) -> Result<Value, AppError> {
         let bytes = self.bytes(url, policy, MAX_API_BYTES).await?;
         serde_json::from_slice(&bytes).map_err(|_| source_unavailable("正文来源返回了无效 JSON"))
     }
 
-    async fn text(
+    /// Bounded text fetch against one fixed-host policy. The periodical
+    /// provider (`crate::periodical`) reuses this single fixed-host client
+    /// instead of creating a second HTTP stack or a second allowlist.
+    pub(crate) async fn text(
         &self,
         url: &str,
         policy: HostPolicy,
@@ -96,6 +100,24 @@ impl OnlineContentClient {
     ) -> Result<String, AppError> {
         let bytes = self.bytes(url, policy, max_bytes).await?;
         String::from_utf8(bytes).map_err(|_| source_unavailable("正文来源返回了无法读取的文本"))
+    }
+
+    /// Same bounded text fetch, but an explicit 404/410 is reported as
+    /// `Ok(None)` instead of an error. Only "the source says this object does
+    /// not exist" may be treated as absence; every other failure stays a
+    /// failure so callers cannot mistake an outage for missing content.
+    pub(crate) async fn text_optional(
+        &self,
+        url: &str,
+        policy: HostPolicy,
+        max_bytes: usize,
+    ) -> Result<Option<String>, AppError> {
+        let Some(response) = self.fetch_optional(url, policy, max_bytes, None).await? else {
+            return Ok(None);
+        };
+        String::from_utf8(response.bytes)
+            .map(Some)
+            .map_err(|_| source_unavailable("正文来源返回了无法读取的文本"))
     }
 
     async fn bytes(
@@ -114,6 +136,19 @@ impl OnlineContentClient {
         max_bytes: usize,
         range: Option<RemoteByteRange>,
     ) -> Result<RemoteHttpResponse, AppError> {
+        self.fetch_optional(url, policy, max_bytes, range)
+            .await?
+            .ok_or_else(|| source_unavailable("正文来源返回异常状态"))
+    }
+
+    /// `Ok(None)` 只表示来源明确回答「该对象不存在」（404/410）。
+    async fn fetch_optional(
+        &self,
+        url: &str,
+        policy: HostPolicy,
+        max_bytes: usize,
+        range: Option<RemoteByteRange>,
+    ) -> Result<Option<RemoteHttpResponse>, AppError> {
         let mut current = validate_url(url, policy)?;
         for _ in 0..=MAX_REDIRECTS {
             let target =
@@ -182,6 +217,12 @@ impl OnlineContentClient {
                 continue;
             }
             if !response.status().is_success() {
+                if matches!(
+                    response.status(),
+                    reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+                ) {
+                    return Ok(None);
+                }
                 return Err(source_unavailable("正文来源返回异常状态"));
             }
             if response
@@ -225,14 +266,14 @@ impl OnlineContentClient {
                 .map(|value| value.total)
                 .or_else(|| response_content_length(status, &body))
                 .unwrap_or(body.len() as u64);
-            return Ok(RemoteHttpResponse {
+            return Ok(Some(RemoteHttpResponse {
                 bytes: body,
                 content_type,
                 total_size,
                 content_range,
                 accept_ranges,
                 partial: status == reqwest::StatusCode::PARTIAL_CONTENT,
-            });
+            }));
         }
         Err(source_unavailable("正文来源重定向次数过多"))
     }
@@ -602,6 +643,7 @@ impl OnlineCatalogProvider {
             .client
             .text(&url, HostPolicy::EuropePmc, MAX_HTML_BYTES)
             .await?;
+        validate_europe_pmc_full_text(&xml, pmcid)?;
         let document = parse_europe_pmc(&xml);
         if document.title.is_empty() && document.paragraphs.is_empty() {
             return Err(source_unavailable("Europe PMC 全文为空"));
@@ -868,6 +910,7 @@ impl OnlineCatalogProvider {
             .client
             .text(&url, HostPolicy::EuropePmc, MAX_HTML_BYTES)
             .await?;
+        validate_europe_pmc_full_text(&xml, pmcid)?;
         let document = parse_europe_pmc(&xml);
         if document.title.is_empty() && document.paragraphs.is_empty() {
             return Err(source_unavailable("Europe PMC 全文为空"));
@@ -917,6 +960,17 @@ impl OnlineCatalogProvider {
         let html = safe_article_html(page_title, &paragraphs).into_bytes();
         bounded_session_body(html, range, "text/html; charset=utf-8")
     }
+}
+
+/// 下载和 Remote Session 必须与专用期刊 Provider 使用同一条身份边界：
+/// 旧的轻量正文提取器只关心标题/段落，无法证明响应确实属于请求 PMCID，
+/// 也会把只有标题或空 body 的 XML 当成可读正文。
+fn validate_europe_pmc_full_text(xml: &str, pmcid: &str) -> Result<(), AppError> {
+    let record = parse_europe_pmc_article(xml, pmcid)?;
+    if !record.is_readable() {
+        return Err(source_unavailable("Europe PMC 全文没有可读正文"));
+    }
+    Ok(())
 }
 
 fn validate_range_response(
@@ -1073,7 +1127,7 @@ fn validate_arxiv_id(value: &str) -> Result<String, AppError> {
     Ok(value.to_owned())
 }
 
-fn is_pmcid(value: &str) -> bool {
+pub(crate) fn is_pmcid(value: &str) -> bool {
     let Some(rest) = value.strip_prefix("PMC") else {
         return false;
     };
@@ -1926,6 +1980,22 @@ mod tests {
         );
         assert_eq!(document.title, "A title");
         assert_eq!(document.paragraphs, vec!["First paragraph .", "Second."]);
+    }
+
+    #[test]
+    fn europe_pmc_full_text_paths_require_matching_identity_and_body_paragraph() {
+        let valid = r#"<article><front><article-meta>
+            <article-id pub-id-type="pmc">PMC1</article-id>
+            <title-group><article-title>Title</article-title></title-group>
+          </article-meta></front><body><p>Readable body.</p></body></article>"#;
+        assert!(validate_europe_pmc_full_text(valid, "PMC1").is_ok());
+        assert!(validate_europe_pmc_full_text(valid, "PMC2").is_err());
+
+        let metadata_only = r#"<article><front><article-meta>
+            <article-id pub-id-type="pmc">PMC1</article-id>
+            <title-group><article-title>Title only</article-title></title-group>
+          </article-meta></front></article>"#;
+        assert!(validate_europe_pmc_full_text(metadata_only, "PMC1").is_err());
     }
 
     #[test]

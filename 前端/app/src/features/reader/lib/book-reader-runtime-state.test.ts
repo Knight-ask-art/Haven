@@ -3,6 +3,7 @@ import {
   loadDemoBookReaderBookmarks,
   recordDemoBookReaderHistory,
   resolveBookReaderRuntimeState,
+  selectDemoBookReaderKind,
 } from "./book-reader-runtime-state"
 
 describe("book reader runtime state", () => {
@@ -33,5 +34,12 @@ describe("book reader runtime state", () => {
     recordDemoBookReaderHistory("mock", "media-1", recordHistory)
     expect(recordHistory).toHaveBeenCalledOnce()
     expect(recordHistory).toHaveBeenCalledWith("media-1")
+  })
+
+  it("selects bounded demo fixtures by the demo storage id", () => {
+    expect(selectDemoBookReaderKind("mock", "p1-1")).toBe("periodical")
+    expect(selectDemoBookReaderKind("mock", "d1-1")).toBe("document")
+    expect(selectDemoBookReaderKind("mock", "book-jobs")).toBe("book")
+    expect(selectDemoBookReaderKind("tauri", "p1-1")).toBeNull()
   })
 })

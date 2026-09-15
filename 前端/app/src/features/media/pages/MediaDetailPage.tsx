@@ -21,10 +21,17 @@ import { getWorkDetail } from "../ipc/work-gateway"
 import { mapWorkDetailHeaderToMediaDetail } from "../lib/work-detail-mapper"
 import { canConsumeDetail, type WorkDetailState } from "../lib/work-detail-state"
 import { loadAllEditionsByWork, normalizeEditionError } from "../ipc/edition-gateway"
+import { getComicWorkChapterCatalog } from "@/features/comic/ipc/comic-work-chapter-catalog-gateway"
+import {
+  projectComicWorkChapterRows,
+  projectComicWorkEditions,
+  type ComicWorkChapterRow,
+} from "../lib/comic-work-chapter-items"
+import { comicWorkCatalogStatusLabel } from "@/features/comic/lib/comic-work-catalog-view"
 import { mapEditionListToDetailItems, partitionEditionItems, toMediaDetailEpisodes, type EditionListItem, type EditionGroup } from "../lib/edition-mapper"
 import { canConsumeEdition, getEditionListState, type EditionListState } from "../lib/edition-state"
 import { primaryActionRoute } from "../lib/primary-action-route"
-import type { PrimaryActionDto } from "@/lib/ipc/generated/wire"
+import type { ComicWorkChapterCatalogDto, PrimaryActionDto } from "@/lib/ipc/generated/wire"
 import {
   createDownloadForMediaItem,
   deleteOfflineDownload,
@@ -34,6 +41,10 @@ import {
   type MediaItemDownloadInfo,
   type DownloadStatus,
 } from "@/features/downloads/ipc/download-gateway"
+import {
+  contentCategoryLabel,
+  mediaPresentationLabel,
+} from "../lib/periodical-presentation"
 import { resetProgress } from "@/features/progress/ipc/progress-gateway"
 
 export interface MediaDetailData {
@@ -41,6 +52,7 @@ export interface MediaDetailData {
   title: string
   originalTitle?: string
   type: "movie" | "tv" | "book" | "comic" | "periodical" | "document" | "article"
+  categories?: Array<"video" | "book" | "comic" | "periodical">
   year: number
   rating?: string
   quality?: string
@@ -727,14 +739,23 @@ function MediaDetailExperience({ production }: { production: boolean }) {
   const navigate = useNavigate()
   const requestedId = workId || id || "1"
   const [authoritativeItem, setAuthoritativeItem] = useState<MediaDetailData | null>(null)
+  // work_get 已为哪一代请求返回权威投影（成功或失败都算落地）。edition 请求必须等它：
+  // 媒介类型只能由权威投影决定，提前发起对漫画就是一次越界的通用版本列表请求。
+  // 代次必须同时绑定 requestedId 与 detailRetryNonce —— 重置进度/详情重试会换掉当前这次
+  // work_get，只比对作品 ID 会让旧代次的落地标记为新代次放行。
+  const [detailSettled, setDetailSettled] = useState<{ workId: string; retryNonce: number } | null>(null)
   const [detailLoading, setDetailLoading] = useState(production)
   const [detailError, setDetailError] = useState<HavenError | null>(null)
   const [detailRetryNonce, setDetailRetryNonce] = useState(0)
   const [editionItems, setEditionItems] = useState<EditionListItem[] | null>(production ? null : [])
+  // 生产漫画不用 EditionListItem 承载章节：目录 DTO 本身就是章节事实来源（顺序、状态、
+  // 可打开性、来源、匹配），压缩成剧集行会把这些字段丢掉。
+  const [comicCatalog, setComicCatalog] = useState<ComicWorkChapterCatalogDto | null>(null)
   const [editionLoading, setEditionLoading] = useState(production)
   const [editionError, setEditionError] = useState<HavenError | null>(null)
   const [editionRetryNonce, setEditionRetryNonce] = useState(0)
   const [activeEditionType, setActiveEditionType] = useState<string | null>(null)
+  const [activeComicEditionId, setActiveComicEditionId] = useState<string | null>(null)
 
   useEffect(() => {
     if (!production) return
@@ -747,27 +768,59 @@ function MediaDetailExperience({ production }: { production: boolean }) {
         if (cancelled) return
         setAuthoritativeItem(mapWorkDetailHeaderToMediaDetail(header))
         setDetailLoading(false)
+        setDetailSettled({ workId: requestedId, retryNonce: detailRetryNonce })
       })
       .catch((error: unknown) => {
         if (cancelled) return
         setDetailError(error instanceof HavenError ? error : null)
         setDetailLoading(false)
+        // 失败也是落地：类型未知时沿用通用版本列表，页面不能停在版本加载中。
+        setDetailSettled({ workId: requestedId, retryNonce: detailRetryNonce })
       })
     return () => {
       cancelled = true
     }
   }, [production, requestedId, detailRetryNonce])
 
+  // 漫画生产路径消费与 Comic Reader 相同的 Work 级目录 Gateway；其他媒介保持原有
+  // edition_list_by_work 路径。媒介类型由 work_get 决定，所以 edition 请求要等当前代次的
+  // 权威投影落地：漫画只取 Work 目录（不再先打一次通用版本列表再覆盖），其余情况——非漫画
+  // 作品、work_get 失败导致类型未知——一律沿用通用版本列表。
+  const editionSourceReady = !production
+    || (detailSettled?.workId === requestedId && detailSettled.retryNonce === detailRetryNonce)
+  const comicProduction = editionSourceReady && authoritativeItem?.type === "comic"
+
   useEffect(() => {
     if (!production) return
     let cancelled = false
     setEditionLoading(true)
     setEditionItems(null)
+    setComicCatalog(null)
     setEditionError(null)
+    // 权威类型未落地时只进入 loading，不发请求；落地后依赖变化会再次触发本 effect。
+    if (!editionSourceReady) return
+    if (comicProduction) {
+      // 漫画目录 DTO 原样留在 state 里，供详情页按后端事实（含不可打开章节）渲染。
+      getComicWorkChapterCatalog({ workId: requestedId, mediaItemId: null })
+        .then((catalog) => {
+          if (cancelled) return
+          setComicCatalog(catalog)
+          setEditionLoading(false)
+        })
+        .catch((error: unknown) => {
+          if (cancelled) return
+          setEditionError(normalizeEditionError(error))
+          setEditionLoading(false)
+        })
+      return () => {
+        cancelled = true
+      }
+    }
     loadAllEditionsByWork(requestedId)
-      .then((result) => {
+      .then((result) => mapEditionListToDetailItems(result))
+      .then((items) => {
         if (cancelled) return
-        setEditionItems(mapEditionListToDetailItems(result))
+        setEditionItems(items)
         setEditionLoading(false)
       })
       .catch((error: unknown) => {
@@ -778,7 +831,7 @@ function MediaDetailExperience({ production }: { production: boolean }) {
     return () => {
       cancelled = true
     }
-  }, [editionRetryNonce, production, requestedId])
+  }, [comicProduction, editionRetryNonce, editionSourceReady, production, requestedId])
 
   // Explicit browser demo keeps its curated catalog; Tauri uses only the server projection.
   const media = production
@@ -789,8 +842,26 @@ function MediaDetailExperience({ production }: { production: boolean }) {
       }
       : buildUnavailableDetail(requestedId))
     : getMediaDetailData(requestedId)
+  // 生产漫画的目录行直接由 Work 目录 DTO 投影：顺序、状态、可打开性、页数、进度、来源与
+  // 匹配提示都读后端事实；Edition 维度取 catalog.editions，前端不重新推导章节归属。
+  const comicDetailCatalog = comicProduction ? comicCatalog : null
+  const comicChapterRows = comicDetailCatalog ? projectComicWorkChapterRows(comicDetailCatalog) : null
+  const comicEditions = comicDetailCatalog ? projectComicWorkEditions(comicDetailCatalog) : []
+  const visibleComicChapterRows = comicChapterRows && activeComicEditionId !== null
+    ? comicChapterRows.filter((row) => row.editionId === activeComicEditionId)
+    : comicChapterRows
+  const comicCatalogStatus = comicDetailCatalog ? comicWorkCatalogStatusLabel(comicDetailCatalog.refreshStatus) : null
+  // 目录行是章节事实，数量也要跟着它走，不能退回被压缩过的 episodesOrChapters。
+  const contentsItemCount = visibleComicChapterRows
+    ? visibleComicChapterRows.length
+    : media.episodesOrChapters?.length ?? 0
+  const contentUnitCount = comicChapterRows
+    ? comicChapterRows.filter((row) => row.canOpen).length
+    : media.episodesOrChapters?.length || 0
   const downloadableMediaItemId = authoritativeItem?.primaryAction?.mediaItemId
     ?? editionItems?.find((item) => item.primaryAction?.mediaItemId)?.primaryAction?.mediaItemId
+    // 漫画版本行不再经过 EditionListItem，兜底沿用目录里第一个可打开章节。
+    ?? comicChapterRows?.find((row) => row.primaryAction?.mediaItemId)?.primaryAction?.mediaItemId
 
   const [activeTab, setActiveTab] = useState<"contents" | "overview" | "specs">("contents")
   const [isDescriptionExpanded, setIsDescriptionExpanded] = useState(false)
@@ -877,10 +948,12 @@ function MediaDetailExperience({ production }: { production: boolean }) {
   const editionGroups: EditionGroup[] = partitionEditionItems(editionItems ?? [])
   const activeGroup = editionGroups.find((group) => group.mediaType === activeEditionType) ?? editionGroups[0]
   const episodesForActiveGroup = activeGroup ? toMediaDetailEpisodes(activeGroup.items) : sortedEpisodes
-  const sortedActiveEpisodes = episodesForActiveGroup
-    ? isAscending
-      ? episodesForActiveGroup
-      : [...episodesForActiveGroup].reverse()
+  // 生产漫画的行来自 Work 目录，顺序就是后端事实（backendOrder，含幕间、暂不可用与外部
+  // 章节）。正倒序是展示偏好，不能改写内容事实，否则一次 desc 偏好就与 catalog.chapters
+  // 的返回顺序相悖。其余来源——非漫画的版本列表、浏览器 Demo 的策展数据——维持既有行为。
+  const backendOrderLocked = comicProduction
+  const sortedActiveEpisodes = episodesForActiveGroup && !isAscending && !backendOrderLocked
+    ? [...episodesForActiveGroup].reverse()
     : episodesForActiveGroup
 
   // 详情页直接进入/刷新也从服务端 WorkCard 投影读取收藏；localStorage 不再作为权威。
@@ -926,6 +999,7 @@ function MediaDetailExperience({ production }: { production: boolean }) {
     setSelectedSeason(initialSeasonId)
     setIsMoreMenuOpen(false)
     setActiveEditionType(null)
+    setActiveComicEditionId(null)
   }, [initialSeasonId, media.id, production])
 
   // per-作品正倒序持久化（localStorage，仅 UI 偏好）
@@ -1146,8 +1220,23 @@ function MediaDetailExperience({ production }: { production: boolean }) {
     }
   }
 
+  /**
+   * 生产漫画章节行直接用后端目录事实：可打开性只认 `canOpen`。不可打开的章节（暂不可用、
+   * 仅外部来源）只提示，不进入阅读器路由，避免落到没有内容授权的页面；可打开的仍走
+   * `handleEditionOpen` 的在线阅读能力校验。
+   */
+  const handleComicChapterOpen = (row: ComicWorkChapterRow) => {
+    if (!row.canOpen) {
+      setToastMessage("当前章节暂不可打开")
+      setTimeout(() => setToastMessage(null), 2500)
+      return
+    }
+    void handleEditionOpen(row.primaryAction, row.id)
+  }
+
   // 媒介图标/按钮文案适配
   const primaryAction = production ? authoritativeItem?.primaryAction : undefined
+  const isPeriodical = media.type === "periodical" || media.categories?.includes("periodical") === true
 
   const getPrimaryActionLabel = () => {
     if (production) {
@@ -1158,27 +1247,19 @@ function MediaDetailExperience({ production }: { production: boolean }) {
     }
     if (media.progress && media.progress > 0) {
       if (media.type === "movie" || media.type === "tv") return "继续播放"
-      if (media.type === "periodical") return "继续翻阅"
+      if (isPeriodical) return "继续翻阅"
       if (media.type === "document") return "继续查阅"
       return "继续阅读"
     }
     if (media.type === "movie" || media.type === "tv") return "播放"
-    if (media.type === "periodical") return "翻阅"
+    if (isPeriodical) return "翻阅"
     if (media.type === "document") return "查阅"
     return "阅读"
   }
 
   const getTypeLabel = () => {
-    switch (media.type) {
-      case "movie": return "电影"
-      case "tv": return "剧集"
-      case "book": return "图书"
-      case "comic": return "漫画"
-      case "periodical": return "报刊"
-      case "document": return "资料"
-      case "article": return "文章"
-      default: return "媒体"
-    }
+    if (media.type === "periodical") return contentCategoryLabel("periodical")
+    return mediaPresentationLabel(media.type, media.categories?.[0])
   }
 
   const getTabContentsLabel = () => {
@@ -1186,11 +1267,11 @@ function MediaDetailExperience({ production }: { production: boolean }) {
       case "tv": return "剧集与选集"
       case "comic": return "单行本与话数"
       case "movie": return "影片资源"
-      case "periodical": return "往期刊物与分册"
       case "document": return "文档目录与附录"
       default: return "章节与目录"
     }
   }
+  const tabContentsLabel = isPeriodical ? "往期刊物与分册" : getTabContentsLabel()
 
   const detailState: WorkDetailState = !production
     ? "data"
@@ -1202,14 +1283,18 @@ function MediaDetailExperience({ production }: { production: boolean }) {
           ? "retryable_error"
           : "terminal_error"
   const favoriteCanWrite = !production || (!detailLoading && authoritativeItem?.id === media.id)
-  const editionState: EditionListState = getEditionListState(production, editionLoading, editionItems, editionError)
+  // 生产漫画的目录 DTO 才是章节事实：空目录判定也必须看 catalog.chapters，而不是被压缩过的行。
+  const editionContent = comicProduction ? comicCatalog?.chapters ?? null : editionItems
+  const editionState: EditionListState = getEditionListState(production, editionLoading, editionContent, editionError)
   // The Work/Edition DTO exposes the selected media item, while the resource
   // summary owns the actual online-read capability.  Keep the visual action
   // in place but fail closed until that capability has been resolved; this is
   // what turns download-only providers (for example OPDS/Gutenberg EPUBs)
   // into an explicit "download first" state instead of a dead reader route.
-  const primaryActionTarget = production && onlineReadCapability === "available"
+  const primaryActionTarget = production && primaryAction?.kind === "open_edition"
     ? primaryActionRoute(primaryAction)
+    : production && (onlineReadCapability === "available" || hasOfflineResource)
+      ? primaryActionRoute(primaryAction)
     : !production
       ? getConsumeRoute(media.type, media.id)
       : null
@@ -1646,7 +1731,7 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                 : "text-muted-foreground border-transparent hover:text-foreground"
             )}
           >
-            {getTabContentsLabel()}
+            {tabContentsLabel}
           </button>
           <button
             onClick={() => setActiveTab("overview")}
@@ -1703,22 +1788,67 @@ function MediaDetailExperience({ production }: { production: boolean }) {
               </div>
             )}
 
-            {media.episodesOrChapters && media.episodesOrChapters.length > 1 && (
+            {contentsItemCount > 1 && (
               <div className="flex items-center justify-between">
                 <span className="text-xs font-bold text-muted-foreground uppercase tracking-widest">
-                  共 {media.episodesOrChapters.length} 集
+                  共 {contentsItemCount} 集
                 </span>
+                {/* 生产漫画的目录顺序不可改：与其展示一个点了也不生效的开关，不如不展示，
+                    改成显示后端目录的刷新状态。 */}
+                {backendOrderLocked ? (
+                  comicCatalogStatus && (
+                    <span data-testid="comic-catalog-status" className="text-xs font-bold text-muted-foreground">
+                      目录{comicCatalogStatus}
+                    </span>
+                  )
+                ) : (
+                  <button
+                    type="button"
+                    aria-label={isAscending ? "正序" : "倒序"}
+                    data-testid="work-sort-toggle"
+                    onClick={() => setIsAscending((v) => !v)}
+                    className="inline-flex items-center gap-1.5 rounded-full border border-black/10 dark:border-white/15 bg-black/5 dark:bg-white/5 px-3 py-1.5 text-xs font-bold text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+                  >
+                    {isAscending ? <ArrowUp className="w-3.5 h-3.5" /> : <ArrowDown className="w-3.5 h-3.5" />}
+                    <ArrowUpDown className="w-3 h-3 opacity-60" />
+                    {isAscending ? "正序" : "倒序"}
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* 漫画版本维度直接取 catalog.editions，不从前端重新推导章节归属 */}
+            {comicEditions.length > 1 && (
+              <div className="flex w-fit max-w-full gap-[4px] overflow-x-auto rounded-lg bg-muted/60 p-[4px]" role="tablist" aria-label="漫画版本">
                 <button
                   type="button"
-                  aria-label={isAscending ? "正序" : "倒序"}
-                  data-testid="work-sort-toggle"
-                  onClick={() => setIsAscending((v) => !v)}
-                  className="inline-flex items-center gap-1.5 rounded-full border border-black/10 dark:border-white/15 bg-black/5 dark:bg-white/5 px-3 py-1.5 text-xs font-bold text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+                  role="tab"
+                  aria-selected={activeComicEditionId === null}
+                  onClick={() => setActiveComicEditionId(null)}
+                  className={cn(
+                    "inline-flex shrink-0 items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-bold transition-colors cursor-pointer",
+                    activeComicEditionId === null ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground"
+                  )}
                 >
-                  {isAscending ? <ArrowUp className="w-3.5 h-3.5" /> : <ArrowDown className="w-3.5 h-3.5" />}
-                  <ArrowUpDown className="w-3 h-3 opacity-60" />
-                  {isAscending ? "正序" : "倒序"}
+                  全部
+                  <span className="opacity-60 tabular-nums">{comicChapterRows?.length ?? 0}</span>
                 </button>
+                {comicEditions.map((edition) => (
+                  <button
+                    key={edition.editionId}
+                    type="button"
+                    role="tab"
+                    aria-selected={activeComicEditionId === edition.editionId}
+                    onClick={() => setActiveComicEditionId(edition.editionId)}
+                    className={cn(
+                      "inline-flex shrink-0 items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-bold transition-colors cursor-pointer",
+                      activeComicEditionId === edition.editionId ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground"
+                    )}
+                  >
+                    {edition.label}
+                    <span className="opacity-60 tabular-nums">{edition.chapterCount}</span>
+                  </button>
+                ))}
               </div>
             )}
 
@@ -1808,7 +1938,16 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                   <span>时长/大小</span>
                 </div>
                 <div className="flex flex-col divide-y divide-border/40">
-                  {sortedActiveEpisodes?.map((chap) => (
+                  {/* 生产漫画：行事实全部来自 Work 目录 DTO（含不可打开章节） */}
+                  {visibleComicChapterRows?.map((row) => (
+                    <ComicWorkChapterRowItem
+                      key={row.id}
+                      row={row}
+                      isOpening={editionOpeningId === row.id}
+                      onOpen={handleComicChapterOpen}
+                    />
+                  ))}
+                  {!visibleComicChapterRows && sortedActiveEpisodes?.map((chap) => (
                     <div
                       key={chap.id}
                       onClick={() => {
@@ -1894,7 +2033,7 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                   className="flex items-center gap-3 rounded-2xl border border-border/60 bg-background/70 p-[16px] text-left transition-colors hover:border-primary/40 hover:bg-muted/40"
                 >
                   <span className="flex h-[40px] w-[40px] shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary"><BookOpen className="h-[18px] w-[18px]" /></span>
-                  <span className="min-w-0"><span className="block text-xs font-semibold text-muted-foreground">内容单元</span><span className="mt-1 block truncate text-sm font-bold">{media.episodesOrChapters?.length || 0} 个可打开项</span><span className="mt-1 block text-xs text-muted-foreground">查看季、集或章节</span></span>
+                  <span className="min-w-0"><span className="block text-xs font-semibold text-muted-foreground">内容单元</span><span className="mt-1 block truncate text-sm font-bold">{contentUnitCount} 个可打开项</span><span className="mt-1 block text-xs text-muted-foreground">查看季、集或章节</span></span>
                 </button>
               </div>
 
@@ -2043,6 +2182,72 @@ function MediaDetailExperience({ production }: { production: boolean }) {
           backdropUrl: media.backdropUrl
         }}
       />
+    </div>
+  )
+}
+
+/**
+ * 生产漫画的章节行：标题、章节号、状态、页数、进度、来源与匹配提示都直接读 Work 目录 DTO。
+ * `canOpen === false` 的行不导航，与可打开项在可交互性上明确区分。
+ */
+function ComicWorkChapterRowItem({ row, isOpening, onOpen }: {
+  row: ComicWorkChapterRow
+  isOpening: boolean
+  onOpen: (row: ComicWorkChapterRow) => void
+}) {
+  return (
+    <div
+      onClick={() => onOpen(row)}
+      aria-busy={isOpening}
+      aria-disabled={!row.canOpen}
+      data-can-open={row.canOpen ? "true" : "false"}
+      data-current={row.isCurrent ? "true" : "false"}
+      className={cn(
+        "flex items-center justify-between py-5 px-[16px] -mx-[16px] rounded-2xl transition-colors group gap-[16px]",
+        row.canOpen ? "hover:bg-black/5 dark:hover:bg-white/5 cursor-pointer" : "cursor-default",
+        isOpening && "opacity-70 cursor-wait",
+      )}
+    >
+      <div className="flex items-center gap-5 min-w-0">
+        <div className={cn("flex items-center justify-center shrink-0 transition-transform", row.canOpen && "group-hover:scale-110")}>
+          <BookOpen className="w-6 h-6 text-foreground" />
+        </div>
+        <div className="flex flex-col min-w-0 gap-1">
+          <span className={cn("text-base md:text-lg font-bold truncate transition-colors", row.canOpen ? "text-foreground group-hover:text-primary" : "text-muted-foreground")}>
+            {row.title}
+          </span>
+          <span className="flex flex-wrap items-center gap-x-[8px] gap-y-1 text-xs md:text-sm font-semibold text-muted-foreground">
+            <span>{row.number}</span>
+            <span className="rounded-[4px] border border-black/10 dark:border-white/15 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider">
+              {row.statusLabel}
+            </span>
+            {row.isCurrent && (
+              <span className="rounded-[4px] border border-primary/30 bg-primary/10 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-primary">
+                当前
+              </span>
+            )}
+            {row.needsMatchReview && (
+              <span
+                data-testid={`comic-match-review-${row.id}`}
+                className="rounded-[4px] border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-bold tracking-wider text-amber-600 dark:text-amber-400"
+              >
+                匹配待确认
+              </span>
+            )}
+          </span>
+        </div>
+      </div>
+      <div className="flex items-center gap-[16px] shrink-0 pr-[32px]">
+        <div className="flex flex-col items-end gap-0.5">
+          <span className="text-sm font-semibold text-muted-foreground">{row.pageCountLabel}</span>
+          <span className="text-xs font-semibold text-muted-foreground">{row.sourceSummaryLabel}</span>
+        </div>
+        {row.progressPercent !== null && row.progressPercent > 0 && (
+          <span data-testid={`comic-chapter-progress-${row.id}`} className="text-xs font-bold text-muted-foreground tabular-nums">
+            {Math.round(row.progressPercent)}%
+          </span>
+        )}
+      </div>
     </div>
   )
 }

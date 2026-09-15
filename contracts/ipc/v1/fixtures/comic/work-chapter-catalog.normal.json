@@ -1,0 +1,170 @@
+{
+  "schemaVersion": 1,
+  "workId": "11111111-1111-4111-8111-111111111111",
+  "currentMediaItemId": "22222222-2222-4222-8222-222222222201",
+  "editions": [
+    {
+      "editionId": "33333333-3333-4333-8333-333333333301",
+      "profile": {
+        "language": "zh-hk",
+        "languageKind": "known",
+        "translationLine": null,
+        "translationLineKind": "unknown",
+        "scanGroup": "Fixture Scan Group",
+        "scanGroupKind": "content_line",
+        "colorMode": "unknown"
+      },
+      "displayLabel": "zh-hk / Fixture Scan Group",
+      "chapterCount": 2
+    },
+    {
+      "editionId": "33333333-3333-4333-8333-333333333302",
+      "profile": {
+        "language": "en",
+        "languageKind": "known",
+        "translationLine": null,
+        "translationLineKind": "not_applicable",
+        "scanGroup": "Mirror label",
+        "scanGroupKind": "mirror_label",
+        "colorMode": "grayscale"
+      },
+      "displayLabel": "en / Mirror label / grayscale",
+      "chapterCount": 1
+    }
+  ],
+  "chapters": [
+    {
+      "mediaItemId": "22222222-2222-4222-8222-222222222201",
+      "editionId": "33333333-3333-4333-8333-333333333301",
+      "subjectId": "55555555-5555-4555-8555-555555555555",
+      "chapterNumber": 12.5,
+      "volumeNumber": 2,
+      "title": "幕间",
+      "publishedAt": "2026-08-01T00:00:00Z",
+      "pageCount": 24,
+      "status": "available",
+      "canOpen": true,
+      "sources": [
+        {
+          "source": {
+            "sourceId": "mangadex",
+            "remoteWorkId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "remoteChapterId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+          },
+          "status": "available",
+          "mirrorLabel": null,
+          "observedAt": "2026-09-04T00:00:00Z",
+          "sourceOrder": 0
+        }
+      ],
+      "matchResult": null,
+      "progress": {
+        "mediaItemId": "22222222-2222-4222-8222-222222222201",
+        "completion": "in_progress",
+        "progressRatio": 0.4,
+        "revision": "12",
+        "updatedAt": "2026-09-04T00:00:00Z",
+        "locator": {
+          "version": 1,
+          "kind": "comic",
+          "data": {
+            "chapterItemId": "22222222-2222-4222-8222-222222222201",
+            "pageIndex": 9,
+            "pageProgression": 0.4
+          }
+        },
+        "keyframeUri": null
+      },
+      "previousMediaItemId": null,
+      "nextMediaItemId": "22222222-2222-4222-8222-222222222202",
+      "backendOrder": 0
+    },
+    {
+      "mediaItemId": "22222222-2222-4222-8222-222222222202",
+      "editionId": "33333333-3333-4333-8333-333333333301",
+      "subjectId": null,
+      "chapterNumber": 13,
+      "volumeNumber": null,
+      "title": "暂不可用章节",
+      "publishedAt": null,
+      "pageCount": 0,
+      "status": "temporarily_unavailable",
+      "canOpen": false,
+      "sources": [
+        {
+          "source": {
+            "sourceId": "mangadex",
+            "remoteWorkId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "remoteChapterId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+          },
+          "status": "temporarily_unavailable",
+          "mirrorLabel": null,
+          "observedAt": "2026-09-04T00:00:00Z",
+          "sourceOrder": 0
+        }
+      ],
+      "matchResult": null,
+      "progress": null,
+      "previousMediaItemId": "22222222-2222-4222-8222-222222222201",
+      "nextMediaItemId": "22222222-2222-4222-8222-222222222203",
+      "backendOrder": 1
+    },
+    {
+      "mediaItemId": "22222222-2222-4222-8222-222222222203",
+      "editionId": "33333333-3333-4333-8333-333333333302",
+      "subjectId": null,
+      "chapterNumber": 14,
+      "volumeNumber": null,
+      "title": "外部章节",
+      "publishedAt": null,
+      "pageCount": null,
+      "status": "external_only",
+      "canOpen": false,
+      "sources": [
+        {
+          "source": {
+            "sourceId": "mangadex",
+            "remoteWorkId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "remoteChapterId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+          },
+          "status": "external_only",
+          "mirrorLabel": "Mirror label",
+          "observedAt": "2026-09-04T00:00:00Z",
+          "sourceOrder": 0
+        }
+      ],
+      "matchResult": {
+        "kind": "candidate",
+        "confidence": "low",
+        "progressMigration": "suggested",
+        "evidence": [
+          { "kind": "weak_chapter_metadata", "matched": null }
+        ]
+      },
+      "progress": null,
+      "previousMediaItemId": "22222222-2222-4222-8222-222222222202",
+      "nextMediaItemId": null,
+      "backendOrder": 2
+    }
+  ],
+  "refreshStatus": "synced",
+  "lastObservedAt": "2026-09-04T00:00:00Z",
+  "truncated": false,
+  "refreshReceipts": [
+    {
+      "refreshId": "66666666-6666-4666-8666-666666666666",
+      "workId": "11111111-1111-4111-8111-111111111111",
+      "sourceId": "mangadex",
+      "remoteWorkId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "status": "succeeded",
+      "generationBefore": 1,
+      "generationAfter": 2,
+      "observedFrom": "2026-09-03T00:00:00Z",
+      "observedTo": "2026-09-04T00:00:00Z",
+      "truncated": false,
+      "retainedPreviousCatalog": false,
+      "errorCode": null,
+      "observedAt": "2026-09-04T00:00:00Z"
+    }
+  ]
+}
