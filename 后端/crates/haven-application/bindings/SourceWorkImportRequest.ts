@@ -3,4 +3,8 @@
 /**
  * `source_work_import` 请求：导入搜索候选（operationId + 序号定位服务端缓存）。
  */
-export type SourceWorkImportRequest = { operationId: string, index: number, };
+export type SourceWorkImportRequest = { operationId: string, index: number, 
+/**
+ * null/缺省保持“导入为新 Work”；非 null 只能是本地 WorkId。
+ */
+targetWorkId?: string, };

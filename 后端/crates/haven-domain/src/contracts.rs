@@ -8,11 +8,12 @@ use async_trait::async_trait;
 
 use haven_common::{AppError, ErrorKind};
 
-use crate::comic_catalog::ComicChapterCatalogState;
+use crate::comic_catalog::{ComicCatalogRefreshReceipt, ComicChapterCatalogState};
 use crate::comic_identity::{
     ChapterSourceIdentity, ChapterSourceRef, ComicPageIdentitySnapshot,
     ComicProgressMigrationSnapshot, EditionProfile, PageIdentity,
 };
+use crate::comic_progress_subject::{ComicProgressSubject, ComicProgressSubjectMember};
 use crate::entities::*;
 use crate::enums::DownloadState;
 use crate::ids::*;
@@ -26,6 +27,18 @@ pub enum WorkOrder {
     LastActive,
     ReleaseDate,
     Rating,
+}
+
+/// Work 与来源身份之间的持久化绑定。
+///
+/// 领域层只保留稳定的来源标识和本地 Work 归属，不携带远端 URL、认证材料
+/// 或本地存储路径。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct WorkSourceRef {
+    pub provider: String,
+    pub external_id: String,
+    pub work_id: WorkId,
 }
 
 #[async_trait]
@@ -92,6 +105,15 @@ pub trait WorkRepository {
     ) -> Result<Option<WorkId>, AppError>;
     /// 该 Work 是否已有任意来源引用（enrichment 判"新作品"用）。
     async fn has_any_source_ref(&self, id: WorkId) -> Result<bool, AppError>;
+    /// 读取该 Work 的全部来源引用；不支持读取的端口必须显式返回明确错误。
+    async fn list_source_refs(&self, _work_id: WorkId) -> Result<Vec<WorkSourceRef>, AppError> {
+        Err(AppError::new(
+            "WORK_SOURCE_REFS_UNIMPLEMENTED",
+            ErrorKind::Unsupported,
+            "当前存储实现不支持读取作品来源引用",
+            false,
+        ))
+    }
     async fn save_source_ref(
         &self,
         provider: &str,
@@ -243,6 +265,55 @@ pub trait ComicProgressMigrationRepository: Send + Sync {
         id: ComicProgressMigrationId,
         expected_applied_revision: &str,
     ) -> Result<bool, AppError>;
+}
+
+/// 漫画目录刷新 Receipt 的只读契约。
+///
+/// Receipt 是 append-only 的来源观察事实。Work 级章节聚合只读取它来投影
+/// 聚合根的刷新状态/覆盖度，不会因为读取而触发或伪造一次刷新；没有实现该
+/// 契约的组装层保持空 receipts，聚合根回落到 `NeverSynced`。
+#[async_trait]
+pub trait ComicCatalogRefreshOutcomeRepository: Send + Sync {
+    /// Append one refresh observation.
+    ///
+    /// The default keeps read-only test doubles and older assembly layers
+    /// source-compatible. A refresh use case must treat the default error as a
+    /// real persistence failure instead of reporting a successful refresh.
+    async fn save(&self, _receipt: &ComicCatalogRefreshReceipt) -> Result<(), AppError> {
+        Err(AppError::new(
+            "COMIC_REFRESH_RECEIPT_UNAVAILABLE",
+            ErrorKind::Unsupported,
+            "当前存储实现不支持保存漫画目录刷新结果",
+            false,
+        ))
+    }
+
+    async fn list_by_work(
+        &self,
+        work_id: WorkId,
+    ) -> Result<Vec<ComicCatalogRefreshReceipt>, AppError>;
+}
+
+/// 漫画进度主体与成员映射的持久化契约。
+///
+/// Subject 只保存跨 MediaItem 的连续性与权威 Progress 指针；实际阅读位置、
+/// 完成状态、时间和 revision 继续只由 `ProgressRepository` 持有。
+#[async_trait]
+pub trait ComicProgressSubjectRepository: Send + Sync {
+    async fn get(
+        &self,
+        id: ComicProgressSubjectId,
+    ) -> Result<Option<ComicProgressSubject>, AppError>;
+    async fn get_for_media_item(
+        &self,
+        media_item_id: MediaItemId,
+    ) -> Result<Option<ComicProgressSubjectMember>, AppError>;
+    async fn list_members(
+        &self,
+        subject_id: ComicProgressSubjectId,
+    ) -> Result<Vec<ComicProgressSubjectMember>, AppError>;
+    async fn save_subject(&self, subject: &ComicProgressSubject) -> Result<(), AppError>;
+    async fn save_member(&self, member: &ComicProgressSubjectMember) -> Result<(), AppError>;
 }
 
 #[async_trait]
