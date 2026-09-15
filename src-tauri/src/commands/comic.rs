@@ -7,12 +7,104 @@ use haven_application::wire::{
     ComicChapterSourceCandidatesGetRequestDto, ComicPageManifestDto, ComicPageManifestGetRequest,
     ComicPageProgressRemapRequestDto, ComicProgressMigrationRequestDto,
     ComicProgressMigrationResultDto, ComicProgressMigrationRevertRequestDto,
-    ComicProgressMigrationRevertResultDto, ComicRegisteredChapterCatalogDto, ErrorDto,
+    ComicProgressMigrationRevertResultDto, ComicRegisteredChapterCatalogDto,
+    ComicWorkChapterCatalogDto, ComicWorkChapterCatalogRequestDto, ErrorDto,
 };
-use haven_domain::ids::MediaItemId;
+use haven_domain::ids::{MediaItemId, WorkId};
 
-use crate::ipc::{invalid_id, run_blocking, to_error_dto};
+use crate::ipc::{invalid_argument, invalid_id, run_blocking, to_error_dto};
 use crate::state::AppState;
+
+/// Parse the Work-level catalog request at the IPC boundary.
+///
+/// Only canonical local UUID strings are accepted. Provider URLs, remote
+/// chapter IDs, grants and matching evidence never become routing inputs.
+fn parse_work_catalog_request(
+    request: ComicWorkChapterCatalogRequestDto,
+) -> Result<haven_application::services::comic_catalog::ComicWorkChapterCatalogRequest, ErrorDto> {
+    let (work_id, media_item_id) =
+        match (request.work_id.as_deref(), request.media_item_id.as_deref()) {
+            (Some(_), Some(_)) | (None, None) => {
+                return Err(invalid_argument("workId 与 mediaItemId 必须严格二选一"));
+            }
+            (Some(work_id), None) => (
+                Some(WorkId::from_uuid(parse_canonical_uuid(work_id)?)),
+                None,
+            ),
+            (None, Some(media_item_id)) => (
+                None,
+                Some(MediaItemId::from_uuid(parse_canonical_uuid(media_item_id)?)),
+            ),
+        };
+    Ok(
+        haven_application::services::comic_catalog::ComicWorkChapterCatalogRequest {
+            work_id,
+            media_item_id,
+        },
+    )
+}
+
+fn parse_canonical_uuid(value: &str) -> Result<uuid::Uuid, ErrorDto> {
+    let parsed = uuid::Uuid::parse_str(value).map_err(|_| invalid_id())?;
+    if parsed.to_string() != value {
+        return Err(invalid_id());
+    }
+    Ok(parsed)
+}
+
+/// Work-level comic catalog query core. The Application service performs the
+/// same exact-one and ownership checks again before reading repositories.
+pub async fn run_comic_work_chapter_catalog_get(
+    state: &AppState,
+    request: ComicWorkChapterCatalogRequestDto,
+) -> Result<ComicWorkChapterCatalogDto, ErrorDto> {
+    let request = parse_work_catalog_request(request)?;
+    let catalog = state
+        .comic_catalog
+        .work_catalog_get(request)
+        .await
+        .map_err(|error| to_error_dto(&error))?;
+    haven_application::services::comic_catalog::work_catalog_to_dto(&catalog)
+        .map_err(|error| to_error_dto(&error))
+}
+
+#[tauri::command]
+pub async fn comic_work_chapter_catalog_get(
+    state: State<'_, AppState>,
+    request: ComicWorkChapterCatalogRequestDto,
+) -> Result<ComicWorkChapterCatalogDto, ErrorDto> {
+    let state = (*state.inner()).clone();
+    run_blocking(move || async move { run_comic_work_chapter_catalog_get(&state, request).await })
+        .await
+}
+
+/// Work-level comic catalog refresh core. Network access is confined to the
+/// Application refresh use case; the command only parses local routing IDs.
+pub async fn run_comic_work_chapter_catalog_refresh(
+    state: &AppState,
+    request: ComicWorkChapterCatalogRequestDto,
+) -> Result<ComicWorkChapterCatalogDto, ErrorDto> {
+    let request = parse_work_catalog_request(request)?;
+    let refreshed = state
+        .comic_catalog
+        .work_catalog_refresh_for_target(request)
+        .await
+        .map_err(|error| to_error_dto(&error))?;
+    haven_application::services::comic_catalog::work_catalog_to_dto(&refreshed.catalog)
+        .map_err(|error| to_error_dto(&error))
+}
+
+#[tauri::command]
+pub async fn comic_work_chapter_catalog_refresh(
+    state: State<'_, AppState>,
+    request: ComicWorkChapterCatalogRequestDto,
+) -> Result<ComicWorkChapterCatalogDto, ErrorDto> {
+    let state = (*state.inner()).clone();
+    run_blocking(
+        move || async move { run_comic_work_chapter_catalog_refresh(&state, request).await },
+    )
+    .await
+}
 
 /// 漫画章节目录命令核心：只读取来源观察，不创建/更新 Work、Edition、MediaItem。
 pub async fn run_comic_chapter_catalog_get(
@@ -251,8 +343,7 @@ mod tests {
         state: &AppState,
     ) -> (ChapterSourceIdentity, ChapterSourceIdentity, MediaItemId) {
         let work_id = WorkId::new();
-        let source_edition_id = EditionId::new();
-        let target_edition_id = EditionId::new();
+        let edition_id = EditionId::new();
         let source_media_item_id = MediaItemId::new();
         let target_media_item_id = MediaItemId::new();
         let now = haven_common::UtcMillis(1);
@@ -280,34 +371,29 @@ mod tests {
             })
             .await
             .unwrap();
-        for (id, title) in [
-            (source_edition_id, "IPC 源版本"),
-            (target_edition_id, "IPC 目标版本"),
-        ] {
-            state
-                .repos
-                .edition
-                .save(&Edition {
-                    id,
-                    work_id,
-                    title: title.into(),
-                    subtitle: None,
-                    edition_type: MediaType::Comic,
-                    release_date: None,
-                    language: Some("zh-cn".into()),
-                    region: None,
-                    publisher_or_studio: None,
-                    description: None,
-                    artwork: ArtworkSet::default(),
-                    created_at: now,
-                    updated_at: now,
-                })
-                .await
-                .unwrap();
-        }
+        state
+            .repos
+            .edition
+            .save(&Edition {
+                id: edition_id,
+                work_id,
+                title: "IPC 漫画版本".into(),
+                subtitle: None,
+                edition_type: MediaType::Comic,
+                release_date: None,
+                language: Some("zh-cn".into()),
+                region: None,
+                publisher_or_studio: None,
+                description: None,
+                artwork: ArtworkSet::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
         for (id, edition_id) in [
-            (source_media_item_id, source_edition_id),
-            (target_media_item_id, target_edition_id),
+            (source_media_item_id, edition_id),
+            (target_media_item_id, edition_id),
         ] {
             state
                 .repos
@@ -399,7 +485,7 @@ mod tests {
                 &Progress {
                     id: ProgressId::new(),
                     work_id,
-                    edition_id: source_edition_id,
+                    edition_id,
                     media_item_id: source_media_item_id,
                     locator: Locator::Comic(ComicLocator {
                         chapter_item_id: source_media_item_id,
@@ -419,6 +505,80 @@ mod tests {
             .unwrap();
 
         (source, target, target_media_item_id)
+    }
+
+    async fn seed_comic_catalog_fixture(state: &AppState) -> (WorkId, MediaItemId) {
+        let work_id = WorkId::new();
+        let edition_id = EditionId::new();
+        let media_item_id = MediaItemId::new();
+        let now = haven_common::UtcMillis(1);
+        state
+            .repos
+            .work
+            .save(&Work {
+                id: work_id,
+                canonical_title: "Work 目录命令测试".into(),
+                original_title: None,
+                sort_title: None,
+                description: None,
+                work_type: WorkType::Standalone,
+                release_year: None,
+                language: Some("zh-cn".into()),
+                director: None,
+                actor: None,
+                status: WorkStatus::Completed,
+                rating_value: None,
+                rating_scale: None,
+                artwork: ArtworkSet::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        state
+            .repos
+            .edition
+            .save(&Edition {
+                id: edition_id,
+                work_id,
+                title: "Work 目录版本".into(),
+                subtitle: None,
+                edition_type: MediaType::Comic,
+                release_date: None,
+                language: Some("zh-cn".into()),
+                region: None,
+                publisher_or_studio: None,
+                description: None,
+                artwork: ArtworkSet::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        state
+            .repos
+            .media_item
+            .save(&MediaItem {
+                id: media_item_id,
+                edition_id,
+                parent_id: None,
+                media_type: MediaType::Comic,
+                title: "第 1 话".into(),
+                index: MediaIndex::Chapter {
+                    volume: None,
+                    chapter: 1.0,
+                },
+                duration_ms: None,
+                page_count: Some(3),
+                chapter_count: None,
+                published_at: None,
+                status: MediaItemStatus::Available,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        (work_id, media_item_id)
     }
 
     #[tokio::test]
@@ -636,6 +796,92 @@ mod tests {
             ComicPageProgressRemapRequestDto {
                 session_id: "NOT-A-CANONICAL-ID".into(),
                 expected_revision: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "INVALID_ID");
+    }
+
+    #[tokio::test]
+    async fn comic_work_chapter_catalog_command_accepts_work_or_media_item_and_projects_backend_identity(
+    ) {
+        let state = AppState::new(Arc::new(Db::open_in_memory().unwrap()));
+        let (work_id, media_item_id) = seed_comic_catalog_fixture(&state).await;
+
+        let by_work = run_comic_work_chapter_catalog_get(
+            &state,
+            ComicWorkChapterCatalogRequestDto {
+                work_id: Some(work_id.to_string()),
+                media_item_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(by_work.work_id, work_id.to_string());
+        assert_eq!(by_work.current_media_item_id, None);
+        assert_eq!(by_work.chapters.len(), 1);
+        assert_eq!(by_work.chapters[0].media_item_id, media_item_id.to_string());
+
+        let by_media_item = run_comic_work_chapter_catalog_get(
+            &state,
+            ComicWorkChapterCatalogRequestDto {
+                work_id: None,
+                media_item_id: Some(media_item_id.to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(by_media_item.work_id, work_id.to_string());
+        assert_eq!(
+            by_media_item.current_media_item_id,
+            Some(media_item_id.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn comic_work_chapter_catalog_command_rejects_ambiguous_and_noncanonical_targets() {
+        let state = AppState::new(Arc::new(Db::open_in_memory().unwrap()));
+        let local_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+        let error = run_comic_work_chapter_catalog_get(
+            &state,
+            ComicWorkChapterCatalogRequestDto {
+                work_id: None,
+                media_item_id: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "INVALID_ARGUMENT");
+
+        let error = run_comic_work_chapter_catalog_get(
+            &state,
+            ComicWorkChapterCatalogRequestDto {
+                work_id: Some(local_id.into()),
+                media_item_id: Some(local_id.into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "INVALID_ARGUMENT");
+
+        let error = run_comic_work_chapter_catalog_get(
+            &state,
+            ComicWorkChapterCatalogRequestDto {
+                work_id: None,
+                media_item_id: Some("https://example.invalid/chapter".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "INVALID_ID");
+
+        let error = run_comic_work_chapter_catalog_get(
+            &state,
+            ComicWorkChapterCatalogRequestDto {
+                work_id: Some(local_id.to_ascii_uppercase()),
+                media_item_id: None,
             },
         )
         .await
