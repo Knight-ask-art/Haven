@@ -5,8 +5,25 @@ import { useNavigate, useParams } from "react-router"
 import type { EditionDetailDto, MediaItemSummaryDto } from "@/lib/ipc/generated/wire"
 import { HavenError } from "@/lib/ipc/errors"
 import { getHavenClientMode } from "@/lib/ipc/runtime"
+import {
+  createDownloadForMediaItem,
+  getMediaItemDownloadInfo,
+  getMediaItemsDownloadInfo,
+  subscribeDownloadEvents,
+  type MediaItemDownloadInfo,
+} from "@/features/downloads/ipc/download-gateway"
 import { getEdition, normalizeEditionError } from "../ipc/edition-gateway"
 import { primaryActionRoute } from "../lib/primary-action-route"
+import {
+  primaryActionPresentation,
+  resolveMediaItemCapability,
+  type MediaItemCapabilityPresentation,
+} from "../lib/periodical-presentation"
+
+type ItemCapability = {
+  info: MediaItemDownloadInfo | null
+  failed: boolean
+}
 
 function itemMeta(item: MediaItemSummaryDto): string {
   if (item.durationMs != null) return `${Math.max(1, Math.round(item.durationMs / 60_000))} 分钟`
@@ -30,6 +47,12 @@ export function EditionDetailPage() {
   const [loading, setLoading] = useState(mode === "tauri")
   const [error, setError] = useState<HavenError | null>(null)
   const requestSequence = useRef(0)
+  const capabilityGeneration = useRef(0)
+  const capabilityRequests = useRef(new Map<string, number>())
+  const capabilitiesRef = useRef<Record<string, ItemCapability>>({})
+  const [capabilities, setCapabilities] = useState<Record<string, ItemCapability>>({})
+  const [downloadPending, setDownloadPending] = useState<Record<string, boolean>>({})
+  const [downloadErrors, setDownloadErrors] = useState<Record<string, string>>({})
 
   const load = useCallback(async () => {
     if (!editionId || mode !== "tauri") {
@@ -53,6 +76,126 @@ export function EditionDetailPage() {
     void load()
     return () => { requestSequence.current += 1 }
   }, [load])
+
+  useEffect(() => {
+    capabilitiesRef.current = capabilities
+  }, [capabilities])
+
+  useEffect(() => {
+    const generation = ++capabilityGeneration.current
+    capabilityRequests.current.clear()
+    setDownloadPending({})
+    setDownloadErrors({})
+    if (!detail || detail.items.length === 0) {
+      setCapabilities({})
+      return
+    }
+
+    const ids = detail.items.map((item) => item.mediaItemId)
+    const initial: Record<string, ItemCapability> = {}
+    for (const id of ids) initial[id] = { info: null, failed: false }
+    capabilitiesRef.current = initial
+    setCapabilities(initial)
+
+    void getMediaItemsDownloadInfo(ids)
+      .then((projected) => {
+        if (capabilityGeneration.current !== generation) return
+        const next: Record<string, ItemCapability> = {}
+        for (const id of ids) {
+          next[id] = { info: projected.get(id) ?? null, failed: false }
+        }
+        capabilitiesRef.current = next
+        setCapabilities(next)
+      })
+      .catch(() => {
+        if (capabilityGeneration.current !== generation) return
+        const next: Record<string, ItemCapability> = {}
+        for (const id of ids) next[id] = { info: null, failed: true }
+        capabilitiesRef.current = next
+        setCapabilities(next)
+      })
+  }, [detail])
+
+  const refreshItemCapability = useCallback(async (mediaItemId: string, generation = capabilityGeneration.current) => {
+    const requestId = (capabilityRequests.current.get(mediaItemId) ?? 0) + 1
+    capabilityRequests.current.set(mediaItemId, requestId)
+    setCapabilities((current) => ({ ...current, [mediaItemId]: { info: null, failed: false } }))
+    try {
+      const info = await getMediaItemDownloadInfo(mediaItemId)
+      if (
+        capabilityGeneration.current !== generation
+        || capabilityRequests.current.get(mediaItemId) !== requestId
+      ) return info
+      setCapabilities((current) => ({ ...current, [mediaItemId]: { info, failed: false } }))
+      return info
+    } catch {
+      if (
+        capabilityGeneration.current !== generation
+        || capabilityRequests.current.get(mediaItemId) !== requestId
+      ) return null
+      setCapabilities((current) => ({ ...current, [mediaItemId]: { info: null, failed: true } }))
+      return null
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!detail || detail.items.length === 0) return
+    const generation = capabilityGeneration.current
+    let mounted = true
+    let cleanup: (() => Promise<void>) | null = null
+    void subscribeDownloadEvents((event) => {
+      if (!mounted || capabilityGeneration.current !== generation) return
+      const item = detail.items.find((candidate) => (
+        capabilitiesRef.current[candidate.mediaItemId]?.info?.taskId === event.data.taskId
+      ))
+      if (item) void refreshItemCapability(item.mediaItemId, generation)
+    }).then((dispose) => {
+      if (!mounted) void dispose().catch(() => undefined)
+      else cleanup = dispose
+    }).catch(() => undefined)
+    return () => {
+      mounted = false
+      if (cleanup) void cleanup().catch(() => undefined)
+    }
+  }, [detail, refreshItemCapability])
+
+  const handleDownload = useCallback(async (item: MediaItemSummaryDto) => {
+    const generation = capabilityGeneration.current
+    const current = capabilitiesRef.current[item.mediaItemId]?.info
+    if (!current?.canDownload) {
+      await refreshItemCapability(item.mediaItemId, generation)
+      return
+    }
+    setDownloadErrors((previous) => {
+      const next = { ...previous }
+      delete next[item.mediaItemId]
+      return next
+    })
+    setDownloadPending((previous) => ({ ...previous, [item.mediaItemId]: true }))
+    try {
+      await createDownloadForMediaItem(item.mediaItemId)
+      await refreshItemCapability(item.mediaItemId, generation)
+    } catch (cause) {
+      if (capabilityGeneration.current === generation) {
+        setDownloadErrors((previous) => ({
+          ...previous,
+          [item.mediaItemId]: cause instanceof HavenError ? cause.message : "创建下载任务失败",
+        }))
+      }
+    } finally {
+      if (capabilityGeneration.current === generation) {
+        setDownloadPending((previous) => {
+          const next = { ...previous }
+          delete next[item.mediaItemId]
+          return next
+        })
+      }
+    }
+  }, [refreshItemCapability])
+
+  const handleRetryCapability = useCallback((mediaItemId: string) => {
+    void refreshItemCapability(mediaItemId)
+  }, [refreshItemCapability])
 
   if (mode !== "tauri") {
     return <StatePanel title="版本详情仅在桌面应用中可用" detail="浏览器预览不会伪造本地媒体条目。" onBack={() => navigate(-1)} />
@@ -96,7 +239,18 @@ export function EditionDetailPage() {
           <div className="rounded-xl border border-dashed border-border px-5 py-10 text-center text-sm text-muted-foreground">该版本暂无已登记的媒体条目</div>
         ) : (
           <div className="divide-y divide-border rounded-xl border border-border">
-            {detail.items.map((item) => <MediaItemRow key={item.mediaItemId} item={item} onOpen={(route) => navigate(route)} />)}
+            {detail.items.map((item) => (
+              <MediaItemRow
+                key={item.mediaItemId}
+                item={item}
+                capability={capabilities[item.mediaItemId]}
+                downloadPending={downloadPending[item.mediaItemId] === true}
+                downloadError={downloadErrors[item.mediaItemId]}
+                onOpen={(route) => navigate(route)}
+                onDownload={() => void handleDownload(item)}
+                onRetry={() => handleRetryCapability(item.mediaItemId)}
+              />
+            ))}
           </div>
         )}
       </section>
@@ -104,18 +258,73 @@ export function EditionDetailPage() {
   )
 }
 
-function MediaItemRow({ item, onOpen }: { item: MediaItemSummaryDto; onOpen: (route: string) => void }) {
+function MediaItemRow({
+  item,
+  capability,
+  downloadPending,
+  downloadError,
+  onOpen,
+  onDownload,
+  onRetry,
+}: {
+  item: MediaItemSummaryDto
+  capability?: ItemCapability
+  downloadPending: boolean
+  downloadError?: string
+  onOpen: (route: string) => void
+  onDownload: () => void
+  onRetry: () => void
+}) {
+  const action = primaryActionPresentation(item.primaryAction)
   const route = primaryActionRoute(item.primaryAction)
-  const disabled = route === null
+  const capabilityPresentation: MediaItemCapabilityPresentation = resolveMediaItemCapability(
+    capability?.info,
+    capability?.failed ?? false,
+  )
+  const selfEditionAction = item.primaryAction?.kind === "open_edition"
+    && route === `/edition/${item.editionId}`
+  const canOpen = !selfEditionAction
+    && route !== null
+    && (capabilityPresentation.state === "online" || capabilityPresentation.state === "offline")
+  const canDownload = !canOpen && capabilityPresentation.state === "download_only"
+  const disabled = downloadPending
+    || (!canOpen && !canDownload && capabilityPresentation.state !== "error")
+  const buttonLabel = downloadPending
+    ? "准备下载"
+    : canOpen
+      ? item.primaryAction?.labelHint === "continue" ? "继续" : "打开"
+      : canDownload
+        ? "下载后阅读"
+        : capabilityPresentation.state === "queued"
+          ? "下载中"
+          : capabilityPresentation.state === "loading"
+            ? "读取能力"
+            : capabilityPresentation.state === "error"
+              ? "重试"
+              : "不可用"
+  const statusLabel = downloadError ?? (
+    selfEditionAction ? "当前内容暂不可用" : capabilityPresentation.label
+  )
   return (
     <div className="flex items-center gap-4 px-5 py-4">
       <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">{itemIcon(item)}</span>
       <div className="min-w-0 flex-1">
         <p className="truncate font-semibold">{item.title}</p>
-        <p className="mt-1 text-sm text-muted-foreground">{item.indexLabel} · {itemMeta(item)} · {item.availableResourceCount > 0 ? "本地可用" : "资源不可用"}</p>
+        <p className="mt-1 text-sm text-muted-foreground">{item.indexLabel} · {itemMeta(item)} · {statusLabel}</p>
       </div>
-      <button type="button" disabled={disabled} onClick={() => { if (route) onOpen(route) }} className="shrink-0 rounded-lg border border-border px-4 py-2 text-sm font-semibold transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50">
-        {disabled ? "不可用" : item.primaryAction?.labelHint === "continue" ? "继续" : "打开"}
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => {
+          if (canOpen && route) onOpen(route)
+          else if (canDownload) onDownload()
+          else if (capabilityPresentation.state === "error") onRetry()
+        }}
+        aria-label={buttonLabel}
+        title={action.label}
+        className="shrink-0 rounded-lg border border-border px-4 py-2 text-sm font-semibold transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        {buttonLabel}
       </button>
     </div>
   )

@@ -5,12 +5,16 @@ import type { MediaDetailData } from "../pages/MediaDetailPage"
 function deriveType(mediaTypes: WorkDetailHeaderDto["availableMediaTypes"], categories: WorkDetailHeaderDto["categories"]): MediaDetailData["type"] {
   if (mediaTypes.includes("series") || mediaTypes.includes("episode")) return "tv"
   if (mediaTypes.includes("movie")) return "movie"
+  // 报刊是 ContentCategory 才对得上的分类：后端没有独立的 Periodical MediaType，
+  // 只由 MediaType::Document / Article 映射而来。若先看 availableMediaTypes，
+  // ["document"] + ["periodical"] 会被投影成 document，遮蔽报刊入口、文案和
+  // Reader 路由，因此分类判断必须排在 document/article 之前。
+  if (categories.includes("periodical")) return "periodical"
   if (mediaTypes.includes("document")) return "document"
   if (mediaTypes.includes("article")) return "article"
   if (mediaTypes.includes("comic")) return "comic"
   if (mediaTypes.includes("book")) return "book"
-  const category = categories[0]
-  return category === "periodical" ? "periodical" : "document"
+  return "document"
 }
 
 /** Maps only WorkDetailHeaderDto facts; editions are loaded by edition_list_by_work. */
@@ -22,6 +26,7 @@ export function mapWorkDetailHeaderToMediaDetail(dto: WorkDetailHeaderDto): Medi
     title: dto.title,
     originalTitle: dto.originalTitle ?? undefined,
     type: deriveType(dto.availableMediaTypes, dto.categories),
+    categories: dto.categories,
     year: dto.releaseYear ?? 0,
     backdropUrl,
     posterUrl: artworkRequestUri(dto.posterUri),

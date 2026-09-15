@@ -10,6 +10,7 @@ import type { ContinueItemDto, HomeDto, WorkCardDto } from "@/lib/ipc/generated/
 import { artworkRequestUri } from "@/lib/artwork-url"
 import { pickCardImage } from "@/lib/artwork-policy"
 import { defaultCoverCategoryForMediaType } from "@/lib/default-cover"
+import { contentCategoryLabel } from "@/features/media/lib/periodical-presentation"
 
 import type { MediaCardProps } from "@/components/ui/haven/MediaCard"
 
@@ -21,15 +22,22 @@ import { HavenError, toHavenError } from "@/lib/ipc/errors"
 const PROGRESS_LABEL: Record<string, string> = {
   video: "继续观看",
   book: "继续阅读",
+  periodical: "继续翻阅",
   comic: "继续阅读",
   article: "继续阅读",
   document: "继续查阅",
 }
 
+function categoryLabel(category: string | undefined): string {
+  return contentCategoryLabel(category)
+}
+
 function deriveMediaType(card: WorkCardDto): string {
+  if (card.categories.includes("periodical")) return "periodical"
   const media = card.availableMediaTypes
   if (media.includes("movie") || media.includes("series") || media.includes("episode")) return "video"
-  if (media.includes("book") || media.includes("document")) return "book"
+  if (media.includes("document")) return "document"
+  if (media.includes("book")) return "book"
   if (media.includes("comic")) return "comic"
   if (media.includes("article")) return "article"
   return card.categories[0] ?? "video"
@@ -44,7 +52,7 @@ export function continueItemToCard(item: ContinueItemDto, cards: WorkCardDto[]):
     id: item.mediaItemId,
     title: card.title,
     subtitle: PROGRESS_LABEL[mediaType] ?? "继续",
-    typeBadge: card.categories[0] ?? "媒体",
+    typeBadge: categoryLabel(card.categories[0]),
     layout: "landscape",
     progress: item.progress.progressRatio != null ? Math.round(item.progress.progressRatio * 100) : undefined,
     imageUrl: pickCardImage(card),
@@ -57,8 +65,8 @@ export function workCardToMediaCard(card: WorkCardDto): MediaCardProps {
   return {
     id: card.workId,
     title: card.title,
-    subtitle: card.categories[0] ?? "媒体",
-    typeBadge: card.categories[0] ?? "媒体",
+    subtitle: categoryLabel(card.categories[0]),
+    typeBadge: categoryLabel(card.categories[0]),
     imageUrl: artworkRequestUri(card.posterUri),
     artworkCategory: defaultCoverCategoryForMediaType(card.categories[0]),
   }

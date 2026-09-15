@@ -46,6 +46,8 @@ import type {
   ComicChapterCatalogGetRequest,
   ComicChapterCatalogDto,
   ComicRegisteredChapterCatalogDto,
+  ComicWorkChapterCatalogRequestDto,
+  ComicWorkChapterCatalogDto,
   ComicChapterSourceCandidatesDto,
   ComicChapterSourceCandidatesGetRequestDto,
   ComicProgressMigrationRequestDto,
@@ -142,6 +144,12 @@ export interface HavenClient {
     request: ComicChapterCatalogGetRequest,
   ): Promise<ComicRegisteredChapterCatalogDto>;
   comicChapterCatalogRefresh(request: ComicChapterCatalogGetRequest): Promise<ComicChapterCatalogDto>;
+  comicWorkChapterCatalogGet(
+    request: ComicWorkChapterCatalogRequestDto,
+  ): Promise<ComicWorkChapterCatalogDto>;
+  comicWorkChapterCatalogRefresh(
+    request: ComicWorkChapterCatalogRequestDto,
+  ): Promise<ComicWorkChapterCatalogDto>;
   comicChapterSourceCandidatesGet(
     request: ComicChapterSourceCandidatesGetRequestDto,
   ): Promise<ComicChapterSourceCandidatesDto>;
