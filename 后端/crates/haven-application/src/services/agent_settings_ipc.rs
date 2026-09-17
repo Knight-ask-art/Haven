@@ -25,7 +25,7 @@ use haven_domain::setting_proposal::{
 };
 use haven_domain::settings::{ReadingSettings, SettingsPatch, SettingsSection, SettingsValue};
 
-use crate::services::agent::AgentProposalService;
+use crate::services::agent::{AgentProposalService, AgentSettingsScopeActionRequest};
 use crate::services::setting_proposals::SettingProposalService;
 use crate::services::settings::SettingsService;
 use crate::wire::{
@@ -174,15 +174,13 @@ impl AgentSettingsIpcService {
 
         let action = self
             .agent
-            .create_settings_proposal(
+            .create_settings_proposal(AgentSettingsScopeActionRequest::new(
                 session_id,
                 request_id,
                 &context.snapshot,
                 target,
                 change,
-                context.snapshot.revision().map(str::to_owned),
-                None,
-            )
+            ))
             .await?;
 
         let proposal = self
@@ -759,11 +757,10 @@ mod tests {
 
         fn stored_reading(&self) -> ReadingSettings {
             let state = self.state.lock().unwrap();
-            match &state.settings.get("reading").unwrap().data_json {
-                raw => match serde_json::from_str::<SettingsValue>(raw).unwrap() {
-                    SettingsValue::Reading(reading) => reading,
-                    other => panic!("分区不是阅读设置：{}", other.section().as_str()),
-                },
+            let raw = &state.settings.get("reading").unwrap().data_json;
+            match serde_json::from_str::<SettingsValue>(raw).unwrap() {
+                SettingsValue::Reading(reading) => reading,
+                other => panic!("分区不是阅读设置：{}", other.section().as_str()),
             }
         }
 
@@ -779,11 +776,10 @@ mod tests {
         /// 模拟"别处改了设置"：值变化 + 新 revision。
         fn write_reading(&self, patch: ReadingPatch) -> String {
             let mut state = self.state.lock().unwrap();
-            let current = match &state.settings.get("reading").unwrap().data_json {
-                raw => match serde_json::from_str::<SettingsValue>(raw).unwrap() {
-                    SettingsValue::Reading(reading) => reading,
-                    other => panic!("分区不是阅读设置：{}", other.section().as_str()),
-                },
+            let raw = &state.settings.get("reading").unwrap().data_json;
+            let current = match serde_json::from_str::<SettingsValue>(raw).unwrap() {
+                SettingsValue::Reading(reading) => reading,
+                other => panic!("分区不是阅读设置：{}", other.section().as_str()),
             };
             let merged = SettingsPatch::Reading(patch).apply_to(&SettingsValue::Reading(current));
             let revision = format!("rev-{}", state.recovery);

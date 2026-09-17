@@ -50,7 +50,7 @@ pub mod work;
 
 pub use agent::{
     AgentActionProposal, AgentCapabilityPolicy, AgentProposalService, AgentSettingsActionRequest,
-    AgentSubjectScopePort, RepositoryAgentSubjectScope,
+    AgentSettingsScopeActionRequest, AgentSubjectScopePort, RepositoryAgentSubjectScope,
 };
 pub use agent_settings_ipc::{AgentSettingsContext, AgentSettingsIpcService};
 pub use app_info::{AppInfoPorts, AppInfoService, DirectoryKind};

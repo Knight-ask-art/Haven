@@ -566,8 +566,8 @@ impl AgentSettingsContextPayload {
         self.capabilities.validate()?;
         // 能力清单是"本切片已实现能力"的声明，设置上下文只允许声明设置读取/提案；
         // 别的能力即使将来实现，也不得从设置上下文这里变相出现。
-        if self.capabilities.grants(AgentCapability::SettingsRead) == false
-            || self.capabilities.grants(AgentCapability::SettingsProposal) == false
+        if !self.capabilities.grants(AgentCapability::SettingsRead)
+            || !self.capabilities.grants(AgentCapability::SettingsProposal)
         {
             return Err(invalid_settings_context(
                 "设置上下文的能力清单必须声明设置读取与设置提案",
@@ -936,7 +936,7 @@ impl AgentApprovalToken {
         hasher.update(b"\n");
         hasher.update(self.raw.as_bytes());
         let digest = format!("{:x}", hasher.finalize());
-        Ok(AgentApprovalTokenHash::parse(digest)?)
+        AgentApprovalTokenHash::parse(digest)
     }
 }
 
@@ -2249,9 +2249,10 @@ pub fn contains_sensitive_text(text: &str) -> bool {
 
 /// 关键词是否以独立 token 出现（前一个字符不能是字母数字/`_`/`-`）。
 fn at_token_boundary(text: &str, start: usize) -> bool {
-    text[..start].chars().next_back().map_or(true, |c| {
-        !(c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    })
+    text[..start]
+        .chars()
+        .next_back()
+        .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
 }
 
 fn contains_credential_assignment(text: &str) -> bool {
@@ -3417,7 +3418,7 @@ mod tests {
             "api_key: sk-live-0123456789abcdef",
             "API_KEY = 42c0ffee1234",
             "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
-            "access_key=AKIAIOSFODNN7EXAMPLE",
+            "access_key=local-dev-placeholder-0001",
             "password: hunter2secret",
             "client_secret: 0123456789abcdef",
             "bearer\tdeadbeefcafebabe",

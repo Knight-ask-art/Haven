@@ -318,10 +318,12 @@ impl AgentActionProposal {
     }
 }
 
-/// 创建 Agent 设置动作的输入。
+/// 创建 Agent 设置动作的输入（**作品内容范围**）。
 ///
 /// `context` 直接引用**已构造的快照**：subject / 快照 id / context_hash 都从快照
 /// 派生，调用方没有机会让三者互相不一致。
+///
+/// 全局设置范围是另一个入口，见 [`AgentSettingsScopeActionRequest`]。
 #[derive(Debug, Clone)]
 pub struct AgentSettingsActionRequest<'a> {
     pub session_id: AgentSessionId,
@@ -369,6 +371,57 @@ impl<'a> AgentSettingsActionRequest<'a> {
 
     pub fn with_capability_manifest(mut self, manifest: AgentCapabilityManifest) -> Self {
         self.capability_manifest = manifest;
+        self
+    }
+}
+
+/// 创建 Agent 设置动作的输入（**全局设置范围**）。
+///
+/// `context` 直接引用**已构造的设置上下文快照**：subject / 快照 id / context_hash /
+/// base_revision 全部从快照派生，调用方没有机会让它们与上下文身份互相矛盾。
+///
+/// 与 [`AgentSettingsActionRequest`] 的差别不只是快照类型：这里**没有**能力清单字段。
+/// 设置范围的能力清单只能取自快照里的服务端固定清单，调用方无法自带清单。
+///
+/// 字段全部私有：所有绑定（subject / context id / context_hash / base_revision）
+/// 都只能经 [`Self::new`] 从快照派生，调用方既不能用 struct literal 伪造，也不能在
+/// 构造后替换 `context` 而让派生自旧快照的 `base_revision` 与新上下文脱钩。
+#[derive(Debug, Clone)]
+pub struct AgentSettingsScopeActionRequest<'a> {
+    session_id: AgentSessionId,
+    request_id: AgentRequestId,
+    context: &'a AgentSettingsContextSnapshot,
+    target: SettingTarget,
+    change: SettingProposalChange,
+    /// 目标作用域当前 authoritative revision；`None` 表示目标行尚未持久化。
+    ///
+    /// 它取自快照而不是调用方：revision 参与 `context_hash` 的构造，因此"上下文是
+    /// 这一版、基线却是另一版"不该可表达。
+    base_revision: Option<String>,
+    ttl_ms: Option<i64>,
+}
+
+impl<'a> AgentSettingsScopeActionRequest<'a> {
+    pub fn new(
+        session_id: AgentSessionId,
+        request_id: AgentRequestId,
+        context: &'a AgentSettingsContextSnapshot,
+        target: SettingTarget,
+        change: SettingProposalChange,
+    ) -> Self {
+        Self {
+            session_id,
+            request_id,
+            context,
+            target,
+            change,
+            base_revision: context.revision().map(str::to_owned),
+            ttl_ms: None,
+        }
+    }
+
+    pub fn with_ttl_ms(mut self, ttl_ms: i64) -> Self {
+        self.ttl_ms = Some(ttl_ms);
         self
     }
 }
@@ -491,14 +544,18 @@ impl AgentProposalService {
     /// 基线版本会在**同一个事务内**再核对一次（上下文过期 fail-closed）。
     pub async fn create_settings_proposal(
         &self,
-        session_id: AgentSessionId,
-        request_id: AgentRequestId,
-        context: &AgentSettingsContextSnapshot,
-        target: SettingTarget,
-        change: SettingProposalChange,
-        base_revision: Option<String>,
-        ttl_ms: Option<i64>,
+        request: AgentSettingsScopeActionRequest<'_>,
     ) -> Result<AgentActionProposal, AppError> {
+        let AgentSettingsScopeActionRequest {
+            session_id,
+            request_id,
+            context,
+            target,
+            change,
+            base_revision,
+            ttl_ms,
+        } = request;
+
         validate_agent_identity_ids(session_id, request_id)?;
 
         let manifest = context.capabilities();
@@ -777,14 +834,18 @@ mod tests {
     use haven_domain::agent::{
         AgentApprovalState, AgentBoundaryMode, AgentContentKind, AgentContextPayload,
         AgentContextSnapshot, AgentLocatorConfidence, AgentScopeSubject,
+        AgentSettingsContextPayload, AgentSettingsSubject,
     };
     use haven_domain::contracts::{
         EditionPreference, MediaItemPreference, SettingProposalRepository, SettingsRow,
     };
     use haven_domain::ids::{EditionId, MediaItemId, WorkId};
-    use haven_domain::setting_proposal::{SettingProposal, SettingProposalStatus};
+    use haven_domain::setting_proposal::{
+        SettingProposal, SettingProposalStatus, canonical_json_of,
+    };
     use haven_domain::settings::{
-        PreferenceData, ReadingFontSize, ReadingPatch, SettingsPatch, SettingsSection,
+        PreferenceData, ReadingFontSize, ReadingPatch, ReadingSettings, SettingsPatch,
+        SettingsSection, SettingsValue,
     };
 
     use crate::services::setting_proposals::{SettingProposalTxPorts, SettingProposalUoW};
@@ -1341,6 +1402,15 @@ mod tests {
         .unwrap()
     }
 
+    /// 全局设置范围的上下文快照（能力清单与脱敏登记由领域构造填好）。
+    fn settings_context(revision: Option<&str>) -> AgentSettingsContextSnapshot {
+        let payload = AgentSettingsContextPayload::new(
+            AgentSettingsSubject::reading(),
+            revision.map(str::to_owned),
+        );
+        AgentSettingsContextSnapshot::derive(payload).unwrap()
+    }
+
     /// 直接构造一条合法提案（领域构造固化 canonical JSON、digest 与过期时刻）。
     fn stored_proposal(id: SettingProposalId, ttl_ms: i64) -> SettingProposal {
         SettingProposal::new(
@@ -1424,6 +1494,80 @@ mod tests {
         assert!(provenance.summary.is_none());
 
         // 只创建提案：目标零写入。
+        assert_eq!(store.target_writes(), 0);
+    }
+
+    /// 全局设置范围的入口（[`AgentSettingsScopeActionRequest`]）：绑定全部取自设置快照，
+    /// 基线版本也只能来自快照，落库前仍在同一 UoW 内再核对一次。
+    #[tokio::test]
+    async fn create_settings_proposal_binds_settings_subject_and_derives_base_revision() {
+        let store = FakeStore::new();
+        let svc = service(&store);
+        store.state.lock().unwrap().settings.insert(
+            "reading".to_owned(),
+            SettingsRow {
+                section: "reading".to_owned(),
+                schema_version: 1,
+                revision: "rev-0001".to_owned(),
+                data_json: canonical_json_of(&SettingsValue::Reading(ReadingSettings::default()))
+                    .unwrap(),
+                updated_at: UtcMillis(1),
+            },
+        );
+        let context = settings_context(Some("rev-0001"));
+        let session_id = AgentSessionId::new();
+        let request_id = AgentRequestId::new();
+
+        let action = svc
+            .create_settings_proposal(AgentSettingsScopeActionRequest::new(
+                session_id,
+                request_id,
+                &context,
+                SettingTarget::global(SettingsSection::Reading),
+                reading_change(ReadingFontSize::Large),
+            ))
+            .await
+            .unwrap();
+
+        // 快照 id/hash 与设置范围 subject 全部由设置快照派生：不是作品身份，
+        // 也没有伪造的 work/edition/media_item。
+        assert_eq!(action.context_snapshot_id(), context.id());
+        assert_eq!(action.context_hash(), context.context_hash());
+        assert_eq!(
+            action.subject(),
+            AgentScopeSubject::settings(AgentSettingsSubject::reading())
+        );
+        assert!(action.subject().as_content().is_none());
+
+        let stored = store.stored(action.setting_proposal_id());
+        assert_eq!(stored.status(), SettingProposalStatus::Pending);
+        // 基线版本来自快照的 revision：调用方没有裸传入口。
+        assert_eq!(stored.base_revision(), Some("rev-0001"));
+        assert_eq!(stored.provenance().source_kind, ProvenanceSourceKind::Agent);
+        assert_eq!(stored.provenance().actor_kind, ProvenanceActorKind::Agent);
+        assert_eq!(
+            stored.provenance().reason,
+            ProvenanceReason::AgentSuggestion
+        );
+        assert!(stored.provenance().source_ref.is_none());
+        assert!(stored.provenance().summary.is_none());
+        // 只创建提案：目标零写入。
+        assert_eq!(store.target_writes(), 0);
+
+        // 快照 revision 与库中基线不一致：同一个 UoW 内 fail-closed，不落库。
+        let stale = settings_context(Some("rev-0002"));
+        let error = svc
+            .create_settings_proposal(AgentSettingsScopeActionRequest::new(
+                session_id,
+                request_id,
+                &stale,
+                SettingTarget::global(SettingsSection::Reading),
+                reading_change(ReadingFontSize::Large),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), "REVISION_CONFLICT");
+        assert_eq!(store.state.lock().unwrap().proposals.len(), 1);
         assert_eq!(store.target_writes(), 0);
     }
 
