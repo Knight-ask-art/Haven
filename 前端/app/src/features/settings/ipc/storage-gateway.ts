@@ -47,7 +47,9 @@ export function guardStorageLocation(value: unknown): value is StorageLocationDt
   if (FORBIDDEN_STORAGE_LOCATION_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(value, field))) {
     return false;
   }
-  if (Object.keys(value).some((field) => !STORAGE_LOCATION_FIELDS.has(field))) return false;
+  if (Reflect.ownKeys(value).some(
+    (field) => typeof field !== "string" || !STORAGE_LOCATION_FIELDS.has(field),
+  )) return false;
   return typeof value.locationId === "string"
     && value.locationId.length > 0
     && typeof value.displayName === "string"

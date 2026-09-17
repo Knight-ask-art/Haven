@@ -122,7 +122,23 @@ import type {
   VideoScreenshotChunkRequest,
   VideoScreenshotResultDto,
   PreferenceComicSettingsDto,
+  PreferenceReadingPatchDto,
   PreferenceReadingSettingsDto,
+  PeriodicalTreeGetRequest,
+  PeriodicalTreeDto,
+  AgentCapabilityManifestDto,
+  AgentSettingChangeDto,
+  AgentSettingChangeReceiptDto,
+  AgentSettingChangeReceiptGetRequest,
+  AgentSettingsContextDto,
+  AgentSettingsProposalApproveRequest,
+  AgentSettingsProposalApproveResultDto,
+  AgentSettingsProposalCreateRequest,
+  AgentSettingsProposalDto,
+  AgentSettingsProposalGetRequest,
+  AgentSettingsProposalGetResultDto,
+  AgentSettingsProposalRejectRequest,
+  AgentSettingsProposalRejectResultDto,
 } from "./generated/wire";
 import type {
   SettingsChangedDto,
@@ -173,6 +189,7 @@ import settingsComicSaved from "../../../../../contracts/ipc/v1/fixtures/setting
 import settingsDownloadsDefault from "../../../../../contracts/ipc/v1/fixtures/settings/downloads.default.json" with { type: "json" };
 import settingsDownloadsSaved from "../../../../../contracts/ipc/v1/fixtures/settings/downloads.saved.json" with { type: "json" };
 import settingsPrivacyDefault from "../../../../../contracts/ipc/v1/fixtures/settings/privacy.default.json" with { type: "json" };
+import type { ReadingPatchWire } from "./settings-wire";
 import settingsConflictError from "../../../../../contracts/ipc/v1/fixtures/settings/update.error-revision-conflict.json" with { type: "json" };
 import settingsInvalidArgument from "../../../../../contracts/ipc/v1/fixtures/settings/update.error-invalid-argument.json" with { type: "json" };
 import sourceRegistryNormal from "../../../../../contracts/ipc/v1/fixtures/source/registry.normal.json" with { type: "json" };
@@ -219,6 +236,132 @@ const MOCK_COMIC_NO_SOURCE_PROGRESS_RECEIPT: ComicProgressMigrationReceiptDto = 
   undoable: false,
   appliedRevision: null,
 };
+
+/** Mock 只为这个演示 Work 提供期刊层级；其它 Work 一律「无期刊」。 */
+const DEMO_PERIODICAL_WORK_ID = "0196f0d2-0000-7000-8000-00000000e001";
+
+/**
+ * 演示期刊层级：一个期刊 → 两个卷 → 三个期 → 四篇文章，确定性内联 fixture。
+ *
+ * 只包含本地身份与展示事实（标题、ISSN、刊期原文、发行日期、DOI、页码区间），
+ * 以及用于幂等核对的来源 key / opaque 远端文章 ID；**不伪造正文 URL、signed URL、
+ * 本地路径或 Provider 原始响应**——正文资源仍走既有 Session/grant 路径。
+ * 每次调用返回新建对象，避免调用方改动污染后续 Demo 会话。
+ */
+function demoPeriodicalTree(): PeriodicalTreeDto {
+  return {
+    schemaVersion: 1,
+    workId: DEMO_PERIODICAL_WORK_ID,
+    periodical: {
+      id: "0196f0d2-0000-7000-8000-00000000e100",
+      workId: DEMO_PERIODICAL_WORK_ID,
+      title: "示范期刊 · 信息科学前沿",
+      issnPrint: null,
+      issnElectronic: "1234-5679",
+      publisher: "栖阅演示数据",
+    },
+    volumes: [
+      {
+        id: "0196f0d2-0000-7000-8000-00000000e201",
+        periodicalId: "0196f0d2-0000-7000-8000-00000000e100",
+        label: null,
+        number: 12,
+        year: 2024,
+        ordinal: 0,
+        issues: [
+          {
+            id: "0196f0d2-0000-7000-8000-00000000e301",
+            volumeId: "0196f0d2-0000-7000-8000-00000000e201",
+            label: "3-4",
+            number: null,
+            publicationDate: "2024-03",
+            ordinal: 0,
+            articles: [
+              {
+                id: "0196f0d2-0000-7000-8000-00000000e401",
+                issueId: "0196f0d2-0000-7000-8000-00000000e301",
+                mediaItemId: "0196f0d2-0000-7000-8000-00000000e501",
+                ordinal: 1,
+                title: "面向本地优先阅读器的期刊层级建模",
+                doi: "10.0000/zhiyue.2024.0001",
+                pageRange: { start: "e12345", end: null },
+                sourceKey: "europepmc",
+                remoteArticleId: "demo-0001",
+                availability: "full_text",
+              },
+              {
+                id: "0196f0d2-0000-7000-8000-00000000e402",
+                issueId: "0196f0d2-0000-7000-8000-00000000e301",
+                mediaItemId: "0196f0d2-0000-7000-8000-00000000e502",
+                ordinal: null,
+                title: "来源未给出序号的第二篇",
+                doi: null,
+                pageRange: null,
+                sourceKey: "europepmc",
+                remoteArticleId: "demo-0002",
+                availability: "metadata_only",
+              },
+            ],
+          },
+          {
+            id: "0196f0d2-0000-7000-8000-00000000e302",
+            volumeId: "0196f0d2-0000-7000-8000-00000000e201",
+            label: null,
+            number: 4,
+            publicationDate: "2024-04-18",
+            ordinal: 1,
+            articles: [
+              {
+                id: "0196f0d2-0000-7000-8000-00000000e403",
+                issueId: "0196f0d2-0000-7000-8000-00000000e302",
+                mediaItemId: "0196f0d2-0000-7000-8000-00000000e503",
+                ordinal: 1,
+                title: "不规则页码与缺页区间",
+                doi: null,
+                pageRange: { start: "S1", end: "S5" },
+                sourceKey: "europepmc",
+                remoteArticleId: "demo-0003",
+                availability: "unknown",
+              },
+            ],
+          },
+        ],
+      },
+      {
+        id: "0196f0d2-0000-7000-8000-00000000e202",
+        periodicalId: "0196f0d2-0000-7000-8000-00000000e100",
+        label: "Suppl 1",
+        number: null,
+        year: 2025,
+        ordinal: 1,
+        issues: [
+          {
+            id: "0196f0d2-0000-7000-8000-00000000e303",
+            volumeId: "0196f0d2-0000-7000-8000-00000000e202",
+            label: "Spring",
+            number: null,
+            publicationDate: "2025",
+            ordinal: 0,
+            articles: [
+              {
+                id: "0196f0d2-0000-7000-8000-00000000e404",
+                issueId: "0196f0d2-0000-7000-8000-00000000e303",
+                mediaItemId: "0196f0d2-0000-7000-8000-00000000e504",
+                ordinal: 1,
+                title: "增刊中的元数据候选文章",
+                doi: null,
+                pageRange: null,
+                sourceKey: "europepmc",
+                remoteArticleId: "demo-0004",
+                availability: "metadata_only",
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+}
 
 // Browser-only demo content. Production receives an opaque haven-resource URI from Tauri.
 const DEMO_SESSION_CONTENT: Record<string, string> = {
@@ -295,6 +438,158 @@ export interface MockHavenClientOptions {
 }
 
 /** 共享 Fixture 驱动的 Mock Client（契约冻结前置的最小消费实现）。 */
+// ---- Agent 全局设置 Mock 辅助（A1 智能配置推荐） ----
+
+interface MockAgentProposalRecord {
+  proposalId: string
+  digest: string
+  status: "pending" | "applied" | "rejected" | "expired" | "conflict"
+  baseRevision: string | null
+  changes: AgentSettingChangeDto[]
+  patch: PreferenceReadingPatchDto
+  createdAt: string
+  expiresAt: string
+  receipt?: { appliedRevision: string; appliedAt: string; changed: boolean }
+}
+
+/** 从 SettingsValue 里取出阅读分区（形状不符即抛错，不做静默降级）。 */
+function readingSettingsOf(value: SettingsValue): PreferenceReadingSettingsDto {
+  if (typeof value !== "object" || value === null || !("section" in value)) {
+    throw new Error("reading 设置形状非法")
+  }
+  const candidate = value as { section?: unknown }
+  if (candidate.section !== "reading") {
+    throw new Error("reading 设置形状非法")
+  }
+  return value as PreferenceReadingSettingsDto
+}
+
+/**
+ * 提案 patch → 设置分区 patch。
+ *
+ * 空串在 Rust 语义里表示"清除该覆盖"，因此这里映射为 null；
+ * 其余字段直接透传（Wire 枚举与 DTO 枚举的字符串表示逐字一致）。
+ */
+function mockReadingPatch(patch: PreferenceReadingPatchDto): ReadingPatchWire {
+  const cleared = (value: string | null | undefined): string | null | undefined =>
+    value === undefined ? undefined : value === null || value.trim() === "" ? null : value
+  return {
+    section: "reading",
+    fontFamily: patch.fontFamily ?? undefined,
+    customFontFamily: cleared(patch.customFontFamily) as string | null | undefined,
+    fontSize: patch.fontSize ?? undefined,
+    lineHeight: patch.lineHeight ?? undefined,
+    contentWidth: patch.contentWidth ?? undefined,
+    theme: patch.theme ?? undefined,
+    customBackground: cleared(patch.customBackground) as string | null | undefined,
+    customText: cleared(patch.customText) as string | null | undefined,
+    fontWeight: patch.fontWeight ?? undefined,
+    letterSpacing: patch.letterSpacing ?? undefined,
+    systemAuto: patch.systemAuto ?? undefined,
+    pagination: patch.pagination ?? undefined,
+  }
+}
+
+/** 逐字段比较"当前值 vs patch 应用后的值"，与 Rust 的改动列表保持同一语义。 */
+function mockReadingChanges(
+  current: SettingsValue,
+  patch: PreferenceReadingPatchDto,
+): AgentSettingChangeDto[] {
+  const before = readingSettingsOf(current)
+  const after = readingSettingsOf(applySettingsPatch(current, mockReadingPatch(patch)))
+  const changes: AgentSettingChangeDto[] = []
+  const push = (key: string, from: unknown, to: unknown) => {
+    const fromText = from === null || from === undefined ? "" : String(from)
+    const toText = to === null || to === undefined ? "" : String(to)
+    if (fromText !== toText) {
+      changes.push({ key, before: fromText, after: toText })
+    }
+  }
+  push("reading.fontFamily", before.fontFamily, after.fontFamily)
+  push("reading.customFontFamily", before.customFontFamily, after.customFontFamily)
+  push("reading.fontSize", before.fontSize, after.fontSize)
+  push("reading.lineHeight", before.lineHeight, after.lineHeight)
+  push("reading.contentWidth", before.contentWidth, after.contentWidth)
+  push("reading.theme", before.theme, after.theme)
+  push("reading.customBackground", before.customBackground, after.customBackground)
+  push("reading.customText", before.customText, after.customText)
+  push("reading.fontWeight", before.fontWeight, after.fontWeight)
+  push("reading.letterSpacing", before.letterSpacing, after.letterSpacing)
+  push("reading.systemAuto", before.systemAuto, after.systemAuto)
+  push("reading.pagination", before.pagination, after.pagination)
+  return changes
+}
+
+function mockProposalDto(record: MockAgentProposalRecord): AgentSettingsProposalDto {
+  return {
+    schemaVersion: 1,
+    proposalId: record.proposalId,
+    status: record.status === "conflict" ? "pending" : record.status,
+    subject: { section: "reading" },
+    targetLabel: "全局默认 · 阅读",
+    baseRevision: record.baseRevision,
+    digest: record.digest,
+    createdAt: record.createdAt,
+    expiresAt: record.expiresAt,
+    changes: record.changes,
+  }
+}
+
+function mockReceiptDto(record: MockAgentProposalRecord): AgentSettingChangeReceiptDto {
+  const receipt = record.receipt
+  if (!receipt) throw new Error("回执不存在")
+  return {
+    schemaVersion: 1,
+    receiptId: `mock-receipt-${record.proposalId}`,
+    proposalId: record.proposalId,
+    proposalDigest: record.digest,
+    status: record.status === "conflict" ? "pending" : record.status,
+    appliedRevision: receipt.appliedRevision,
+    changed: receipt.changed,
+    changes: record.changes,
+    appliedAt: receipt.appliedAt,
+  }
+}
+
+/**
+ * Mock 确定性摘要（64 位小写十六进制，FNV-1a 展开）。
+ *
+ * 它**不是** Rust 的 canonical SHA-256，只是让契约形状（长度/字符集）与真实 digest
+ * 一致，从而让页面能按同一条路径渲染与回传；Mock/预览标识由调用方负责展示。
+ */
+function mockDigest(payload: unknown): string {
+  const canonical = mockCanonicalJson(payload)
+  let out = ""
+  for (let block = 0; out.length < 64; block += 1) {
+    let hash = 0x811c9dc5 ^ block
+    for (let index = 0; index < canonical.length; index += 1) {
+      hash ^= canonical.charCodeAt(index)
+      hash = Math.imul(hash, 0x01000193) >>> 0
+    }
+    out += hash.toString(16).padStart(8, "0")
+  }
+  return out.slice(0, 64)
+}
+
+/** 键按字节序、紧凑输出的 canonical JSON（数组保序）。 */
+function mockCanonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null"
+  if (Array.isArray(value)) return `[${value.map(mockCanonicalJson).join(",")}]`
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, entry]) => entry !== undefined)
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+  return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${mockCanonicalJson(entry)}`).join(",")}}`
+}
+
+/** 由 digest 派生确定性 UUID（v5 风格版本/变体位），让 Mock 的 contextId 稳定可复算。 */
+function mockUuidFromDigest(digest: string): string {
+  const hex = digest.slice(0, 32).split("")
+  hex[12] = "5"
+  hex[16] = "8"
+  const joined = hex.join("")
+  return `${joined.slice(0, 8)}-${joined.slice(8, 12)}-${joined.slice(12, 16)}-${joined.slice(16, 20)}-${joined.slice(20, 32)}`
+}
+
 export class MockHavenClient implements HavenClient {
   /** 空库模式：libraryList 返回 list.empty（供空态 UI 场景）。 */
   private readonly emptyLibrary: boolean;
@@ -314,6 +609,8 @@ export class MockHavenClient implements HavenClient {
   private progressRevisionCounter = 1;
   private markerCounter = 1;
   private readonly markers: MarkerDto[] = [];
+  private readonly agentProposals = new Map<string, MockAgentProposalRecord>();
+  private agentProposalCounter = 1;
   private searchOperationCounter = 1;
   private readonly sourceEnabled = new Map<string, boolean>();
   private readonly sourceEndpoints = new Map<string, string>();
@@ -527,6 +824,22 @@ export class MockHavenClient implements HavenClient {
     };
     this.comicManifests.set(request.sessionId, manifest);
     return manifest;
+  }
+
+  /**
+   * 浏览器 Demo 的期刊层级：只对演示 Work 返回确定性层级，其它 Work（含演示书库里
+   * 的图书）一律 `PERIODICAL_NOT_FOUND`。这里不按标题猜期刊、不伪造空树，与后端
+   * "读不到层级就是资源错误"的语义保持一致。
+   */
+  async periodicalTreeGet(request: PeriodicalTreeGetRequest): Promise<PeriodicalTreeDto> {
+    if (request.workId !== DEMO_PERIODICAL_WORK_ID) {
+      throw new HavenError({
+        code: "PERIODICAL_NOT_FOUND",
+        userMessage: "该作品没有期刊层级",
+        retryable: false,
+      });
+    }
+    return demoPeriodicalTree();
   }
 
   async comicChapterCatalogGet(
@@ -1757,6 +2070,257 @@ export class MockHavenClient implements HavenClient {
 
   async castStop(): Promise<import("./generated/wire").CastStopResult> {
     return { schemaVersion: 1, stopped: true };
+  }
+
+  // ---- A1 智能配置推荐（Agent 全局设置 Typed IPC，Mock/开发契约） ----
+  //
+  // 这里实现的是**契约形状**，不是模型能力：Mock 不调用任何 Provider，也不伪造
+  // 模型名或"AI 已生成"结论。它只让开发与契约测试能走通
+  // Context → Proposal → 用户批准 → Receipt 的 Typed 闭环，digest 与回执都来自
+  // 本对象内的确定性状态机（页面必须把它标注为 Mock/预览）。
+  //
+  // 与真实实现的差异（刻意保留）：
+  // - contextId/contextHash 是 Mock 自算的确定性摘要，不是 Rust 的 SHA-256 canonical 摘要；
+  // - 没有一次性 Approval Token 参与（真实路径由 Rust 内部生成并消费）。
+
+  async agentCapabilityManifestGet(): Promise<AgentCapabilityManifestDto> {
+    return {
+      agentApiVersion: 1,
+      capabilities: {
+        settingsRead: true,
+        settingsProposal: true,
+        librarySummaryRead: false,
+        metadataProposal: false,
+        renameProposal: false,
+        secretRead: false,
+        filesystemWrite: false,
+      },
+    }
+  }
+
+  async agentSettingsContextGet(): Promise<AgentSettingsContextDto> {
+    const { revision, value } = this.mockReadingState()
+    return this.buildAgentContext(revision, value)
+  }
+
+  async agentSettingsProposalCreate(
+    request: AgentSettingsProposalCreateRequest,
+  ): Promise<AgentSettingsProposalDto> {
+    const { revision, value } = this.mockReadingState()
+    const context = this.buildAgentContext(revision, value)
+    // 与 Rust 相同的 fail-closed 判据：context id/hash 与 base revision 必须逐字匹配
+    // 最近一次读取的结果，否则零写入地拒绝。
+    if (request.baseRevision !== context.revision) {
+      throw new HavenError({
+        code: "AGENT_SETTINGS_BASE_REVISION_MISMATCH",
+        userMessage: "设置版本在生成提案前已变化，请重新读取设置",
+        retryable: false,
+      })
+    }
+    if (request.contextHash !== context.contextHash) {
+      throw new HavenError({
+        code: "AGENT_SETTINGS_CONTEXT_STALE",
+        userMessage: "设置上下文已过期，请重新读取设置后再生成提案",
+        retryable: false,
+      })
+    }
+    if (request.contextId !== context.contextId) {
+      throw new HavenError({
+        code: "AGENT_SETTINGS_CONTEXT_ID_MISMATCH",
+        userMessage: "设置上下文 ID 与当前设置不一致，请重新读取设置",
+        retryable: false,
+      })
+    }
+
+    const changes = mockReadingChanges(value, request.patch)
+    if (changes.length === 0) {
+      throw new HavenError({
+        code: "AGENT_SETTINGS_PATCH_CONFLICT",
+        userMessage: "提案没有产生任何阅读设置改动",
+        retryable: false,
+      })
+    }
+
+    const key = `mock-proposal-${this.agentProposalCounter}`
+    this.agentProposalCounter += 1
+    const now = new Date()
+    const record: MockAgentProposalRecord = {
+      proposalId: key,
+      digest: mockDigest({
+        contextHash: context.contextHash,
+        baseRevision: context.revision,
+        patch: request.patch,
+      }),
+      status: "pending",
+      baseRevision: context.revision,
+      changes,
+      patch: request.patch,
+      createdAt: now.toISOString(),
+      expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+    }
+    this.agentProposals.set(key, record)
+    return mockProposalDto(record)
+  }
+
+  async agentSettingsProposalGet(
+    request: AgentSettingsProposalGetRequest,
+  ): Promise<AgentSettingsProposalGetResultDto> {
+    const record = this.requireMockProposal(request.proposalId)
+    return {
+      proposal: mockProposalDto(record),
+      receipt: record.receipt ? mockReceiptDto(record) : null,
+    }
+  }
+
+  async agentSettingsProposalReject(
+    request: AgentSettingsProposalRejectRequest,
+  ): Promise<AgentSettingsProposalRejectResultDto> {
+    const record = this.requireMockProposal(request.proposalId)
+    if (request.expectedDigest !== record.digest) {
+      throw new HavenError({
+        code: "SETTING_PROPOSAL_DIGEST_MISMATCH",
+        userMessage: "确认的摘要与提案不一致",
+        retryable: false,
+      })
+    }
+    // 与 Rust reject 语义一致：重复拒绝本身幂等；已应用/已过期是终态，
+    // 不能被重新解释为一次成功的拒绝。Mock 不能把这些状态静默吞掉。
+    if (record.status === "applied" || record.status === "expired") {
+      throw new HavenError({
+        code: "SETTING_PROPOSAL_NOT_PENDING",
+        userMessage: "提案已进入终态，不能再次拒绝",
+        retryable: false,
+      })
+    }
+    if (record.status === "pending" || record.status === "conflict") {
+      record.status = "rejected"
+    }
+    return { proposal: mockProposalDto(record) }
+  }
+
+  async agentSettingsProposalApprove(
+    request: AgentSettingsProposalApproveRequest,
+  ): Promise<AgentSettingsProposalApproveResultDto> {
+    const record = this.requireMockProposal(request.proposalId)
+    // UI 只能回传它显示的那份 digest；Mock 侧同样不接受"自己算一个"的确认。
+    if (request.expectedDigest !== record.digest) {
+      throw new HavenError({
+        code: "SETTING_PROPOSAL_DIGEST_MISMATCH",
+        userMessage: "确认的摘要与提案不一致",
+        retryable: false,
+      })
+    }
+    if (record.status === "rejected" || record.status === "expired") {
+      throw new HavenError({
+        code: "SETTING_PROPOSAL_NOT_PENDING",
+        userMessage: "提案已进入终态，不能再次批准",
+        retryable: false,
+      })
+    }
+    // 已应用：幂等返回原回执（与真实路径一致，不重复写入）。
+    if (record.status === "applied" && record.receipt) {
+      return { proposal: mockProposalDto(record), receipt: mockReceiptDto(record) }
+    }
+
+    // Rust 在事务内先重读提案，再以 now >= expiresAt 将 pending 原子收敛为
+    // expired，并以稳定错误返回；此分支不写目标设置，也不产生回执。
+    if ((record.status === "pending" || record.status === "conflict") && new Date() >= new Date(record.expiresAt)) {
+      record.status = "expired"
+      throw new HavenError({
+        code: "SETTING_PROPOSAL_EXPIRED",
+        userMessage: "提案已过期，未执行任何修改",
+        retryable: false,
+      })
+    }
+
+    const { revision, value } = this.mockReadingState()
+    if (revision !== record.baseRevision) {
+      record.status = "conflict"
+      throw new HavenError({
+        code: "REVISION_CONFLICT",
+        userMessage: "设置版本已变化，提案不能应用",
+        retryable: false,
+      })
+    }
+
+    const nextValue = applySettingsPatch(value, mockReadingPatch(record.patch))
+    const nextRevision = `set-mock-${this.settingsRevisionCounter++}`
+    this.settings.set("reading", { value: nextValue, revision: nextRevision })
+    record.status = "applied"
+    record.receipt = {
+      appliedRevision: nextRevision,
+      appliedAt: new Date().toISOString(),
+      changed: !settingsValuesEqual(nextValue, value),
+    }
+    return { proposal: mockProposalDto(record), receipt: mockReceiptDto(record) }
+  }
+
+  async agentSettingChangeReceiptGet(
+    request: AgentSettingChangeReceiptGetRequest,
+  ): Promise<AgentSettingChangeReceiptDto | null> {
+    const record = this.requireMockProposal(request.proposalId)
+    if (!record.receipt) return null
+    return mockReceiptDto(record)
+  }
+
+  /** authoritative 阅读设置（与 `settingsGet("reading")` 同源，不另建状态）。 */
+  private mockReadingState(): { revision: string | null; value: SettingsValue } {
+    const state = this.settings.get("reading")
+    if (state) return { revision: state.revision, value: state.value }
+    const fixture = settingsReadingDefault as SettingsSnapshot
+    return { revision: fixture.revision, value: fixture.value }
+  }
+
+  private buildAgentContext(revision: string | null, value: SettingsValue): AgentSettingsContextDto {
+    const reading = readingSettingsOf(value)
+    const contextHash = mockDigest({ section: "reading", revision, reading })
+    return {
+      schemaVersion: 1,
+      contextId: mockUuidFromDigest(contextHash),
+      contextHash,
+      subject: { section: "reading" },
+      revision,
+      reading: {
+        section: "reading",
+        fontFamily: reading.fontFamily,
+        customFontFamily: reading.customFontFamily ?? null,
+        fontSize: reading.fontSize,
+        lineHeight: reading.lineHeight,
+        contentWidth: reading.contentWidth,
+        theme: reading.theme,
+        customBackground: reading.customBackground ?? null,
+        customText: reading.customText ?? null,
+        fontWeight: reading.fontWeight,
+        letterSpacing: reading.letterSpacing,
+        systemAuto: reading.systemAuto,
+        pagination: reading.pagination,
+        redactedFields: [],
+      },
+      capabilities: {
+        agentApiVersion: 1,
+        capabilities: {
+          settingsRead: true,
+          settingsProposal: true,
+          librarySummaryRead: false,
+          metadataProposal: false,
+          renameProposal: false,
+          secretRead: false,
+          filesystemWrite: false,
+        },
+      },
+    }
+  }
+
+  private requireMockProposal(proposalId: string): MockAgentProposalRecord {
+    const record = this.agentProposals.get(proposalId)
+    if (!record) {
+      throw new HavenError({
+        code: "SETTING_PROPOSAL_NOT_FOUND",
+        userMessage: "提案不存在",
+        retryable: false,
+      })
+    }
+    return record
   }
 
   private nextRuntimeIdentity(): string {

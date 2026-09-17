@@ -86,15 +86,9 @@ impl PeriodicalIssueRecord {
     }
 }
 
-/// 文章正文可用性。Provider 必须显式声明，Application 不把无正文条目
-/// 宣称成可读。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PeriodicalArticleAvailability {
-    /// 来源提供可读全文；导入后才允许把 Resource 标记为可用。
-    FullText,
-    /// 只有元数据；内容不存在或尚未开放，Resource 不得声明为可用。
-    MetadataOnly,
-}
+/// 文章正文可用性。取值集合由领域层单点定义（`PeriodicalArticle` 的持久化事实
+/// 与 Provider 观察必须是同一个闭合枚举），这里只重导出，避免两处取值漂移。
+pub use haven_domain::periodical::PeriodicalArticleAvailability;
 
 /// 一篇文章及其期刊归属的 provider 观察。
 #[derive(Debug, Clone, PartialEq)]
@@ -115,8 +109,10 @@ pub struct PeriodicalArticleRecord {
 }
 
 impl PeriodicalArticleRecord {
+    /// 只有观察到全文才允许建立可读正文资源；`Unknown` 与 `MetadataOnly` 都不是
+    /// 可读结论。
     pub fn is_readable(&self) -> bool {
-        self.availability == PeriodicalArticleAvailability::FullText
+        self.availability.is_readable()
     }
 
     /// 请求身份与响应身份必须一致，否则不能把结果写进请求 PMCID 的归属链。

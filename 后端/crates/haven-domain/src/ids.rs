@@ -90,6 +90,11 @@ id_type!(PeriodicalId, "期刊 ID");
 id_type!(PeriodicalVolumeId, "期刊卷 ID");
 id_type!(PeriodicalIssueId, "期刊期号 ID");
 id_type!(PeriodicalArticleId, "期刊文章 ID");
+id_type!(SettingProposalId, "设置变更提案 ID");
+id_type!(SettingChangeReceiptId, "设置变更回执 ID");
+id_type!(AgentSessionId, "Agent 会话 ID");
+id_type!(AgentRequestId, "Agent 请求 ID");
+id_type!(AgentContextSnapshotId, "Agent 上下文快照 ID");
 
 /// 指向系统凭据存储的引用（不存明文凭据本身）。
 ///

@@ -29,10 +29,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
+// `Object.keys` 只看可枚举字符串键，会漏掉 symbol 键和 `defineProperty` 造出的
+// 非枚举键，让契约外的字段混进闭集 DTO；`Reflect.ownKeys` 取全部自有键，任何
+// 非字符串键一律越界。
 function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  const actual = Object.keys(value).sort()
-  const expected = [...keys].sort()
-  return actual.length === expected.length && actual.every((key, index) => key === expected[index])
+  const ownKeys = Reflect.ownKeys(value)
+  if (ownKeys.length !== keys.length) return false
+  return ownKeys.every((key) => typeof key === "string" && keys.includes(key))
 }
 
 function isSafeOpaque(value: unknown, maxLength = MAX_OPAQUE_VALUE_LENGTH): value is string {

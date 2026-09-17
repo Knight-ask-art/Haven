@@ -5,6 +5,8 @@
 //! - 只依赖 domain 契约（trait object），不依赖 Sqlite/Tauri 实现。
 //! - 实现方（src-tauri / 测试）通过组合端口注入具体 Repository。
 
+pub mod agent;
+pub mod agent_settings_ipc;
 pub mod app_info;
 pub mod cache;
 pub mod cast;
@@ -24,6 +26,7 @@ pub mod home;
 pub mod library;
 pub mod marker;
 pub mod periodical;
+pub mod periodical_query;
 pub mod ports;
 pub mod progress;
 pub mod reader_search;
@@ -34,6 +37,7 @@ pub mod scan;
 pub mod search_history;
 pub mod search_source;
 pub mod session;
+pub mod setting_proposals;
 pub mod settings;
 pub mod settings_file;
 pub mod source_import;
@@ -44,6 +48,11 @@ pub mod trending;
 pub mod video_screenshot;
 pub mod work;
 
+pub use agent::{
+    AgentActionProposal, AgentCapabilityPolicy, AgentProposalService, AgentSettingsActionRequest,
+    AgentSubjectScopePort, RepositoryAgentSubjectScope,
+};
+pub use agent_settings_ipc::{AgentSettingsContext, AgentSettingsIpcService};
 pub use app_info::{AppInfoPorts, AppInfoService, DirectoryKind};
 pub use cache::{ArtworkCacheClearPort, CacheService};
 pub use cast::{CastControlPort, CastDiscoveryPort, CastGrantRegistry, CastMediaPort, CastService};
@@ -76,6 +85,7 @@ pub use periodical::{
     PeriodicalIssueRecord, PeriodicalIssueTree, PeriodicalJournalRecord, PeriodicalProvider,
     PeriodicalTree, PeriodicalVolumeRecord, PeriodicalVolumeTree,
 };
+pub use periodical_query::{PERIODICAL_TREE_SCHEMA_VERSION, PeriodicalQueryService};
 pub use ports::ComicProgressMigrationPorts;
 pub use ports::SessionOpenPorts;
 pub use ports::{FavoritePorts, LibraryPorts};
@@ -97,6 +107,10 @@ pub use search_source::{
     SearchEventSink, SearchSourceParticipant, SearchSourceService,
 };
 pub use session::{PreparedSession, PreparedSessionSource, PreparedSubtitleTrack, SessionService};
+pub use setting_proposals::{
+    DEFAULT_SETTING_PROPOSAL_TTL_MS, SettingProposalRequest, SettingProposalService,
+    SettingProposalTxPorts, SettingProposalUoW,
+};
 pub use settings::{
     SettingsService, SettingsSnapshot, SettingsTxPorts, SettingsUoW, SettingsUpdateResult,
 };

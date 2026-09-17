@@ -40,6 +40,20 @@ describe("storage wire runtime guards", () => {
     }
   })
 
+  it("rejects unknown symbol and non-enumerable own keys", () => {
+    const withSymbolKey = { ...listNormal[0], [Symbol("extra")]: "extra" }
+    const withHiddenKey = { ...listNormal[0] }
+    Object.defineProperty(withHiddenKey, "hiddenExtra", {
+      value: "extra",
+      enumerable: false,
+    })
+
+    expect(guardStorageLocationList([withSymbolKey])).toBe(false)
+    expect(guardStorageLocationList([withHiddenKey])).toBe(false)
+    expect(guardStorageLocationList(listNormal)).toBe(true)
+    expect(guardStorageLocationList(listNormal.map((entry) => ({ ...entry })))).toBe(true)
+  })
+
   it("accepts the shared cancel fixtures", () => {
     expect(guardScanCancelResult(cancelAccepted)).toBe(true)
     expect(guardScanCancelResult(cancelTerminal)).toBe(true)

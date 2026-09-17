@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-agent-capability-manifest-get"
+description = "Enables the agent_capability_manifest_get command without any pre-configured scope."
+commands.allow = ["agent_capability_manifest_get"]
+
+[[permission]]
+identifier = "deny-agent-capability-manifest-get"
+description = "Denies the agent_capability_manifest_get command without any pre-configured scope."
+commands.deny = ["agent_capability_manifest_get"]

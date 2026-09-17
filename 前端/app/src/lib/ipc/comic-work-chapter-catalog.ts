@@ -36,8 +36,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  const actual = Object.keys(value).sort();
+/**
+ * 自有键精确集合检查：键集合必须与 Rust 侧闭集 DTO 的字段完全相等。
+ *
+ * `Object.keys` 只看可枚举字符串键，symbol 键和 `defineProperty` 造出的非枚举
+ * 键都会被漏掉，`{...合法字段, [Symbol()]: x}` 这类结构会被当成闭合的 wire
+ * 数据透传。这里改用 `Reflect.ownKeys`（字符串 + symbol，含不可枚举）做同一套
+ * 精确集合比较：非字符串键直接越界，未知键与缺失键由长度和逐项比较兜住。
+ */
+function hasExactKeys(value: object, keys: readonly string[]): boolean {
+  const ownKeys = Reflect.ownKeys(value);
+  if (!ownKeys.every((key): key is string => typeof key === "string")) return false;
+  const actual = [...ownKeys].sort();
   const expected = [...keys].sort();
   return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 }

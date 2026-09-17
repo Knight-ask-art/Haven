@@ -26,6 +26,13 @@
     "allow-storage-location-rebind-local-directory",
     "allow-storage-location-disconnect",
     "allow-storage-location-remove",
+    "allow-agent-capability-manifest-get",
+    "allow-agent-settings-context-get",
+    "allow-agent-settings-proposal-create",
+    "allow-agent-settings-proposal-get",
+    "allow-agent-settings-proposal-reject",
+    "allow-agent-settings-proposal-approve",
+    "allow-agent-setting-change-receipt-get",
     "allow-settings-get",
     "allow-settings-update",
     "allow-settings-export",
@@ -102,6 +109,7 @@
     "allow-video-screenshot-begin",
     "allow-video-screenshot-chunk",
     "allow-video-screenshot-commit",
-    "allow-video-screenshot-cancel"
+    "allow-video-screenshot-cancel",
+    "allow-periodical-tree-get"
   ]
 }

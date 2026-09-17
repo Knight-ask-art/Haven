@@ -108,6 +108,20 @@ import type {
   VideoScreenshotBeginResultDto,
   VideoScreenshotChunkRequest,
   VideoScreenshotResultDto,
+  PeriodicalTreeGetRequest,
+  PeriodicalTreeDto,
+  AgentCapabilityManifestDto,
+  AgentSettingChangeReceiptDto,
+  AgentSettingChangeReceiptGetRequest,
+  AgentSettingsContextDto,
+  AgentSettingsProposalApproveRequest,
+  AgentSettingsProposalApproveResultDto,
+  AgentSettingsProposalCreateRequest,
+  AgentSettingsProposalDto,
+  AgentSettingsProposalGetRequest,
+  AgentSettingsProposalGetResultDto,
+  AgentSettingsProposalRejectRequest,
+  AgentSettingsProposalRejectResultDto,
 } from "./generated/wire";
 import type { UpdaterCheckResult, UpdaterInstallResult } from "./client";
 import { HavenError, toHavenError } from "./errors.js";
@@ -324,6 +338,14 @@ export class TauriHavenClient implements HavenClient {
   ): Promise<ComicPageManifestDto> {
     try {
       return await invoke<ComicPageManifestDto>("comic_page_manifest_get", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async periodicalTreeGet(request: PeriodicalTreeGetRequest): Promise<PeriodicalTreeDto> {
+    try {
+      return await invoke<PeriodicalTreeDto>("periodical_tree_get", { request });
     } catch (error) {
       throw toHavenError(error);
     }
@@ -977,6 +999,79 @@ export class TauriHavenClient implements HavenClient {
   async castStop(request: import("./generated/wire").CastStopRequest): Promise<import("./generated/wire").CastStopResult> {
     try {
       return await invoke<import("./generated/wire").CastStopResult>("cast_stop", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  // ---- A1 智能配置推荐（Agent 全局设置 Typed IPC） ----
+  //
+  // 每个命令都是闭合 typed 调用：没有 agent_invoke(commandName, arbitraryArguments)
+  // 这类自由分发入口，也没有任何 token 字段参与请求或响应。
+
+  async agentCapabilityManifestGet(): Promise<AgentCapabilityManifestDto> {
+    try {
+      return await invoke<AgentCapabilityManifestDto>("agent_capability_manifest_get");
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async agentSettingsContextGet(): Promise<AgentSettingsContextDto> {
+    try {
+      return await invoke<AgentSettingsContextDto>("agent_settings_context_get");
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async agentSettingsProposalCreate(
+    request: AgentSettingsProposalCreateRequest,
+  ): Promise<AgentSettingsProposalDto> {
+    try {
+      return await invoke<AgentSettingsProposalDto>("agent_settings_proposal_create", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async agentSettingsProposalGet(
+    request: AgentSettingsProposalGetRequest,
+  ): Promise<AgentSettingsProposalGetResultDto> {
+    try {
+      return await invoke<AgentSettingsProposalGetResultDto>("agent_settings_proposal_get", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async agentSettingsProposalReject(
+    request: AgentSettingsProposalRejectRequest,
+  ): Promise<AgentSettingsProposalRejectResultDto> {
+    try {
+      return await invoke<AgentSettingsProposalRejectResultDto>("agent_settings_proposal_reject", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async agentSettingsProposalApprove(
+    request: AgentSettingsProposalApproveRequest,
+  ): Promise<AgentSettingsProposalApproveResultDto> {
+    try {
+      return await invoke<AgentSettingsProposalApproveResultDto>("agent_settings_proposal_approve", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async agentSettingChangeReceiptGet(
+    request: AgentSettingChangeReceiptGetRequest,
+  ): Promise<AgentSettingChangeReceiptDto | null> {
+    try {
+      return await invoke<AgentSettingChangeReceiptDto | null>("agent_setting_change_receipt_get", {
+        request,
+      });
     } catch (error) {
       throw toHavenError(error);
     }

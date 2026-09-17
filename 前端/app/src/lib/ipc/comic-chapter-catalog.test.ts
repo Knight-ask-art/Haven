@@ -71,6 +71,24 @@ function registeredCatalog(): Record<string, unknown> {
   }
 }
 
+const foreignSymbol = Symbol("foreign")
+
+function addForeignSymbolKey(target: object): void {
+  Object.defineProperty(target, foreignSymbol, { value: "extra", enumerable: true })
+}
+
+function addHiddenStringKey(target: object): void {
+  Object.defineProperty(target, "foreignField", { value: "extra", enumerable: false })
+}
+
+function firstChapter(value: Record<string, unknown>): Record<string, unknown> {
+  return (value.chapters as Array<Record<string, unknown>>)[0]
+}
+
+function editionProfileOf(chapter: Record<string, unknown>): Record<string, unknown> {
+  return chapter.editionProfile as Record<string, unknown>
+}
+
 describe("isComicChapterCatalogDto", () => {
   it("accepts a catalog with explicit unknown and known Edition facets", () => {
     expect(isComicChapterCatalogDto(catalog(), { sourceId, remoteWorkId })).toBe(true)
@@ -115,6 +133,38 @@ describe("isComicChapterCatalogDto", () => {
     chapters[0].pageCount = null
     expect(isComicChapterCatalogDto(value)).toBe(true)
   })
+
+  it("rejects an unknown symbol own key on the envelope, chapter and Edition profile", () => {
+    expect(isComicChapterCatalogDto(catalog(), { sourceId, remoteWorkId })).toBe(true)
+
+    const onEnvelope = catalog()
+    addForeignSymbolKey(onEnvelope)
+    expect(isComicChapterCatalogDto(onEnvelope, { sourceId, remoteWorkId })).toBe(false)
+
+    const onChapter = catalog()
+    addForeignSymbolKey(firstChapter(onChapter))
+    expect(isComicChapterCatalogDto(onChapter, { sourceId, remoteWorkId })).toBe(false)
+
+    const onProfile = catalog()
+    addForeignSymbolKey(editionProfileOf(firstChapter(onProfile)))
+    expect(isComicChapterCatalogDto(onProfile, { sourceId, remoteWorkId })).toBe(false)
+  })
+
+  it("rejects an unknown non-enumerable own key on the envelope, chapter and Edition profile", () => {
+    expect(isComicChapterCatalogDto(catalog(), { sourceId, remoteWorkId })).toBe(true)
+
+    const onEnvelope = catalog()
+    addHiddenStringKey(onEnvelope)
+    expect(isComicChapterCatalogDto(onEnvelope, { sourceId, remoteWorkId })).toBe(false)
+
+    const onChapter = catalog()
+    addHiddenStringKey(firstChapter(onChapter))
+    expect(isComicChapterCatalogDto(onChapter, { sourceId, remoteWorkId })).toBe(false)
+
+    const onProfile = catalog()
+    addHiddenStringKey(editionProfileOf(firstChapter(onProfile)))
+    expect(isComicChapterCatalogDto(onProfile, { sourceId, remoteWorkId })).toBe(false)
+  })
 })
 
 describe("isComicRegisteredChapterCatalogDto", () => {
@@ -140,5 +190,45 @@ describe("isComicRegisteredChapterCatalogDto", () => {
     const unknownField = registeredCatalog()
     ;(unknownField.chapters as Array<Record<string, unknown>>)[0].url = "https://example.invalid/page"
     expect(isComicRegisteredChapterCatalogDto(unknownField)).toBe(false)
+  })
+
+  it("rejects an unknown symbol own key on the envelope, refresh state, chapter and Edition profile", () => {
+    expect(isComicRegisteredChapterCatalogDto(registeredCatalog(), { sourceId, remoteWorkId })).toBe(true)
+
+    const onEnvelope = registeredCatalog()
+    addForeignSymbolKey(onEnvelope)
+    expect(isComicRegisteredChapterCatalogDto(onEnvelope, { sourceId, remoteWorkId })).toBe(false)
+
+    const onRefreshState = registeredCatalog()
+    addForeignSymbolKey(onRefreshState.refreshState as Record<string, unknown>)
+    expect(isComicRegisteredChapterCatalogDto(onRefreshState, { sourceId, remoteWorkId })).toBe(false)
+
+    const onChapter = registeredCatalog()
+    addForeignSymbolKey(firstChapter(onChapter))
+    expect(isComicRegisteredChapterCatalogDto(onChapter, { sourceId, remoteWorkId })).toBe(false)
+
+    const onProfile = registeredCatalog()
+    addForeignSymbolKey(editionProfileOf(firstChapter(onProfile)))
+    expect(isComicRegisteredChapterCatalogDto(onProfile, { sourceId, remoteWorkId })).toBe(false)
+  })
+
+  it("rejects an unknown non-enumerable own key on the envelope, refresh state, chapter and Edition profile", () => {
+    expect(isComicRegisteredChapterCatalogDto(registeredCatalog(), { sourceId, remoteWorkId })).toBe(true)
+
+    const onEnvelope = registeredCatalog()
+    addHiddenStringKey(onEnvelope)
+    expect(isComicRegisteredChapterCatalogDto(onEnvelope, { sourceId, remoteWorkId })).toBe(false)
+
+    const onRefreshState = registeredCatalog()
+    addHiddenStringKey(onRefreshState.refreshState as Record<string, unknown>)
+    expect(isComicRegisteredChapterCatalogDto(onRefreshState, { sourceId, remoteWorkId })).toBe(false)
+
+    const onChapter = registeredCatalog()
+    addHiddenStringKey(firstChapter(onChapter))
+    expect(isComicRegisteredChapterCatalogDto(onChapter, { sourceId, remoteWorkId })).toBe(false)
+
+    const onProfile = registeredCatalog()
+    addHiddenStringKey(editionProfileOf(firstChapter(onProfile)))
+    expect(isComicRegisteredChapterCatalogDto(onProfile, { sourceId, remoteWorkId })).toBe(false)
   })
 })
