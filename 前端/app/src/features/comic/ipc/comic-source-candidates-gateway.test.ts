@@ -56,6 +56,28 @@ const result: ComicChapterSourceCandidatesDto = {
   truncated: false,
 }
 
+function invokeGateway(response: unknown) {
+  const comicChapterSourceCandidatesGet = vi.fn<HavenClient["comicChapterSourceCandidatesGet"]>()
+    .mockResolvedValue(response as ComicChapterSourceCandidatesDto)
+  return getComicChapterSourceCandidates(request, { comicChapterSourceCandidatesGet })
+}
+
+function withSymbolKey<T extends object>(value: T, key: symbol): T {
+  return Object.assign({}, value, { [key]: "internal" })
+}
+
+function withNonEnumerableKey<T extends object>(value: T, key: string): T {
+  const clone = { ...value }
+  Object.defineProperty(clone, key, { value: "internal", enumerable: false })
+  return clone
+}
+
+const pristineCandidate = result.candidates[0]
+
+function withCandidate(candidate: unknown): unknown {
+  return { ...result, candidates: [candidate] }
+}
+
 describe("comic chapter source candidates gateway", () => {
   it("returns the backend-ranked safe candidate projection", async () => {
     const comicChapterSourceCandidatesGet = vi.fn<HavenClient["comicChapterSourceCandidatesGet"]>()
@@ -101,5 +123,35 @@ describe("comic chapter source candidates gateway", () => {
     await expect(getComicChapterSourceCandidates(request, {
       comicChapterSourceCandidatesGet,
     })).rejects.toBe(expected)
+  })
+
+  it("rejects unknown symbol and non-enumerable own keys on the response envelope", async () => {
+    await expect(invokeGateway(result)).resolves.toBe(result)
+
+    await expect(invokeGateway(withSymbolKey(result, Symbol("internal")))).rejects.toMatchObject({
+      code: "COMIC_SOURCE_CANDIDATES_INVALID_RESPONSE",
+      retryable: false,
+    })
+    await expect(invokeGateway(withNonEnumerableKey(result, "internalTrace"))).rejects.toMatchObject({
+      code: "COMIC_SOURCE_CANDIDATES_INVALID_RESPONSE",
+      retryable: false,
+    })
+  })
+
+  it("rejects unknown symbol and non-enumerable own keys on the candidate object", async () => {
+    await expect(invokeGateway(withCandidate(pristineCandidate))).resolves.toBeTruthy()
+
+    await expect(invokeGateway(withCandidate(
+      withSymbolKey(pristineCandidate, Symbol("internal")),
+    ))).rejects.toMatchObject({
+      code: "COMIC_SOURCE_CANDIDATES_INVALID_RESPONSE",
+      retryable: false,
+    })
+    await expect(invokeGateway(withCandidate(
+      withNonEnumerableKey(pristineCandidate, "internalTrace"),
+    ))).rejects.toMatchObject({
+      code: "COMIC_SOURCE_CANDIDATES_INVALID_RESPONSE",
+      retryable: false,
+    })
   })
 })

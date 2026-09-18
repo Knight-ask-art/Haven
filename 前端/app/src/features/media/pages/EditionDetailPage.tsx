@@ -102,7 +102,13 @@ export function EditionDetailPage() {
         if (capabilityGeneration.current !== generation) return
         const next: Record<string, ItemCapability> = {}
         for (const id of ids) {
-          next[id] = { info: projected.get(id) ?? null, failed: false }
+          // A missing id means this row's capability query failed while the rest
+          // of the batch succeeded. That is a retryable failure, not "still
+          // loading": leaving it at `info: null, failed: false` would spin
+          // forever, and an empty projection would claim the item has no
+          // resource.
+          const info = projected.get(id)
+          next[id] = info ? { info, failed: false } : { info: null, failed: true }
         }
         capabilitiesRef.current = next
         setCapabilities(next)

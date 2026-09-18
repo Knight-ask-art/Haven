@@ -84,6 +84,10 @@ plan/
 # Public release curation: source maps stay local.
 **/*.map
 
+# Generated at release time by the release workflow; the tracked
+# src-tauri/tauri.conf.json remains the local-build source of truth.
+/src-tauri/tauri.release.conf.json
+
 # Internal-only helper documentation is not part of the public release snapshot.
 **/AGENTS.md
 /design-qa.md

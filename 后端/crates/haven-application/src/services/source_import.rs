@@ -1917,6 +1917,9 @@ impl SourceImportService {
             page_range: record.page_range.clone(),
             source: PeriodicalArticleSourceIdentity::new(source_key, remote_article_id)
                 .ok_or_else(|| source_unavailable("文章来源身份非法"))?,
+            // Provider 本次的正文观察是文章的持久化事实：导入后必须原样保留，
+            // UI 才有依据区分「来源只有元数据」与「没有观察到」。
+            provider_content_availability: record.availability,
             created_at: now,
             updated_at: now,
         };

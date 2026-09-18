@@ -15,9 +15,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * 严格自有键集合检查：键集合必须与生成 Wire DTO 的字段完全相等。
+ *
+ * `Object.keys` 只看可枚举字符串键，symbol 键和 `defineProperty` 造出的非枚举键
+ * 都会被漏掉，`{...合法字段, [Symbol()]: x}` 这类结构会被当成闭合的 wire 数据透传。
+ * `Reflect.ownKeys` 取全部自有键（字符串 + symbol，含不可枚举），任何非字符串键
+ * 直接越界，未知键与缺失键由长度和逐项比较兜住。
+ */
 function hasExactFields(value: Record<string, unknown>, allowed: ReadonlySet<string>): boolean {
-  const keys = Object.keys(value);
-  return keys.length === allowed.size && keys.every((key) => allowed.has(key));
+  const ownKeys = Reflect.ownKeys(value);
+  return ownKeys.length === allowed.size
+    && ownKeys.every((key) => typeof key === "string" && allowed.has(key));
 }
 
 function isCanonicalUuid(value: unknown): value is string {

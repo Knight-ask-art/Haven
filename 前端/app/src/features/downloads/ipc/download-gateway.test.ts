@@ -34,6 +34,28 @@ const BASE_TASK: DownloadTaskDto = {
 
 const EMPTY_RESOURCES: ResourceListDto = { schemaVersion: 1, items: [] }
 
+/** 一条真实的远端可下载资源投影；批量隔离用例只需要「有真实能力」这一个事实。 */
+function downloadableResources(resourceId: string): ResourceListDto {
+  return {
+    schemaVersion: 1,
+    items: [{
+      resourceId,
+      resourceType: "publication_file",
+      availability: "available",
+      mimeType: "application/pdf",
+      size: null,
+      storageDisplayName: null,
+      sourceDisplayName: "期刊来源",
+      isOffline: false,
+      isLocal: false,
+      requiresReauthorization: false,
+      canDownload: true,
+      canOnlineRead: false,
+      streamKind: null,
+    }],
+  }
+}
+
 function clientWith(
   tasks: DownloadTaskDto[],
   resources: ResourceListDto = EMPTY_RESOURCES,
@@ -368,5 +390,82 @@ describe("getWorkDownloadState", () => {
     expect(resourceListByMediaItem).toHaveBeenCalledTimes(2)
     expect(projected.get("media-1")).toMatchObject({ status: "idle", canDownload: false })
     expect(projected.get("media-2")).toMatchObject({ status: "queued", canDownload: true })
+  })
+
+  it("keeps the real projection of every item whose resource query succeeded", async () => {
+    // 批量里的一篇资源查询失败：它只影响自己，其余各篇仍返回真实投影。
+    const downloadList = vi.fn(async () => [{
+      ...BASE_TASK,
+      mediaItemId: "media-2",
+      state: "downloading" as const,
+      offlineResourceId: null,
+    }])
+    const resourceListByMediaItem = vi.fn(async ({ mediaItemId }: { mediaItemId: string }) => {
+      if (mediaItemId === "media-broken") throw new Error("resource query failed")
+      return mediaItemId === "media-2" ? downloadableResources("remote-2") : EMPTY_RESOURCES
+    })
+    const client = clientWith([], EMPTY_RESOURCES, [], downloadList)
+    client.resourceListByMediaItem = resourceListByMediaItem
+
+    const projected = await getMediaItemsDownloadInfo(
+      ["media-1", "media-broken", "media-2"],
+      client,
+    )
+
+    expect(resourceListByMediaItem).toHaveBeenCalledTimes(3)
+    expect(projected.get("media-2")).toMatchObject({
+      status: "queued",
+      canDownload: true,
+      canOnlineRead: false,
+      sourceResourceId: "remote-2",
+      taskId: "task-1",
+    })
+    expect(projected.get("media-1")).toMatchObject({ status: "idle", canDownload: false })
+  })
+
+  it("leaves a failed item out of the batch instead of inventing an unavailable one", async () => {
+    // 缺失 = 「这次没拿到这一篇的事实」。把它写成零能力的不可用投影，就是拿缺失当结论：
+    // 调用者既看不出该重试，也读不到「这一篇没有资源」以外的任何事实。
+    const client = clientWith([])
+    client.resourceListByMediaItem = vi.fn(async ({ mediaItemId }: { mediaItemId: string }) => {
+      if (mediaItemId === "media-broken") throw new Error("resource query failed")
+      return EMPTY_RESOURCES
+    })
+
+    const projected = await getMediaItemsDownloadInfo(["media-1", "media-broken"], client)
+
+    expect(projected.has("media-broken")).toBe(false)
+    expect(projected.get("media-broken")).toBeUndefined()
+    expect([...projected.keys()]).toEqual(["media-1"])
+    // 空投影只能来自真实条目（这里 media-1 就是一条），不能用来补缺失的那一篇。
+    expect(projected.get("media-1")).toMatchObject({
+      status: "idle",
+      canDownload: false,
+      hasOfflineResource: false,
+      canOnlineRead: false,
+      sourceResourceId: null,
+    })
+  })
+
+  it("still rejects the single-item helper when its resource query fails", async () => {
+    // 单篇调用必须保留 reject 语义：调用者要能识别失败并重试，而不是收到一份
+    // 「这一篇什么都没有」的明确结论。
+    const client = clientWith([])
+    client.resourceListByMediaItem = vi.fn(async () => {
+      throw new Error("resource query failed")
+    })
+
+    await expect(getMediaItemDownloadInfo("media-1", client)).rejects.toThrow("resource query failed")
+  })
+
+  it("still rejects the whole batch when the shared download list fails", async () => {
+    // 共享的任务扫描不是「某一篇的失败」：没有它就没有任何一篇的投影依据。
+    const downloadList = vi.fn(async () => {
+      throw new Error("download list failed")
+    })
+    const client = clientWith([], EMPTY_RESOURCES, [], downloadList)
+
+    await expect(getMediaItemsDownloadInfo(["media-1", "media-2"], client))
+      .rejects.toThrow("download list failed")
   })
 })

@@ -6,6 +6,7 @@
 //! - **禁止**在 Command 内写 SQL 或触碰 DB Row。
 //! - favorite_set 只发布 changed=true 的 favorite.changed。
 
+pub mod agent;
 pub mod app_info;
 pub mod cache;
 pub mod cast;
@@ -19,6 +20,7 @@ pub mod history;
 pub mod home;
 pub mod library;
 pub mod marker;
+pub mod periodical;
 pub mod progress;
 pub mod reader;
 pub mod resource;

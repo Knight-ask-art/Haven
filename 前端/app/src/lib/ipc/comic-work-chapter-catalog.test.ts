@@ -6,6 +6,25 @@ import fixture from "../../../../../contracts/ipc/v1/fixtures/comic/work-chapter
 const WORK_ID = "11111111-1111-4111-8111-111111111111"
 const MEDIA_ITEM_ID = "22222222-2222-4222-8222-222222222201"
 
+/**
+ * 未知 wire 字段不一定以可枚举字符串键出现。symbol 键和 defineProperty 造出的
+ * 非枚举键都是对象的自有键，`Object.keys` 看不到它们，但结构上依然越界。
+ */
+const UNKNOWN_WIRE_KEY = Symbol("unknown-wire-field")
+
+function withSymbolUnknownKey(target: Record<string, unknown>): Record<string, unknown> {
+  return { ...target, [UNKNOWN_WIRE_KEY]: 1 }
+}
+
+function withHiddenUnknownKey(target: Record<string, unknown>): Record<string, unknown> {
+  return Object.defineProperty({ ...target }, "hiddenUnknown", {
+    value: 1,
+    enumerable: false,
+    writable: true,
+    configurable: true,
+  })
+}
+
 function normal(): ComicWorkChapterCatalogDto {
   return fixture as unknown as ComicWorkChapterCatalogDto
 }
@@ -247,5 +266,70 @@ describe("isComicWorkChapterCatalogDto", () => {
     expect(accepts({ exact: "x", prefix: null, suffix: null })).toBe(true)
     expect(accepts({ exact: "x", prefix: null, suffix: null, extra: 1 })).toBe(false)
     expect(accepts({ exact: "x", prefix: null })).toBe(false)
+  })
+
+  it("rejects a symbol-keyed or non-enumerable unknown field on the catalog envelope", () => {
+    const catalog = normal()
+
+    // 克隆本身仍合法：下面的拒绝来自注入的未知键，而不是结构被破坏。
+    expect(isComicWorkChapterCatalogDto({ ...catalog })).toBe(true)
+    expect(isComicWorkChapterCatalogDto(withSymbolUnknownKey({ ...catalog }))).toBe(false)
+    expect(isComicWorkChapterCatalogDto(withHiddenUnknownKey({ ...catalog }))).toBe(false)
+  })
+
+  it("rejects a symbol-keyed or non-enumerable unknown field nested in the wire tree", () => {
+    const catalog = normal()
+    const chapter = catalog.chapters[0]
+    const progress = chapter.progress
+    if (progress === null) throw new Error("fixture 首个章节必须携带进度块")
+
+    const cases: Array<{ where: string; broken: unknown }> = []
+    for (const [kind, inject] of Object.entries({
+      symbol: withSymbolUnknownKey,
+      "non-enumerable": withHiddenUnknownKey,
+    })) {
+      cases.push(
+        {
+          where: `edition:${kind}`,
+          broken: {
+            ...catalog,
+            editions: [inject({ ...catalog.editions[0] }), ...catalog.editions.slice(1)],
+          },
+        },
+        {
+          where: `chapter:${kind}`,
+          broken: { ...catalog, chapters: [inject({ ...chapter }), ...catalog.chapters.slice(1)] },
+        },
+        {
+          where: `source:${kind}`,
+          broken: {
+            ...catalog,
+            chapters: [
+              { ...chapter, sources: [inject({ ...chapter.sources[0] })] },
+              ...catalog.chapters.slice(1),
+            ],
+          },
+        },
+        {
+          where: `locator:${kind}`,
+          broken: withFirstChapterLocator(catalog, inject({ ...progress.locator })),
+        },
+        {
+          where: `locatorData:${kind}`,
+          broken: withFirstChapterLocator(catalog, {
+            ...progress.locator,
+            data: inject({ ...progress.locator.data }),
+          }),
+        },
+      )
+    }
+
+    for (const { where, broken } of cases) {
+      expect({ where, accepted: isComicWorkChapterCatalogDto(broken) })
+        .toEqual({ where, accepted: false })
+    }
+
+    // 未注入未知键的原始 fixture 仍必须通过，证明上面的拒绝不是克隆手法造成的。
+    expect(isComicWorkChapterCatalogDto(normal())).toBe(true)
   })
 })

@@ -16,6 +16,7 @@ import { ComicReaderPage } from "@/features/comic/pages/ComicReaderPage"
 import { ArticleReaderPage } from "@/features/reader/pages/ArticleReaderPage"
 import { HistoryPage } from "@/features/footprints/pages/HistoryPage"
 import { EditionDetailPage } from "@/features/media/pages/EditionDetailPage"
+import { PeriodicalTreePage } from "@/features/periodical/pages/PeriodicalTreePage"
 
 export class AppErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean; error: unknown }> {
   state = { hasError: false, error: null as unknown }
@@ -47,7 +48,14 @@ if (import.meta.env.DEV || import.meta.env.VITE_SPIKE_ENABLED === "1") {
   }
 }
 
-export const router = createBrowserRouter([
+/**
+ * 应用路由表（不导出）。
+ *
+ * 路由测试通过下面已经导出的 `router` 实例读它（`router.routes`），而不是让本文件
+ * 为了可测试性再导出一个非组件常量：那会给本文件多加一条
+ * react-refresh/only-export-components 警告，而 `router` 已经足够读到同一份配置。
+ */
+const appRoutes: RouteObject[] = [
   ...spikeRoute ? [spikeRoute] : [],
   {
     path: "player/:mediaItemId",
@@ -94,6 +102,11 @@ export const router = createBrowserRouter([
         element: <EditionDetailPage />
       },
       {
+        // 报刊层级浏览：按 Work 身份读取真实期刊树，入口在作品详情页。
+        path: "periodical/:workId",
+        element: <PeriodicalTreePage />
+      },
+      {
         path: "media/:id",
         element: <LegacyMediaRedirect />
       },
@@ -131,7 +144,9 @@ export const router = createBrowserRouter([
       }
     ]
   }
-])
+]
+
+export const router = createBrowserRouter(appRoutes)
 
 function LegacyMediaRedirect() {
   const { id } = useParams<{ id?: string }>()

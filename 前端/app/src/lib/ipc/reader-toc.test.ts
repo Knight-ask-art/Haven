@@ -47,4 +47,36 @@ describe("isReaderTocResultDto", () => {
     const oversized = { ...result, items: Array.from({ length: 8193 }, () => item) }
     expect(isReaderTocResultDto(oversized)).toBe(false)
   })
+
+  const unknownOwnKeyMutations: Array<[string, (value: Record<string, unknown>) => void]> = [
+    ["a symbol own key", (value) => {
+      Object.defineProperty(value, Symbol("locator"), { value: "secret" })
+    }],
+    ["a non-enumerable own key", (value) => {
+      Object.defineProperty(value, "locator", { value: "secret", enumerable: false })
+    }],
+  ]
+
+  it.each(unknownOwnKeyMutations)(
+    "rejects an otherwise valid result carrying %s",
+    (_label, mutate) => {
+      const value: Record<string, unknown> = { ...result, items: [{ ...item }] }
+      expect(isReaderTocResultDto(value)).toBe(true)
+      mutate(value)
+      expect(isReaderTocResultDto(value)).toBe(false)
+    },
+  )
+
+  it.each(unknownOwnKeyMutations)(
+    "rejects an otherwise valid item carrying %s",
+    (_label, mutate) => {
+      const nested: Record<string, unknown> = { ...item }
+      const value: Record<string, unknown> = { ...result, items: [nested] }
+      expect(isReaderTocResultDto(value)).toBe(true)
+      expect(isTocItemDto(nested)).toBe(true)
+      mutate(nested)
+      expect(isTocItemDto(nested)).toBe(false)
+      expect(isReaderTocResultDto(value)).toBe(false)
+    },
+  )
 })

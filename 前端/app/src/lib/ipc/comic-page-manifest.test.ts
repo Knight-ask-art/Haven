@@ -57,6 +57,36 @@ describe("isComicPageManifestDto", () => {
     expect(isComicPageManifestDto(value)).toBe(false)
   })
 
+  const unknownOwnKeyMutations: Array<[string, (value: Record<string, unknown>) => void]> = [
+    ["a symbol own key", (value) => {
+      Object.defineProperty(value, Symbol("locator"), { value: "secret" })
+    }],
+    ["a non-enumerable own key", (value) => {
+      Object.defineProperty(value, "locator", { value: "secret", enumerable: false })
+    }],
+  ]
+
+  it.each(unknownOwnKeyMutations)(
+    "rejects an otherwise valid manifest carrying %s",
+    (_label, mutate) => {
+      const value = manifest()
+      expect(isComicPageManifestDto(value)).toBe(true)
+      mutate(value)
+      expect(isComicPageManifestDto(value)).toBe(false)
+    },
+  )
+
+  it.each(unknownOwnKeyMutations)(
+    "rejects an otherwise valid page carrying %s",
+    (_label, mutate) => {
+      const value = manifest()
+      expect(isComicPageManifestDto(value)).toBe(true)
+      const pages = value.pages as Array<Record<string, unknown>>
+      mutate(pages[0])
+      expect(isComicPageManifestDto(value)).toBe(false)
+    },
+  )
+
   it("rejects discontinuous indices and duplicate or intersecting identities", () => {
     const discontinuous = manifest()
     ;(discontinuous.pages as Array<Record<string, unknown>>)[1].pageIndex = 2

@@ -15,8 +15,8 @@ use haven_domain::ids::{
     MediaItemId, PeriodicalArticleId, PeriodicalId, PeriodicalIssueId, PeriodicalVolumeId, WorkId,
 };
 use haven_domain::periodical::{
-    Doi, Issn, PageRange, Periodical, PeriodicalArticle, PeriodicalArticleSourceIdentity,
-    PeriodicalIssue, PeriodicalPlacement, PeriodicalVolume,
+    Doi, Issn, PageRange, Periodical, PeriodicalArticle, PeriodicalArticleAvailability,
+    PeriodicalArticleSourceIdentity, PeriodicalIssue, PeriodicalPlacement, PeriodicalVolume,
 };
 
 use crate::db::Db;
@@ -43,6 +43,7 @@ const ARTICLE_PLACEMENT_SELECT: &str = "
     a.page_range_end    AS article_page_range_end,
     a.source_key        AS article_source_key,
     a.remote_article_id AS article_remote_article_id,
+    a.provider_content_availability AS article_provider_content_availability,
     a.created_at        AS article_created_at,
     a.updated_at        AS article_updated_at,
     i.id                AS issue_id,
@@ -146,6 +147,14 @@ fn parse_page_range(
     }
 }
 
+/// 闭合枚举解析：库里出现未定义的正文观察取值时是行级错误，而不是猜一个状态。
+fn parse_availability(
+    value: String,
+    field: &'static str,
+) -> rusqlite::Result<PeriodicalArticleAvailability> {
+    PeriodicalArticleAvailability::parse(&value).ok_or_else(|| invalid_row(field))
+}
+
 /// 逐列重建一条完整归属链。任何一层解析失败都返回行级错误，不返回部分归属。
 fn placement_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PeriodicalPlacement> {
     let periodical = Periodical {
@@ -199,6 +208,10 @@ fn placement_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PeriodicalPla
             source_key: row.get("article_source_key")?,
             remote_article_id: row.get("article_remote_article_id")?,
         },
+        provider_content_availability: parse_availability(
+            row.get("article_provider_content_availability")?,
+            "article_provider_content_availability",
+        )?,
         created_at: UtcMillis(row.get("article_created_at")?),
         updated_at: UtcMillis(row.get("article_updated_at")?),
     };
@@ -239,7 +252,8 @@ const ISSUE_COLUMNS: &str =
     "id, volume_id, label, number, publication_date, ordinal, created_at, updated_at";
 
 const ARTICLE_COLUMNS: &str = "id, issue_id, media_item_id, ordinal, title, doi,
-    page_range_start, page_range_end, source_key, remote_article_id, created_at, updated_at";
+    page_range_start, page_range_end, source_key, remote_article_id,
+    provider_content_availability, created_at, updated_at";
 
 fn volume_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PeriodicalVolume> {
     let volume = PeriodicalVolume {
@@ -287,6 +301,10 @@ fn article_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PeriodicalArtic
             source_key: row.get("source_key")?,
             remote_article_id: row.get("remote_article_id")?,
         },
+        provider_content_availability: parse_availability(
+            row.get("provider_content_availability")?,
+            "provider_content_availability",
+        )?,
         created_at: UtcMillis(row.get("created_at")?),
         updated_at: UtcMillis(row.get("updated_at")?),
     };
@@ -403,8 +421,8 @@ pub(crate) fn save_article_on_conn(
         "INSERT INTO periodical_articles
             (id, issue_id, media_item_id, ordinal, title, doi,
              page_range_start, page_range_end, source_key, remote_article_id,
-             created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             provider_content_availability, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(id) DO UPDATE SET
              issue_id = excluded.issue_id,
              media_item_id = excluded.media_item_id,
@@ -415,6 +433,7 @@ pub(crate) fn save_article_on_conn(
              page_range_end = excluded.page_range_end,
              source_key = excluded.source_key,
              remote_article_id = excluded.remote_article_id,
+             provider_content_availability = excluded.provider_content_availability,
              updated_at = excluded.updated_at",
         rusqlite::params![
             article.id.to_string(),
@@ -433,6 +452,7 @@ pub(crate) fn save_article_on_conn(
                 .and_then(|range| range.end.as_deref()),
             article.source.source_key,
             article.source.remote_article_id,
+            article.provider_content_availability.as_str(),
             article.created_at.0,
             article.updated_at.0,
         ],
@@ -734,6 +754,7 @@ mod tests {
             doi: Doi::parse("10.1038/s41467-024-00001-2"),
             page_range: PageRange::new("e12345", None),
             source: PeriodicalArticleSourceIdentity::new("europepmc", "PMC1234567").unwrap(),
+            provider_content_availability: PeriodicalArticleAvailability::MetadataOnly,
             created_at: now(),
             updated_at: now(),
         };
@@ -896,5 +917,64 @@ mod tests {
             .await
             .expect_err("文章不能绑定非 Article MediaItem");
         assert_eq!(error.code().as_str(), "INVALID_PERIODICAL_IDENTITY");
+    }
+
+    /// Provider 的正文观察是文章的持久化事实，读写都必须带上它。
+    #[tokio::test]
+    async fn article_provider_content_availability_roundtrips() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let mut expected = placement(&db);
+        expected.article.provider_content_availability = PeriodicalArticleAvailability::FullText;
+        let repo = SqlitePeriodicalRepository::new(db.clone());
+        save_placement(&repo, &expected).await.unwrap();
+
+        assert_eq!(
+            repo.list_articles(expected.issue.id).await.unwrap()[0].provider_content_availability,
+            PeriodicalArticleAvailability::FullText
+        );
+        let stored = repo
+            .find_article_by_source("europepmc", "PMC1234567")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.article.provider_content_availability,
+            PeriodicalArticleAvailability::FullText,
+            "归属链读取必须带上正文观察"
+        );
+    }
+
+    /// 040 时代写入的行没有这一列：补列后只能落成保守的「没有观察到」，
+    /// 不能被追溯成任何已观察到的正文状态。
+    #[tokio::test]
+    async fn legacy_article_rows_without_the_observation_read_back_as_unknown() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let expected = placement(&db);
+        let repo = SqlitePeriodicalRepository::new(db.clone());
+        save_placement(&repo, &expected).await.unwrap();
+
+        let legacy_media_item = seed_article_media_item(&db);
+        db.lock()
+            .execute(
+                "INSERT INTO periodical_articles
+                    (id, issue_id, media_item_id, ordinal, title, doi,
+                     page_range_start, page_range_end, source_key, remote_article_id,
+                     created_at, updated_at)
+                 VALUES ('0196f0d2-0000-7000-8000-0000000000aa', ?1, ?2, NULL, '迁移前的文章',
+                         NULL, NULL, NULL, 'europepmc', 'PMC-legacy', 1, 1)",
+                rusqlite::params![expected.issue.id.to_string(), legacy_media_item.to_string()],
+            )
+            .unwrap();
+
+        let articles = repo.list_articles(expected.issue.id).await.unwrap();
+        let legacy = articles
+            .iter()
+            .find(|article| article.source.remote_article_id == "PMC-legacy")
+            .expect("旧行必须仍可读取");
+        assert_eq!(
+            legacy.provider_content_availability,
+            PeriodicalArticleAvailability::Unknown,
+            "没有 Provider 观察的旧行不得被宣称有正文或只有元数据"
+        );
     }
 }

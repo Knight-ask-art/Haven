@@ -293,6 +293,51 @@ impl UnitOfWork for FailingPeriodicalDatabaseUow {
     }
 }
 
+/// 篡改计划：Provider 观察被改成 `FullText`，但正文资源仍不可用。
+///
+/// 事务必须拒绝这种自相矛盾的计划，而不是把「没有正文」写成「来源有全文」。
+struct FullTextObservationWithUnavailableResource {
+    inner: SqliteUnitOfWork,
+}
+
+impl UnitOfWork for FullTextObservationWithUnavailableResource {
+    fn run_favorite(
+        &self,
+        _f: &dyn Fn(&dyn FavoriteTxPorts) -> Result<(), AppError>,
+    ) -> Result<(), AppError> {
+        Err(AppError::new(
+            "TEST_UOW_UNSUPPORTED",
+            ErrorKind::Unsupported,
+            "期刊集成测试不使用收藏事务",
+            false,
+        ))
+    }
+
+    fn run_source_import(
+        &self,
+        _provider: &str,
+        _external_id: &str,
+        _work: &Work,
+        _edition: &Edition,
+        _items: &[MediaItem],
+        _resources: &[Resource],
+    ) -> Result<(), AppError> {
+        Err(AppError::new(
+            "TEST_UOW_UNSUPPORTED",
+            ErrorKind::Unsupported,
+            "期刊集成测试不使用通用来源事务",
+            false,
+        ))
+    }
+
+    fn run_periodical_import(&self, plan: &PeriodicalImportPlan) -> Result<(), AppError> {
+        let mut tampered = plan.clone();
+        tampered.article.provider_content_availability = PeriodicalArticleAvailability::FullText;
+        tampered.resource.availability = Availability::SourceUnavailable;
+        self.inner.run_periodical_import(&tampered)
+    }
+}
+
 fn table_count(db: &Db, table: &str) -> i64 {
     db.with_tx(|tx| {
         tx.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -445,6 +490,107 @@ async fn metadata_only_articles_are_never_advertised_as_readable() {
         .unwrap();
     assert_eq!(resources.len(), 1);
     assert_eq!(resources[0].availability, Availability::SourceUnavailable);
+
+    // Provider 的正文观察必须落到文章行上，否则 UI 只能看到笼统的「不可阅读」，
+    // 无法把「来源只有元数据」与「这次没有观察到」分开。
+    let placement = service
+        .periodical_placement(EUROPE_PMC_SOURCE_KEY, PMCID_C)
+        .await
+        .unwrap()
+        .expect("文章归属链必须存在");
+    assert_eq!(
+        placement.article.provider_content_availability,
+        PeriodicalArticleAvailability::MetadataOnly
+    );
+}
+
+/// 新导入按 Provider 本次观察写入正文可用性；FullText 与本次导入建立的正文资源
+/// 事实一致，MetadataOnly 不建立可读资源。
+#[tokio::test]
+async fn imported_articles_persist_the_provider_content_observation() {
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    let provider = Arc::new(FakePeriodicalProvider::new(vec![
+        full_text_record(PMCID_A, "Full text article"),
+        article_record(
+            PMCID_C,
+            "Metadata only article",
+            PeriodicalArticleAvailability::MetadataOnly,
+            Some(journal_record(Some("2041-1723"), None)),
+        ),
+    ]));
+    let (service, repos) = service(&db, provider);
+
+    let full_text = service
+        .import_content_candidate(EUROPE_PMC_SOURCE_KEY, PMCID_A)
+        .await
+        .unwrap();
+    let metadata_only = service
+        .import_content_candidate(EUROPE_PMC_SOURCE_KEY, PMCID_C)
+        .await
+        .unwrap();
+    assert_eq!(
+        full_text.work_id, metadata_only.work_id,
+        "同一期刊的两篇文章归属同一个期刊 Work"
+    );
+
+    for (pmcid, imported, observation, item_status, resource_availability) in [
+        (
+            PMCID_A,
+            &full_text,
+            PeriodicalArticleAvailability::FullText,
+            MediaItemStatus::Available,
+            Availability::Available,
+        ),
+        (
+            PMCID_C,
+            &metadata_only,
+            PeriodicalArticleAvailability::MetadataOnly,
+            MediaItemStatus::Unavailable,
+            Availability::SourceUnavailable,
+        ),
+    ] {
+        let placement = service
+            .periodical_placement(EUROPE_PMC_SOURCE_KEY, pmcid)
+            .await
+            .unwrap()
+            .expect("文章归属链必须存在");
+        assert_eq!(
+            placement.article.provider_content_availability, observation,
+            "导入必须按 Provider 观察写入正文可用性"
+        );
+        assert_eq!(placement.article.media_item_id, imported.media_item_id);
+
+        let item = MediaItemRepository::get(&*repos, imported.media_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.status, item_status);
+        let resources = ResourceRepository::list_by_media_item(&*repos, imported.media_item_id)
+            .await
+            .unwrap();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(
+            resources[0].availability, resource_availability,
+            "可读资源事实必须与 Provider 观察一致"
+        );
+        if observation == PeriodicalArticleAvailability::MetadataOnly {
+            assert_eq!(resources[0].mime_type, None, "元数据条目不声明正文 MIME");
+        }
+    }
+
+    // 层级读取路径同样带上正文观察，UI 才有可辨识的事实可用。
+    let tree = service
+        .periodical_tree(full_text.work_id)
+        .await
+        .unwrap()
+        .expect("期刊层级必须存在");
+    let mut observed: Vec<String> = tree.volumes[0].issues[0]
+        .articles
+        .iter()
+        .map(|article| format!("{:?}", article.provider_content_availability))
+        .collect();
+    observed.sort();
+    assert_eq!(observed, vec!["FullText", "MetadataOnly"]);
 }
 
 #[tokio::test]
@@ -823,6 +969,43 @@ async fn database_failures_are_not_retried_as_periodical_conflicts() {
             table_count(&db, table),
             0,
             "失败的导入不得在 {table} 留下行"
+        );
+    }
+}
+
+/// Provider 的正文观察与本次导入建立的正文资源事实必须一致：
+/// `FullText` 不能配上不可用的正文资源，否则页面会把不存在的正文写成来源有全文。
+#[tokio::test]
+async fn full_text_observation_requires_a_readable_content_resource() {
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    let provider = Arc::new(FakePeriodicalProvider::new(vec![full_text_record(
+        PMCID_A,
+        "Contradictory article",
+    )]));
+    let uow = Arc::new(FullTextObservationWithUnavailableResource {
+        inner: SqliteUnitOfWork::new(db.clone()),
+    });
+    let (service, _repos) = service_with_uow(&db, provider, uow);
+
+    let error = service
+        .import_content_candidate(EUROPE_PMC_SOURCE_KEY, PMCID_A)
+        .await
+        .expect_err("自相矛盾的计划必须被拒绝");
+    assert_eq!(error.code().as_str(), "PERIODICAL_IMPORT_PLAN_INVALID");
+    for table in [
+        "works",
+        "editions",
+        "media_items",
+        "resources",
+        "periodicals",
+        "periodical_volumes",
+        "periodical_issues",
+        "periodical_articles",
+    ] {
+        assert_eq!(
+            table_count(&db, table),
+            0,
+            "被拒绝的计划不得在 {table} 留下行"
         );
     }
 }

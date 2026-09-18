@@ -107,6 +107,7 @@ import { useUpdater } from "@/features/settings/lib/useUpdater"
 import { ERROR_REPORT_LEVEL_LABELS } from "@/features/settings/ipc/error-report-gateway"
 import { useErrorReport } from "@/features/settings/lib/useErrorReport"
 import { useNotice } from "@/app/notice-center/notice-context"
+import { AiAssistantDialog } from "@/features/settings/components/ai-assistant/AiAssistantDialog"
 
 interface SettingsSection {
   id: SettingsSectionId
@@ -125,7 +126,7 @@ const SETTINGS_SECTIONS: SettingsSection[] = [
   { id: "storage", label: "存储", description: "媒体位置与空间管理", icon: HardDrive },
   { id: "downloads", label: "下载", description: "离线位置与队列策略", icon: Download },
   { id: "sync", label: "同步与备份", description: "用户自己的同步目标", icon: Cloud },
-  { id: "ai", label: "智能功能", description: "本地配置的 AI Provider", icon: Sparkles },
+  { id: "ai", label: "智能功能", description: "本地配置的 AI 服务", icon: Sparkles },
   { id: "updates", label: "更新", description: "应用与 Source Pack", icon: RefreshCw },
   { id: "privacy", label: "隐私与网络", description: "本地数据与网络行为", icon: Shield },
   { id: "about", label: "关于", description: "版本、许可与路径", icon: Info },
@@ -178,9 +179,13 @@ const DEFAULT_SETTINGS = {
   syncProgress: true,
   syncFavorites: true,
   aiEnabled: false,
+  // 界面上 aiProvider 是「API 协议」、aiEndpoint 是「API 地址」；底层键名保持不变，
+  // 避免影响既有持久化与 wire 契约。
   aiProvider: "OpenAI Compatible",
   aiEndpoint: "https://api.example.com/v1",
   aiKey: "",
+  // defaultModel / visionModel 保留既有持久化键与默认值；模型列表未接入时它们不参与渲染，
+  // 也不在渲染中改写，避免把占位模型名写成已配置状态。
   defaultModel: "未配置",
   visionModel: "未配置",
   autoUpdate: true,
@@ -257,6 +262,7 @@ function SettingsContent() {
   const [settings, setSettings] = useState<SettingsState>(DEFAULT_SETTINGS)
   const [searchQuery, setSearchQuery] = useState("")
   const [showMoreSettings, setShowMoreSettings] = useState(false)
+  const [assistantOpen, setAssistantOpen] = useState(false)
   const requestedSection = sectionParam as SettingsSectionId | null
   const activeSection = SETTINGS_SECTIONS.some((section) => section.id === requestedSection)
     ? requestedSection as SettingsSectionId
@@ -428,7 +434,7 @@ function SettingsContent() {
           <section className="settings-scrollbar-hidden min-h-0 min-w-0 flex-1 overflow-y-auto bg-[#f5f5f7]/50 dark:bg-[#000000]/20 p-[20px] pb-[112px] sm:p-[32px] sm:pb-[112px] lg:px-[48px] lg:pt-[40px]">
             <div className="mx-auto flex max-w-[1240px] flex-col items-start gap-[32px] xl:flex-row xl:justify-center xl:gap-[48px]">
               <div className="min-w-0 w-full flex-1 space-y-6 xl:max-w-[860px]">
-                {renderSettingsSection(activeSection, settings, update, forms, showNotice, resourceContext)}
+                {renderSettingsSection(activeSection, settings, update, forms, showNotice, resourceContext, () => setAssistantOpen(true))}
               </div>
               <div className="w-full shrink-0 xl:w-[320px]">
                 <SettingsSummaryRail activeSection={activeSection} settings={settings} forms={forms} onReset={resetSettings} onReload={reloadSettings} showNotice={showNotice} />
@@ -437,6 +443,11 @@ function SettingsContent() {
           </section>
         </div>
       </main>
+
+      {/* 助手只作为设置页内的浮层入口，不改变全局路由，也不接入第二套设置事实源。 */}
+      {/* 运行时可用则走 Typed IPC（Tauri 真实客户端 / 浏览器 dev 的 Mock）；*/}
+      {/* 不可用时明确进入本地预览，不伪造任何模型结果。 */}
+      <AiAssistantDialog open={assistantOpen} onOpenChange={setAssistantOpen} />
 
     </div>
   )
@@ -449,6 +460,7 @@ function renderSettingsSection(
   forms: { general: SettingsFormController; appearance: SettingsFormController; playback: SettingsFormController; reading: SettingsFormController; comic: SettingsFormController; downloads: SettingsFormController; privacy: SettingsFormController },
   showNotice: (message: string) => void,
   resourceContext: ResourcePreferenceContext | null,
+  onOpenAssistant: () => void,
 ) {
   switch (section) {
     case "appearance":
@@ -468,7 +480,7 @@ function renderSettingsSection(
     case "sync":
       return <SyncSettings settings={settings} update={update} />
     case "ai":
-      return <AiSettings settings={settings} update={update} showNotice={showNotice} />
+      return <AiSettings settings={settings} update={update} showNotice={showNotice} onOpenAssistant={onOpenAssistant} />
     case "updates":
       return <UpdateSettings showNotice={showNotice} />
     case "privacy":
@@ -863,7 +875,7 @@ function SelectControl({ value, options, onChange, ariaLabel, disabled = false }
           role="listbox"
           aria-label={ariaLabel}
           style={menuStyle}
-          className="settings-scrollbar-hidden overflow-y-auto rounded-[12px] border border-black/[0.08] dark:border-white/[0.08] bg-white/[0.97] dark:bg-[#2c2c2e]/97 p-[4px] shadow-[0_14px_36px_rgba(0,0,0,0.16),0_2px_8px_rgba(0,0,0,0.06)] dark:shadow-[0_14px_36px_rgba(0,0,0,0.4),0_2px_8px_rgba(0,0,0,0.2)] backdrop-blur-xl"
+          className="settings-scrollbar-hidden overflow-y-auto rounded-[12px] border border-black/[0.08] dark:border-white/[0.08] bg-white/[0.97] dark:bg-[#2c2c2e]/[0.97] p-[4px] shadow-[0_14px_36px_rgba(0,0,0,0.16),0_2px_8px_rgba(0,0,0,0.06)] dark:shadow-[0_14px_36px_rgba(0,0,0,0.4),0_2px_8px_rgba(0,0,0,0.2)] backdrop-blur-xl"
         >
           {options.map((option, index) => {
             const isSelected = option === value
@@ -2662,20 +2674,37 @@ function SyncSettings({ settings, update }: { settings: SettingsState; update: a
   )
 }
 
-function AiSettings({ settings, update, showNotice }: { settings: SettingsState; update: any; showNotice: (message: string) => void }) {
+/** API 协议选项：按请求/响应编排语义列出，不绑定具体服务商；写入的仍是 aiProvider 键。 */
+const API_PROTOCOL_OPTIONS = ["OpenAI Compatible", "Anthropic Messages", "Google Gemini", "Ollama"]
+
+/**
+ * 模型选择的唯一显示值：Provider 模型发现与能力列表都没有接入，
+ * 因此不列出任何示例或占位模型名，也不从模型名推断识图能力。
+ * 真实模型只能来自 Provider 的模型列表，能力只能来自 Provider 的能力字段。
+ */
+const NO_AVAILABLE_MODEL = "无可用模型"
+
+function AiSettings({ settings, update, showNotice, onOpenAssistant }: { settings: SettingsState; update: any; showNotice: (message: string) => void; onOpenAssistant: () => void }) {
+  // 没有可用模型时两个选择都保持禁用并只显示空态；defaultModel / visionModel 的原值
+  // 继续留在状态里，渲染过程既不读取也不改写，避免把占位名当成已配置的模型。
   return (
     <>
       <SettingsIntro section="AI" title="智能功能" description="AI 采用 BYOK。栖阅不为你的调用计费，也不会通过 Haven 中央服务器接收 API Key。" />
-      <div className="mb-7 flex gap-3 rounded-3xl border border-[#f0b429]/25 bg-[#fff8e5] p-5"><Sparkles className="mt-0.5 h-5 w-5 shrink-0 text-[#b7791f]" /><p className="text-xs leading-5 text-[#7a5a1a]">实际费用由你配置的 AI 服务提供商收取。Endpoint、模型和 API Key 将由后端安全存储层接管。</p></div>
-      <SettingsGroup title="Provider">
-        <SettingRow title="启用智能功能"><Toggle checked={settings.aiEnabled} onChange={(value) => update("aiEnabled", value)} label="启用智能功能" /></SettingRow>
-        <SettingRow title="AI Provider"><SelectControl value={settings.aiProvider} options={["OpenAI Compatible", "Azure OpenAI", "本地 Ollama"]} onChange={(value) => update("aiProvider", value)} ariaLabel="AI Provider" /></SettingRow>
-        <SettingRow title="Endpoint"><input value={settings.aiEndpoint} onChange={(event) => update("aiEndpoint", event.target.value)} className="h-10 w-[260px] rounded-xl border border-black/[0.08] bg-[#f5f5f7] px-3 text-sm outline-none focus:border-[#007aff]/50" aria-label="AI Endpoint" /></SettingRow>
-        <SettingRow title="API Key" description="密钥只单向写入 Windows 凭据管理器，设置界面不显示原文。"><div className="flex items-center gap-[8px]"><span className="flex items-center gap-1.5 text-[13px] font-semibold text-[#6e6e73]">{settings.aiKey ? "已配置" : "未配置"}{settings.aiKey && <CircleCheck className="h-[15px] w-[15px] text-[#34c759]" strokeWidth={2.2} />}</span><button type="button" onClick={() => showNotice("凭据写入将在后端 Credential Store 接入后开放")} className="rounded-full px-[8px] py-[8px] text-xs font-semibold text-[#007aff]">配置</button></div></SettingRow>
-        <SettingRow title="Default Model"><div className="flex items-center gap-4"><SelectControl value={settings.defaultModel} options={["未配置", "gpt-4o", "claude-compatible"]} onChange={(value) => update("defaultModel", value)} ariaLabel="Default Model" /><button type="button" onClick={() => showNotice("正在向 Provider 获取可用模型")} className="text-[13px] font-medium text-[#007aff] transition-colors hover:text-[#005bb5] hover:underline">拉取模型</button></div></SettingRow>
-        <SettingRow title="Vision Model"><div className="flex items-center gap-4"><SelectControl value={settings.visionModel} options={["未配置", "gpt-4o", "vision-compatible"]} onChange={(value) => update("visionModel", value)} ariaLabel="Vision Model" /><button type="button" onClick={() => showNotice("正在向 Provider 获取可用视觉模型")} className="text-[13px] font-medium text-[#007aff] transition-colors hover:text-[#005bb5] hover:underline">拉取模型</button></div></SettingRow>
+      <div className="mb-7 flex gap-3 rounded-3xl border border-[#f0b429]/25 bg-[#fff8e5] p-5"><Sparkles className="mt-0.5 h-5 w-5 shrink-0 text-[#b7791f]" /><p className="text-xs leading-5 text-[#7a5a1a]">实际费用由你配置的 AI 服务提供商收取。API 地址、模型和 API Key 将由后端安全存储层接管。</p></div>
+      <SettingsGroup title="配置建议" description="由本机设置快照生成可逐项审查的改动提案；批准前不会写入任何设置。">
+        <SettingRow icon={<Sparkles className="h-[19px] w-[19px]" strokeWidth={1.8} />} title="栖伴" description="栖伴是栖阅的 Haven 智能体：在对话中描述你的需求，它会读取设置快照并给出可逐项审查的提案。当前尚未接入模型服务（无可用模型），提案为确定性模板，必须由你批准后才会写入。">
+          <button type="button" onClick={onOpenAssistant} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[#007aff] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#006fe6]">打开栖伴</button>
+        </SettingRow>
       </SettingsGroup>
-      <div className="flex justify-end"><button type="button" onClick={() => showNotice("连接测试将在 AI Provider 后端适配后执行")} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[#1d1d1f] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#2c2c2e]">测试连接</button></div>
+      <SettingsGroup title="API 连接" description="按协议选择接入方式；API 地址由你填写，栖阅不代理请求。">
+        <SettingRow title="启用智能功能"><Toggle checked={settings.aiEnabled} onChange={(value) => update("aiEnabled", value)} label="启用智能功能" /></SettingRow>
+        <SettingRow title="API 协议" description="决定请求与响应的编排协议，而不是具体服务商。"><SelectControl value={settings.aiProvider} options={API_PROTOCOL_OPTIONS} onChange={(value) => update("aiProvider", value)} ariaLabel="API 协议" /></SettingRow>
+        <SettingRow title="API 地址" description="协议服务根地址，例如自建网关或本地运行时的入口。"><input value={settings.aiEndpoint} onChange={(event) => update("aiEndpoint", event.target.value)} className="h-10 w-[260px] rounded-xl border border-black/[0.08] bg-[#f5f5f7] px-3 text-sm text-[#1d1d1f] outline-none focus:border-[#007aff]/50 dark:border-white/[0.12] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]" aria-label="API 地址" /></SettingRow>
+        <SettingRow title="API Key" description="密钥只单向写入 Windows 凭据管理器，设置界面不显示原文。"><div className="flex items-center gap-[8px]"><span className="flex items-center gap-1.5 text-[13px] font-semibold text-[#6e6e73]">{settings.aiKey ? "已配置" : "未配置"}{settings.aiKey && <CircleCheck className="h-[15px] w-[15px] text-[#34c759]" strokeWidth={2.2} />}</span><button type="button" onClick={() => showNotice("凭据写入将在后端 Credential Store 接入后开放")} className="rounded-full px-[8px] py-[8px] text-xs font-semibold text-[#007aff]">配置</button></div></SettingRow>
+        <SettingRow title="默认模型" description="模型来自 API 的模型列表；当前没有可用的 Provider 模型发现通道。"><div className="flex items-center gap-4"><SelectControl value={NO_AVAILABLE_MODEL} options={[NO_AVAILABLE_MODEL]} onChange={() => undefined} ariaLabel="默认模型" disabled /><button type="button" onClick={() => showNotice("正在向 API 获取可用模型")} className="text-[13px] font-medium text-[#007aff] transition-colors hover:text-[#005bb5] hover:underline">拉取模型</button></div></SettingRow>
+        <SettingRow title="识图模型" description="默认模型未确认识图能力；需要识图时在这里单独指定模型。"><div className="flex items-center gap-4"><SelectControl value={NO_AVAILABLE_MODEL} options={[NO_AVAILABLE_MODEL]} onChange={() => undefined} ariaLabel="识图模型" disabled /><button type="button" onClick={() => showNotice("正在向 API 获取可用识图模型")} className="text-[13px] font-medium text-[#007aff] transition-colors hover:text-[#005bb5] hover:underline">拉取模型</button></div></SettingRow>
+      </SettingsGroup>
+      <div className="flex justify-end"><button type="button" onClick={() => showNotice("连接测试将在 AI 服务后端适配后执行")} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[#1d1d1f] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#2c2c2e]">测试连接</button></div>
     </>
   )
 }

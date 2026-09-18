@@ -18,7 +18,7 @@ use haven_domain::comic_progress_subject::ComicProgressSubject;
 use haven_domain::entities::{
     Edition, FavoriteTarget, MediaIndex, MediaItem, Resource, ResourceLocator, Work,
 };
-use haven_domain::enums::{MediaType, ResourceType};
+use haven_domain::enums::{Availability, MediaItemStatus, MediaType, ResourceType};
 use haven_domain::ids::{MediaItemId, WorkId};
 use haven_domain::locator::{ComicLocator, Locator};
 
@@ -378,6 +378,18 @@ fn apply_periodical_import(
     {
         return Err(invalid_periodical_plan(
             "报刊导入计划必须使用 Article/ArticleSnapshot 与匹配的来源对象",
+        ));
+    }
+
+    // Provider 的正文观察与本次导入建立的正文事实必须一致：观察到全文就必须落成
+    // 可读的正文资源，没有观察到全文就不得宣称可读。计划来自 Application，这里
+    // 在事务内重新判定，避免任何调用方把不存在的正文写成「来源有全文」。
+    let claims_readable_content = plan.article.provider_content_availability.is_readable();
+    let has_readable_content = plan.resource.availability == Availability::Available
+        && plan.item.status == MediaItemStatus::Available;
+    if claims_readable_content != has_readable_content {
+        return Err(invalid_periodical_plan(
+            "报刊文章的正文观察与正文资源事实不一致",
         ));
     }
 

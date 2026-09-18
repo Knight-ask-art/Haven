@@ -173,6 +173,22 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "040_periodicals",
         include_str!("../../../../migrations/040_periodicals.sql"),
     ),
+    (
+        "041_periodical_article_content_availability",
+        include_str!("../../../../migrations/041_periodical_article_content_availability.sql"),
+    ),
+    (
+        "042_setting_proposals",
+        include_str!("../../../../migrations/042_setting_proposals.sql"),
+    ),
+    (
+        "043_agent_action_bindings",
+        include_str!("../../../../migrations/043_agent_action_bindings.sql"),
+    ),
+    (
+        "044_agent_approval_tokens",
+        include_str!("../../../../migrations/044_agent_approval_tokens.sql"),
+    ),
 ];
 
 pub fn run(conn: &mut Connection) -> Result<(), AppError> {
@@ -1940,5 +1956,572 @@ mod tests {
             .unwrap();
         assert_eq!(id, "legacy-cms10-https", "迁移不得重建 Artwork 身份");
         assert!(recorded_checksum(&conn, "022_artwork_legacy_sources").is_some());
+    }
+
+    /// 041 为 040 时代已有的文章行保守补上 Provider 正文观察。
+    ///
+    /// 迁移前写入的行不可能被追溯成任何「已观察到的正文状态」，因此只能是
+    /// `unknown`——既不是 `metadata_only`（那是对来源的断言），也不是 `full_text`。
+    #[test]
+    fn legacy_periodical_articles_gain_a_conservative_provider_observation() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_legacy_through(&mut conn, 40);
+        // 这里只验证 ALTER TABLE 对既有行的取值，不构造完整归属链。
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        conn.execute(
+            "INSERT INTO periodical_articles
+                (id, issue_id, media_item_id, ordinal, title, doi,
+                 page_range_start, page_range_end, source_key, remote_article_id,
+                 created_at, updated_at)
+             VALUES ('legacy-article', 'legacy-issue', 'legacy-item', 1, '迁移前的文章',
+                     NULL, NULL, NULL, 'europepmc', 'PMC-legacy', 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+
+        let observed: String = conn
+            .query_row(
+                "SELECT provider_content_availability FROM periodical_articles
+                 WHERE id = 'legacy-article'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            observed, "unknown",
+            "没有 Provider 观察的旧行只能保守为 unknown"
+        );
+
+        // 列是闭合枚举：三态之外的取值写不进去。
+        assert!(
+            conn.execute(
+                "UPDATE periodical_articles SET provider_content_availability = 'readable'
+                 WHERE id = 'legacy-article'",
+                [],
+            )
+            .is_err(),
+            "闭合枚举之外的可用性取值必须被拒绝"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE periodical_articles SET provider_content_availability = NULL
+                 WHERE id = 'legacy-article'",
+                [],
+            )
+            .is_err(),
+            "正文观察是 NOT NULL：不能把缺失写成 NULL"
+        );
+    }
+
+    /// 042 建立提案与回执两张表，并把作用域形状、状态闭合、changed 0/1、
+    /// digest 长度与时间关系全部收敛成数据库层约束；回执只能对应真实存在的提案，
+    /// 且与它 1:1。
+    #[test]
+    fn setting_proposal_tables_are_closed_and_related() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_legacy_through(&mut conn, 42);
+        assert!(
+            recorded_checksum(&conn, "042_setting_proposals").is_some(),
+            "042 必须由真实 runner 记录"
+        );
+
+        let now = haven_common::UtcMillis::now().0;
+        let digest = "a".repeat(64);
+
+        // 一条形状完整、状态 pending 的 global 提案。
+        let insert_proposal = |conn: &Connection,
+                               id: &str,
+                               scope: &str,
+                               section: Option<&str>,
+                               edition_id: Option<&str>,
+                               media_item_id: Option<&str>,
+                               digest: &str,
+                               status: &str,
+                               created_at: i64,
+                               expires_at: i64| {
+            conn.execute(
+                "INSERT INTO setting_proposals
+                    (id, scope, section, edition_id, media_item_id, payload_json, digest, status,
+                     created_at, expires_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?7, ?8, ?9, ?8)",
+                params![
+                    id,
+                    scope,
+                    section,
+                    edition_id,
+                    media_item_id,
+                    digest,
+                    status,
+                    created_at,
+                    expires_at
+                ],
+            )
+        };
+        insert_proposal(
+            &conn,
+            "p-global",
+            "global",
+            Some("reading"),
+            None,
+            None,
+            &digest,
+            "pending",
+            now,
+            now + 1_000,
+        )
+        .unwrap();
+
+        // status 是闭合集合。
+        assert!(
+            insert_proposal(
+                &conn,
+                "p-status",
+                "global",
+                Some("reading"),
+                None,
+                None,
+                &digest,
+                "confirmed",
+                now,
+                now + 1_000,
+            )
+            .is_err(),
+            "闭合集合之外的提案状态必须被拒绝"
+        );
+        // scope 也是闭合集合，且形状与冗余 target 列绑定。
+        assert!(
+            insert_proposal(
+                &conn,
+                "p-scope",
+                "workspace",
+                None,
+                None,
+                None,
+                &digest,
+                "pending",
+                now,
+                now + 1_000,
+            )
+            .is_err(),
+            "未知 scope 必须被拒绝"
+        );
+        assert!(
+            insert_proposal(
+                &conn,
+                "p-global-no-section",
+                "global",
+                None,
+                None,
+                None,
+                &digest,
+                "pending",
+                now,
+                now + 1_000,
+            )
+            .is_err(),
+            "global 提案必须携带 section"
+        );
+        assert!(
+            insert_proposal(
+                &conn,
+                "p-edition-with-media",
+                "edition",
+                None,
+                Some("e1"),
+                Some("m1"),
+                &digest,
+                "pending",
+                now,
+                now + 1_000,
+            )
+            .is_err(),
+            "edition 提案不允许携带 media_item_id"
+        );
+        assert!(
+            insert_proposal(
+                &conn,
+                "p-media-item-no-edition",
+                "media_item",
+                None,
+                None,
+                Some("m1"),
+                &digest,
+                "pending",
+                now,
+                now + 1_000,
+            )
+            .is_err(),
+            "media_item 提案必须携带所属 edition"
+        );
+        // digest 长度与时间关系。
+        assert!(
+            insert_proposal(
+                &conn,
+                "p-short-digest",
+                "global",
+                Some("reading"),
+                None,
+                None,
+                "abc",
+                "pending",
+                now,
+                now + 1_000,
+            )
+            .is_err(),
+            "digest 必须是 64 位十六进制长度"
+        );
+        assert!(
+            insert_proposal(
+                &conn,
+                "p-expiry",
+                "global",
+                Some("reading"),
+                None,
+                None,
+                &digest,
+                "pending",
+                now,
+                now,
+            )
+            .is_err(),
+            "过期时间必须晚于创建时间"
+        );
+
+        // 回执：只能对应真实存在的提案。
+        let insert_receipt = |conn: &Connection,
+                              id: &str,
+                              proposal_id: &str,
+                              changed: i64,
+                              applied_revision: Option<&str>| {
+            conn.execute(
+                "INSERT INTO setting_change_receipts
+                    (id, proposal_id, proposal_digest, scope, section, edition_id, media_item_id,
+                     before_json, after_json, applied_revision, changed, provenance_json, applied_at)
+                 VALUES (?1, ?2, ?3, 'global', 'reading', NULL, NULL, '{}', '{}', ?4, ?5, '{}', ?6)",
+                params![id, proposal_id, digest, applied_revision, changed, now],
+            )
+        };
+        assert!(
+            insert_receipt(&conn, "r-orphan", "p-missing", 0, None).is_err(),
+            "回执不允许指向不存在的提案"
+        );
+        insert_receipt(&conn, "r-1", "p-global", 1, Some("set-1")).unwrap();
+        assert!(
+            insert_receipt(&conn, "r-2", "p-global", 0, None).is_err(),
+            "一条提案最多一张回执"
+        );
+        assert!(
+            insert_receipt(&conn, "r-3", "p-global", 2, Some("set-1")).is_err(),
+            "changed 只能是 0/1"
+        );
+        assert!(
+            insert_receipt(&conn, "r-4", "p-global", 1, None).is_err(),
+            "changed=1 必须写出新的 applied_revision"
+        );
+
+        // 回执是 append-only 审计事实：有回执的提案不能被删除，避免历史被级联擦除。
+        assert!(
+            conn.execute("DELETE FROM setting_proposals WHERE id = 'p-global'", [])
+                .is_err(),
+            "已有回执的提案删除必须被外键保护"
+        );
+        let receipts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM setting_change_receipts WHERE proposal_id = 'p-global'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipts, 1, "删除失败时回执必须保留");
+
+        // 目标列刻意不建外键：删除目标不能让审计事实消失，也不能反向阻塞删除。
+        assert!(
+            conn.execute(
+                "INSERT INTO setting_proposals
+                    (id, scope, section, edition_id, media_item_id, payload_json, digest, status,
+                     created_at, expires_at, updated_at)
+                 VALUES ('p-dangling-edition', 'edition', NULL, '0196f0d2-0000-7000-8000-0000000000ff',
+                         NULL, '{}', ?1, 'pending', ?2, ?3, ?2)",
+                params![digest, now, now + 1_000],
+            )
+            .is_ok(),
+            "目标列不建外键：目标被删除后提案仍要能被读取并返回稳定的 target-not-found"
+        );
+    }
+
+    #[test]
+    fn agent_action_binding_table_is_closed_and_restricts_parent_deletion() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_legacy_through(&mut conn, 43);
+        assert!(
+            recorded_checksum(&conn, "043_agent_action_bindings").is_some(),
+            "043 必须由真实 runner 记录"
+        );
+
+        let now = haven_common::UtcMillis::now().0;
+        let digest = "a".repeat(64);
+        conn.execute(
+            "INSERT INTO setting_proposals
+                (id, scope, section, edition_id, media_item_id, payload_json, digest, status,
+                 created_at, expires_at, updated_at)
+             VALUES ('p-agent-binding', 'global', 'reading', NULL, NULL, '{}', ?1, 'pending', ?2, ?3, ?2)",
+            params![digest, now, now + 1_000],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_action_bindings
+                (proposal_id, session_id, request_id, context_snapshot_id, context_hash,
+                 subject_json, action_kind, created_at, expires_at, approval_state, updated_at)
+             VALUES ('p-agent-binding', 'session-1', 'request-1', 'snapshot-1', ?1,
+                     '{}', 'settings_proposal', ?2, ?3, 'pending', ?2)",
+            params![digest, now, now + 1_000],
+        )
+        .unwrap();
+
+        assert!(
+            conn.execute(
+                "UPDATE agent_action_bindings SET context_hash = 'short' WHERE proposal_id = 'p-agent-binding'",
+                [],
+            )
+            .is_err(),
+            "context_hash 必须保持 SHA-256 摘要长度"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE agent_action_bindings SET action_kind = 'filesystem_write' WHERE proposal_id = 'p-agent-binding'",
+                [],
+            )
+            .is_err(),
+            "动作类型必须是服务端闭合集合"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE agent_action_bindings SET approval_state = 'confirmed' WHERE proposal_id = 'p-agent-binding'",
+                [],
+            )
+            .is_err(),
+            "审批状态必须是服务端闭合集合"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE agent_action_bindings SET expires_at = created_at WHERE proposal_id = 'p-agent-binding'",
+                [],
+            )
+            .is_err(),
+            "绑定过期时间必须晚于创建时间"
+        );
+        assert!(
+            conn.execute(
+                "DELETE FROM setting_proposals WHERE id = 'p-agent-binding'",
+                [],
+            )
+            .is_err(),
+            "有 Agent 绑定的提案不能被删除"
+        );
+        let binding_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_action_bindings WHERE proposal_id = 'p-agent-binding'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(binding_count, 1);
+    }
+
+    #[test]
+    fn migration_044_adds_closed_approval_token_columns_and_preserves_043_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_legacy_through(&mut conn, 43);
+
+        let now = haven_common::UtcMillis::now().0;
+        let digest = "a".repeat(64);
+        conn.execute(
+            "INSERT INTO setting_proposals
+                (id, scope, section, edition_id, media_item_id, payload_json, digest, status,
+                 created_at, expires_at, updated_at)
+             VALUES ('p-044-legacy', 'global', 'reading', NULL, NULL, '{}', ?1, 'pending', ?2, ?3, ?2)",
+            params![digest, now, now + 1_000],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_action_bindings
+                (proposal_id, session_id, request_id, context_snapshot_id, context_hash,
+                 subject_json, action_kind, created_at, expires_at, approval_state, updated_at)
+             VALUES ('p-044-legacy', 'session-044', 'request-044', 'snapshot-044', ?1,
+                     '{}', 'settings_proposal', ?2, ?3, 'pending', ?2)",
+            params![digest, now, now + 1_000],
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+        assert!(recorded_checksum(&conn, "044_agent_approval_tokens").is_some());
+        let legacy_token_columns: (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT approval_token_hash, approval_token_issued_at
+                 FROM agent_action_bindings WHERE proposal_id = 'p-044-legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy_token_columns, (None, None));
+
+        conn.execute(
+            "INSERT INTO setting_proposals
+                (id, scope, section, edition_id, media_item_id, payload_json, digest, status,
+                 created_at, expires_at, updated_at)
+             VALUES ('p-044-token', 'global', 'reading', NULL, NULL, '{}', ?1, 'pending', ?2, ?3, ?2)",
+            params![digest, now, now + 1_000],
+        )
+        .unwrap();
+        let valid_hash = "b".repeat(64);
+        conn.execute(
+            "INSERT INTO agent_action_bindings
+                (proposal_id, session_id, request_id, context_snapshot_id, context_hash,
+                 subject_json, action_kind, created_at, expires_at, approval_state,
+                 approval_token_hash, approval_token_issued_at, updated_at)
+             VALUES ('p-044-token', 'session-044', 'request-044', 'snapshot-044', ?1,
+                     '{}', 'settings_proposal', ?2, ?3, 'pending', ?4, ?2, ?2)",
+            params![digest, now, now + 1_000, valid_hash],
+        )
+        .unwrap();
+
+        // hash 只能是 64 位小写十六进制，且 hash / issued_at 必须成对存在。
+        assert!(
+            conn.execute(
+                "UPDATE agent_action_bindings
+                 SET approval_token_hash = NULL WHERE proposal_id = 'p-044-token'",
+                [],
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "UPDATE agent_action_bindings
+                 SET approval_token_hash = ?1 WHERE proposal_id = 'p-044-token'",
+                params!["A".repeat(64)],
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "UPDATE agent_action_bindings
+                 SET approval_token_hash = ?1 WHERE proposal_id = 'p-044-token'",
+                params![format!("{}g", "b".repeat(63))],
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "UPDATE agent_action_bindings
+                 SET approval_token_issued_at = ?1 WHERE proposal_id = 'p-044-token'",
+                params![now + 1_000],
+            )
+            .is_err()
+        );
+
+        // 终态必须清除 token 材料；清除后迁移到终态才允许。
+        assert!(
+            conn.execute(
+                "UPDATE agent_action_bindings
+                 SET approval_state = 'applied' WHERE proposal_id = 'p-044-token'",
+                [],
+            )
+            .is_err()
+        );
+        conn.execute(
+            "UPDATE agent_action_bindings
+             SET approval_state = 'applied', approval_token_hash = NULL,
+                 approval_token_issued_at = NULL
+             WHERE proposal_id = 'p-044-token'",
+            [],
+        )
+        .unwrap();
+        let terminal_token_columns: (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT approval_token_hash, approval_token_issued_at
+                 FROM agent_action_bindings WHERE proposal_id = 'p-044-token'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(terminal_token_columns, (None, None));
+    }
+
+    /// 审计保留语义：删除目标（媒体条目/版本）既不能被提案或回执反向阻塞，
+    /// 也不能把提案与回执连带擦掉——历史必须留着，apply 只回报稳定的
+    /// `SETTING_PROPOSAL_TARGET_NOT_FOUND`。
+    #[test]
+    fn setting_proposal_audit_rows_survive_target_deletion() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_legacy_through(&mut conn, 42);
+
+        let now = haven_common::UtcMillis::now().0;
+        let digest = "b".repeat(64);
+        let work_id = "0196f0d2-0000-7000-8000-00000000000a";
+        let edition_id = "0196f0d2-0000-7000-8000-00000000000b";
+        let media_item_id = "0196f0d2-0000-7000-8000-00000000000c";
+        conn.execute(
+            "INSERT INTO works (id, canonical_title, work_type, status, created_at, updated_at)
+             VALUES (?1, '审计保留', 'fiction', 'completed', ?2, ?2)",
+            params![work_id, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO editions (id, work_id, title, edition_type, created_at, updated_at)
+             VALUES (?1, ?2, '审计保留版本', 'book', ?3, ?3)",
+            params![edition_id, work_id, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO media_items
+                (id, edition_id, media_type, title, status, created_at, updated_at)
+             VALUES (?1, ?2, 'book', '审计保留资源', 'available', ?3, ?3)",
+            params![media_item_id, edition_id, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO setting_proposals
+                (id, scope, section, edition_id, media_item_id, payload_json, digest, status,
+                 created_at, expires_at, updated_at)
+             VALUES ('p-1', 'media_item', NULL, ?1, ?2, '{}', ?3, 'applied', ?4, ?5, ?4)",
+            params![edition_id, media_item_id, digest, now, now + 1_000],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO setting_change_receipts
+                (id, proposal_id, proposal_digest, scope, section, edition_id, media_item_id,
+                 before_json, after_json, applied_revision, changed, provenance_json, applied_at)
+             VALUES ('r-1', 'p-1', ?1, 'media_item', NULL, ?2, ?3, '{}', '{}', 'pref-media-1', 1,
+                     '{}', ?4)",
+            params![digest, edition_id, media_item_id, now],
+        )
+        .unwrap();
+
+        assert_eq!(
+            conn.execute(
+                "DELETE FROM media_items WHERE id = ?1",
+                params![media_item_id]
+            )
+            .unwrap(),
+            1,
+            "媒体条目必须能被删除：提案/回执的存在不得反向阻塞业务删除"
+        );
+        assert_eq!(
+            conn.execute("DELETE FROM editions WHERE id = ?1", params![edition_id])
+                .unwrap(),
+            1,
+            "版本必须能被删除"
+        );
+
+        for table in ["setting_proposals", "setting_change_receipts"] {
+            let remaining: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(remaining, 1, "删除目标后 {table} 的审计事实必须保留");
+        }
     }
 }

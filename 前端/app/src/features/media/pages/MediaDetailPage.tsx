@@ -4,7 +4,7 @@ import { cn } from "@/lib/utils"
 import { 
   ChevronLeft, ChevronRight, Play, BookOpen, Heart, Share2,
   Ellipsis, Star, Folder, CheckCircle, RotateCcw, Trash2,
-  Tv, Film, Book, FileText, Download, Link2,
+  Tv, Film, Book, FileText, Download, Link2, ListTree,
   ArrowUp, ArrowDown, ArrowUpDown
 } from "lucide-react"
 import { ShareCardModal } from "@/components/ui/haven/ShareCardModal"
@@ -1541,6 +1541,24 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                     )}
                     <span className="tracking-wide">{getPrimaryActionLabel()}</span>
                   </button>
+
+                  {/* 报刊层级入口：只对生产环境、权威投影已落地的期刊作品出现，且只用真实 workId。
+                      这里是浏览入口而不是正文入口，因此不参与主操作的能力门（正文仍逐篇在层级页判定）。 */}
+                  {production && isPeriodical && detailState === "data" && authoritativeItem && (
+                    <button
+                      type="button"
+                      data-testid="periodical-tree-entry"
+                      onClick={() => navigate(`/periodical/${authoritativeItem.id}`)}
+                      className={cn(
+                        "flex items-center justify-center gap-2.5 px-7 h-14 rounded-full font-bold text-base",
+                        "border border-black/10 dark:border-white/15 bg-black/5 dark:bg-white/5 text-foreground",
+                        "transition-colors duration-300 hover:bg-black/10 dark:hover:bg-white/10 cursor-pointer"
+                      )}
+                    >
+                      <ListTree className="w-5 h-5 shrink-0" />
+                      <span className="tracking-wide">浏览期刊层级</span>
+                    </button>
+                  )}
 
                   {production && detailState !== "data" && (
                     <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status">

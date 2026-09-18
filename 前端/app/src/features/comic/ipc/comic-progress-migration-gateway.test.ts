@@ -141,6 +141,11 @@ const nonAppliedStatuses: Array<ComicProgressMigrationResultDto["status"]> = [
   "no_target_page",
 ]
 
+function withHiddenOwnKey<T extends object>(value: T): T {
+  Object.defineProperty(value, "runtimeOnly", { value: "must-be-rejected", enumerable: false })
+  return value
+}
+
 describe("comic progress migration wire guards", () => {
   it("accepts opaque source identities, an owner-bound remap request, and a complete applied result", () => {
     const request: ComicProgressMigrationRequestDto = {
@@ -209,6 +214,72 @@ describe("comic progress migration wire guards", () => {
     expect(isComicPageProgressRemapRequestDto({
       ...remapRequest,
       sessionId: "CCCCCCCC-CCCC-4CCC-8000-CCCCCCCCCCCC",
+    })).toBe(false)
+  })
+
+  it("rejects an unknown symbol own key on a request, a result, and nested objects", () => {
+    const request: ComicProgressMigrationRequestDto = {
+      source,
+      target,
+      allowBestEffort: false,
+      allowTargetOverwrite: false,
+    }
+    expect(isComicProgressMigrationRequestDto(request)).toBe(true)
+    expect(isComicProgressMigrationResultDto(appliedResult)).toBe(true)
+
+    const symbolKey = Symbol("runtimeOnly")
+    expect(isComicProgressMigrationRequestDto({
+      ...request,
+      [symbolKey]: "must-be-rejected",
+    })).toBe(false)
+    expect(isComicProgressMigrationResultDto({
+      ...appliedResult,
+      [symbolKey]: "must-be-rejected",
+    })).toBe(false)
+
+    expect(isComicProgressMigrationRequestDto({
+      ...request,
+      source: { ...source, [symbolKey]: "must-be-rejected" },
+    })).toBe(false)
+    expect(isComicProgressMigrationResultDto({
+      ...appliedResult,
+      pageMigration: { ...appliedResult.pageMigration, [symbolKey]: "must-be-rejected" },
+    })).toBe(false)
+  })
+
+  it("rejects an unknown non-enumerable own key on a request, a result, and nested objects", () => {
+    const request: ComicProgressMigrationRequestDto = {
+      source: { ...source },
+      target: { ...target },
+      allowBestEffort: false,
+      allowTargetOverwrite: false,
+    }
+    expect(isComicProgressMigrationRequestDto(request)).toBe(true)
+    expect(isComicProgressMigrationRequestDto(withHiddenOwnKey({ ...request }))).toBe(false)
+    expect(isComicProgressMigrationRequestDto({
+      ...request,
+      source: withHiddenOwnKey({ ...source }),
+    })).toBe(false)
+    expect(isComicProgressMigrationRequestDto({
+      ...request,
+      target: withHiddenOwnKey({ ...target }),
+    })).toBe(false)
+
+    expect(isComicProgressMigrationResultDto(appliedResult)).toBe(true)
+    expect(isComicProgressMigrationResultDto(withHiddenOwnKey({ ...appliedResult }))).toBe(false)
+    expect(isComicProgressMigrationResultDto({
+      ...appliedResult,
+      receipt: {
+        ...appliedReceipt,
+        pageMapping: withHiddenOwnKey({ ...appliedReceipt.pageMapping }),
+      },
+    })).toBe(false)
+    expect(isComicProgressMigrationResultDto({
+      ...appliedResult,
+      matchResult: {
+        ...appliedResult.matchResult!,
+        evidence: [withHiddenOwnKey({ ...migrationEvidence[0] })],
+      },
     })).toBe(false)
   })
 })

@@ -111,7 +111,7 @@ impl LocalAppInfoProvider {
 impl AppInfoPorts for LocalAppInfoProvider {
     fn get(&self) -> Result<AppInfoFacts, AppError> {
         Ok(AppInfoFacts {
-            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            app_version: release_app_version(),
             build_channel: if cfg!(debug_assertions) {
                 "development".to_owned()
             } else {
@@ -171,6 +171,16 @@ impl AppInfoPorts for LocalAppInfoProvider {
             )
             .with_source(error)
         })
+    }
+}
+
+/// Release builds may override the Tauri bundle version for Windows MSI
+/// compatibility. Keep About/Diagnostics aligned with that updater version;
+/// ordinary local builds continue to use the Cargo package version.
+fn release_app_version() -> String {
+    match option_env!("HAVEN_RELEASE_VERSION") {
+        Some(version) if !version.is_empty() => version.to_owned(),
+        _ => env!("CARGO_PKG_VERSION").to_owned(),
     }
 }
 
@@ -267,6 +277,14 @@ mod tests {
     }
 
     #[test]
+    fn app_version_uses_release_override_or_cargo_version() {
+        let expected = option_env!("HAVEN_RELEASE_VERSION")
+            .filter(|version| !version.is_empty())
+            .unwrap_or(env!("CARGO_PKG_VERSION"));
+        assert_eq!(release_app_version(), expected);
+    }
+
+    #[test]
     fn parses_only_named_license_summaries() {
         let notices = parse_third_party_notices(
             "## Package A\n- Publisher-declared license: `MIT`\n\n## Assets\n- Other: owner\n",
@@ -304,7 +322,7 @@ mod tests {
             std::env::temp_dir().join("haven-app-info-cache"),
         );
         let facts = provider.get().unwrap();
-        assert_eq!(facts.database_version, "040_periodicals");
+        assert_eq!(facts.database_version, "044_agent_approval_tokens");
         assert_eq!(facts.source_pack_version.as_deref(), Some("builtin-1"));
         assert!(facts.third_party_notices.is_empty());
         assert_eq!(facts.app_license.as_deref(), Some("MIT"));

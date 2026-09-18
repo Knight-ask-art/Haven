@@ -3557,3 +3557,444 @@ pub struct CastStopResult {
     pub schema_version: u32,
     pub stopped: bool,
 }
+
+// ── 报刊层级（`ContentCategory::Periodical`）─────────────────────────────────
+//
+// 只读查询：期刊 → 卷 → 期 → 文章。字段只包含稳定的身份与展示/归属事实：
+// - 身份：Haven ID（字符串 UUID）与 ISSN（print / electronic 是两个独立身份）；
+// - 展示/归属：标题、出版方、卷/期标签与序号、发行日期、DOI、页码、来源 opaque 身份。
+//
+// **绝不输出** URL、Cookie、请求头、本地路径、Provider 原始响应或签名资源地址。
+// 文章正文与资源地址只能经既有 Resource / Session 链路获取。
+//
+// 列表顺序 = Repository 返回顺序（卷、期按 ordinal，文章按 ordinal）；
+// 前端不得自行重排或推断层级归属。
+//
+// 反序列化是闭合的：这一组 DTO（含请求）都带 `deny_unknown_fields`，
+// 多一个字段即整体失败而不是被静默忽略。字段重命名是精确匹配，
+// snake_case 与大小写变体不构成同一个字段。
+// 说明只写在这里：ts-rs 会把 `///` 文档注释复制进生成物 wire.ts，
+// 在 `//` 注释里说明才不会造成生成绑定漂移。
+
+/// `periodical_tree_get` 请求：按 Work 读取该作品的完整期刊层级。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct PeriodicalTreeGetRequest {
+    pub work_id: String,
+}
+
+/// 页码区间。报刊页码允许非连续与不规则形态（`e12345`、`S1-S5`），
+/// 因此保留来源文本而不是解析成整数；单页时 `end` 为 null。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct PageRangeDto {
+    pub start: String,
+    pub end: Option<String>,
+}
+
+/// 期刊身份与展示事实。`workId` 是期刊在 Haven 中的 Work 归属。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct PeriodicalDto {
+    pub id: String,
+    pub work_id: String,
+    pub title: String,
+    /// ISSN（印刷版）；来源未给出时为 null，不与 electronic 互相推断。
+    pub issn_print: Option<String>,
+    /// ISSN（电子版）。
+    pub issn_electronic: Option<String>,
+    pub publisher: Option<String>,
+}
+
+/// 文章正文可用性：Provider 对「这篇正文是否可读」的观察（闭合三态）。
+///
+/// 这不是本地阅读能力：`fullText` 只说明来源声明有正文，`metadataOnly` 只说明
+/// 来源只有元数据，`unknown` 说明没有观察到。页面据此区分三种情况，但**不得**
+/// 用它阻止用户打开自己已经拥有的在线或离线内容。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum PeriodicalArticleAvailabilityDto {
+    FullText,
+    MetadataOnly,
+    Unknown,
+}
+
+/// 期刊文章。`mediaItemId` 绑定既有 MediaItem，阅读/进度/资源链路由既有契约承担。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct PeriodicalArticleDto {
+    pub id: String,
+    pub issue_id: String,
+    pub media_item_id: String,
+    /// 期内文章序号；来源未给出时为 null，后端不猜测。
+    pub ordinal: Option<u32>,
+    pub title: String,
+    /// DOI 文本（不是可解析 URL）。
+    pub doi: Option<String>,
+    pub page_range: Option<PageRangeDto>,
+    /// 来源 key（如 `europepmc`）与来源侧 opaque 文章 ID：只用于幂等与归属核对。
+    pub source_key: String,
+    pub remote_article_id: String,
+    /// Provider 的正文观察。页面用它区分「仅有元数据」与「没有观察到」；
+    /// 真实可读路径由既有 Resource/Session 能力决定，不受此字段限制。
+    pub availability: PeriodicalArticleAvailabilityDto,
+}
+
+/// 期刊期号；`label` 保留不规则期号原文（`3-4`、`Suppl 2`、`Spring`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct PeriodicalIssueDto {
+    pub id: String,
+    pub volume_id: String,
+    pub label: Option<String>,
+    pub number: Option<f64>,
+    /// 发行日期（来源精度：`YYYY` / `YYYY-MM` / `YYYY-MM-DD`）。
+    pub publication_date: Option<String>,
+    pub ordinal: u32,
+    pub articles: Vec<PeriodicalArticleDto>,
+}
+
+/// 期刊卷；`label` 保留来源原文（例如 `Suppl 1`），`number` 仅在可解析时存在。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct PeriodicalVolumeDto {
+    pub id: String,
+    pub periodical_id: String,
+    pub label: Option<String>,
+    pub number: Option<f64>,
+    pub year: Option<i32>,
+    pub ordinal: u32,
+    pub issues: Vec<PeriodicalIssueDto>,
+}
+
+/// `periodical_tree_get` 响应：一个 Work 的完整期刊层级。
+///
+/// 层级由后端按 Repository 顺序组装；前端只做渲染，不重排、不推断归属。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct PeriodicalTreeDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub work_id: String,
+    pub periodical: PeriodicalDto,
+    pub volumes: Vec<PeriodicalVolumeDto>,
+}
+
+// ========== Agent 全局设置 Typed IPC（A1「智能配置推荐」垂直切片） ==========
+//
+// 本组 DTO 是设置页栖伴读写的**唯一**契约入口：读的是脱敏后的全局阅读设置
+// 快照，写的是严格 Typed 的 `PreferenceReadingPatchDto` 提案。
+// 它们共同保证：
+// - 没有任意 JSON / SQL / 路径 / 自由 command 名的入口；
+// - canonical digest 只由 Rust 生成，UI 只回传它显示的那一份；
+// - 一次性 Approval Token 不出现在任何字段里（它只在 Rust 内部批准路径存在）。
+
+/// 全局设置上下文覆盖的 Section（闭合集合；第一版只有 `reading`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum AgentSettingsSectionDto {
+    Reading,
+}
+
+impl From<haven_domain::agent::AgentSettingsSection> for AgentSettingsSectionDto {
+    fn from(value: haven_domain::agent::AgentSettingsSection) -> Self {
+        match value {
+            haven_domain::agent::AgentSettingsSection::Reading => Self::Reading,
+        }
+    }
+}
+
+impl From<AgentSettingsSectionDto> for haven_domain::agent::AgentSettingsSection {
+    fn from(value: AgentSettingsSectionDto) -> Self {
+        match value {
+            AgentSettingsSectionDto::Reading => Self::Reading,
+        }
+    }
+}
+
+/// 被服务端脱敏（清空）的字段名。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum AgentSettingsRedactedFieldDto {
+    CustomFontFamily,
+    CustomBackground,
+    CustomText,
+}
+
+impl From<haven_domain::agent::AgentSettingsRedactedField> for AgentSettingsRedactedFieldDto {
+    fn from(value: haven_domain::agent::AgentSettingsRedactedField) -> Self {
+        use haven_domain::agent::AgentSettingsRedactedField as Field;
+        match value {
+            Field::CustomFontFamily => Self::CustomFontFamily,
+            Field::CustomBackground => Self::CustomBackground,
+            Field::CustomText => Self::CustomText,
+        }
+    }
+}
+
+/// Agent 能力清单投影（与领域清单同形；`capabilities` 缺省即全关）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentCapabilityManifestDto {
+    pub agent_api_version: u32,
+    pub capabilities: AgentCapabilitySetDto,
+}
+
+/// 能力开关集合。这里是**服务端固定清单**的投影，不是调用方可配置的授权开关。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentCapabilitySetDto {
+    pub settings_read: bool,
+    pub settings_proposal: bool,
+    pub library_summary_read: bool,
+    pub metadata_proposal: bool,
+    pub rename_proposal: bool,
+    pub secret_read: bool,
+    pub filesystem_write: bool,
+}
+
+impl From<haven_domain::agent::AgentCapabilityManifest> for AgentCapabilityManifestDto {
+    fn from(value: haven_domain::agent::AgentCapabilityManifest) -> Self {
+        Self {
+            agent_api_version: value.agent_api_version,
+            capabilities: AgentCapabilitySetDto {
+                settings_read: value.capabilities.settings_read,
+                settings_proposal: value.capabilities.settings_proposal,
+                library_summary_read: value.capabilities.library_summary_read,
+                metadata_proposal: value.capabilities.metadata_proposal,
+                rename_proposal: value.capabilities.rename_proposal,
+                secret_read: value.capabilities.secret_read,
+                filesystem_write: value.capabilities.filesystem_write,
+            },
+        }
+    }
+}
+
+/// 脱敏后的全局阅读设置快照。
+///
+/// 字段名与 `PreferenceReadingSettingsDto` 一致，便于页面直接渲染当前档位；
+/// `redactedFields` 里的字段在服务端已被清空（null），页面必须显示为「已脱敏」，
+/// 不得当作「未设置」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentSettingsReadingSnapshotDto {
+    #[ts(type = "\"reading\"")]
+    pub section: String,
+    pub font_family: PreferenceReadingFontFamilyDto,
+    pub custom_font_family: Option<String>,
+    pub font_size: PreferenceReadingFontSizeDto,
+    pub line_height: PreferenceReadingLineHeightDto,
+    pub content_width: PreferenceReadingContentWidthDto,
+    pub theme: PreferenceReadingThemeDto,
+    pub custom_background: Option<String>,
+    pub custom_text: Option<String>,
+    pub font_weight: PreferenceReadingFontWeightDto,
+    pub letter_spacing: PreferenceReadingLetterSpacingDto,
+    pub system_auto: bool,
+    pub pagination: PreferenceReadingPaginationDto,
+    /// 服务端脱敏过的字段名（空数组表示没有被裁剪）。
+    pub redacted_fields: Vec<AgentSettingsRedactedFieldDto>,
+}
+
+/// `agent_settings_context_get` 响应：读取边界（只读，无 secret/路径/正文）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentSettingsContextDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    /// 服务端派生的设置上下文身份（64 位小写十六进制 context hash 的派生 UUID）。
+    pub context_id: String,
+    /// canonical 设置上下文载荷的 SHA-256；提案创建必须回传它。
+    pub context_hash: String,
+    pub subject: AgentSettingsSubjectDto,
+    /// authoritative 设置 revision；`null` 表示该分区从未保存过。
+    pub revision: Option<String>,
+    pub reading: AgentSettingsReadingSnapshotDto,
+    pub capabilities: AgentCapabilityManifestDto,
+}
+
+/// 全局设置范围（不含任何作品身份，也不含伪造的 Work ID）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentSettingsSubjectDto {
+    pub section: AgentSettingsSectionDto,
+}
+
+impl From<haven_domain::agent::AgentSettingsSubject> for AgentSettingsSubjectDto {
+    fn from(value: haven_domain::agent::AgentSettingsSubject) -> Self {
+        Self {
+            section: value.section.into(),
+        }
+    }
+}
+
+/// 创建设置提案的请求（闭合 typed DTO）。
+///
+/// `contextId` / `contextHash` / `baseRevision` 都必须来自最近一次
+/// `agent_settings_context_get`：服务端会重新读取 authoritative 设置、重建上下文并
+/// 逐项比对，任一项对不上都 fail-closed（零写入）。这里**没有**任何绕过字段。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentSettingsProposalCreateRequest {
+    pub session_id: String,
+    pub request_id: String,
+    pub context_id: String,
+    pub context_hash: String,
+    pub base_revision: Option<String>,
+    pub patch: PreferenceReadingPatchDto,
+}
+
+/// 提案状态（闭合集合）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum AgentSettingsProposalStatusDto {
+    Pending,
+    Applied,
+    Rejected,
+    Expired,
+}
+
+impl From<haven_domain::setting_proposal::SettingProposalStatus>
+    for AgentSettingsProposalStatusDto
+{
+    fn from(value: haven_domain::setting_proposal::SettingProposalStatus) -> Self {
+        use haven_domain::setting_proposal::SettingProposalStatus as Status;
+        match value {
+            Status::Pending => Self::Pending,
+            Status::Applied => Self::Applied,
+            Status::Rejected => Self::Rejected,
+            Status::Expired => Self::Expired,
+        }
+    }
+}
+
+/// 一条提案内的单项改动（从提案载荷与 authoritative 当前值推导，不由前端计算）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentSettingChangeDto {
+    /// 稳定设置项 id（例如 `reading.fontSize`）。
+    pub key: String,
+    /// 改动前的档位（Wire 枚举值字符串）。
+    pub before: String,
+    /// 改动后的档位（Wire 枚举值字符串）。
+    pub after: String,
+}
+
+/// Agent 设置提案投影。
+///
+/// `digest` 是 Rust 生成的 canonical digest（64 位小写十六进制）；UI 必须原样
+/// 回传它，不得自行计算领域 digest。这里**没有** Approval Token 字段。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentSettingsProposalDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub proposal_id: String,
+    pub status: AgentSettingsProposalStatusDto,
+    pub subject: AgentSettingsSubjectDto,
+    pub target_label: String,
+    pub base_revision: Option<String>,
+    pub digest: String,
+    pub created_at: String,
+    pub expires_at: String,
+    pub changes: Vec<AgentSettingChangeDto>,
+}
+
+/// 回执投影：只暴露「改了什么、结果如何」，不暴露 token 或任意 JSON 结构。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentSettingChangeReceiptDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub receipt_id: String,
+    pub proposal_id: String,
+    /// 与提案 digest 同源；UI 用它核对回执确实对应自己批准的那一份。
+    pub proposal_digest: String,
+    /// `applied` / `rejected` / `expired` / `pending`（未应用时为 pending）。
+    pub status: AgentSettingsProposalStatusDto,
+    /// 应用后的 authoritative revision；`null` 表示没有写出新版本。
+    pub applied_revision: Option<String>,
+    pub changed: bool,
+    pub changes: Vec<AgentSettingChangeDto>,
+    pub applied_at: String,
+}
+
+/// 批准请求：只有提案 ID 与**UI 显示的那份 canonical digest**。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentSettingsProposalApproveRequest {
+    pub proposal_id: String,
+    pub expected_digest: String,
+}
+
+/// 拒绝请求：同样只提交提案 ID 与 UI 显示的那份 canonical digest。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentSettingsProposalRejectRequest {
+    pub proposal_id: String,
+    pub expected_digest: String,
+}
+
+/// 提案读取请求（UI 刷新/重开后回读）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentSettingsProposalGetRequest {
+    pub proposal_id: String,
+}
+
+/// 回执读取请求。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentSettingChangeReceiptGetRequest {
+    pub proposal_id: String,
+}
+
+/// 批准结果：应用后的提案状态 + 回执。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentSettingsProposalApproveResultDto {
+    pub proposal: AgentSettingsProposalDto,
+    pub receipt: AgentSettingChangeReceiptDto,
+}
+
+/// 拒绝结果：拒绝后的提案投影（零写入）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentSettingsProposalRejectResultDto {
+    pub proposal: AgentSettingsProposalDto,
+}
+
+/// 读取结果：提案 + 可能存在的回执（未应用时 `receipt` 为 null）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentSettingsProposalGetResultDto {
+    pub proposal: AgentSettingsProposalDto,
+    pub receipt: Option<AgentSettingChangeReceiptDto>,
+}

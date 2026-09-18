@@ -5,6 +5,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Explicit release tag, for example v0.1.0-beta.1"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -55,42 +60,30 @@ jobs:
         # Tauri build below remains build evidence; runtime/release acceptance
         # still requires a candidate record validated by the evidence checker.
 
-      - name: Prepare Windows bundle version
-        id: bundle-version
+      - name: Resolve release version
+        id: release-version
         shell: pwsh
         env:
-          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_REF: ${{ inputs.release_tag || github.ref_name }}
         run: |
-          $releaseRef = $env:RELEASE_REF
-          if ($releaseRef.StartsWith('v')) {
-            $releaseVersion = $releaseRef.Substring(1)
-          } else {
-            # Keep workflow_dispatch usable while making tag-triggered releases strict.
-            $releaseVersion = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).version
-          }
+          python tools/release/bundle-version.py --ref "$env:RELEASE_REF" --github-output "$env:GITHUB_OUTPUT"
 
-          # Windows MSI encodes the optional SemVer prerelease identifier as a
-          # numeric value in the range 0..65535.  Keep the public Git tag
-          # (for example v0.1.0-beta.1), but use the equivalent numeric bundle
-          # version (0.1.0-1) only for the generated installers and updater
-          # manifest.  Stable versions are passed through unchanged.
-          $bundleVersion = $releaseVersion
-          if ($releaseVersion -match '^(?<base>\d+\.\d+\.\d+)-(?<channel>[0-9A-Za-z]+)\.(?<number>\d+)$') {
-            $number = [int]$Matches['number']
-            if ($number -gt 65535) {
-              throw "MSI prerelease number must be <= 65535; got $number"
-            }
-            $bundleVersion = "$($Matches['base'])-$number"
-          } elseif ($releaseVersion.Contains('-')) {
-            throw "MSI prerelease versions must end with a numeric identifier (for example 0.1.0-beta.1); got $releaseVersion"
-          }
+      - name: Validate first-party release version
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.release-version.outputs.release_version }}
+        run: |
+          python tools/release/version-check.py --version "$env:RELEASE_VERSION"
 
-          @{ version = $bundleVersion } |
+      - name: Prepare Windows bundle version
+        shell: pwsh
+        env:
+          BUNDLE_VERSION: ${{ steps.release-version.outputs.bundle_version }}
+        run: |
+          @{ version = $env:BUNDLE_VERSION } |
             ConvertTo-Json -Compress |
             Set-Content -Path src-tauri/tauri.release.conf.json -Encoding utf8
-          "release_version=$releaseVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "bundle_version=$bundleVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          Write-Host "Prepared Windows bundle version $bundleVersion for release $releaseVersion"
+          Write-Host "Prepared Windows bundle version $env:BUNDLE_VERSION"
 
       - name: Build and publish Tauri release
         uses: tauri-apps/tauri-action@v1
@@ -100,19 +93,19 @@ jobs:
           # two secrets before creating a release tag.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Match About/Diagnostics with the numeric bundle version used by
+          # the updater when tauri.release.conf.json overrides the public tag.
+          HAVEN_RELEASE_VERSION: ${{ steps.release-version.outputs.bundle_version }}
         with:
           projectPath: src-tauri
-          # The config override changes the internal Windows bundle version,
-          # so always target the exact pushed Git tag explicitly.
-          tagName: ${{ github.ref_name }}
-          releaseName: Haven ${{ github.ref_name }}
+          # The config override changes only the internal Windows bundle
+          # version; publish under the exact validated public tag.
+          tagName: ${{ steps.release-version.outputs.release_ref }}
+          releaseName: Haven ${{ steps.release-version.outputs.release_ref }}
           releaseBody: |
             See [CHANGELOG.md](https://github.com/Knight-ask-art/Haven/blob/main/CHANGELOG.md)
             for supported formats, known limitations, and upgrade behavior.
           releaseDraft: true
-          # Tag names containing a prerelease marker (for example
-          # v0.1.0-beta.1) must remain prereleases.  Otherwise the first
-          # beta would become the channel's "latest" release and the later
-          # v0.1.0 stable build could not be distinguished by the updater.
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          # The helper derives prerelease state from the validated public tag.
+          prerelease: ${{ steps.release-version.outputs.prerelease }}
           args: --target x86_64-pc-windows-msvc --config tauri.release.conf.json
