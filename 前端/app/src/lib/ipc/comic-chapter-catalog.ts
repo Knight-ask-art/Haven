@@ -20,8 +20,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+// `Object.keys` 只看可枚举字符串键，symbol 键和 `defineProperty` 造出的非枚举键
+// 都会被漏掉，`{...合法字段, [Symbol()]: x}` 这类结构会被当成闭合的 wire 数据透传。
+// `Reflect.ownKeys` 取全部自有键（字符串 + symbol，含不可枚举），非字符串键一律越界。
 function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  const actual = Object.keys(value).sort();
+  const ownKeys = Reflect.ownKeys(value);
+  if (!ownKeys.every((key): key is string => typeof key === "string")) return false;
+  const actual = [...ownKeys].sort();
   const expected = [...keys].sort();
   return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 }

@@ -113,13 +113,21 @@ export async function createDownloadForMediaItem(
  * detail page must not create a task or touch the filesystem. `canDownload`
  * is a backend capability projection; this feature never infers it from a
  * locator, `isLocal`, or a remote identity.
+ *
+ * A failed resource query stays a failure and rejects the call. Answering with
+ * an all-false projection would turn "we did not get an answer" into the
+ * verdict "this MediaItem has no resource", which the caller cannot retry out
+ * of. Batch isolation (below) deliberately does not soften this path.
  */
 export async function getMediaItemDownloadInfo(
   mediaItemId: string,
   client = getHavenClient(),
 ): Promise<MediaItemDownloadInfo> {
-  const projected = await getMediaItemsDownloadInfo([mediaItemId], client)
-  return projected.get(mediaItemId) ?? emptyMediaItemDownloadInfo()
+  const [tasks, resources] = await Promise.all([
+    listDownloads(client),
+    client.resourceListByMediaItem({ mediaItemId }),
+  ])
+  return projectMediaItemDownloadInfo(mediaItemId, tasks, resources)
 }
 
 /**
@@ -127,6 +135,15 @@ export async function getMediaItemDownloadInfo(
  * complete download-task scan. Edition pages often contain many rows and
  * `listDownloads` is paginated, so doing that scan once is materially cheaper
  * than calling the single-item helper in a loop.
+ *
+ * Each MediaItem is isolated: one row whose resource query fails must not turn
+ * the whole page into a failed batch. Such an item is left **out** of the
+ * returned map, so the caller reads a missing key as "no fact for this item"
+ * and can offer a retry. It is never filled in with an all-false projection,
+ * which would state "this item has no resource" as a fact — and never with a
+ * fabricated `unavailable`. The shared task scan is *not* isolated: without
+ * `downloadList` there is no projection basis for anyone, so the whole call
+ * rejects.
  */
 export async function getMediaItemsDownloadInfo(
   mediaItemIds: readonly string[],
@@ -137,26 +154,21 @@ export async function getMediaItemsDownloadInfo(
 
   const [tasks, resources] = await Promise.all([
     listDownloads(client),
-    Promise.all(uniqueMediaItemIds.map((mediaItemId) => (
-      client.resourceListByMediaItem({ mediaItemId })
-    ))),
+    Promise.all(uniqueMediaItemIds.map(async (mediaItemId) => {
+      try {
+        return await client.resourceListByMediaItem({ mediaItemId })
+      } catch {
+        return null
+      }
+    })),
   ])
 
-  return new Map(uniqueMediaItemIds.map((mediaItemId, index) => [
-    mediaItemId,
-    projectMediaItemDownloadInfo(mediaItemId, tasks, resources[index]),
-  ]))
-}
-
-function emptyMediaItemDownloadInfo(): MediaItemDownloadInfo {
-  return {
-    status: "idle",
-    canDownload: false,
-    hasOfflineResource: false,
-    canOnlineRead: false,
-    sourceResourceId: null,
-    taskId: null,
-  }
+  const projected = new Map<string, MediaItemDownloadInfo>()
+  uniqueMediaItemIds.forEach((mediaItemId, index) => {
+    const resourceList = resources[index]
+    if (resourceList) projected.set(mediaItemId, projectMediaItemDownloadInfo(mediaItemId, tasks, resourceList))
+  })
+  return projected
 }
 
 function projectMediaItemDownloadInfo(

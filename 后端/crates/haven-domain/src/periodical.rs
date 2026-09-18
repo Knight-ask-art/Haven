@@ -506,6 +506,53 @@ impl PeriodicalIssue {
     }
 }
 
+/// 文章正文可用性：Provider 对「这篇正文是否可读」的观察。
+///
+/// 这是一个**闭合三态**的观察值，不是本地阅读能力：
+/// - `FullText` 表示来源声明有可读正文，导入才允许建立可读资源；
+/// - `MetadataOnly` 表示来源只有元数据，正文未开放，不得建立可读资源；
+/// - `Unknown` 表示没有观察到（例如迁移之前导入、或来源没有给出可用性），
+///   它既不是「有正文」也不是「只有元数据」，调用方不得替它下结论。
+///
+/// 本地已有的在线阅读能力或离线资源不属于这里：用户自己已经拿到的内容始终
+/// 按真实资源路径打开，不受 Provider 观察限制。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeriodicalArticleAvailability {
+    /// 来源提供可读全文。
+    FullText,
+    /// 只有元数据；内容不存在或尚未开放。
+    MetadataOnly,
+    /// 没有观察到正文可用性。
+    Unknown,
+}
+
+impl PeriodicalArticleAvailability {
+    /// 只有观察到全文才允许被当作可读正文。
+    pub fn is_readable(self) -> bool {
+        matches!(self, Self::FullText)
+    }
+
+    /// 持久化与 Wire 共用的字面量（闭合枚举的三个取值）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FullText => "full_text",
+            Self::MetadataOnly => "metadata_only",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// 严格解析：闭合枚举之外的文本没有对应观察值。
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "full_text" => Some(Self::FullText),
+            "metadata_only" => Some(Self::MetadataOnly),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
+
 /// 文章在来源侧的 opaque 身份（例如 `europepmc` + `PMC1234567`）。
 ///
 /// 这不是 Haven ID，也不包含 URL、Cookie 或请求细节；它只用于导入幂等。
@@ -545,11 +592,19 @@ pub struct PeriodicalArticle {
     pub doi: Option<Doi>,
     pub page_range: Option<PageRange>,
     pub source: PeriodicalArticleSourceIdentity,
+    /// Provider 对正文可用性的观察。导入后必须原样保留，否则 UI 只能看到
+    /// 笼统的「不可阅读」，无法区分「来源只有元数据」与「没有观察到」。
+    pub provider_content_availability: PeriodicalArticleAvailability,
     pub created_at: UtcMillis,
     pub updated_at: UtcMillis,
 }
 
 impl PeriodicalArticle {
+    /// 只有 Provider 观察到全文时，本篇文章才允许建立可读正文资源。
+    pub fn is_readable(&self) -> bool {
+        self.provider_content_availability.is_readable()
+    }
+
     pub fn validate(&self) -> Result<(), AppError> {
         if identity_text(&self.title).is_none() {
             return Err(invalid_periodical_identity("文章标题非法"));
@@ -680,6 +735,7 @@ mod tests {
             doi: Doi::parse("10.1038/s41467-024-00001-2"),
             page_range: PageRange::new("e12345", None),
             source: PeriodicalArticleSourceIdentity::new("europepmc", "PMC1234567").unwrap(),
+            provider_content_availability: PeriodicalArticleAvailability::FullText,
             created_at: now(),
             updated_at: now(),
         }
@@ -899,6 +955,57 @@ mod tests {
         assert!(
             article.validate().is_err(),
             "反序列化或外部构造的非法页码也必须拒绝"
+        );
+    }
+
+    /// Provider 的正文观察是闭合三态，且只有 `FullText` 允许被当作可读正文。
+    #[test]
+    fn article_content_availability_is_a_closed_three_state_observation() {
+        assert!(PeriodicalArticleAvailability::FullText.is_readable());
+        // 「只有元数据」与「没有观察到」都不是可读结论，不能被当成可读。
+        assert!(!PeriodicalArticleAvailability::MetadataOnly.is_readable());
+        assert!(!PeriodicalArticleAvailability::Unknown.is_readable());
+
+        // 取值集合在序列化层面同样闭合：三态以外的文本无法往返。
+        for (availability, text) in [
+            (PeriodicalArticleAvailability::FullText, "full_text"),
+            (PeriodicalArticleAvailability::MetadataOnly, "metadata_only"),
+            (PeriodicalArticleAvailability::Unknown, "unknown"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&availability).unwrap(),
+                format!("\"{text}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<PeriodicalArticleAvailability>(&format!("\"{text}\""))
+                    .unwrap(),
+                availability
+            );
+        }
+        assert!(
+            serde_json::from_str::<PeriodicalArticleAvailability>("\"readable\"").is_err(),
+            "闭合枚举不得接受未定义的可用性取值"
+        );
+    }
+
+    /// 文章把 Provider 的正文观察作为自己的持久化事实携带，而不是导入后丢弃。
+    #[test]
+    fn article_carries_the_provider_content_availability_observation() {
+        let article = PeriodicalArticle {
+            provider_content_availability: PeriodicalArticleAvailability::MetadataOnly,
+            ..article(PeriodicalIssueId::new())
+        };
+        article.validate().unwrap();
+        assert_eq!(
+            article.provider_content_availability,
+            PeriodicalArticleAvailability::MetadataOnly
+        );
+
+        let json = serde_json::to_value(&article).unwrap();
+        assert_eq!(
+            json["provider_content_availability"],
+            serde_json::json!("metadata_only"),
+            "文章必须显式序列化 Provider 的正文观察"
         );
     }
 

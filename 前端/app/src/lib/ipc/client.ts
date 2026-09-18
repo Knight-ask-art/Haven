@@ -100,6 +100,20 @@ import type {
   VideoScreenshotBeginResultDto,
   VideoScreenshotChunkRequest,
   VideoScreenshotResultDto,
+  PeriodicalTreeGetRequest,
+  PeriodicalTreeDto,
+  AgentCapabilityManifestDto,
+  AgentSettingChangeReceiptDto,
+  AgentSettingChangeReceiptGetRequest,
+  AgentSettingsContextDto,
+  AgentSettingsProposalApproveRequest,
+  AgentSettingsProposalApproveResultDto,
+  AgentSettingsProposalCreateRequest,
+  AgentSettingsProposalDto,
+  AgentSettingsProposalGetRequest,
+  AgentSettingsProposalGetResultDto,
+  AgentSettingsProposalRejectRequest,
+  AgentSettingsProposalRejectResultDto,
 } from "./generated/wire";
 import type { EditionListByWorkRequest, EditionListByWorkResultDto } from "../../features/media/ipc/edition-wire";
 import type {
@@ -258,4 +272,46 @@ export interface HavenClient {
   castPlay(request: import("./generated/wire").CastPlayRequest): Promise<import("./generated/wire").CastPlayResult>;
   castStatus(request: import("./generated/wire").CastStatusRequest): Promise<import("./generated/wire").CastStatusDto>;
   castStop(request: import("./generated/wire").CastStopRequest): Promise<import("./generated/wire").CastStopResult>;
+  // ---- V1.0.0 报刊产品化 ----
+  /**
+   * 按 Work 身份读取「期刊 → 卷 → 期 → 文章」层级。响应只含本地身份与展示事实，
+   * 不含正文 URL、Cookie、请求头、本地路径或签名资源地址。
+   */
+  periodicalTreeGet(request: PeriodicalTreeGetRequest): Promise<PeriodicalTreeDto>;
+  // ---- A1 智能配置推荐（Agent 全局设置 Typed IPC） ----
+  /**
+   * 服务端固定的 Agent 能力清单（只含本切片已实现能力，不接受任何入参）。
+   */
+  agentCapabilityManifestGet(): Promise<AgentCapabilityManifestDto>;
+  /**
+   * 读取全局阅读设置上下文：脱敏快照 + revision + context id/hash + 能力清单。
+   * 返回里没有 secret、绝对路径、正文或任意 JSON。
+   */
+  agentSettingsContextGet(): Promise<AgentSettingsContextDto>;
+  /**
+   * 创建设置提案（只创建，不写设置）。必须回传最近一次读取得到的
+   * contextId / contextHash / baseRevision。
+   */
+  agentSettingsProposalCreate(
+    request: AgentSettingsProposalCreateRequest,
+  ): Promise<AgentSettingsProposalDto>;
+  /** 回读提案与（可能存在的）回执。 */
+  agentSettingsProposalGet(
+    request: AgentSettingsProposalGetRequest,
+  ): Promise<AgentSettingsProposalGetResultDto>;
+  /** 拒绝提案（零设置写入）。 */
+  agentSettingsProposalReject(
+    request: AgentSettingsProposalRejectRequest,
+  ): Promise<AgentSettingsProposalRejectResultDto>;
+  /**
+   * 用户批准：唯一写入口。只提交提案 ID 与 UI 显示的那份 canonical digest；
+   * 一次性审批令牌由 Rust 内部生成并消费，不出现在请求或响应里。
+   */
+  agentSettingsProposalApprove(
+    request: AgentSettingsProposalApproveRequest,
+  ): Promise<AgentSettingsProposalApproveResultDto>;
+  /** 读取变更回执（未应用返回 null）。 */
+  agentSettingChangeReceiptGet(
+    request: AgentSettingChangeReceiptGetRequest,
+  ): Promise<AgentSettingChangeReceiptDto | null>;
 }

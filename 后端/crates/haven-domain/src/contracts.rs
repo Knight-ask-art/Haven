@@ -8,6 +8,7 @@ use async_trait::async_trait;
 
 use haven_common::{AppError, ErrorKind};
 
+use crate::agent::AgentActionBinding;
 use crate::comic_catalog::{ComicCatalogRefreshReceipt, ComicChapterCatalogState};
 use crate::comic_identity::{
     ChapterSourceIdentity, ChapterSourceRef, ComicPageIdentitySnapshot,
@@ -20,6 +21,7 @@ use crate::ids::*;
 use crate::periodical::{
     Issn, Periodical, PeriodicalArticle, PeriodicalIssue, PeriodicalPlacement, PeriodicalVolume,
 };
+use crate::setting_proposal::{SettingChangeReceipt, SettingProposal};
 use crate::settings::PreferenceData;
 
 /// Work 列表排序（domain 概念；wire `LibraryListSort` 由 mapper 转换）。
@@ -619,6 +621,9 @@ pub struct EditionPreference {
     pub updated_at: haven_common::UtcMillis,
 }
 
+/// 媒体条目级资源内设。`edition_id` 是**行内记载的归属版本**：读取时必须原样返回，
+/// 不得按调用方上下文改写。提案应用路径会把它与 target 的 edition 交叉校验，不一致
+/// 即稳定的完整性错误（而不是"顺手改成目标版本"——那会把一条错行静默洗白）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaItemPreference {
     pub media_item_id: MediaItemId,
@@ -650,6 +655,48 @@ pub trait ResourcePreferenceRepository: Send + Sync {
         preference: &MediaItemPreference,
         expected_revision: Option<&str>,
     ) -> Result<bool, AppError>;
+}
+
+/// 设置变更提案持久化契约（V02-SETTING-PROPOSAL-001）。
+///
+/// 只覆盖"提案本身"的存取：创建、读取与回执查询。
+/// **应用（apply）刻意不在这里**：真正生效必须走 Application 层的显式
+/// `apply_confirmed` 事务路径（重读提案 → 完整性校验 → 条件 CAS → 回执 +
+/// 状态迁移必须同一事务），Repository 不提供任何状态迁移或"直接执行"方法。
+#[async_trait]
+pub trait SettingProposalRepository: Send + Sync {
+    /// 保存新提案（status 必须为 `pending`；id 冲突是错误，不做覆盖）。
+    async fn create(&self, proposal: &SettingProposal) -> Result<(), AppError>;
+    /// 读取并对存储行做完整性校验：canonical JSON 与 digest 必须自洽、
+    /// 载荷版本受支持、target/operation 结构匹配、冗余 target 列与载荷一致。
+    async fn get(&self, id: SettingProposalId) -> Result<Option<SettingProposal>, AppError>;
+    /// 读取变更回执（提案未应用返回 `None`）。
+    ///
+    /// 返回的回执必须是**自洽的审计事实**：`proposal_digest` 是 64 位 ASCII 小写
+    /// 十六进制、`before`/`after` 落在 target 对应的类型上且是 canonical 形式、
+    /// `changed` 与 `applied_revision` 互相印证。读取端不得只信列值就返回——
+    /// 无法校验或与父提案不一致的行是完整性错误，不是 `None`。
+    /// 反过来，`None` 的含义被钉死为"**确实没有应用过**"：提案处于 `applied`
+    /// 却读不出回执是存储被改写，必须报完整性错误——把它报成 `None` 会让审计/UI
+    /// 与 `apply_confirmed` 对同一状态给出相反结论。
+    async fn get_receipt(
+        &self,
+        id: SettingProposalId,
+    ) -> Result<Option<SettingChangeReceipt>, AppError>;
+}
+
+/// Agent 动作绑定的只读契约。
+///
+/// 创建、Approval Token 摘要的签发/消费与状态迁移由 SettingProposal 的同一 UoW
+/// 事务负责；原始 token 不经过 Repository，也不作为可序列化领域事实保存。这个
+/// Repository 只用于 Agent 动作恢复/执行前读取并校验绑定事实，不提供任何直接写设置
+/// 或绕过审批链的状态修改方法。
+#[async_trait]
+pub trait AgentActionBindingRepository: Send + Sync {
+    async fn get(
+        &self,
+        proposal_id: SettingProposalId,
+    ) -> Result<Option<AgentActionBinding>, AppError>;
 }
 
 /// 受控图片代理映射（契约 §36 C1：外部海报 URL 不进 IPC）。

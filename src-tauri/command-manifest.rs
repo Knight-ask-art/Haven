@@ -108,6 +108,41 @@ define_commands!(
         "allow-storage-location-remove",
         commands::storage_location::storage_location_remove
     ),
+    (
+        "agent_capability_manifest_get",
+        "allow-agent-capability-manifest-get",
+        commands::agent::agent_capability_manifest_get
+    ),
+    (
+        "agent_settings_context_get",
+        "allow-agent-settings-context-get",
+        commands::agent::agent_settings_context_get
+    ),
+    (
+        "agent_settings_proposal_create",
+        "allow-agent-settings-proposal-create",
+        commands::agent::agent_settings_proposal_create
+    ),
+    (
+        "agent_settings_proposal_get",
+        "allow-agent-settings-proposal-get",
+        commands::agent::agent_settings_proposal_get
+    ),
+    (
+        "agent_settings_proposal_reject",
+        "allow-agent-settings-proposal-reject",
+        commands::agent::agent_settings_proposal_reject
+    ),
+    (
+        "agent_settings_proposal_approve",
+        "allow-agent-settings-proposal-approve",
+        commands::agent::agent_settings_proposal_approve
+    ),
+    (
+        "agent_setting_change_receipt_get",
+        "allow-agent-setting-change-receipt-get",
+        commands::agent::agent_setting_change_receipt_get
+    ),
     ("settings_get", "allow-settings-get", commands::settings::settings_get),
     (
         "settings_update",
@@ -440,5 +475,10 @@ define_commands!(
         "video_screenshot_cancel",
         "allow-video-screenshot-cancel",
         commands::video_screenshot::video_screenshot_cancel
+    ),
+    (
+        "periodical_tree_get",
+        "allow-periodical-tree-get",
+        commands::periodical::periodical_tree_get
     )
 );

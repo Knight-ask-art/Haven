@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-agent-settings-proposal-get"
+description = "Enables the agent_settings_proposal_get command without any pre-configured scope."
+commands.allow = ["agent_settings_proposal_get"]
+
+[[permission]]
+identifier = "deny-agent-settings-proposal-get"
+description = "Denies the agent_settings_proposal_get command without any pre-configured scope."
+commands.deny = ["agent_settings_proposal_get"]

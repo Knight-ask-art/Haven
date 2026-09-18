@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
-import { MemoryRouter, Route, Routes, useNavigate } from "react-router"
+import { MemoryRouter, Route, Routes, useNavigate, useParams } from "react-router"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { ComicWorkChapterCatalogDto } from "@/lib/ipc/generated/wire"
 import type { EditionListItem } from "../lib/edition-mapper"
@@ -91,6 +91,23 @@ function renderPageWithReader(initial = "/work/A") {
   )
 }
 
+/** 额外挂上期刊层级路由，用于断言入口是否真的发生导航以及带了什么身份。 */
+function renderPageWithPeriodicalTree(initial = "/work/periodical") {
+  return render(
+    <MemoryRouter initialEntries={[initial]}>
+      <Routes>
+        <Route path="/work/:workId" element={<MediaDetailPage />} />
+        <Route path="/periodical/:workId" element={<PeriodicalTreeMarker />} />
+      </Routes>
+    </MemoryRouter>
+  )
+}
+
+function PeriodicalTreeMarker() {
+  const { workId } = useParams<{ workId?: string }>()
+  return <div data-testid="periodical-tree">{workId}</div>
+}
+
 async function openMore() {
   fireEvent.click(await screen.findByTitle("更多"))
 }
@@ -133,6 +150,22 @@ describe("MediaDetailPage download lifecycle", () => {
 
     expect(await screen.findByText("报刊资料")).toBeTruthy()
     expect(screen.getByRole("button", { name: "往期刊物与分册" })).toBeTruthy()
+  })
+
+  it("opens the periodical hierarchy browser with the authoritative work identity", async () => {
+    renderPageWithPeriodicalTree("/work/periodical")
+
+    fireEvent.click(await screen.findByTestId("periodical-tree-entry"))
+
+    // 入口只传本地 Work 身份，不夹带来源、Provider 或任何正文地址。
+    expect((await screen.findByTestId("periodical-tree")).textContent).toBe("periodical")
+  })
+
+  it("does not offer the periodical hierarchy entry for other media", async () => {
+    renderPage("/work/A")
+
+    expect(await screen.findByText("作品 A")).toBeTruthy()
+    expect(screen.queryByTestId("periodical-tree-entry")).toBeNull()
   })
 
   it("refreshes the full download projection when creation returns completed", async () => {

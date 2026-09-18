@@ -177,6 +177,48 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Enables the agent_capability_manifest_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-agent-capability-manifest-get",
+          "markdownDescription": "Enables the agent_capability_manifest_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the agent_setting_change_receipt_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-agent-setting-change-receipt-get",
+          "markdownDescription": "Enables the agent_setting_change_receipt_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the agent_settings_context_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-agent-settings-context-get",
+          "markdownDescription": "Enables the agent_settings_context_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the agent_settings_proposal_approve command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-agent-settings-proposal-approve",
+          "markdownDescription": "Enables the agent_settings_proposal_approve command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the agent_settings_proposal_create command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-agent-settings-proposal-create",
+          "markdownDescription": "Enables the agent_settings_proposal_create command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the agent_settings_proposal_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-agent-settings-proposal-get",
+          "markdownDescription": "Enables the agent_settings_proposal_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the agent_settings_proposal_reject command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-agent-settings-proposal-reject",
+          "markdownDescription": "Enables the agent_settings_proposal_reject command without any pre-configured scope."
+        },
+        {
           "description": "Enables the app_info_get command without any pre-configured scope.",
           "type": "string",
           "const": "allow-app-info-get",
@@ -477,6 +519,12 @@
           "markdownDescription": "Enables the open_logs_directory command without any pre-configured scope."
         },
         {
+          "description": "Enables the periodical_tree_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-periodical-tree-get",
+          "markdownDescription": "Enables the periodical_tree_get command without any pre-configured scope."
+        },
+        {
           "description": "Enables the preference_get command without any pre-configured scope.",
           "type": "string",
           "const": "allow-preference-get",
@@ -751,6 +799,48 @@
           "type": "string",
           "const": "allow-work-get",
           "markdownDescription": "Enables the work_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the agent_capability_manifest_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-agent-capability-manifest-get",
+          "markdownDescription": "Denies the agent_capability_manifest_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the agent_setting_change_receipt_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-agent-setting-change-receipt-get",
+          "markdownDescription": "Denies the agent_setting_change_receipt_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the agent_settings_context_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-agent-settings-context-get",
+          "markdownDescription": "Denies the agent_settings_context_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the agent_settings_proposal_approve command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-agent-settings-proposal-approve",
+          "markdownDescription": "Denies the agent_settings_proposal_approve command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the agent_settings_proposal_create command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-agent-settings-proposal-create",
+          "markdownDescription": "Denies the agent_settings_proposal_create command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the agent_settings_proposal_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-agent-settings-proposal-get",
+          "markdownDescription": "Denies the agent_settings_proposal_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the agent_settings_proposal_reject command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-agent-settings-proposal-reject",
+          "markdownDescription": "Denies the agent_settings_proposal_reject command without any pre-configured scope."
         },
         {
           "description": "Denies the app_info_get command without any pre-configured scope.",
@@ -1051,6 +1141,12 @@
           "type": "string",
           "const": "deny-open-logs-directory",
           "markdownDescription": "Denies the open_logs_directory command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the periodical_tree_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-periodical-tree-get",
+          "markdownDescription": "Denies the periodical_tree_get command without any pre-configured scope."
         },
         {
           "description": "Denies the preference_get command without any pre-configured scope.",

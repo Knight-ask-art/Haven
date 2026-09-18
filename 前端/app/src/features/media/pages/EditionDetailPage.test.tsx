@@ -183,4 +183,41 @@ describe("EditionDetailPage reading actions", () => {
     fireEvent.click(screen.getByRole("button", { name: "打开" }))
     expect(await screen.findByText("article route")).toBeTruthy()
   })
+
+  it("marks only the row missing from the batch projection as a retryable failure", async () => {
+    // 批量投影里少了 media-broken：这一篇这次没读到能力事实。它必须落成可重试的失败，
+    // 而不是永远停在 loading（读不出事实）或「当前内容暂不可用」（把缺失当结论）。
+    const broken = item({
+      mediaItemId: "media-broken",
+      title: "读取失败的资料",
+      indexLabel: "第 1 项",
+      primaryAction: action("reader", "media-broken"),
+    })
+    const readable = item({
+      mediaItemId: "media-readable",
+      title: "在线资料",
+      indexLabel: "第 2 项",
+      primaryAction: action("reader", "media-readable"),
+    })
+    editionGateway.getEdition.mockResolvedValue(detail([broken, readable]))
+    downloadGateway.getMediaItemsDownloadInfo.mockResolvedValue(new Map([
+      ["media-readable", capability({ canOnlineRead: true })],
+    ]))
+    downloadGateway.getMediaItemDownloadInfo.mockResolvedValue(capability({ canOnlineRead: true }))
+
+    renderPage()
+
+    expect(await screen.findByText("第 1 项 · 12 页 · 能力读取失败")).toBeTruthy()
+    // 成功项保留真实能力：一项失败不牵连整批，也不影响这一项原本的可读路径。
+    expect(screen.getByText("第 2 项 · 12 页 · 可在线阅读")).toBeTruthy()
+    // 失败项不是「正在读取」，也不会被写成明确不可用。
+    expect(screen.queryByText(/正在读取能力/)).toBeNull()
+    expect(screen.queryByText("当前内容暂不可用")).toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: "重试" }))
+    await waitFor(() => expect(downloadGateway.getMediaItemDownloadInfo).toHaveBeenCalledWith("media-broken"))
+    // 单篇重查拿到真实能力后，这一行回到可打开状态。
+    expect(await screen.findByText("第 1 项 · 12 页 · 可在线阅读")).toBeTruthy()
+    expect(screen.getAllByRole("button", { name: "打开" })).toHaveLength(2)
+  })
 })

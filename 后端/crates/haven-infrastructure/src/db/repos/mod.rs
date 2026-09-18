@@ -5,6 +5,7 @@
 //! - 当前查询均为短事务级操作；Tauri 接线后重查询由外层 `spawn_blocking` 承接。
 //! - Locator 序列化走 `Locator` 自身的 version + kind + data envelope（未知版本拒绝）。
 
+pub mod agent_bindings;
 pub mod comic_catalog_refresh_outcomes;
 pub mod comic_identity;
 pub mod comic_progress_migrations;
@@ -24,6 +25,7 @@ pub mod progress;
 pub mod resource;
 pub mod resource_preferences;
 pub mod search_history;
+pub mod setting_proposals;
 pub mod settings;
 pub mod storage_location;
 pub mod trending_cache;
@@ -34,6 +36,7 @@ use haven_common::AppError;
 use haven_domain::entities::ArtworkSet;
 use haven_domain::locator::Locator;
 
+pub use agent_bindings::SqliteAgentActionBindingRepository;
 pub use comic_catalog_refresh_outcomes::SqliteComicCatalogRefreshOutcomeRepository;
 pub use comic_identity::{SqliteChapterSourceRepository, SqliteComicPageIdentityRepository};
 pub use comic_progress_migrations::SqliteComicProgressMigrationRepository;
@@ -52,6 +55,7 @@ pub use progress::SqliteProgressRepository;
 pub use resource::SqliteResourceRepository;
 pub use resource_preferences::SqliteResourcePreferenceRepository;
 pub use search_history::SqliteSearchHistoryRepository;
+pub use setting_proposals::{SqliteSettingProposalRepository, SqliteSettingProposalUow};
 pub use settings::{SqliteSettingsRepository, SqliteSettingsUoW};
 pub use storage_location::SqliteStorageLocationRepository;
 pub use trending_cache::SqliteTrendingCacheRepository;
@@ -85,6 +89,8 @@ pub struct SqliteRepositories {
     pub progress_subjects: SqliteComicProgressSubjectRepository,
     pub catalog_refresh_outcomes: SqliteComicCatalogRefreshOutcomeRepository,
     pub periodical: SqlitePeriodicalRepository,
+    pub setting_proposals: SqliteSettingProposalRepository,
+    pub agent_bindings: SqliteAgentActionBindingRepository,
 }
 
 impl SqliteRepositories {
@@ -114,7 +120,9 @@ impl SqliteRepositories {
             progress_migration: SqliteComicProgressMigrationRepository::new(db.clone()),
             progress_subjects: SqliteComicProgressSubjectRepository::new(db.clone()),
             catalog_refresh_outcomes: SqliteComicCatalogRefreshOutcomeRepository::new(db.clone()),
-            periodical: SqlitePeriodicalRepository::new(db),
+            periodical: SqlitePeriodicalRepository::new(db.clone()),
+            setting_proposals: SqliteSettingProposalRepository::new(db.clone()),
+            agent_bindings: SqliteAgentActionBindingRepository::new(db),
         }
     }
 }
@@ -1196,5 +1204,41 @@ impl haven_domain::contracts::PeriodicalRepository for SqliteRepositories {
         article: &haven_domain::periodical::PeriodicalArticle,
     ) -> Result<(), haven_common::AppError> {
         self.periodical.save_article(article).await
+    }
+}
+
+#[async_trait::async_trait]
+impl haven_domain::contracts::SettingProposalRepository for SqliteRepositories {
+    async fn create(
+        &self,
+        proposal: &haven_domain::setting_proposal::SettingProposal,
+    ) -> Result<(), haven_common::AppError> {
+        self.setting_proposals.create(proposal).await
+    }
+
+    async fn get(
+        &self,
+        id: haven_domain::ids::SettingProposalId,
+    ) -> Result<Option<haven_domain::setting_proposal::SettingProposal>, haven_common::AppError>
+    {
+        self.setting_proposals.get(id).await
+    }
+
+    async fn get_receipt(
+        &self,
+        id: haven_domain::ids::SettingProposalId,
+    ) -> Result<Option<haven_domain::setting_proposal::SettingChangeReceipt>, haven_common::AppError>
+    {
+        self.setting_proposals.get_receipt(id).await
+    }
+}
+
+#[async_trait::async_trait]
+impl haven_domain::contracts::AgentActionBindingRepository for SqliteRepositories {
+    async fn get(
+        &self,
+        proposal_id: haven_domain::ids::SettingProposalId,
+    ) -> Result<Option<haven_domain::agent::AgentActionBinding>, haven_common::AppError> {
+        self.agent_bindings.get(proposal_id).await
     }
 }

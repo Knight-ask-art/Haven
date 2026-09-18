@@ -1618,51 +1618,80 @@ struct EuropeDocument {
     paragraphs: Vec<String>,
 }
 
+/// 轻量正文提取器捕获的元素种类。
+#[derive(Clone, Copy)]
+enum EuropeCapture {
+    Title,
+    Paragraph,
+}
+
+/// JATS 路径闭合：文章标题只接受 `article-meta` 之内的 `article-title`，正文段落只
+/// 接受 `body` 之内的 `p`。
+///
+/// `<back><ref-list>` 里的同名元素属于参考文献条目，既不能覆盖真正 article-meta
+/// 标题，也不能混进正文；`article-meta` 内的 `<abstract>` 段落同样不是正文。该判定
+/// 与 `periodical::is_body_paragraph` 等严格校验路径保持一致。
+fn europe_capture_kind(path: &[String], name: &str) -> Option<EuropeCapture> {
+    match name {
+        "article-title" if path.iter().any(|ancestor| ancestor == "article-meta") => {
+            Some(EuropeCapture::Title)
+        }
+        "p" if path.iter().any(|ancestor| ancestor == "body") => Some(EuropeCapture::Paragraph),
+        _ => None,
+    }
+}
+
 fn parse_europe_pmc(xml: &str) -> EuropeDocument {
     let mut reader = quick_xml::Reader::from_str(xml);
     let mut document = EuropeDocument::default();
-    let mut current: Option<String> = None;
+    let mut path: Vec<String> = Vec::new();
     let mut buffer = String::new();
+    // 捕获元素的同时记录它在 `path` 中的深度：内联 XML（如 `<italic>`）和更深的嵌套
+    // 元素都只是把文本追加进同一个缓冲区，不会提前结束捕获。
+    let mut capture: Option<(EuropeCapture, usize)> = None;
     loop {
         match reader.read_event() {
             Ok(Event::Start(event)) => {
                 let name = local_name(event.name().as_ref());
-                if name == "article-title" {
-                    current = Some("title".to_owned());
-                    buffer.clear();
-                } else if name == "p" {
-                    current = Some("paragraph".to_owned());
+                if capture.is_none()
+                    && let Some(kind) = europe_capture_kind(&path, &name)
+                {
+                    capture = Some((kind, path.len() + 1));
                     buffer.clear();
                 }
+                path.push(name);
             }
             Ok(Event::Text(text)) => {
-                if current.is_some() {
+                if capture.is_some() {
                     let value = text.unescape().map(|v| v.into_owned()).unwrap_or_default();
                     buffer.push_str(&value);
                     buffer.push(' ');
                 }
             }
             Ok(Event::CData(text)) => {
-                if current.is_some() {
+                if capture.is_some() {
                     buffer.push_str(&String::from_utf8_lossy(text.as_ref()));
                     buffer.push(' ');
                 }
             }
             Ok(Event::End(event)) => {
                 let name = local_name(event.name().as_ref());
-                if (name == "article-title" && current.as_deref() == Some("title"))
-                    || (name == "p" && current.as_deref() == Some("paragraph"))
+                if let Some((kind, depth)) = capture
+                    && depth == path.len()
+                    && path.last().is_some_and(|last| *last == name)
                 {
                     let value = clean_text(&buffer);
                     if !value.is_empty() {
-                        if name == "article-title" {
-                            document.title = value;
-                        } else {
-                            document.paragraphs.push(value);
+                        match kind {
+                            EuropeCapture::Title => document.title = value,
+                            EuropeCapture::Paragraph => document.paragraphs.push(value),
                         }
                     }
-                    current = None;
+                    capture = None;
                     buffer.clear();
+                }
+                if path.last().is_some_and(|last| *last == name) {
+                    path.pop();
                 }
             }
             Ok(Event::Eof) | Err(_) => break,
@@ -1976,10 +2005,71 @@ mod tests {
     #[test]
     fn parses_europe_pmc_title_and_paragraphs() {
         let document = parse_europe_pmc(
-            "<article><front><article-title>A title</article-title></front><body><p>First <italic>paragraph</italic>.</p><p>Second.</p></body></article>",
+            "<article><front><article-meta><title-group><article-title>A title</article-title></title-group></article-meta></front><body><p>First <italic>paragraph</italic>.</p><p>Second.</p></body></article>",
         );
         assert_eq!(document.title, "A title");
         assert_eq!(document.paragraphs, vec!["First paragraph .", "Second."]);
+    }
+
+    #[test]
+    fn europe_pmc_extraction_ignores_reference_title_and_paragraphs() {
+        // 旧实现按标签名全局收集，back/ref-list 中的 article-title 会覆盖真正的
+        // article-meta 标题，参考文献段落也会混进正文。
+        let xml = r#"<article>
+            <front><article-meta>
+              <article-id pub-id-type="pmc">PMC1</article-id>
+              <title-group><article-title>Real article title</article-title></title-group>
+            </article-meta></front>
+            <body><p>Real body <italic>paragraph</italic>.</p></body>
+            <back><ref-list><ref>
+              <mixed-citation><article-title>Cited reference title</article-title></mixed-citation>
+              <p>Cited reference paragraph.</p>
+            </ref></ref-list></back>
+          </article>"#;
+        let document = parse_europe_pmc(xml);
+        assert_eq!(document.title, "Real article title");
+        assert_eq!(document.paragraphs, vec!["Real body paragraph ."]);
+    }
+
+    #[test]
+    fn europe_pmc_extraction_requires_jats_path_closure() {
+        let xml = r#"<article>
+            <front>
+              <article-title>Front title outside article-meta</article-title>
+              <article-meta>
+                <title-group><article-title>Metadata title</article-title></title-group>
+                <abstract><p>Abstract paragraph.</p></abstract>
+              </article-meta>
+            </front>
+            <body>
+              <sec><title>Section heading</title><p>Body paragraph.</p></sec>
+              <p><![CDATA[CDATA body paragraph.]]></p>
+            </body>
+            <back><ref-list><ref><mixed-citation><p>Back paragraph.</p></mixed-citation></ref></ref-list></back>
+          </article>"#;
+        let document = parse_europe_pmc(xml);
+        assert_eq!(document.title, "Metadata title");
+        assert_eq!(
+            document.paragraphs,
+            vec!["Body paragraph.", "CDATA body paragraph."]
+        );
+    }
+
+    #[test]
+    fn europe_pmc_extraction_leaves_unclosed_paragraph_to_strict_validation() {
+        // 解析结构错误仍由 `validate_europe_pmc_full_text` 的严格路径负责；宽松提取器
+        // 只保证不把未闭合的残片当成正文。
+        let unclosed = parse_europe_pmc(
+            "<article><front><article-meta><title-group><article-title>Title</article-title></title-group></article-meta></front><body><p>Unclosed",
+        );
+        assert_eq!(unclosed.title, "Title");
+        assert!(unclosed.paragraphs.is_empty());
+
+        let mismatched = parse_europe_pmc(
+            "<article><front><article-meta><title-group><article-title>Title</article-title></title-group></article-meta></front><body><p>Mismatched</div></body></article>",
+        );
+        assert_eq!(mismatched.title, "Title");
+        assert!(mismatched.paragraphs.is_empty());
     }
 
     #[test]

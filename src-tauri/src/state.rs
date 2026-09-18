@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use tauri::Emitter;
 
+use haven_application::services::agent::{AgentProposalService, RepositoryAgentSubjectScope};
+use haven_application::services::agent_settings_ipc::AgentSettingsIpcService;
 use haven_application::services::cache::CacheService;
 use haven_application::services::cast::{CastGrantRegistry, CastService};
 use haven_application::services::comic::ComicPageService;
@@ -26,6 +28,7 @@ use haven_application::services::history::HistoryService;
 use haven_application::services::home::HomeService;
 use haven_application::services::library::LibraryService;
 use haven_application::services::marker::MarkerService;
+use haven_application::services::periodical_query::PeriodicalQueryService;
 use haven_application::services::ports::{
     ComicCatalogRefreshReceiptPort, ComicCatalogWorkPorts, SourceImportPorts, SourceRegistryPorts,
 };
@@ -40,6 +43,7 @@ use haven_application::services::search_history::SearchHistoryService;
 use haven_application::services::search_source::SearchSourceParticipant;
 use haven_application::services::search_source::SearchSourceService;
 use haven_application::services::session::SessionService;
+use haven_application::services::setting_proposals::SettingProposalService;
 use haven_application::services::settings::SettingsService;
 use haven_application::services::source_import::SourceImportService;
 use haven_application::services::source_registry::SourceRegistryService;
@@ -55,7 +59,9 @@ use haven_infrastructure::artwork_cache::ArtworkCache;
 use haven_infrastructure::cast::{AxumCastMediaServer, SoapCastControl, SsdpMdnsDiscovery};
 use haven_infrastructure::cms10::{Cms10CatalogProvider, Cms10Client, Cms10SearchParticipant};
 use haven_infrastructure::comic::LocalComicPageProvider;
-use haven_infrastructure::db::repos::{SqliteRepositories, SqliteSettingsUoW};
+use haven_infrastructure::db::repos::{
+    SqliteRepositories, SqliteSettingProposalUow, SqliteSettingsUoW,
+};
 use haven_infrastructure::db::uow::{SqliteStorageUoW, SqliteUnitOfWork};
 use haven_infrastructure::download::{LocalDownloadRunner, LocalOfflineResourceFiles};
 use haven_infrastructure::epub::LocalEpubTocProvider;
@@ -113,6 +119,11 @@ pub struct AppState {
     pub search_sink: Arc<TauriSearchEventSink>,
     /// 来源候选入库（V2-B 实战批次）。
     pub source_import: SourceImportService,
+    /// 报刊层级只读查询（期刊 → 卷 → 期 → 文章）。
+    ///
+    /// 只持有 PeriodicalRepository：查询路径不碰网络 Provider，也不写存储；
+    /// 与 source_import 的报刊导入路径共用同一份持久化契约（不建立第二套数据源）。
+    pub periodical: PeriodicalQueryService,
     /// 元数据自动流水线（契约 §36.8；V2-F 批次）。
     pub enrichment: EnrichmentService,
     /// `metadata.changed` 事件出口（流水线状态变更广播）。
@@ -141,6 +152,10 @@ pub struct AppState {
     pub reader_search_sink: Arc<TauriReaderSearchEventSink>,
     /// 当前窗口的有界视频截图上传与保存服务。
     pub video_screenshot: VideoScreenshotService,
+    /// 设置变更提案的创建/读取/拒绝/显式确认应用（与设置 Agent 共用同一 UoW）。
+    pub setting_proposals: SettingProposalService,
+    /// 全局设置 Agent 的 Typed Application 入口（读取/提案/批准/回执）。
+    pub agent_settings: AgentSettingsIpcService,
 }
 
 impl AppState {
@@ -154,6 +169,28 @@ impl AppState {
         let repos = Arc::new(SqliteRepositories::new(db.clone()));
         repos.download.recover_interrupted()?;
         let settings = SettingsService::new(Arc::new(SqliteSettingsUoW::new(db.clone())));
+        // Agent 设置切片：提案服务与批准入口共用 AppState 的同一份 Settings /
+        // SettingProposal UoW 与 Repository，不新建第二套 DB 句柄。
+        let setting_proposals = SettingProposalService::new(
+            repos.clone(),
+            Arc::new(SqliteSettingProposalUow::new(db.clone())),
+        );
+        let agent_subject_scope = Arc::new(RepositoryAgentSubjectScope::new(
+            repos.clone(),
+            repos.clone(),
+            repos.clone(),
+        ));
+        let agent_proposals = AgentProposalService::new(
+            setting_proposals.clone(),
+            agent_subject_scope,
+            repos.clone(),
+        )
+        .with_settings_service(settings.clone());
+        let agent_settings = AgentSettingsIpcService::new(
+            setting_proposals.clone(),
+            agent_proposals,
+            settings.clone(),
+        );
         let resource_preferences = ResourcePreferenceService::new(
             repos.clone(),
             repos.clone(),
@@ -210,6 +247,8 @@ impl AppState {
         );
         let periodical_repository: Arc<dyn haven_domain::contracts::PeriodicalRepository> =
             repos.clone();
+        // 只读查询服务与导入路径共用同一个 Repository 实例（同一 DB 句柄）。
+        let periodical = PeriodicalQueryService::new(periodical_repository.clone());
         let comic_pages = comic_pages.with_remote_provider(online_catalog.clone());
         let history = HistoryService::new(repos.clone(), Arc::new(settings.clone()));
         let marker = MarkerService::new(repos.clone());
@@ -491,6 +530,7 @@ impl AppState {
             search_source,
             search_sink,
             source_import,
+            periodical,
             enrichment,
             metadata_sink,
             stream,
@@ -508,6 +548,8 @@ impl AppState {
             reader_search,
             reader_search_sink,
             video_screenshot,
+            setting_proposals,
+            agent_settings,
         })
     }
 }
