@@ -189,6 +189,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "044_agent_approval_tokens",
         include_str!("../../../../migrations/044_agent_approval_tokens.sql"),
     ),
+    (
+        "045_ai_provider_profiles",
+        include_str!("../../../../migrations/045_ai_provider_profiles.sql"),
+    ),
 ];
 
 pub fn run(conn: &mut Connection) -> Result<(), AppError> {

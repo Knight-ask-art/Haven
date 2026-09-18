@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "profileId": "gw-main",
+  "state": "ready",
+  "models": [
+    {
+      "modelId": "gpt-4o-mini",
+      "displayName": "GPT-4o mini",
+      "created": 1700000000,
+      "ownedBy": "system",
+      "chat": "supported",
+      "vision": "unknown",
+      "embedding": "unknown"
+    },
+    {
+      "modelId": "text-embedding-3-small",
+      "displayName": null,
+      "created": null,
+      "ownedBy": null,
+      "chat": "unknown",
+      "vision": "unknown",
+      "embedding": "supported"
+    }
+  ]
+}

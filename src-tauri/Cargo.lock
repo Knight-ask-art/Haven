@@ -1757,16 +1757,19 @@ dependencies = [
 name = "haven-tauri"
 version = "0.1.0-beta.1"
 dependencies = [
+ "async-trait",
  "chrono",
  "haven-application",
  "haven-common",
  "haven-domain",
  "haven-infrastructure",
+ "libc",
  "reqwest 0.12.28",
  "rfd",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-updater",
@@ -1774,6 +1777,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

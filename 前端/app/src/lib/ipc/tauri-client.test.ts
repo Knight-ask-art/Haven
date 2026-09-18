@@ -281,6 +281,73 @@ describe("TauriHavenClient settings", () => {
   })
 })
 
+describe("TauriHavenClient agent broker", () => {
+  const DISABLED = {
+    schemaVersion: 1,
+    status: "disabled",
+    endpoint: null,
+    reason: null,
+  } as const
+
+  it("maps each command with no arguments at all", async () => {
+    invoke.mockResolvedValue(DISABLED)
+
+    const client = new TauriHavenClient()
+    await expect(client.agentBrokerStatus()).resolves.toEqual(DISABLED)
+    expect(invoke).toHaveBeenLastCalledWith("agent_broker_status")
+
+    await expect(client.agentBrokerEnable()).resolves.toEqual(DISABLED)
+    expect(invoke).toHaveBeenLastCalledWith("agent_broker_enable")
+
+    await expect(client.agentBrokerDisable()).resolves.toEqual(DISABLED)
+    expect(invoke).toHaveBeenLastCalledWith("agent_broker_disable")
+
+    // 端点由 Rust 按平台解析：传输层不夹带 request / endpoint 等自由参数，
+    // 也就没有人能从 WebView 指定要监听的地址。
+    expect(invoke.mock.calls.map((call) => call.length)).toEqual([1, 1, 1])
+  })
+
+  it("passes the listening endpoint through and never rewrites fail-closed states", async () => {
+    // 端点不是 secret（契约 §4.2）：它是可复制的本地配置值，原样透传。
+    const listening = {
+      schemaVersion: 1,
+      status: "listening",
+      endpoint: "\\\\.\\pipe\\haven-agent-v1-3f2a91c4",
+      reason: null,
+    } as const
+    invoke.mockResolvedValueOnce(listening)
+    const enabled = await new TauriHavenClient().agentBrokerEnable()
+    // 端点逐字透传：传输层不解析、不重写、不隐藏这一段本地地址。
+    expect(enabled).toBe(listening)
+    expect(enabled.endpoint).toBe("\\\\.\\pipe\\haven-agent-v1-3f2a91c4")
+
+    // busy / unavailable 是 Rust 的 fail-closed 结论。传输层若在此"顺手"降级成
+    // disabled，用户就看不到端点被占用这件事。
+    const busy = {
+      schemaVersion: 1,
+      status: "busy",
+      endpoint: null,
+      reason: "端点已被另一个栖阅实例占用",
+    } as const
+    invoke.mockResolvedValueOnce(busy)
+    await expect(new TauriHavenClient().agentBrokerStatus()).resolves.toBe(busy)
+  })
+
+  it("normalizes contract error dtos and unknown rejections into HavenError", async () => {
+    invoke.mockRejectedValueOnce({
+      code: "HAVEN_BROKER_ENDPOINT_BUSY",
+      userMessage: "端点已被另一个栖阅实例占用",
+      retryable: false,
+    })
+    await expect(new TauriHavenClient().agentBrokerEnable())
+      .rejects.toMatchObject({ code: "HAVEN_BROKER_ENDPOINT_BUSY", retryable: false })
+
+    invoke.mockRejectedValueOnce(new Error("ipc exploded"))
+    await expect(new TauriHavenClient().agentBrokerDisable())
+      .rejects.toMatchObject({ code: "INTERNAL_ERROR", retryable: false })
+  })
+})
+
 describe("TauriHavenClient updater", () => {
   beforeEach(() => {
     check.mockReset()
