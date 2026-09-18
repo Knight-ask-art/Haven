@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ai-provider-profile-list"
+description = "Enables the ai_provider_profile_list command without any pre-configured scope."
+commands.allow = ["ai_provider_profile_list"]
+
+[[permission]]
+identifier = "deny-ai-provider-profile-list"
+description = "Denies the ai_provider_profile_list command without any pre-configured scope."
+commands.deny = ["ai_provider_profile_list"]

@@ -38,9 +38,38 @@ haven-common = { path = "../后端/crates/haven-common" }
 haven-domain = { path = "../后端/crates/haven-domain" }
 haven-application = { path = "../后端/crates/haven-application" }
 haven-infrastructure = { path = "../后端/crates/haven-infrastructure" }
+# A5 外部 Agent Broker。三项都已在依赖树里（见 Cargo.lock），只是提升为直接依赖：
+# - tokio 用于本地端点 I/O 与任务调度（版本与 workspace 其它 crate 一致，锁 1.53.1）；
+# - async-trait 用于 BrokerAgentApi；
+# - sha2 用于由用户 SID 派生端点后缀。
+async-trait = "0.1.92"
+sha2 = "0.10.9"
+tokio = { version = "1.53.1", features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "net",
+    "io-util",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# 仅 Windows：Named Pipe 的 DACL 收紧与读回断言。版本与 lockfile 中的 0.59.0 对齐，
+# 不引入新的 windows-sys 大版本。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59.0", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }
-tokio = { version = "1.53.1", features = ["macros", "rt", "time", "sync"] }
 tempfile = "3.27.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }

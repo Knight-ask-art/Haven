@@ -11,13 +11,20 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use url::Url;
 
-/// Context-specific policy name. Both current contexts share the same safe
+/// Context-specific policy name. The current contexts share the same safe
 /// default port set; keeping the context explicit prevents a future relaxed
 /// rule from being accidentally reused by the media proxy.
+///
+/// `AiProviderEndpoint` is the user-configured AI provider root. Its rules are
+/// today identical to `SourceEndpoint` on purpose: allowing a loopback or LAN
+/// endpoint has to be a reviewed decision (see `docs/architecture/AI_SYSTEM.md`
+/// §7), not a side effect of adding the AI slice. Spelling the context out
+/// means that decision cannot be inherited silently by this caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpUrlPolicy {
     SourceEndpoint,
     MediaResource,
+    AiProviderEndpoint,
 }
 
 /// Errors are intentionally coarse so callers can map them to a safe user

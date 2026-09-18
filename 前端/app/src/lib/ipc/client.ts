@@ -102,6 +102,7 @@ import type {
   VideoScreenshotResultDto,
   PeriodicalTreeGetRequest,
   PeriodicalTreeDto,
+  AgentBrokerStatusResultDto,
   AgentCapabilityManifestDto,
   AgentSettingChangeReceiptDto,
   AgentSettingChangeReceiptGetRequest,
@@ -114,6 +115,14 @@ import type {
   AgentSettingsProposalGetResultDto,
   AgentSettingsProposalRejectRequest,
   AgentSettingsProposalRejectResultDto,
+  AiProviderModelsCatalogDto,
+  AiProviderModelsListRequest,
+  AiProviderProfileDeleteRequest,
+  AiProviderProfileDeleteResultDto,
+  AiProviderProfileDto,
+  AiProviderProfileGetRequest,
+  AiProviderProfileListResultDto,
+  AiProviderProfileUpsertRequest,
 } from "./generated/wire";
 import type { EditionListByWorkRequest, EditionListByWorkResultDto } from "../../features/media/ipc/edition-wire";
 import type {
@@ -314,4 +323,41 @@ export interface HavenClient {
   agentSettingChangeReceiptGet(
     request: AgentSettingChangeReceiptGetRequest,
   ): Promise<AgentSettingChangeReceiptDto | null>;
+  // ---- A2 AI Provider 基础切片（docs/architecture/AI_SYSTEM.md） ----
+  /**
+   * 列出全部 AI Provider Profile 与其凭据配置状态。
+   * 返回里没有 API key、credentialRef 或凭据 target 名。
+   */
+  aiProviderProfileList(): Promise<AiProviderProfileListResultDto>;
+  /** 读取单个 AI Provider Profile（不存在抛 NOT_FOUND）。 */
+  aiProviderProfileGet(request: AiProviderProfileGetRequest): Promise<AiProviderProfileDto>;
+  /**
+   * 写入 AI Provider Profile（非敏感字段）。CAS：`expectedRevision` 不对即冲突。
+   * API key 不经过这里，走 `credentialSet({ provider: "ai" })`。
+   */
+  aiProviderProfileUpsert(
+    request: AiProviderProfileUpsertRequest,
+  ): Promise<AiProviderProfileDto>;
+  /** 删除 Profile：先清理 `haven:ai:<profileId>` 凭据，再 CAS 删除行。 */
+  aiProviderProfileDelete(
+    request: AiProviderProfileDeleteRequest,
+  ): Promise<AiProviderProfileDeleteResultDto>;
+  /**
+   * 读取 Provider 的模型目录（只读、有界、非敏感投影）。
+   * 未配置密钥 / 被禁用 / 目录为空都是空目录 + 明确 state，不是错误。
+   */
+  aiProviderModelsList(request: AiProviderModelsListRequest): Promise<AiProviderModelsCatalogDto>;
+  // ---- A5 外部 Agent Broker（默认关闭；docs/architecture/MCP_EXTERNAL_AGENT_TRANSPORT.md §4.5）----
+  //
+  // 三个命令都不接受入参：端点由 Rust 按平台解析，调用方无法指定，也没有
+  // `invoke(commandName, args)` 这类自由分发入口。状态是运行时事实，不是用户授权开关。
+  /**
+   * 读取当前状态（默认 `disabled`）。**不**开启端点、不探测连接。
+   * `endpoint` 只在 `listening` 时出现；它不是秘密，是可复制的本地配置值。
+   */
+  agentBrokerStatus(): Promise<AgentBrokerStatusResultDto>;
+  /** 用户显式开启外部 Agent 接入；已开启时幂等返回同一端点。失败即 fail closed。 */
+  agentBrokerEnable(): Promise<AgentBrokerStatusResultDto>;
+  /** 用户显式关闭：停止监听、断开在途连接，返回关闭后的状态（`endpoint` 为 null）。 */
+  agentBrokerDisable(): Promise<AgentBrokerStatusResultDto>;
 }

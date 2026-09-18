@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "profiles": [
+    {
+      "schemaVersion": 1,
+      "profileId": "gw-main",
+      "displayName": "自建网关",
+      "kind": "openai_compatible",
+      "endpoint": "https://gateway.example.invalid/v1",
+      "enabled": true,
+      "selectedModelId": "gpt-4o-mini",
+      "credentialConfigured": true,
+      "revision": "0196f0d2-0000-7000-8000-000000000101",
+      "createdAt": "2026-09-18T00:00:00Z",
+      "updatedAt": "2026-09-18T00:00:00Z"
+    }
+  ]
+}

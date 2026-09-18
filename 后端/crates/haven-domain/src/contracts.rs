@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use haven_common::{AppError, ErrorKind};
 
 use crate::agent::AgentActionBinding;
+use crate::ai_provider::{AiProviderProfile, AiProviderProfileDeleteOutcome};
 use crate::comic_catalog::{ComicCatalogRefreshReceipt, ComicChapterCatalogState};
 use crate::comic_identity::{
     ChapterSourceIdentity, ChapterSourceRef, ComicPageIdentitySnapshot,
@@ -705,6 +706,42 @@ pub trait AgentActionBindingRepository: Send + Sync {
 pub trait ImageProxyRepository: Send + Sync {
     async fn register(&self, source_id: &str, target_url: &str) -> Result<String, AppError>;
     async fn resolve(&self, id: &str) -> Result<Option<String>, AppError>;
+}
+
+/// AI Provider Profile 持久化契约（`docs/architecture/AI_SYSTEM.md` §3、§4）。
+///
+/// 只承载**非敏感**配置：profile 行里没有、也不允许有 API key。凭据只存在于
+/// CredentialStore（`haven:ai:<profile_id>`），本契约不提供任何 secret 读写方法。
+///
+/// 写路径全部是 CAS：
+/// - `cas_upsert` 携带 `expected_revision`（`None` = 期望该行尚不存在），成功时返回
+///   **持久化后的行本身**（而不是调用方传进来的候选值）。返回行而不是 revision 是
+///   刻意的：更新时数据库保留原 `created_at`，只回传 revision 会迫使调用方用本地候选
+///   值拼 DTO，于是响应里的 `createdAt` 与随后 `get` 读到的权威状态不一致。返回 `None`
+///   表示条件不满足（并发冲突），调用方必须映射为冲突错误，不得重试成"最后写入获胜"。
+/// - `cas_delete` 同理，返回显式结果而不是 `bool`，避免把"不存在"和"版本冲突"
+///   混成同一个值。
+#[async_trait]
+pub trait AiProviderProfileRepository: Send + Sync {
+    /// 列出全部 profile（按 profile_id 升序；列表本身无分页语义）。
+    async fn list(&self) -> Result<Vec<AiProviderProfile>, AppError>;
+
+    /// 读取单个 profile；不存在返回 `None`。
+    async fn get(&self, profile_id: &str) -> Result<Option<AiProviderProfile>, AppError>;
+
+    /// 条件写入。成功返回**持久化后的行**；`expected_revision` 不匹配返回 `None`。
+    async fn cas_upsert(
+        &self,
+        profile: &AiProviderProfile,
+        expected_revision: Option<&str>,
+    ) -> Result<Option<AiProviderProfile>, AppError>;
+
+    /// 条件删除。
+    async fn cas_delete(
+        &self,
+        profile_id: &str,
+        expected_revision: Option<&str>,
+    ) -> Result<AiProviderProfileDeleteOutcome, AppError>;
 }
 
 /// Enrichment 流水线状态记录（契约 §36.8）。

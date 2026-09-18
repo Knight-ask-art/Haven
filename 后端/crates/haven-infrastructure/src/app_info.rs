@@ -322,7 +322,7 @@ mod tests {
             std::env::temp_dir().join("haven-app-info-cache"),
         );
         let facts = provider.get().unwrap();
-        assert_eq!(facts.database_version, "044_agent_approval_tokens");
+        assert_eq!(facts.database_version, "045_ai_provider_profiles");
         assert_eq!(facts.source_pack_version.as_deref(), Some("builtin-1"));
         assert!(facts.third_party_notices.is_empty());
         assert_eq!(facts.app_license.as_deref(), Some("MIT"));
