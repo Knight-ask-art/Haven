@@ -7,6 +7,8 @@
 //! - favorite_set 只发布 changed=true 的 favorite.changed。
 
 pub mod agent;
+pub mod agent_broker;
+pub mod ai_provider;
 pub mod app_info;
 pub mod cache;
 pub mod cast;

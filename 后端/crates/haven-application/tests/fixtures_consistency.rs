@@ -609,3 +609,78 @@ fn remote_stream_resource_list_loads() {
         );
     }
 }
+
+#[test]
+fn ai_provider_profile_fixtures_load_without_secret_leakage() {
+    use haven_application::wire::{AiProviderKindDto, AiProviderProfileListResultDto};
+
+    let normal: AiProviderProfileListResultDto =
+        serde_json::from_str(&load("ai-provider/profile.list.normal.json")).unwrap();
+    assert_eq!(normal.schema_version, 1);
+    assert_eq!(normal.profiles.len(), 1);
+    let profile = &normal.profiles[0];
+    assert_eq!(profile.kind, AiProviderKindDto::OpenAiCompatible);
+    assert!(profile.credential_configured);
+    // profile 投影里唯一的凭据信息就是这个布尔事实。
+    let serialized = serde_json::to_string(&normal).unwrap();
+    for forbidden in [
+        "secret",
+        "apiKey",
+        "api_key",
+        "credentialRef",
+        "credential_ref",
+        "haven:ai:",
+        "password",
+        "Bearer",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "profile 投影禁止 {forbidden}"
+        );
+    }
+    // 端点必须仍是 http(s)，不得被写成 file:// 或本地路径。
+    assert!(profile.endpoint.starts_with("https://"));
+
+    let empty: AiProviderProfileListResultDto =
+        serde_json::from_str(&load("ai-provider/profile.list.empty.json")).unwrap();
+    assert!(empty.profiles.is_empty(), "无 profile 时列表必须为空");
+}
+
+#[test]
+fn ai_provider_model_catalog_fixtures_never_fake_capabilities() {
+    use haven_application::wire::{
+        AiModelCapabilityDto, AiProviderModelsCatalogDto, AiProviderModelsCatalogStateDto,
+    };
+
+    let normal: AiProviderModelsCatalogDto =
+        serde_json::from_str(&load("ai-provider/models.catalog.normal.json")).unwrap();
+    assert_eq!(normal.schema_version, 1);
+    assert_eq!(normal.state, AiProviderModelsCatalogStateDto::Ready);
+    assert_eq!(normal.models.len(), 2);
+    // 显式声明才被采信；没有声明的能力是 unknown，而不是 unsupported。
+    assert_eq!(normal.models[0].chat, AiModelCapabilityDto::Supported);
+    assert_eq!(normal.models[0].vision, AiModelCapabilityDto::Unknown);
+    assert_eq!(normal.models[1].embedding, AiModelCapabilityDto::Supported);
+    assert_eq!(normal.models[1].chat, AiModelCapabilityDto::Unknown);
+
+    // 三种诚实空态都必须能加载，且模型数组为空（UI 据此显示「无可用模型」）。
+    for (name, state) in [
+        (
+            "ai-provider/models.catalog.no-credential.json",
+            AiProviderModelsCatalogStateDto::NoCredential,
+        ),
+        (
+            "ai-provider/models.catalog.disabled.json",
+            AiProviderModelsCatalogStateDto::Disabled,
+        ),
+        (
+            "ai-provider/models.catalog.empty.json",
+            AiProviderModelsCatalogStateDto::Empty,
+        ),
+    ] {
+        let catalog: AiProviderModelsCatalogDto =
+            serde_json::from_str(&load(name)).unwrap_or_else(|e| panic!("{name} 无法加载: {e}"));
+        assert_eq!(catalog.state, state, "{name}");
+        assert!(catalog.models.is_empty(), "{name} 必须是空目录");
+    }
+}

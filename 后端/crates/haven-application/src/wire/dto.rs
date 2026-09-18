@@ -2996,7 +2996,7 @@ pub enum StreamKindDto {
     Direct,
 }
 
-/// 凭据 Provider（契约 §36.5 闭合枚举；v0.2 仅 webdav）。
+/// 凭据 Provider（契约 §36.5 闭合枚举）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, rename_all = "snake_case")]
@@ -3004,6 +3004,9 @@ pub enum CredentialProviderDto {
     Webdav,
     /// OPDS 自定义书源凭据（V2-H 收尾批次；profile 段为 sourceId）。
     Opds,
+    /// AI Provider Profile 凭据（`haven:ai:<profile-id>`）。只用于受控的
+    /// status/set/delete；任何响应都不回显 secret。
+    Ai,
 }
 
 impl CredentialProviderDto {
@@ -3012,6 +3015,7 @@ impl CredentialProviderDto {
         match self {
             Self::Webdav => "webdav",
             Self::Opds => "opds",
+            Self::Ai => "ai",
         }
     }
 }
@@ -3997,4 +4001,231 @@ pub struct AgentSettingsProposalRejectResultDto {
 pub struct AgentSettingsProposalGetResultDto {
     pub proposal: AgentSettingsProposalDto,
     pub receipt: Option<AgentSettingChangeReceiptDto>,
+}
+
+// ---------- 外部 Agent Broker（A5；默认关闭） ----------
+
+/// Broker 当前生命周期状态。它是运行时状态，不是用户授权开关；授权边界仍由
+/// Rust Broker 的闭合请求集合与 Proposal 审批链决定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum AgentBrokerStatusDto {
+    Disabled,
+    Listening,
+    Busy,
+    Unavailable,
+}
+
+/// 外部 Agent Broker 状态投影。端点只在 listening 时出现；reason 只携带稳定、可展示的
+/// fail-closed 文案，不携带路径、堆栈、凭据或原始系统错误。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentBrokerStatusResultDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub status: AgentBrokerStatusDto,
+    pub endpoint: Option<String>,
+    pub reason: Option<String>,
+}
+
+// ---------- AI Provider Profile（A2 基础切片；docs/architecture/AI_SYSTEM.md） ----------
+//
+// 这里的 DTO 全部是**非敏感**投影：profile 行本身不含 secret，模型目录来自
+// Provider 的 /models。API key 只存在于 CredentialStore，任何响应只投影
+// `credentialConfigured` 布尔事实，不投影 target 名或 secret。
+
+/// AI Provider 种类（闭合枚举；第一版只有 OpenAI 兼容协议）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum AiProviderKindDto {
+    // 显式 rename：`rename_all = "snake_case"` 会把 `OpenAiCompatible` 拆成
+    // `open_ai_compatible`，与领域/数据库使用的稳定值 `openai_compatible` 不一致。
+    #[serde(rename = "openai_compatible")]
+    #[ts(rename = "openai_compatible")]
+    OpenAiCompatible,
+}
+
+impl From<haven_domain::ai_provider::AiProviderKind> for AiProviderKindDto {
+    fn from(value: haven_domain::ai_provider::AiProviderKind) -> Self {
+        match value {
+            haven_domain::ai_provider::AiProviderKind::OpenAiCompatible => Self::OpenAiCompatible,
+        }
+    }
+}
+
+impl From<AiProviderKindDto> for haven_domain::ai_provider::AiProviderKind {
+    fn from(value: AiProviderKindDto) -> Self {
+        match value {
+            AiProviderKindDto::OpenAiCompatible => {
+                haven_domain::ai_provider::AiProviderKind::OpenAiCompatible
+            }
+        }
+    }
+}
+
+/// 模型能力三态。`unknown` 表示 Provider 没有声明该能力，
+/// **不**等价于「不支持」，也**不**从模型名推断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum AiModelCapabilityDto {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+impl From<haven_domain::ai_provider::AiModelCapability> for AiModelCapabilityDto {
+    fn from(value: haven_domain::ai_provider::AiModelCapability) -> Self {
+        use haven_domain::ai_provider::AiModelCapability as Capability;
+        match value {
+            Capability::Supported => Self::Supported,
+            Capability::Unsupported => Self::Unsupported,
+            Capability::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// AI Provider Profile 投影。**不含** API key、credentialRef 或凭据 target 名。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AiProviderProfileDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub profile_id: String,
+    pub display_name: String,
+    pub kind: AiProviderKindDto,
+    /// 用户显式配置的 API 根地址（已通过共享 HTTP URL 策略）。
+    pub endpoint: String,
+    pub enabled: bool,
+    /// 用户选择的模型 id；从未选择时为 null。
+    pub selected_model_id: Option<String>,
+    /// 该 profile 的凭据是否已配置（凭据存储只提供存在性，不提供写入时间）。
+    pub credential_configured: bool,
+    /// CAS 版本号；更新/删除必须原样回传。
+    pub revision: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// `ai_provider_profile_list` 响应。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AiProviderProfileListResultDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub profiles: Vec<AiProviderProfileDto>,
+}
+
+/// `ai_provider_profile_get` 请求。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AiProviderProfileGetRequest {
+    pub profile_id: String,
+}
+
+/// `ai_provider_profile_upsert` 请求。
+///
+/// `expectedRevision` 为 null 表示「期望该 profile 尚不存在」；
+/// 与当前行不一致时返回冲突且零写入。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AiProviderProfileUpsertRequest {
+    pub profile_id: String,
+    pub display_name: String,
+    pub kind: AiProviderKindDto,
+    pub endpoint: String,
+    pub enabled: bool,
+    pub selected_model_id: Option<String>,
+    pub expected_revision: Option<String>,
+}
+
+/// `ai_provider_profile_delete` 请求。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AiProviderProfileDeleteRequest {
+    pub profile_id: String,
+    pub expected_revision: Option<String>,
+}
+
+/// 删除结果。凭据清理先于行删除；`credentialDeleted` 只报告事实，不含任何凭据材料。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AiProviderProfileDeleteResultDto {
+    pub profile_id: String,
+    pub credential_deleted: bool,
+}
+
+/// `ai_provider_models_list` 请求。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AiProviderModelsListRequest {
+    pub profile_id: String,
+}
+
+/// 模型目录状态。`no_credential` / `disabled` / `empty` 都是**诚实空态**而不是错误。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum AiProviderModelsCatalogStateDto {
+    /// 目录已取到且至少有一条模型。
+    Ready,
+    /// profile 被禁用：不发请求。
+    Disabled,
+    /// profile 未配置凭据：不发请求。
+    NoCredential,
+    /// 请求成功但 Provider 没有返回任何模型。
+    Empty,
+}
+
+/// 一条模型目录记录。能力字段缺失一律 `unknown`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AiProviderModelDto {
+    pub model_id: String,
+    pub display_name: Option<String>,
+    /// Provider 自报的创建时间（Unix 秒）；语义由 Provider 定义。
+    #[ts(type = "number | null")]
+    pub created: Option<i64>,
+    pub owned_by: Option<String>,
+    pub chat: AiModelCapabilityDto,
+    pub vision: AiModelCapabilityDto,
+    pub embedding: AiModelCapabilityDto,
+}
+
+/// `ai_provider_models_list` 响应。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AiProviderModelsCatalogDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub profile_id: String,
+    pub state: AiProviderModelsCatalogStateDto,
+    pub models: Vec<AiProviderModelDto>,
+}
+
+impl AiProviderModelDto {
+    /// 领域模型记录 → wire 投影。
+    pub fn from_domain(value: &haven_domain::ai_provider::AiModelDescriptor) -> Self {
+        Self {
+            model_id: value.model_id.clone(),
+            display_name: value.display_name.clone(),
+            created: value.created,
+            owned_by: value.owned_by.clone(),
+            chat: value.chat.into(),
+            vision: value.vision.into(),
+            embedding: value.embedding.into(),
+        }
+    }
 }
