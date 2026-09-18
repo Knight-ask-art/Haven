@@ -177,6 +177,24 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Enables the agent_broker_disable command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-agent-broker-disable",
+          "markdownDescription": "Enables the agent_broker_disable command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the agent_broker_enable command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-agent-broker-enable",
+          "markdownDescription": "Enables the agent_broker_enable command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the agent_broker_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-agent-broker-status",
+          "markdownDescription": "Enables the agent_broker_status command without any pre-configured scope."
+        },
+        {
           "description": "Enables the agent_capability_manifest_get command without any pre-configured scope.",
           "type": "string",
           "const": "allow-agent-capability-manifest-get",
@@ -217,6 +235,36 @@
           "type": "string",
           "const": "allow-agent-settings-proposal-reject",
           "markdownDescription": "Enables the agent_settings_proposal_reject command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the ai_provider_models_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ai-provider-models-list",
+          "markdownDescription": "Enables the ai_provider_models_list command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the ai_provider_profile_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ai-provider-profile-delete",
+          "markdownDescription": "Enables the ai_provider_profile_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the ai_provider_profile_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ai-provider-profile-get",
+          "markdownDescription": "Enables the ai_provider_profile_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the ai_provider_profile_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ai-provider-profile-list",
+          "markdownDescription": "Enables the ai_provider_profile_list command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the ai_provider_profile_upsert command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ai-provider-profile-upsert",
+          "markdownDescription": "Enables the ai_provider_profile_upsert command without any pre-configured scope."
         },
         {
           "description": "Enables the app_info_get command without any pre-configured scope.",
@@ -801,6 +849,24 @@
           "markdownDescription": "Enables the work_get command without any pre-configured scope."
         },
         {
+          "description": "Denies the agent_broker_disable command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-agent-broker-disable",
+          "markdownDescription": "Denies the agent_broker_disable command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the agent_broker_enable command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-agent-broker-enable",
+          "markdownDescription": "Denies the agent_broker_enable command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the agent_broker_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-agent-broker-status",
+          "markdownDescription": "Denies the agent_broker_status command without any pre-configured scope."
+        },
+        {
           "description": "Denies the agent_capability_manifest_get command without any pre-configured scope.",
           "type": "string",
           "const": "deny-agent-capability-manifest-get",
@@ -841,6 +907,36 @@
           "type": "string",
           "const": "deny-agent-settings-proposal-reject",
           "markdownDescription": "Denies the agent_settings_proposal_reject command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ai_provider_models_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ai-provider-models-list",
+          "markdownDescription": "Denies the ai_provider_models_list command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ai_provider_profile_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ai-provider-profile-delete",
+          "markdownDescription": "Denies the ai_provider_profile_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ai_provider_profile_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ai-provider-profile-get",
+          "markdownDescription": "Denies the ai_provider_profile_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ai_provider_profile_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ai-provider-profile-list",
+          "markdownDescription": "Denies the ai_provider_profile_list command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ai_provider_profile_upsert command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ai-provider-profile-upsert",
+          "markdownDescription": "Denies the ai_provider_profile_upsert command without any pre-configured scope."
         },
         {
           "description": "Denies the app_info_get command without any pre-configured scope.",

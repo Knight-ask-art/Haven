@@ -480,5 +480,48 @@ define_commands!(
         "periodical_tree_get",
         "allow-periodical-tree-get",
         commands::periodical::periodical_tree_get
+    ),
+    // A2 AI Provider 基础切片（docs/architecture/AI_SYSTEM.md）。
+    // 只有 profile 生命周期与只读模型目录；没有任何把提示词直通模型的自由入口。
+    (
+        "ai_provider_profile_list",
+        "allow-ai-provider-profile-list",
+        commands::ai_provider::ai_provider_profile_list
+    ),
+    (
+        "ai_provider_profile_get",
+        "allow-ai-provider-profile-get",
+        commands::ai_provider::ai_provider_profile_get
+    ),
+    (
+        "ai_provider_profile_upsert",
+        "allow-ai-provider-profile-upsert",
+        commands::ai_provider::ai_provider_profile_upsert
+    ),
+    (
+        "ai_provider_profile_delete",
+        "allow-ai-provider-profile-delete",
+        commands::ai_provider::ai_provider_profile_delete
+    ),
+    (
+        "ai_provider_models_list",
+        "allow-ai-provider-models-list",
+        commands::ai_provider::ai_provider_models_list
+    ),
+    // A5 外部 Agent Broker：默认关闭；仅暴露状态与显式启停，不开放任意 invoke。
+    (
+        "agent_broker_status",
+        "allow-agent-broker-status",
+        commands::agent_broker::agent_broker_status
+    ),
+    (
+        "agent_broker_enable",
+        "allow-agent-broker-enable",
+        commands::agent_broker::agent_broker_enable
+    ),
+    (
+        "agent_broker_disable",
+        "allow-agent-broker-disable",
+        commands::agent_broker::agent_broker_disable
     )
 );

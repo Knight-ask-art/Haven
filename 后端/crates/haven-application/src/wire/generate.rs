@@ -295,6 +295,21 @@ pub fn generate_wire_bindings() -> String {
         AgentSettingsProposalApproveResultDto::export_to_string(&config).unwrap(),
         AgentSettingsProposalRejectResultDto::export_to_string(&config).unwrap(),
         AgentSettingsProposalGetResultDto::export_to_string(&config).unwrap(),
+        AgentBrokerStatusDto::export_to_string(&config).unwrap(),
+        AgentBrokerStatusResultDto::export_to_string(&config).unwrap(),
+        // AI Provider Profile 基础切片（docs/architecture/AI_SYSTEM.md）
+        AiProviderKindDto::export_to_string(&config).unwrap(),
+        AiModelCapabilityDto::export_to_string(&config).unwrap(),
+        AiProviderProfileDto::export_to_string(&config).unwrap(),
+        AiProviderProfileListResultDto::export_to_string(&config).unwrap(),
+        AiProviderProfileGetRequest::export_to_string(&config).unwrap(),
+        AiProviderProfileUpsertRequest::export_to_string(&config).unwrap(),
+        AiProviderProfileDeleteRequest::export_to_string(&config).unwrap(),
+        AiProviderProfileDeleteResultDto::export_to_string(&config).unwrap(),
+        AiProviderModelsListRequest::export_to_string(&config).unwrap(),
+        AiProviderModelsCatalogStateDto::export_to_string(&config).unwrap(),
+        AiProviderModelDto::export_to_string(&config).unwrap(),
+        AiProviderModelsCatalogDto::export_to_string(&config).unwrap(),
     ] {
         for line in declaration.lines() {
             if line.trim_start().starts_with("import type") {
@@ -419,6 +434,87 @@ mod tests {
             out.contains("schemaVersion"),
             "PageDto 必须带 schemaVersion"
         );
+    }
+
+    #[test]
+    fn ai_provider_wire_shape_is_frozen() {
+        let out = generate_wire_bindings();
+        for expected in [
+            "AiProviderKindDto",
+            "AiModelCapabilityDto",
+            "AiProviderProfileDto",
+            "AiProviderProfileListResultDto",
+            "AiProviderProfileGetRequest",
+            "AiProviderProfileUpsertRequest",
+            "AiProviderProfileDeleteRequest",
+            "AiProviderProfileDeleteResultDto",
+            "AiProviderModelsListRequest",
+            "AiProviderModelsCatalogStateDto",
+            "AiProviderModelDto",
+            "AiProviderModelsCatalogDto",
+        ] {
+            assert!(out.contains(expected), "生成物缺少类型 {expected}");
+        }
+        // 种类字符串必须与领域/数据库一致（`rename_all = snake_case` 会拆成
+        // `open_ai_compatible`，那是错误的稳定值）。
+        assert!(
+            out.contains("export type AiProviderKindDto = \"openai_compatible\";"),
+            "AiProviderKindDto 必须序列化为 openai_compatible"
+        );
+        assert!(
+            !out.contains("open_ai_compatible"),
+            "不得出现被 snake_case 拆开的种类值"
+        );
+        // 能力三态必须完整；缺一态就会让 UI 把「没声明」读成「支持」或「不支持」。
+        assert!(out.contains(
+            "export type AiModelCapabilityDto = \"supported\" | \"unsupported\" | \"unknown\";"
+        ));
+        // `created` 是 Unix 秒，wire 上是 number 而不是 bigint。
+        assert!(
+            out.contains("created: number | null"),
+            "AiProviderModelDto.created 必须是 number | null"
+        );
+        // 凭据 Provider 必须包含 ai 命名空间。
+        assert!(
+            out.contains("export type CredentialProviderDto = \"webdav\" | \"opds\" | \"ai\";")
+        );
+        // secret 绝不能出现在任何 AI Provider 线上类型里。
+        for forbidden in ["apiKey", "api_key", "secret", "credentialRef", "target"] {
+            for line in out
+                .lines()
+                .filter(|line| line.contains("AiProvider") || line.contains("AiModel"))
+            {
+                assert!(
+                    !line.contains(forbidden),
+                    "AI wire 类型不得包含 {forbidden}: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ai_provider_profile_dto_serializes_without_credential_material() {
+        let dto = AiProviderProfileDto {
+            schema_version: 1,
+            profile_id: "gw".into(),
+            display_name: "自建网关".into(),
+            kind: AiProviderKindDto::OpenAiCompatible,
+            endpoint: "https://gateway.example.invalid/v1".into(),
+            enabled: true,
+            selected_model_id: None,
+            credential_configured: true,
+            revision: "rev-1".into(),
+            created_at: "2026-09-18T00:00:00Z".into(),
+            updated_at: "2026-09-18T00:00:00Z".into(),
+        };
+        let encoded = serde_json::to_string(&dto).unwrap();
+        assert!(encoded.contains("\"kind\":\"openai_compatible\""));
+        for forbidden in ["secret", "haven:ai:", "credentialRef", "apiKey"] {
+            assert!(
+                !encoded.contains(forbidden),
+                "不得包含 {forbidden}: {encoded}"
+            );
+        }
     }
 
     #[test]

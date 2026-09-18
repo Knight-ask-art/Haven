@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod agent_settings_ipc;
+pub mod ai_provider;
 pub mod app_info;
 pub mod cache;
 pub mod cast;
@@ -53,6 +54,10 @@ pub use agent::{
     AgentSettingsScopeActionRequest, AgentSubjectScopePort, RepositoryAgentSubjectScope,
 };
 pub use agent_settings_ipc::{AgentSettingsContext, AgentSettingsIpcService};
+pub use ai_provider::{
+    AI_CREDENTIAL_PROVIDER, AiModelCatalogPort, AiProviderProfileService, UnavailableModelCatalog,
+    credential_target as ai_provider_credential_target,
+};
 pub use app_info::{AppInfoPorts, AppInfoService, DirectoryKind};
 pub use cache::{ArtworkCacheClearPort, CacheService};
 pub use cast::{CastControlPort, CastDiscoveryPort, CastGrantRegistry, CastMediaPort, CastService};

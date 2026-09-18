@@ -110,6 +110,14 @@
     "allow-video-screenshot-chunk",
     "allow-video-screenshot-commit",
     "allow-video-screenshot-cancel",
-    "allow-periodical-tree-get"
+    "allow-periodical-tree-get",
+    "allow-ai-provider-profile-list",
+    "allow-ai-provider-profile-get",
+    "allow-ai-provider-profile-upsert",
+    "allow-ai-provider-profile-delete",
+    "allow-ai-provider-models-list",
+    "allow-agent-broker-status",
+    "allow-agent-broker-enable",
+    "allow-agent-broker-disable"
   ]
 }
