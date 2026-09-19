@@ -71,6 +71,15 @@ pub struct BoundListener {
     inner: platform::Listener,
 }
 
+impl std::fmt::Debug for BoundListener {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundListener")
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
+    }
+}
+
 impl BoundListener {
     pub fn endpoint(&self) -> &BrokerEndpoint {
         &self.endpoint
