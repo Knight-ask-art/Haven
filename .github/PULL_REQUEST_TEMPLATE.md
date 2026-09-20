@@ -2,6 +2,18 @@
 
 <!-- 用几句话说明用户问题、解决方式和不在本 PR 范围内的内容。 -->
 
+关联 Issue / 任务 ID：
+
+基线与当前 Head SHA：
+
+## 范围与边界
+
+Allowed Paths：
+
+Forbidden Paths / 不在本 PR 范围内：
+
+风险：`LOW | MEDIUM | HIGH | CRITICAL`
+
 ## 变更范围（用于选择性 PR Gate）
 
 - [ ] 仅文档/README（不包含 `.github/`、依赖锁文件或发布工具）
@@ -21,15 +33,27 @@ PR Gate 会根据实际 diff 再次分类；此处勾选用于审查说明，不
 
 ## 验证
 
+- [ ] 已在上面记录的精确 Head SHA 上执行验证
 - [ ] `npm run ci:check`（如涉及前端）
 - [ ] `cargo fmt --all -- --check`（如涉及 Rust）
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`（如涉及后端）
 - [ ] `cargo build --locked --features custom-protocol`（如涉及 Tauri 或前端资源）
 
 - [ ] `python tools/release/public-snapshot-check.py`
+- [ ] `python tools/docs/check.py`（如涉及文档、工作流或治理）
 - [ ] `python tools/film-tv/evidence-check.py --layer contract`（如涉及 Film/TV）
 
 未运行的检查及原因：
+
+## 证据状态
+
+- [ ] `CODE_PRESENT`
+- [ ] `AUTOMATED_TESTED`
+- [ ] `INDEPENDENTLY_REVIEWED`
+- [ ] `DESKTOP_RUNTIME_VERIFIED`（不适用时说明原因）
+- [ ] `RELEASE_VERIFIED`（不适用时说明原因）
+
+运行时证据、已知限制与回滚/恢复路径：
 
 ## 隐私与发布边界
 

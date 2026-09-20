@@ -135,6 +135,12 @@ jobs:
       - name: Check public snapshot and forbidden artifacts
         run: python tools/release/public-snapshot-check.py
 
+      - name: Check curated documentation
+        run: python tools/docs/check.py
+
+      - name: Test curated documentation checker
+        run: python tools/docs/check.test.py
+
       - name: Test public snapshot policy
         run: python tools/release/public-snapshot-check.test.py
 
