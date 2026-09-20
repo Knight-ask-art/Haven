@@ -86,12 +86,15 @@ From the repository root, run both checks:
 
 ```text
 python tools/docs/check.py
+python tools/docs/check.test.py
 python tools/release/public-snapshot-check.py
+python tools/release/public-snapshot-check.test.py
 ```
 
 The documentation checker validates curated public content and, when local
 legacy directories exist, checks that every record is named in its lifecycle
-register. The snapshot checker reads Git's tracked index, so newly authored but
-untracked files can pass the first check and still fail the second. Before a
-commit, also run
+register. The snapshot checker reads Git's tracked index, so a newly authored
+required public file can pass the first check and still fail the second until
+it is tracked; arbitrary untracked files are outside both public surfaces.
+Before a commit, also run
 `git diff --cached --check` on the exact staged allowlist.

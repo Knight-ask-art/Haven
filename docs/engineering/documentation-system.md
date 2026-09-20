@@ -39,7 +39,7 @@ architecture document.
 
 ## Metadata contract
 
-Every canonical or guide document has:
+Every curated public document has:
 
 ```yaml
 doc_id: unique.stable.id
@@ -58,6 +58,12 @@ also declare `generated_from` and `generated_by`.
 `source_of_truth` is not a closed enum. It names the authority precisely enough
 to resolve drift, for example `runtime-contracts`, `accepted-decisions`,
 `GitHub-settings-and-workflows` or `review-evidence-lifecycle-index`.
+
+The work index additionally declares the ledger state that the checker
+enforces: `active_ledger` names the one live ledger, `ledger_cutover` is
+`pending` or `complete`, `ledger_state` is `current` or `stale`, and
+`ledger_as_of` is an ISO date. These fields describe migration state; they do
+not create a second ledger or promote stale evidence.
 
 ## File placement and naming
 
@@ -112,7 +118,7 @@ The `python tools/docs/check.py` command verifies:
 - every curated public document declares public visibility;
 - no secrets, signed URLs, cookies or absolute local paths;
 - local historical records remain subject to their lifecycle-register checks;
-- generated-document headers;
+- generated-document metadata (`generated_from` and `generated_by`);
 - stale review warnings;
 - the declared ledger and cutover state cannot create a competing live ledger;
 - every local plan, review and legacy record is named in its lifecycle register

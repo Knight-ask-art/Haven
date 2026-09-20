@@ -1,9 +1,12 @@
 # Haven Claude Code entrypoint
 
-When present in the checkout, Claude Code must read `AGENTS.md` and the
-relevant documents under `docs/` before acting. `AGENTS.md` contains
-repository-local safety rules;
+When an applicable `AGENTS.md` is present in the checkout, Claude Code must
+read it and the relevant documents under `docs/` before acting. `AGENTS.md`
+contains repository-local safety rules;
 `docs/agents/claude-code.md` contains the Claude Code delegation contract.
+If no `AGENTS.md` is present in a fresh clone, use the public documents and
+the delegation contract as the repository guidance; do not infer missing
+machine-local rules.
 
 This file is intentionally thin. It is an entrypoint, not a second source of
 truth. When it conflicts with `AGENTS.md`, the repository rules and the user's

@@ -176,6 +176,11 @@ class DocumentationCheckerTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("public link targets a private path", errors[0])
 
+    def test_casefolded_private_document_directories_stay_private(self) -> None:
+        candidate = DOCS_CHECK.ROOT / "docs" / "Reviews" / "raw.md"
+
+        self.assertTrue(DOCS_CHECK.is_private_repository_target(candidate))
+
     def test_public_link_cannot_target_ignored_internal_material(self) -> None:
         document = DOCS_CHECK.Document(
             path=DOCS_CHECK.ROOT / "docs" / "README.md",

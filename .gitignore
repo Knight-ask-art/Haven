@@ -73,9 +73,9 @@ plan/
 !/docs/plans/README.md
 /docs/reviews/*
 !/docs/reviews/README.md
-# One already-tracked superpowers design record remains in clones despite this
-# ignore rule and has an exact public-snapshot exception. Keep the directory
-# ignored so no additional legacy files are added.
+# Legacy superpowers material is local-only; canonical extracts belong under
+# the maintained public documentation areas. Keep the directory ignored so no
+# legacy execution files are added to the public snapshot.
 /docs/superpowers/
 /docs/drafts/
 /docs/project/

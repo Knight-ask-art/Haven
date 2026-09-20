@@ -27,10 +27,12 @@ SKIP_DIRS = {
     "tmp",
     ".tmp",
 }
+SKIP_DIRS_CASEFOLDED = frozenset(directory.casefold() for directory in SKIP_DIRS)
 PUBLIC_INDEXES = {
     Path("plans/README.md"),
     Path("reviews/README.md"),
 }
+PUBLIC_INDEXES_CASEFOLDED = frozenset(path.as_posix().casefold() for path in PUBLIC_INDEXES)
 GRANDFATHERED_PUBLIC_DOCUMENTS: set[Path] = set()
 LOCAL_RECORD_REGISTERS = (
     (DOCS / "plans", DOCS / "plans" / "README.md", False, frozenset({"README.md"})),
@@ -109,8 +111,9 @@ def public_documents() -> list[Path]:
     return sorted(
         path
         for path in DOCS.rglob("*.md")
-        if path.relative_to(DOCS) in PUBLIC_INDEXES
-        or path.relative_to(DOCS).parts[0] not in SKIP_DIRS
+        if path.relative_to(DOCS).as_posix().casefold() in PUBLIC_INDEXES_CASEFOLDED
+        or path.relative_to(DOCS).parts[0].casefold()
+        not in SKIP_DIRS_CASEFOLDED
     )
 
 
@@ -196,7 +199,10 @@ def is_private_repository_target(candidate: Path) -> bool:
         return False
 
     docs_relative = Path(*relative.parts[1:])
-    if docs_relative in PUBLIC_INDEXES or docs_relative in GRANDFATHERED_PUBLIC_DOCUMENTS:
+    if (
+        docs_relative.as_posix().casefold() in PUBLIC_INDEXES_CASEFOLDED
+        or docs_relative in GRANDFATHERED_PUBLIC_DOCUMENTS
+    ):
         return False
     return bool(docs_relative.parts and docs_relative.parts[0].casefold() in SKIP_DIRS)
 
