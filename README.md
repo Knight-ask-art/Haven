@@ -132,6 +132,7 @@ Tauri 桌面版本已经接入固定的 HTTPS GitHub Release 检查链；在维�
 
 ## Documentation
 
+- [文档中心](docs/README.md)
 - [公开变更记录](CHANGELOG.md)
 - [内置来源能力表](SOURCES.md)
 - [CMS10 用户配置说明](CMS10_USER_CONFIG.md)
