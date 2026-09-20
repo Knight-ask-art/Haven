@@ -108,7 +108,7 @@ class DocumentationCheckerTests(unittest.TestCase):
                 body=(
                     "C:/Users/example/.claude/plans/task.md "
                     "https://example.test/file?signature=secret "
-                    "ghp_123456789012345678901234567890\n"
+                    "ghp_" "123456789012345678901234567890\n"
                     "Cookie: session=raw-value"
                 ),
             )
