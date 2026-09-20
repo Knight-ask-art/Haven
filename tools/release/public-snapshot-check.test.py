@@ -37,7 +37,6 @@ class PublicSnapshotTreeTests(unittest.TestCase):
             "docs/architecture/overview.md",
             "docs/plans/README.md",
             "docs/reviews/README.md",
-            "docs/superpowers/specs/2026-09-10-comic-reading-center-design.md",
         )
 
         self.assertEqual(errors, [])

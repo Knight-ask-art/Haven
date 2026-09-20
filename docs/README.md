@@ -62,7 +62,7 @@ The existing locations remain available during migration:
 | `plan/` | Local planning and current implementation ledger | Migrate stable facts; keep one live ledger until explicit cutover |
 | `docs/plans/` | Public lifecycle index plus internal dated plans | Promote durable decisions; never execute a stale baseline |
 | `docs/reviews/` | Public evidence index plus internal review records | Keep raw evidence append-only; never treat it as current capability truth |
-| `docs/superpowers/` | Internal legacy execution material with one grandfathered public design record | Keep all new material private; retain and scan only the exact historical exception while extracting durable decisions |
+| `docs/superpowers/` | Internal legacy execution material | Keep all material private; extract durable decisions selectively and register local records in the migration map |
 | `docs/internal/` and `docs/private/` | Local-only material | Never publish |
 
 No document is removed merely because a newer document exists. A migration map,
@@ -89,9 +89,9 @@ python tools/docs/check.py
 python tools/release/public-snapshot-check.py
 ```
 
-The documentation checker validates curated public content and the body of the
-grandfathered public record. When local legacy directories exist, it also checks
-that every record is named in its lifecycle register. The snapshot checker reads
-Git's tracked index, so newly authored but untracked files can pass the first
-check and still fail the second. Before a commit, also run
+The documentation checker validates curated public content and, when local
+legacy directories exist, checks that every record is named in its lifecycle
+register. The snapshot checker reads Git's tracked index, so newly authored but
+untracked files can pass the first check and still fail the second. Before a
+commit, also run
 `git diff --cached --check` on the exact staged allowlist.

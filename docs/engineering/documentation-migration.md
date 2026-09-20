@@ -23,7 +23,7 @@ every source listed below is current.
 | `docs/plans/*.md` except `README.md` | Canonical engineering, operations or decision document | Dated plan archive | Internal | map, then keep or archive | Completed plans retain context; durable decisions move to a stable home. |
 | `docs/reviews/README.md` | Same path | Public evidence index | Public | maintain | The index exposes baselines and lifecycle without publishing raw diagnostics. |
 | `docs/reviews/*.md` except `README.md` | Canonical document only for durable conclusions | Historical review evidence | Internal | keep append-only | A review is bound to its original commit and must not be rewritten as current truth. |
-| `docs/superpowers/` | `docs/architecture/`, `docs/engineering/` or an accepted ADR | Legacy execution material | Internal, except the exact grandfathered public design record | extract selectively | Keep the public exception content-scanned and add no new public files in this tree. |
+| `docs/superpowers/` | `docs/architecture/`, `docs/engineering/` or an accepted ADR | Legacy execution material | Internal | extract selectively | Keep all new and existing execution material private; promote only durable, revalidated facts to a canonical public home. |
 | `AGENTS.md` | Repository-local governance | Agent instruction file | Local | keep outside public snapshot | It may contain machine-specific or operator-only context. |
 | `CLAUDE.md` | `docs/agents/claude-code.md` | Agent entrypoint | Public | keep thin | The entrypoint points to the detailed delegation contract without duplicating it. |
 | `docs/` canonical files | `docs/README.md` navigation | Stable public documentation | Public | keep and review | These files are the maintained public documentation plane. |
@@ -84,11 +84,10 @@ integrity gap; do not reconstruct the missing contract from downstream prose.
 
 | Legacy record | Canonical destination | Result |
 | --- | --- | --- |
-| `docs/superpowers/specs/2026-09-10-comic-reading-center-design.md` | [Comic Content Identity and Continuity](../architecture/comic-content-continuity.md) | Durable identity, catalog, migration and safety invariants extracted. The legacy copy remains as an explicitly grandfathered public-history file until cleanup is separately authorized. |
+| `docs/superpowers/specs/2026-09-10-comic-reading-center-design.md` | [Comic Content Identity and Continuity](../architecture/comic-content-continuity.md) | Durable identity, catalog, migration and safety invariants were extracted. The legacy source is local-only historical material and is not part of the public snapshot. |
 
 The internal implementation plan and verification records for that work remain
-under `docs/superpowers/`. They are not current capability evidence and are not
-part of the public snapshot. No new file may use this grandfathered path.
+local-only under `docs/superpowers/`. They are not current capability evidence.
 
 ## Legacy file register
 
@@ -97,7 +96,7 @@ execution files are mapped here:
 
 | old_path | new_path | doc_id | classification | visibility | owner | action | reason | links_checked |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `docs/superpowers/specs/2026-09-10-comic-reading-center-design.md` | `docs/architecture/comic-content-continuity.md` | `legacy.comic-continuity.spec.2026-09-10` | accepted design history | grandfathered public | architecture | extract and retain | Cleanup needs separate authorization; canonical invariants now have a maintained home. | yes, 2026-09-20 |
+| `docs/superpowers/specs/2026-09-10-comic-reading-center-design.md` | `docs/architecture/comic-content-continuity.md` | `legacy.comic-continuity.spec.2026-09-10` | accepted design history | internal | architecture | extract and retain locally | Canonical invariants now have a maintained home; the legacy source remains local-only historical evidence. | yes, 2026-09-20 |
 | `docs/superpowers/plans/2026-09-10-comic-reading-center.md` | `docs/architecture/comic-content-continuity.md` | `legacy.comic-continuity.plan.2026-09-10` | execution plan | internal | feature-owner | archive | Its implementation snapshots and checkbox state are not current task truth. | sampled, 2026-09-20 |
 | `docs/superpowers/verification/2026-09-10-comic-reading-center-gates.md` | `docs/engineering/testing-and-evidence.md` | `legacy.comic-continuity.gates.2026-09-10` | historical verification | internal | quality | archive | Results are tied to old working-tree baselines and cannot serve as a fresh gate. | sampled, 2026-09-20 |
 | `docs/superpowers/verification/2026-09-14-content-capability-audit.md` | `docs/SOURCE_OF_TRUTH.md` | `legacy.content-capability-audit.2026-09-14` | capability audit | internal | quality | archive | Durable evidence rules were promoted; quantitative findings remain historical. | sampled, 2026-09-20 |

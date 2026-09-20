@@ -65,7 +65,6 @@ REQUIRED_FILES = {
     "docs/product/ai-boundaries.md",
     "docs/reference/README.md",
     "docs/reviews/README.md",
-    "docs/superpowers/specs/2026-09-10-comic-reading-center-design.md",
     "docs/work/README.md",
     "tools/docs/check.py",
     "tools/docs/check.test.py",
@@ -94,9 +93,6 @@ FORBIDDEN_DOCUMENT_PREFIXES = (
 PUBLIC_DOCUMENT_INDEXES = {
     "docs/plans/README.md",
     "docs/reviews/README.md",
-}
-GRANDFATHERED_LEGACY_DOCUMENTS = {
-    "docs/superpowers/specs/2026-09-10-comic-reading-center-design.md",
 }
 FORBIDDEN_ROOT_SEGMENTS_CASEFOLDED = frozenset(
     segment.casefold() for segment in FORBIDDEN_ROOT_SEGMENTS
@@ -175,10 +171,7 @@ def check_public_tree(root: Path, files: list[str], errors: list[str]) -> None:
             normalized_casefold.startswith(prefix.casefold())
             for prefix in FORBIDDEN_DOCUMENT_PREFIXES
         )
-        is_allowed_document_exception = (
-            normalized in PUBLIC_DOCUMENT_INDEXES
-            or normalized in GRANDFATHERED_LEGACY_DOCUMENTS
-        )
+        is_allowed_document_exception = normalized in PUBLIC_DOCUMENT_INDEXES
         if is_forbidden_document and not is_allowed_document_exception:
             add_error(errors, f"forbidden internal document path is tracked: {normalized}")
         if any(normalized_casefold.startswith(prefix.casefold()) for prefix in FORBIDDEN_PUBLIC_PREFIXES):

@@ -43,7 +43,7 @@ class DocumentationCheckerTests(unittest.TestCase):
         }
         self.assertEqual(
             grandfathered,
-            {"superpowers/specs/2026-09-10-comic-reading-center-design.md"},
+            set(),
         )
 
     def test_curated_documents_have_unique_ids_and_valid_links(self) -> None:
@@ -95,18 +95,8 @@ class DocumentationCheckerTests(unittest.TestCase):
 
         self.assertTrue(any("duplicate metadata field: owner" in error for error in errors))
 
-    def test_grandfathered_public_document_receives_body_and_link_checks(self) -> None:
-        errors = []
-        for path in DOCS_CHECK.grandfathered_public_documents():
-            document = DOCS_CHECK.Document(
-                path=path,
-                fields={"visibility": "public"},
-                body=path.read_text(encoding="utf-8"),
-            )
-            errors.extend(DOCS_CHECK.check_links(document))
-            errors.extend(DOCS_CHECK.check_body(document))
-
-        self.assertEqual(errors, [])
+    def test_no_legacy_document_is_public_by_exception(self) -> None:
+        self.assertEqual(DOCS_CHECK.grandfathered_public_documents(), [])
 
     def test_public_body_rejects_private_paths_signed_urls_and_markers(self) -> None:
         with tempfile.TemporaryDirectory(dir=DOCS_CHECK.ROOT) as temporary:

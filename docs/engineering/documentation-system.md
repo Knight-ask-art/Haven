@@ -111,7 +111,7 @@ The `python tools/docs/check.py` command verifies:
 - Markdown link targets and private-path boundaries;
 - every curated public document declares public visibility;
 - no secrets, signed URLs, cookies or absolute local paths;
-- the grandfathered public history record receives the same body safety scan;
+- local historical records remain subject to their lifecycle-register checks;
 - generated-document headers;
 - stale review warnings;
 - the declared ledger and cutover state cannot create a competing live ledger;

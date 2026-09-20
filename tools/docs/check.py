@@ -31,9 +31,7 @@ PUBLIC_INDEXES = {
     Path("plans/README.md"),
     Path("reviews/README.md"),
 }
-GRANDFATHERED_PUBLIC_DOCUMENTS = {
-    Path("superpowers/specs/2026-09-10-comic-reading-center-design.md"),
-}
+GRANDFATHERED_PUBLIC_DOCUMENTS: set[Path] = set()
 LOCAL_RECORD_REGISTERS = (
     (DOCS / "plans", DOCS / "plans" / "README.md", False, frozenset({"README.md"})),
     (DOCS / "reviews", DOCS / "reviews" / "README.md", False, frozenset({"README.md"})),

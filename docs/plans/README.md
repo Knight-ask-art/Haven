@@ -34,6 +34,8 @@ artifact identity, the relevant gates and an explicit record of runtime limits.
 | Record ID | Internal record | Owner | Baseline | Lifecycle | Durable destination | Links checked | Disposition |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `plan.release-readiness.v1.0.0.2026-09-15` | `docs/plans/2026-09-15-v1.0.0-release-readiness-plan.md` | release-owner | `origin/main@7d0758e` | superseded | [Release and Rollback](../operations/release-and-rollback.md) | internal-only, sampled 2026-09-20 | The release invariants remain useful, but the executable checklist must be re-baselined before any release-candidate work. No completion claim is carried forward. |
+| `plan.agent-approval-token.2026-09-17` | `docs/plans/2026-09-17-agent-approval-token-plan.md` | agent-platform | `origin/main@2d9c25b` | archived | [Documentation System](../engineering/documentation-system.md) | internal-only, sampled 2026-09-20 | Historical implementation plan retained in Git history; its contract claims require a fresh baseline and are not public capability evidence. |
+| `plan.agent-typed-ipc-ui.2026-09-17` | `docs/plans/2026-09-17-agent-typed-ipc-ui-plan.md` | agent-platform | `origin/main@2d9c25b` | archived | [Documentation System](../engineering/documentation-system.md) | internal-only, sampled 2026-09-20 | Historical implementation plan retained in Git history; its interface claims require a fresh baseline and are not public capability evidence. |
 
 ## Adding or closing a plan
 
