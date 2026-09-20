@@ -28,14 +28,50 @@ REQUIRED_FILES = {
     ".github/workflows/ci.yml",
     ".github/workflows/codeql.yml",
     ".github/dependabot.yml",
+    ".github/PULL_REQUEST_TEMPLATE.md",
+    ".github/ISSUE_TEMPLATE/bug_report.yml",
+    ".github/ISSUE_TEMPLATE/feature_request.yml",
+    ".github/ISSUE_TEMPLATE/config.yml",
+    "CLAUDE.md",
     "README.en.md",
     "后端/crates/haven-application/resources/builtin-sources.json",
     "前端/app/src/lib/ipc/generated/wire.ts",
     "contracts/ipc/v1/fixtures/README.md",
     "contracts/film-tv/README.md",
     "contracts/film-tv/acceptance-matrix.json",
+    "docs/README.md",
+    "docs/SOURCE_OF_TRUTH.md",
+    "docs/TASK_WORKFLOW.md",
+    "docs/ARCHITECTURE_ROADMAP.md",
+    "docs/agents/README.md",
+    "docs/engineering/documentation-system.md",
+    "docs/engineering/documentation-migration.md",
+    "docs/engineering/git-worktree-and-commits.md",
+    "docs/engineering/testing-and-evidence.md",
+    "docs/agents/claude-code.md",
+    "docs/agents/engineering-agents.md",
+    "docs/agents/handoff.md",
+    "docs/architecture/README.md",
+    "docs/architecture/comic-content-continuity.md",
+    "docs/decisions/README.md",
+    "docs/design/README.md",
+    "docs/engineering/README.md",
+    "docs/engineering/architecture-change.md",
+    "docs/operations/github.md",
+    "docs/operations/README.md",
+    "docs/operations/release-and-rollback.md",
+    "docs/plans/README.md",
+    "docs/product/README.md",
+    "docs/product/ai-boundaries.md",
+    "docs/reference/README.md",
+    "docs/reviews/README.md",
+    "docs/superpowers/specs/2026-09-10-comic-reading-center-design.md",
+    "docs/work/README.md",
+    "tools/docs/check.py",
+    "tools/docs/check.test.py",
     "tools/film-tv/evidence-check.py",
     "tools/film-tv/evidence-check.test.py",
+    "tools/release/public-snapshot-check.py",
     "tools/release/public-snapshot-check.test.py",
     "tools/release/version-check.py",
     "tools/release/version-check.test.py",
@@ -47,6 +83,7 @@ FORBIDDEN_ROOT_SEGMENTS = {"plan", "测试", "参考项目", "logs", "tmp", ".tm
 FORBIDDEN_DOCUMENT_PREFIXES = (
     "docs/internal/",
     "docs/private/",
+    "docs/plans/",
     "docs/reviews/",
     "docs/superpowers/",
     "docs/drafts/",
@@ -54,6 +91,13 @@ FORBIDDEN_DOCUMENT_PREFIXES = (
     "docs/tmp/",
     "docs/.tmp/",
 )
+PUBLIC_DOCUMENT_INDEXES = {
+    "docs/plans/README.md",
+    "docs/reviews/README.md",
+}
+GRANDFATHERED_LEGACY_DOCUMENTS = {
+    "docs/superpowers/specs/2026-09-10-comic-reading-center-design.md",
+}
 FORBIDDEN_ROOT_SEGMENTS_CASEFOLDED = frozenset(
     segment.casefold() for segment in FORBIDDEN_ROOT_SEGMENTS
 )
@@ -127,12 +171,22 @@ def check_public_tree(root: Path, files: list[str], errors: list[str]) -> None:
         normalized_casefold = normalized.casefold()
         if path.parts and path.parts[0].casefold() in FORBIDDEN_ROOT_SEGMENTS_CASEFOLDED:
             add_error(errors, f"forbidden public root path is tracked: {normalized}")
-        if any(normalized_casefold.startswith(prefix.casefold()) for prefix in FORBIDDEN_DOCUMENT_PREFIXES):
+        is_forbidden_document = any(
+            normalized_casefold.startswith(prefix.casefold())
+            for prefix in FORBIDDEN_DOCUMENT_PREFIXES
+        )
+        is_allowed_document_exception = (
+            normalized in PUBLIC_DOCUMENT_INDEXES
+            or normalized in GRANDFATHERED_LEGACY_DOCUMENTS
+        )
+        if is_forbidden_document and not is_allowed_document_exception:
             add_error(errors, f"forbidden internal document path is tracked: {normalized}")
         if any(normalized_casefold.startswith(prefix.casefold()) for prefix in FORBIDDEN_PUBLIC_PREFIXES):
             add_error(errors, f"unsupported mobile asset is tracked: {normalized}")
         if any(normalized_casefold.startswith(prefix.casefold()) for prefix in FORBIDDEN_LOCAL_ONLY_PREFIXES):
             add_error(errors, f"local-only diagnostic or upstream test is tracked: {normalized}")
+        if path.name.casefold() == "agents.md":
+            add_error(errors, f"local-only agent instruction file is tracked: {normalized}")
         forbidden_directory_names = {
             "diagnostics",
             "diagnostic",

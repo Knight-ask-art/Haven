@@ -14,17 +14,30 @@ SPEC.loader.exec_module(PUBLIC_SNAPSHOT_CHECK)
 
 
 class PublicSnapshotTreeTests(unittest.TestCase):
-    def _errors(self, *files: str) -> list[str]:
+    def _errors(self, *files: str, omit: set[str] | None = None) -> list[str]:
         errors: list[str] = []
-        tracked = [*PUBLIC_SNAPSHOT_CHECK.REQUIRED_FILES, *files]
+        tracked = [
+            *(PUBLIC_SNAPSHOT_CHECK.REQUIRED_FILES - (omit or set())),
+            *files,
+        ]
         PUBLIC_SNAPSHOT_CHECK.check_public_tree(Path("."), tracked, errors)
         return errors
+
+    def test_missing_required_public_file_is_rejected(self) -> None:
+        missing = "docs/README.md"
+
+        errors = self._errors(omit={missing})
+
+        self.assertIn(f"required public file is not tracked: {missing}", errors)
 
     def test_public_docs_are_allowed(self) -> None:
         errors = self._errors(
             "docs/README.md",
             "docs/user-guide/getting-started.md",
             "docs/architecture/overview.md",
+            "docs/plans/README.md",
+            "docs/reviews/README.md",
+            "docs/superpowers/specs/2026-09-10-comic-reading-center-design.md",
         )
 
         self.assertEqual(errors, [])
@@ -33,6 +46,7 @@ class PublicSnapshotTreeTests(unittest.TestCase):
         errors = self._errors(
             "docs/internal/roadmap.md",
             "docs/private/release-notes.md",
+            "docs/plans/2026-09-15-release.md",
             "docs/reviews/security-review.md",
             "docs/superpowers/specs/feature.md",
             "docs/drafts/unpublished.md",
@@ -46,7 +60,15 @@ class PublicSnapshotTreeTests(unittest.TestCase):
         internal_errors = [
             error for error in errors if "forbidden internal document path" in error
         ]
-        self.assertEqual(len(internal_errors), 9)
+        self.assertEqual(len(internal_errors), 10)
+
+    def test_local_agent_instructions_are_not_public_snapshot_files(self) -> None:
+        errors = self._errors("AGENTS.md", "nested/AGENTS.md")
+
+        agent_errors = [
+            error for error in errors if "local-only agent instruction file" in error
+        ]
+        self.assertEqual(len(agent_errors), 2)
 
     def test_existing_non_document_security_boundaries_remain_forbidden(self) -> None:
         errors = self._errors(
