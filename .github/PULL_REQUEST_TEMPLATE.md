@@ -1,43 +1,42 @@
 ## 变更说明
 
-<!-- 用几句话说明用户问题、解决方式和不在本 PR 范围内的内容。 -->
+<!-- 说明用户问题、解决方式及此次不改变的行为。 -->
 
-## 变更范围（用于选择性 PR Gate）
+关联 Issue：
 
-- [ ] 仅文档/README（不包含 `.github/`、依赖锁文件或发布工具）
-- [ ] Frontend（`前端/`、Node 依赖或前端构建配置）
-- [ ] Backend Rust（`后端/`、Rust workspace 或锁文件）
-- [ ] Tauri（`src-tauri/` 或 Tauri 构建配置）
-- [ ] Film/TV（`contracts/film-tv/`、`tools/film-tv/` 或影视实现/fixture）
-- [ ] 跨模块/高影响（workflow、IPC contract、发布工具、依赖或构建脚本）
+## 影响范围
 
-<!--
-PR Gate 会根据实际 diff 再次分类；此处勾选用于审查说明，不能绕过自动检查。
-所有 PR 都运行公共策略与仓库完整性检查。相关模块的严格 lint/build/test
-以及 Film/TV evidence 会阻塞合并；CodeQL Gate 只分析受影响语言。
-当前 `Protect main` 规则集保持 0 个必需 approval；未来改为 1 个 approval
-只需调整规则集参数，`CODEOWNERS` 与这些自动化 Gate 无需改动。
--->
+<!-- 列出受影响的功能、模块和兼容性边界，避免无关改动。 -->
 
-## 验证
+- [ ] 文档或贡献说明
+- [ ] 前端界面或构建
+- [ ] Rust 后端
+- [ ] Tauri 桌面与权限
+- [ ] Film/TV 契约或实现
+- [ ] IPC、依赖、工作流或发布工具
 
-- [ ] `npm run ci:check`（如涉及前端）
-- [ ] `cargo fmt --all -- --check`（如涉及 Rust）
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`（如涉及后端）
-- [ ] `cargo build --locked --features custom-protocol`（如涉及 Tauri 或前端资源）
+PR Gate 根据实际 diff 选择检查，不以勾选项代替自动分类。
+合并须满足当前 head 的必需 CI 和审查要求。
 
-- [ ] `python tools/release/public-snapshot-check.py`
-- [ ] `python tools/film-tv/evidence-check.py --layer contract`（如涉及 Film/TV）
+## 已完成的验证
 
-未运行的检查及原因：
+<!-- 仅列实际执行且完成的检查，注明覆盖范围和对应提交。不要粘贴原始诊断日志。 -->
+
+| 检查 | 覆盖范围 | 结果 | 提交 |
+| --- | --- | --- | --- |
+
+## 行为、兼容与恢复说明
+
+<!-- 说明实际行为变化、数据迁移、用户可观察的限制和恢复方式。 -->
 
 ## 隐私与发布边界
 
-- [ ] 未提交数据库、媒体文件、书籍正文、Cookie、Token、完整 URL 或完整本地路径。
-- [ ] 未提交 `dist/`、`target/`、日志、诊断导出或本地测试资料。
-- [ ] 未提交 `.env`、私钥、凭据配置或其他本地 secret marker。
-- [ ] 如修改第三方资源，已更新对应 Notice 或说明其许可证来源。
+- [ ] 未提交凭据、数据库、媒体正文、Cookie、Token 或个人数据。
+- [ ] 未提交构建缓存、原始诊断或开发操作记录。
+- [ ] 未公开开发工具操作流程、私有文件清单或机器本地路径。
+- [ ] 第三方内容保留许可证和 Notice。
+- [ ] UI 截图不含个人或敏感信息。
 
 ## UI 变更（如适用）
 
-<!-- 只附加不含个人信息的截图或说明受影响的 loading/empty/error 状态。 -->
+<!-- 可附加非敏感截图，说明 loading、empty 和 error 等受影响状态。 -->
