@@ -10,7 +10,7 @@ chrono = "0.4.45"
 haven-common = { path = "../haven-common" }
 haven-domain = { path = "../haven-domain" }
 serde = { version = "1.0.229", features = ["derive"] }
-base64 = "0.22"
+base64 = "0.23"
 serde_json = "1.0.151"
 # tokio：ScanService + Search 并行 + Settings JSON 文件需要 rt + rt-multi-thread + sync + time + fs。
 tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "sync", "time", "fs"] }
