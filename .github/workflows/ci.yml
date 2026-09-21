@@ -135,6 +135,12 @@ jobs:
       - name: Check public snapshot and forbidden artifacts
         run: python tools/release/public-snapshot-check.py
 
+      - name: Check curated documentation
+        run: python tools/docs/check.py
+
+      - name: Test curated documentation checker
+        run: python tools/docs/check.test.py
+
       - name: Test public snapshot policy
         run: python tools/release/public-snapshot-check.test.py
 
@@ -414,14 +420,19 @@ jobs:
 
           require_if_selected() {
             local selected="$1" result="$2" label="$3"
-            if [[ "$selected" == true && "$result" != success ]]; then
-              echo "$label is required but finished with $result"
-              return 1
+            if [[ "$selected" == true ]]; then
+              if [[ "$result" != success ]]; then
+                echo "$label is required but finished with $result"
+                return 1
+              fi
+              echo "$label passed (required)"
+              return 0
             fi
-            if [[ "$selected" != true && "$result" != skipped && "$result" != success ]]; then
+            if [[ "$result" != skipped && "$result" != success ]]; then
               echo "$label was not selected but finished with $result"
               return 1
             fi
+            echo "$label skipped (not selected; result=$result)"
           }
 
           require_if_selected "$FRONTEND_REQUIRED" "$FRONTEND_RESULT" frontend

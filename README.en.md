@@ -196,6 +196,7 @@ only as GitHub Actions secrets; it is never committed to this repository.
 
 ## Documentation
 
+- [Documentation home](docs/README.md)
 - [CMS10 user configuration](CMS10_USER_CONFIG.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
 
