@@ -3,6 +3,7 @@
 //! Composition Root：setup 打开 DB → AppState 组装 Services → invoke_handler 注册命令。
 //! 命令清单必须与 `capabilities/main.json` 保持一致（IPC-TAURI-001A 验收）。
 
+pub mod agent_broker;
 pub mod commands;
 pub mod download_sink;
 pub mod ipc;

@@ -199,4 +199,49 @@ describe("MockHavenClient session lifecycle", () => {
     registry = await client.sourceRegistryList()
     expect(registry.sources.some((source) => source.sourceId === added.sourceId)).toBe(false)
   })
+
+  it("starts with the broker disabled and only reaches listening after an explicit enable", async () => {
+    const client = new MockHavenClient()
+    await expect(client.agentBrokerStatus()).resolves.toEqual({
+      schemaVersion: 1,
+      status: "disabled",
+      endpoint: null,
+      reason: null,
+    })
+
+    const enabled = await client.agentBrokerEnable()
+    expect(enabled).toEqual({
+      schemaVersion: 1,
+      status: "listening",
+      endpoint: expect.any(String),
+      reason: null,
+    })
+    expect(Object.keys(enabled).sort()).toEqual(["endpoint", "reason", "schemaVersion", "status"])
+    // 幂等：重复 enable 返回同一端点，且状态是查询出来的事实而不是一次性返回值。
+    await expect(client.agentBrokerEnable()).resolves.toEqual(enabled)
+    await expect(client.agentBrokerStatus()).resolves.toEqual(enabled)
+
+    // 未开启时 disable 同样幂等；关闭后端点从投影里撤下。
+    await expect(client.agentBrokerDisable()).resolves.toEqual({
+      schemaVersion: 1,
+      status: "disabled",
+      endpoint: null,
+      reason: null,
+    })
+    await expect(client.agentBrokerDisable()).resolves.toEqual({
+      schemaVersion: 1,
+      status: "disabled",
+      endpoint: null,
+      reason: null,
+    })
+  })
+
+  it("marks its broker endpoint as a browser-preview marker instead of faking a local endpoint", async () => {
+    const endpoint = (await new MockHavenClient().agentBrokerEnable()).endpoint ?? ""
+    // 浏览器里没有 Rust Broker：返回 `\\.\pipe\…` 或 `*.sock` 形状的假地址，会让
+    // 页面把一段永远连不上的路径当成可用端点展示并复制给用户。
+    expect(endpoint).toContain("mock")
+    expect(endpoint).not.toMatch(/^\\\\\.\\pipe\\/)
+    expect(endpoint).not.toMatch(/\.sock$/)
+  })
 })

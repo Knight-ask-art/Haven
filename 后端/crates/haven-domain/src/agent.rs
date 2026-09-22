@@ -29,9 +29,11 @@ use crate::ids::{
 };
 use crate::locator::Locator;
 use crate::setting_proposal::{
-    SettingTarget, canonical_digest, canonical_json_of, is_canonical_digest,
+    SettingProposalChange, SettingTarget, canonical_digest, canonical_json_of, is_canonical_digest,
 };
-use crate::settings::{ReadingSettings, SettingsSection};
+use crate::settings::{
+    PreferenceData, ReadingPatch, ReadingSettings, SettingsPatch, SettingsSection,
+};
 
 /// canonical 上下文载荷的 schema 版本（参与 `context_hash`）。
 pub const AGENT_CONTEXT_PAYLOAD_VERSION: u32 = 1;
@@ -466,14 +468,14 @@ impl AgentReadingSnapshot {
     /// Agent 上下文之前必须走敏感结构扫描；命中即整体丢弃该字段并登记，
     /// 不做部分截断——半截的路径同样是路径。
     ///
-    /// 扫描用 [`contains_sensitive_value_fragment`] 而不是快照/正文用的
+    /// 扫描用 [`contains_sensitive_setting_value`] 而不是快照/正文用的
     /// [`contains_sensitive_text`]：后者的凭据关键词表（`custom_background` 这类
     /// 字段名本身就含 `secret`/`custom_*` 结构）是为**正文片段**设计的，
     /// 直接套在单值上会把正常字段值判成敏感。
     pub fn from_settings(settings: &ReadingSettings) -> Self {
         let mut redacted_fields = Vec::new();
         let mut keep = |value: &Option<String>, field: AgentSettingsRedactedField| match value {
-            Some(text) if contains_sensitive_value_fragment(text) => {
+            Some(text) if contains_sensitive_setting_value(text) => {
                 redacted_fields.push(field);
                 None
             }
@@ -510,6 +512,165 @@ impl AgentReadingSnapshot {
             redacted: AgentReadingRedaction { redacted_fields },
         }
     }
+}
+
+/// 自由文本设置值在 Agent 投影里的固定占位符。
+///
+/// 它是**唯一**允许替代敏感原值的字符串：任何人看到它都知道"这里原本有一个值，
+/// 但按安全规则没有投影给 Agent"，而不是把它当成用户真的这么设置过。
+pub const AGENT_REDACTED_VALUE: &str = "[redacted]";
+
+/// 单个自由文本设置值的 Agent 投影：命中敏感结构 → 占位符。
+///
+/// 与 [`AgentReadingSnapshot::from_settings`] 的"清空 + 登记"不同，这里服务的是
+/// **形状固定、只有字符串槽位**的改动列表（`key`/`before`/`after`）：那里没有
+/// "这个字段被脱敏过"的登记位，只能用固定占位符替换。
+pub fn redact_setting_value_for_agent(value: &str) -> &str {
+    if contains_sensitive_setting_value(value) {
+        AGENT_REDACTED_VALUE
+    } else {
+        value
+    }
+}
+
+/// 整个阅读 Patch 的自由文本字段投影：敏感字段清空并登记被清空的字段名。
+///
+/// 这是"资源偏好快照 → Agent"的唯一脱敏规则，与全局设置上下文的快照共用同一个
+/// 单值判据（[`contains_sensitive_setting_value`]），避免两处各自实现、各自漂移。
+pub fn redact_reading_patch_for_agent(
+    patch: &ReadingPatch,
+) -> (ReadingPatch, Vec<AgentSettingsRedactedField>) {
+    let mut redacted_fields = Vec::new();
+    let mut keep = |value: &Option<String>, field: AgentSettingsRedactedField| match value {
+        Some(text) if contains_sensitive_setting_value(text) => {
+            redacted_fields.push(field);
+            None
+        }
+        Some(text) => Some(text.clone()),
+        None => None,
+    };
+    let custom_font_family = keep(
+        &patch.custom_font_family,
+        AgentSettingsRedactedField::CustomFontFamily,
+    );
+    let custom_background = keep(
+        &patch.custom_background,
+        AgentSettingsRedactedField::CustomBackground,
+    );
+    let custom_text = keep(&patch.custom_text, AgentSettingsRedactedField::CustomText);
+    redacted_fields.sort_unstable();
+    redacted_fields.dedup();
+    (
+        ReadingPatch {
+            custom_font_family,
+            custom_background,
+            custom_text,
+            ..patch.clone()
+        },
+        redacted_fields,
+    )
+}
+
+/// 将 authoritative 阅读设置投影为可进入 Agent 回执/差异的值。
+///
+/// 与上下文快照一样，命中敏感结构的自由文本不会被替换成用户可误认的普通值；
+/// 统一使用固定占位符。这个函数只用于 Agent 的审计投影，不改变设置事实源。
+pub fn redact_reading_settings_for_agent(settings: &ReadingSettings) -> ReadingSettings {
+    ReadingSettings {
+        custom_font_family: settings
+            .custom_font_family
+            .as_deref()
+            .map(redact_setting_value_for_agent)
+            .map(str::to_owned),
+        custom_background: settings
+            .custom_background
+            .as_deref()
+            .map(redact_setting_value_for_agent)
+            .map(str::to_owned),
+        custom_text: settings
+            .custom_text
+            .as_deref()
+            .map(redact_setting_value_for_agent)
+            .map(str::to_owned),
+        ..settings.clone()
+    }
+}
+
+/// 将资源偏好值投影为 Agent 可见的值。
+///
+/// 资源偏好在存储层是窄 Patch，而不是完整阅读设置；这里只复制结构并对三个开放
+/// 字符串槽位做同一套脱敏。资源快照/资源 Receipt 没有全局快照那样的字段登记，
+/// 因此使用固定 `[redacted]` 占位符而不是清空字段，避免 Agent 把“被隐藏”误判成
+/// “用户没有设置”。真正的 Agent 资源写入保存的是 patch 变体，不能依赖这个投影
+/// 来恢复被隐藏的 authoritative 值。
+pub fn redact_preference_data_for_agent(data: &PreferenceData) -> PreferenceData {
+    PreferenceData {
+        reading: data.reading.as_ref().map(|patch| ReadingPatch {
+            custom_font_family: patch
+                .custom_font_family
+                .as_deref()
+                .map(redact_setting_value_for_agent)
+                .map(str::to_owned),
+            custom_background: patch
+                .custom_background
+                .as_deref()
+                .map(redact_setting_value_for_agent)
+                .map(str::to_owned),
+            custom_text: patch
+                .custom_text
+                .as_deref()
+                .map(redact_setting_value_for_agent)
+                .map(str::to_owned),
+            ..patch.clone()
+        }),
+        comic: data.comic.clone(),
+    }
+}
+
+/// Agent 来源提案的自由文本安全校验。
+///
+/// 用户自己的设置允许自由文本（本机字体族名、自定义取色），因此**这条规则只加在
+/// Agent 来源的写入上**：Agent 提案不得把"疑似绝对路径 / endpoint / 凭据赋值"的
+/// 自由文本写进设置事实源。
+///
+/// 命中即拒绝，且错误文案是**固定短语**：被拒绝的原值不会出现在错误消息、wire
+/// 或日志里——否则"拒绝"本身就成了把敏感值带出边界的信道。
+pub fn validate_agent_proposal_free_text(change: &SettingProposalChange) -> Result<(), AppError> {
+    let reading = match change {
+        SettingProposalChange::SettingsPatch(SettingsPatch::Reading(patch)) => patch,
+        SettingProposalChange::ResourcePreference(data)
+        | SettingProposalChange::AgentResourcePreferencePatch(data) => match &data.reading {
+            Some(patch) => patch,
+            None => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+    for (value, field) in [
+        (
+            &reading.custom_font_family,
+            AgentSettingsRedactedField::CustomFontFamily,
+        ),
+        (
+            &reading.custom_background,
+            AgentSettingsRedactedField::CustomBackground,
+        ),
+        (&reading.custom_text, AgentSettingsRedactedField::CustomText),
+    ] {
+        let Some(value) = value else { continue };
+        if contains_sensitive_setting_value(value) {
+            return Err(agent_free_text_error(field));
+        }
+    }
+    Ok(())
+}
+
+fn agent_free_text_error(_field: AgentSettingsRedactedField) -> AppError {
+    AppError::new(
+        "AGENT_PROPOSAL_SENSITIVE_FREE_TEXT",
+        ErrorKind::Validation,
+        "Agent 提案包含不允许的敏感自由文本，已拒绝（原值不回显）",
+        false,
+    )
 }
 
 /// 枚举值在快照里只作为**字符串 token** 保存：领域层不复制一份 Wire 字符串字面量，
@@ -935,7 +1096,11 @@ impl AgentApprovalToken {
         hasher.update(proposal_digest.as_bytes());
         hasher.update(b"\n");
         hasher.update(self.raw.as_bytes());
-        let digest = format!("{:x}", hasher.finalize());
+        let digest: String = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         AgentApprovalTokenHash::parse(digest)
     }
 }
@@ -1929,6 +2094,16 @@ pub enum AgentCapability {
     SettingsProposal,
     /// 读取书库摘要。
     LibrarySummaryRead,
+    /// 读取设置来源分层。
+    SettingSourcesRead,
+    /// 读取版本/媒体条目的资源偏好。
+    ResourcePreferenceRead,
+    /// 创建资源偏好变更提案（不直接生效）。
+    ResourcePreferenceProposal,
+    /// 读取媒体条目的声明式能力。
+    MediaCapabilitiesRead,
+    /// 读取本地引导状态。
+    OnboardingRead,
     /// 创建元数据变更提案。
     MetadataProposal,
     /// 创建重命名提案。
@@ -1945,6 +2120,11 @@ impl AgentCapability {
             Self::SettingsRead => "settings_read",
             Self::SettingsProposal => "settings_proposal",
             Self::LibrarySummaryRead => "library_summary_read",
+            Self::SettingSourcesRead => "setting_sources_read",
+            Self::ResourcePreferenceRead => "resource_preference_read",
+            Self::ResourcePreferenceProposal => "resource_preference_proposal",
+            Self::MediaCapabilitiesRead => "media_capabilities_read",
+            Self::OnboardingRead => "onboarding_read",
             Self::MetadataProposal => "metadata_proposal",
             Self::RenameProposal => "rename_proposal",
             Self::SecretRead => "secret_read",
@@ -1969,6 +2149,16 @@ pub struct AgentCapabilitySet {
     #[serde(default)]
     pub library_summary_read: bool,
     #[serde(default)]
+    pub setting_sources_read: bool,
+    #[serde(default)]
+    pub resource_preference_read: bool,
+    #[serde(default)]
+    pub resource_preference_proposal: bool,
+    #[serde(default)]
+    pub media_capabilities_read: bool,
+    #[serde(default)]
+    pub onboarding_read: bool,
+    #[serde(default)]
     pub metadata_proposal: bool,
     #[serde(default)]
     pub rename_proposal: bool,
@@ -1985,6 +2175,11 @@ impl AgentCapabilitySet {
             AgentCapability::SettingsRead => self.settings_read,
             AgentCapability::SettingsProposal => self.settings_proposal,
             AgentCapability::LibrarySummaryRead => self.library_summary_read,
+            AgentCapability::SettingSourcesRead => self.setting_sources_read,
+            AgentCapability::ResourcePreferenceRead => self.resource_preference_read,
+            AgentCapability::ResourcePreferenceProposal => self.resource_preference_proposal,
+            AgentCapability::MediaCapabilitiesRead => self.media_capabilities_read,
+            AgentCapability::OnboardingRead => self.onboarding_read,
             AgentCapability::MetadataProposal => self.metadata_proposal,
             AgentCapability::RenameProposal => self.rename_proposal,
             AgentCapability::SecretRead => self.secret_read,
@@ -2000,7 +2195,7 @@ impl AgentCapabilitySet {
 /// {"agentApiVersion":1,"capabilities":{"settingsRead":true,...}}
 /// ```
 /// 关闭优先：默认值与 [`AgentCapabilityManifest::for_current_slice`] 只声明
-/// **本切片已实现**的能力（`settings_read` / `settings_proposal`），其余一律 false；
+/// **本切片已实现**的读取/提案能力，其余高风险能力一律 false；
 /// `validate` 拒绝任何声明了未实现能力的清单——manifest 是"声明"，不是"授权"。
 /// 未知字段由 `deny_unknown_fields` 在顶层与 `capabilities` 两层分别拒绝。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2020,14 +2215,19 @@ impl Default for AgentCapabilityManifest {
 }
 
 impl AgentCapabilityManifest {
-    /// 本切片的能力清单：只读设置 + 创建设置提案。
+    /// 本切片的能力清单：冻结的 7 个只读能力 + 2 个设置/资源偏好提案能力。
     pub const fn for_current_slice() -> Self {
         Self {
             agent_api_version: AGENT_API_VERSION,
             capabilities: AgentCapabilitySet {
                 settings_read: true,
                 settings_proposal: true,
-                library_summary_read: false,
+                library_summary_read: true,
+                setting_sources_read: true,
+                resource_preference_read: true,
+                resource_preference_proposal: true,
+                media_capabilities_read: true,
+                onboarding_read: true,
                 metadata_proposal: false,
                 rename_proposal: false,
                 secret_read: false,
@@ -2050,7 +2250,6 @@ impl AgentCapabilityManifest {
             ));
         }
         for capability in [
-            AgentCapability::LibrarySummaryRead,
             AgentCapability::MetadataProposal,
             AgentCapability::RenameProposal,
             AgentCapability::SecretRead,
@@ -2222,7 +2421,12 @@ const BEARER_TOKEN_MIN_CHARS: usize = 8;
 /// - 其余三类（`bearer` 片段、endpoint、绝对路径）与正文扫描共用同一实现。
 ///
 /// 允许 `#rrggbb` 颜色、字体族名与普通中文，不误伤。
-fn contains_sensitive_value_fragment(text: &str) -> bool {
+///
+/// 这是**单值**层面的唯一判据：`AgentReadingSnapshot::from_settings`、
+/// [`redact_reading_patch_for_agent`]、[`redact_setting_value_for_agent`] 与
+/// [`validate_agent_proposal_free_text`] 全部走它，避免"读路径脱敏、写路径放行"
+/// 这类只有一处实现的漂移。
+pub fn contains_sensitive_setting_value(text: &str) -> bool {
     let lowered = text.to_ascii_lowercase();
     contains_credential_assignment(&lowered)
         || contains_bearer_fragment(&lowered)
@@ -3484,10 +3688,20 @@ mod tests {
         let manifest = AgentCapabilityManifest::default();
         manifest.validate().unwrap();
         assert_eq!(manifest.agent_api_version, AGENT_API_VERSION);
-        assert!(manifest.grants(AgentCapability::SettingsRead));
-        assert!(manifest.grants(AgentCapability::SettingsProposal));
         for capability in [
+            AgentCapability::SettingsRead,
+            AgentCapability::SettingsProposal,
             AgentCapability::LibrarySummaryRead,
+            AgentCapability::SettingSourcesRead,
+            AgentCapability::ResourcePreferenceRead,
+            AgentCapability::ResourcePreferenceProposal,
+            AgentCapability::MediaCapabilitiesRead,
+            AgentCapability::OnboardingRead,
+        ] {
+            assert!(manifest.grants(capability), "{capability:?} 必须已实现");
+            manifest.require(capability).unwrap();
+        }
+        for capability in [
             AgentCapability::MetadataProposal,
             AgentCapability::RenameProposal,
             AgentCapability::SecretRead,
@@ -3509,7 +3723,6 @@ mod tests {
 
         // 值对象自身的默认值才是全关：不存在"默认放行"的中间态。
         for capability in [
-            AgentCapability::LibrarySummaryRead,
             AgentCapability::MetadataProposal,
             AgentCapability::RenameProposal,
             AgentCapability::SecretRead,
@@ -3531,7 +3744,12 @@ mod tests {
                 "capabilities": {
                     "settingsRead": true,
                     "settingsProposal": true,
-                    "librarySummaryRead": false,
+                    "librarySummaryRead": true,
+                    "settingSourcesRead": true,
+                    "resourcePreferenceRead": true,
+                    "resourcePreferenceProposal": true,
+                    "mediaCapabilitiesRead": true,
+                    "onboardingRead": true,
                     "metadataProposal": false,
                     "renameProposal": false,
                     "secretRead": false,
@@ -3542,7 +3760,9 @@ mod tests {
 
         // 反序列化同一份 JSON 必须回到同一个值。
         let approved = r#"{"agentApiVersion":1,"capabilities":{
-            "settingsRead":true,"settingsProposal":true,"librarySummaryRead":false,
+            "settingsRead":true,"settingsProposal":true,"librarySummaryRead":true,
+            "settingSourcesRead":true,"resourcePreferenceRead":true,
+            "resourcePreferenceProposal":true,"mediaCapabilitiesRead":true,"onboardingRead":true,
             "metadataProposal":false,"renameProposal":false,"secretRead":false,
             "filesystemWrite":false}}"#;
         let parsed: AgentCapabilityManifest = serde_json::from_str(approved).unwrap();
@@ -3562,6 +3782,11 @@ mod tests {
                 "settingsRead": true,
                 "settingsProposal": false,
                 "librarySummaryRead": false,
+                "settingSourcesRead": false,
+                "resourcePreferenceRead": false,
+                "resourcePreferenceProposal": false,
+                "mediaCapabilitiesRead": false,
+                "onboardingRead": false,
                 "metadataProposal": false,
                 "renameProposal": false,
                 "secretRead": false,
@@ -3695,12 +3920,8 @@ mod tests {
             "清单自身非法时，任何 require 都必须先失败"
         );
 
-        // 每一项未实现能力单独声明都会被拒绝。
+        // 每一项高风险未实现能力单独声明都会被拒绝。
         for (capability, json) in [
-            (
-                AgentCapability::LibrarySummaryRead,
-                r#"{"agentApiVersion":1,"capabilities":{"librarySummaryRead":true}}"#,
-            ),
             (
                 AgentCapability::MetadataProposal,
                 r#"{"agentApiVersion":1,"capabilities":{"metadataProposal":true}}"#,
@@ -3729,7 +3950,6 @@ mod tests {
 
         // 程序化构造同样被拒绝（不能绕过 JSON 校验）。
         for capability in [
-            AgentCapability::LibrarySummaryRead,
             AgentCapability::MetadataProposal,
             AgentCapability::RenameProposal,
             AgentCapability::SecretRead,
@@ -3737,9 +3957,6 @@ mod tests {
         ] {
             let mut manifest = AgentCapabilityManifest::for_current_slice();
             match capability {
-                AgentCapability::LibrarySummaryRead => {
-                    manifest.capabilities.library_summary_read = true
-                }
                 AgentCapability::MetadataProposal => manifest.capabilities.metadata_proposal = true,
                 AgentCapability::RenameProposal => manifest.capabilities.rename_proposal = true,
                 AgentCapability::SecretRead => manifest.capabilities.secret_read = true,
@@ -4497,6 +4714,179 @@ mod tests {
                 .code()
                 .as_str(),
             "AGENT_SETTINGS_CONTEXT_INVALID"
+        );
+    }
+
+    /// 单值层面的敏感结构判据：**读路径**（快照/投影）与**写路径**（Agent 提案）
+    /// 共用它，因此只写一条用例钉住"什么算敏感、什么不算"。
+    #[test]
+    fn setting_value_sensitivity_scan_is_shared_by_reads_and_writes() {
+        // 合法的设置值：取色、字体族名、中文说明都不算敏感。
+        for allowed in [
+            "#f7f1e3",
+            "Source Han Serif",
+            "Noto Serif CJK SC",
+            "霞鹜文楷",
+            "system-ui",
+        ] {
+            assert!(
+                !contains_sensitive_setting_value(allowed),
+                "合法设置值不得被误判：{allowed}"
+            );
+            assert_eq!(redact_setting_value_for_agent(allowed), allowed);
+        }
+        // 绝对路径、endpoint、`Bearer` 片段与凭据赋值一律命中。
+        for sensitive in [
+            "C:/Windows/Fonts/msyh.ttc",
+            "D:\\fonts\\my.ttf",
+            "/etc/fonts/local.conf",
+            "\\\\server\\share\\font.ttf",
+            "https://example.invalid/font.css",
+            "file:///usr/share/fonts",
+            "Authorization: Bearer sk-live-1234567890",
+            "api_key=sk-live-1234567890",
+        ] {
+            assert!(
+                contains_sensitive_setting_value(sensitive),
+                "敏感结构必须命中：{sensitive}"
+            );
+            assert_eq!(
+                redact_setting_value_for_agent(sensitive),
+                AGENT_REDACTED_VALUE,
+                "敏感值的 Agent 投影只能是占位符：{sensitive}"
+            );
+        }
+    }
+
+    /// 资源偏好（版本/条目级覆盖）只在**三个自由文本字段**上做脱敏，其余字段原样保留。
+    #[test]
+    fn reading_patch_redaction_clears_only_sensitive_free_text_fields() {
+        let patch = ReadingPatch {
+            font_size: Some(crate::settings::ReadingFontSize::Large),
+            custom_font_family: Some("C:/Windows/Fonts/msyh.ttc".into()),
+            custom_background: Some("#101418".into()),
+            custom_text: Some("password=hunter2xyz".into()),
+            ..ReadingPatch::default()
+        };
+        let (redacted, fields) = redact_reading_patch_for_agent(&patch);
+        assert!(redacted.custom_font_family.is_none());
+        assert!(redacted.custom_text.is_none());
+        // 合规的自由文本与档位原样保留：脱敏不是"抹掉整段偏好"。
+        assert_eq!(redacted.custom_background.as_deref(), Some("#101418"));
+        assert_eq!(redacted.font_size, patch.font_size);
+        assert_eq!(
+            fields,
+            vec![
+                AgentSettingsRedactedField::CustomFontFamily,
+                AgentSettingsRedactedField::CustomText,
+            ]
+        );
+        // 序列化投影不得携带被清空的原值。
+        let json = canonical_json_of(&redacted).unwrap();
+        for needle in ["C:/Windows", "hunter2xyz"] {
+            assert!(!json.contains(needle), "脱敏后的 patch 不得携带 {needle}");
+        }
+    }
+
+    #[test]
+    fn preference_data_redaction_uses_a_placeholder_for_sensitive_resource_text() {
+        let data = PreferenceData {
+            reading: Some(ReadingPatch {
+                custom_font_family: Some("D:/private/font.ttf".into()),
+                custom_background: Some("#101418".into()),
+                ..ReadingPatch::default()
+            }),
+            comic: None,
+        };
+        let redacted = redact_preference_data_for_agent(&data);
+        let reading = redacted
+            .reading
+            .as_ref()
+            .expect("reading section remains present");
+        assert_eq!(
+            reading.custom_font_family.as_deref(),
+            Some(AGENT_REDACTED_VALUE)
+        );
+        assert_eq!(reading.custom_background.as_deref(), Some("#101418"));
+        let json = serde_json::to_string(&redacted).unwrap();
+        assert!(!json.contains("D:/private/font.ttf"));
+        assert!(json.contains(AGENT_REDACTED_VALUE));
+    }
+
+    /// Agent 提案的自由文本校验：命中即拒绝，且**错误里没有原值**。
+    #[test]
+    fn agent_proposal_free_text_is_rejected_without_echoing_the_value() {
+        let sensitive = "C:/Windows/Fonts/msyh.ttc";
+        let reading_patch = ReadingPatch {
+            custom_font_family: Some(sensitive.into()),
+            ..ReadingPatch::default()
+        };
+        for change in [
+            SettingProposalChange::SettingsPatch(SettingsPatch::Reading(reading_patch.clone())),
+            SettingProposalChange::ResourcePreference(crate::settings::PreferenceData {
+                reading: Some(reading_patch.clone()),
+                comic: None,
+            }),
+            SettingProposalChange::AgentResourcePreferencePatch(crate::settings::PreferenceData {
+                reading: Some(reading_patch.clone()),
+                comic: None,
+            }),
+        ] {
+            let error = validate_agent_proposal_free_text(&change).unwrap_err();
+            assert_eq!(error.code().as_str(), "AGENT_PROPOSAL_SENSITIVE_FREE_TEXT");
+            assert!(
+                !error.user_message().contains(sensitive)
+                    && !error.user_message().contains("Windows"),
+                "拒绝文案不得回显原值：{}",
+                error.user_message()
+            );
+            assert_eq!(
+                error.user_message(),
+                "Agent 提案包含不允许的敏感自由文本，已拒绝（原值不回显）"
+            );
+        }
+
+        // 合规的自由文本（字体族名、取色、中文）必须放行，否则 Agent 连正常建议都提不了。
+        for change in [
+            SettingProposalChange::SettingsPatch(SettingsPatch::Reading(ReadingPatch {
+                custom_font_family: Some("Source Han Serif".into()),
+                custom_background: Some("#f7f1e3".into()),
+                custom_text: Some("#2b2b2b".into()),
+                ..ReadingPatch::default()
+            })),
+            SettingProposalChange::ResourcePreference(crate::settings::PreferenceData {
+                reading: Some(ReadingPatch {
+                    custom_text: Some("霞鹜文楷".into()),
+                    ..ReadingPatch::default()
+                }),
+                comic: None,
+            }),
+            SettingProposalChange::AgentResourcePreferencePatch(crate::settings::PreferenceData {
+                reading: Some(ReadingPatch {
+                    custom_text: Some("霞鹜文楷".into()),
+                    ..ReadingPatch::default()
+                }),
+                comic: None,
+            }),
+        ] {
+            validate_agent_proposal_free_text(&change).unwrap();
+        }
+
+        // 与阅读自由文本无关的分区/操作不受这条规则影响。
+        assert!(
+            validate_agent_proposal_free_text(&SettingProposalChange::SettingsPatch(
+                SettingsPatch::Comic(Default::default())
+            ))
+            .is_ok()
+        );
+        assert!(
+            validate_agent_proposal_free_text(&SettingProposalChange::ResourcePreference(
+                crate::settings::PreferenceData {
+                    reading: None,
+                    comic: Some(Default::default()),
+                }
+            ))
+            .is_ok()
         );
     }
 

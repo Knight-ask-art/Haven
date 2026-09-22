@@ -152,7 +152,7 @@ fn parse_atom(xml: &str, base: &str) -> (Vec<OpdsEntry>, Vec<(String, String)>) 
             }
             Ok(Event::Text(t)) => {
                 if let Some(field) = text_target {
-                    let text = t.unescape().map(|c| c.into_owned()).unwrap_or_default();
+                    let text = decode_xml_text(&t).unwrap_or_default();
                     apply_text(field, &text, &mut builder);
                 }
             }
@@ -161,6 +161,13 @@ fn parse_atom(xml: &str, base: &str) -> (Vec<OpdsEntry>, Vec<(String, String)>) 
                     let raw = t.into_inner();
                     let text = std::str::from_utf8(raw.as_ref()).unwrap_or("");
                     apply_text(field, text, &mut builder);
+                }
+            }
+            Ok(Event::GeneralRef(reference)) => {
+                if let Some(field) = text_target
+                    && let Some(text) = decode_xml_reference(&reference)
+                {
+                    apply_text(field, &text, &mut builder);
                 }
             }
             Ok(Event::End(e)) => {
@@ -229,6 +236,21 @@ fn local_name_of(raw: &[u8]) -> String {
 
 fn local_name(e: &quick_xml::events::BytesStart<'_>) -> String {
     local_name_of(e.name().as_ref())
+}
+
+fn decode_xml_text(text: &quick_xml::events::BytesText<'_>) -> Option<String> {
+    let decoded = text.decode().ok()?;
+    quick_xml::escape::unescape(decoded.as_ref())
+        .ok()
+        .map(|value| value.into_owned())
+}
+
+fn decode_xml_reference(reference: &quick_xml::events::BytesRef<'_>) -> Option<String> {
+    let name = reference.decode().ok()?;
+    let raw = format!("&{name};");
+    quick_xml::escape::unescape(&raw)
+        .ok()
+        .map(|value| value.into_owned())
 }
 
 fn apply_text(field: &str, text: &str, builder: &mut EntryBuilder) {

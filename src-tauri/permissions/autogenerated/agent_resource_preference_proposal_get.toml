@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-agent-resource-preference-proposal-get"
+description = "Enables the agent_resource_preference_proposal_get command without any pre-configured scope."
+commands.allow = ["agent_resource_preference_proposal_get"]
+
+[[permission]]
+identifier = "deny-agent-resource-preference-proposal-get"
+description = "Denies the agent_resource_preference_proposal_get command without any pre-configured scope."
+commands.deny = ["agent_resource_preference_proposal_get"]

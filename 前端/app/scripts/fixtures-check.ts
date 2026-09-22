@@ -17,6 +17,8 @@ import type {
   LibraryChangedDto,
   LibraryScanEvent,
   LibraryShelvesDto,
+  AiProviderModelsCatalogDto,
+  AiProviderProfileListResultDto,
   MediaStateDto,
   MetadataChangedDto,
   PageDto,
@@ -84,6 +86,13 @@ import credentialStatusConfigured from "../../../contracts/ipc/v1/fixtures/crede
 import credentialStatusNotConfigured from "../../../contracts/ipc/v1/fixtures/credential/status.not-configured.json" with { type: "json" };
 import credentialSetRequest from "../../../contracts/ipc/v1/fixtures/credential/set.request.json" with { type: "json" };
 import credentialDeleteRequest from "../../../contracts/ipc/v1/fixtures/credential/delete.request.json" with { type: "json" };
+// A2 AI Provider 基础切片：与 Rust 侧 fixtures_consistency 消费同一批样本。
+import aiProviderProfileListNormal from "../../../contracts/ipc/v1/fixtures/ai-provider/profile.list.normal.json" with { type: "json" };
+import aiProviderProfileListEmpty from "../../../contracts/ipc/v1/fixtures/ai-provider/profile.list.empty.json" with { type: "json" };
+import aiProviderModelsReady from "../../../contracts/ipc/v1/fixtures/ai-provider/models.catalog.normal.json" with { type: "json" };
+import aiProviderModelsNoCredential from "../../../contracts/ipc/v1/fixtures/ai-provider/models.catalog.no-credential.json" with { type: "json" };
+import aiProviderModelsDisabled from "../../../contracts/ipc/v1/fixtures/ai-provider/models.catalog.disabled.json" with { type: "json" };
+import aiProviderModelsEmpty from "../../../contracts/ipc/v1/fixtures/ai-provider/models.catalog.empty.json" with { type: "json" };
 import mediaStateNormal from "../../../contracts/ipc/v1/fixtures/media-state/state.normal.json" with { type: "json" };
 import enrichmentStatusRequest from "../../../contracts/ipc/v1/fixtures/enrichment/status.request.json" with { type: "json" };
 import enrichmentStatePending from "../../../contracts/ipc/v1/fixtures/enrichment/state.pending.json" with { type: "json" };
@@ -141,6 +150,12 @@ const loadedBaseFixtureSamples: readonly unknown[] = [
   credentialStatusNotConfigured,
   credentialSetRequest,
   credentialDeleteRequest,
+  aiProviderProfileListNormal,
+  aiProviderProfileListEmpty,
+  aiProviderModelsReady,
+  aiProviderModelsNoCredential,
+  aiProviderModelsDisabled,
+  aiProviderModelsEmpty,
   mediaStateNormal,
   enrichmentStatusRequest,
   enrichmentStatePending,
@@ -423,6 +438,88 @@ function guardCredentialStatus(dto: unknown): dto is CredentialStatusDto {
   return true;
 }
 
+// AI Provider 基础切片（A2）。这里是本文件自己的守卫，与 `guardCredentialStatus` 同理：
+// fixtures-check 以 `--ignoreConfig` 编译，解析不了 `@/` 别名，因此不能复用设置页
+// gateway 里的守卫。那份**更严格**的守卫（精确键集 + 拒绝 symbol/非枚举键）由
+// `features/settings/ipc/ai-provider-gateway.test.ts` 直接加载同一批 fixture 覆盖。
+const AI_PROVIDER_PROFILE_FIELDS = [
+  "schemaVersion",
+  "profileId",
+  "displayName",
+  "kind",
+  "endpoint",
+  "enabled",
+  "selectedModelId",
+  "credentialConfigured",
+  "revision",
+  "createdAt",
+  "updatedAt",
+];
+const AI_MODEL_FIELDS = ["modelId", "displayName", "created", "ownedBy", "chat", "vision", "embedding"];
+const AI_CATALOG_FIELDS = ["schemaVersion", "profileId", "state", "models"];
+const AI_MODEL_CAPABILITIES = new Set(["supported", "unsupported", "unknown"]);
+const AI_CATALOG_STATES = new Set(["ready", "disabled", "no_credential", "empty"]);
+
+function hasExactFields(value: Record<string, unknown>, fields: readonly string[]): boolean {
+  const keys = Reflect.ownKeys(value);
+  return keys.length === fields.length
+    && keys.every((key) => typeof key === "string" && fields.includes(key));
+}
+
+function guardAiProviderProfileFixture(dto: unknown): boolean {
+  const v = dto as Record<string, unknown>;
+  if (!hasExactFields(v, AI_PROVIDER_PROFILE_FIELDS)) fail("AI Provider profile 字段集", v);
+  if (v.schemaVersion !== 1) fail("AiProviderProfileDto.schemaVersion 必须为 1", v);
+  if (typeof v.profileId !== "string" || v.profileId.length === 0) fail("profileId", v);
+  if (typeof v.displayName !== "string" || v.displayName.length === 0) fail("displayName", v);
+  if (v.kind !== "openai_compatible") fail("kind 闭合枚举值", v);
+  if (typeof v.endpoint !== "string" || !/^https?:\/\//.test(v.endpoint)) fail("endpoint 必须是 http(s)", v);
+  if (typeof v.enabled !== "boolean") fail("enabled", v);
+  if (v.selectedModelId !== null && typeof v.selectedModelId !== "string") fail("selectedModelId", v);
+  if (typeof v.credentialConfigured !== "boolean") fail("credentialConfigured", v);
+  if (typeof v.revision !== "string" || v.revision.length === 0) fail("revision", v);
+  for (const forbidden of ["secret", "apiKey", "api_key", "credentialRef", "target", "token"]) {
+    if (Object.prototype.hasOwnProperty.call(v, forbidden)) fail(`profile 投影禁止 ${forbidden}`, v);
+  }
+  return true;
+}
+
+function guardAiProviderProfileListFixture(dto: unknown): dto is AiProviderProfileListResultDto {
+  const v = dto as Record<string, unknown>;
+  if (!hasExactFields(v, ["schemaVersion", "profiles"])) fail("AI Provider list 字段集", v);
+  if (v.schemaVersion !== 1) fail("AiProviderProfileListResultDto.schemaVersion 必须为 1", v);
+  if (!Array.isArray(v.profiles)) fail("profiles 必须是数组", v);
+  for (const profile of v.profiles as unknown[]) {
+    if (!guardAiProviderProfileFixture(profile)) return false;
+  }
+  return true;
+}
+
+function guardAiProviderModelsFixture(dto: unknown): dto is AiProviderModelsCatalogDto {
+  const v = dto as Record<string, unknown>;
+  if (!hasExactFields(v, AI_CATALOG_FIELDS)) fail("AI Provider catalog 字段集", v);
+  if (v.schemaVersion !== 1) fail("AiProviderModelsCatalogDto.schemaVersion 必须为 1", v);
+  if (typeof v.profileId !== "string" || v.profileId.length === 0) fail("profileId", v);
+  if (typeof v.state !== "string" || !AI_CATALOG_STATES.has(v.state)) fail("state 闭合枚举值", v);
+  if (!Array.isArray(v.models)) fail("models 必须是数组", v);
+  if (v.state !== "ready" && (v.models as unknown[]).length > 0) fail("非 ready 状态不得携带模型", v);
+  if (v.state === "ready" && (v.models as unknown[]).length === 0) fail("ready 状态不得是空目录", v);
+  for (const model of v.models as unknown[]) {
+    const m = model as Record<string, unknown>;
+    if (!hasExactFields(m, AI_MODEL_FIELDS)) fail("AI Provider model 字段集", m);
+    if (typeof m.modelId !== "string" || m.modelId.length === 0) fail("modelId", m);
+    if (m.displayName !== null && typeof m.displayName !== "string") fail("displayName", m);
+    if (m.created !== null && typeof m.created !== "number") fail("created", m);
+    if (m.ownedBy !== null && typeof m.ownedBy !== "string") fail("ownedBy", m);
+    for (const capability of ["chat", "vision", "embedding"]) {
+      if (typeof m[capability] !== "string" || !AI_MODEL_CAPABILITIES.has(m[capability] as string)) {
+        fail(`${capability} 能力三态`, m);
+      }
+    }
+  }
+  return true;
+}
+
 function guardMediaState(dto: unknown): dto is MediaStateDto {
   const v = dto as Record<string, unknown>;
   if (v.schemaVersion !== 2) fail("MediaStateDto.schemaVersion 必须为 2", v);
@@ -596,6 +693,24 @@ const checkMetadataChanged: MetadataChangedDto = guardMetadataChanged(metadataCh
 const checkResourceRemoteStream: ResourceListDto = guardResourceList(resourceRemoteStream)
   ? resourceRemoteStream
   : fail("resourceRemoteStream", resourceRemoteStream);
+const checkAiProfilesNormal: AiProviderProfileListResultDto = guardAiProviderProfileListFixture(aiProviderProfileListNormal)
+  ? aiProviderProfileListNormal
+  : fail("aiProviderProfileListNormal", aiProviderProfileListNormal);
+const checkAiProfilesEmpty: AiProviderProfileListResultDto = guardAiProviderProfileListFixture(aiProviderProfileListEmpty)
+  ? aiProviderProfileListEmpty
+  : fail("aiProviderProfileListEmpty", aiProviderProfileListEmpty);
+const checkAiModelsReady: AiProviderModelsCatalogDto = guardAiProviderModelsFixture(aiProviderModelsReady)
+  ? aiProviderModelsReady
+  : fail("aiProviderModelsReady", aiProviderModelsReady);
+const checkAiModelsNoCredential: AiProviderModelsCatalogDto = guardAiProviderModelsFixture(aiProviderModelsNoCredential)
+  ? aiProviderModelsNoCredential
+  : fail("aiProviderModelsNoCredential", aiProviderModelsNoCredential);
+const checkAiModelsDisabled: AiProviderModelsCatalogDto = guardAiProviderModelsFixture(aiProviderModelsDisabled)
+  ? aiProviderModelsDisabled
+  : fail("aiProviderModelsDisabled", aiProviderModelsDisabled);
+const checkAiModelsEmpty: AiProviderModelsCatalogDto = guardAiProviderModelsFixture(aiProviderModelsEmpty)
+  ? aiProviderModelsEmpty
+  : fail("aiProviderModelsEmpty", aiProviderModelsEmpty);
 
 // ---- 语义断言 ----
 
@@ -741,6 +856,70 @@ if (credentialSetFixture.secret !== "fixture-not-a-real-secret") {
 }
 if ((credentialDeleteRequest as { provider: string }).provider !== "webdav") {
   throw new Error("credential provider 闭合枚举值 webdav");
+}
+
+// ---- AI Provider 基础切片（A2）----
+if (checkAiProfilesNormal.profiles.length !== 1) {
+  throw new Error("ai-provider normal 样本必须恰好有一个 profile");
+}
+const aiProfile = checkAiProfilesNormal.profiles[0];
+if (aiProfile.kind !== "openai_compatible") {
+  throw new Error("AI Provider 种类是闭合枚举，样本值必须是 openai_compatible");
+}
+if (!aiProfile.endpoint.startsWith("https://")) {
+  throw new Error("AI Provider 端点必须是 http(s)；样本不得使用本地路径或其它 scheme");
+}
+if (checkAiProfilesEmpty.profiles.length !== 0) {
+  throw new Error("无 profile 的样本必须是空列表（UI 据此显示「无可用模型」）");
+}
+// profile 投影里唯一的凭据信息是布尔事实：样本里不得出现任何凭据材料。
+const aiFixtureText = JSON.stringify([
+  checkAiProfilesNormal,
+  checkAiProfilesEmpty,
+  checkAiModelsReady,
+  checkAiModelsNoCredential,
+  checkAiModelsDisabled,
+  checkAiModelsEmpty,
+]);
+for (const forbidden of ["haven:ai:", "secret", "apiKey", "api_key", "credentialRef", "Bearer"]) {
+  if (aiFixtureText.includes(forbidden)) {
+    throw new Error(`AI Provider 样本不得包含 ${forbidden}`);
+  }
+}
+if (checkAiModelsReady.state !== "ready" || checkAiModelsReady.models.length !== 2) {
+  throw new Error("ai-provider ready 样本语义");
+}
+// 能力三态：只有显式声明才是 supported；没有声明的必须是 unknown，
+// 绝不能因为模型名里带 "vision"/"embedding" 就被写成 supported/unsupported。
+if (checkAiModelsReady.models[0].vision !== "unknown") {
+  throw new Error("未声明识图能力的模型必须是 unknown，不得从模型名推断");
+}
+if (checkAiModelsReady.models[0].chat !== "supported") {
+  throw new Error("显式声明的能力才允许是 supported");
+}
+if (checkAiModelsReady.models[1].embedding !== "supported"
+  || checkAiModelsReady.models[1].chat !== "unknown") {
+  throw new Error("显式声明的向量能力才允许是 supported");
+}
+for (const [name, catalog, state] of [
+  ["no-credential", checkAiModelsNoCredential, "no_credential"],
+  ["disabled", checkAiModelsDisabled, "disabled"],
+  ["empty", checkAiModelsEmpty, "empty"],
+] as const) {
+  if (catalog.state !== state) throw new Error(`ai-provider ${name} 样本 state 语义`);
+  if (catalog.models.length !== 0) {
+    throw new Error(`ai-provider ${name} 样本必须是空目录（诚实空态，不得伪造模型）`);
+  }
+}
+// 交叉一致性：profile 里被选中的模型必须真的出现在同一批样本的模型目录里。
+// 一个"选了目录里没有的模型"的样本会教 UI 相信模型可以凭空存在。
+const listedModelIds = new Set(checkAiModelsReady.models.map((model) => model.modelId));
+if (aiProfile.selectedModelId !== null && !listedModelIds.has(aiProfile.selectedModelId)) {
+  throw new Error("profile 选中的模型必须来自同一批样本的模型目录");
+}
+// UI 的空态文案绝不能同时是一个真实模型 id，否则「无可用模型」会被当成可选项。
+if (listedModelIds.has("无可用模型")) {
+  throw new Error("AI Provider 空态文案不得与任何模型 id 重名");
 }
 
 if (checkMediaState.rating !== null) throw new Error("v0.2 rating 预留位恒 null");

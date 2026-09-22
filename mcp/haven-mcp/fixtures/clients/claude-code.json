@@ -1,0 +1,13 @@
+{
+  "fixture": true,
+  "verified": false,
+  "client": "Claude Code",
+  "server": {
+    "command": "node",
+    "args": ["<repo>/mcp/haven-mcp/dist/index.js"],
+    "env": {
+      "HAVEN_MCP_BRIDGE": "live",
+      "HAVEN_MCP_ENDPOINT": "<copy-from-haven-ui>"
+    }
+  }
+}

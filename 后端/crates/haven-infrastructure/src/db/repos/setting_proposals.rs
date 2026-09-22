@@ -1107,8 +1107,8 @@ mod tests {
         AgentLocatorConfidence, AgentSubject,
     };
     use haven_domain::contracts::{
-        AgentActionBindingRepository, ResourcePreferenceRepository, SettingProposalRepository,
-        SettingsRepository, SettingsRow,
+        AgentActionBindingRepository, EditionPreference, ResourcePreferenceRepository,
+        SettingProposalRepository, SettingsRepository, SettingsRow,
     };
     use haven_domain::ids::{AgentContextSnapshotId, AgentRequestId, AgentSessionId, WorkId};
     use haven_domain::setting_proposal::{
@@ -1159,7 +1159,7 @@ mod tests {
         .unwrap()
     }
 
-    fn seed_edition(db: &Db, edition_id: EditionId) {
+    fn seed_edition(db: &Db, edition_id: EditionId) -> haven_domain::ids::WorkId {
         let work_id = haven_domain::ids::WorkId::new();
         {
             let conn = db.lock();
@@ -1176,6 +1176,7 @@ mod tests {
             )
             .unwrap();
         }
+        work_id
     }
 
     fn seed_media_item(db: &Db, media_item_id: MediaItemId, edition_id: EditionId) {
@@ -1629,6 +1630,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_agent_resource_patch_approval_merges_without_receipt_leak() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (service, repository) = service(&db);
+        let edition_id = EditionId::new();
+        let work_id = seed_edition(&db, edition_id);
+        let preferences = crate::db::repos::SqliteResourcePreferenceRepository::new(db.clone());
+        let existing_revision = "pref-existing".to_owned();
+        let existing = EditionPreference {
+            edition_id,
+            data: PreferenceData {
+                reading: Some(ReadingPatch {
+                    custom_font_family: Some("D:\\private\\font.ttf".to_owned()),
+                    ..ReadingPatch::default()
+                }),
+                comic: None,
+            },
+            revision: existing_revision.clone(),
+            updated_at: UtcMillis::now(),
+        };
+        assert!(
+            preferences
+                .cas_upsert_edition(&existing, None)
+                .await
+                .unwrap()
+        );
+
+        let patch = PreferenceData {
+            reading: Some(ReadingPatch {
+                font_size: Some(ReadingFontSize::Large),
+                ..ReadingPatch::default()
+            }),
+            comic: None,
+        };
+        let target = SettingTarget::edition(edition_id);
+        let (proposal, _) = service
+            .create_with_agent_binding(
+                SettingProposalRequest::new(
+                    target,
+                    SettingProposalChange::AgentResourcePreferencePatch(patch.clone()),
+                    SettingProvenance::agent(ProvenanceReason::AgentSuggestion),
+                )
+                .with_base_revision(Some(existing_revision)),
+                agent_binding_input(AgentSubject::edition(
+                    work_id,
+                    edition_id,
+                    AgentContentKind::Book,
+                )),
+            )
+            .await
+            .unwrap();
+
+        let receipt = service
+            .approve_agent_resource_proposal_in_one_uow(proposal.id(), proposal.digest(), target)
+            .await
+            .unwrap();
+        assert!(receipt.changed);
+        assert!(!receipt.before_canonical_json.contains("private"));
+        assert!(!receipt.after_canonical_json.contains("font.ttf"));
+        assert_eq!(
+            repository
+                .get(proposal.id())
+                .await
+                .unwrap()
+                .unwrap()
+                .status(),
+            SettingProposalStatus::Applied
+        );
+        let stored = preferences.get_edition(edition_id).await.unwrap().unwrap();
+        let reading = stored.data.reading.unwrap();
+        assert_eq!(
+            reading.custom_font_family.as_deref(),
+            Some("D:\\private\\font.ttf")
+        );
+        assert_eq!(reading.font_size, Some(ReadingFontSize::Large));
+    }
+
+    #[tokio::test]
     async fn sqlite_agent_approval_token_consumption_rolls_back_with_late_receipt_failure() {
         let db = Arc::new(Db::open_in_memory().unwrap());
         let (service, repository) = service(&db);
@@ -1790,7 +1868,13 @@ mod tests {
             .create_with_agent_binding(
                 SettingProposalRequest::new(
                     SettingTarget::edition(EditionId::new()),
-                    SettingProposalChange::ResourcePreference(PreferenceData::default()),
+                    SettingProposalChange::AgentResourcePreferencePatch(PreferenceData {
+                        reading: Some(haven_domain::settings::ReadingPatch {
+                            font_size: Some(ReadingFontSize::Large),
+                            ..Default::default()
+                        }),
+                        comic: None,
+                    }),
                     SettingProvenance::agent(ProvenanceReason::AgentSuggestion),
                 ),
                 agent_binding_input(agent_subject(&db)),

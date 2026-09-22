@@ -6,7 +6,10 @@
 //! - 实现方（src-tauri / 测试）通过组合端口注入具体 Repository。
 
 pub mod agent;
+pub mod agent_context;
 pub mod agent_settings_ipc;
+pub mod agent_trace;
+pub mod ai_provider;
 pub mod app_info;
 pub mod cache;
 pub mod cast;
@@ -52,7 +55,19 @@ pub use agent::{
     AgentActionProposal, AgentCapabilityPolicy, AgentProposalService, AgentSettingsActionRequest,
     AgentSettingsScopeActionRequest, AgentSubjectScopePort, RepositoryAgentSubjectScope,
 };
+pub use agent_context::AgentContextQueryService;
 pub use agent_settings_ipc::{AgentSettingsContext, AgentSettingsIpcService};
+pub use agent_trace::{
+    AgentEventKind, AgentTraceContext, AgentTraceEvent, AgentTraceEventDraft, AgentTracePort,
+    AgentTraceQueryPort, AgentTraceQueryService, InMemoryAgentTraceCollector,
+    MAX_TRACE_EVENTS_PER_SESSION,
+};
+pub use ai_provider::{
+    AI_CREDENTIAL_PROVIDER, AiModelCatalogPort, AiProviderProfileService,
+    AiSettingsRecommendationInput, AiSettingsRecommendationPort, AiSettingsRecommendationRequest,
+    AiSettingsRecommendationResult, UnavailableModelCatalog, UnavailableSettingsRecommendation,
+    credential_target as ai_provider_credential_target,
+};
 pub use app_info::{AppInfoPorts, AppInfoService, DirectoryKind};
 pub use cache::{ArtworkCacheClearPort, CacheService};
 pub use cast::{CastControlPort, CastDiscoveryPort, CastGrantRegistry, CastMediaPort, CastService};

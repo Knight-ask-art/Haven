@@ -229,8 +229,10 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
         const context = canvas.getContext("2d")
         if (!context) throw new Error("PDF canvas unavailable")
         context.clearRect(0, 0, canvas.width, canvas.height)
+        // PDF.js 6 requires an explicit null canvas when rendering through a
+        // supplied 2D context; the context's canvas is the raster target.
         const renderTask = page.render({
-          canvas,
+          canvas: null,
           canvasContext: context,
           viewport,
           transform: outputScale === 1 ? undefined : [outputScale, 0, 0, outputScale, 0, 0],

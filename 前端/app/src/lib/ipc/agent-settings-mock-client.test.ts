@@ -50,7 +50,7 @@ describe("MockHavenClient Agent 全局设置 Typed 契约", () => {
     expect(context.capabilities.capabilities).toMatchObject({
       settingsRead: true,
       settingsProposal: true,
-      librarySummaryRead: false,
+      librarySummaryRead: true,
       metadataProposal: false,
       renameProposal: false,
       secretRead: false,
