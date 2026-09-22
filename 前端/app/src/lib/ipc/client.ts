@@ -107,6 +107,12 @@ import type {
   AgentSettingChangeReceiptDto,
   AgentSettingChangeReceiptGetRequest,
   AgentSettingsContextDto,
+  AgentResourcePreferenceProposalApproveRequest,
+  AgentResourcePreferenceProposalApproveResultDto,
+  AgentResourcePreferenceProposalCreateRequest,
+  AgentResourcePreferenceProposalDto,
+  AgentResourcePreferenceProposalGetRequest,
+  AgentResourcePreferenceProposalGetResultDto,
   AgentSettingsProposalApproveRequest,
   AgentSettingsProposalApproveResultDto,
   AgentSettingsProposalCreateRequest,
@@ -115,8 +121,12 @@ import type {
   AgentSettingsProposalGetResultDto,
   AgentSettingsProposalRejectRequest,
   AgentSettingsProposalRejectResultDto,
+  AgentTraceGetRequest,
+  AgentTraceGetResultDto,
   AiProviderModelsCatalogDto,
   AiProviderModelsListRequest,
+  AiSettingsRecommendationDto,
+  AiSettingsRecommendationGenerateRequest,
   AiProviderProfileDeleteRequest,
   AiProviderProfileDeleteResultDto,
   AiProviderProfileDto,
@@ -323,6 +333,20 @@ export interface HavenClient {
   agentSettingChangeReceiptGet(
     request: AgentSettingChangeReceiptGetRequest,
   ): Promise<AgentSettingChangeReceiptDto | null>;
+  /** 创建资源级偏好提案（只创建，不写入 authoritative 偏好）。 */
+  agentResourcePreferenceProposalCreate(
+    request: AgentResourcePreferenceProposalCreateRequest,
+  ): Promise<AgentResourcePreferenceProposalDto>;
+  /** 回读资源级提案与（可能存在的）回执，供未来 UI 重建同一份 Diff。 */
+  agentResourcePreferenceProposalGet(
+    request: AgentResourcePreferenceProposalGetRequest,
+  ): Promise<AgentResourcePreferenceProposalGetResultDto>;
+  /** 用户批准资源级提案；CAS 与 Receipt 仍由 Rust Application service 执行。 */
+  agentResourcePreferenceProposalApprove(
+    request: AgentResourcePreferenceProposalApproveRequest,
+  ): Promise<AgentResourcePreferenceProposalApproveResultDto>;
+  /** 读取指定 Agent 会话的有界轨迹（当前仅 typed backend，尚无 UI）。 */
+  agentTraceGet(request: AgentTraceGetRequest): Promise<AgentTraceGetResultDto>;
   // ---- A2 AI Provider 基础切片（docs/architecture/AI_SYSTEM.md） ----
   /**
    * 列出全部 AI Provider Profile 与其凭据配置状态。
@@ -347,6 +371,13 @@ export interface HavenClient {
    * 未配置密钥 / 被禁用 / 目录为空都是空目录 + 明确 state，不是错误。
    */
   aiProviderModelsList(request: AiProviderModelsListRequest): Promise<AiProviderModelsCatalogDto>;
+  /**
+   * 让已配置 Provider 生成一次结构化阅读设置建议；返回值只包含 pending Proposal，
+   * 不包含 Apply / Approval / Token，也不会绕过 Haven 的确认链。
+   */
+  aiSettingsRecommendationGenerate(
+    request: AiSettingsRecommendationGenerateRequest,
+  ): Promise<AiSettingsRecommendationDto>;
   // ---- A5 外部 Agent Broker（默认关闭；docs/architecture/MCP_EXTERNAL_AGENT_TRANSPORT.md §4.5）----
   //
   // 三个命令都不接受入参：端点由 Rust 按平台解析，调用方无法指定，也没有

@@ -82,7 +82,12 @@ export class FixtureHavenAgentBridge implements HavenAgentBridge {
       capabilities: {
         settings_read: true,
         settings_proposal: true,
-        library_summary_read: false,
+        library_summary_read: true,
+        setting_sources_read: true,
+        resource_preference_read: true,
+        resource_preference_proposal: true,
+        media_capabilities_read: true,
+        onboarding_read: true,
         metadata_proposal: false,
         rename_proposal: false,
         secret_read: false,
@@ -119,6 +124,8 @@ export class FixtureHavenAgentBridge implements HavenAgentBridge {
   async getResourcePreferenceSnapshot(): Promise<ResourcePreferenceSnapshotResult> {
     this.guard("getResourcePreferenceSnapshot");
     return {
+      context_id: UUID_CONTEXT,
+      context_hash: DIGEST_A,
       target_scope: "media_item",
       edition_id: UUID_EDITION,
       media_item_id: UUID_MEDIA_ITEM,

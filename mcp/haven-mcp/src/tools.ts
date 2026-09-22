@@ -49,45 +49,20 @@ type ToolImplementation = ImplementedTool | UnimplementedTool;
 /**
  * 工具 → 实现状态。
  *
- * 当前只有 2 个工具在 Haven 后端有真实用例，与
- * `AgentCapabilityManifest::for_current_slice()`（`settings_read` / `settings_proposal`）
- * 完全一致。其余 6 个的能力在 Application 层不存在，`AgentCapabilityManifest::validate`
- * 甚至**拒绝**声明它们。`test/tools.test.ts` 冻结这个集合。
+ * 当前冻结的 9 个工具均有对应的 Application service / Broker 路径；能力清单仍由
+ * `AgentCapabilityManifest::for_current_slice()` 投影，未开放的 metadata / rename /
+ * secret / filesystem 能力继续保持关闭。`test/tools.test.ts` 冻结这个集合。
  */
 export const TOOL_IMPLEMENTATION: Record<ToolName, ToolImplementation> = {
   get_system_capabilities: { implemented: true, operation: "读取能力清单" },
   get_settings_snapshot: { implemented: true, operation: "读取设置快照" },
-  get_setting_sources: {
-    implemented: false,
-    capability: "setting_sources_read",
-    reason: "Haven 后端尚无面向 Agent 的「设置来源分层」只读用例。",
-  },
-  get_resource_preference_snapshot: {
-    implemented: false,
-    capability: "resource_preference_read",
-    reason: "Haven 后端尚无面向 Agent 的资源偏好上下文快照（现有快照只覆盖 reading 分区）。",
-  },
-  get_library_summary: {
-    implemented: false,
-    capability: "library_summary_read",
-    reason: "Haven 尚未实现 library_summary_read 能力；能力清单里该位为 false。",
-  },
-  get_media_capabilities: {
-    implemented: false,
-    capability: "media_capabilities_read",
-    reason: "Haven 后端尚无面向 Agent 的条目能力声明投影。",
-  },
-  get_onboarding_state: {
-    implemented: false,
-    capability: "onboarding_read",
-    reason: "Haven 后端尚无面向 Agent 的引导状态只读用例。",
-  },
+  get_setting_sources: { implemented: true, operation: "读取设置来源" },
+  get_resource_preference_snapshot: { implemented: true, operation: "读取资源偏好快照" },
+  get_library_summary: { implemented: true, operation: "读取媒体库摘要" },
+  get_media_capabilities: { implemented: true, operation: "读取媒体条目能力" },
+  get_onboarding_state: { implemented: true, operation: "读取引导状态" },
   propose_settings_patch: { implemented: true, operation: "创建设置提案" },
-  propose_resource_preference_patch: {
-    implemented: false,
-    capability: "resource_preference_proposal",
-    reason: "Haven 后端尚无面向 Agent 的资源偏好提案用例（提案内核支持该操作类型，但缺少 Agent 作用域入口）。",
-  },
+  propose_resource_preference_patch: { implemented: true, operation: "创建资源偏好提案" },
 };
 
 // ---- 工具元数据（名称、标题、说明、注解）----
@@ -171,7 +146,7 @@ Examples:
 
 Error Handling:
   - HAVEN_BRIDGE_UNAVAILABLE: 本构建没有接通 Haven 运行时
-  - HAVEN_CAPABILITY_UNAVAILABLE: 当前 Haven 版本未实现 settings_read`,
+  - HAVEN_CAPABILITY_UNAVAILABLE: 当前 Haven 版本未开放 settings_read`,
   },
   get_setting_sources: {
     readOnly: true,
@@ -192,8 +167,7 @@ Examples:
   - Use when: "为什么我的字号设置没生效？" -> 看哪一层覆盖了它
 
 Error Handling:
-  - HAVEN_CAPABILITY_UNAVAILABLE: 当前 Haven 版本尚未实现该只读用例（本工具的**协议**
-    已冻结，但**运行时能力**未接通）。`,
+  - HAVEN_CAPABILITY_UNAVAILABLE: 当前 Haven 版本未开放该只读能力。`,
   },
   get_resource_preference_snapshot: {
     readOnly: true,
@@ -216,7 +190,7 @@ Examples:
   - Use when: "这本书的排版单独调一下" -> 先读该条目的偏好快照
 
 Error Handling:
-  - HAVEN_CAPABILITY_UNAVAILABLE: 当前 Haven 版本尚未实现该只读用例。`,
+  - HAVEN_CAPABILITY_UNAVAILABLE: 当前 Haven 版本未开放该只读能力。`,
   },
   get_library_summary: {
     readOnly: true,
@@ -240,8 +214,7 @@ Examples:
   - Use when: "我的库里都有什么？" -> 先看摘要，再决定是否需要更细的读取
 
 Error Handling:
-  - HAVEN_CAPABILITY_UNAVAILABLE: Haven 的 library_summary_read 能力尚未实现
-    （能力清单里该位为 false，且 Haven 拒绝声明未实现的能力）。`,
+  - HAVEN_CAPABILITY_UNAVAILABLE: Haven 的 library_summary_read 能力未开放。`,
   },
   get_media_capabilities: {
     readOnly: true,
@@ -266,7 +239,7 @@ Examples:
   - Use when: "这个条目能不能直接读正文？" -> 查它的 declared_capabilities
 
 Error Handling:
-  - HAVEN_CAPABILITY_UNAVAILABLE: 当前 Haven 版本尚未实现该只读用例。`,
+  - HAVEN_CAPABILITY_UNAVAILABLE: 当前 Haven 版本未开放该只读能力。`,
   },
   get_onboarding_state: {
     readOnly: true,
@@ -284,7 +257,7 @@ Examples:
   - Use when: "我还没设置过栖阅，下一步该做什么？"
 
 Error Handling:
-  - HAVEN_CAPABILITY_UNAVAILABLE: 当前 Haven 版本尚未实现该只读用例。`,
+  - HAVEN_CAPABILITY_UNAVAILABLE: 当前 Haven 版本未开放该只读能力。`,
   },
   propose_settings_patch: {
     readOnly: false,
@@ -360,8 +333,7 @@ Examples:
 
 Error Handling:
   - INVALID_ARGUMENT: 输入不合法
-  - HAVEN_CAPABILITY_UNAVAILABLE: Haven 尚无面向 Agent 的资源偏好提案用例
-    （提案内核支持该操作类型，但缺少 Agent 作用域入口）。`,
+  - HAVEN_CAPABILITY_UNAVAILABLE: Haven 尚未开放资源偏好提案能力。`,
   },
 };
 
@@ -373,6 +345,11 @@ const capabilitySetSchema = z.strictObject({
   settings_read: z.boolean(),
   settings_proposal: z.boolean(),
   library_summary_read: z.boolean(),
+  setting_sources_read: z.boolean(),
+  resource_preference_read: z.boolean(),
+  resource_preference_proposal: z.boolean(),
+  media_capabilities_read: z.boolean(),
+  onboarding_read: z.boolean(),
   metadata_proposal: z.boolean(),
   rename_proposal: z.boolean(),
   secret_read: z.boolean(),
@@ -450,6 +427,8 @@ const settingSourcesOutputSchema = z.strictObject({
 
 const resourcePreferenceSnapshotOutputSchema = z.strictObject({
   ...envelope,
+  context_id: z.string(),
+  context_hash: z.string(),
   target_scope: z.enum(["edition", "media_item"]),
   edition_id: z.string(),
   media_item_id: z.string().nullable(),

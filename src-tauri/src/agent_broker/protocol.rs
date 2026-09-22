@@ -7,8 +7,8 @@
 //! 只在 listener 层出现。
 //!
 //! 三条硬规则：
-//! - **闭合**：帧类型只有 `hello` / `context` / `create_proposal` / `cancel`（客户端→服务端）
-//!   与 `welcome` / `ok` / `error`（服务端→客户端）。没有 `get_proposal` / `approve` /
+//! - **闭合**：客户端→服务端只有 `hello`、6 个 Read 帧、2 个 Propose 帧与 `cancel`，
+//!   服务端→客户端只有 `welcome` / `ok` / `error`。没有 `get_proposal` / `approve` /
 //!   `reject` / `apply` / `receipt` / `fs` / `sql` / `secret` / `exec`。
 //! - **严格**：帧对象带 `deny_unknown_fields`；多一个字段就是错误，不是忽略。
 //! - **有界**：帧/请求/响应/在途/连接五条上限写死，不协商。
@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use haven_domain::agent::AgentCapabilityManifest;
+use uuid::Uuid;
 
 use super::error::BrokerError;
 
@@ -33,17 +34,87 @@ pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 pub const MAX_INFLIGHT_PER_CONNECTION: usize = 8;
 /// 并发连接上限。
 pub const MAX_CONNECTIONS: usize = 8;
-/// 每连接 pending 提案上限（配额）。
-pub const MAX_PENDING_PROPOSALS_PER_CONNECTION: u32 = 8;
+/// 每连接外部提案创建尝试上限（配额）。
+pub const MAX_PROPOSAL_ATTEMPTS_PER_CONNECTION: u32 = 8;
 /// 每个 Haven 进程窗口的外部提案创建上限（配额）。进程窗口计数，重启清零。
 pub const MAX_EXTERNAL_PROPOSALS_PER_PROCESS: u32 = 32;
 
-/// 帧类型（客户端 → 服务端）。闭合集合，恰好 4 项。
-pub const CLIENT_FRAME_TYPES: &[&str] = &["hello", "context", "create_proposal", "cancel"];
+/// 帧类型（客户端 → 服务端）。闭合集合，恰好 10 项。
+pub const CLIENT_FRAME_TYPES: &[&str] = &[
+    "hello",
+    "context",
+    "setting_sources",
+    "resource_preference",
+    "library_summary",
+    "media_capabilities",
+    "onboarding",
+    "create_proposal",
+    "create_resource_proposal",
+    "cancel",
+];
 /// 帧类型（服务端 → 客户端）。闭合集合，恰好 3 项。
 pub const SERVER_FRAME_TYPES: &[&str] = &["welcome", "ok", "error"];
-/// 服务端授予的请求类型（`welcome.granted_requests`）。闭合集合，**恰好 2 项**。
-pub const GRANTED_REQUESTS: &[&str] = &["context", "create_proposal"];
+/// 服务端支持的请求类型与领域能力的固定映射。
+///
+/// `welcome.granted_requests` 必须从实际 manifest 过滤生成，不能把编译期全量列表
+/// 原样发给客户端，否则关闭某一能力后握手仍会声称它可用。
+const REQUEST_CAPABILITIES: &[(&str, haven_domain::agent::AgentCapability)] = &[
+    (
+        "context",
+        haven_domain::agent::AgentCapability::SettingsRead,
+    ),
+    (
+        "setting_sources",
+        haven_domain::agent::AgentCapability::SettingSourcesRead,
+    ),
+    (
+        "resource_preference",
+        haven_domain::agent::AgentCapability::ResourcePreferenceRead,
+    ),
+    (
+        "library_summary",
+        haven_domain::agent::AgentCapability::LibrarySummaryRead,
+    ),
+    (
+        "media_capabilities",
+        haven_domain::agent::AgentCapability::MediaCapabilitiesRead,
+    ),
+    (
+        "onboarding",
+        haven_domain::agent::AgentCapability::OnboardingRead,
+    ),
+    (
+        "create_proposal",
+        haven_domain::agent::AgentCapability::SettingsProposal,
+    ),
+    (
+        "create_resource_proposal",
+        haven_domain::agent::AgentCapability::ResourcePreferenceProposal,
+    ),
+];
+
+/// 当前切片能力全开的请求集合，保留为协议测试和文档锚点；运行时握手使用
+/// [`granted_requests_for_manifest`]，因此未来关闭单项能力不会产生虚假授权。
+pub const GRANTED_REQUESTS: &[&str] = &[
+    "context",
+    "setting_sources",
+    "resource_preference",
+    "library_summary",
+    "media_capabilities",
+    "onboarding",
+    "create_proposal",
+    "create_resource_proposal",
+];
+
+pub fn granted_requests_for_manifest(manifest: &AgentCapabilityManifest) -> Vec<&'static str> {
+    REQUEST_CAPABILITIES
+        .iter()
+        .filter_map(|(request, capability)| manifest.grants(*capability).then_some(*request))
+        .collect()
+}
+
+pub const MIN_LIST_LIMIT: u32 = 1;
+pub const MAX_LIST_LIMIT: u32 = 50;
 
 /// 明确禁止的帧类型。它们**不存在**于本协议——列在这里是为了让"不存在"可被断言，
 /// 而不是因为解析器要处理它们。
@@ -132,6 +203,49 @@ fn validate_request_id(id: i64) -> Result<(), BrokerError> {
     Ok(())
 }
 
+fn validate_uuid_text(label: &'static str, value: &str) -> Result<(), BrokerError> {
+    validate_short_text(label, value, MAX_CONTEXT_ID_LEN)?;
+    if Uuid::parse_str(value).is_err() {
+        return Err(BrokerError::invalid_argument(match label {
+            "edition_id" => "edition_id 必须是合法 UUID。",
+            "media_item_id" => "media_item_id 必须是合法 UUID。",
+            _ => "字段必须是合法 UUID。",
+        }));
+    }
+    Ok(())
+}
+
+fn validate_limit(value: u32) -> Result<(), BrokerError> {
+    if !(MIN_LIST_LIMIT..=MAX_LIST_LIMIT).contains(&value) {
+        return Err(BrokerError::invalid_argument("limit 必须在 1 到 50 之间。"));
+    }
+    Ok(())
+}
+
+fn validate_resource_scope(
+    target_scope: &str,
+    edition_id: &str,
+    media_item_id: Option<&str>,
+) -> Result<(), BrokerError> {
+    if !matches!(target_scope, "edition" | "media_item") {
+        return Err(BrokerError::invalid_argument(
+            "target_scope 只支持 edition 或 media_item。",
+        ));
+    }
+    validate_uuid_text("edition_id", edition_id)?;
+    match (target_scope, media_item_id) {
+        ("edition", None) => Ok(()),
+        ("edition", Some(_)) => Err(BrokerError::invalid_argument(
+            "edition 作用域不得携带 media_item_id。",
+        )),
+        ("media_item", Some(value)) => validate_uuid_text("media_item_id", value),
+        ("media_item", None) => Err(BrokerError::invalid_argument(
+            "media_item 作用域必须携带 media_item_id。",
+        )),
+        _ => unreachable!(),
+    }
+}
+
 /// `context` 只接受**空对象**载荷。
 ///
 /// 该用例没有任何参数。允许携带任意字段会让"客户端以为传了参数、服务端静默忽略"
@@ -190,6 +304,52 @@ pub struct PlainRequest {
     pub payload: Option<Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmptyPayload {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypedRequest<P> {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub id: i64,
+    pub payload: P,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingSourcesPayload {
+    pub section: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourcePreferencePayload {
+    pub target_scope: String,
+    pub edition_id: String,
+    pub media_item_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LibrarySummaryPayload {
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaCapabilitiesPayload {
+    pub media_item_id: Option<String>,
+    pub limit: u32,
+}
+
+pub type SettingSourcesFrame = TypedRequest<SettingSourcesPayload>;
+pub type ResourcePreferenceFrame = TypedRequest<ResourcePreferencePayload>;
+pub type LibrarySummaryFrame = TypedRequest<LibrarySummaryPayload>;
+pub type MediaCapabilitiesFrame = TypedRequest<MediaCapabilitiesPayload>;
+pub type OnboardingFrame = TypedRequest<EmptyPayload>;
+
 /// `create_proposal` 的载荷。
 ///
 /// **刻意不含 `session_id` / `request_id`**：领域身份由 Broker 生成（见 `session.rs`），
@@ -214,6 +374,20 @@ pub struct CreateProposalFrame {
     pub payload: CreateProposalPayload,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateResourceProposalPayload {
+    pub target_scope: String,
+    pub edition_id: String,
+    pub media_item_id: Option<String>,
+    pub context_id: String,
+    pub context_hash: String,
+    pub base_revision: Option<String>,
+    pub patch: Value,
+}
+
+pub type CreateResourceProposalFrame = TypedRequest<CreateResourceProposalPayload>;
+
 /// `cancel` 帧。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -228,7 +402,13 @@ pub struct CancelFrame {
 pub enum ClientFrame {
     Hello(HelloFrame),
     Context(PlainRequest),
+    SettingSources(SettingSourcesFrame),
+    ResourcePreference(ResourcePreferenceFrame),
+    LibrarySummary(LibrarySummaryFrame),
+    MediaCapabilities(MediaCapabilitiesFrame),
+    Onboarding(OnboardingFrame),
     CreateProposal(CreateProposalFrame),
+    CreateResourceProposal(CreateResourceProposalFrame),
     Cancel(CancelFrame),
 }
 
@@ -238,7 +418,13 @@ impl ClientFrame {
         match self {
             Self::Hello(_) => None,
             Self::Context(frame) => Some(frame.id),
+            Self::SettingSources(frame) => Some(frame.id),
+            Self::ResourcePreference(frame) => Some(frame.id),
+            Self::LibrarySummary(frame) => Some(frame.id),
+            Self::MediaCapabilities(frame) => Some(frame.id),
+            Self::Onboarding(frame) => Some(frame.id),
             Self::CreateProposal(frame) => Some(frame.id),
+            Self::CreateResourceProposal(frame) => Some(frame.id),
             Self::Cancel(frame) => Some(frame.id),
         }
     }
@@ -248,7 +434,13 @@ impl ClientFrame {
         match self {
             Self::Hello(_) => "hello",
             Self::Context(_) => "context",
+            Self::SettingSources(_) => "setting_sources",
+            Self::ResourcePreference(_) => "resource_preference",
+            Self::LibrarySummary(_) => "library_summary",
+            Self::MediaCapabilities(_) => "media_capabilities",
+            Self::Onboarding(_) => "onboarding",
             Self::CreateProposal(_) => "create_proposal",
+            Self::CreateResourceProposal(_) => "create_resource_proposal",
             Self::Cancel(_) => "cancel",
         }
     }
@@ -296,6 +488,49 @@ pub fn parse_client_frame(text: &str) -> Result<ClientFrame, BrokerError> {
             validate_empty_payload(frame.payload.as_ref())?;
             Ok(ClientFrame::Context(frame))
         }
+        "setting_sources" => {
+            let frame: SettingSourcesFrame = serde_json::from_value(value)
+                .map_err(|_| invalid("setting_sources 帧字段不合法"))?;
+            validate_request_id(frame.id)?;
+            if frame.payload.section != "reading" {
+                return Err(invalid("section 只支持 reading。"));
+            }
+            Ok(ClientFrame::SettingSources(frame))
+        }
+        "resource_preference" => {
+            let frame: ResourcePreferenceFrame = serde_json::from_value(value)
+                .map_err(|_| invalid("resource_preference 帧字段不合法"))?;
+            validate_request_id(frame.id)?;
+            validate_resource_scope(
+                &frame.payload.target_scope,
+                &frame.payload.edition_id,
+                frame.payload.media_item_id.as_deref(),
+            )?;
+            Ok(ClientFrame::ResourcePreference(frame))
+        }
+        "library_summary" => {
+            let frame: LibrarySummaryFrame = serde_json::from_value(value)
+                .map_err(|_| invalid("library_summary 帧字段不合法"))?;
+            validate_request_id(frame.id)?;
+            validate_limit(frame.payload.limit)?;
+            Ok(ClientFrame::LibrarySummary(frame))
+        }
+        "media_capabilities" => {
+            let frame: MediaCapabilitiesFrame = serde_json::from_value(value)
+                .map_err(|_| invalid("media_capabilities 帧字段不合法"))?;
+            validate_request_id(frame.id)?;
+            if let Some(media_item_id) = frame.payload.media_item_id.as_deref() {
+                validate_uuid_text("media_item_id", media_item_id)?;
+            }
+            validate_limit(frame.payload.limit)?;
+            Ok(ClientFrame::MediaCapabilities(frame))
+        }
+        "onboarding" => {
+            let frame: OnboardingFrame =
+                serde_json::from_value(value).map_err(|_| invalid("onboarding 帧字段不合法"))?;
+            validate_request_id(frame.id)?;
+            Ok(ClientFrame::Onboarding(frame))
+        }
         "create_proposal" => {
             let frame: CreateProposalFrame = serde_json::from_value(value)
                 .map_err(|_| invalid("create_proposal 帧字段不合法"))?;
@@ -308,6 +543,24 @@ pub fn parse_client_frame(text: &str) -> Result<ClientFrame, BrokerError> {
                 validate_short_text("base_revision", revision, MAX_BASE_REVISION_LEN)?;
             }
             Ok(ClientFrame::CreateProposal(frame))
+        }
+        "create_resource_proposal" => {
+            let frame: CreateResourceProposalFrame = serde_json::from_value(value)
+                .map_err(|_| invalid("create_resource_proposal 帧字段不合法"))?;
+            validate_request_id(frame.id)?;
+            validate_resource_scope(
+                &frame.payload.target_scope,
+                &frame.payload.edition_id,
+                frame.payload.media_item_id.as_deref(),
+            )?;
+            validate_uuid_text("context_id", &frame.payload.context_id)?;
+            if !is_canonical_digest(&frame.payload.context_hash) {
+                return Err(invalid("context_hash 必须是 64 位小写十六进制。"));
+            }
+            if let Some(revision) = frame.payload.base_revision.as_deref() {
+                validate_short_text("base_revision", revision, MAX_BASE_REVISION_LEN)?;
+            }
+            Ok(ClientFrame::CreateResourceProposal(frame))
         }
         "cancel" => {
             let frame: CancelFrame =
@@ -327,6 +580,11 @@ pub struct CapabilityReport {
     pub settings_read: bool,
     pub settings_proposal: bool,
     pub library_summary_read: bool,
+    pub setting_sources_read: bool,
+    pub resource_preference_read: bool,
+    pub resource_preference_proposal: bool,
+    pub media_capabilities_read: bool,
+    pub onboarding_read: bool,
     pub metadata_proposal: bool,
     pub rename_proposal: bool,
     pub secret_read: bool,
@@ -345,6 +603,11 @@ impl CapabilityReport {
             settings_read: capabilities.settings_read,
             settings_proposal: capabilities.settings_proposal,
             library_summary_read: capabilities.library_summary_read,
+            setting_sources_read: capabilities.setting_sources_read,
+            resource_preference_read: capabilities.resource_preference_read,
+            resource_preference_proposal: capabilities.resource_preference_proposal,
+            media_capabilities_read: capabilities.media_capabilities_read,
+            onboarding_read: capabilities.onboarding_read,
             metadata_proposal: capabilities.metadata_proposal,
             rename_proposal: capabilities.rename_proposal,
             secret_read: capabilities.secret_read,
@@ -390,7 +653,7 @@ impl WelcomeFrame {
                 agent_api_version: manifest.agent_api_version,
                 capabilities: CapabilityReport::from_manifest(manifest),
             },
-            granted_requests: GRANTED_REQUESTS.to_vec(),
+            granted_requests: granted_requests_for_manifest(&manifest),
         }
     }
 }
@@ -486,10 +749,23 @@ mod tests {
 
     #[test]
     fn client_frame_set_is_closed_and_forbidden_types_are_absent() {
-        assert_eq!(CLIENT_FRAME_TYPES.len(), 4);
+        assert_eq!(CLIENT_FRAME_TYPES.len(), 10);
         assert_eq!(SERVER_FRAME_TYPES.len(), 3);
-        // `granted_requests` **恰好 2 项**——这是 A5 v1 的核心收敛。
-        assert_eq!(GRANTED_REQUESTS.len(), 2);
+        // `granted_requests` 只包含已实现的 Read / Propose 请求，且顺序冻结。
+        assert_eq!(GRANTED_REQUESTS.len(), 8);
+        assert_eq!(
+            GRANTED_REQUESTS,
+            &[
+                "context",
+                "setting_sources",
+                "resource_preference",
+                "library_summary",
+                "media_capabilities",
+                "onboarding",
+                "create_proposal",
+                "create_resource_proposal",
+            ]
+        );
         for forbidden in FORBIDDEN_FRAME_TYPES {
             assert!(
                 !CLIENT_FRAME_TYPES.contains(forbidden),
@@ -546,6 +822,84 @@ mod tests {
                 parse_client_frame(payload).unwrap_err().code(),
                 "INVALID_ARGUMENT",
                 "必须拒绝：{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_request_payloads_are_strict_and_bounded() {
+        for (frame, expected_kind) in [
+            (
+                r#"{"type":"setting_sources","id":1,"payload":{"section":"reading"}}"#,
+                "setting_sources",
+            ),
+            (
+                r#"{"type":"resource_preference","id":2,"payload":{"target_scope":"edition","edition_id":"0196f0d2-0000-7000-8000-0000000000c1","media_item_id":null}}"#,
+                "resource_preference",
+            ),
+            (
+                r#"{"type":"library_summary","id":3,"payload":{"limit":1}}"#,
+                "library_summary",
+            ),
+            (
+                r#"{"type":"library_summary","id":4,"payload":{"limit":50}}"#,
+                "library_summary",
+            ),
+            (
+                r#"{"type":"media_capabilities","id":5,"payload":{"media_item_id":"0196f0d2-0000-7000-8000-0000000000c1","limit":50}}"#,
+                "media_capabilities",
+            ),
+            (r#"{"type":"onboarding","id":6,"payload":{}}"#, "onboarding"),
+        ] {
+            assert_eq!(parse_client_frame(frame).unwrap().kind(), expected_kind);
+        }
+
+        for frame in [
+            r#"{"type":"setting_sources","id":1,"payload":{"section":"reading","extra":true}}"#,
+            r#"{"type":"resource_preference","id":1,"payload":{"target_scope":"edition","edition_id":"0196f0d2-0000-7000-8000-0000000000c1","media_item_id":null,"extra":true}}"#,
+            r#"{"type":"library_summary","id":1,"payload":{"limit":1,"extra":true}}"#,
+            r#"{"type":"media_capabilities","id":1,"payload":{"media_item_id":null,"limit":1,"extra":true}}"#,
+            r#"{"type":"onboarding","id":1,"payload":{"extra":true}}"#,
+        ] {
+            assert_eq!(
+                parse_client_frame(frame).unwrap_err().code(),
+                "INVALID_ARGUMENT",
+                "未知字段必须被拒绝：{frame}"
+            );
+        }
+
+        for limit in [0, 51] {
+            let frame =
+                format!(r#"{{"type":"library_summary","id":1,"payload":{{"limit":{limit}}}}}"#);
+            assert_eq!(
+                parse_client_frame(&frame).unwrap_err().code(),
+                "INVALID_ARGUMENT",
+                "limit={limit} 必须被拒绝"
+            );
+        }
+        assert_eq!(
+            parse_client_frame(
+                r#"{"type":"media_capabilities","id":1,"payload":{"media_item_id":"not-a-uuid","limit":1}}"#
+            )
+            .unwrap_err()
+            .code(),
+            "INVALID_ARGUMENT"
+        );
+    }
+
+    #[test]
+    fn resource_proposal_requires_matching_scope_shape() {
+        let valid = r#"{"type":"create_resource_proposal","id":1,"payload":{"target_scope":"edition","edition_id":"0196f0d2-0000-7000-8000-0000000000c1","media_item_id":null,"context_id":"0196f0d2-0000-7000-8000-0000000000c1","context_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","base_revision":null,"patch":{"reading":{"font_size":"large"}}}}"#;
+        assert!(parse_client_frame(valid).is_ok());
+
+        for frame in [
+            r#"{"type":"create_resource_proposal","id":1,"payload":{"target_scope":"edition","edition_id":"0196f0d2-0000-7000-8000-0000000000c1","media_item_id":"0196f0d2-0000-7000-8000-0000000000c2","context_id":"0196f0d2-0000-7000-8000-0000000000c1","context_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","base_revision":null,"patch":{"reading":{"font_size":"large"}}}}"#,
+            r#"{"type":"create_resource_proposal","id":1,"payload":{"target_scope":"media_item","edition_id":"0196f0d2-0000-7000-8000-0000000000c1","media_item_id":null,"context_id":"0196f0d2-0000-7000-8000-0000000000c1","context_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","base_revision":null,"patch":{"reading":{"font_size":"large"}}}}"#,
+        ] {
+            assert_eq!(
+                parse_client_frame(frame).unwrap_err().code(),
+                "INVALID_ARGUMENT",
+                "资源提案形状必须被拒绝：{frame}"
             );
         }
     }
@@ -668,20 +1022,56 @@ mod tests {
         assert_eq!(value["protocol_version"], 1);
         assert_eq!(value["session_id"], "abc");
         assert_eq!(value["haven"]["capabilities"]["settings_read"], true);
+        assert_eq!(value["haven"]["capabilities"]["library_summary_read"], true);
+        assert_eq!(value["haven"]["capabilities"]["setting_sources_read"], true);
         assert_eq!(
-            value["haven"]["capabilities"]["library_summary_read"],
-            false
+            value["haven"]["capabilities"]["resource_preference_read"],
+            true
         );
+        assert_eq!(
+            value["haven"]["capabilities"]["resource_preference_proposal"],
+            true
+        );
+        assert_eq!(
+            value["haven"]["capabilities"]["media_capabilities_read"],
+            true
+        );
+        assert_eq!(value["haven"]["capabilities"]["onboarding_read"], true);
         assert_eq!(value["haven"]["capabilities"]["secret_read"], false);
         assert_eq!(value["haven"]["capabilities"]["filesystem_write"], false);
         assert_eq!(
             value["granted_requests"],
-            serde_json::json!(["context", "create_proposal"])
+            serde_json::json!([
+                "context",
+                "setting_sources",
+                "resource_preference",
+                "library_summary",
+                "media_capabilities",
+                "onboarding",
+                "create_proposal",
+                "create_resource_proposal"
+            ])
         );
         // 不得夹带任何写权限或身份材料。
         for forbidden in ["token", "credential", "secret_value", "path"] {
             assert!(!text.contains(forbidden), "welcome 不得包含 {forbidden}");
         }
+    }
+
+    #[test]
+    fn welcome_grants_only_requests_backed_by_enabled_capabilities() {
+        let mut manifest = AgentCapabilityManifest::for_current_slice();
+        manifest.capabilities.library_summary_read = false;
+        manifest.capabilities.resource_preference_proposal = false;
+        let requests = granted_requests_for_manifest(&manifest);
+        assert!(!requests.contains(&"library_summary"));
+        assert!(!requests.contains(&"create_resource_proposal"));
+        assert!(requests.contains(&"context"));
+        assert!(requests.contains(&"create_proposal"));
+        assert!(
+            !requests.contains(&"cancel"),
+            "cancel 是控制帧，不是 granted request"
+        );
     }
 
     #[test]

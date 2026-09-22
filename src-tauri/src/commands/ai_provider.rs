@@ -12,10 +12,12 @@
 
 use tauri::State;
 
+use haven_application::services::AiSettingsRecommendationRequest;
 use haven_application::wire::{
     AiProviderModelsCatalogDto, AiProviderModelsListRequest, AiProviderProfileDeleteRequest,
     AiProviderProfileDeleteResultDto, AiProviderProfileDto, AiProviderProfileGetRequest,
-    AiProviderProfileListResultDto, AiProviderProfileUpsertRequest, ErrorDto,
+    AiProviderProfileListResultDto, AiProviderProfileUpsertRequest, AiSettingsRecommendationDto,
+    AiSettingsRecommendationGenerateRequest, ErrorDto,
 };
 
 use crate::ipc::{run_blocking, to_error_dto};
@@ -93,6 +95,38 @@ pub async fn ai_provider_models_list(
         profiles
             .models_catalog(request)
             .await
+            .map_err(|error| to_error_dto(&error))
+    })
+    .await
+}
+
+/// `ai_settings_recommendation_generate`：调用已配置 Provider 生成一次结构化推荐，
+/// 并只创建 pending Proposal；不执行任何设置写入。
+#[tauri::command]
+pub async fn ai_settings_recommendation_generate(
+    state: State<'_, AppState>,
+    request: AiSettingsRecommendationGenerateRequest,
+) -> Result<AiSettingsRecommendationDto, ErrorDto> {
+    let profiles = state.ai_provider.clone();
+    run_blocking(move || async move {
+        profiles
+            .generate_settings_recommendation(AiSettingsRecommendationRequest {
+                profile_id: request.profile_id,
+                session_id: request.session_id,
+                request_id: request.request_id,
+                context_id: request.context_id,
+                context_hash: request.context_hash,
+                base_revision: request.base_revision,
+            })
+            .await
+            .map(|result| AiSettingsRecommendationDto {
+                schema_version: result.schema_version,
+                profile_id: result.profile_id,
+                model_id: result.model_id,
+                explanation: result.explanation,
+                recommended_patch: result.recommended_patch,
+                proposal: result.proposal,
+            })
             .map_err(|error| to_error_dto(&error))
     })
     .await

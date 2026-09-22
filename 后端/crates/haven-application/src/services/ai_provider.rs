@@ -18,19 +18,24 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use haven_common::{AppError, ErrorKind};
+use haven_domain::agent::AgentReadingSnapshot;
 use haven_domain::ai_provider::{
-    AiModelDescriptor, AiProviderKind, AiProviderProfile, AiProviderProfileDeleteOutcome,
+    AiModelCapability, AiModelDescriptor, AiProviderKind, AiProviderProfile,
+    AiProviderProfileDeleteOutcome, AiSettingsRecommendation,
 };
 use haven_domain::contracts::AiProviderProfileRepository;
 use haven_domain::credential::{CredentialStore, SecretString};
-use haven_domain::ids::CredentialRef;
+use haven_domain::ids::{AgentRequestId, AgentSessionId, CredentialRef};
 
 use crate::mapper::time::utc_millis_to_rfc3339;
+use crate::services::agent_settings_ipc::AgentSettingsIpcService;
+use crate::services::agent_trace::{AgentEventKind, AgentTracePort, record_best_effort};
 use crate::wire::{
-    AiProviderKindDto, AiProviderModelDto, AiProviderModelsCatalogDto,
-    AiProviderModelsCatalogStateDto, AiProviderModelsListRequest, AiProviderProfileDeleteRequest,
-    AiProviderProfileDeleteResultDto, AiProviderProfileDto, AiProviderProfileListResultDto,
-    AiProviderProfileUpsertRequest,
+    AgentSettingsProposalCreateRequest, AgentSettingsProposalDto, AiProviderKindDto,
+    AiProviderModelDto, AiProviderModelsCatalogDto, AiProviderModelsCatalogStateDto,
+    AiProviderModelsListRequest, AiProviderProfileDeleteRequest, AiProviderProfileDeleteResultDto,
+    AiProviderProfileDto, AiProviderProfileListResultDto, AiProviderProfileUpsertRequest,
+    PreferenceReadingPatchDto,
 };
 
 /// CredentialStore scoped target 的 provider 段（ADR-001 校验规则内）。
@@ -53,6 +58,46 @@ pub trait AiModelCatalogPort: Send + Sync {
         endpoint: &str,
         secret: &SecretString,
     ) -> Result<Vec<AiModelDescriptor>, AppError>;
+}
+
+/// 设置建议端口。实现方只负责一次受限的 Structured Output 请求，不能创建 Proposal、
+/// 不能批准或应用设置。
+#[async_trait]
+pub trait AiSettingsRecommendationPort: Send + Sync {
+    async fn recommend_settings(
+        &self,
+        kind: AiProviderKind,
+        endpoint: &str,
+        secret: &SecretString,
+        input: &AiSettingsRecommendationInput,
+    ) -> Result<AiSettingsRecommendation, AppError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct AiSettingsRecommendationInput {
+    pub model_id: String,
+    pub reading: AgentReadingSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiSettingsRecommendationRequest {
+    pub profile_id: String,
+    pub session_id: String,
+    pub request_id: String,
+    pub context_id: String,
+    pub context_hash: String,
+    pub base_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiSettingsRecommendationResult {
+    pub schema_version: u32,
+    pub profile_id: String,
+    pub model_id: String,
+    pub explanation: Option<String>,
+    pub recommended_patch: PreferenceReadingPatchDto,
+    pub proposal: AgentSettingsProposalDto,
 }
 
 /// 模型发现端口不可用时的占位实现（例如尚未接线的组装层或测试替身）。
@@ -78,12 +123,30 @@ impl AiModelCatalogPort for UnavailableModelCatalog {
     }
 }
 
+pub struct UnavailableSettingsRecommendation;
+
+#[async_trait]
+impl AiSettingsRecommendationPort for UnavailableSettingsRecommendation {
+    async fn recommend_settings(
+        &self,
+        _kind: AiProviderKind,
+        _endpoint: &str,
+        _secret: &SecretString,
+        _input: &AiSettingsRecommendationInput,
+    ) -> Result<AiSettingsRecommendation, AppError> {
+        Err(recommendation_unavailable())
+    }
+}
+
 /// AI Provider Profile 服务。
 #[derive(Clone)]
 pub struct AiProviderProfileService {
     profiles: Arc<dyn AiProviderProfileRepository>,
     credentials: Arc<dyn CredentialStore>,
     catalog: Arc<dyn AiModelCatalogPort>,
+    recommender: Arc<dyn AiSettingsRecommendationPort>,
+    agent_settings: Option<AgentSettingsIpcService>,
+    trace: Option<Arc<dyn AgentTracePort>>,
 }
 
 impl AiProviderProfileService {
@@ -96,7 +159,29 @@ impl AiProviderProfileService {
             profiles,
             credentials,
             catalog,
+            recommender: Arc::new(UnavailableSettingsRecommendation),
+            agent_settings: None,
+            trace: None,
         }
+    }
+
+    pub fn with_settings_recommendation(
+        mut self,
+        recommender: Arc<dyn AiSettingsRecommendationPort>,
+    ) -> Self {
+        self.recommender = recommender;
+        self
+    }
+
+    pub fn with_agent_settings(mut self, agent_settings: AgentSettingsIpcService) -> Self {
+        self.agent_settings = Some(agent_settings);
+        self
+    }
+
+    /// 注入共享轨迹 collector。Provider 轨迹只记录阶段，不记录 endpoint、凭据或模型响应。
+    pub fn with_trace(mut self, trace: Arc<dyn AgentTracePort>) -> Self {
+        self.trace = Some(trace);
+        self
     }
 
     /// `ai_provider_profile_list`：列出全部 profile 并附带各自的凭据配置事实。
@@ -240,6 +325,138 @@ impl AiProviderProfileService {
         })
     }
 
+    /// 生成一份绑定当前全局阅读设置上下文的建议，并停在 `pending` Proposal。
+    ///
+    /// 此方法没有 Apply 路径：Provider 只返回 typed 值，Proposal 创建仍由
+    /// `AgentSettingsIpcService` 完成，批准与 CAS 继续留在既有用户确认入口。
+    pub async fn generate_settings_recommendation(
+        &self,
+        request: AiSettingsRecommendationRequest,
+    ) -> Result<AiSettingsRecommendationResult, AppError> {
+        let session_id = request
+            .session_id
+            .parse::<AgentSessionId>()
+            .map_err(|_| invalid_argument("session_id 非法"))?;
+        let request_id = request
+            .request_id
+            .parse::<AgentRequestId>()
+            .map_err(|_| invalid_argument("request_id 非法"))?;
+        record_best_effort(
+            self.trace.as_ref(),
+            session_id,
+            request_id,
+            &request.context_id,
+            &request.context_hash,
+            AgentEventKind::RequestStarted,
+        )
+        .await;
+        let profile = self.load(&request.profile_id).await?;
+        if !profile.enabled() {
+            return Err(recommendation_disabled());
+        }
+        let target = credential_target(profile.profile_id())?;
+        let Some(secret) = self.credentials.get(&target).await? else {
+            return Err(recommendation_no_credential());
+        };
+        let Some(selected_model_id) = profile.selected_model_id() else {
+            return Err(recommendation_no_selected_model());
+        };
+        let models = self
+            .catalog
+            .list_models(profile.kind(), profile.endpoint(), &secret)
+            .await?;
+        let Some(model) = models.iter().find(|model| {
+            model.model_id == selected_model_id && model.chat == AiModelCapability::Supported
+        }) else {
+            return Err(recommendation_model_unavailable());
+        };
+
+        let agent_settings = self
+            .agent_settings
+            .clone()
+            .ok_or_else(recommendation_unavailable)?;
+        let context = agent_settings.context().await?;
+        if context.context_id().to_string() != request.context_id
+            || context.context_hash() != request.context_hash
+            || context.revision() != request.base_revision.as_deref()
+        {
+            return Err(recommendation_context_stale());
+        }
+        record_best_effort(
+            self.trace.as_ref(),
+            session_id,
+            request_id,
+            &request.context_id,
+            &request.context_hash,
+            AgentEventKind::ContextLoaded,
+        )
+        .await;
+
+        record_best_effort(
+            self.trace.as_ref(),
+            session_id,
+            request_id,
+            &request.context_id,
+            &request.context_hash,
+            AgentEventKind::ProviderRequest,
+        )
+        .await;
+        let recommendation = self
+            .recommender
+            .recommend_settings(
+                profile.kind(),
+                profile.endpoint(),
+                &secret,
+                &AiSettingsRecommendationInput {
+                    model_id: model.model_id.clone(),
+                    reading: context.snapshot().reading().clone(),
+                },
+            )
+            .await?;
+        record_best_effort(
+            self.trace.as_ref(),
+            session_id,
+            request_id,
+            &request.context_id,
+            &request.context_hash,
+            AgentEventKind::ProviderResponse,
+        )
+        .await;
+        let patch: PreferenceReadingPatchDto = recommendation.patch().clone().into();
+        record_best_effort(
+            self.trace.as_ref(),
+            session_id,
+            request_id,
+            &request.context_id,
+            &request.context_hash,
+            AgentEventKind::StructuredOutputValidated,
+        )
+        .await;
+        let proposal = agent_settings
+            .create_proposal(
+                session_id,
+                request_id,
+                &AgentSettingsProposalCreateRequest {
+                    session_id: request.session_id,
+                    request_id: request.request_id,
+                    context_id: request.context_id,
+                    context_hash: request.context_hash,
+                    base_revision: request.base_revision,
+                    patch: patch.clone(),
+                },
+            )
+            .await?;
+
+        Ok(AiSettingsRecommendationResult {
+            schema_version: 1,
+            profile_id: profile.profile_id().to_owned(),
+            model_id: model.model_id.clone(),
+            explanation: recommendation.explanation().map(str::to_owned),
+            recommended_patch: patch,
+            proposal,
+        })
+    }
+
     async fn load(&self, profile_id: &str) -> Result<AiProviderProfile, AppError> {
         self.profiles
             .get(profile_id)
@@ -321,6 +538,60 @@ fn revision_conflict() -> AppError {
 
 fn invalid_argument(message: impl Into<String>) -> AppError {
     AppError::new("INVALID_ARGUMENT", ErrorKind::Validation, message, false)
+}
+
+fn recommendation_unavailable() -> AppError {
+    AppError::new(
+        "AI_PROVIDER_RECOMMENDATION_UNAVAILABLE",
+        ErrorKind::Unsupported,
+        "当前没有可用的 AI 设置建议模型",
+        false,
+    )
+}
+
+fn recommendation_disabled() -> AppError {
+    AppError::new(
+        "AI_PROVIDER_DISABLED",
+        ErrorKind::Unsupported,
+        "AI Provider 已禁用",
+        false,
+    )
+}
+
+fn recommendation_no_credential() -> AppError {
+    AppError::new(
+        "AI_PROVIDER_NO_CREDENTIAL",
+        ErrorKind::Unauthorized,
+        "AI Provider 尚未配置凭据",
+        false,
+    )
+}
+
+fn recommendation_no_selected_model() -> AppError {
+    AppError::new(
+        "AI_PROVIDER_NO_SELECTED_MODEL",
+        ErrorKind::Validation,
+        "AI Provider 尚未选择模型",
+        false,
+    )
+}
+
+fn recommendation_model_unavailable() -> AppError {
+    AppError::new(
+        "AI_PROVIDER_MODEL_UNAVAILABLE",
+        ErrorKind::Unsupported,
+        "当前选中的模型不可用于设置建议",
+        false,
+    )
+}
+
+fn recommendation_context_stale() -> AppError {
+    AppError::new(
+        "AI_PROVIDER_SETTINGS_CONTEXT_STALE",
+        ErrorKind::Conflict,
+        "设置上下文已变化，请重新读取后再生成建议",
+        true,
+    )
 }
 
 #[cfg(test)]
@@ -494,6 +765,31 @@ mod tests {
                 return Err(error);
             }
             Ok(self.models.lock().unwrap().clone())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingRecommender {
+        calls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl AiSettingsRecommendationPort for RecordingRecommender {
+        async fn recommend_settings(
+            &self,
+            _kind: AiProviderKind,
+            _endpoint: &str,
+            _secret: &SecretString,
+            input: &AiSettingsRecommendationInput,
+        ) -> Result<AiSettingsRecommendation, AppError> {
+            self.calls.lock().unwrap().push(input.model_id.clone());
+            AiSettingsRecommendation::new(
+                haven_domain::settings::ReadingPatch {
+                    font_size: Some(haven_domain::settings::ReadingFontSize::Large),
+                    ..haven_domain::settings::ReadingPatch::default()
+                },
+                Some("根据当前阅读设置生成建议".into()),
+            )
         }
     }
 
@@ -1080,5 +1376,303 @@ mod tests {
             .unwrap();
         let encoded = serde_json::to_string(&catalog).unwrap();
         assert!(!encoded.contains("sk-super-secret-value"));
+    }
+
+    #[tokio::test]
+    async fn valid_structured_recommendation_creates_pending_proposal_without_writing_settings() {
+        let fixture = fixture();
+        let created = fixture
+            .service
+            .upsert(AiProviderProfileUpsertRequest {
+                selected_model_id: Some("reader-model".into()),
+                ..upsert_request("gw", None)
+            })
+            .await
+            .unwrap();
+        let target = credential_target(&created.profile_id).unwrap();
+        fixture
+            .credentials
+            .set(&target, &SecretString::new("sk-test-only"))
+            .await
+            .unwrap();
+        *fixture.catalog.models.lock().unwrap() = vec![
+            AiModelDescriptor::new(
+                "reader-model".into(),
+                Some("Reader Model".into()),
+                None,
+                Some("fixture".into()),
+                AiModelCapability::Supported,
+                AiModelCapability::Unknown,
+                AiModelCapability::Unknown,
+            )
+            .unwrap(),
+        ];
+
+        let agent_store = crate::services::agent_settings_ipc::tests::FakeStore::new();
+        crate::services::agent_settings_ipc::tests::seed_reading(&agent_store, Some("rev-0001"));
+        let agent_settings = crate::services::agent_settings_ipc::tests::service(&agent_store);
+        let recommender = Arc::new(RecordingRecommender::default());
+        let service = AiProviderProfileService::new(
+            fixture.profiles.clone(),
+            fixture.credentials.clone(),
+            fixture.catalog.clone(),
+        )
+        .with_settings_recommendation(recommender.clone())
+        .with_agent_settings(agent_settings.clone());
+
+        let context = agent_settings.context().await.unwrap();
+        let result = service
+            .generate_settings_recommendation(AiSettingsRecommendationRequest {
+                profile_id: "gw".into(),
+                session_id: AgentSessionId::new().to_string(),
+                request_id: AgentRequestId::new().to_string(),
+                context_id: context.context_id().to_string(),
+                context_hash: context.context_hash().to_owned(),
+                base_revision: context.revision().map(str::to_owned),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.profile_id, "gw");
+        assert_eq!(result.model_id, "reader-model");
+        assert_eq!(
+            result.explanation.as_deref(),
+            Some("根据当前阅读设置生成建议")
+        );
+        assert_eq!(
+            result.recommended_patch.font_size,
+            Some(crate::wire::PreferenceReadingFontSizeDto::Large)
+        );
+        assert_eq!(
+            result.proposal.status,
+            crate::wire::AgentSettingsProposalStatusDto::Pending
+        );
+        assert_eq!(result.proposal.changes.len(), 1);
+        assert_eq!(result.proposal.changes[0].key, "reading.fontSize");
+        assert_eq!(result.proposal.changes[0].after, "large");
+        assert_eq!(
+            agent_store.target_writes(),
+            0,
+            "Provider 建议不得直接写设置"
+        );
+        assert_eq!(agent_store.revision().as_deref(), Some("rev-0001"));
+        assert_eq!(
+            agent_store.proposal_count(),
+            1,
+            "必须进入既有 Proposal store"
+        );
+        assert_eq!(
+            recommender.calls.lock().unwrap().as_slice(),
+            ["reader-model"]
+        );
+
+        let encoded = serde_json::to_string(&result).unwrap();
+        for forbidden in ["sk-test-only", "haven:ai:", "credentialRef", "secret"] {
+            assert!(
+                !encoded.contains(forbidden),
+                "建议结果不得携带敏感材料：{forbidden}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recommendation_preconditions_fail_closed_without_provider_calls() {
+        let cases = [
+            ("disabled", false, None, "AI_PROVIDER_DISABLED"),
+            (
+                "no_credential",
+                true,
+                Some("reader-model"),
+                "AI_PROVIDER_NO_CREDENTIAL",
+            ),
+            (
+                "no_selected_model",
+                true,
+                None,
+                "AI_PROVIDER_NO_SELECTED_MODEL",
+            ),
+        ];
+
+        for (profile_id, enabled, selected_model_id, expected_code) in cases {
+            let fixture = fixture();
+            fixture
+                .service
+                .upsert(AiProviderProfileUpsertRequest {
+                    profile_id: profile_id.into(),
+                    enabled,
+                    selected_model_id: selected_model_id.map(str::to_owned),
+                    ..upsert_request(profile_id, None)
+                })
+                .await
+                .unwrap();
+            if profile_id == "no_selected_model" {
+                let target = credential_target(profile_id).unwrap();
+                fixture
+                    .credentials
+                    .set(&target, &SecretString::new("sk-test-only"))
+                    .await
+                    .unwrap();
+            }
+            let agent_store = crate::services::agent_settings_ipc::tests::FakeStore::new();
+            crate::services::agent_settings_ipc::tests::seed_reading(
+                &agent_store,
+                Some("rev-0001"),
+            );
+            let agent_settings = crate::services::agent_settings_ipc::tests::service(&agent_store);
+            let context = agent_settings.context().await.unwrap();
+            let recommender = Arc::new(RecordingRecommender::default());
+            let service = AiProviderProfileService::new(
+                fixture.profiles.clone(),
+                fixture.credentials.clone(),
+                fixture.catalog.clone(),
+            )
+            .with_settings_recommendation(recommender.clone())
+            .with_agent_settings(agent_settings);
+
+            let error = service
+                .generate_settings_recommendation(AiSettingsRecommendationRequest {
+                    profile_id: profile_id.into(),
+                    session_id: AgentSessionId::new().to_string(),
+                    request_id: AgentRequestId::new().to_string(),
+                    context_id: context.context_id().to_string(),
+                    context_hash: context.context_hash().to_owned(),
+                    base_revision: context.revision().map(str::to_owned),
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(error.code().as_str(), expected_code);
+            assert!(fixture.catalog.calls.lock().unwrap().is_empty());
+            assert!(recommender.calls.lock().unwrap().is_empty());
+            assert_eq!(agent_store.target_writes(), 0);
+            assert_eq!(agent_store.proposal_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_or_unsupported_chat_capability_never_reaches_recommender() {
+        for chat in [AiModelCapability::Unknown, AiModelCapability::Unsupported] {
+            let fixture = fixture();
+            fixture
+                .service
+                .upsert(AiProviderProfileUpsertRequest {
+                    selected_model_id: Some("reader-model".into()),
+                    ..upsert_request("gw", None)
+                })
+                .await
+                .unwrap();
+            let target = credential_target("gw").unwrap();
+            fixture
+                .credentials
+                .set(&target, &SecretString::new("sk-test-only"))
+                .await
+                .unwrap();
+            *fixture.catalog.models.lock().unwrap() = vec![
+                AiModelDescriptor::new(
+                    "reader-model".into(),
+                    None,
+                    None,
+                    None,
+                    chat,
+                    AiModelCapability::Unknown,
+                    AiModelCapability::Unknown,
+                )
+                .unwrap(),
+            ];
+            let agent_store = crate::services::agent_settings_ipc::tests::FakeStore::new();
+            crate::services::agent_settings_ipc::tests::seed_reading(
+                &agent_store,
+                Some("rev-0001"),
+            );
+            let agent_settings = crate::services::agent_settings_ipc::tests::service(&agent_store);
+            let context = agent_settings.context().await.unwrap();
+            let recommender = Arc::new(RecordingRecommender::default());
+            let service = AiProviderProfileService::new(
+                fixture.profiles.clone(),
+                fixture.credentials.clone(),
+                fixture.catalog.clone(),
+            )
+            .with_settings_recommendation(recommender.clone())
+            .with_agent_settings(agent_settings);
+
+            let error = service
+                .generate_settings_recommendation(AiSettingsRecommendationRequest {
+                    profile_id: "gw".into(),
+                    session_id: AgentSessionId::new().to_string(),
+                    request_id: AgentRequestId::new().to_string(),
+                    context_id: context.context_id().to_string(),
+                    context_hash: context.context_hash().to_owned(),
+                    base_revision: context.revision().map(str::to_owned),
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(error.code().as_str(), "AI_PROVIDER_MODEL_UNAVAILABLE");
+            assert_eq!(fixture.catalog.calls.lock().unwrap().len(), 1);
+            assert!(recommender.calls.lock().unwrap().is_empty());
+            assert_eq!(agent_store.target_writes(), 0);
+            assert_eq!(agent_store.proposal_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_settings_context_is_rejected_before_provider_recommendation() {
+        let fixture = fixture();
+        fixture
+            .service
+            .upsert(AiProviderProfileUpsertRequest {
+                selected_model_id: Some("reader-model".into()),
+                ..upsert_request("gw", None)
+            })
+            .await
+            .unwrap();
+        let target = credential_target("gw").unwrap();
+        fixture
+            .credentials
+            .set(&target, &SecretString::new("sk-test-only"))
+            .await
+            .unwrap();
+        *fixture.catalog.models.lock().unwrap() = vec![
+            AiModelDescriptor::new(
+                "reader-model".into(),
+                None,
+                None,
+                None,
+                AiModelCapability::Supported,
+                AiModelCapability::Unknown,
+                AiModelCapability::Unknown,
+            )
+            .unwrap(),
+        ];
+        let agent_store = crate::services::agent_settings_ipc::tests::FakeStore::new();
+        crate::services::agent_settings_ipc::tests::seed_reading(&agent_store, Some("rev-0001"));
+        let agent_settings = crate::services::agent_settings_ipc::tests::service(&agent_store);
+        let old_context = agent_settings.context().await.unwrap();
+        let _ = agent_store.write_reading_for_test(haven_domain::settings::ReadingPatch {
+            line_height: Some(haven_domain::settings::ReadingLineHeight::Airy),
+            ..haven_domain::settings::ReadingPatch::default()
+        });
+        let recommender = Arc::new(RecordingRecommender::default());
+        let service = AiProviderProfileService::new(
+            fixture.profiles.clone(),
+            fixture.credentials.clone(),
+            fixture.catalog.clone(),
+        )
+        .with_settings_recommendation(recommender.clone())
+        .with_agent_settings(agent_settings);
+
+        let error = service
+            .generate_settings_recommendation(AiSettingsRecommendationRequest {
+                profile_id: "gw".into(),
+                session_id: AgentSessionId::new().to_string(),
+                request_id: AgentRequestId::new().to_string(),
+                context_id: old_context.context_id().to_string(),
+                context_hash: old_context.context_hash().to_owned(),
+                base_revision: old_context.revision().map(str::to_owned),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), "AI_PROVIDER_SETTINGS_CONTEXT_STALE");
+        assert!(recommender.calls.lock().unwrap().is_empty());
+        assert_eq!(agent_store.target_writes(), 0);
+        assert_eq!(agent_store.proposal_count(), 0);
     }
 }

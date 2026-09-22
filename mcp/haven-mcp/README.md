@@ -21,7 +21,7 @@
 | Typed Haven Agent Bridge 端口（`src/bridge.ts`） | **已实现**（类型化的读 + 提案端口） |
 | 显式不可用适配器（`UnavailableHavenAgentBridge`） | **已实现**，且是生产默认 |
 | 本地传输适配器（`src/local-broker.ts` 的 `LiveHavenAgentBridge`） | **已实现**：`HAVEN_MCP_BRIDGE=live` + 合法 `HAVEN_MCP_ENDPOINT` 时连接 Rust Broker |
-| Haven 后端的其余 6 个只读/提案用例 | **未实现**（见下表） |
+| Haven 后端的 9 个只读/提案用例 | **均已实现**；真实 Haven→Node→MCP 尚未验收 |
 
 因此现在的行为分三种：
 
@@ -34,8 +34,9 @@
 3. **`live` 但端点缺失 / 非法**：缺失时保持显式不可用，非法时返回
    `HAVEN_MCP_ENDPOINT_INVALID` 且**不尝试连接**（不猜、不扫描、不回退）。
 
-**它不会返回任何编造的数据。** 另外：9 个工具里只有 3 个在 Haven 后端有用例，其余 6 个
-**即使 live 通道接通也仍然**返回 `HAVEN_CAPABILITY_UNAVAILABLE`（那属于 A6，与传输无关）。
+**它不会返回任何编造的数据。** 9 个工具现在都有 Haven 后端路径；但默认桥接关闭、端点
+缺失或真实链路不可达时，工具仍会如实返回 `HAVEN_BRIDGE_UNAVAILABLE`。能力被服务端明确
+关闭时才会返回 `HAVEN_CAPABILITY_UNAVAILABLE`。
 
 **未验收边界**：Codex / Claude Code / DSH / Pi 四个真实客户端、Windows WebView2 上的栖阅
 设置界面、以及 Haven→Node→MCP 的真实端到端都**没有实测过**——本包的连接用例用的是进程内
@@ -48,15 +49,21 @@
 | `get_system_capabilities` | ✅ 已实现（本地 + 桥接状态） |
 | `get_settings_snapshot` | ✅ 已实现（`settings_read`） |
 | `propose_settings_patch` | ✅ 已实现（`settings_proposal`） |
-| `get_setting_sources` | ❌ 后端无用例 → `HAVEN_CAPABILITY_UNAVAILABLE` |
-| `get_resource_preference_snapshot` | ❌ 后端无用例 |
-| `get_library_summary` | ❌ `library_summary_read` 能力未实现 |
-| `get_media_capabilities` | ❌ 后端无用例 |
-| `get_onboarding_state` | ❌ 后端无用例 |
-| `propose_resource_preference_patch` | ❌ 缺少 Agent 作用域入口 |
+| `get_setting_sources` | ✅ 已接入 `setting_sources_read` |
+| `get_resource_preference_snapshot` | ✅ 已接入 `resource_preference_read` |
+| `get_library_summary` | ✅ 已接入 `library_summary_read` |
+| `get_media_capabilities` | ✅ 已接入 `media_capabilities_read` |
+| `get_onboarding_state` | ✅ 已接入 `onboarding_read` |
+| `propose_resource_preference_patch` | ✅ 已接入 `resource_preference_proposal` |
 
 工具清单是**冻结集合**（`src/constants.ts` 的 `TOOL_NAMES`）。新增工具必须先改架构文档；
 `test/tools.test.ts` 断言注册结果与它完全相等，因此"顺手多加一个 write 工具"会直接失败。
+
+资源级 `propose_resource_preference_patch` 只携带 Agent 请求修改的部分 patch，不会把当前
+authoritative 偏好合并后再复制进外部响应。用户在 Haven UI 批准时，Rust Application service
+会在同一 CAS 事务内重读并合并；Agent Receipt（若由 UI/内部服务读取）也是脱敏审计投影，
+不暴露已有的字体路径、endpoint、Bearer 或凭据样式文本。Haven 内部的 authoritative 设置
+仍保存真实值。MCP server 本身没有 Receipt 读取或 Apply 工具。
 
 ---
 
@@ -158,7 +165,7 @@ npm test            # vitest（含真实 stdio 端到端）
 `npm test` 里的 stdio 端到端用例需要一个已构建的 `dist/`；缺失时会跳过并在测试名里说明。
 完整门禁因此是 **`npm run build && npm test`**。
 
-本轮（2026-09-18 工作树）结果：**86 passed / 1 skipped**。那 1 个 skipped 是 `dist/` **已**
+本轮（2026-09-20 工作树）结果：**88 passed / 1 skipped**。那 1 个 skipped 是 `dist/` **已**
 构建时才跳过的占位提示用例（`dist 缺失时请先运行 npm run build`），属于预期行为。
 
 覆盖范围：
@@ -174,9 +181,11 @@ npm test            # vitest（含真实 stdio 端到端）
 | `structuredContent` 与文本同源（json 严格相等 / markdown 覆盖标量） | `test/tools.test.ts`、`test/respond.test.ts` |
 | 桥接选择 fail-closed（fixture / 未知取值拒绝启动；live 缺端点或非法端点不静默降级） | `test/bridge-selection.test.ts` |
 | live 本地传输：端点形态校验、帧编解码、长度前缀拆包重组、越界与错配响应拒绝 | `test/local-broker.test.ts`（**进程内假 transport，不是真的 Broker**） |
+| Codex / Claude Code / DSH / Pi 配置夹具形状与未验证标记 | `test/client-fixtures.test.ts`、`fixtures/clients/*.json` |
 | 生产入口行为 + stdout 洁净（真实子进程） | `test/stdio-e2e.test.ts` |
 | stdout 洁净、无 fs/SQL/Tauri 依赖、端口无写方法、`node:net` 仅 connect | `test/source-guards.test.ts` |
 | 枚举与 patch 字段对生成 `wire.ts` 无漂移 | `test/wire-drift.test.ts` |
 
-**这些是单元 / 集成测试，不是生产实测。** 真实客户端（Codex / Claude Code / DSH / Pi）、
+**这些是单元 / 集成测试，不是生产实测。** 四份配置夹具已经存在，但仅用于验证统一模板、
+客户端标识和 `verified: false` 的事实标记；真实客户端（Codex / Claude Code / DSH / Pi）、
 真实 Windows WebView2 界面与 Haven→Node→MCP 端到端链路都没有验过。

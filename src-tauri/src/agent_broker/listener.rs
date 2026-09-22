@@ -1190,12 +1190,55 @@ mod tests {
             Ok(json!({ "revision": "rev-1" }))
         }
 
+        async fn setting_sources(&self) -> Result<serde_json::Value, BrokerError> {
+            Ok(json!({"schemaVersion": 1, "section": "reading", "revision": null, "layers": []}))
+        }
+
+        async fn resource_preference(
+            &self,
+            _request: &super::super::protocol::ResourcePreferencePayload,
+        ) -> Result<serde_json::Value, BrokerError> {
+            Ok(
+                json!({"schemaVersion": 1, "contextId": "0196f0d2-0000-7000-8000-0000000000c1", "contextHash": "a".repeat(64), "targetScope": "edition", "editionId": "0196f0d2-0000-7000-8000-0000000000c1", "mediaItemId": null, "revision": null, "reading": null, "comic": null}),
+            )
+        }
+
+        async fn library_summary(&self, _limit: u32) -> Result<serde_json::Value, BrokerError> {
+            Ok(
+                json!({"schemaVersion": 1, "counts": {"works": 0, "editions": 0, "mediaItems": 0, "favorites": 0, "inProgress": 0}, "categories": [], "recent": [], "truncated": false}),
+            )
+        }
+
+        async fn media_capabilities(
+            &self,
+            _media_item_id: Option<&str>,
+            _limit: u32,
+        ) -> Result<serde_json::Value, BrokerError> {
+            Ok(json!({"schemaVersion": 1, "items": [], "truncated": false}))
+        }
+
+        async fn onboarding(&self) -> Result<serde_json::Value, BrokerError> {
+            Ok(
+                json!({"schemaVersion": 1, "completedSteps": [], "nextStep": null, "hasStorageLocation": false, "hasLibraryContent": false, "hasAiProvider": false}),
+            )
+        }
+
         async fn create_proposal(
             &self,
             _session_id: haven_domain::ids::AgentSessionId,
             _request_id: haven_domain::ids::AgentRequestId,
             _request: &haven_application::wire::AgentSettingsProposalCreateRequest,
         ) -> Result<haven_application::wire::AgentSettingsProposalDto, BrokerError> {
+            Err(BrokerError::capability_unavailable())
+        }
+
+        async fn create_resource_proposal(
+            &self,
+            _session_id: haven_domain::ids::AgentSessionId,
+            _request_id: haven_domain::ids::AgentRequestId,
+            _request: &haven_application::wire::AgentResourcePreferenceProposalCreateRequest,
+        ) -> Result<haven_application::wire::AgentResourcePreferenceProposalDto, BrokerError>
+        {
             Err(BrokerError::capability_unavailable())
         }
     }
@@ -1220,6 +1263,39 @@ mod tests {
             Ok(json!({ "revision": "rev-1", "pad": self.big }))
         }
 
+        async fn setting_sources(&self) -> Result<serde_json::Value, BrokerError> {
+            Ok(json!({"schemaVersion": 1, "section": "reading", "revision": null, "layers": []}))
+        }
+
+        async fn resource_preference(
+            &self,
+            _request: &super::super::protocol::ResourcePreferencePayload,
+        ) -> Result<serde_json::Value, BrokerError> {
+            Ok(
+                json!({"schemaVersion": 1, "contextId": "0196f0d2-0000-7000-8000-0000000000c1", "contextHash": "a".repeat(64), "targetScope": "edition", "editionId": "0196f0d2-0000-7000-8000-0000000000c1", "mediaItemId": null, "revision": null, "reading": null, "comic": null}),
+            )
+        }
+
+        async fn library_summary(&self, _limit: u32) -> Result<serde_json::Value, BrokerError> {
+            Ok(
+                json!({"schemaVersion": 1, "counts": {"works": 0, "editions": 0, "mediaItems": 0, "favorites": 0, "inProgress": 0}, "categories": [], "recent": [], "truncated": false}),
+            )
+        }
+
+        async fn media_capabilities(
+            &self,
+            _media_item_id: Option<&str>,
+            _limit: u32,
+        ) -> Result<serde_json::Value, BrokerError> {
+            Ok(json!({"schemaVersion": 1, "items": [], "truncated": false}))
+        }
+
+        async fn onboarding(&self) -> Result<serde_json::Value, BrokerError> {
+            Ok(
+                json!({"schemaVersion": 1, "completedSteps": [], "nextStep": null, "hasStorageLocation": false, "hasLibraryContent": false, "hasAiProvider": false}),
+            )
+        }
+
         async fn create_proposal(
             &self,
             _session_id: haven_domain::ids::AgentSessionId,
@@ -1228,6 +1304,16 @@ mod tests {
         ) -> Result<haven_application::wire::AgentSettingsProposalDto, BrokerError> {
             let _ = self.entered.send("create_proposal");
             self.release_proposal.notified().await;
+            Err(BrokerError::capability_unavailable())
+        }
+
+        async fn create_resource_proposal(
+            &self,
+            _session_id: haven_domain::ids::AgentSessionId,
+            _request_id: haven_domain::ids::AgentRequestId,
+            _request: &haven_application::wire::AgentResourcePreferenceProposalCreateRequest,
+        ) -> Result<haven_application::wire::AgentResourcePreferenceProposalDto, BrokerError>
+        {
             Err(BrokerError::capability_unavailable())
         }
     }
@@ -1325,7 +1411,16 @@ mod tests {
         assert_eq!(welcome["type"], "welcome");
         assert_eq!(
             welcome["granted_requests"],
-            json!(["context", "create_proposal"])
+            json!([
+                "context",
+                "setting_sources",
+                "resource_preference",
+                "library_summary",
+                "media_capabilities",
+                "onboarding",
+                "create_proposal",
+                "create_resource_proposal"
+            ])
         );
 
         client.write_all(&context_frame(9)).await.unwrap();

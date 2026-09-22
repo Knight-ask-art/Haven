@@ -291,7 +291,10 @@ pub fn run(conn: &mut Connection) -> Result<(), AppError> {
 
 fn checksum(sql: &str) -> String {
     let normalized = sql.replace("\r\n", "\n");
-    format!("{:x}", Sha256::digest(normalized.as_bytes()))
+    Sha256::digest(normalized.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn db_err(msg: &'static str) -> impl Fn(rusqlite::Error) -> AppError {

@@ -10,7 +10,11 @@ use std::sync::Arc;
 use tauri::Emitter;
 
 use haven_application::services::agent::{AgentProposalService, RepositoryAgentSubjectScope};
+use haven_application::services::agent_context::AgentContextQueryService;
 use haven_application::services::agent_settings_ipc::AgentSettingsIpcService;
+use haven_application::services::agent_trace::{
+    AgentTraceQueryService, InMemoryAgentTraceCollector,
+};
 use haven_application::services::ai_provider::AiProviderProfileService;
 use haven_application::services::cache::CacheService;
 use haven_application::services::cast::{CastGrantRegistry, CastService};
@@ -163,6 +167,15 @@ pub struct AppState {
     pub setting_proposals: SettingProposalService,
     /// 全局设置 Agent 的 Typed Application 入口（读取/提案/批准/回执）。
     pub agent_settings: AgentSettingsIpcService,
+    /// Agent 轨迹的有界进程内 collector；未来 UI 通过 `agent_trace_get` 读取。
+    pub agent_trace: Arc<InMemoryAgentTraceCollector>,
+    pub agent_trace_query: AgentTraceQueryService,
+    /// 外部 Agent 共享的只读上下文与资源偏好提案 Application 入口。
+    ///
+    /// Broker 只持有该服务的 Clone，不自行创建 Repository、DB 或 Provider；
+    /// 因此内置 Agent、MCP 与未来其它外部 Agent 入口看到的是同一份 authoritative
+    /// context 与 Proposal 事实。
+    pub agent_context: AgentContextQueryService,
     /// 外部 Agent 接入 Broker（A5 接线切片；契约 §4.5）。
     ///
     /// **默认关闭**：构造它不创建端点，端点只在用户显式开启后才存在。
@@ -199,11 +212,15 @@ impl AppState {
             repos.clone(),
         )
         .with_settings_service(settings.clone());
+        let agent_context_proposals = agent_proposals.clone();
+        let agent_trace = Arc::new(InMemoryAgentTraceCollector::new());
+        let agent_trace_query = AgentTraceQueryService::new(agent_trace.clone());
         let agent_settings = AgentSettingsIpcService::new(
             setting_proposals.clone(),
             agent_proposals,
             settings.clone(),
-        );
+        )
+        .with_trace(agent_trace.clone());
         // A5 接线：Broker **默认关闭**。构造只建一个空 manager——不解析端点、
         // 不碰文件系统、不新建 DB 句柄；端点只在用户显式 enable 时创建。
         let agent_broker = Arc::new(AgentBrokerManager::default());
@@ -481,7 +498,26 @@ impl AppState {
             ai_provider_profiles,
             credential_store,
             Arc::new(haven_infrastructure::ai_provider::OpenAiCompatibleModelCatalog::new()),
-        );
+        )
+        .with_settings_recommendation(Arc::new(
+            haven_infrastructure::ai_provider::OpenAiCompatibleSettingsRecommender::new(),
+        ))
+        .with_agent_settings(agent_settings.clone())
+        .with_trace(agent_trace.clone());
+        let agent_context = AgentContextQueryService::new(
+            repos.clone(),
+            repos.clone(),
+            repos.clone(),
+            repos.clone(),
+            repos.clone(),
+            repos.clone(),
+            repos.clone(),
+            repos.clone(),
+            settings.clone(),
+            agent_context_proposals,
+            ai_provider.clone(),
+        )
+        .with_trace(agent_trace.clone());
         // Trending：Query 只读 SQLite 快照；Refresh 才访问豆瓣并写技术缓存。
         // 生产组合根不使用静态榜单兜底，来源不可用时由 Refresh 返回可重试错误。
         let artwork_cache = Arc::new(ArtworkCache::new(
@@ -580,6 +616,9 @@ impl AppState {
             video_screenshot,
             setting_proposals,
             agent_settings,
+            agent_trace,
+            agent_trace_query,
+            agent_context,
             agent_broker,
         })
     }
