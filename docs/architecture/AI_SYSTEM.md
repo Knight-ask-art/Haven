@@ -7,6 +7,7 @@
 
 - 阶段计划：[`docs/plans/2026-09-18-ai-provider-mcp-skill-plan.md`](../plans/2026-09-18-ai-provider-mcp-skill-plan.md)
 - 外部 Agent 传输设计（A5，**设计已冻结；核心已落地，真实客户端与端到端未验收**）：[`MCP_EXTERNAL_AGENT_TRANSPORT.md`](./MCP_EXTERNAL_AGENT_TRANSPORT.md)
+- Claude Code 子代理工作流（第三方 Provider 已配置时的调用、复审与验收规范）：[`CLAUDE_CODE_AGENT_WORKFLOW.md`](./CLAUDE_CODE_AGENT_WORKFLOW.md)
 - 既有 Proposal 内核：`haven-domain/src/setting_proposal.rs`、`haven-application/src/services/setting_proposals.rs`
 - 既有 Typed IPC 切片：`haven-application/src/services/agent_settings_ipc.rs`、`src-tauri/src/commands/agent.rs`
 - 凭据契约：`haven-domain/src/credential.rs`（ADR-001，Windows Credential Manager）
@@ -73,6 +74,28 @@ Provider 不是执行者。模型输出不是权限。MCP 不是写入通道。S
 3. **旧快照 fail-closed**。`contextId` / `contextHash` / `baseRevision` 任一不匹配即拒绝。
 4. **回执是审计事实**。删除目标不会删除提案与回执；回执必须自洽（`changed` 与 before/after 一致）。
 5. **token / secret / 路径 / 正文不进 wire**。DSO 只暴露 code / message / retryable。
+
+### 1.1 资源级 Agent Proposal 的部分 Patch 语义
+
+全局阅读设置与资源级偏好都复用同一套 Proposal / Approval / CAS / Receipt 内核，但
+Agent 的资源级提案有一个必须保持的存储差异：
+
+- `AgentResourcePreferencePatch` 只把 Agent 请求修改的部分 `PreferenceData` 写进 Proposal
+  的 canonical JSON。它**不**把当前 authoritative 偏好合并成完整快照再保存，因此已有的字体路径、
+  endpoint 样式文本或其它敏感自由文本不会因为 Agent 只改字号而被复制进 Proposal。
+- `PreferenceData::apply_patch` 明确区分 `None` 的含义：资源级 Agent patch 中顶层 `None`
+  表示“不触碰该分区”，字段级 `None` 表示“不触碰该字段”；普通 `ResourcePreference`
+  仍表示完整覆盖数据，不能用另一种语义替代。
+- 用户批准资源提案时，Application service 在同一个 UoW 内重新读取 authoritative 资源偏好，
+  校验 `base_revision`，合并 Agent patch，再执行 CAS。冲突、过期、digest 不一致或 token
+  失败都不会留下目标写入或 Receipt。
+- Agent Receipt 的 `before_canonical_json` / `after_canonical_json` 是**脱敏审计投影**：
+  Agent 可能看到的 Receipt 不包含路径、endpoint、Bearer 或凭据样式文本；Haven authoritative
+  设置事实源仍保存用户真实值。所有 Agent Receipt 应用入口必须共用这条投影逻辑。
+
+因此，Proposal/Receipt 展示层可以安全地说“本次 Agent 请求改了哪些字段”，但不能把它们当作
+完整资源设置快照或 secret 容器。后续 UI 只消费这套投影，不能在前端重新拼一份 authoritative
+值，也不能为 Agent 增加直接读取 Receipt 的权限。
 
 ---
 
@@ -197,6 +220,27 @@ get_onboarding_state
 清单是闭合集合：`mcp/haven-mcp/src/constants.ts` 的 `TOOL_NAMES` 是唯一声明处，
 `test/tools.test.ts` 断言真实注册结果与它完全相等，并对工具名跑禁用词根扫描。
 
+当前 `AgentCapabilityManifest::for_current_slice()` 的有效能力投影为：
+
+```text
+settings_read                 true
+settings_proposal             true
+setting_sources_read          true
+resource_preference_read      true
+resource_preference_proposal  true
+library_summary_read          true
+media_capabilities_read       true
+onboarding_read               true
+
+metadata_proposal             false
+rename_proposal               false
+secret_read                   false
+filesystem_write              false
+```
+
+能力清单是服务端权威声明，不是 Agent 自带的授权凭证；Skill、MCP 客户端或 Provider
+不能通过提交另一份 manifest 打开关闭项。
+
 ### 5.2 链路（不可绕过）
 
 ```text
@@ -213,7 +257,7 @@ MCP client
 MCP server **不读** SQLite、**不碰**文件系统、**不访问** CredentialStore、**不**
 invoke Tauri。它只调用桥接端口，端口只承载已经投影、已经脱敏的载荷。
 
-### 5.3 传输与接通状态（截至 2026-09-18）
+### 5.3 传输与接通状态（截至 2026-09-20）
 
 | 层 | 状态 |
 | --- | --- |
@@ -221,18 +265,19 @@ invoke Tauri。它只调用桥接端口，端口只承载已经投影、已经�
 | Typed Haven Agent Bridge 端口 | **已实现**（`mcp/haven-mcp/src/bridge.ts`） |
 | 显式不可用适配器 | **已实现**，且是生产默认 |
 | 本地传输适配器（端口 → 运行中的 Haven 进程） | **已实现**（`mcp/haven-mcp/src/local-broker.ts` 的 `LiveHavenAgentBridge`；Rust 侧 Broker、Tauri 命令与设置页「外部 Agent 接入」分组均已落地），但**默认关闭**，真实链路**未验收** |
-| 9 个工具对应的 Haven 后端用例 | 3 个已实现，6 个未实现 |
+| 9 个工具对应的 Haven 后端用例 | **9 个均已实现**（Application / Rust Broker / Node live 路径具备；真实客户端与端到端未验收） |
 
 运行时桥接的设计已冻结（[A5 传输设计](./MCP_EXTERNAL_AGENT_TRANSPORT.md)），A5.1–A5.5 与
 A5.7/A5.8 的核心也已落地：Rust Broker、Tauri 命令、设置页分组与 Node live 适配器都在仓库里
 并有测试。**但"有实现"不等于"已接通"**：默认关闭、默认不可用，四个真实客户端、真实 Windows
-WebView2 界面与 Haven→Node→MCP 的端到端都**未验收**，A5.6 的四客户端夹具也未实现。
+WebView2 界面与 Haven→Node→MCP 的端到端都**未验收**。A5.6 的四份配置夹具与契约测试已经落地，
+但夹具明确标记 `verified: false`，不代表真实客户端兼容性已经验证。
 逐项证据与边界见该文件 §11.1 与 §12。
 
 目标接入方是**用户已经装好的**外部 Agent（Codex、Claude Code、DSH、Pi …），
 它们共用**同一套** 9 工具契约；客户端之间的差异只是 stdio 配置写法，
-不存在任何客户端专属工具或特权模式。设置页已提供四客户端共用的**同一份**配置模板，但
-四个客户端**均未实测**（A5.6 的四份客户端夹具与兼容验证都未做），见
+不存在任何客户端专属工具或特权模式。设置页已提供四客户端共用的**同一份**配置模板，仓库也
+提供四份 `verified: false` 配置夹具；四个客户端**均未实测**，见
 [`MCP_EXTERNAL_AGENT_TRANSPORT.md`](./MCP_EXTERNAL_AGENT_TRANSPORT.md) §9 的兼容矩阵。
 
 因此默认行为是**显式不可用**，而不是伪造接通：
@@ -250,11 +295,12 @@ WebView2 界面与 Haven→Node→MCP 的端到端都**未验收**，A5.6 的四
 两种不可用的含义必须区分开，`get_system_capabilities` 会如实报告：
 
 - `HAVEN_BRIDGE_UNAVAILABLE`：桥接没接通，**换一个 Haven 版本可能就行**；
-- `HAVEN_CAPABILITY_UNAVAILABLE`：Haven 后端根本没有这个用例，**重试无用**。
+- `HAVEN_CAPABILITY_UNAVAILABLE`：当前 Haven 版本没有开放这个能力，**重试无用**。
 
-**未实现的 6 个工具在协议面上已冻结，但运行时不可用。** 这是刻意的：
-协议冻结让客户端与后续实现有稳定的目标，而"返回编造的数据"会把一个尚未实现的能力
-伪装成已完成。**live 通道接通后它们依然如此**——那 6 个用例属于 A6，与传输无关。
+**9 个冻结工具均已具备后端运行路径。** 这表示每个工具都能从 Node Bridge 经过 Rust
+Broker 分派到 Application service，并经过能力、输入、脱敏与有界校验；它不表示默认 Broker
+已开启，也不表示 Codex / Claude Code / DSH / Pi、Windows WebView2 或真实
+Haven→Node→MCP 链路已经验收。
 
 **外部 Agent 接入默认关闭。** 只有用户在设置页显式开启后才会创建本地端点；未开启时
 `agent_broker_status` 返回 `disabled` 且不带端点，界面不给端点、不给模板。
@@ -344,6 +390,62 @@ Provider 的模型发现是当前唯一由用户配置端点的出站请求，�
 
 ---
 
+## 8.1 Provider Structured Outputs（A7，已落地）
+
+设置建议不是自由文本到 JSON 的解析捷径，而是一条受限的 typed 端口：
+
+```text
+AiProviderProfileService
+  → profile enabled / CredentialStore / selected_model_id
+  → /models 目录中同 id 且 chat == Supported
+  → AgentSettingsIpcService.context()（authoritative 快照）
+  → AiSettingsRecommendationPort
+  → OpenAiCompatibleSettingsRecommender
+       /chat/completions + response_format=json_schema + strict=true
+  → AiSettingsRecommendation（只含 ReadingPatch + 有界 explanation）
+  → AgentSettingsIpcService.create_proposal()
+  → pending Proposal
+```
+
+硬规则：
+
+1. 没有 enabled profile、凭据、selected model 或显式 `chat=Supported` 时，不发起模型请求；
+   不内置、不猜测 `gpt-4o` 或任何其它模型名。
+2. Provider 端口不能创建 Proposal、批准、Apply 或 Receipt；Proposal 只能由 Haven
+   Application service 创建，因此 digest 仍由 Rust canonical JSON + SHA-256 生成。
+3. `context_id` / `context_hash` / `base_revision` 在调用 Provider 前后都绑定到
+   authoritative 设置上下文；过期上下文以 `AI_PROVIDER_SETTINGS_CONTEXT_STALE` 失败，零写入。
+4. Structured Output 外层与 12 个阅读字段都要求 exact keys；未知字段、缺失字段、非法枚举、
+   超长解释或控制字符全部 fail-closed。响应正文、API key、endpoint 与 credential target
+   不进入错误、Proposal、wire 或日志。
+5. 本轮故意不接 AI 前端对话框、设置页聊天框或轨迹图；后端端口与 Proposal 领域能力先独立
+   可测，前端可以在后续按同一 typed 契约接线。
+
+资源级 Agent patch 同样遵守这条边界：Provider 只能返回部分 patch，不能返回“已合并后的
+完整偏好”来冒充权威事实；合并、CAS、Receipt 都由 Haven Application service 完成。
+
+---
+
+## 8.2 Agent Event / Trace（A8，已落地）
+
+后端提供 `AgentTracePort` 与有界内存 collector，事件类型是闭合集合：
+
+```text
+request_started → context_loaded → provider_request → provider_response
+→ structured_output_validated → proposal_created → waiting_for_approval
+→ approval_rejected | cas_started → applied → receipt_created
+```
+
+另外允许 `cancelled` / `retrying` / `failed` 作为终止或重试事件。每条事件只绑定：
+`session_id`、`request_id`、`context_id`、`context_hash`、服务端分配的 `sequence`、
+可选 `duration_ms` 与时间戳。collector 按会话最多保留 256 条，拒绝调用方伪造序号，
+不接受自由文本，因此轨迹不是 Provider 原文、聊天历史或权限通道。
+
+目前它是后端 typed 基础与测试替身，尚未接入 AI 前端展示；未来 UI 必须消费同一组事件，
+不能重新引入 raw response、secret、绝对路径、SQL 或正文。
+
+---
+
 ## 9. 验收门禁
 
 任何 AI 相关改动合并前必须全部为真：
@@ -369,6 +471,7 @@ Provider 的模型发现是当前唯一由用户配置端点的出站请求，�
 | G17 | MCP 文本与结构化同源 | json 格式 `JSON.parse(text)` 深度相等；markdown 覆盖全部标量 |
 | G18 | MCP stdout 洁净 | 真实子进程端到端：stdout 每行都是 JSON-RPC，日志只在 stderr |
 | G19 | Skill 不越权 | `tools/skills/skill-contract-check.py`：工具名只来自 MCP 冻结 9 项；白名单外的工具名仅允许出现在禁止语境；evals 与 frontmatter 一致；`SKILL.md` < 500 行 |
+| G20 | Agent 资源 Patch 与审计脱敏 | Domain `apply_patch` 单测 + Application/Infrastructure 资源审批单测：部分 patch 不覆盖未请求字段；CAS 冲突零写入；Agent Proposal / Receipt 不泄漏 authoritative 路径或 endpoint |
 
 ---
 
@@ -380,9 +483,10 @@ Provider 的模型发现是当前唯一由用户配置端点的出站请求，�
 | **A2** | AI Provider Profile 基础切片：profile 持久化 + 凭据引用 + 模型发现 + Typed IPC + 设置页接线 | **已落地** |
 | **A3** | MCP 协议面 + Typed Bridge 端口：9 个冻结工具、strict schema、脱敏/有界/同源响应、显式不可用桥接 | **已落地** |
 | **A4** | 正式 Skill：`skills/haven-agent-proposal` 行为协议 + 契约校验与 evals | **已落地** |
-| **A5** | MCP 运行时传输适配器：把端口接到运行中的 Haven（认证/来源、生命周期、能力协商）——设计已冻结，见 [`MCP_EXTERNAL_AGENT_TRANSPORT.md`](./MCP_EXTERNAL_AGENT_TRANSPORT.md)，拆分见计划 A5.1–A5.8 | **核心已落地，未验收**：Rust Broker（A5.1–A5.4）、Windows 命名管道（A5.2）、Tauri 接线与设置页「外部 Agent 接入」分组、Node live 适配器（A5.5）均已实现并有测试；A5.6 四客户端夹具未实现，Unix 侧未编译验证，四客户端 / 真机 UI / 端到端均未验收 |
-| **A6** | 补齐 6 个未实现工具的 Haven 后端用例（library summary / media capabilities / onboarding / setting sources / 资源偏好读与提案） | 后续 |
-| **A7** | Provider 生成 Proposal：把模型输出接进 A1 的提案路径（仍无 Apply 权限） | 后续 |
+| **A5** | MCP 运行时传输适配器：把端口接到运行中的 Haven（认证/来源、生命周期、能力协商）——设计已冻结，见 [`MCP_EXTERNAL_AGENT_TRANSPORT.md`](./MCP_EXTERNAL_AGENT_TRANSPORT.md)，拆分见计划 A5.1–A5.8 | **核心已落地，未验收**：Rust Broker（A5.1–A5.4）、Windows 命名管道（A5.2）、Tauri 接线与设置页「外部 Agent 接入」分组、Node live 适配器（A5.5）与四客户端 `verified: false` 配置夹具（A5.6）均已实现并有契约测试；Unix 侧未编译验证，四客户端 / 真机 UI / 端到端均未验收 |
+| **A6** | 将 9 个 MCP 工具全部接入 Haven 后端（library summary / media capabilities / onboarding / setting sources / 资源偏好读与提案等） | **已落地**；真实数据库数据与端到端尚未验收 |
+| **A7** | Provider Structured Output 生成 typed 设置建议并接进 A1 Proposal 路径（仍无 Apply 权限） | **已落地**；无 profile / 凭据 / 选中模型 / 显式 chat 能力时诚实失败 |
+| **A8** | Agent Event / Trace typed 基础（闭合事件、上下文绑定、序号与上限） | **已落地**；本轮暂不接 AI 前端轨迹 UI |
 
 仍**不含**：Python sidecar、PydanticAI、完整 Agent runtime、MCP 的任何写入/审批工具、
 `metadata_patch` / `file_renames`、任何自动 Apply，以及任何给 Skill 的额外权限。
@@ -390,8 +494,8 @@ Provider 的模型发现是当前唯一由用户配置端点的出站请求，�
 **A3 + A4 + A5 合起来的边界必须说清楚**：MCP 的**协议面**、**桥接端口**与**行为协议 Skill**
 都已完成并冻结；A5 的运行时传输适配器（Rust Broker + Tauri 接线 + 设置页分组 + Node live
 适配器）也已实现，但它**默认关闭**，且**从未在真实客户端、真机或端到端链路上验收过**。
-同时 **6 个工具的后端用例仍未实现**（A6），所以即使 live 通道接通，它们依然返回
-`HAVEN_CAPABILITY_UNAVAILABLE`。结论：默认配置下 9 个工具里只有 `get_system_capabilities`
-可用（它如实报告其余不可用）；**"链路上线"不等于"已接通 MCP"，任何文档都不得这样描述**。
+9 个工具的后端路径现在均已实现；默认配置下它们仍可能因为 Broker 未开启或端点未配置
+返回 `HAVEN_BRIDGE_UNAVAILABLE`。**"链路上线"不等于"已完成真实客户端验收"，任何文档
+都不得把单元测试通过写成已接通生产 MCP。**
 Skill 的价值在于：在这些不可用的前提下，模型也会**如实说明**并给出安全的手动路径，
 而不是编造数据或绕过审批。

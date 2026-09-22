@@ -33,6 +33,10 @@
     "allow-agent-settings-proposal-reject",
     "allow-agent-settings-proposal-approve",
     "allow-agent-setting-change-receipt-get",
+    "allow-agent-resource-preference-proposal-create",
+    "allow-agent-resource-preference-proposal-get",
+    "allow-agent-resource-preference-proposal-approve",
+    "allow-agent-trace-get",
     "allow-settings-get",
     "allow-settings-update",
     "allow-settings-export",
@@ -116,6 +120,7 @@
     "allow-ai-provider-profile-upsert",
     "allow-ai-provider-profile-delete",
     "allow-ai-provider-models-list",
+    "allow-ai-settings-recommendation-generate",
     "allow-agent-broker-status",
     "allow-agent-broker-enable",
     "allow-agent-broker-disable"

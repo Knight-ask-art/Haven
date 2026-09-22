@@ -143,6 +143,26 @@ define_commands!(
         "allow-agent-setting-change-receipt-get",
         commands::agent::agent_setting_change_receipt_get
     ),
+    (
+        "agent_resource_preference_proposal_create",
+        "allow-agent-resource-preference-proposal-create",
+        commands::agent::agent_resource_preference_proposal_create
+    ),
+    (
+        "agent_resource_preference_proposal_get",
+        "allow-agent-resource-preference-proposal-get",
+        commands::agent::agent_resource_preference_proposal_get
+    ),
+    (
+        "agent_resource_preference_proposal_approve",
+        "allow-agent-resource-preference-proposal-approve",
+        commands::agent::agent_resource_preference_proposal_approve
+    ),
+    (
+        "agent_trace_get",
+        "allow-agent-trace-get",
+        commands::agent::agent_trace_get
+    ),
     ("settings_get", "allow-settings-get", commands::settings::settings_get),
     (
         "settings_update",
@@ -507,6 +527,11 @@ define_commands!(
         "ai_provider_models_list",
         "allow-ai-provider-models-list",
         commands::ai_provider::ai_provider_models_list
+    ),
+    (
+        "ai_settings_recommendation_generate",
+        "allow-ai-settings-recommendation-generate",
+        commands::ai_provider::ai_settings_recommendation_generate
     ),
     // A5 外部 Agent Broker：默认关闭；仅暴露状态与显式启停，不开放任意 invoke。
     (

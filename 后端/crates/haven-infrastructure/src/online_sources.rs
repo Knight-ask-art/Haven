@@ -1663,7 +1663,15 @@ fn parse_europe_pmc(xml: &str) -> EuropeDocument {
             }
             Ok(Event::Text(text)) => {
                 if capture.is_some() {
-                    let value = text.unescape().map(|v| v.into_owned()).unwrap_or_default();
+                    let value = decode_xml_text(&text).unwrap_or_default();
+                    buffer.push_str(&value);
+                    buffer.push(' ');
+                }
+            }
+            Ok(Event::GeneralRef(reference)) => {
+                if capture.is_some()
+                    && let Some(value) = decode_xml_reference(&reference)
+                {
                     buffer.push_str(&value);
                     buffer.push(' ');
                 }
@@ -1724,7 +1732,16 @@ fn parse_arxiv_metadata(xml: &str) -> Option<(String, String, Option<i32>)> {
                 }
             }
             Ok(Event::Text(text)) if in_entry => {
-                let value = text.unescape().map(|v| v.into_owned()).unwrap_or_default();
+                let value = decode_xml_text(&text).unwrap_or_default();
+                match field {
+                    Some("title") => title.push_str(value.trim()),
+                    Some("summary") => summary.push_str(value.trim()),
+                    Some("published") => year = value.get(0..4).and_then(|v| v.parse().ok()),
+                    _ => {}
+                }
+            }
+            Ok(Event::GeneralRef(reference)) if in_entry => {
+                let value = decode_xml_reference(&reference).unwrap_or_default();
                 match field {
                     Some("title") => title.push_str(value.trim()),
                     Some("summary") => summary.push_str(value.trim()),
@@ -1757,6 +1774,21 @@ fn local_name(raw: &[u8]) -> String {
         .next()
         .unwrap_or("")
         .to_owned()
+}
+
+fn decode_xml_text(text: &quick_xml::events::BytesText<'_>) -> Option<String> {
+    let decoded = text.decode().ok()?;
+    quick_xml::escape::unescape(decoded.as_ref())
+        .ok()
+        .map(|value| value.into_owned())
+}
+
+fn decode_xml_reference(reference: &quick_xml::events::BytesRef<'_>) -> Option<String> {
+    let name = reference.decode().ok()?;
+    let raw = format!("&{name};");
+    quick_xml::escape::unescape(&raw)
+        .ok()
+        .map(|value| value.into_owned())
 }
 
 fn clean_text(value: &str) -> String {

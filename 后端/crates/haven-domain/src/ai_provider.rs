@@ -15,6 +15,9 @@
 use haven_common::network::{HttpUrlError, HttpUrlPolicy, parse_http_url};
 use haven_common::{AppError, ErrorKind};
 
+use crate::agent::contains_sensitive_text;
+use crate::settings::ReadingPatch;
+
 /// Provider 种类（闭合集合）。第一版只支持 OpenAI 兼容协议。
 ///
 /// 新增种类必须同时补齐：Provider 适配器、模型发现路径、wire 枚举与 UI 文案；
@@ -52,6 +55,10 @@ pub const AI_PROVIDER_MODEL_ID_MAX_LEN: usize = 200;
 pub const AI_PROVIDER_MODEL_NAME_MAX_LEN: usize = 200;
 /// `ownedBy` 上限。
 pub const AI_PROVIDER_MODEL_OWNER_MAX_LEN: usize = 120;
+/// 模型给出的解释上限（短文本，防滥用；不参与任何写入语义）。
+pub const AI_RECOMMENDATION_EXPLANATION_MAX_LEN: usize = 500;
+/// 模型给出的阅读 patch 自由文本字段上限。
+pub const AI_RECOMMENDATION_TEXT_FIELD_MAX_LEN: usize = 64;
 
 /// 一个非敏感的 Provider Profile。
 ///
@@ -344,6 +351,18 @@ pub fn models_url_for(endpoint: &str) -> Result<String, AppError> {
     Ok(candidate)
 }
 
+/// 在已规范化的 endpoint 下拼 `/chat/completions`，不重复、不逃逸 URL 策略。
+pub fn chat_completions_url_for(endpoint: &str) -> Result<String, AppError> {
+    let base = validate_endpoint(endpoint)?;
+    let candidate = if base.ends_with("/chat/completions") {
+        base
+    } else {
+        format!("{base}/chat/completions")
+    };
+    parse_http_url(&candidate, HttpUrlPolicy::AiProviderEndpoint).map_err(endpoint_error)?;
+    Ok(candidate)
+}
+
 fn looks_like_local_path(value: &str) -> bool {
     if value.starts_with('/') || value.starts_with('\\') {
         return true;
@@ -398,6 +417,12 @@ impl AiModelCapability {
             None => Self::Unknown,
         }
     }
+
+    /// 只有 Provider **显式声明** `supported` 才允许发起需要该能力的请求。
+    /// `unsupported` 与 `unknown` 都拒绝：缺字段不等于支持，能力不猜。
+    pub const fn is_explicitly_supported(self) -> bool {
+        matches!(self, Self::Supported)
+    }
 }
 
 /// 一条模型目录记录的严格投影。
@@ -438,6 +463,71 @@ impl AiModelDescriptor {
             embedding,
         })
     }
+}
+
+/// Provider 返回的一次设置建议。
+///
+/// 这是一个纯值对象：它不带 profile、会话、提案或批准信息，也没有任何直接写入
+/// 能力。Application service 会把它转换成既有的 `SettingProposal`，然后停在 pending。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiSettingsRecommendation {
+    patch: ReadingPatch,
+    explanation: Option<String>,
+}
+
+impl AiSettingsRecommendation {
+    pub fn new(patch: ReadingPatch, explanation: Option<String>) -> Result<Self, AppError> {
+        validate_recommendation_text(patch.custom_font_family.as_deref())?;
+        validate_recommendation_text(patch.custom_background.as_deref())?;
+        validate_recommendation_text(patch.custom_text.as_deref())?;
+        let explanation = explanation
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if let Some(value) = explanation.as_deref() {
+            if value.chars().count() > AI_RECOMMENDATION_EXPLANATION_MAX_LEN
+                || value.chars().any(|character| character.is_control())
+            {
+                return Err(recommendation_validation_error(
+                    "设置建议说明超出长度或包含控制字符",
+                ));
+            }
+            if contains_sensitive_text(value) {
+                return Err(recommendation_validation_error(
+                    "设置建议说明包含不允许的敏感文本",
+                ));
+            }
+        }
+        Ok(Self { patch, explanation })
+    }
+
+    pub fn patch(&self) -> &ReadingPatch {
+        &self.patch
+    }
+
+    pub fn explanation(&self) -> Option<&str> {
+        self.explanation.as_deref()
+    }
+}
+
+fn validate_recommendation_text(value: Option<&str>) -> Result<(), AppError> {
+    let Some(value) = value else { return Ok(()) };
+    if value.chars().count() > AI_RECOMMENDATION_TEXT_FIELD_MAX_LEN
+        || value.chars().any(|character| character.is_control())
+    {
+        return Err(recommendation_validation_error(
+            "设置建议文本字段超出长度或包含控制字符",
+        ));
+    }
+    Ok(())
+}
+
+fn recommendation_validation_error(message: &'static str) -> AppError {
+    AppError::new(
+        "AI_PROVIDER_RECOMMENDATION_INVALID_RESPONSE",
+        ErrorKind::Parse,
+        message,
+        false,
+    )
 }
 
 /// Provider 自报的可选字符串字段：清理控制字符、限长；清空后视为缺失。
@@ -521,6 +611,23 @@ mod tests {
         assert_eq!(
             models_url_for("https://gateway.example.invalid/v1/models").unwrap(),
             "https://gateway.example.invalid/v1/models"
+        );
+    }
+
+    #[test]
+    fn chat_endpoint_does_not_duplicate_segments() {
+        assert_eq!(
+            chat_completions_url_for("https://gateway.example.invalid/v1").unwrap(),
+            "https://gateway.example.invalid/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url_for("https://gateway.example.invalid/v1/").unwrap(),
+            "https://gateway.example.invalid/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url_for("https://gateway.example.invalid/v1/chat/completions")
+                .unwrap(),
+            "https://gateway.example.invalid/v1/chat/completions"
         );
     }
 
@@ -692,6 +799,53 @@ mod tests {
         assert_eq!(descriptor.vision, AiModelCapability::Unknown);
         assert_eq!(descriptor.embedding, AiModelCapability::Unknown);
         assert_eq!(descriptor.chat, AiModelCapability::Unknown);
+        assert!(!AiModelCapability::Unknown.is_explicitly_supported());
+        assert!(!AiModelCapability::Unsupported.is_explicitly_supported());
+        assert!(AiModelCapability::Supported.is_explicitly_supported());
+    }
+
+    #[test]
+    fn recommendation_value_object_rejects_untrusted_text() {
+        let valid = AiSettingsRecommendation::new(
+            ReadingPatch {
+                custom_text: Some("#123456".to_owned()),
+                ..ReadingPatch::default()
+            },
+            Some("建议降低亮度".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(valid.explanation(), Some("建议降低亮度"));
+        assert!(
+            AiSettingsRecommendation::new(
+                ReadingPatch {
+                    custom_text: Some("a\u{7}b".to_owned()),
+                    ..ReadingPatch::default()
+                },
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            AiSettingsRecommendation::new(
+                ReadingPatch::default(),
+                Some("x".repeat(AI_RECOMMENDATION_EXPLANATION_MAX_LEN + 1)),
+            )
+            .is_err()
+        );
+        let sensitive_explanation = AiSettingsRecommendation::new(
+            ReadingPatch::default(),
+            Some("请使用 C:/Users/private/font.ttf 这个字体文件".to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            sensitive_explanation.code().as_str(),
+            "AI_PROVIDER_RECOMMENDATION_INVALID_RESPONSE"
+        );
+        assert!(
+            !sensitive_explanation
+                .user_message()
+                .contains("C:/Users/private/font.ttf")
+        );
     }
 
     #[test]

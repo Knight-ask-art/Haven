@@ -197,7 +197,8 @@ impl SettingTarget {
             }
             (
                 Self::Edition(_) | Self::MediaItem(_),
-                SettingProposalChange::ResourcePreference(_),
+                SettingProposalChange::ResourcePreference(_)
+                | SettingProposalChange::AgentResourcePreferencePatch(_),
             ) => true,
             _ => false,
         }
@@ -206,14 +207,17 @@ impl SettingTarget {
 
 /// 提案要执行的操作（强类型闭合联合；`kind` 为判别标签）。
 ///
-/// 只有两种操作可以进入设置事实源：全局分区部分更新，或资源级偏好数据。
-/// 两者的载荷都是 `deny_unknown_fields` 的 Typed DTO，未知字段与任意 JSON Map
-/// 都在反序列化边界被拒绝。
+/// 只有三种操作可以进入设置事实源：全局分区部分更新、资源级完整覆盖数据，或
+/// Agent 专用的资源级部分 patch。后者必须在应用事务里重读当前 authoritative 值后
+/// 合并，避免把带有路径/凭据样式的旧自由文本复制进 Agent Proposal/Receipt。
+/// 三者的载荷都是 `deny_unknown_fields` 的 Typed DTO，未知字段与任意 JSON Map 都在
+/// 反序列化边界被拒绝。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SettingProposalChange {
     SettingsPatch(SettingsPatch),
     ResourcePreference(PreferenceData),
+    AgentResourcePreferencePatch(PreferenceData),
 }
 
 impl SettingProposalChange {
@@ -221,6 +225,7 @@ impl SettingProposalChange {
         match self {
             Self::SettingsPatch(_) => "settings_patch",
             Self::ResourcePreference(_) => "resource_preference",
+            Self::AgentResourcePreferencePatch(_) => "agent_resource_preference_patch",
         }
     }
 }
@@ -706,7 +711,10 @@ pub fn canonical_json_of<T: Serialize + ?Sized>(value: &T) -> Result<String, App
 
 /// canonical JSON 的 SHA-256 小写十六进制摘要。
 pub fn canonical_digest(canonical_json: &str) -> String {
-    format!("{:x}", Sha256::digest(canonical_json.as_bytes()))
+    Sha256::digest(canonical_json.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// 摘要的严格形状：恰好 64 个 ASCII **小写**十六进制字符。

@@ -11,13 +11,19 @@
 
 use tauri::State;
 
-use haven_application::services::AgentSettingsIpcService;
+use haven_application::services::{
+    AgentContextQueryService, AgentSettingsIpcService, AgentTraceQueryService,
+};
 use haven_application::wire::{
-    AgentCapabilityManifestDto, AgentSettingChangeReceiptDto, AgentSettingChangeReceiptGetRequest,
-    AgentSettingsContextDto, AgentSettingsProposalApproveRequest,
-    AgentSettingsProposalApproveResultDto, AgentSettingsProposalCreateRequest,
-    AgentSettingsProposalDto, AgentSettingsProposalGetRequest, AgentSettingsProposalGetResultDto,
-    AgentSettingsProposalRejectRequest, AgentSettingsProposalRejectResultDto, ErrorDto,
+    AgentCapabilityManifestDto, AgentResourcePreferenceProposalApproveRequest,
+    AgentResourcePreferenceProposalApproveResultDto, AgentResourcePreferenceProposalCreateRequest,
+    AgentResourcePreferenceProposalDto, AgentResourcePreferenceProposalGetRequest,
+    AgentResourcePreferenceProposalGetResultDto, AgentSettingChangeReceiptDto,
+    AgentSettingChangeReceiptGetRequest, AgentSettingsContextDto,
+    AgentSettingsProposalApproveRequest, AgentSettingsProposalApproveResultDto,
+    AgentSettingsProposalCreateRequest, AgentSettingsProposalDto, AgentSettingsProposalGetRequest,
+    AgentSettingsProposalGetResultDto, AgentSettingsProposalRejectRequest,
+    AgentSettingsProposalRejectResultDto, AgentTraceGetRequest, AgentTraceGetResultDto, ErrorDto,
 };
 use haven_domain::ids::{AgentRequestId, AgentSessionId, SettingProposalId};
 
@@ -52,6 +58,19 @@ pub async fn run_agent_settings_proposal_create(
     let request_id = parse_request_id(&request.request_id)?;
     agent_settings
         .create_proposal(session_id, request_id, &request)
+        .await
+        .map_err(|error| to_error_dto(&error))
+}
+
+/// 创建资源级偏好提案（只创建，不写资源偏好）。
+pub async fn run_agent_resource_preference_proposal_create(
+    agent_context: &AgentContextQueryService,
+    request: AgentResourcePreferenceProposalCreateRequest,
+) -> Result<AgentResourcePreferenceProposalDto, ErrorDto> {
+    let session_id = parse_session_id(&request.session_id)?;
+    let request_id = parse_request_id(&request.request_id)?;
+    agent_context
+        .create_resource_preference_proposal(session_id, request_id, &request)
         .await
         .map_err(|error| to_error_dto(&error))
 }
@@ -101,6 +120,40 @@ pub async fn run_agent_setting_change_receipt_get(
         .map_err(|error| to_error_dto(&error))
 }
 
+/// 按 proposalId 回读资源级 Agent 提案与回执；不提供任何直接写入能力。
+pub async fn run_agent_resource_preference_proposal_get(
+    agent_context: &haven_application::services::AgentContextQueryService,
+    request: AgentResourcePreferenceProposalGetRequest,
+) -> Result<AgentResourcePreferenceProposalGetResultDto, ErrorDto> {
+    agent_context
+        .get_resource_preference_proposal(&request)
+        .await
+        .map_err(|error| to_error_dto(&error))
+}
+
+/// 用户批准资源级 Agent 提案；目标、绑定、token、CAS 与 receipt 仍由 Application 内核
+/// 在同一 UoW 中核对和执行。
+pub async fn run_agent_resource_preference_proposal_approve(
+    agent_context: &haven_application::services::AgentContextQueryService,
+    request: AgentResourcePreferenceProposalApproveRequest,
+) -> Result<AgentResourcePreferenceProposalApproveResultDto, ErrorDto> {
+    agent_context
+        .approve_resource_preference_proposal(&request)
+        .await
+        .map_err(|error| to_error_dto(&error))
+}
+
+/// 读取一条 session 绑定的有界 Agent 轨迹；不返回模型正文或敏感材料。
+pub async fn run_agent_trace_get(
+    agent_trace: &AgentTraceQueryService,
+    request: AgentTraceGetRequest,
+) -> Result<AgentTraceGetResultDto, ErrorDto> {
+    agent_trace
+        .get(&request)
+        .await
+        .map_err(|error| to_error_dto(&error))
+}
+
 // ---------- Tauri 命令 ----------
 
 #[tauri::command]
@@ -124,6 +177,18 @@ pub async fn agent_settings_proposal_create(
     let agent_settings = state.agent_settings.clone();
     run_blocking(move || async move {
         run_agent_settings_proposal_create(&agent_settings, request).await
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn agent_resource_preference_proposal_create(
+    state: State<'_, AppState>,
+    request: AgentResourcePreferenceProposalCreateRequest,
+) -> Result<AgentResourcePreferenceProposalDto, ErrorDto> {
+    let agent_context = state.agent_context.clone();
+    run_blocking(move || async move {
+        run_agent_resource_preference_proposal_create(&agent_context, request).await
     })
     .await
 }
@@ -174,6 +239,39 @@ pub async fn agent_setting_change_receipt_get(
         run_agent_setting_change_receipt_get(&agent_settings, request).await
     })
     .await
+}
+
+#[tauri::command]
+pub async fn agent_resource_preference_proposal_get(
+    state: State<'_, AppState>,
+    request: AgentResourcePreferenceProposalGetRequest,
+) -> Result<AgentResourcePreferenceProposalGetResultDto, ErrorDto> {
+    let agent_context = state.agent_context.clone();
+    run_blocking(move || async move {
+        run_agent_resource_preference_proposal_get(&agent_context, request).await
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn agent_resource_preference_proposal_approve(
+    state: State<'_, AppState>,
+    request: AgentResourcePreferenceProposalApproveRequest,
+) -> Result<AgentResourcePreferenceProposalApproveResultDto, ErrorDto> {
+    let agent_context = state.agent_context.clone();
+    run_blocking(move || async move {
+        run_agent_resource_preference_proposal_approve(&agent_context, request).await
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn agent_trace_get(
+    state: State<'_, AppState>,
+    request: AgentTraceGetRequest,
+) -> Result<AgentTraceGetResultDto, ErrorDto> {
+    let agent_trace = state.agent_trace_query.clone();
+    run_blocking(move || async move { run_agent_trace_get(&agent_trace, request).await }).await
 }
 
 // ---------- 解析辅助 ----------

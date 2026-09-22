@@ -131,6 +131,12 @@ import type {
   AgentSettingChangeDto,
   AgentSettingChangeReceiptDto,
   AgentSettingChangeReceiptGetRequest,
+  AgentResourcePreferenceProposalApproveRequest,
+  AgentResourcePreferenceProposalApproveResultDto,
+  AgentResourcePreferenceProposalCreateRequest,
+  AgentResourcePreferenceProposalDto,
+  AgentResourcePreferenceProposalGetRequest,
+  AgentResourcePreferenceProposalGetResultDto,
   AgentSettingsContextDto,
   AgentSettingsProposalApproveRequest,
   AgentSettingsProposalApproveResultDto,
@@ -140,9 +146,13 @@ import type {
   AgentSettingsProposalGetResultDto,
   AgentSettingsProposalRejectRequest,
   AgentSettingsProposalRejectResultDto,
+  AgentTraceGetRequest,
+  AgentTraceGetResultDto,
   AiModelCapabilityDto,
   AiProviderModelsCatalogDto,
   AiProviderModelsListRequest,
+  AiSettingsRecommendationDto,
+  AiSettingsRecommendationGenerateRequest,
   AiProviderProfileDeleteRequest,
   AiProviderProfileDeleteResultDto,
   AiProviderProfileDto,
@@ -2261,13 +2271,32 @@ export class MockHavenClient implements HavenClient {
       capabilities: {
         settingsRead: true,
         settingsProposal: true,
-        librarySummaryRead: false,
+        librarySummaryRead: true,
+        settingSourcesRead: true,
+        resourcePreferenceRead: true,
+        resourcePreferenceProposal: true,
+        mediaCapabilitiesRead: true,
+        onboardingRead: true,
         metadataProposal: false,
         renameProposal: false,
         secretRead: false,
         filesystemWrite: false,
       },
     }
+  }
+
+  /**
+   * Mock 不伪造模型调用或 AI 推荐；没有真实 Provider 时给出与 Rust 相同的显式空能力错误。
+   * 这样 UI 可以开发错误/未配置状态，但不会把演示数据误显示为模型生成结果。
+   */
+  async aiSettingsRecommendationGenerate(
+    _request: AiSettingsRecommendationGenerateRequest,
+  ): Promise<AiSettingsRecommendationDto> {
+    throw new HavenError({
+      code: "AI_PROVIDER_RECOMMENDATION_UNAVAILABLE",
+      userMessage: "当前演示环境未接入 AI 设置推荐",
+      retryable: false,
+    });
   }
 
   async agentSettingsContextGet(): Promise<AgentSettingsContextDto> {
@@ -2435,6 +2464,40 @@ export class MockHavenClient implements HavenClient {
     return mockReceiptDto(record)
   }
 
+  async agentResourcePreferenceProposalCreate(
+    _request: AgentResourcePreferenceProposalCreateRequest,
+  ): Promise<AgentResourcePreferenceProposalDto> {
+    throw new HavenError({
+      code: "HAVEN_CAPABILITY_UNAVAILABLE",
+      userMessage: "当前能力未开放",
+      retryable: false,
+    });
+  }
+
+  async agentResourcePreferenceProposalGet(
+    _request: AgentResourcePreferenceProposalGetRequest,
+  ): Promise<AgentResourcePreferenceProposalGetResultDto> {
+    throw new HavenError({
+      code: "HAVEN_CAPABILITY_UNAVAILABLE",
+      userMessage: "当前能力未开放",
+      retryable: false,
+    });
+  }
+
+  async agentResourcePreferenceProposalApprove(
+    _request: AgentResourcePreferenceProposalApproveRequest,
+  ): Promise<AgentResourcePreferenceProposalApproveResultDto> {
+    throw new HavenError({
+      code: "HAVEN_CAPABILITY_UNAVAILABLE",
+      userMessage: "当前能力未开放",
+      retryable: false,
+    });
+  }
+
+  async agentTraceGet(request: AgentTraceGetRequest): Promise<AgentTraceGetResultDto> {
+    return { schemaVersion: 1, sessionId: request.sessionId, events: [] };
+  }
+
   /** authoritative 阅读设置（与 `settingsGet("reading")` 同源，不另建状态）。 */
   private mockReadingState(): { revision: string | null; value: SettingsValue } {
     const state = this.settings.get("reading")
@@ -2473,7 +2536,12 @@ export class MockHavenClient implements HavenClient {
         capabilities: {
           settingsRead: true,
           settingsProposal: true,
-          librarySummaryRead: false,
+          librarySummaryRead: true,
+          settingSourcesRead: true,
+          resourcePreferenceRead: true,
+          resourcePreferenceProposal: true,
+          mediaCapabilitiesRead: true,
+          onboardingRead: true,
           metadataProposal: false,
           renameProposal: false,
           secretRead: false,

@@ -38,7 +38,7 @@
 
 ## 2. 当前接通状态
 
-（截至 2026-09-18；`get_system_capabilities` 的 `tool_implementation` 是权威来源，
+（截至 2026-09-20；`get_system_capabilities` 的 `tool_implementation` 是权威来源，
 本表只是它的快照，**不要**把它当成比工具返回值更可信的东西。）
 
 | 工具 | Haven 侧实现 | 不可用时你会看到 |
@@ -46,14 +46,14 @@
 | `get_system_capabilities` | ✅ | ——（永远可用） |
 | `get_settings_snapshot` | ✅ | `HAVEN_BRIDGE_UNAVAILABLE`（桥接未接通时） |
 | `propose_settings_patch` | ✅ | 同上 |
-| `get_setting_sources` | ❌ | `HAVEN_CAPABILITY_UNAVAILABLE` |
-| `get_resource_preference_snapshot` | ❌ | `HAVEN_CAPABILITY_UNAVAILABLE` |
-| `get_library_summary` | ❌ | `HAVEN_CAPABILITY_UNAVAILABLE` |
-| `get_media_capabilities` | ❌ | `HAVEN_CAPABILITY_UNAVAILABLE` |
-| `get_onboarding_state` | ❌ | `HAVEN_CAPABILITY_UNAVAILABLE` |
-| `propose_resource_preference_patch` | ❌ | `HAVEN_CAPABILITY_UNAVAILABLE` |
+| `get_setting_sources` | ✅ | `HAVEN_BRIDGE_UNAVAILABLE`（桥接未接通时） |
+| `get_resource_preference_snapshot` | ✅ | `HAVEN_BRIDGE_UNAVAILABLE`（桥接未接通时） |
+| `get_library_summary` | ✅ | `HAVEN_BRIDGE_UNAVAILABLE`（桥接未接通时） |
+| `get_media_capabilities` | ✅ | `HAVEN_BRIDGE_UNAVAILABLE`（桥接未接通时） |
+| `get_onboarding_state` | ✅ | `HAVEN_BRIDGE_UNAVAILABLE`（桥接未接通时） |
+| `propose_resource_preference_patch` | ✅ | `HAVEN_BRIDGE_UNAVAILABLE`（桥接未接通时） |
 
-另外：**live 运行时传输尚未实现**。当前生产默认是显式不可用桥接，因此即使上表里
+另外：**live 运行时传输已经实现，但仍需用户显式开启 Haven Broker 并配置端点**。当前生产默认是显式不可用桥接，因此即使上表里
 "✅"的工具，在没有接通桥接的环境里也会返回 `HAVEN_BRIDGE_UNAVAILABLE`。
 这不是故障，是本版本的已知边界——如实告诉用户，不要用别的方式凑答案。
 
@@ -86,7 +86,10 @@
     "agent_api_version": 1,
     "capabilities": {
       "settings_read": bool, "settings_proposal": bool,
-      "library_summary_read": bool, "metadata_proposal": bool,
+      "setting_sources_read": bool, "resource_preference_read": bool,
+      "resource_preference_proposal": bool, "library_summary_read": bool,
+      "media_capabilities_read": bool, "onboarding_read": bool,
+      "metadata_proposal": bool,
       "rename_proposal": bool, "secret_read": bool, "filesystem_write": bool
     },
     "reason": "HAVEN_BRIDGE_UNAVAILABLE|null"
@@ -141,7 +144,7 @@ Haven 甚至会拒绝任何声明它们的能力清单。
   "patch": { "font_size": "large" },
   "response_format": "json|markdown" }
 
-// 资源级（当前未实现）
+// 资源级（需要先读取同一作用域的快照）
 { "target_scope": "edition|media_item",
   "edition_id": "…", "media_item_id": "…|null",
   "context_id": "…", "context_hash": "…", "base_revision": "…|null",
@@ -151,6 +154,10 @@ Haven 甚至会拒绝任何声明它们的能力清单。
 
 约束：`patch` 至少一个非 null 字段；`target_scope='media_item'` 时 `media_item_id` 必填，
 `='edition'` 时必须为 `null`；一条提案最多 12 个键。
+
+资源级 `patch` 只表示本次请求的部分变更，不是 authoritative `PreferenceData` 的完整副本。
+Haven 批准时会在同一 CAS 事务中重读并合并；未出现在 patch 中的字段不会被清除或覆盖。
+因此 Agent 不应为了补全 Diff 而复制快照中已脱敏的路径、endpoint 或凭据样式文本。
 
 ### 提案返回的形状
 
@@ -164,18 +171,21 @@ Haven 甚至会拒绝任何声明它们的能力清单。
   "section": "reading|null", "edition_id": "…|null", "media_item_id": "…|null",
   "base_revision": "…|null",
   "created_at": "RFC3339", "expires_at": "RFC3339",
-  "changes": [ { "key": "reading.font_size", "before": "medium", "after": "large" } ] }
+  "changes": [ { "key": "reading.fontSize", "before": "medium", "after": "large" } ] }
 ```
 
 返回里**没有** approval token、secret、credentialRef、绝对路径或 SQL —— 不是"没打印"，
 是结构里根本没有这些位置。
 
+Agent Receipt（只在 Haven UI/内部 typed service 内部产生）使用脱敏的 before/after 审计投影；
+authoritative 设置仍保存真实值，MCP v1 不暴露 Receipt 读取或 Apply 工具。
+
 ## 5. 错误码含义
 
 | 错误码 | 含义 | 该怎么做 |
 | --- | --- | --- |
-| `HAVEN_BRIDGE_UNAVAILABLE` | Haven 运行时桥接没接通（本版本尚无 live 传输适配器） | 如实说明 + 给手动路径。换环境可能就行。 |
-| `HAVEN_CAPABILITY_UNAVAILABLE` | Haven 后端没有这个用例 | 如实说明。**重试无用**，不要换工具凑近似答案。 |
+| `HAVEN_BRIDGE_UNAVAILABLE` | Haven 运行时桥接没接通（默认关闭、端点未配置或 Haven 未运行） | 如实说明 + 给手动路径；确认 Broker 已开启且端点配置正确后再试。 |
+| `HAVEN_CAPABILITY_UNAVAILABLE` | 当前 Haven 版本没有开放该能力 | 如实说明。**重试无用**，不要换工具凑近似答案。 |
 | `HAVEN_BRIDGE_TIMEOUT` | 桥接超时 | 可重试；告知用户"应用可能正忙"。 |
 | `HAVEN_BRIDGE_PROTOCOL_ERROR` | 桥接返回了不符合契约的载荷 | 视为实现缺陷，如实报告，不要解释成用户输入问题。 |
 | `INVALID_ARGUMENT` | 输入不合法（字段名、取值、锚点格式） | 自己改正后重试一次；仍失败就把字段名报给用户。 |

@@ -1,14 +1,15 @@
 # MCP 外部 Agent 传输设计（A5）
 
-- 状态：**设计已冻结；A5 的核心已落地，但没有任何一项经过真实验收**。Rust Broker 内核、
+- 状态：**设计已冻结；A5 的核心已落地，但没有任何一项经过完整真实验收**。Rust Broker 内核、
   Windows 命名管道服务端、Tauri 命令 / `AppState` 接线、设置页「外部 Agent 接入」分组与
-  Node live 适配器都已在仓库里并有测试；真实客户端、真机 UI 与端到端链路尚未验收。
+  Node live 适配器都已在仓库里并有测试；9 个工具的后端路径也已全部接通；真实客户端、
+  真机 UI 与端到端链路尚未验收。
   逐项状态与证据见 §12。
 - 上游边界：[`AI_SYSTEM.md`](./AI_SYSTEM.md)（§5 MCP 边界、§6 Skill 边界）
 - 阶段拆分：[`docs/plans/2026-09-18-ai-provider-mcp-skill-plan.md`](../plans/2026-09-18-ai-provider-mcp-skill-plan.md) 的 A5 节
 
 > 本版依据独立审查修订，相对首版有七处实质变更：取消发现文件改为显式端点配置（§4）、
-> 请求集合由 3 项收紧为 2 项（§5.3）、会话与请求身份改由服务端生成（§6.2）、
+> 请求集合冻结为 8 个 granted requests（`cancel` 仅为控制帧，见 §5.3）、会话与请求身份改由服务端生成（§6.2）、
 > 配额写成确定契约（§8.3）、明确 `node:net` 的允许边界（§8.4）、
 > Windows DACL 只授权当前用户（§4.4）、多实例改为 fail closed 且不声称支持（§7.4）。
 
@@ -38,7 +39,9 @@
 
 - 一套 MCP 工具定义（A3 冻结的 9 个），不为任何客户端定制分支；
 - 一条受控的本地 IPC 通道，把 MCP server 接到运行中的 Haven；
-- 结论上只有两种能力：**读取脱敏上下文**、**创建 pending 提案**。
+- 结论上只有两种能力：**读取脱敏上下文**、**创建 pending 提案**。Broker 的业务请求由
+  6 个 Read 请求和 2 个 Propose 请求组成；第 9 个 MCP 工具 `get_system_capabilities`
+  只在 Node MCP server 本地投影桥接与 Haven 能力状态，不进入 Broker `granted_requests`。
 
 ### 非目标（A5 明确不做）
 
@@ -109,7 +112,8 @@ Haven UI 提供的**同一份配置模板**（四个客户端共用；各客户�
                     ▼
 ┌─ Haven 应用进程（Rust）──────────────────────────────────┐
 │  Broker server（本设计新增）                              │
-│    └─ 只投影 2 个用例：context / create_proposal          │
+│    └─ 投影 8 个请求：6 Read + 2 Propose                  │
+│       （MCP 的第 9 个工具 get_system_capabilities 在 Node 本地完成）│
 │    └─ 服务端生成 AgentSessionId / AgentRequestId（§6.2）  │
 │    └─ 配额前置校验（§8.3）                                 │
 │  Typed Application service（AgentSettingsIpcService）     │
@@ -132,9 +136,8 @@ Haven UI 提供的**同一份配置模板**（四个客户端共用；各客户�
 | ③ | 用户 ↔ 写入 | 一切自动化 | 只能由人在 Haven UI 批准 |
 
 **关键点：边界②的请求集合比 Haven 的 Application service 面**窄**。**
-`AgentSettingsIpcService` 有 `context` / `create_proposal` / `get_proposal` / `reject_proposal`
-/ `approve_proposal` / `receipt` 六个方法；Broker **只投影其中两个**（§5.3）。
-`get_proposal` / `approve` / `reject` / `receipt` 是 UI 的权限，Broker 里不存在对应帧——
+Broker 现在投影 Agent Context 的 6 个 Read 用例和 Agent Settings 的 2 个 Propose 用例；
+`get_proposal` / `approve` / `reject` / `receipt` 仍是 UI 的权限，Broker 里不存在对应帧——
 不是"关着"，是**没有这个帧类型**，因此无法被构造出来。§11 有验收专门断言这个投影关系。
 
 ---
@@ -268,25 +271,39 @@ ACL 是**主要**控制手段；协议层的握手、能力清单与配额是纵
     "capabilities": {              // **权威**：服务端说的才算（§6.1）
       "settings_read": true,
       "settings_proposal": true,
-      "library_summary_read": false,
+      "setting_sources_read": true,
+      "resource_preference_read": true,
+      "resource_preference_proposal": true,
+      "library_summary_read": true,
+      "media_capabilities_read": true,
+      "onboarding_read": true,
       "metadata_proposal": false,
       "rename_proposal": false,
       "secret_read": false,
       "filesystem_write": false
     }
   },
-  "granted_requests": ["context", "create_proposal"] }
+  "granted_requests": [
+    "context", "setting_sources", "resource_preference", "library_summary",
+    "media_capabilities", "onboarding", "create_proposal", "create_resource_proposal"
+  ] }
 ```
 
 握手超时 5 s；超时或版本不等 → `HAVEN_BROKER_PROTOCOL_MISMATCH` 并断连。
 版本不等时**不做降级兼容**：宁可让客户端拿到明确错误，也不要让它以为协商成功。
 
-### 5.3 请求闭合集合（**恰好 2 项**）
+### 5.3 请求闭合集合（**恰好 8 项；`cancel` 是控制帧**）
 
 | `type` | 对应 Application 用例 | 语义 |
 | --- | --- | --- |
 | `context` | `AgentSettingsIpcService::context` | 读脱敏设置上下文（context_id / hash / revision / 能力清单） |
-| `create_proposal` | `AgentSettingsIpcService::create_proposal` | 创建 pending 提案 |
+| `setting_sources` | `AgentContextQueryService::setting_sources` | 读设置来源与权威层信息 |
+| `resource_preference` | `AgentContextQueryService::resource_preference_snapshot` | 读 edition / media item 作用域阅读偏好 |
+| `library_summary` | `AgentContextQueryService::library_summary` | 读有界媒体库统计摘要 |
+| `media_capabilities` | `AgentContextQueryService::media_capabilities` | 读媒体项可用能力摘要 |
+| `onboarding` | `AgentContextQueryService::onboarding_state` | 读引导完成状态 |
+| `create_proposal` | `AgentSettingsIpcService::create_proposal` | 创建全局 reading pending 提案 |
+| `create_resource_proposal` | `AgentContextQueryService::create_resource_preference_proposal` | 创建资源级 reading pending 提案 |
 
 ```jsonc
 // 通用请求外壳
@@ -309,7 +326,8 @@ ACL 是**主要**控制手段；协议层的握手、能力清单与配额是纵
 3. 批准之后的状态与 Receipt **仍归 Haven UI**：把回读交给外部 Agent，会诱导
    "Agent 声称已生效"，而 Skill 明确禁止这类表述。
 
-因此 v1 的请求集恰好 2 项。将来若要让外部 Agent 回读提案状态，必须先同时修改
+因此 v1 的 granted request 集恰好 8 项；`cancel` 只控制当前连接的在途任务，不是业务
+能力，也不进入 `welcome.granted_requests`。将来若要让外部 Agent 回读提案状态，必须先同时修改
 冻结端口与冻结工具清单，并单独评审——不在 A5 内。
 
 **不存在的请求类型**（因此无法被构造）：`get_proposal` / `approve` / `reject` / `apply` /
@@ -381,7 +399,12 @@ ACL 是**主要**控制手段；协议层的握手、能力清单与配额是纵
 | --- | --- | --- |
 | `settings_read` | ✅ true | |
 | `settings_proposal` | ✅ true | |
-| `library_summary_read` | ❌ false | 后端用例未实现 |
+| `setting_sources_read` | ✅ true | |
+| `resource_preference_read` | ✅ true | |
+| `resource_preference_proposal` | ✅ true | |
+| `library_summary_read` | ✅ true | |
+| `media_capabilities_read` | ✅ true | |
+| `onboarding_read` | ✅ true | |
 | `metadata_proposal` | ❌ false | 本版本明确不做 |
 | `rename_proposal` | ❌ false | 本版本明确不做 |
 | `secret_read` | ❌ false | 永不提供 |
@@ -555,9 +578,15 @@ Unix 侧的判据刻意**不是**"socket 文件存不存在"：那个文件在�
 ### 8.1 允许 / 禁止（闭合）
 
 ```text
-ALLOWED（只有这两件事）
-  context          读脱敏设置上下文
-  create_proposal  创建 pending 提案（零写入设置）
+ALLOWED（两类、八个请求）
+  context / setting_sources / resource_preference / library_summary
+  media_capabilities / onboarding
+                   读取脱敏、有限、无正文的上下文
+  create_proposal / create_resource_proposal
+                   创建 pending 提案（零写入设置）
+
+CONTROL（不是业务能力）
+  cancel           取消当前连接上的在途请求；不进入 granted_requests
 
 FORBIDDEN（协议里**不存在**对应帧，因此无法构造）
   get_proposal · approve · reject · apply · write · delete · rename
@@ -565,10 +594,15 @@ FORBIDDEN（协议里**不存在**对应帧，因此无法构造）
   exec / invoke / 任意命令 · 任意 prompt 直通
 ```
 
-工具面（MCP 侧）与请求面（Broker 侧）同构：MCP 的 9 个工具里，只有
-`get_settings_snapshot` 与 `propose_settings_patch` 会真正打到 Broker；
-其余 6 个因为后端用例未实现而在 MCP 层就返回 `HAVEN_CAPABILITY_UNAVAILABLE`，
-不经过 Broker —— **live 通道接通后依然如此**（A6 才补这 6 个用例）。
+工具面（MCP 侧）与请求面（Broker 侧）同构：9 个 MCP 工具全部有对应的 Broker / Application
+路径；其中 `get_system_capabilities` 负责本地能力状态投影，其余 8 个请求经过 Broker。
+能力仍由服务端逐请求重校验，且默认 Broker 关闭，所以真实调用可能得到
+`HAVEN_BRIDGE_UNAVAILABLE`，这与后端用例是否存在是两回事。
+
+资源级 `create_resource_proposal` 只提交 Agent 请求的部分 patch，不把 authoritative 偏好
+合并后回传或保存成 Proposal。真正批准时由 Haven 在同一 UoW 内重读、合并并 CAS；Agent
+Receipt 若由内部路径产生，也只保存脱敏的 before/after 审计投影。原始设置事实仍留在 Haven
+内部，Broker/MCP 不提供 Receipt 读取帧，也不把路径、endpoint 或凭据样式文本交给外部 Agent。
 
 ### 8.2 同用户恶意进程——诚实限制
 
@@ -592,29 +626,32 @@ Windows DACL 限制到创建者 SID、Unix `0600` 限制到属主，挡的是**�
 | 配额 | 上限 | 作用域 |
 | --- | --- | --- |
 | 在途请求 | **8** | 每连接（= §5.1 的帧级上限） |
-| 未过期 pending 提案 | **8** | 每连接 |
-| 外部提案创建次数 | **32** | 每个 Haven **进程窗口**（本次运行期间） |
+| 外部提案创建尝试 | **8** | 每连接 |
+| 外部提案创建尝试 | **32** | 每个 Haven **进程窗口**（本次运行期间） |
 
 - 超出任一项 → `HAVEN_BROKER_QUOTA_EXCEEDED`，**在进入 `AgentSettingsIpcService` 之前拒绝**，
   零写入。
-- pending 提案 TTL 沿用既有 `DEFAULT_SETTING_PROPOSAL_TTL_MS` = **24 小时**
+- 这里统计的是创建尝试，不是假定 Application 成功后的 pending 数：调用失败时也不退款，
+  因为失败可能发生在 Proposal 已落库但响应投影失败之后；这是一条更保守、可证明的
+  fail-closed 噪音上限。
+- 成功创建的 pending 提案仍沿用既有 `DEFAULT_SETTING_PROPOSAL_TTL_MS` = **24 小时**
   （`haven-application/src/services/setting_proposals.rs:50`），不新增第二套过期语义。
-- 连接断开时，该连接的 in-flight 与 pending 计数随之释放（pending 提案本身仍在库里，
-  按 24 小时 TTL 过期）。
+- 连接断开时，在途计数随之释放；尝试配额属于连接/进程窗口，不因断开或重连退款。
 
 **数值理由**：
 
 - **8**（在途）与 `§5.1` 的帧级并发上限一致——一个数值只定义一次，避免两处各写一个。
-- **8**（每连接 pending）远小于"人类愿意逐条审阅"的规模；一个正常的 Agent 交互会
+- **8**（每连接尝试）远小于"人类愿意逐条审阅"的规模；一个正常的 Agent 交互会
   提议一两次就等用户批准，8 已经宽松。
-- **32**（进程窗口）是"一次运行期间外部创建总量"的上界。它足够覆盖长时间使用
-  （用户批准后再提议，反复几十次），又能在被恶意进程灌水时把总量挡在可人工清理的范围内。
+- **32**（进程窗口尝试）是一次运行期间外部创建工作的上界。它足够覆盖长时间使用，
+  又能在被恶意进程或反复失败的 Agent 灌水时把总量挡在可人工清理的范围内。
 
 **这是进程窗口配额，不是跨重启的持久计数。** 换句话说：重启 Haven 会把 32 清零。
 残留风险与为何接受：
 
 - 重启需要用户本人操作（或已经能控制该用户会话），此时攻击者能做的事远不止灌提案；
-- 即便被清零，恶意进程能得到的**仍然只是"多写一些 pending 提案"**——它无法 Apply，
+- 即便被清零，恶意进程能得到的**仍然只是"多发起一些创建尝试"**——成功时最多写入
+  pending 提案，但它无法 Apply，
   无法绕过 UI 批准。配额的作用是抑制噪音，不是充当权限边界；
 - 若做成持久计数，就要新增一张持久表并处理迁移/清理，收益（防一个本来就不构成提权的
   噪音）不抵复杂度。将来若真出现滥用证据，再升级为持久计数并单独立项。
@@ -667,9 +704,9 @@ FORBIDDEN（src/ 内一律不得出现）
 
 ## 9. 外部 Agent 兼容矩阵
 
-**下表是设计目标，不是实测结果。** 截至 2026-09-18 的工作树，四个客户端仍全部未实测；
-A5.6 目前只有"四个客户端共用同一份模板"的契约测试（`agent-broker-gateway.test.ts`），
-**没有**四份真实客户端配置夹具，也没有任何兼容性验证。
+**下表是设计目标，不是实测结果。** 截至 2026-09-20 的工作树，四个客户端仍全部未实测；
+A5.6 已提供四份统一形状的配置夹具与契约测试（`test/client-fixtures.test.ts`），但每份夹具都明确
+标记 `verified: false`，因此**没有任何真实客户端兼容性验证结论**。
 
 | 客户端 | 接入方式 | 配置形态 | 状态 |
 | --- | --- | --- | --- |
@@ -678,8 +715,8 @@ A5.6 目前只有"四个客户端共用同一份模板"的契约测试（`agent-
 | DSH | MCP stdio | 同上 | 设计目标；**未实测** |
 | Pi | MCP stdio | 同上 | 设计目标；**未实测** |
 
-四者共用 Haven UI 提供的**同一份配置模板**（§2）。共同不变量（当前由共用模板的契约测试
-覆盖；四份客户端夹具尚未实现）：
+四者共用 Haven UI 提供的**同一份配置模板**（§2）。仓库中的四份夹具只把客户端身份作为
+测试数据，不能成为权限来源；共同不变量由共用模板和 `test/client-fixtures.test.ts` 覆盖：
 
 1. 只暴露冻结的 9 个工具，不因客户端而增减；
 2. 输入 schema 一律 strict，未知字段被拒绝；
@@ -718,8 +755,8 @@ A5 完成的定义是下列全部可执行、可重复：
 
 | # | 验收项 | 手段 |
 | --- | --- | --- |
-| V1 | Broker 请求集合**恰好 2 项**（`context` / `create_proposal`） | 代码扫描 + 协议 fixtures 双向断言 |
-| V2 | 请求集合是 Application service 面的**真子集**，且 `get_proposal`/approve/reject/receipt **不存在** | 对照 `AgentSettingsIpcService` 方法表 |
+| V1 | Broker `granted_requests` 集合**恰好 8 项**（6 Read + 2 Propose）；`cancel` 仅是控制帧 | 代码扫描 + 协议 fixtures 双向断言 |
+| V2 | 请求集合是 Application service 面的**真子集**，且 `get_proposal`/approve/reject/receipt **不存在** | 对照 `AgentSettingsIpcService` / `AgentContextQueryService` 方法表 |
 | V3 | Windows Named Pipe DACL **只**含创建者用户 SID（不含 SYSTEM） | 真实建管道后读回安全描述符并断言 |
 | V4 | Unix socket `0600` + 目录 `0700`，且无"先建后 chmod"窗口 | `stat` 断言 + 时序断言 |
 | V5 | 默认关闭：未开启用户开关时端点不存在、UI 不显示端点 | 进程级断言 |
@@ -744,13 +781,13 @@ Unix stale socket 的附加验收约束：Haven 管理的运行目录组件出�
 或端点路径被普通文件/目录/符号链接占用时，必须 fail closed，不 chmod 或删除无关对象；只有明确
 `ECONNREFUSED` / `ENOENT` 且 `lstat` 确认是 socket 时，才允许删除固定端点并最多重绑一次。
 
-### 11.1 当前核对（2026-09-18 工作树）
+### 11.1 当前核对（2026-09-20 工作树）
 
 **"验收项存在"不等于"已验收"。** 逐条现状：
 
 已由测试钉住的部分：
 
-- **协议 / 会话**：请求集恰好 2 项且禁帧到不了 Application（V1/V2）、握手版本不等即断连
+- **协议 / 会话**：8 项 granted requests 且禁帧到不了 Application（V1/V2）、握手版本不等即断连
   且不降级（V6）、帧/请求/响应上限与未知帧码（V7 的多数）、取消幂等与断连清理（V8）、
   `clientInfo` 不影响身份与能力（V14）——`agent_broker/{protocol,session}.rs` 单测。
 - **身份服务端生成**（V19）：帧里带 `session_id` / `request_id` 被拒，同连接共享 session。
@@ -778,7 +815,8 @@ Unix stale socket 的附加验收约束：Haven 管理的运行目录组件出�
   关系的用例，也没有注入延迟的真实双进程测试。
 - V10（Haven 退出 → MCP 归因）：需要真实双进程，未做。
 - V11 的真实客户端路径：只在 Node 单测里成立，未经客户端复核。
-- V15（四客户端夹具）：❌ 只有共用模板的契约测试，四份客户端夹具未实现。
+- V15（四客户端夹具）：✅ 四份 `verified: false` 配置夹具与契约测试已落地；❌ 四个真实客户端仍未实测，
+  因而不构成兼容性验收。
 - V16（Broker 层脱敏/有界）：MCP 层有泄漏夹具，Broker 层未单独做泄漏 fixtures。
 - V20（端点跨重启稳定）：需两次真实启动对比，未做。
 - V21 的行为断言部分：源码扫描已由守卫覆盖，行为断言未做。
@@ -795,8 +833,9 @@ transport）。**单元与集成测试通过不等于生产实测。**
 
 ## 12. 实现状态与已知缺口
 
-**截至 2026-09-18 的工作树：A5 的 Rust 侧、Tauri 接线、设置页 UI 与 Node live 适配器都已
-落地并有测试；但真实客户端、真机 UI 与 Haven→Node→MCP 的真实链路都还没有验收。**
+**截至 2026-09-20 的工作树：A5 的 Rust 侧、Tauri 接线、设置页 UI、Node live 适配器与
+9 个工具的后端路径都已落地并有测试；但真实客户端、真机 UI 与 Haven→Node→MCP 的真实
+链路都还没有验收。**
 
 仓库现状：
 
@@ -808,11 +847,12 @@ transport）。**单元与集成测试通过不等于生产实测。**
 | **Broker 协议 / schema / 会话状态机** | ✅ 已实现（A5.1）：`src-tauri/src/agent_broker/{protocol,session,error,endpoint}.rs`；`agent_broker` 定向与全量 `cargo test` 均通过 |
 | **Windows Named Pipe 服务端** | ✅ 已实现（A5.2）：`CreateNamedPipeW` + 只含当前用户 SID 的 DACL + `FILE_FLAG_FIRST_PIPE_INSTANCE`；真实管道往返与 DACL 读回断言已通过 |
 | **Unix domain socket 服务端** | ⚠️ 已实现，但**本机仍未编译验证**（A5.3）：本机是 Windows，`#[cfg(unix)]` 代码路径在本机从未被编译或运行。已为它加上 Linux `--all-targets` 的 CI 作业（`tauri-unix`，见下表最后一行），但**该作业尚未在 GitHub 上运行过**，因此仍不得据此声称 Unix 侧可用。实现含每用户活实例锁（`flock`，锁文件 `0600`）与崩溃残留恢复（§7.3、§7.4）——对应用例已写进 `listener.rs` 的 `unix_endpoint` 一组，**同样从未运行** |
-| **Rust Application bridge（Broker → `AgentSettingsIpcService`）** | ✅ 已实现（A5.4）：`AgentSettingsBrokerApi`；身份由服务端生成；配额前置；均有单测 |
+| **Rust Application bridge（Broker → Context / Settings services）** | ✅ 已实现（A5.4/A6）：`AgentSettingsBrokerApi`；8 个 granted requests 均有 dispatch、身份由服务端生成、配额前置；均有单测 |
+| **Agent 资源 Patch / Receipt 安全语义** | ✅ 已实现：资源 Proposal 保存部分 `AgentResourcePreferencePatch`，批准时在同一 CAS UoW 内重读并合并；所有 Agent Receipt 写入路径使用统一脱敏审计投影，authoritative 值不被改写 |
 | **Tauri 命令 / AppState 接线** | ✅ 已实现：`AppState` 持有 `AgentBrokerManager`，`agent_broker_status` / `agent_broker_enable` / `agent_broker_disable` 已注册，`command-manifest.rs` 与生成的权限 / capability 已接线 |
 | **设置页 UI（开启 / 端点 / 模板）** | ✅ 已实现：设置页「外部 Agent 接入」分组，默认关闭、状态与启停、真实端点复制、四客户端共用模板；浏览器 Mock 只显示 `mock://` 预览（不可复制、不给模板）。**真实 Windows WebView2 上的该界面尚未验收**；设计里的「测试端点」按钮当前**不存在**，待补 |
-| **Node local bridge（MCP server → Broker）** | ✅ 已实现（A5.5）：`src/local-broker.ts` 的 `LiveHavenAgentBridge`。`HAVEN_MCP_BRIDGE=live` **且** `HAVEN_MCP_ENDPOINT` 形态合法时连接 Rust Broker；默认仍是 `unavailable`；未配置或形态非法一律 fail closed；不读文件系统 / SQLite / secret。`mcp/haven-mcp` 本轮 `npm run build && npm test` = **86 passed / 1 skipped** |
-| **四客户端 fixtures** | ❌ **未实现**（A5.6）：只有"四客户端共用同一份模板"的契约测试，没有四份真实客户端配置夹具，也没有任何兼容性验证 |
+| **Node local bridge（MCP server → Broker）** | ✅ 已实现（A5.5）：`src/local-broker.ts` 的 `LiveHavenAgentBridge`。`HAVEN_MCP_BRIDGE=live` **且** `HAVEN_MCP_ENDPOINT` 形态合法时连接 Rust Broker；默认仍是 `unavailable`；未配置或形态非法一律 fail closed；不读文件系统 / SQLite / secret。`mcp/haven-mcp` 本轮 `npm run build && npm test` = **88 passed / 1 skipped** |
+| **四客户端 fixtures** | ✅ **已实现（A5.6）**：`fixtures/clients/{codex,claude-code,dsh,pi}.json` 共用同一 server 形状，契约测试校验身份、工具清单与 `verified: false`；❌ 真实客户端兼容性仍未验收 |
 | **安全：默认关闭 / DACL / 配额** | ✅ 已实现（A5.7 核心）：默认关闭有单测；配额 8 / 8 / 32 在进入 Application 之前逐项拒绝；端点与模板 UI 已落地；「测试端点」按钮待补 |
 | **生命周期：取消 / 断线 / 超时 / fail closed** | ✅ 已实现（A5.8 核心）：取消幂等、断连清理、空闲连接上限、请求 20 s 超时、握手 5 s 与单次写出 5 s 超时、停机、多实例 fail closed 均有单测；握手、写出与空闲三个窗口都作为内部函数参数注入，用例用毫秒级值证明连接任务会自己收尾。空闲超时（30 min）已有**毫秒级专门用例**（含"生产默认下不提前关闭"的对照），但它与其余用例一样只跑内存 duplex，**不构成真实双进程或平台端点上的验证** |
 | **Public CI 的 Linux 与 MCP 作业** | ✅ 已添加（尚未运行）：`tauri-unix` 用 `--all-targets` 编译并运行 `#[cfg(unix)]` 用例，补齐了 CodeQL 对照所需的 `pkg-config` / `libwayland-dev`，并在 Rust format/clippy/test 之前用根 `.node-version` 安装 Node、在前端工作目录 `npm ci && npm run build` 以产出被嵌入的 `../前端/app/dist`（不安装任何本机 Linux Rust target）；`mcp/*` 单列为 `mcp` scope 与 `mcp` 作业（`npm ci --no-audit --no-fund` → `npm run build` → `npm test`），`full=true`（含 `.github/*`、依赖与构建策略改动）时同样触发，并已接入 `pr-gate` 的 `needs` 与 `require_if_selected`。**这两个作业都尚未在 GitHub 上运行过**，因此不构成任何验收证据 |
@@ -822,10 +862,6 @@ transport）。**单元与集成测试通过不等于生产实测。**
 工具返回 `HAVEN_BRIDGE_UNAVAILABLE` / `HAVEN_CAPABILITY_UNAVAILABLE`。
 只有用户显式开启 Broker、并在客户端配置 `HAVEN_MCP_BRIDGE=live` + 端点之后才会走真实通道；
 **而这条通道从未验收过**。**在任何情况下都不得对外描述为"已接通 MCP"。**
-
-**默认配置下结论不变**：未设 `HAVEN_MCP_BRIDGE` 时 `haven-mcp-server` 仍只连到
-`UnavailableHavenAgentBridge`，`bridge.available = false`，工具返回
-`HAVEN_BRIDGE_UNAVAILABLE` / `HAVEN_CAPABILITY_UNAVAILABLE`。**不得对外描述为"已接通 MCP"。**
 
 落地过程中被实测推翻的两条设计假设（都已按实测结果修正）：
 
@@ -852,10 +888,10 @@ transport）。**单元与集成测试通过不等于生产实测。**
 
 - 同用户恶意进程无法区分（§8.2）——需要独立安全评审才能推进为可写通道。
 - 配额是进程窗口计数，重启清零（§8.3）——接受为残留风险，理由见该节。
-- 6 个工具的后端用例仍未实现（A6）：**live 通道接通后它们依然返回
-  `HAVEN_CAPABILITY_UNAVAILABLE`**，因此"链路上线"不等于"整个 MCP 已完成"。
-- 四客户端（Codex / Claude Code / DSH / Pi）全部未实测；A5.6 目前只有共用模板与契约测试，
-  四份客户端配置夹具未实现（§9）。
+- 9 个工具的后端路径已经实现（A6）；但真实 Haven→Node→MCP 链路仍未验收，
+  因此"后端路径存在"不等于"整个 MCP 已完成"。
+- 四客户端（Codex / Claude Code / DSH / Pi）全部未实测；A5.6 的四份配置夹具与契约测试已经落地，
+  但 `verified: false` 只表示配置合同存在，不代表真实客户端兼容性通过（§9）。
 - Unix 侧 `#[cfg(unix)]` 在**本机**未编译、未运行（本机 Windows）；CI 已添加 Linux
   all-targets 作业，但该作业尚未在 GitHub 上运行过，不得据此声称已编译验证。
 - 真实 Windows WebView2 界面未验收；「测试端点」按钮未实现。

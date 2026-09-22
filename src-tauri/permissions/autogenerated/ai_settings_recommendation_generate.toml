@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ai-settings-recommendation-generate"
+description = "Enables the ai_settings_recommendation_generate command without any pre-configured scope."
+commands.allow = ["ai_settings_recommendation_generate"]
+
+[[permission]]
+identifier = "deny-ai-settings-recommendation-generate"
+description = "Denies the ai_settings_recommendation_generate command without any pre-configured scope."
+commands.deny = ["ai_settings_recommendation_generate"]

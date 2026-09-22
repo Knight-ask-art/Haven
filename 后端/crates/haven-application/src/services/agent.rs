@@ -43,8 +43,8 @@ use crate::services::settings::SettingsService;
 /// Agent 的能力清单是调用方声明，不是授权凭证。
 ///
 /// 这个策略故意没有公开可配置的能力集合：服务端只允许当前已经实现并经过
-/// Application Service 保护的设置读取/设置提案能力。未来增加能力时必须显式
-/// 修改这里并补齐对应的服务端边界，而不能由模型或客户端的 manifest 自行放开。
+/// Application Service 保护的读取/提案能力。未来增加能力时必须显式修改这里
+/// 并补齐对应的服务端边界，而不能由模型或客户端的 manifest 自行放开。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AgentCapabilityPolicy;
 
@@ -62,7 +62,14 @@ impl AgentCapabilityPolicy {
         manifest.validate()?;
         if !matches!(
             capability,
-            AgentCapability::SettingsRead | AgentCapability::SettingsProposal
+            AgentCapability::SettingsRead
+                | AgentCapability::SettingsProposal
+                | AgentCapability::ResourcePreferenceRead
+                | AgentCapability::ResourcePreferenceProposal
+                | AgentCapability::SettingSourcesRead
+                | AgentCapability::LibrarySummaryRead
+                | AgentCapability::MediaCapabilitiesRead
+                | AgentCapability::OnboardingRead
         ) {
             return Err(agent_capability_policy_denied(capability));
         }
@@ -331,6 +338,10 @@ pub struct AgentSettingsActionRequest<'a> {
     pub context: &'a AgentContextSnapshot,
     pub target: SettingTarget,
     pub change: SettingProposalChange,
+    /// 服务端要为本次动作核对的能力。全局设置入口默认使用
+    /// `settings_proposal`；资源偏好入口显式使用
+    /// `resource_preference_proposal`，避免把所有内容范围写操作混成一枚权限位。
+    pub required_capability: AgentCapability,
     /// Agent/模型对能力的声明。它必须再次经过服务端固定策略授权，不能单独
     /// 作为权限来源。
     pub capability_manifest: AgentCapabilityManifest,
@@ -353,6 +364,7 @@ impl<'a> AgentSettingsActionRequest<'a> {
             context,
             target,
             change,
+            required_capability: AgentCapability::SettingsProposal,
             capability_manifest: AgentCapabilityManifest::for_current_slice(),
             base_revision: None,
             ttl_ms: None,
@@ -371,6 +383,11 @@ impl<'a> AgentSettingsActionRequest<'a> {
 
     pub fn with_capability_manifest(mut self, manifest: AgentCapabilityManifest) -> Self {
         self.capability_manifest = manifest;
+        self
+    }
+
+    pub fn with_required_capability(mut self, capability: AgentCapability) -> Self {
+        self.required_capability = capability;
         self
     }
 }
@@ -477,10 +494,8 @@ impl AgentProposalService {
         // 不会先落一条提案再报错（避免非法绑定留下孤儿提案）。
         validate_agent_identity_ids(request.session_id, request.request_id)?;
 
-        self.capability_policy.authorize(
-            &request.capability_manifest,
-            AgentCapability::SettingsProposal,
-        )?;
+        self.capability_policy
+            .authorize(&request.capability_manifest, request.required_capability)?;
 
         let subject = request.context.subject();
         subject.validate()?;
@@ -607,6 +622,16 @@ impl AgentProposalService {
         self.bindings.get(proposal_id).await
     }
 
+    /// 只读借用内部的设置提案服务。
+    ///
+    /// Agent 的只读投影（`agent_context`）需要在创建提案后按 id 回读刚落库的提案，
+    /// 但不应为此复制一份提案读取逻辑，也不应把 `AgentProposalService` 的私有字段
+    /// 变成第二套读路径：这里只借出 `&SettingProposalService`，读到的提案与用户界面
+    /// 看到的是同一条记录，且不暴露任何绕过 digest / token / UoW / CAS 的写入口。
+    pub fn setting_proposal(&self) -> &SettingProposalService {
+        &self.setting_proposals
+    }
+
     /// 拒绝动作对应的提案（委托既有 [`SettingProposalService::reject`]）。
     ///
     /// 拒绝不写任何设置事实，因此不要求 Subject 仍然存在；已拒绝且 digest 一致时保持幂等。
@@ -668,6 +693,26 @@ impl AgentProposalService {
     ) -> Result<SettingChangeReceipt, AppError> {
         self.setting_proposals
             .approve_agent_proposal_in_one_uow(proposal_id, confirmed_digest, subject)
+            .await
+    }
+
+    /// 用户批准 Agent 资源偏好提案的唯一 Application 入口。
+    ///
+    /// 资源目标由调用方以强类型传入；SettingProposalService 会在同一 UoW 内再次
+    /// 对比持久化 Proposal、Agent binding、目标维度、一次性 token、CAS 与 Receipt，
+    /// 因而这里不会形成一条绕开全局设置入口安全内核的“第二套资源写路径”。
+    pub async fn approve_agent_resource_proposal_in_one_uow(
+        &self,
+        proposal_id: SettingProposalId,
+        confirmed_digest: &str,
+        expected_target: SettingTarget,
+    ) -> Result<SettingChangeReceipt, AppError> {
+        self.setting_proposals
+            .approve_agent_resource_proposal_in_one_uow(
+                proposal_id,
+                confirmed_digest,
+                expected_target,
+            )
             .await
     }
 

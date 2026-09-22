@@ -3,8 +3,8 @@
 //! 契约来源：`docs/architecture/MCP_EXTERNAL_AGENT_TRANSPORT.md` §5.3、§5.5、§6.2、§8.3。
 //!
 //! 本层是 **Broker 与 Application service 之间唯一的桥**，也是 A5 安全收敛的落点：
-//! - 请求集合**恰好 2 项**：`context` / `create_proposal`。没有 `get_proposal`、没有
-//!   `approve` / `reject` / `apply` / `receipt` —— 它们在协议层就不存在帧类型。
+//! - 请求集合只包含冻结的 Read / Propose 请求。没有 `get_proposal`、没有 `approve` /
+//!   `reject` / `apply` / `receipt` —— 它们在协议层就不存在帧类型。
 //! - **身份由服务端生成**：握手时产出 `AgentSessionId`，每个通过校验的 frame id 映射为
 //!   新的 `AgentRequestId`。客户端的 `hello.client` 只进日志，不进领域。
 //! - **配额前置**：在调用 Application **之前**检查，超限即返回且零写入。
@@ -33,20 +33,25 @@ use serde_json::{json, Value};
 use tokio::sync::{watch, Mutex};
 
 use haven_application::wire::{
-    AgentSettingsProposalCreateRequest, AgentSettingsProposalDto, PreferenceReadingContentWidthDto,
-    PreferenceReadingFontFamilyDto, PreferenceReadingFontSizeDto, PreferenceReadingFontWeightDto,
+    AgentResourcePreferencePatchDto, AgentResourcePreferenceProposalCreateRequest,
+    AgentResourcePreferenceProposalDto, AgentResourcePreferenceScopeDto,
+    AgentSettingsProposalCreateRequest, AgentSettingsProposalDto, PreferenceComicDirectionDto,
+    PreferenceComicPageGapDto, PreferenceComicPatchDto, PreferenceComicPreloadPagesDto,
+    PreferenceComicViewModeDto, PreferenceReadingContentWidthDto, PreferenceReadingFontFamilyDto,
+    PreferenceReadingFontSizeDto, PreferenceReadingFontWeightDto,
     PreferenceReadingLetterSpacingDto, PreferenceReadingLineHeightDto,
     PreferenceReadingPaginationDto, PreferenceReadingPatchDto, PreferenceReadingThemeDto,
 };
-use haven_domain::agent::AgentCapabilityManifest;
+use haven_domain::agent::{AgentCapability, AgentCapabilityManifest};
 use haven_domain::ids::{AgentRequestId, AgentSessionId};
 
 use super::error::BrokerError;
 use super::protocol::{
     encode_server_frame, parse_client_frame, CancelFrame, ClientFrame, ClientInfo,
-    CreateProposalFrame, HelloFrame, OkFrame, PlainRequest, WelcomeFrame,
-    MAX_EXTERNAL_PROPOSALS_PER_PROCESS, MAX_INFLIGHT_PER_CONNECTION,
-    MAX_PENDING_PROPOSALS_PER_CONNECTION, PROTOCOL_VERSION,
+    CreateProposalFrame, CreateResourceProposalFrame, HelloFrame, LibrarySummaryFrame,
+    MediaCapabilitiesFrame, OkFrame, OnboardingFrame, PlainRequest, ResourcePreferenceFrame,
+    SettingSourcesFrame, WelcomeFrame, MAX_EXTERNAL_PROPOSALS_PER_PROCESS,
+    MAX_INFLIGHT_PER_CONNECTION, MAX_PROPOSAL_ATTEMPTS_PER_CONNECTION, PROTOCOL_VERSION,
 };
 
 /// 单请求超时。
@@ -58,14 +63,31 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// 只读上下文投影：`context` 请求的响应载荷。
 pub type ContextPayload = Value;
 
-/// Broker 需要的两个 Application 用例。
+/// Broker 需要的 Application 用例。
 ///
-/// **只有两个方法。** 这个 trait 的形状本身就是"Broker 不能 approve"的证明：
-/// 没有对应方法，就没有可达路径。
+/// 这里刻意只包含冻结的 Read / Propose 方法；没有 approve / apply / receipt、文件系统、
+/// SQL 或 secret 方法，因此 Broker 的 trait 形状本身就是安全边界的一部分。
 #[async_trait]
 pub trait BrokerAgentApi: Send + Sync {
     /// 对应 `AgentSettingsIpcService::context`。
     async fn context(&self) -> Result<ContextPayload, BrokerError>;
+
+    async fn setting_sources(&self) -> Result<Value, BrokerError>;
+
+    async fn resource_preference(
+        &self,
+        request: &super::protocol::ResourcePreferencePayload,
+    ) -> Result<Value, BrokerError>;
+
+    async fn library_summary(&self, limit: u32) -> Result<Value, BrokerError>;
+
+    async fn media_capabilities(
+        &self,
+        media_item_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Value, BrokerError>;
+
+    async fn onboarding(&self) -> Result<Value, BrokerError>;
 
     /// 对应 `AgentSettingsIpcService::create_proposal`。
     ///
@@ -76,6 +98,13 @@ pub trait BrokerAgentApi: Send + Sync {
         request_id: AgentRequestId,
         request: &AgentSettingsProposalCreateRequest,
     ) -> Result<AgentSettingsProposalDto, BrokerError>;
+
+    async fn create_resource_proposal(
+        &self,
+        session_id: AgentSessionId,
+        request_id: AgentRequestId,
+        request: &AgentResourcePreferenceProposalCreateRequest,
+    ) -> Result<AgentResourcePreferenceProposalDto, BrokerError>;
 }
 
 /// 进程窗口配额：外部提案创建次数。
@@ -188,14 +217,56 @@ impl BrokerReadingPatch {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+struct BrokerComicPatch {
+    view_mode: Option<PreferenceComicViewModeDto>,
+    direction: Option<PreferenceComicDirectionDto>,
+    page_gap: Option<PreferenceComicPageGapDto>,
+    preload_pages: Option<PreferenceComicPreloadPagesDto>,
+}
+
+impl BrokerComicPatch {
+    fn into_wire(self) -> PreferenceComicPatchDto {
+        PreferenceComicPatchDto {
+            view_mode: self.view_mode,
+            direction: self.direction,
+            page_gap: self.page_gap,
+            preload_pages: self.preload_pages,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+struct BrokerResourcePreferencePatch {
+    reading: Option<BrokerReadingPatch>,
+    comic: Option<BrokerComicPatch>,
+}
+
+impl BrokerResourcePreferencePatch {
+    fn into_wire(self) -> AgentResourcePreferencePatchDto {
+        AgentResourcePreferencePatchDto {
+            reading: self.reading.map(BrokerReadingPatch::into_wire),
+            comic: self.comic.map(BrokerComicPatch::into_wire),
+        }
+    }
+}
+
 /// 解析 patch。
 ///
-/// `null` 与"字段缺失"都映射为 `None`（= 不覆盖该字段），与既有 Wire DTO 的语义一致：
-/// `PreferenceReadingPatchDto` 用 `Option` 表达"不覆盖"，没有独立的"清除"状态。
-/// 这不是本层新引入的限制——Tauri UI 走的是同一个 DTO。
+/// `null` 与"字段缺失"都映射为 `None`（= 不覆盖该字段）。资源级 Agent patch 还会在
+/// Domain 合并时 trim 自由文本，空白值视为“不触碰”；这个闭合 patch 目前没有“清除
+/// 资源覆盖字段”的独立状态。它与全局阅读设置的完整覆盖语义不同，不能混为一谈。
 fn parse_reading_patch(value: Value) -> Result<PreferenceReadingPatchDto, ()> {
     serde_json::from_value::<BrokerReadingPatch>(value)
         .map(BrokerReadingPatch::into_wire)
+        .map_err(|_| ())
+}
+
+fn parse_resource_preference_patch(value: Value) -> Result<AgentResourcePreferencePatchDto, ()> {
+    serde_json::from_value::<BrokerResourcePreferencePatch>(value)
+        .map(BrokerResourcePreferencePatch::into_wire)
         .map_err(|_| ())
 }
 
@@ -204,12 +275,11 @@ struct SessionState {
     session_id: AgentSessionId,
     app_version: String,
     handshaked: bool,
-    /// 本连接已创建的提案数（配额）。
+    /// 本连接外部提案创建尝试数（配额）。
     ///
-    /// 语义上等价于"未过期 pending 提案数"：TTL 是 24 小时，而连接通常在数分钟内结束，
-    /// 因此连接存续期内已创建的都仍然 pending。若连接真的超过 24 小时，这个计数会比
-    /// 实际 pending 数**偏大**——偏向更严格的一侧，符合 fail-closed 原则。
-    created_proposals: u32,
+    /// 在进入 Application 前消耗，Application 失败也不退款：结果不确定时不能把名额
+    /// 当作“没有发生过”。这不是 pending 数，也不随 Proposal TTL 或拒绝状态回收。
+    proposal_attempts: u32,
     /// **活动**在途请求 id。已完成的 id 可以被复用。
     inflight: BTreeSet<i64>,
 }
@@ -224,10 +294,27 @@ pub struct Dispatch {
 #[derive(Debug)]
 enum DispatchAction {
     Context,
+    SettingSources,
+    ResourcePreference {
+        request: super::protocol::ResourcePreferencePayload,
+    },
+    LibrarySummary {
+        limit: u32,
+    },
+    MediaCapabilities {
+        media_item_id: Option<String>,
+        limit: u32,
+    },
+    Onboarding,
     CreateProposal {
         session_id: AgentSessionId,
         request_id: AgentRequestId,
         request: Box<AgentSettingsProposalCreateRequest>,
+    },
+    CreateResourceProposal {
+        session_id: AgentSessionId,
+        request_id: AgentRequestId,
+        request: Box<AgentResourcePreferenceProposalCreateRequest>,
     },
 }
 
@@ -275,7 +362,7 @@ impl BrokerSession {
                 session_id: AgentSessionId::new(),
                 app_version: app_version.into(),
                 handshaked: false,
-                created_proposals: 0,
+                proposal_attempts: 0,
                 inflight: BTreeSet::new(),
             }),
             cancels: StdMutex::new(HashMap::new()),
@@ -339,7 +426,15 @@ impl BrokerSession {
             ClientFrame::Hello(hello) => Prepared::Immediate(self.handshake(hello).await),
             ClientFrame::Cancel(frame) => self.cancel(frame),
             ClientFrame::Context(request) => self.prepare_context(request).await,
+            ClientFrame::SettingSources(frame) => self.prepare_setting_sources(frame).await,
+            ClientFrame::ResourcePreference(frame) => self.prepare_resource_preference(frame).await,
+            ClientFrame::LibrarySummary(frame) => self.prepare_library_summary(frame).await,
+            ClientFrame::MediaCapabilities(frame) => self.prepare_media_capabilities(frame).await,
+            ClientFrame::Onboarding(frame) => self.prepare_onboarding(frame).await,
             ClientFrame::CreateProposal(frame) => self.prepare_create_proposal(frame).await,
+            ClientFrame::CreateResourceProposal(frame) => {
+                self.prepare_create_resource_proposal(frame).await
+            }
         }
     }
 
@@ -384,6 +479,20 @@ impl BrokerSession {
     async fn run_action(&self, action: DispatchAction) -> Result<Value, BrokerError> {
         match action {
             DispatchAction::Context => self.api.context().await,
+            DispatchAction::SettingSources => self.api.setting_sources().await,
+            DispatchAction::ResourcePreference { request } => {
+                self.api.resource_preference(&request).await
+            }
+            DispatchAction::LibrarySummary { limit } => self.api.library_summary(limit).await,
+            DispatchAction::MediaCapabilities {
+                media_item_id,
+                limit,
+            } => {
+                self.api
+                    .media_capabilities(media_item_id.as_deref(), limit)
+                    .await
+            }
+            DispatchAction::Onboarding => self.api.onboarding().await,
             DispatchAction::CreateProposal {
                 session_id,
                 request_id,
@@ -395,6 +504,17 @@ impl BrokerSession {
                     .await?;
                 // 序列化失败**不得**退化成 `null` 成功：那会让客户端拿到一个看起来成功、
                 // 实际没有内容的提案。宁可回一个内部错误。
+                serde_json::to_value(&proposal).map_err(|_| BrokerError::internal())
+            }
+            DispatchAction::CreateResourceProposal {
+                session_id,
+                request_id,
+                request,
+            } => {
+                let proposal = self
+                    .api
+                    .create_resource_proposal(session_id, request_id, &request)
+                    .await?;
                 serde_json::to_value(&proposal).map_err(|_| BrokerError::internal())
             }
         }
@@ -426,18 +546,92 @@ impl BrokerSession {
     }
 
     async fn prepare_context(&self, request: PlainRequest) -> Prepared {
-        match self.claim(request.id).await {
-            Ok(()) => Prepared::Dispatch(Dispatch {
-                id: request.id,
-                action: DispatchAction::Context,
-            }),
-            Err(error) => Prepared::Immediate(self.reply_error(Some(request.id), &error)),
+        self.prepare_read(
+            request.id,
+            AgentCapability::SettingsRead,
+            DispatchAction::Context,
+        )
+        .await
+    }
+
+    async fn prepare_setting_sources(&self, frame: SettingSourcesFrame) -> Prepared {
+        self.prepare_read(
+            frame.id,
+            AgentCapability::SettingSourcesRead,
+            DispatchAction::SettingSources,
+        )
+        .await
+    }
+
+    async fn prepare_resource_preference(&self, frame: ResourcePreferenceFrame) -> Prepared {
+        self.prepare_read(
+            frame.id,
+            AgentCapability::ResourcePreferenceRead,
+            DispatchAction::ResourcePreference {
+                request: super::protocol::ResourcePreferencePayload {
+                    target_scope: frame.payload.target_scope,
+                    edition_id: frame.payload.edition_id,
+                    media_item_id: frame.payload.media_item_id,
+                },
+            },
+        )
+        .await
+    }
+
+    async fn prepare_library_summary(&self, frame: LibrarySummaryFrame) -> Prepared {
+        self.prepare_read(
+            frame.id,
+            AgentCapability::LibrarySummaryRead,
+            DispatchAction::LibrarySummary {
+                limit: frame.payload.limit,
+            },
+        )
+        .await
+    }
+
+    async fn prepare_media_capabilities(&self, frame: MediaCapabilitiesFrame) -> Prepared {
+        self.prepare_read(
+            frame.id,
+            AgentCapability::MediaCapabilitiesRead,
+            DispatchAction::MediaCapabilities {
+                media_item_id: frame.payload.media_item_id,
+                limit: frame.payload.limit,
+            },
+        )
+        .await
+    }
+
+    async fn prepare_onboarding(&self, frame: OnboardingFrame) -> Prepared {
+        self.prepare_read(
+            frame.id,
+            AgentCapability::OnboardingRead,
+            DispatchAction::Onboarding,
+        )
+        .await
+    }
+
+    async fn prepare_read(
+        &self,
+        id: i64,
+        capability: AgentCapability,
+        action: DispatchAction,
+    ) -> Prepared {
+        if let Err(error) = require_capability(capability) {
+            return Prepared::Immediate(self.reply_error(Some(id), &error));
+        }
+        match self.claim(id).await {
+            Ok(()) => Prepared::Dispatch(Dispatch { id, action }),
+            Err(error) => Prepared::Immediate(self.reply_error(Some(id), &error)),
         }
     }
 
     async fn prepare_create_proposal(&self, frame: CreateProposalFrame) -> Prepared {
         let id = frame.id;
         let payload = frame.payload;
+
+        if let Err(error) = require_capability(AgentCapability::SettingsProposal) {
+            return Prepared::Immediate(self.reply_error(Some(id), &error));
+        }
 
         // 只有 reading 分区：闭合集合，其他值直接拒绝。
         if payload.section != "reading" {
@@ -464,7 +658,7 @@ impl BrokerSession {
                     self.reply_and_close_error(None, &BrokerError::protocol_mismatch()),
                 );
             }
-            if state.created_proposals >= MAX_PENDING_PROPOSALS_PER_CONNECTION {
+            if state.proposal_attempts >= MAX_PROPOSAL_ATTEMPTS_PER_CONNECTION {
                 return Prepared::Immediate(
                     self.reply_error(Some(id), &BrokerError::quota_exceeded()),
                 );
@@ -482,7 +676,7 @@ impl BrokerSession {
             }
             let (sender, _) = watch::channel(false);
             self.lock_cancels().insert(id, sender);
-            state.created_proposals += 1;
+            state.proposal_attempts += 1;
             (state.session_id, AgentRequestId::new())
         };
 
@@ -499,6 +693,80 @@ impl BrokerSession {
         Prepared::Dispatch(Dispatch {
             id,
             action: DispatchAction::CreateProposal {
+                session_id,
+                request_id,
+                request: Box::new(request),
+            },
+        })
+    }
+
+    async fn prepare_create_resource_proposal(
+        &self,
+        frame: CreateResourceProposalFrame,
+    ) -> Prepared {
+        let id = frame.id;
+        let payload = frame.payload;
+
+        if let Err(error) = require_capability(AgentCapability::ResourcePreferenceProposal) {
+            return Prepared::Immediate(self.reply_error(Some(id), &error));
+        }
+
+        let target_scope = match parse_resource_scope(&payload.target_scope) {
+            Ok(scope) => scope,
+            Err(error) => return Prepared::Immediate(self.reply_error(Some(id), &error)),
+        };
+        let patch = match parse_resource_preference_patch(payload.patch) {
+            Ok(patch) => patch,
+            Err(()) => {
+                return Prepared::Immediate(self.reply_error(
+                    Some(id),
+                    &BrokerError::invalid_argument("资源偏好 patch 字段不合法。"),
+                ));
+            }
+        };
+
+        let (session_id, request_id) = {
+            let mut state = self.state.lock().await;
+            if !state.handshaked {
+                return Prepared::Immediate(
+                    self.reply_and_close_error(None, &BrokerError::protocol_mismatch()),
+                );
+            }
+            if state.proposal_attempts >= MAX_PROPOSAL_ATTEMPTS_PER_CONNECTION {
+                return Prepared::Immediate(
+                    self.reply_error(Some(id), &BrokerError::quota_exceeded()),
+                );
+            }
+            if !self.quota.try_consume() {
+                return Prepared::Immediate(
+                    self.reply_error(Some(id), &BrokerError::quota_exceeded()),
+                );
+            }
+            if let Err(error) = claim_inflight(&mut state, id) {
+                self.quota.refund();
+                return Prepared::Immediate(self.reply_error(Some(id), &error));
+            }
+            let (sender, _) = watch::channel(false);
+            self.lock_cancels().insert(id, sender);
+            state.proposal_attempts += 1;
+            (state.session_id, AgentRequestId::new())
+        };
+
+        let request = AgentResourcePreferenceProposalCreateRequest {
+            session_id: session_id.to_string(),
+            request_id: request_id.to_string(),
+            target_scope,
+            edition_id: payload.edition_id,
+            media_item_id: payload.media_item_id,
+            context_id: payload.context_id,
+            context_hash: payload.context_hash,
+            base_revision: payload.base_revision,
+            patch,
+        };
+
+        Prepared::Dispatch(Dispatch {
+            id,
+            action: DispatchAction::CreateResourceProposal {
                 session_id,
                 request_id,
                 request: Box::new(request),
@@ -575,6 +843,22 @@ impl BrokerSession {
     }
 }
 
+fn require_capability(capability: AgentCapability) -> Result<(), BrokerError> {
+    AgentCapabilityManifest::for_current_slice()
+        .require(capability)
+        .map_err(|_| BrokerError::capability_unavailable())
+}
+
+fn parse_resource_scope(raw: &str) -> Result<AgentResourcePreferenceScopeDto, BrokerError> {
+    match raw {
+        "edition" => Ok(AgentResourcePreferenceScopeDto::Edition),
+        "media_item" => Ok(AgentResourcePreferenceScopeDto::MediaItem),
+        _ => Err(BrokerError::invalid_argument(
+            "target_scope 只支持 edition 或 media_item。",
+        )),
+    }
+}
+
 /// 活动在途登记。已完成的 id 可以复用；**活动**的 id 重复或超过上限即拒绝。
 fn claim_inflight(state: &mut SessionState, id: i64) -> Result<(), BrokerError> {
     if state.inflight.contains(&id) {
@@ -604,9 +888,16 @@ mod tests {
     #[derive(Default)]
     struct FakeApi {
         context_calls: AtomicU32,
+        setting_sources_calls: AtomicU32,
+        resource_preference_calls: AtomicU32,
+        library_summary_calls: AtomicU32,
+        media_capabilities_calls: AtomicU32,
+        onboarding_calls: AtomicU32,
         proposal_calls: AtomicU32,
+        resource_proposal_calls: AtomicU32,
         last_session: StdMutex<Option<String>>,
         last_request: StdMutex<Option<String>>,
+        last_resource_request: StdMutex<Option<AgentResourcePreferenceProposalCreateRequest>>,
         fail_with: StdMutex<Option<BrokerError>>,
         /// 置真时 `context` 会一直等待，用来测试并发、取消与超时。
         block_context: AtomicBool,
@@ -633,6 +924,67 @@ mod tests {
             Ok(json!({ "context_hash": "a".repeat(64), "revision": "rev-1" }))
         }
 
+        async fn setting_sources(&self) -> Result<Value, BrokerError> {
+            self.setting_sources_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({
+                "schemaVersion": 1,
+                "section": "reading",
+                "revision": "rev-1",
+                "layers": []
+            }))
+        }
+
+        async fn resource_preference(
+            &self,
+            _request: &super::super::protocol::ResourcePreferencePayload,
+        ) -> Result<Value, BrokerError> {
+            self.resource_preference_calls
+                .fetch_add(1, Ordering::SeqCst);
+            Ok(json!({
+                "schemaVersion": 1,
+                "contextId": "0196f0d2-0000-7000-8000-0000000000c1",
+                "contextHash": "a".repeat(64),
+                "targetScope": "edition",
+                "editionId": CONTEXT_ID,
+                "mediaItemId": null,
+                "revision": null,
+                "reading": null,
+                "comic": null
+            }))
+        }
+
+        async fn library_summary(&self, _limit: u32) -> Result<Value, BrokerError> {
+            self.library_summary_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({
+                "schemaVersion": 1,
+                "counts": {"works": 0, "editions": 0, "mediaItems": 0, "favorites": 0, "inProgress": 0},
+                "categories": [],
+                "recent": [],
+                "truncated": false
+            }))
+        }
+
+        async fn media_capabilities(
+            &self,
+            _media_item_id: Option<&str>,
+            _limit: u32,
+        ) -> Result<Value, BrokerError> {
+            self.media_capabilities_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"schemaVersion": 1, "items": [], "truncated": false}))
+        }
+
+        async fn onboarding(&self) -> Result<Value, BrokerError> {
+            self.onboarding_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({
+                "schemaVersion": 1,
+                "completedSteps": [],
+                "nextStep": null,
+                "hasStorageLocation": false,
+                "hasLibraryContent": false,
+                "hasAiProvider": false
+            }))
+        }
+
         async fn create_proposal(
             &self,
             session_id: AgentSessionId,
@@ -646,6 +998,35 @@ mod tests {
                 return Err(error);
             }
             Err(BrokerError::capability_unavailable())
+        }
+
+        async fn create_resource_proposal(
+            &self,
+            session_id: AgentSessionId,
+            request_id: AgentRequestId,
+            request: &AgentResourcePreferenceProposalCreateRequest,
+        ) -> Result<AgentResourcePreferenceProposalDto, BrokerError> {
+            self.resource_proposal_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_session.lock().unwrap() = Some(session_id.to_string());
+            *self.last_request.lock().unwrap() = Some(request_id.to_string());
+            *self.last_resource_request.lock().unwrap() = Some(request.clone());
+            if let Some(error) = self.fail_with.lock().unwrap().clone() {
+                return Err(error);
+            }
+            Ok(AgentResourcePreferenceProposalDto {
+                schema_version: 1,
+                proposal_id: "0196f0d2-0000-7000-8000-0000000000d1".into(),
+                status: haven_application::wire::AgentSettingsProposalStatusDto::Pending,
+                target_scope: request.target_scope,
+                target_label: "fixture".into(),
+                edition_id: request.edition_id.clone(),
+                media_item_id: request.media_item_id.clone(),
+                base_revision: request.base_revision.clone(),
+                digest: CONTEXT_HASH.into(),
+                created_at: "2026-09-20T00:00:00Z".into(),
+                expires_at: "2026-09-21T00:00:00Z".into(),
+                changes: Vec::new(),
+            })
         }
     }
 
@@ -692,6 +1073,12 @@ mod tests {
         )
     }
 
+    fn resource_proposal_frame(id: i64) -> String {
+        format!(
+            r#"{{"type":"create_resource_proposal","id":{id},"payload":{{"target_scope":"edition","edition_id":"{CONTEXT_ID}","media_item_id":null,"context_id":"{CONTEXT_ID}","context_hash":"{CONTEXT_HASH}","base_revision":null,"patch":{{"reading":{{"font_size":"large"}}}}}}}}"#
+        )
+    }
+
     const CONTEXT_ID: &str = "0196f0d2-0000-7000-8000-0000000000c1";
     const CONTEXT_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -705,9 +1092,35 @@ mod tests {
         assert_eq!(welcome["protocol_version"], 1);
         assert_eq!(
             welcome["granted_requests"],
-            json!(["context", "create_proposal"])
+            json!([
+                "context",
+                "setting_sources",
+                "resource_preference",
+                "library_summary",
+                "media_capabilities",
+                "onboarding",
+                "create_proposal",
+                "create_resource_proposal"
+            ])
         );
         assert_eq!(welcome["haven"]["capabilities"]["settings_read"], true);
+        assert_eq!(
+            welcome["haven"]["capabilities"]["setting_sources_read"],
+            true
+        );
+        assert_eq!(
+            welcome["haven"]["capabilities"]["resource_preference_read"],
+            true
+        );
+        assert_eq!(
+            welcome["haven"]["capabilities"]["resource_preference_proposal"],
+            true
+        );
+        assert_eq!(
+            welcome["haven"]["capabilities"]["media_capabilities_read"],
+            true
+        );
+        assert_eq!(welcome["haven"]["capabilities"]["onboarding_read"], true);
         assert_eq!(welcome["haven"]["capabilities"]["secret_read"], false);
         let session_id = welcome["session_id"].as_str().unwrap().to_owned();
         assert_eq!(session_id.len(), 36, "必须是 UUID 形态");
@@ -724,6 +1137,26 @@ mod tests {
             report.library_summary_read,
             manifest.capabilities.library_summary_read
         );
+        assert_eq!(
+            report.setting_sources_read,
+            manifest.capabilities.setting_sources_read
+        );
+        assert_eq!(
+            report.resource_preference_read,
+            manifest.capabilities.resource_preference_read
+        );
+        assert_eq!(
+            report.resource_preference_proposal,
+            manifest.capabilities.resource_preference_proposal
+        );
+        assert_eq!(
+            report.media_capabilities_read,
+            manifest.capabilities.media_capabilities_read
+        );
+        assert_eq!(
+            report.onboarding_read,
+            manifest.capabilities.onboarding_read
+        );
         assert_eq!(report.secret_read, manifest.capabilities.secret_read);
         assert_eq!(
             report.filesystem_write,
@@ -732,11 +1165,11 @@ mod tests {
 
         // 变一个能力的清单必须产出不同的报告——证明是投影而不是复制。
         let mut mutated = manifest;
-        mutated.capabilities.library_summary_read = true;
+        mutated.capabilities.setting_sources_read = false;
         let mutated_report = super::super::protocol::CapabilityReport::from_manifest(mutated);
         assert_ne!(
-            mutated_report.library_summary_read,
-            report.library_summary_read
+            mutated_report.setting_sources_read,
+            report.setting_sources_read
         );
     }
 
@@ -820,6 +1253,100 @@ mod tests {
         assert_eq!(value["payload"]["revision"], "rev-1");
         assert_eq!(api.context_calls.load(Ordering::SeqCst), 1);
         assert_eq!(session.inflight_len().await, 0, "完成后必须释放在途登记");
+    }
+
+    #[tokio::test]
+    async fn all_new_read_requests_dispatch_to_application() {
+        let api = Arc::new(FakeApi::default());
+        let quota = Arc::new(ProcessQuota::default());
+        let session = session_with(api.clone(), quota.clone());
+        let _ = handshake(&session).await;
+
+        for (id, frame, expected_key) in [
+            (
+                11,
+                r#"{"type":"setting_sources","id":11,"payload":{"section":"reading"}}"#,
+                "section",
+            ),
+            (
+                12,
+                r#"{"type":"resource_preference","id":12,"payload":{"target_scope":"edition","edition_id":"0196f0d2-0000-7000-8000-0000000000c1","media_item_id":null}}"#,
+                "targetScope",
+            ),
+            (
+                13,
+                r#"{"type":"library_summary","id":13,"payload":{"limit":1}}"#,
+                "counts",
+            ),
+            (
+                14,
+                r#"{"type":"media_capabilities","id":14,"payload":{"media_item_id":null,"limit":1}}"#,
+                "items",
+            ),
+            (
+                15,
+                r#"{"type":"onboarding","id":15,"payload":{}}"#,
+                "completedSteps",
+            ),
+        ] {
+            let value = parse(match round_trip(&session, frame).await {
+                FrameOutcome::Reply(text) => text,
+                other => panic!("{expected_key} 必须成功，得到 {other:?}"),
+            });
+            assert_eq!(value["type"], "ok");
+            assert_eq!(value["id"], id);
+            assert!(value["payload"].get(expected_key).is_some());
+        }
+
+        assert_eq!(api.setting_sources_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(api.resource_preference_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(api.library_summary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(api.media_capabilities_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(api.onboarding_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(api.proposal_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(api.resource_proposal_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(quota.used(), 0, "只读请求不得消耗提案配额");
+        assert_eq!(session.inflight_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn resource_proposal_dispatches_typed_scope_and_patch_to_application() {
+        let api = Arc::new(FakeApi::default());
+        let session = session_with(api.clone(), Arc::new(ProcessQuota::default()));
+        let _ = handshake(&session).await;
+        let frame = format!(
+            r#"{{"type":"create_resource_proposal","id":16,"payload":{{"target_scope":"edition","edition_id":"{CONTEXT_ID}","media_item_id":null,"context_id":"{CONTEXT_ID}","context_hash":"{CONTEXT_HASH}","base_revision":null,"patch":{{"reading":{{"font_size":"large"}}}}}}}}"#
+        );
+
+        let value = parse(match round_trip(&session, &frame).await {
+            FrameOutcome::Reply(text) => text,
+            other => panic!("资源提案必须成功，得到 {other:?}"),
+        });
+        assert_eq!(value["type"], "ok");
+        assert_eq!(value["id"], 16);
+        assert_eq!(value["payload"]["status"], "pending");
+        assert_eq!(api.resource_proposal_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(api.proposal_calls.load(Ordering::SeqCst), 0);
+
+        let request = api
+            .last_resource_request
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("Application 必须收到资源提案请求");
+        assert_eq!(
+            request.target_scope,
+            AgentResourcePreferenceScopeDto::Edition
+        );
+        assert_eq!(request.edition_id, CONTEXT_ID);
+        assert!(request.media_item_id.is_none());
+        assert_eq!(request.context_id, CONTEXT_ID);
+        assert_eq!(request.context_hash, CONTEXT_HASH);
+        assert_eq!(
+            request.patch.reading.and_then(|patch| patch.font_size),
+            Some(PreferenceReadingFontSizeDto::Large)
+        );
+        assert_eq!(session.inflight_len().await, 0);
     }
 
     #[tokio::test]
@@ -1321,12 +1848,12 @@ mod tests {
         let session = session_with(api.clone(), Arc::new(ProcessQuota::with_limit(100)));
         let _ = handshake(&session).await;
 
-        for _ in 0..MAX_PENDING_PROPOSALS_PER_CONNECTION {
+        for _ in 0..MAX_PROPOSAL_ATTEMPTS_PER_CONNECTION {
             let _ = round_trip(&session, &proposal_frame(2)).await;
         }
         assert_eq!(
             api.proposal_calls.load(Ordering::SeqCst),
-            MAX_PENDING_PROPOSALS_PER_CONNECTION
+            MAX_PROPOSAL_ATTEMPTS_PER_CONNECTION
         );
 
         let value = parse(match immediate(session.prepare(&proposal_frame(2)).await) {
@@ -1337,7 +1864,7 @@ mod tests {
         assert_eq!(value["error"]["retryable"], false);
         assert_eq!(
             api.proposal_calls.load(Ordering::SeqCst),
-            MAX_PENDING_PROPOSALS_PER_CONNECTION,
+            MAX_PROPOSAL_ATTEMPTS_PER_CONNECTION,
             "超限后 Application **不得**被调用"
         );
     }
@@ -1366,6 +1893,30 @@ mod tests {
             2,
             "跨连接也不得越界"
         );
+    }
+
+    #[tokio::test]
+    async fn global_and_resource_proposals_share_the_process_quota() {
+        let api = Arc::new(FakeApi::default());
+        let quota = Arc::new(ProcessQuota::with_limit(1));
+        let resource_session = session_with(api.clone(), quota.clone());
+        let _ = handshake(&resource_session).await;
+        let resource = round_trip(&resource_session, &resource_proposal_frame(1)).await;
+        assert!(matches!(resource, FrameOutcome::Reply(_)));
+        assert_eq!(api.resource_proposal_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(quota.used(), 1);
+
+        let settings_session = session_with(api.clone(), quota.clone());
+        let _ = handshake(&settings_session).await;
+        let value = parse(
+            match immediate(settings_session.prepare(&proposal_frame(2)).await) {
+                FrameOutcome::Reply(text) => text,
+                other => panic!("超出共享配额必须立即返回错误，得到 {other:?}"),
+            },
+        );
+        assert_eq!(value["error"]["code"], "HAVEN_BROKER_QUOTA_EXCEEDED");
+        assert_eq!(api.proposal_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(api.resource_proposal_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -52,7 +52,7 @@ impl BrokerError {
     pub fn unknown_frame() -> Self {
         Self::new(
             "HAVEN_BROKER_UNKNOWN_FRAME",
-            "请求帧类型不受支持；本协议只接受 hello / context / create_proposal / cancel。",
+            "请求帧类型不受支持；本协议只接受已声明的 Read / Propose 请求。",
             false,
         )
     }
@@ -166,12 +166,63 @@ impl BrokerError {
 /// 因此这里原样传递 —— 但 `code` 仍然是 Haven 的稳定码，客户端据此判定。
 impl From<&haven_common::AppError> for BrokerError {
     fn from(error: &haven_common::AppError) -> Self {
-        Self {
-            code: error.code().as_str().to_owned(),
-            message: error.user_message().to_owned(),
-            retryable: error.retryable(),
+        let code = error.code().as_str();
+        let code_is_safe = code_is_safe(code);
+        let message_is_safe = error.kind() != haven_common::ErrorKind::Internal
+            && broker_message_is_safe(error.user_message());
+        if code_is_safe && message_is_safe {
+            Self::new(code, error.user_message(), error.retryable())
+        } else {
+            Self::new(
+                if code_is_safe { code } else { "INTERNAL_ERROR" },
+                "请求未能完成；详细信息不会通过外部 Agent 返回。",
+                error.retryable(),
+            )
         }
     }
+}
+
+fn code_is_safe(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+/// `AppError::user_message` 对 UI 是展示文案，但 Broker 是外部 Agent 边界；这里再做
+/// 一层保守过滤，避免未来某个底层错误把路径、SQL 或 Provider 原文带到外部。
+fn broker_message_is_safe(message: &str) -> bool {
+    if message.is_empty() || message.len() > 512 || message.chars().any(char::is_control) {
+        return false;
+    }
+    let lowered = message.to_ascii_lowercase();
+    let forbidden_fragments = [
+        "select ",
+        "insert ",
+        "update ",
+        "delete ",
+        "pragma ",
+        "sqlite",
+        "http://",
+        "https://",
+        "file://",
+        "bearer ",
+        "api_key",
+        "apikey",
+        "credential",
+        "password=",
+        "token=",
+        "raw response",
+        "response body",
+    ];
+    !message.contains('\\')
+        && !message.contains('/')
+        && !message.contains('<')
+        && !message.contains('>')
+        && !forbidden_fragments
+            .iter()
+            .any(|fragment| lowered.contains(fragment))
 }
 
 #[cfg(test)]
@@ -220,5 +271,34 @@ mod tests {
         assert!(!BrokerError::not_enabled().retryable());
         assert!(!BrokerError::endpoint_busy().retryable());
         assert!(!BrokerError::capability_unavailable().retryable());
+    }
+
+    #[test]
+    fn app_error_mapping_redacts_internal_and_sensitive_details() {
+        for (kind, message) in [
+            (
+                haven_common::ErrorKind::Internal,
+                "provider raw response: {secret}",
+            ),
+            (
+                haven_common::ErrorKind::Validation,
+                "D:\\private\\token.txt",
+            ),
+            (haven_common::ErrorKind::Network, "SELECT * FROM secrets"),
+            (
+                haven_common::ErrorKind::Network,
+                "https://provider.invalid/key",
+            ),
+        ] {
+            let error = haven_common::AppError::new("PROVIDER_FAILED", kind, message, false);
+            let mapped = BrokerError::from(&error);
+            assert_eq!(mapped.code(), "PROVIDER_FAILED");
+            assert_eq!(
+                mapped.message(),
+                "请求未能完成；详细信息不会通过外部 Agent 返回。"
+            );
+            assert!(!mapped.message().contains("secret"));
+            assert!(!mapped.message().contains("provider.invalid"));
+        }
     }
 }

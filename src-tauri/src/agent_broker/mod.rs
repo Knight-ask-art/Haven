@@ -23,8 +23,12 @@ use async_trait::async_trait;
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 
+use haven_application::services::agent_context::AgentContextQueryService;
 use haven_application::services::agent_settings_ipc::AgentSettingsIpcService;
-use haven_application::wire::{AgentSettingsProposalCreateRequest, AgentSettingsProposalDto};
+use haven_application::wire::{
+    AgentResourcePreferenceProposalCreateRequest, AgentResourcePreferenceProposalDto,
+    AgentResourcePreferenceScopeDto, AgentSettingsProposalCreateRequest, AgentSettingsProposalDto,
+};
 use haven_domain::ids::{AgentRequestId, AgentSessionId};
 
 use endpoint::BrokerEndpoint;
@@ -33,15 +37,16 @@ use session::{BrokerAgentApi, ContextPayload, ProcessQuota};
 
 /// 生产用的 [`BrokerAgentApi`]：直接转调 A1 已有的 Application service。
 ///
-/// **不新建 Repository、不新建 SQLite 连接**：这里只持有一个 `AgentSettingsIpcService`
-/// 的克隆，与 UI 走的是同一份实现、同一个 UoW、同一个设置事实源。
+/// **不新建 Repository、不新建 SQLite 连接**：这里只持有既有的设置与上下文 Application
+/// service 克隆，与 UI 走的是同一份 UoW、同一个设置/媒体事实源。
 pub struct AgentSettingsBrokerApi {
-    service: AgentSettingsIpcService,
+    settings: AgentSettingsIpcService,
+    context: AgentContextQueryService,
 }
 
 impl AgentSettingsBrokerApi {
-    pub fn new(service: AgentSettingsIpcService) -> Self {
-        Self { service }
+    pub fn new(settings: AgentSettingsIpcService, context: AgentContextQueryService) -> Self {
+        Self { settings, context }
     }
 }
 
@@ -49,12 +54,85 @@ impl AgentSettingsBrokerApi {
 impl BrokerAgentApi for AgentSettingsBrokerApi {
     async fn context(&self) -> Result<ContextPayload, BrokerError> {
         let context = self
-            .service
+            .settings
             .context()
             .await
             .map_err(|error| BrokerError::from(&error))?;
         // 投影成 DTO 再序列化：只有经过既有投影的类型才可能出现在响应里。
         serde_json::to_value(context.to_dto()).map_err(|_| BrokerError::internal())
+    }
+
+    async fn setting_sources(&self) -> Result<serde_json::Value, BrokerError> {
+        let value = self
+            .context
+            .setting_sources()
+            .await
+            .map_err(|error| BrokerError::from(&error))?;
+        serde_json::to_value(value).map_err(|_| BrokerError::internal())
+    }
+
+    async fn resource_preference(
+        &self,
+        request: &protocol::ResourcePreferencePayload,
+    ) -> Result<serde_json::Value, BrokerError> {
+        let scope = parse_resource_scope(&request.target_scope)?;
+        let edition_id = request
+            .edition_id
+            .parse()
+            .map_err(|_| BrokerError::invalid_argument("edition_id 非法。"))?;
+        let media_item_id = request
+            .media_item_id
+            .as_deref()
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|_| BrokerError::invalid_argument("media_item_id 非法。"))
+            })
+            .transpose()?;
+        let value = self
+            .context
+            .resource_preference_snapshot(scope, edition_id, media_item_id)
+            .await
+            .map_err(|error| BrokerError::from(&error))?;
+        serde_json::to_value(value).map_err(|_| BrokerError::internal())
+    }
+
+    async fn library_summary(&self, limit: u32) -> Result<serde_json::Value, BrokerError> {
+        let value = self
+            .context
+            .library_summary(limit)
+            .await
+            .map_err(|error| BrokerError::from(&error))?;
+        serde_json::to_value(value).map_err(|_| BrokerError::internal())
+    }
+
+    async fn media_capabilities(
+        &self,
+        media_item_id: Option<&str>,
+        limit: u32,
+    ) -> Result<serde_json::Value, BrokerError> {
+        let media_item_id = media_item_id
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|_| BrokerError::invalid_argument("media_item_id 非法。"))
+            })
+            .transpose()?;
+        let value = self
+            .context
+            .media_capabilities(media_item_id, limit)
+            .await
+            .map_err(|error| BrokerError::from(&error))?;
+        serde_json::to_value(value).map_err(|_| BrokerError::internal())
+    }
+
+    async fn onboarding(&self) -> Result<serde_json::Value, BrokerError> {
+        let value = self
+            .context
+            .onboarding_state()
+            .await
+            .map_err(|error| BrokerError::from(&error))?;
+        serde_json::to_value(value).map_err(|_| BrokerError::internal())
     }
 
     async fn create_proposal(
@@ -63,10 +141,35 @@ impl BrokerAgentApi for AgentSettingsBrokerApi {
         request_id: AgentRequestId,
         request: &AgentSettingsProposalCreateRequest,
     ) -> Result<AgentSettingsProposalDto, BrokerError> {
-        self.service
+        self.settings
             .create_proposal(session_id, request_id, request)
             .await
             .map_err(|error| BrokerError::from(&error))
+    }
+
+    async fn create_resource_proposal(
+        &self,
+        session_id: AgentSessionId,
+        request_id: AgentRequestId,
+        request: &AgentResourcePreferenceProposalCreateRequest,
+    ) -> Result<AgentResourcePreferenceProposalDto, BrokerError> {
+        let mut request = request.clone();
+        request.session_id = session_id.to_string();
+        request.request_id = request_id.to_string();
+        self.context
+            .create_resource_preference_proposal(session_id, request_id, &request)
+            .await
+            .map_err(|error| BrokerError::from(&error))
+    }
+}
+
+fn parse_resource_scope(raw: &str) -> Result<AgentResourcePreferenceScopeDto, BrokerError> {
+    match raw {
+        "edition" => Ok(AgentResourcePreferenceScopeDto::Edition),
+        "media_item" => Ok(AgentResourcePreferenceScopeDto::MediaItem),
+        _ => Err(BrokerError::invalid_argument(
+            "target_scope 只支持 edition 或 media_item。",
+        )),
     }
 }
 
@@ -348,12 +451,54 @@ mod tests {
             Ok(json!({}))
         }
 
+        async fn setting_sources(&self) -> Result<serde_json::Value, BrokerError> {
+            Ok(json!({"schemaVersion": 1, "section": "reading", "revision": null, "layers": []}))
+        }
+
+        async fn resource_preference(
+            &self,
+            _request: &protocol::ResourcePreferencePayload,
+        ) -> Result<serde_json::Value, BrokerError> {
+            Ok(
+                json!({"schemaVersion": 1, "contextId": "0196f0d2-0000-7000-8000-0000000000c1", "contextHash": "a".repeat(64), "targetScope": "edition", "editionId": "0196f0d2-0000-7000-8000-0000000000c1", "mediaItemId": null, "revision": null, "reading": null, "comic": null}),
+            )
+        }
+
+        async fn library_summary(&self, _limit: u32) -> Result<serde_json::Value, BrokerError> {
+            Ok(
+                json!({"schemaVersion": 1, "counts": {"works": 0, "editions": 0, "mediaItems": 0, "favorites": 0, "inProgress": 0}, "categories": [], "recent": [], "truncated": false}),
+            )
+        }
+
+        async fn media_capabilities(
+            &self,
+            _media_item_id: Option<&str>,
+            _limit: u32,
+        ) -> Result<serde_json::Value, BrokerError> {
+            Ok(json!({"schemaVersion": 1, "items": [], "truncated": false}))
+        }
+
+        async fn onboarding(&self) -> Result<serde_json::Value, BrokerError> {
+            Ok(
+                json!({"schemaVersion": 1, "completedSteps": [], "nextStep": null, "hasStorageLocation": false, "hasLibraryContent": false, "hasAiProvider": false}),
+            )
+        }
+
         async fn create_proposal(
             &self,
             _session_id: AgentSessionId,
             _request_id: AgentRequestId,
             _request: &AgentSettingsProposalCreateRequest,
         ) -> Result<AgentSettingsProposalDto, BrokerError> {
+            Err(BrokerError::capability_unavailable())
+        }
+
+        async fn create_resource_proposal(
+            &self,
+            _session_id: AgentSessionId,
+            _request_id: AgentRequestId,
+            _request: &AgentResourcePreferenceProposalCreateRequest,
+        ) -> Result<AgentResourcePreferenceProposalDto, BrokerError> {
             Err(BrokerError::capability_unavailable())
         }
     }

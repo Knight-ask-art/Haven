@@ -27,6 +27,8 @@ use haven_common::{AppError, ErrorKind, UtcMillis};
 use haven_domain::agent::{
     AgentActionBinding, AgentActionBindingInput, AgentActionKind, AgentApprovalState,
     AgentApprovalToken, AgentApprovalTokenHash, AgentScopeSubject, AgentSettingsSubject,
+    redact_preference_data_for_agent, redact_reading_settings_for_agent,
+    validate_agent_proposal_free_text,
 };
 use haven_domain::contracts::{
     EditionPreference, MediaItemPreference, SettingProposalRepository, SettingsRow,
@@ -288,6 +290,19 @@ pub trait SettingProposalUoW: Send + Sync {
     ) -> Result<(), AppError>;
 }
 
+/// 调用方在 Agent 批准入口声明的**期望作用域**。
+///
+/// 两类提案走同一条批准路径，但"我批准的是哪一种范围"必须由调用方显式声明：
+/// 事务内会把它与持久化绑定、持久化提案目标逐项比对，因此不存在"用设置入口批准
+/// 资源提案"或"用资源入口批准设置提案"这种跨作用域复用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentApprovalScope {
+    /// 全局设置范围（分区级）。
+    Settings(AgentSettingsSubject),
+    /// 资源级范围：Edition 或 MediaItem 目标。
+    Resource(SettingTarget),
+}
+
 #[derive(Clone)]
 pub struct SettingProposalService {
     repository: Arc<dyn SettingProposalRepository>,
@@ -343,6 +358,16 @@ impl SettingProposalService {
         {
             return Err(agent_binding_provenance_mismatch());
         }
+        if matches!(
+            &request.change,
+            SettingProposalChange::ResourcePreference(_)
+        ) {
+            return Err(agent_resource_full_replace_forbidden());
+        }
+        // Agent 来源的提案不得把"疑似绝对路径 / endpoint / 凭据赋值"的自由文本写进设置
+        // 事实源。校验发生在构造提案**之前**：命中即拒绝，既不落库也不回显原值
+        // （用户自己的设置不受这条限制——只有 Agent 提案走这条关）。
+        validate_agent_proposal_free_text(&request.change)?;
         if !binding_input.subject().covers(request.target) {
             return Err(agent_binding_subject_mismatch());
         }
@@ -549,11 +574,50 @@ impl SettingProposalService {
     ///
     /// `required_subject` 由上层的 typed 设置入口固定提供（当前为全局阅读设置），
     /// 事务内仍会与持久化绑定逐项比对，防止把内容范围绑定误用于设置批准。
+    ///
+    /// **这个方法只批准全局设置范围的提案。** 资源级（Edition / MediaItem）提案走
+    /// [`Self::approve_agent_resource_proposal_in_one_uow`]：两者共用同一条
+    /// token / CAS / Receipt / UoW 路径，区别只在期望作用域。
     pub async fn approve_agent_proposal_in_one_uow(
         &self,
         id: SettingProposalId,
         confirmed_digest: &str,
         required_subject: AgentSettingsSubject,
+    ) -> Result<SettingChangeReceipt, AppError> {
+        self.approve_agent_scope_in_one_uow(
+            id,
+            confirmed_digest,
+            AgentApprovalScope::Settings(required_subject),
+        )
+        .await
+    }
+
+    /// 用户批准**资源级** Agent 提案：与设置批准同一条 UoW / token / CAS / 回执路径。
+    ///
+    /// `expected_target` 是调用方声明它要批准的目标（Edition 或 MediaItem）。事务内会
+    /// 逐项核对：持久化提案的 target 必须与它**逐字段相同**，持久化绑定必须是内容范围
+    /// subject 且与该目标同维（Edition 目标不接受条目级绑定，反之亦然）。
+    /// 这样"资源提案批准"不需要第二套 repository、CAS 或回执，也不会因为入口不同而
+    /// 少做任何一步校验。
+    pub async fn approve_agent_resource_proposal_in_one_uow(
+        &self,
+        id: SettingProposalId,
+        confirmed_digest: &str,
+        expected_target: SettingTarget,
+    ) -> Result<SettingChangeReceipt, AppError> {
+        self.approve_agent_scope_in_one_uow(
+            id,
+            confirmed_digest,
+            AgentApprovalScope::Resource(expected_target),
+        )
+        .await
+    }
+
+    async fn approve_agent_scope_in_one_uow(
+        &self,
+        id: SettingProposalId,
+        confirmed_digest: &str,
+        expected_scope: AgentApprovalScope,
     ) -> Result<SettingChangeReceipt, AppError> {
         let confirmed = confirmed_digest.to_owned();
         let cell = Arc::new(Mutex::new(None::<Result<SettingChangeReceipt, AppError>>));
@@ -565,12 +629,7 @@ impl SettingProposalService {
             let binding = validate_agent_binding_for_proposal(tx, &proposal)?
                 .ok_or_else(agent_approval_token_binding_required)?;
 
-            required_subject.validate()?;
-            if binding.subject() != AgentScopeSubject::settings(required_subject)
-                || !required_subject.covers(proposal.target())
-            {
-                return Err(agent_binding_subject_mismatch());
-            }
+            require_agent_approval_scope(&binding, &proposal, expected_scope)?;
             if proposal.status() != SettingProposalStatus::Pending {
                 return Err(setting_proposal_not_pending_error(proposal.status()));
             }
@@ -613,13 +672,19 @@ impl SettingProposalService {
             if !tx.consume_agent_action_approval_token(id, &confirmed, &token_hash, now)? {
                 return Err(agent_approval_token_invalid("令牌已失效或已被消费"));
             }
+            let (before_canonical_json, after_canonical_json) =
+                receipt_canonical_json_for_provenance(
+                    proposal.provenance(),
+                    proposal.target(),
+                    &applied,
+                )?;
             let receipt = SettingChangeReceipt {
                 id: SettingChangeReceiptId::new(),
                 proposal_id: proposal.id(),
                 proposal_digest: proposal.digest().to_owned(),
                 target: proposal.target(),
-                before_canonical_json: applied.before_canonical_json,
-                after_canonical_json: applied.after_canonical_json,
+                before_canonical_json,
+                after_canonical_json,
                 applied_revision: applied.applied_revision,
                 changed: applied.changed,
                 provenance: proposal.provenance().clone(),
@@ -731,13 +796,19 @@ impl SettingProposalService {
                     return Err(agent_approval_token_invalid("令牌已失效或已被消费"));
                 }
             }
+            let (before_canonical_json, after_canonical_json) =
+                receipt_canonical_json_for_provenance(
+                    proposal.provenance(),
+                    proposal.target(),
+                    &applied,
+                )?;
             let receipt = SettingChangeReceipt {
                 id: SettingChangeReceiptId::new(),
                 proposal_id: proposal.id(),
                 proposal_digest: proposal.digest().to_owned(),
                 target: proposal.target(),
-                before_canonical_json: applied.before_canonical_json,
-                after_canonical_json: applied.after_canonical_json,
+                before_canonical_json,
+                after_canonical_json,
                 applied_revision: applied.applied_revision,
                 changed: applied.changed,
                 provenance: proposal.provenance().clone(),
@@ -779,6 +850,52 @@ fn agent_binding_missing() -> AppError {
     )
 }
 
+/// 事务内核对"调用方声明的期望作用域"与"持久化绑定 + 持久化提案目标"。
+///
+/// 三类不一致对外是同一件事——**这个入口无权批准这条提案**——因此统一返回
+/// `AGENT_ACTION_SUBJECT_MISMATCH`：不向外区分"绑定类型不对"还是"目标不对"，
+/// 免得把绑定形状变成探测侧信道。
+fn require_agent_approval_scope(
+    binding: &AgentActionBinding,
+    proposal: &SettingProposal,
+    expected: AgentApprovalScope,
+) -> Result<(), AppError> {
+    let subject = binding.subject();
+    match expected {
+        AgentApprovalScope::Settings(required) => {
+            required.validate()?;
+            if subject != AgentScopeSubject::settings(required)
+                || !required.covers(proposal.target())
+            {
+                return Err(agent_binding_subject_mismatch());
+            }
+        }
+        AgentApprovalScope::Resource(target) => {
+            let Some(content) = subject.as_content() else {
+                return Err(agent_binding_subject_mismatch());
+            };
+            content.validate()?;
+            // 作用域必须**同维**：Edition 目标不接受条目级绑定（那是更窄的上下文），
+            // 条目目标也不接受版本级绑定（那会越过 Agent 当初看到的范围）。
+            let same_dimension = match target {
+                SettingTarget::Edition(expected) => {
+                    content.media_item_id.is_none()
+                        && content.edition_id == Some(expected.edition_id)
+                }
+                SettingTarget::MediaItem(expected) => {
+                    content.media_item_id == Some(expected.media_item_id)
+                        && content.edition_id == Some(expected.edition_id)
+                }
+                SettingTarget::Global(_) => false,
+            };
+            if proposal.target() != target || !same_dimension || !subject.covers(target) {
+                return Err(agent_binding_subject_mismatch());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn agent_binding_integrity(detail: &'static str) -> AppError {
     AppError::new(
         "AGENT_ACTION_BINDING_INTEGRITY",
@@ -793,6 +910,15 @@ fn agent_binding_provenance_mismatch() -> AppError {
         "AGENT_ACTION_BINDING_PROVENANCE_MISMATCH",
         ErrorKind::Validation,
         "Agent 动作绑定只能用于 Agent/Agent/AgentSuggestion 提案",
+        false,
+    )
+}
+
+fn agent_resource_full_replace_forbidden() -> AppError {
+    AppError::new(
+        "AGENT_RESOURCE_FULL_REPLACE_FORBIDDEN",
+        ErrorKind::Validation,
+        "Agent 资源提案必须使用部分 patch，不能提交完整资源偏好覆盖",
         false,
     )
 }
@@ -859,6 +985,60 @@ struct AppliedTarget {
     changed: bool,
 }
 
+/// Agent 回执是可供未来 UI/外部 Agent 读取的审计投影，不能因为目标当前值里已经
+/// 存在敏感自由文本，就把它原样复制进 Receipt。设置事实源仍保存真实值；这里仅对
+/// 回执的 canonical before/after 做脱敏，且随后仍经过 `SettingChangeReceipt::validate`。
+fn redact_agent_receipt_value(
+    target: SettingTarget,
+    canonical_json: &str,
+) -> Result<String, AppError> {
+    match target {
+        SettingTarget::Global(global) if global.section == SettingsSection::Reading => {
+            let value: SettingsValue = serde_json::from_str(canonical_json)
+                .map_err(|_| setting_proposal_integrity_error("Agent 回执阅读值无法解析"))?;
+            let SettingsValue::Reading(reading) = value else {
+                return Err(setting_proposal_integrity_error(
+                    "Agent 回执分区与目标不一致",
+                ));
+            };
+            canonical_json_of(&SettingsValue::Reading(redact_reading_settings_for_agent(
+                &reading,
+            )))
+        }
+        SettingTarget::Edition(_) | SettingTarget::MediaItem(_) => {
+            let data: PreferenceData = serde_json::from_str(canonical_json)
+                .map_err(|_| setting_proposal_integrity_error("Agent 回执资源偏好值无法解析"))?;
+            canonical_json_of(&redact_preference_data_for_agent(&data))
+        }
+        SettingTarget::Global(_) => Err(setting_proposal_integrity_error(
+            "Agent 回执目标分区不支持脱敏投影",
+        )),
+    }
+}
+
+/// 为所有 Receipt 写入路径统一生成审计 JSON。
+///
+/// Agent 提案无论从用户可见的“一体化批准”入口，还是从底层带 token 的内部应用入口
+/// 完成，都只能把脱敏后的 before/after 写入 Receipt。authoritative 设置仍由 `apply_target`
+/// 写入真实值；这里仅改变对外审计投影，避免某一条内部入口遗漏脱敏。
+fn receipt_canonical_json_for_provenance(
+    provenance: &SettingProvenance,
+    target: SettingTarget,
+    applied: &AppliedTarget,
+) -> Result<(String, String), AppError> {
+    if provenance.source_kind == ProvenanceSourceKind::Agent {
+        Ok((
+            redact_agent_receipt_value(target, &applied.before_canonical_json)?,
+            redact_agent_receipt_value(target, &applied.after_canonical_json)?,
+        ))
+    } else {
+        Ok((
+            applied.before_canonical_json.clone(),
+            applied.after_canonical_json.clone(),
+        ))
+    }
+}
+
 fn apply_target(
     tx: &dyn SettingProposalTxPorts,
     proposal: &SettingProposal,
@@ -878,6 +1058,21 @@ fn apply_target(
                 return Err(setting_proposal_target_not_found_error("版本不存在"));
             }
             apply_edition_preference(tx, target.edition_id, data, proposal.base_revision(), now)
+        }
+        (
+            SettingTarget::Edition(target),
+            SettingProposalChange::AgentResourcePreferencePatch(patch),
+        ) => {
+            if !tx.edition_exists(target.edition_id)? {
+                return Err(setting_proposal_target_not_found_error("版本不存在"));
+            }
+            apply_edition_preference_patch(
+                tx,
+                target.edition_id,
+                patch,
+                proposal.base_revision(),
+                now,
+            )
         }
         (SettingTarget::MediaItem(target), SettingProposalChange::ResourcePreference(data)) => {
             if !tx.edition_exists(target.edition_id)? {
@@ -899,6 +1094,33 @@ fn apply_target(
                 target.edition_id,
                 target.media_item_id,
                 data,
+                proposal.base_revision(),
+                now,
+            )
+        }
+        (
+            SettingTarget::MediaItem(target),
+            SettingProposalChange::AgentResourcePreferencePatch(patch),
+        ) => {
+            if !tx.edition_exists(target.edition_id)? {
+                return Err(setting_proposal_target_not_found_error("版本不存在"));
+            }
+            match tx.media_item_edition(target.media_item_id)? {
+                None => {
+                    return Err(setting_proposal_target_not_found_error("媒体条目不存在"));
+                }
+                Some(edition_id) if edition_id != target.edition_id => {
+                    return Err(setting_proposal_target_not_found_error(
+                        "媒体条目不属于提案指定的版本",
+                    ));
+                }
+                Some(_) => {}
+            }
+            apply_media_item_preference_patch(
+                tx,
+                target.edition_id,
+                target.media_item_id,
+                patch,
                 proposal.base_revision(),
                 now,
             )
@@ -1017,6 +1239,51 @@ fn apply_edition_preference(
     })
 }
 
+fn apply_edition_preference_patch(
+    tx: &dyn SettingProposalTxPorts,
+    edition_id: EditionId,
+    patch: &PreferenceData,
+    base_revision: Option<&str>,
+    now: UtcMillis,
+) -> Result<AppliedTarget, AppError> {
+    let current = tx.load_edition_preference(edition_id)?;
+    let (current_data, current_revision) = match &current {
+        Some(preference) => (preference.data.clone(), Some(preference.revision.clone())),
+        None => (PreferenceData::default(), None),
+    };
+    require_base_revision(current_revision.as_deref(), base_revision)?;
+    let next = current_data.apply_patch(patch);
+    let before_canonical_json = canonical_json_of(&current_data)?;
+    let after_canonical_json = canonical_json_of(&next)?;
+    if current_data == next {
+        return Ok(AppliedTarget {
+            before_canonical_json,
+            after_canonical_json,
+            applied_revision: current_revision,
+            changed: false,
+        });
+    }
+    let revision = new_revision("pref-edition");
+    let written = tx.cas_upsert_edition(
+        &EditionPreference {
+            edition_id,
+            data: next,
+            revision: revision.clone(),
+            updated_at: now,
+        },
+        current_revision.as_deref(),
+    )?;
+    if !written {
+        return Err(setting_proposal_revision_conflict_error());
+    }
+    Ok(AppliedTarget {
+        before_canonical_json,
+        after_canonical_json,
+        applied_revision: Some(revision),
+        changed: true,
+    })
+}
+
 fn apply_media_item_preference(
     tx: &dyn SettingProposalTxPorts,
     edition_id: EditionId,
@@ -1061,6 +1328,60 @@ fn apply_media_item_preference(
             // 归属已在本事务内与 media_items.edition_id 交叉校验过。
             edition_id,
             data: data.clone(),
+            revision: revision.clone(),
+            updated_at: now,
+        },
+        current_revision.as_deref(),
+    )?;
+    if !written {
+        return Err(setting_proposal_revision_conflict_error());
+    }
+    Ok(AppliedTarget {
+        before_canonical_json,
+        after_canonical_json,
+        applied_revision: Some(revision),
+        changed: true,
+    })
+}
+
+fn apply_media_item_preference_patch(
+    tx: &dyn SettingProposalTxPorts,
+    edition_id: EditionId,
+    media_item_id: MediaItemId,
+    patch: &PreferenceData,
+    base_revision: Option<&str>,
+    now: UtcMillis,
+) -> Result<AppliedTarget, AppError> {
+    let current = tx.load_media_item_preference(media_item_id)?;
+    let (current_data, current_revision) = match &current {
+        Some(preference) => {
+            if preference.edition_id != edition_id {
+                return Err(setting_proposal_integrity_error(
+                    "媒体资源内设归属版本与提案目标不一致",
+                ));
+            }
+            (preference.data.clone(), Some(preference.revision.clone()))
+        }
+        None => (PreferenceData::default(), None),
+    };
+    require_base_revision(current_revision.as_deref(), base_revision)?;
+    let next = current_data.apply_patch(patch);
+    let before_canonical_json = canonical_json_of(&current_data)?;
+    let after_canonical_json = canonical_json_of(&next)?;
+    if current_data == next {
+        return Ok(AppliedTarget {
+            before_canonical_json,
+            after_canonical_json,
+            applied_revision: current_revision,
+            changed: false,
+        });
+    }
+    let revision = new_revision("pref-media");
+    let written = tx.cas_upsert_media_item(
+        &MediaItemPreference {
+            media_item_id,
+            edition_id,
+            data: next,
             revision: revision.clone(),
             updated_at: now,
         },

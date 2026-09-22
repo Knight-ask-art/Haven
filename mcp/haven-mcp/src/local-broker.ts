@@ -193,6 +193,11 @@ function assertWelcome(frame: unknown): BrokerWelcome {
     "settings_read",
     "settings_proposal",
     "library_summary_read",
+    "setting_sources_read",
+    "resource_preference_read",
+    "resource_preference_proposal",
+    "media_capabilities_read",
+    "onboarding_read",
     "metadata_proposal",
     "rename_proposal",
     "secret_read",
@@ -201,14 +206,36 @@ function assertWelcome(frame: unknown): BrokerWelcome {
   if (!hasExactKeys(frame.haven.capabilities, capabilityKeys)) throw protocolFailure();
   for (const key of capabilityKeys) assertBoolean(frame.haven.capabilities[key]);
 
-  if (
-    !Array.isArray(frame.granted_requests) ||
-    frame.granted_requests.some((value) => typeof value !== "string") ||
-    frame.granted_requests.length !== 2 ||
-    !frame.granted_requests.includes("context") ||
-    !frame.granted_requests.includes("create_proposal")
-  ) {
+  const requestCapabilities: ReadonlyArray<readonly [string, keyof BrokerWelcome["haven"]["capabilities"]]> = [
+    ["context", "settings_read"],
+    ["setting_sources", "setting_sources_read"],
+    ["resource_preference", "resource_preference_read"],
+    ["library_summary", "library_summary_read"],
+    ["media_capabilities", "media_capabilities_read"],
+    ["onboarding", "onboarding_read"],
+    ["create_proposal", "settings_proposal"],
+    ["create_resource_proposal", "resource_preference_proposal"],
+  ];
+  if (!Array.isArray(frame.granted_requests)) {
     throw protocolFailure();
+  }
+  let previousIndex = -1;
+  const granted = new Set<string>();
+  for (const value of frame.granted_requests) {
+    if (typeof value !== "string") throw protocolFailure();
+    const index = requestCapabilities.findIndex(([request]) => request === value);
+    if (index <= previousIndex || index < 0) throw protocolFailure();
+    const capability = requestCapabilities[index]?.[1];
+    if (capability === undefined || frame.haven.capabilities[capability] !== true) {
+      throw protocolFailure();
+    }
+    previousIndex = index;
+    granted.add(value);
+  }
+  for (const [request, capability] of requestCapabilities) {
+    if (frame.haven.capabilities[capability] === true && !granted.has(request)) {
+      throw protocolFailure();
+    }
   }
 
   return frame as unknown as BrokerWelcome;
@@ -402,7 +429,22 @@ function ensureCapability(welcome: BrokerWelcome, capability: keyof HavenCapabil
   if (!welcome.haven.capabilities[capability]) throw capabilityUnavailable(capability);
 }
 
-async function requestPayload(client: BrokerClient, id: number, type: "context" | "create_proposal", payload: JsonRecord): Promise<JsonRecord> {
+type BrokerRequestType =
+  | "context"
+  | "setting_sources"
+  | "resource_preference"
+  | "library_summary"
+  | "media_capabilities"
+  | "onboarding"
+  | "create_proposal"
+  | "create_resource_proposal";
+
+async function requestPayload(
+  client: BrokerClient,
+  id: number,
+  type: BrokerRequestType,
+  payload: JsonRecord,
+): Promise<JsonRecord> {
   await client.send({ type, id, payload });
   const frame = await client.nextFrame(BRIDGE_TIMEOUT_MS);
   assertFrameRecord(frame);
@@ -482,6 +524,11 @@ function assertContextPayload(payload: JsonRecord): SettingsSnapshotResult {
     "settingsRead",
     "settingsProposal",
     "librarySummaryRead",
+    "settingSourcesRead",
+    "resourcePreferenceRead",
+    "resourcePreferenceProposal",
+    "mediaCapabilitiesRead",
+    "onboardingRead",
     "metadataProposal",
     "renameProposal",
     "secretRead",
@@ -517,36 +564,341 @@ function assertContextPayload(payload: JsonRecord): SettingsSnapshotResult {
   };
 }
 
-function assertProposalPayload(payload: JsonRecord): ProposalOutcome {
+function assertSchemaVersion(payload: JsonRecord): void {
+  if (payload.schemaVersion !== 1) throw protocolFailure();
+}
+
+function assertArray(value: unknown, max: number): asserts value is unknown[] {
+  if (!Array.isArray(value) || value.length > max) throw protocolFailure();
+}
+
+function assertNonNegativeInteger(value: unknown): asserts value is number {
+  assertInteger(value);
+  if (value < 0) throw protocolFailure();
+}
+
+function assertEnum(value: unknown, allowed: readonly string[]): asserts value is string {
+  assertString(value, 64);
+  if (!allowed.includes(value)) throw protocolFailure();
+}
+
+function assertOptionalPatch(
+  value: unknown,
+  keys: readonly string[],
+  booleanKeys: readonly string[] = [],
+): Record<string, unknown> | null {
+  if (value === null) return null;
+  if (!isRecord(value)) throw protocolFailure();
+  const actual = Object.keys(value);
+  if (actual.some((key) => !keys.includes(key))) throw protocolFailure();
+  for (const key of actual) {
+    const item = value[key];
+    if (item === null) continue;
+    if (booleanKeys.includes(key)) assertBoolean(item);
+    else assertString(item, 200);
+  }
+  return { ...value };
+}
+
+function projectPreferencePatch(value: unknown, kind: "reading" | "comic"): Record<string, unknown> | null {
+  if (kind === "reading") {
+    const patch = assertOptionalPatch(
+      value,
+      [
+        "fontFamily",
+        "customFontFamily",
+        "fontSize",
+        "lineHeight",
+        "contentWidth",
+        "theme",
+        "customBackground",
+        "customText",
+        "fontWeight",
+        "letterSpacing",
+        "systemAuto",
+        "pagination",
+      ],
+      ["systemAuto"],
+    );
+    if (patch === null) return null;
+    const names: Record<string, string> = {
+      fontFamily: "font_family",
+      customFontFamily: "custom_font_family",
+      fontSize: "font_size",
+      lineHeight: "line_height",
+      contentWidth: "content_width",
+      customBackground: "custom_background",
+      customText: "custom_text",
+      fontWeight: "font_weight",
+      letterSpacing: "letter_spacing",
+      systemAuto: "system_auto",
+    };
+    return Object.fromEntries(Object.entries(patch).map(([key, item]) => [names[key] ?? key, item]));
+  }
+
+  const patch = assertOptionalPatch(value, ["viewMode", "direction", "pageGap", "preloadPages"]);
+  if (patch === null) return null;
+  const names: Record<string, string> = {
+    viewMode: "view_mode",
+    pageGap: "page_gap",
+    preloadPages: "preload_pages",
+  };
+  return Object.fromEntries(Object.entries(patch).map(([key, item]) => [names[key] ?? key, item]));
+}
+
+function assertSettingSourcesPayload(payload: JsonRecord): SettingSourcesResult {
+  if (!hasExactKeys(payload, ["schemaVersion", "section", "revision", "layers"])) throw protocolFailure();
+  assertSchemaVersion(payload);
+  if (payload.section !== "reading") throw protocolFailure();
+  assertNullableString(payload.revision, 128);
+  assertArray(payload.layers, 4);
+  const layers: SettingSourcesResult["layers"] = [];
+  for (const layer of payload.layers) {
+    if (!isRecord(layer) || !hasExactKeys(layer, ["layer", "present", "revision"])) throw protocolFailure();
+    assertEnum(layer.layer, ["default", "global", "edition", "media_item"]);
+    assertBoolean(layer.present);
+    assertNullableString(layer.revision, 128);
+    layers.push({
+      layer: layer.layer as SettingSourcesResult["layers"][number]["layer"],
+      present: layer.present,
+      revision: layer.revision,
+    });
+  }
+  return { section: "reading", revision: payload.revision, layers };
+}
+
+function assertResourcePreferencePayload(payload: JsonRecord): ResourcePreferenceSnapshotResult {
   if (
     !hasExactKeys(payload, [
       "schemaVersion",
-      "proposalId",
-      "status",
-      "subject",
-      "targetLabel",
-      "baseRevision",
-      "digest",
-      "createdAt",
-      "expiresAt",
-      "changes",
-    ]) ||
-    payload.schemaVersion !== 1 ||
-    payload.status !== "pending" ||
-    !isRecord(payload.subject) ||
-    !hasExactKeys(payload.subject, ["section"]) ||
-    payload.subject.section !== "reading" ||
-    !Array.isArray(payload.changes)
-  ) {
+      "contextId",
+      "contextHash",
+      "targetScope",
+      "editionId",
+      "mediaItemId",
+      "revision",
+      "reading",
+      "comic",
+    ])
+  ) throw protocolFailure();
+  assertSchemaVersion(payload);
+  assertString(payload.contextId, 128);
+  if (!UUID_PATTERN.test(payload.contextId)) throw protocolFailure();
+  assertString(payload.contextHash, 64);
+  if (!DIGEST_PATTERN.test(payload.contextHash)) throw protocolFailure();
+  assertEnum(payload.targetScope, ["edition", "media_item"]);
+  assertString(payload.editionId, 128);
+  if (!UUID_PATTERN.test(payload.editionId)) throw protocolFailure();
+  assertNullableString(payload.mediaItemId, 128);
+  if (payload.mediaItemId !== null && !UUID_PATTERN.test(payload.mediaItemId)) throw protocolFailure();
+  assertNullableString(payload.revision, 128);
+  return {
+    context_id: payload.contextId,
+    context_hash: payload.contextHash,
+    target_scope: payload.targetScope as PreferenceScope,
+    edition_id: payload.editionId,
+    media_item_id: payload.mediaItemId,
+    revision: payload.revision,
+    reading: projectPreferencePatch(payload.reading, "reading"),
+    comic: projectPreferencePatch(payload.comic, "comic"),
+  };
+}
+
+function assertLibrarySummaryPayload(payload: JsonRecord): LibrarySummaryResult {
+  if (!hasExactKeys(payload, ["schemaVersion", "counts", "categories", "recent", "truncated"])) throw protocolFailure();
+  assertSchemaVersion(payload);
+  if (!isRecord(payload.counts) || !hasExactKeys(payload.counts, ["works", "editions", "mediaItems", "favorites", "inProgress"])) {
     throw protocolFailure();
   }
+  for (const key of ["works", "editions", "mediaItems", "favorites", "inProgress"] as const) {
+    assertNonNegativeInteger(payload.counts[key]);
+  }
+  const counts = payload.counts as {
+    works: number;
+    editions: number;
+    mediaItems: number;
+    favorites: number;
+    inProgress: number;
+  };
+  assertArray(payload.categories, 8);
+  const categories: LibrarySummaryResult["categories"] = [];
+  for (const category of payload.categories) {
+    if (!isRecord(category) || !hasExactKeys(category, ["category", "workCount"])) throw protocolFailure();
+    assertString(category.category, 64);
+    assertNonNegativeInteger(category.workCount);
+    categories.push({ category: category.category, work_count: category.workCount });
+  }
+  assertArray(payload.recent, 50);
+  const recent: LibrarySummaryResult["recent"] = [];
+  for (const item of payload.recent) {
+    if (!isRecord(item) || !hasExactKeys(item, ["workId", "title", "category", "progressRatio"])) throw protocolFailure();
+    assertString(item.workId, 128);
+    if (!UUID_PATTERN.test(item.workId)) throw protocolFailure();
+    assertString(item.title, 256);
+    assertString(item.category, 64);
+    if (item.progressRatio !== null) {
+      if (typeof item.progressRatio !== "number" || !Number.isFinite(item.progressRatio) || item.progressRatio < 0 || item.progressRatio > 1) {
+        throw protocolFailure();
+      }
+    }
+    recent.push({
+      work_id: item.workId,
+      title: item.title,
+      category: item.category,
+      progress_ratio: item.progressRatio,
+    });
+  }
+  assertBoolean(payload.truncated);
+  return {
+    counts: {
+      works: counts.works,
+      editions: counts.editions,
+      media_items: counts.mediaItems,
+      favorites: counts.favorites,
+      in_progress: counts.inProgress,
+    },
+    categories,
+    recent,
+    truncated: payload.truncated,
+  };
+}
+
+function assertMediaCapabilitiesPayload(payload: JsonRecord): MediaCapabilitiesResult {
+  if (!hasExactKeys(payload, ["schemaVersion", "items", "truncated"])) throw protocolFailure();
+  assertSchemaVersion(payload);
+  assertArray(payload.items, 50);
+  const items: MediaCapabilitiesResult["items"] = [];
+  for (const item of payload.items) {
+    if (
+      !isRecord(item) ||
+      !hasExactKeys(item, [
+        "mediaItemId",
+        "mediaType",
+        "availability",
+        "canOpenSession",
+        "canExtractText",
+        "canRenderPages",
+        "declaredCapabilities",
+      ])
+    ) throw protocolFailure();
+    assertString(item.mediaItemId, 128);
+    if (!UUID_PATTERN.test(item.mediaItemId)) throw protocolFailure();
+    assertString(item.mediaType, 64);
+    assertString(item.availability, 64);
+    for (const key of ["canOpenSession", "canExtractText", "canRenderPages"] as const) assertBoolean(item[key]);
+    assertArray(item.declaredCapabilities, 8);
+    item.declaredCapabilities.forEach((capability) => assertString(capability, 64));
+    const media = item as {
+      mediaItemId: string;
+      mediaType: string;
+      availability: string;
+      canOpenSession: boolean;
+      canExtractText: boolean;
+      canRenderPages: boolean;
+      declaredCapabilities: string[];
+    };
+    items.push({
+      media_item_id: media.mediaItemId,
+      media_type: media.mediaType,
+      availability: media.availability,
+      can_open_session: media.canOpenSession,
+      can_extract_text: media.canExtractText,
+      can_render_pages: media.canRenderPages,
+      declared_capabilities: media.declaredCapabilities,
+    });
+  }
+  assertBoolean(payload.truncated);
+  return { items, truncated: payload.truncated };
+}
+
+function assertOnboardingPayload(payload: JsonRecord): OnboardingStateResult {
+  if (!hasExactKeys(payload, ["schemaVersion", "completedSteps", "nextStep", "hasStorageLocation", "hasLibraryContent", "hasAiProvider"])) {
+    throw protocolFailure();
+  }
+  assertSchemaVersion(payload);
+  assertArray(payload.completedSteps, 16);
+  payload.completedSteps.forEach((step) => assertString(step, 64));
+  assertNullableString(payload.nextStep, 64);
+  assertBoolean(payload.hasStorageLocation);
+  assertBoolean(payload.hasLibraryContent);
+  assertBoolean(payload.hasAiProvider);
+  const completedSteps = payload.completedSteps as string[];
+  const onboarding = payload as {
+    nextStep: string | null;
+    hasStorageLocation: boolean;
+    hasLibraryContent: boolean;
+    hasAiProvider: boolean;
+  };
+  return {
+    completed_steps: completedSteps,
+    next_step: onboarding.nextStep,
+    has_storage_location: onboarding.hasStorageLocation,
+    has_library_content: onboarding.hasLibraryContent,
+    has_ai_provider: onboarding.hasAiProvider,
+  };
+}
+
+function assertProposalPayload(payload: JsonRecord): ProposalOutcome {
+  const settingsShape = [
+    "schemaVersion",
+    "proposalId",
+    "status",
+    "subject",
+    "targetLabel",
+    "baseRevision",
+    "digest",
+    "createdAt",
+    "expiresAt",
+    "changes",
+  ];
+  const resourceShape = [
+    "schemaVersion",
+    "proposalId",
+    "status",
+    "targetScope",
+    "targetLabel",
+    "editionId",
+    "mediaItemId",
+    "baseRevision",
+    "digest",
+    "createdAt",
+    "expiresAt",
+    "changes",
+  ];
+  const isSettings = hasExactKeys(payload, settingsShape);
+  const isResource = hasExactKeys(payload, resourceShape);
+  if ((!isSettings && !isResource) || payload.status !== "pending") throw protocolFailure();
+  assertSchemaVersion(payload);
   assertString(payload.proposalId, 128);
+  if (!UUID_PATTERN.test(payload.proposalId)) throw protocolFailure();
   assertString(payload.targetLabel, 256);
   assertNullableString(payload.baseRevision, 128);
   assertString(payload.digest, 64);
   if (!DIGEST_PATTERN.test(payload.digest)) throw protocolFailure();
   assertString(payload.createdAt, 128);
   assertString(payload.expiresAt, 128);
+  let subjectScope: ProposalOutcome["subject_scope"];
+  let section: SettingsProposalRequest["section"] | null;
+  let editionId: string | null = null;
+  let mediaItemId: string | null = null;
+  if (isSettings) {
+    if (!isRecord(payload.subject) || !hasExactKeys(payload.subject, ["section"]) || payload.subject.section !== "reading") throw protocolFailure();
+    subjectScope = "global";
+    section = "reading";
+  } else {
+    assertEnum(payload.targetScope, ["edition", "media_item"]);
+    assertString(payload.editionId, 128);
+    if (!UUID_PATTERN.test(payload.editionId)) throw protocolFailure();
+    assertNullableString(payload.mediaItemId, 128);
+    if (payload.mediaItemId !== null && !UUID_PATTERN.test(payload.mediaItemId)) throw protocolFailure();
+    if (payload.targetScope === "media_item" && payload.mediaItemId === null) throw protocolFailure();
+    if (payload.targetScope === "edition" && payload.mediaItemId !== null) throw protocolFailure();
+    subjectScope = payload.targetScope as ProposalOutcome["subject_scope"];
+    section = null;
+    editionId = payload.editionId;
+    mediaItemId = payload.mediaItemId;
+  }
+  assertArray(payload.changes, 64);
   const changes: { key: string; before: string; after: string }[] = [];
   for (const change of payload.changes) {
     if (!isRecord(change) || !hasExactKeys(change, ["key", "before", "after"])) throw protocolFailure();
@@ -560,10 +912,10 @@ function assertProposalPayload(payload: JsonRecord): ProposalOutcome {
     status: "pending",
     digest: payload.digest,
     target_label: payload.targetLabel,
-    subject_scope: "global",
-    section: "reading",
-    edition_id: null,
-    media_item_id: null,
+    subject_scope: subjectScope,
+    section,
+    edition_id: editionId,
+    media_item_id: mediaItemId,
     base_revision: payload.baseRevision,
     created_at: payload.createdAt,
     expires_at: payload.expiresAt,
@@ -634,31 +986,94 @@ export class LiveHavenAgentBridge implements HavenAgentBridge {
   }
 
   async getSettingSources(): Promise<SettingSourcesResult> {
-    throw capabilityUnavailable("setting_sources_read");
+    const client = await this.open();
+    try {
+      const welcome = welcomeOf(client);
+      ensureCapability(welcome, "setting_sources_read");
+      const response = await requestPayload(client, 1, "setting_sources", { section: "reading" });
+      return assertSettingSourcesPayload(response.payload as JsonRecord);
+    } finally {
+      client.close();
+    }
   }
 
-  async getResourcePreferenceSnapshot(_request: {
+  async getResourcePreferenceSnapshot(request: {
     target_scope: PreferenceScope;
     edition_id: string;
     media_item_id: string | null;
   }): Promise<ResourcePreferenceSnapshotResult> {
-    throw capabilityUnavailable("resource_preference_read");
+    const client = await this.open();
+    try {
+      const welcome = welcomeOf(client);
+      ensureCapability(welcome, "resource_preference_read");
+      const response = await requestPayload(client, 1, "resource_preference", {
+        target_scope: request.target_scope,
+        edition_id: request.edition_id,
+        media_item_id: request.media_item_id,
+      });
+      return assertResourcePreferencePayload(response.payload as JsonRecord);
+    } finally {
+      client.close();
+    }
   }
 
-  async getLibrarySummary(_request: { limit: number }): Promise<LibrarySummaryResult> {
-    throw capabilityUnavailable("library_summary_read");
+  async getLibrarySummary(request: { limit: number }): Promise<LibrarySummaryResult> {
+    const client = await this.open();
+    try {
+      const welcome = welcomeOf(client);
+      ensureCapability(welcome, "library_summary_read");
+      const response = await requestPayload(client, 1, "library_summary", { limit: request.limit });
+      return assertLibrarySummaryPayload(response.payload as JsonRecord);
+    } finally {
+      client.close();
+    }
   }
 
-  async getMediaCapabilities(_request: { media_item_id: string | null; limit: number }): Promise<MediaCapabilitiesResult> {
-    throw capabilityUnavailable("media_capabilities_read");
+  async getMediaCapabilities(request: { media_item_id: string | null; limit: number }): Promise<MediaCapabilitiesResult> {
+    const client = await this.open();
+    try {
+      const welcome = welcomeOf(client);
+      ensureCapability(welcome, "media_capabilities_read");
+      const response = await requestPayload(client, 1, "media_capabilities", {
+        media_item_id: request.media_item_id,
+        limit: request.limit,
+      });
+      return assertMediaCapabilitiesPayload(response.payload as JsonRecord);
+    } finally {
+      client.close();
+    }
   }
 
   async getOnboardingState(): Promise<OnboardingStateResult> {
-    throw capabilityUnavailable("onboarding_read");
+    const client = await this.open();
+    try {
+      const welcome = welcomeOf(client);
+      ensureCapability(welcome, "onboarding_read");
+      const response = await requestPayload(client, 1, "onboarding", {});
+      return assertOnboardingPayload(response.payload as JsonRecord);
+    } finally {
+      client.close();
+    }
   }
 
-  async proposeResourcePreferencePatch(_request: ResourcePreferenceProposalRequest): Promise<ProposalOutcome> {
-    throw capabilityUnavailable("resource_preference_proposal");
+  async proposeResourcePreferencePatch(request: ResourcePreferenceProposalRequest): Promise<ProposalOutcome> {
+    const client = await this.open();
+    try {
+      const welcome = welcomeOf(client);
+      ensureCapability(welcome, "resource_preference_proposal");
+      const response = await requestPayload(client, 1, "create_resource_proposal", {
+        target_scope: request.target_scope,
+        edition_id: request.edition_id,
+        media_item_id: request.media_item_id,
+        context_id: request.context_id,
+        context_hash: request.context_hash,
+        base_revision: request.base_revision,
+        patch: request.patch,
+      });
+      return assertProposalPayload(response.payload as JsonRecord);
+    } finally {
+      client.close();
+    }
   }
 
   private async open(): Promise<BrokerClient> {
