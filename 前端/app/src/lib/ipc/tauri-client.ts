@@ -114,6 +114,12 @@ import type {
   AgentCapabilityManifestDto,
   AgentSettingChangeReceiptDto,
   AgentSettingChangeReceiptGetRequest,
+  AgentResourcePreferenceProposalApproveRequest,
+  AgentResourcePreferenceProposalApproveResultDto,
+  AgentResourcePreferenceProposalCreateRequest,
+  AgentResourcePreferenceProposalDto,
+  AgentResourcePreferenceProposalGetRequest,
+  AgentResourcePreferenceProposalGetResultDto,
   AgentSettingsContextDto,
   AgentSettingsProposalApproveRequest,
   AgentSettingsProposalApproveResultDto,
@@ -123,8 +129,12 @@ import type {
   AgentSettingsProposalGetResultDto,
   AgentSettingsProposalRejectRequest,
   AgentSettingsProposalRejectResultDto,
+  AgentTraceGetRequest,
+  AgentTraceGetResultDto,
   AiProviderModelsCatalogDto,
   AiProviderModelsListRequest,
+  AiSettingsRecommendationDto,
+  AiSettingsRecommendationGenerateRequest,
   AiProviderProfileDeleteRequest,
   AiProviderProfileDeleteResultDto,
   AiProviderProfileDto,
@@ -1086,6 +1096,53 @@ export class TauriHavenClient implements HavenClient {
     }
   }
 
+  async agentResourcePreferenceProposalCreate(
+    request: AgentResourcePreferenceProposalCreateRequest,
+  ): Promise<AgentResourcePreferenceProposalDto> {
+    try {
+      return await invoke<AgentResourcePreferenceProposalDto>(
+        "agent_resource_preference_proposal_create",
+        { request },
+      );
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async agentResourcePreferenceProposalGet(
+    request: AgentResourcePreferenceProposalGetRequest,
+  ): Promise<AgentResourcePreferenceProposalGetResultDto> {
+    try {
+      return await invoke<AgentResourcePreferenceProposalGetResultDto>(
+        "agent_resource_preference_proposal_get",
+        { request },
+      );
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async agentResourcePreferenceProposalApprove(
+    request: AgentResourcePreferenceProposalApproveRequest,
+  ): Promise<AgentResourcePreferenceProposalApproveResultDto> {
+    try {
+      return await invoke<AgentResourcePreferenceProposalApproveResultDto>(
+        "agent_resource_preference_proposal_approve",
+        { request },
+      );
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async agentTraceGet(request: AgentTraceGetRequest): Promise<AgentTraceGetResultDto> {
+    try {
+      return await invoke<AgentTraceGetResultDto>("agent_trace_get", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
   // ---- A2 AI Provider 基础切片 ----
   // 全部走 Application service：命令层不含 SQL / HTTP；模型发现由 Rust 侧
   // Infrastructure 适配器发起，WebView 不直接访问 Provider。
@@ -1135,6 +1192,18 @@ export class TauriHavenClient implements HavenClient {
   ): Promise<AiProviderModelsCatalogDto> {
     try {
       return await invoke<AiProviderModelsCatalogDto>("ai_provider_models_list", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async aiSettingsRecommendationGenerate(
+    request: AiSettingsRecommendationGenerateRequest,
+  ): Promise<AiSettingsRecommendationDto> {
+    try {
+      return await invoke<AiSettingsRecommendationDto>("ai_settings_recommendation_generate", {
+        request,
+      });
     } catch (error) {
       throw toHavenError(error);
     }

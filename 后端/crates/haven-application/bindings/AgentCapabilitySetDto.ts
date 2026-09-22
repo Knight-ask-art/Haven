@@ -3,4 +3,4 @@
 /**
  * 能力开关集合。这里是**服务端固定清单**的投影，不是调用方可配置的授权开关。
  */
-export type AgentCapabilitySetDto = { settingsRead: boolean, settingsProposal: boolean, librarySummaryRead: boolean, metadataProposal: boolean, renameProposal: boolean, secretRead: boolean, filesystemWrite: boolean, };
+export type AgentCapabilitySetDto = { settingsRead: boolean, settingsProposal: boolean, librarySummaryRead: boolean, settingSourcesRead: boolean, resourcePreferenceRead: boolean, resourcePreferenceProposal: boolean, mediaCapabilitiesRead: boolean, onboardingRead: boolean, metadataProposal: boolean, renameProposal: boolean, secretRead: boolean, filesystemWrite: boolean, };

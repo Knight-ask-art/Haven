@@ -10,13 +10,13 @@
 //! 开启时注入的 [`AgentSettingsBrokerApi`] 复用 `AppState` 里同一个
 //! `AgentSettingsIpcService`：与 UI 共用一份 UoW 与设置事实源，不新建第二套
 //! DB/Repository。Broker 请求集因此天然是 Application service 面的真子集
-//! （只有 `context` / `create_proposal`，没有 approve/reject/apply）。
+//! （只有 Read / Propose，没有 approve/reject/apply）。
 
 use std::sync::Arc;
 
 use tauri::State;
 
-use haven_application::services::AgentSettingsIpcService;
+use haven_application::services::{AgentContextQueryService, AgentSettingsIpcService};
 use haven_application::wire::{AgentBrokerStatusDto, AgentBrokerStatusResultDto, ErrorDto};
 
 use crate::agent_broker::error::BrokerError;
@@ -77,8 +77,12 @@ pub async fn run_agent_broker_status(
 pub async fn run_agent_broker_enable(
     broker: &AgentBrokerManager,
     agent_settings: &AgentSettingsIpcService,
+    agent_context: &AgentContextQueryService,
 ) -> Result<AgentBrokerStatusResultDto, ErrorDto> {
-    let api = Arc::new(AgentSettingsBrokerApi::new(agent_settings.clone()));
+    let api = Arc::new(AgentSettingsBrokerApi::new(
+        agent_settings.clone(),
+        agent_context.clone(),
+    ));
     broker
         .enable(api)
         .await
@@ -111,8 +115,11 @@ pub async fn agent_broker_enable(
 ) -> Result<AgentBrokerStatusResultDto, ErrorDto> {
     let broker = state.agent_broker.clone();
     let agent_settings = state.agent_settings.clone();
-    run_blocking(move || async move { run_agent_broker_enable(&broker, &agent_settings).await })
-        .await
+    let agent_context = state.agent_context.clone();
+    run_blocking(move || async move {
+        run_agent_broker_enable(&broker, &agent_settings, &agent_context).await
+    })
+    .await
 }
 
 /// `agent_broker_disable`：用户显式关闭外部 Agent 接入。

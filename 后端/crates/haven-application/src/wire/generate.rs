@@ -297,6 +297,29 @@ pub fn generate_wire_bindings() -> String {
         AgentSettingsProposalGetResultDto::export_to_string(&config).unwrap(),
         AgentBrokerStatusDto::export_to_string(&config).unwrap(),
         AgentBrokerStatusResultDto::export_to_string(&config).unwrap(),
+        // Agent 只读投影：设置来源分层 / 资源偏好 / 书库摘要 / 媒体声明式能力 / 引导状态
+        // （与设置提案走同一条 Proposal → UI approval → CAS 路径，这里只有只读事实）
+        AgentSettingSourceLayerDto::export_to_string(&config).unwrap(),
+        AgentSettingSourceDto::export_to_string(&config).unwrap(),
+        AgentSettingSourcesDto::export_to_string(&config).unwrap(),
+        AgentResourcePreferenceScopeDto::export_to_string(&config).unwrap(),
+        AgentResourcePreferenceSnapshotDto::export_to_string(&config).unwrap(),
+        AgentResourcePreferencePatchDto::export_to_string(&config).unwrap(),
+        AgentResourcePreferenceProposalCreateRequest::export_to_string(&config).unwrap(),
+        AgentResourcePreferenceProposalDto::export_to_string(&config).unwrap(),
+        AgentResourcePreferenceProposalGetRequest::export_to_string(&config).unwrap(),
+        AgentResourcePreferenceProposalGetResultDto::export_to_string(&config).unwrap(),
+        AgentResourcePreferenceProposalApproveRequest::export_to_string(&config).unwrap(),
+        AgentResourcePreferenceProposalApproveResultDto::export_to_string(&config).unwrap(),
+        AgentLibrarySummaryCountsDto::export_to_string(&config).unwrap(),
+        AgentLibraryCategoryCountDto::export_to_string(&config).unwrap(),
+        AgentLibraryRecentItemDto::export_to_string(&config).unwrap(),
+        AgentLibrarySummaryDto::export_to_string(&config).unwrap(),
+        AgentMediaAvailabilityDto::export_to_string(&config).unwrap(),
+        AgentMediaCapabilityFlagDto::export_to_string(&config).unwrap(),
+        AgentMediaCapabilityDto::export_to_string(&config).unwrap(),
+        AgentMediaCapabilitiesDto::export_to_string(&config).unwrap(),
+        AgentOnboardingStateDto::export_to_string(&config).unwrap(),
         // AI Provider Profile 基础切片（docs/architecture/AI_SYSTEM.md）
         AiProviderKindDto::export_to_string(&config).unwrap(),
         AiModelCapabilityDto::export_to_string(&config).unwrap(),
@@ -310,6 +333,12 @@ pub fn generate_wire_bindings() -> String {
         AiProviderModelsCatalogStateDto::export_to_string(&config).unwrap(),
         AiProviderModelDto::export_to_string(&config).unwrap(),
         AiProviderModelsCatalogDto::export_to_string(&config).unwrap(),
+        AiSettingsRecommendationGenerateRequest::export_to_string(&config).unwrap(),
+        AiSettingsRecommendationDto::export_to_string(&config).unwrap(),
+        AgentTraceEventKindDto::export_to_string(&config).unwrap(),
+        AgentTraceGetRequest::export_to_string(&config).unwrap(),
+        AgentTraceEventDto::export_to_string(&config).unwrap(),
+        AgentTraceGetResultDto::export_to_string(&config).unwrap(),
     ] {
         for line in declaration.lines() {
             if line.trim_start().starts_with("import type") {
@@ -405,6 +434,27 @@ mod tests {
             "PeriodicalIssueDto",
             "PeriodicalVolumeDto",
             "PeriodicalTreeDto",
+            "AgentSettingSourceLayerDto",
+            "AgentSettingSourceDto",
+            "AgentSettingSourcesDto",
+            "AgentResourcePreferenceScopeDto",
+            "AgentResourcePreferenceSnapshotDto",
+            "AgentResourcePreferencePatchDto",
+            "AgentResourcePreferenceProposalCreateRequest",
+            "AgentResourcePreferenceProposalDto",
+            "AgentResourcePreferenceProposalGetRequest",
+            "AgentResourcePreferenceProposalGetResultDto",
+            "AgentResourcePreferenceProposalApproveRequest",
+            "AgentResourcePreferenceProposalApproveResultDto",
+            "AgentLibrarySummaryCountsDto",
+            "AgentLibraryCategoryCountDto",
+            "AgentLibraryRecentItemDto",
+            "AgentLibrarySummaryDto",
+            "AgentMediaAvailabilityDto",
+            "AgentMediaCapabilityFlagDto",
+            "AgentMediaCapabilityDto",
+            "AgentMediaCapabilitiesDto",
+            "AgentOnboardingStateDto",
         ] {
             assert!(out.contains(expected), "生成物缺少类型 {expected}");
         }
@@ -452,6 +502,12 @@ mod tests {
             "AiProviderModelsCatalogStateDto",
             "AiProviderModelDto",
             "AiProviderModelsCatalogDto",
+            "AiSettingsRecommendationGenerateRequest",
+            "AiSettingsRecommendationDto",
+            "AgentTraceEventKindDto",
+            "AgentTraceGetRequest",
+            "AgentTraceEventDto",
+            "AgentTraceGetResultDto",
         ] {
             assert!(out.contains(expected), "生成物缺少类型 {expected}");
         }
@@ -513,6 +569,51 @@ mod tests {
             assert!(
                 !encoded.contains(forbidden),
                 "不得包含 {forbidden}: {encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_read_only_projection_shape_is_frozen() {
+        let out = generate_wire_bindings();
+        // 只截取本次新增的只读投影块（从设置来源分层到 AI Provider 之前），
+        // 这样"不得出现 secret/路径字段"的断言不会被别处的合法字段干扰。
+        let start = out
+            .find("export type AgentSettingSourceLayerDto")
+            .expect("生成物缺少 Agent 只读投影块");
+        let end = out
+            .find("export type AiProviderKindDto")
+            .expect("生成物缺少 AI Provider 块");
+        let block = &out[start..end];
+
+        // 闭合枚举值：设置来源层与媒体可用性都必须是稳定的小写 token。
+        assert!(block.contains(
+            "export type AgentSettingSourceLayerDto = \"default\" | \"global\" | \"edition\" | \"media_item\";"
+        ));
+        assert!(block.contains(
+            "export type AgentMediaAvailabilityDto = \"available\" | \"unavailable\" | \"unknown\";"
+        ));
+        assert!(block.contains(
+            "export type AgentResourcePreferenceScopeDto = \"edition\" | \"media_item\";"
+        ));
+        // wire 的 canonical 分类没有 `all`：无法归类的最近作品必须是 null，
+        // 不能让页面把它读成某个具体分类。
+        assert!(
+            block.contains("ContentCategory | null"),
+            "无法归类的作品必须投影成 null"
+        );
+        // 只读投影不得携带凭据、endpoint 或绝对路径字段。
+        for forbidden in [
+            "apiKey",
+            "secret",
+            "credential",
+            "endpoint",
+            "absolutePath",
+            "filePath",
+        ] {
+            assert!(
+                !block.contains(forbidden),
+                "Agent 只读投影不得包含 {forbidden}"
             );
         }
     }

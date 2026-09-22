@@ -3763,6 +3763,11 @@ pub struct AgentCapabilitySetDto {
     pub settings_read: bool,
     pub settings_proposal: bool,
     pub library_summary_read: bool,
+    pub setting_sources_read: bool,
+    pub resource_preference_read: bool,
+    pub resource_preference_proposal: bool,
+    pub media_capabilities_read: bool,
+    pub onboarding_read: bool,
     pub metadata_proposal: bool,
     pub rename_proposal: bool,
     pub secret_read: bool,
@@ -3777,6 +3782,11 @@ impl From<haven_domain::agent::AgentCapabilityManifest> for AgentCapabilityManif
                 settings_read: value.capabilities.settings_read,
                 settings_proposal: value.capabilities.settings_proposal,
                 library_summary_read: value.capabilities.library_summary_read,
+                setting_sources_read: value.capabilities.setting_sources_read,
+                resource_preference_read: value.capabilities.resource_preference_read,
+                resource_preference_proposal: value.capabilities.resource_preference_proposal,
+                media_capabilities_read: value.capabilities.media_capabilities_read,
+                onboarding_read: value.capabilities.onboarding_read,
                 metadata_proposal: value.capabilities.metadata_proposal,
                 rename_proposal: value.capabilities.rename_proposal,
                 secret_read: value.capabilities.secret_read,
@@ -3845,6 +3855,235 @@ impl From<haven_domain::agent::AgentSettingsSubject> for AgentSettingsSubjectDto
             section: value.section.into(),
         }
     }
+}
+
+/// 设置来源层（Agent 只读投影）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum AgentSettingSourceLayerDto {
+    Default,
+    Global,
+    Edition,
+    MediaItem,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentSettingSourceDto {
+    pub layer: AgentSettingSourceLayerDto,
+    pub present: bool,
+    pub revision: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentSettingSourcesDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub section: AgentSettingsSectionDto,
+    pub revision: Option<String>,
+    pub layers: Vec<AgentSettingSourceDto>,
+}
+
+/// 资源偏好 Agent 作用域。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum AgentResourcePreferenceScopeDto {
+    Edition,
+    MediaItem,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentResourcePreferenceSnapshotDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub context_id: String,
+    pub context_hash: String,
+    pub target_scope: AgentResourcePreferenceScopeDto,
+    pub edition_id: String,
+    pub media_item_id: Option<String>,
+    pub revision: Option<String>,
+    pub reading: Option<PreferenceReadingPatchDto>,
+    pub comic: Option<PreferenceComicPatchDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentResourcePreferencePatchDto {
+    pub reading: Option<PreferenceReadingPatchDto>,
+    pub comic: Option<PreferenceComicPatchDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentResourcePreferenceProposalCreateRequest {
+    pub session_id: String,
+    pub request_id: String,
+    pub target_scope: AgentResourcePreferenceScopeDto,
+    pub edition_id: String,
+    pub media_item_id: Option<String>,
+    pub context_id: String,
+    pub context_hash: String,
+    pub base_revision: Option<String>,
+    pub patch: AgentResourcePreferencePatchDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentResourcePreferenceProposalDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub proposal_id: String,
+    pub status: AgentSettingsProposalStatusDto,
+    pub target_scope: AgentResourcePreferenceScopeDto,
+    pub target_label: String,
+    pub edition_id: String,
+    pub media_item_id: Option<String>,
+    pub base_revision: Option<String>,
+    pub digest: String,
+    pub created_at: String,
+    pub expires_at: String,
+    pub changes: Vec<AgentSettingChangeDto>,
+}
+
+/// 按提案 ID 回读资源级 Agent 提案；供未来 UI 从外部 Agent 返回的 proposalId 打开 Diff。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentResourcePreferenceProposalGetRequest {
+    pub proposal_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentResourcePreferenceProposalGetResultDto {
+    pub proposal: AgentResourcePreferenceProposalDto,
+    pub receipt: Option<AgentSettingChangeReceiptDto>,
+}
+
+/// 用户批准资源级 Agent 提案；目标作用域从持久化 Proposal 重建，不由调用方自带。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentResourcePreferenceProposalApproveRequest {
+    pub proposal_id: String,
+    pub expected_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentResourcePreferenceProposalApproveResultDto {
+    pub proposal: AgentResourcePreferenceProposalDto,
+    pub receipt: AgentSettingChangeReceiptDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentLibrarySummaryCountsDto {
+    pub works: u64,
+    pub editions: u64,
+    pub media_items: u64,
+    pub favorites: u64,
+    pub in_progress: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentLibraryCategoryCountDto {
+    pub category: ContentCategory,
+    pub work_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentLibraryRecentItemDto {
+    pub work_id: String,
+    pub title: String,
+    // wire 的 `ContentCategory` 没有 `all`：无法按媒体类型归类的作品投影成 null，
+    // 页面必须显示为「未分类」而不是猜一个具体分类。
+    pub category: Option<ContentCategory>,
+    pub progress_ratio: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentLibrarySummaryDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub counts: AgentLibrarySummaryCountsDto,
+    pub categories: Vec<AgentLibraryCategoryCountDto>,
+    pub recent: Vec<AgentLibraryRecentItemDto>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum AgentMediaAvailabilityDto {
+    Available,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum AgentMediaCapabilityFlagDto {
+    OpenSession,
+    ExtractText,
+    RenderPages,
+    Stream,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentMediaCapabilityDto {
+    pub media_item_id: String,
+    pub media_type: MediaTypeDto,
+    pub availability: AgentMediaAvailabilityDto,
+    pub can_open_session: bool,
+    pub can_extract_text: bool,
+    pub can_render_pages: bool,
+    pub declared_capabilities: Vec<AgentMediaCapabilityFlagDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentMediaCapabilitiesDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub items: Vec<AgentMediaCapabilityDto>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentOnboardingStateDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub completed_steps: Vec<String>,
+    pub next_step: Option<String>,
+    pub has_storage_location: bool,
+    pub has_library_content: bool,
+    pub has_ai_provider: bool,
 }
 
 /// 创建设置提案的请求（闭合 typed DTO）。
@@ -4213,6 +4452,94 @@ pub struct AiProviderModelsCatalogDto {
     pub profile_id: String,
     pub state: AiProviderModelsCatalogStateDto,
     pub models: Vec<AiProviderModelDto>,
+}
+
+/// 生成智能阅读设置推荐的请求。
+///
+/// Provider 只负责返回结构化建议；`contextId`、`contextHash` 与
+/// `baseRevision` 必须来自最近一次 authoritative 上下文读取，最终仍停在
+/// `pending` Proposal，不包含任何 Apply / Approval / Token 字段。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AiSettingsRecommendationGenerateRequest {
+    pub profile_id: String,
+    pub session_id: String,
+    pub request_id: String,
+    pub context_id: String,
+    pub context_hash: String,
+    pub base_revision: Option<String>,
+}
+
+/// Provider 生成的结构化推荐及其待批准 Proposal。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AiSettingsRecommendationDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub profile_id: String,
+    pub model_id: String,
+    pub explanation: Option<String>,
+    pub recommended_patch: PreferenceReadingPatchDto,
+    pub proposal: AgentSettingsProposalDto,
+}
+
+/// Agent 轨迹事件类型（闭合集合）。事件只描述步骤，不携带模型原文、路径、SQL 或 secret。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum AgentTraceEventKindDto {
+    RequestStarted,
+    ContextLoaded,
+    ProviderRequest,
+    ProviderResponse,
+    StructuredOutputValidated,
+    ProposalCreated,
+    WaitingForApproval,
+    ApprovalRejected,
+    CasStarted,
+    Applied,
+    ReceiptCreated,
+    Cancelled,
+    Retrying,
+    Failed,
+}
+
+/// 读取指定 Agent 会话轨迹的请求。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentTraceGetRequest {
+    pub session_id: String,
+}
+
+/// 脱敏轨迹事件。context 只保留可重新核对的 id/hash。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentTraceEventDto {
+    pub session_id: String,
+    pub request_id: String,
+    pub context_id: String,
+    pub context_hash: String,
+    #[ts(type = "number")]
+    pub sequence: u64,
+    pub kind: AgentTraceEventKindDto,
+    #[ts(type = "number | null")]
+    pub duration_ms: Option<u64>,
+    pub occurred_at: String,
+}
+
+/// Agent 轨迹读取结果。事件上限由 Application collector 固定保证。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentTraceGetResultDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub session_id: String,
+    pub events: Vec<AgentTraceEventDto>,
 }
 
 impl AiProviderModelDto {

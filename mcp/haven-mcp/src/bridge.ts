@@ -6,24 +6,20 @@
 // - 本端口**没有** Apply / Approve / Reject / Delete / 任意写入方法。审批与执行只在
 //   Haven 自己的 UI 上发生；MCP 侧能做的写操作只有"创建一条 pending 提案"。
 // - 本端口**不读** SQLite、文件系统或 CredentialStore。存储与凭据只存在于 Haven 进程内；
-//   桥接传输（未来的实现）只承载已经投影、已经脱敏的载荷。
-// - 本端口**不**invoke Tauri。它是传输无关的接口；具体传输是另一个（尚未实现的）适配器。
+//   桥接传输只承载已经投影、已经脱敏的载荷。
+// - 本端口**不**invoke Tauri。它是传输无关的接口；具体传输由显式不可用适配器或
+//   本地 Broker 适配器提供。
 //
 // ## 当前接通状态（本切片）
 //
-// **没有生产传输适配器。** 生产默认是 [`UnavailableHavenAgentBridge`]：每个操作都返回
-// 稳定的 `HAVEN_BRIDGE_UNAVAILABLE`，不返回任何伪造数据。这是刻意的：
-// 用一个"看起来能用但数据是编的"适配器冒充已接通，比诚实不可用危险得多。
-//
-// 9 个 MCP 工具中，只有 2 个在 Haven 后端有已实现的用例
-// （`settings_read` / `settings_proposal`，见 `AgentCapabilityManifest::for_current_slice`），
-// 其余 6 个在 Application 层根本不存在——即使传输接通了，它们也必须继续返回
-// `HAVEN_CAPABILITY_UNAVAILABLE` 而不是编造结果。
+// 生产传输由 `LiveHavenAgentBridge` 通过本地 Broker 接入；默认仍是显式不可用的
+// [`UnavailableHavenAgentBridge`]。桥接只承载已经由 Haven Application service 投影的
+// 读结果或 pending Proposal，不拥有 Apply / Approve / 文件 / SQL / secret 能力。
 
 import { BRIDGE_TIMEOUT_MS, ERROR_CODES } from "./constants.js";
 import { HavenMcpError, bridgeUnavailable } from "./errors.js";
 
-/** 桥接类型。`unavailable` 是本切片唯一的生产取值。 */
+/** 桥接类型。生产默认是 `unavailable`；用户显式配置本地 Broker 后可为 `live`。 */
 export type BridgeKind = "unavailable" | "fixture" | "live";
 
 /** 全局设置分区（当前只有 reading，与 `AgentSettingsSection` 一致）。 */
@@ -83,6 +79,11 @@ export interface HavenCapabilityReport {
     settings_read: boolean;
     settings_proposal: boolean;
     library_summary_read: boolean;
+    setting_sources_read: boolean;
+    resource_preference_read: boolean;
+    resource_preference_proposal: boolean;
+    media_capabilities_read: boolean;
+    onboarding_read: boolean;
     metadata_proposal: boolean;
     rename_proposal: boolean;
     secret_read: boolean;
@@ -113,6 +114,8 @@ export interface SettingSourcesResult {
 }
 
 export interface ResourcePreferenceSnapshotResult {
+  context_id: string;
+  context_hash: string;
   target_scope: PreferenceScope;
   edition_id: string;
   media_item_id: string | null;

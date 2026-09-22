@@ -20,14 +20,19 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use haven_application::services::ai_provider::AiModelCatalogPort;
+use haven_application::services::ai_provider::{
+    AiModelCatalogPort, AiSettingsRecommendationInput, AiSettingsRecommendationPort,
+};
+use haven_application::wire::PreferenceReadingPatchDto;
 use haven_common::network::{HttpUrlPolicy, parse_http_url};
 use haven_common::{AppError, ErrorKind};
 use haven_domain::ai_provider::{
-    AI_PROVIDER_MODEL_ID_MAX_LEN, AiModelCapability, AiModelDescriptor, AiProviderKind,
-    models_url_for,
+    AI_PROVIDER_MODEL_ID_MAX_LEN, AI_RECOMMENDATION_EXPLANATION_MAX_LEN,
+    AI_RECOMMENDATION_TEXT_FIELD_MAX_LEN, AiModelCapability, AiModelDescriptor, AiProviderKind,
+    AiSettingsRecommendation, chat_completions_url_for, models_url_for,
 };
 use haven_domain::credential::SecretString;
+use haven_domain::settings::ReadingPatch;
 use serde_json::Value;
 
 use crate::http_security::{pin_client_builder, resolve_public_http_target};
@@ -37,6 +42,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// 模型目录是小型 JSON；1 MiB 足够容纳数千条记录，同时把"被塞一个大响应"挡在外面。
 const MAX_MODELS_BYTES: usize = 1024 * 1024;
 const USER_AGENT: &str = "Haven/0.1.0 (ai provider model discovery)";
+const MAX_RECOMMENDATION_BYTES: usize = 256 * 1024;
+const MAX_RECOMMENDATION_PROMPT_BYTES: usize = 8 * 1024;
+const RECOMMENDATION_TIMEOUT: Duration = Duration::from_secs(30);
+const RECOMMENDATION_USER_AGENT: &str = "Haven/0.1.0 (ai provider settings recommendation)";
+const RECOMMENDATION_SYSTEM_PROMPT: &str = "你是 Haven 阅读设置助手。根据给定的当前阅读设置，只输出一个 JSON 对象：{\"settingsPatch\": {<需要调整的字段，不调整的字段为 null>}, \"explanation\": <简短中文说明或 null>}。只能使用 schema 允许的字段与取值；不要输出多余字段、不要调用任何工具、不要执行任何操作。";
 
 /// OpenAI 兼容的模型发现客户端。
 #[derive(Clone, Default)]
@@ -265,6 +275,342 @@ fn client_error() -> AppError {
         "模型发现客户端初始化失败",
         false,
     )
+}
+
+/// OpenAI 兼容的**设置建议**客户端。
+///
+/// 与模型发现适配器同源：同样的 URL 策略、DNS 每个请求重新解析并固定、关闭重定向、
+/// 有界超时与响应上界。模型只能返回 typed 建议值；Proposal 的创建仍由 Application
+/// service 完成，Provider 没有本地写入能力。
+#[derive(Clone, Default)]
+pub struct OpenAiCompatibleSettingsRecommender;
+
+impl OpenAiCompatibleSettingsRecommender {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl AiSettingsRecommendationPort for OpenAiCompatibleSettingsRecommender {
+    async fn recommend_settings(
+        &self,
+        kind: AiProviderKind,
+        endpoint: &str,
+        secret: &SecretString,
+        input: &AiSettingsRecommendationInput,
+    ) -> Result<AiSettingsRecommendation, AppError> {
+        match kind {
+            AiProviderKind::OpenAiCompatible => {}
+        }
+        let body = build_recommendation_request(input)?;
+        let url = chat_completions_url_for(endpoint)?;
+        let target = resolve_public_http_target(&url, HttpUrlPolicy::AiProviderEndpoint)
+            .await
+            .map_err(recommendation_target_error)?;
+        let builder = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(RECOMMENDATION_TIMEOUT)
+            .user_agent(RECOMMENDATION_USER_AGENT)
+            .http1_only()
+            .redirect(reqwest::redirect::Policy::none());
+        let client = pin_client_builder(builder, &target)
+            .build()
+            .map_err(|_| recommendation_client_error())?;
+
+        let mut response = client
+            .post(target.url.clone())
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", secret.expose()),
+            )
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| recommendation_unreachable())?;
+
+        let status = response.status().as_u16();
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RECOMMENDATION_BYTES as u64)
+        {
+            return Err(recommendation_response_too_large());
+        }
+        let mut raw = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| recommendation_unreachable())?
+        {
+            extend_with_recommendation_cap(&mut raw, &chunk)?;
+        }
+        interpret_recommendation_response(status, &raw)
+    }
+}
+
+fn extend_with_recommendation_cap(body: &mut Vec<u8>, chunk: &[u8]) -> Result<(), AppError> {
+    if body.len() + chunk.len() > MAX_RECOMMENDATION_BYTES {
+        return Err(recommendation_response_too_large());
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+/// 构造严格 JSON 请求体。提示词只包含模型 id 与已脱敏的阅读快照；超界即拒绝，
+/// 不发起出站请求。
+fn build_recommendation_request(input: &AiSettingsRecommendationInput) -> Result<Value, AppError> {
+    let reading =
+        serde_json::to_value(&input.reading).map_err(|_| recommendation_invalid_input())?;
+    let prompt = serde_json::json!({
+        "task": "haven_reading_settings_recommendation",
+        "model": input.model_id,
+        "currentReading": reading,
+    })
+    .to_string();
+    if prompt.len() > MAX_RECOMMENDATION_PROMPT_BYTES {
+        return Err(recommendation_invalid_input());
+    }
+    Ok(serde_json::json!({
+        "model": input.model_id,
+        "temperature": 0,
+        "max_tokens": 512,
+        "messages": [
+            { "role": "system", "content": RECOMMENDATION_SYSTEM_PROMPT },
+            { "role": "user", "content": prompt }
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "haven_settings_recommendation",
+                "strict": true,
+                "schema": recommendation_json_schema(),
+            }
+        }
+    }))
+}
+
+fn nullable_string(max_len: usize) -> Value {
+    serde_json::json!({ "type": ["string", "null"], "maxLength": max_len })
+}
+
+fn nullable_enum(values: &[&str]) -> Value {
+    let mut variants: Vec<Value> = values
+        .iter()
+        .map(|value| Value::String((*value).to_owned()))
+        .collect();
+    variants.push(Value::Null);
+    serde_json::json!({ "type": ["string", "null"], "enum": variants })
+}
+
+fn recommendation_json_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["settingsPatch", "explanation"],
+        "properties": {
+            "settingsPatch": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "fontFamily", "customFontFamily", "fontSize", "lineHeight",
+                    "contentWidth", "theme", "customBackground", "customText",
+                    "fontWeight", "letterSpacing", "systemAuto", "pagination"
+                ],
+                "properties": {
+                    "fontFamily": nullable_enum(&["sans", "serif", "kai", "heiti", "fangsong", "mianfei", "custom"]),
+                    "customFontFamily": nullable_string(AI_RECOMMENDATION_TEXT_FIELD_MAX_LEN),
+                    "fontSize": nullable_enum(&["small", "medium", "large"]),
+                    "lineHeight": nullable_enum(&["compact", "comfortable", "airy"]),
+                    "contentWidth": nullable_enum(&["narrow", "medium", "wide"]),
+                    "theme": nullable_enum(&["system", "paper", "warm", "slate", "dark", "sepia", "eyeCare", "custom"]),
+                    "customBackground": nullable_string(AI_RECOMMENDATION_TEXT_FIELD_MAX_LEN),
+                    "customText": nullable_string(AI_RECOMMENDATION_TEXT_FIELD_MAX_LEN),
+                    "fontWeight": nullable_enum(&["light", "regular", "medium", "semibold", "bold"]),
+                    "letterSpacing": nullable_enum(&["tight", "normal", "relaxed", "loose"]),
+                    "systemAuto": { "type": ["boolean", "null"] },
+                    "pagination": nullable_enum(&["scroll", "paginated", "double"])
+                }
+            },
+            "explanation": nullable_string(AI_RECOMMENDATION_EXPLANATION_MAX_LEN)
+        }
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct ChatCompletionEnvelope {
+    choices: Vec<ChatCompletionChoice>,
+}
+
+#[derive(serde::Deserialize)]
+struct ChatCompletionChoice {
+    message: ChatCompletionMessage,
+}
+
+#[derive(serde::Deserialize)]
+struct ChatCompletionMessage {
+    content: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RecommendationPayload {
+    settings_patch: PreferenceReadingPatchDto,
+    explanation: Option<String>,
+}
+
+pub(crate) fn interpret_recommendation_response(
+    status: u16,
+    body: &[u8],
+) -> Result<AiSettingsRecommendation, AppError> {
+    if !(200..300).contains(&status) {
+        return Err(recommendation_status_error(status));
+    }
+    let envelope: ChatCompletionEnvelope = serde_json::from_slice(body)
+        .map_err(|_| recommendation_invalid_response("响应不是合法的 chat/completions JSON"))?;
+    let content = envelope
+        .choices
+        .into_iter()
+        .next()
+        .and_then(|choice| choice.message.content)
+        .ok_or_else(|| recommendation_invalid_response("响应缺少 choices[0].message.content"))?;
+    parse_recommendation_content(&content)
+}
+
+pub(crate) fn parse_recommendation_content(
+    content: &str,
+) -> Result<AiSettingsRecommendation, AppError> {
+    if content.trim().is_empty() {
+        return Err(recommendation_invalid_response("模型没有返回结构化建议"));
+    }
+    let value: Value = serde_json::from_str(content)
+        .map_err(|_| recommendation_invalid_response("模型输出不符合严格建议 schema"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| recommendation_invalid_response("模型输出必须是对象"))?;
+    const OUTER_KEYS: &[&str] = &["settingsPatch", "explanation"];
+    if !has_exact_keys(object, OUTER_KEYS) {
+        return Err(recommendation_invalid_response(
+            "模型输出包含未知或缺失字段",
+        ));
+    }
+    let patch = object
+        .get("settingsPatch")
+        .and_then(Value::as_object)
+        .ok_or_else(|| recommendation_invalid_response("settingsPatch 必须是对象"))?;
+    const PATCH_KEYS: &[&str] = &[
+        "fontFamily",
+        "customFontFamily",
+        "fontSize",
+        "lineHeight",
+        "contentWidth",
+        "theme",
+        "customBackground",
+        "customText",
+        "fontWeight",
+        "letterSpacing",
+        "systemAuto",
+        "pagination",
+    ];
+    if !has_exact_keys(patch, PATCH_KEYS) {
+        return Err(recommendation_invalid_response(
+            "settingsPatch 字段集合不完整",
+        ));
+    }
+    let payload: RecommendationPayload = serde_json::from_value(value)
+        .map_err(|_| recommendation_invalid_response("模型输出不符合严格建议 schema"))?;
+    AiSettingsRecommendation::new(
+        ReadingPatch::from(payload.settings_patch),
+        payload.explanation,
+    )
+}
+
+fn has_exact_keys(object: &serde_json::Map<String, Value>, expected: &[&str]) -> bool {
+    object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
+}
+
+fn recommendation_status_error(status: u16) -> AppError {
+    if status == 401 || status == 403 {
+        return AppError::new(
+            "AI_PROVIDER_RECOMMENDATION_UNAUTHORIZED",
+            ErrorKind::Unauthorized,
+            "API Key 无效或没有调用对话接口的权限",
+            false,
+        );
+    }
+    if (300..400).contains(&status) {
+        return AppError::new(
+            "AI_PROVIDER_RECOMMENDATION_UNEXPECTED_REDIRECT",
+            ErrorKind::Network,
+            "建议接口返回了重定向；请把 API 地址改为最终地址",
+            false,
+        );
+    }
+    AppError::new(
+        "AI_PROVIDER_RECOMMENDATION_HTTP_ERROR",
+        ErrorKind::Network,
+        format!("设置建议请求失败（HTTP {status}）"),
+        true,
+    )
+}
+
+fn recommendation_invalid_response(detail: &'static str) -> AppError {
+    AppError::new(
+        "AI_PROVIDER_RECOMMENDATION_INVALID_RESPONSE",
+        ErrorKind::Parse,
+        detail,
+        false,
+    )
+}
+
+fn recommendation_invalid_input() -> AppError {
+    AppError::new(
+        "AI_PROVIDER_RECOMMENDATION_INPUT_INVALID",
+        ErrorKind::Validation,
+        "设置建议请求超出允许的大小或形状",
+        false,
+    )
+}
+
+fn recommendation_response_too_large() -> AppError {
+    AppError::new(
+        "AI_PROVIDER_RECOMMENDATION_RESPONSE_TOO_LARGE",
+        ErrorKind::Network,
+        "设置建议响应超出大小上限",
+        false,
+    )
+}
+
+fn recommendation_unreachable() -> AppError {
+    AppError::new(
+        "AI_PROVIDER_RECOMMENDATION_UNREACHABLE",
+        ErrorKind::Network,
+        "无法连接到设置建议接口，请检查 API 地址与网络",
+        true,
+    )
+}
+
+fn recommendation_client_error() -> AppError {
+    AppError::new(
+        "AI_PROVIDER_RECOMMENDATION_CLIENT_INIT_FAILED",
+        ErrorKind::Internal,
+        "设置建议客户端初始化失败",
+        false,
+    )
+}
+
+fn recommendation_target_error(error: crate::http_security::HttpTargetError) -> AppError {
+    use crate::http_security::HttpTargetError as Error;
+    match error {
+        Error::Invalid | Error::UnsafeAddress => AppError::new(
+            "AI_PROVIDER_ENDPOINT_INVALID",
+            ErrorKind::Validation,
+            "API 地址不被允许（仅接受公网 http/https 主机）",
+            false,
+        ),
+        Error::ResolveFailed => recommendation_unreachable(),
+    }
 }
 
 /// 供组装层做启动期自检：策略必须拒绝非公网端点。
@@ -511,5 +857,144 @@ mod tests {
                 "私网/回环端点必须被拒绝: {raw}"
             );
         }
+    }
+
+    fn sample_reading() -> haven_domain::agent::AgentReadingSnapshot {
+        haven_domain::agent::AgentReadingSnapshot {
+            font_family: "sans".into(),
+            custom_font_family: None,
+            font_size: "medium".into(),
+            line_height: "comfortable".into(),
+            content_width: "medium".into(),
+            theme: "system".into(),
+            custom_background: None,
+            custom_text: None,
+            font_weight: "regular".into(),
+            letter_spacing: "normal".into(),
+            system_auto: true,
+            pagination: "scroll".into(),
+            redacted: Default::default(),
+        }
+    }
+
+    #[test]
+    fn recommendation_schema_is_strict_and_closed() {
+        let schema = recommendation_json_schema();
+        assert_eq!(schema["additionalProperties"], Value::Bool(false));
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["settingsPatch", "explanation"])
+        );
+        let patch = &schema["properties"]["settingsPatch"];
+        assert_eq!(patch["additionalProperties"], Value::Bool(false));
+        assert_eq!(patch["required"].as_array().unwrap().len(), 12);
+        assert_eq!(
+            schema["properties"]["explanation"]["maxLength"],
+            serde_json::json!(AI_RECOMMENDATION_EXPLANATION_MAX_LEN)
+        );
+    }
+
+    #[test]
+    fn recommendation_request_is_bounded_and_has_json_schema_response_format() {
+        let body = build_recommendation_request(&AiSettingsRecommendationInput {
+            model_id: "chat-model".into(),
+            reading: sample_reading(),
+        })
+        .unwrap();
+        assert_eq!(body["model"], "chat-model");
+        assert_eq!(body["temperature"], 0);
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert!(
+            !body["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("sk-")
+        );
+
+        let oversized = AiSettingsRecommendationInput {
+            model_id: "chat-model".into(),
+            reading: haven_domain::agent::AgentReadingSnapshot {
+                custom_background: Some("x".repeat(MAX_RECOMMENDATION_PROMPT_BYTES)),
+                ..sample_reading()
+            },
+        };
+        assert_eq!(
+            build_recommendation_request(&oversized)
+                .unwrap_err()
+                .code()
+                .as_str(),
+            "AI_PROVIDER_RECOMMENDATION_INPUT_INVALID"
+        );
+    }
+
+    fn complete_recommendation_content(patch: &str, explanation: &str) -> String {
+        format!(
+            r#"{{"settingsPatch":{{"fontFamily":null,"customFontFamily":null,"fontSize":{patch},"lineHeight":null,"contentWidth":null,"theme":null,"customBackground":null,"customText":null,"fontWeight":null,"letterSpacing":null,"systemAuto":null,"pagination":null}},"explanation":{explanation}}}"#
+        )
+    }
+
+    #[test]
+    fn recommendation_content_is_strictly_typed_and_fail_closed() {
+        let content = complete_recommendation_content("\"large\"", "\"调大字号\"");
+        let recommendation = parse_recommendation_content(&content).unwrap();
+        assert_eq!(
+            recommendation.patch().font_size,
+            Some(haven_domain::settings::ReadingFontSize::Large)
+        );
+        assert_eq!(recommendation.explanation(), Some("调大字号"));
+
+        for bad in [
+            "",
+            "not json",
+            r#"{"settingsPatch":{},"explanation":null}"#,
+            r#"{"settingsPatch":{"fontFamily":null,"customFontFamily":null,"fontSize":"huge","lineHeight":null,"contentWidth":null,"theme":null,"customBackground":null,"customText":null,"fontWeight":null,"letterSpacing":null,"systemAuto":null,"pagination":null},"explanation":null}"#,
+            r#"{"settingsPatch":{"fontFamily":null,"customFontFamily":null,"fontSize":null,"lineHeight":null,"contentWidth":null,"theme":null,"customBackground":null,"customText":null,"fontWeight":null,"letterSpacing":null,"systemAuto":null,"pagination":null},"explanation":null,"extra":true}"#,
+        ] {
+            assert!(
+                parse_recommendation_content(bad).is_err(),
+                "必须 fail closed: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn recommendation_envelope_and_transport_errors_are_stable() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "id": "chatcmpl-1",
+            "choices": [{
+                "message": {
+                    "content": complete_recommendation_content("null", "null")
+                }
+            }]
+        }))
+        .unwrap();
+        let recommendation = interpret_recommendation_response(200, &body).unwrap();
+        assert!(recommendation.explanation().is_none());
+        assert_eq!(recommendation.patch().font_size, None);
+
+        for (status, code) in [
+            (401, "AI_PROVIDER_RECOMMENDATION_UNAUTHORIZED"),
+            (302, "AI_PROVIDER_RECOMMENDATION_UNEXPECTED_REDIRECT"),
+            (503, "AI_PROVIDER_RECOMMENDATION_HTTP_ERROR"),
+        ] {
+            assert_eq!(
+                interpret_recommendation_response(status, b"upstream")
+                    .unwrap_err()
+                    .code()
+                    .as_str(),
+                code
+            );
+        }
+        let mut response = Vec::new();
+        extend_with_recommendation_cap(&mut response, &vec![b'a'; MAX_RECOMMENDATION_BYTES])
+            .unwrap();
+        assert_eq!(
+            extend_with_recommendation_cap(&mut response, b"x")
+                .unwrap_err()
+                .code()
+                .as_str(),
+            "AI_PROVIDER_RECOMMENDATION_RESPONSE_TOO_LARGE"
+        );
     }
 }

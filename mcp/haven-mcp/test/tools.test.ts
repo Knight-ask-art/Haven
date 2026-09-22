@@ -348,15 +348,14 @@ describe("提案工具只创建 pending 提案", () => {
     });
   });
 
-  it("未实现的提案工具返回能力不可用，而不是伪装成桥接故障", async () => {
-    // 即使桥接**可用**，未实现的能力也必须如实报告为能力缺失。
+  it("资源偏好提案走真实桥接方法，并且仍只返回 pending", async () => {
     await withHarness(new FixtureHavenAgentBridge(), async ({ client }) => {
       const result = await client.callTool({
         name: "propose_resource_preference_patch",
         arguments: minimalArgs("propose_resource_preference_patch"),
       });
-      expect(result.isError).toBe(true);
-      expect(errorPayloadOf(result).code).toBe("HAVEN_CAPABILITY_UNAVAILABLE");
+      expect(result.isError).toBeFalsy();
+      expect((result.structuredContent as Record<string, unknown>).status).toBe("pending");
     });
   });
 
@@ -408,19 +407,10 @@ describe("提案工具只创建 pending 提案", () => {
     });
   });
 
-  it("已实现与未实现的工具集合与冻结表一致（当前为 3 / 6）", () => {
+  it("9 个冻结工具均有对应的真实实现声明", () => {
     const implemented = TOOL_NAMES.filter((name) => TOOL_IMPLEMENTATION[name].implemented);
-    expect(implemented).toEqual(["get_system_capabilities", "get_settings_snapshot", "propose_settings_patch"]);
-    expect(implemented).toHaveLength(3);
-    expect(TOOL_NAMES.length - implemented.length).toBe(6);
-    // 未实现的工具必须给出能力名与原因，错误文案才可行动。
-    for (const name of TOOL_NAMES) {
-      const implementation = TOOL_IMPLEMENTATION[name];
-      if (!implementation.implemented) {
-        expect(implementation.capability.length, name).toBeGreaterThan(0);
-        expect(implementation.reason.length, name).toBeGreaterThan(0);
-      }
-    }
+    expect(implemented).toEqual([...TOOL_NAMES]);
+    expect(implemented).toHaveLength(9);
   });
 });
 
@@ -435,9 +425,9 @@ describe("get_system_capabilities：永远可用且如实", () => {
       expect(structured.bridge).toMatchObject({ kind: "fixture", available: true });
       expect(structured.haven.available).toBe(true);
       expect(structured.haven.capabilities.settings_read).toBe(true);
-      expect(structured.haven.capabilities.library_summary_read).toBe(false);
+      expect(structured.haven.capabilities.library_summary_read).toBe(true);
       expect(structured.tool_implementation.get_settings_snapshot).toBe("implemented");
-      expect(structured.tool_implementation.get_library_summary).toBe("not_implemented");
+      expect(structured.tool_implementation.get_library_summary).toBe("implemented");
       expect(structured.forbidden_operations).toContain("apply");
     });
   });
@@ -454,12 +444,12 @@ describe("get_system_capabilities：永远可用且如实", () => {
     });
   });
 
-  it("未实现的能力即使桥接可用也返回 HAVEN_CAPABILITY_UNAVAILABLE", async () => {
+  it("已接通的只读能力均返回真实结构化结果", async () => {
     await withHarness(new FixtureHavenAgentBridge(), async ({ client }) => {
-      for (const name of ["get_library_summary", "get_media_capabilities", "get_onboarding_state", "get_setting_sources"]) {
+      for (const name of ["get_library_summary", "get_media_capabilities", "get_onboarding_state", "get_setting_sources", "get_resource_preference_snapshot"]) {
         const result = await client.callTool({ name, arguments: minimalArgs(name) });
-        expect(result.isError, name).toBe(true);
-        expect(errorPayloadOf(result).code, name).toBe("HAVEN_CAPABILITY_UNAVAILABLE");
+        expect(result.isError, name).toBeFalsy();
+        expect(result.structuredContent, name).toBeDefined();
       }
     });
   });

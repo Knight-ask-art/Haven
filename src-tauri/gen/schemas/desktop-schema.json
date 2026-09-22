@@ -201,6 +201,24 @@
           "markdownDescription": "Enables the agent_capability_manifest_get command without any pre-configured scope."
         },
         {
+          "description": "Enables the agent_resource_preference_proposal_approve command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-agent-resource-preference-proposal-approve",
+          "markdownDescription": "Enables the agent_resource_preference_proposal_approve command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the agent_resource_preference_proposal_create command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-agent-resource-preference-proposal-create",
+          "markdownDescription": "Enables the agent_resource_preference_proposal_create command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the agent_resource_preference_proposal_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-agent-resource-preference-proposal-get",
+          "markdownDescription": "Enables the agent_resource_preference_proposal_get command without any pre-configured scope."
+        },
+        {
           "description": "Enables the agent_setting_change_receipt_get command without any pre-configured scope.",
           "type": "string",
           "const": "allow-agent-setting-change-receipt-get",
@@ -237,6 +255,12 @@
           "markdownDescription": "Enables the agent_settings_proposal_reject command without any pre-configured scope."
         },
         {
+          "description": "Enables the agent_trace_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-agent-trace-get",
+          "markdownDescription": "Enables the agent_trace_get command without any pre-configured scope."
+        },
+        {
           "description": "Enables the ai_provider_models_list command without any pre-configured scope.",
           "type": "string",
           "const": "allow-ai-provider-models-list",
@@ -265,6 +289,12 @@
           "type": "string",
           "const": "allow-ai-provider-profile-upsert",
           "markdownDescription": "Enables the ai_provider_profile_upsert command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the ai_settings_recommendation_generate command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ai-settings-recommendation-generate",
+          "markdownDescription": "Enables the ai_settings_recommendation_generate command without any pre-configured scope."
         },
         {
           "description": "Enables the app_info_get command without any pre-configured scope.",
@@ -873,6 +903,24 @@
           "markdownDescription": "Denies the agent_capability_manifest_get command without any pre-configured scope."
         },
         {
+          "description": "Denies the agent_resource_preference_proposal_approve command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-agent-resource-preference-proposal-approve",
+          "markdownDescription": "Denies the agent_resource_preference_proposal_approve command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the agent_resource_preference_proposal_create command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-agent-resource-preference-proposal-create",
+          "markdownDescription": "Denies the agent_resource_preference_proposal_create command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the agent_resource_preference_proposal_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-agent-resource-preference-proposal-get",
+          "markdownDescription": "Denies the agent_resource_preference_proposal_get command without any pre-configured scope."
+        },
+        {
           "description": "Denies the agent_setting_change_receipt_get command without any pre-configured scope.",
           "type": "string",
           "const": "deny-agent-setting-change-receipt-get",
@@ -909,6 +957,12 @@
           "markdownDescription": "Denies the agent_settings_proposal_reject command without any pre-configured scope."
         },
         {
+          "description": "Denies the agent_trace_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-agent-trace-get",
+          "markdownDescription": "Denies the agent_trace_get command without any pre-configured scope."
+        },
+        {
           "description": "Denies the ai_provider_models_list command without any pre-configured scope.",
           "type": "string",
           "const": "deny-ai-provider-models-list",
@@ -937,6 +991,12 @@
           "type": "string",
           "const": "deny-ai-provider-profile-upsert",
           "markdownDescription": "Denies the ai_provider_profile_upsert command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ai_settings_recommendation_generate command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ai-settings-recommendation-generate",
+          "markdownDescription": "Denies the ai_settings_recommendation_generate command without any pre-configured scope."
         },
         {
           "description": "Denies the app_info_get command without any pre-configured scope.",
