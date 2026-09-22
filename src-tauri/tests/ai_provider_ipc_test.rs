@@ -15,6 +15,12 @@
 //! 本测试**不会**调用 `credential_set`：真实运行环境下那会写进用户的 Windows
 //! 凭据管理器。凭据读写路径由 `CredentialAccessService` 与 `AiProviderProfileService`
 //! 的内存替身单测覆盖。
+//!
+//! **平台差异**：非 Windows 平台按 ADR-001 装配 `UnsupportedCredentialStore`，
+//! profile 行写入后读取凭据存在性必然失败。因此 `profile_lifecycle_*` 在非 Windows
+//! 上断言稳定的 `CREDENTIAL_UNSUPPORTED`（不可重试、不回显端点）后提前返回；
+//! 完整的 CAS / 空目录 / 停用 / 删除生命周期只在 Windows（真实 Credential Manager）
+//! 上执行。测试不会为跑通而替换成伪造的凭据后端。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -220,15 +226,42 @@ fn invalid_endpoints_are_rejected_with_zero_writes() {
     );
 }
 
-#[test]
-fn profile_lifecycle_is_cas_and_credential_cleanup_is_reported() {
-    let app = app();
-    let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
-        .build()
-        .unwrap();
-
+/// 非 Windows 专属契约：仓库在该平台装配 `UnsupportedCredentialStore`（ADR-001
+/// 验证项 3：不静默降级到文件后端），profile 行写入后读取凭据存在性必然失败。
+/// 所以 upsert 必须**诚实失败**，断言稳定错误码、不可重试，且错误不回显端点。
+#[cfg(not(windows))]
+fn assert_credential_store_unsupported(webview: &tauri::WebviewWindow<MockRuntime>) {
+    const ENDPOINT: &str = "https://gateway.example.invalid/v1/";
     let response = get_ipc_response(
-        &webview,
+        webview,
+        invoke_request(
+            "ai_provider_profile_upsert",
+            upsert_body("gw-main", ENDPOINT, true, None),
+        ),
+    );
+    let message = response
+        .expect_err("非 Windows 平台没有系统凭据存储，upsert 不得伪造成功")
+        .to_string();
+    assert!(
+        message.contains("CREDENTIAL_UNSUPPORTED"),
+        "非 Windows 平台的错误码必须稳定，实际: {message}"
+    );
+    assert!(
+        message.contains("\"retryable\":false"),
+        "凭据存储不可用不可重试，实际: {message}"
+    );
+    assert!(
+        !message.contains(ENDPOINT),
+        "错误消息不得回显端点，实际: {message}"
+    );
+}
+
+/// Windows 专属：真实 Windows Credential Manager 存在，因此可以跑完整生命周期
+/// （CAS 写入 → 陈旧版本冲突 → 无凭据空目录 → 停用空目录 → 删除并如实上报凭据清理）。
+#[cfg(windows)]
+fn assert_windows_profile_lifecycle(webview: &tauri::WebviewWindow<MockRuntime>) {
+    let response = get_ipc_response(
+        webview,
         invoke_request(
             "ai_provider_profile_upsert",
             upsert_body("gw-main", "https://gateway.example.invalid/v1/", true, None),
@@ -249,7 +282,7 @@ fn profile_lifecycle_is_cas_and_credential_cleanup_is_reported() {
 
     // 过期版本写入 → 稳定冲突且不改内容。
     let response = get_ipc_response(
-        &webview,
+        webview,
         invoke_request(
             "ai_provider_profile_upsert",
             upsert_body(
@@ -271,7 +304,7 @@ fn profile_lifecycle_is_cas_and_credential_cleanup_is_reported() {
     );
 
     let response = get_ipc_response(
-        &webview,
+        webview,
         invoke_request(
             "ai_provider_profile_get",
             serde_json::json!({ "request": { "profileId": "gw-main" } }),
@@ -284,7 +317,7 @@ fn profile_lifecycle_is_cas_and_credential_cleanup_is_reported() {
 
     // 没有密钥 → 诚实空目录，不发请求。
     let response = get_ipc_response(
-        &webview,
+        webview,
         invoke_request(
             "ai_provider_models_list",
             serde_json::json!({ "request": { "profileId": "gw-main" } }),
@@ -298,7 +331,7 @@ fn profile_lifecycle_is_cas_and_credential_cleanup_is_reported() {
 
     // 停用后同样是空目录，且原因是 disabled。
     let response = get_ipc_response(
-        &webview,
+        webview,
         invoke_request(
             "ai_provider_profile_upsert",
             upsert_body(
@@ -315,7 +348,7 @@ fn profile_lifecycle_is_cas_and_credential_cleanup_is_reported() {
     assert_ne!(updated["revision"], created["revision"]);
 
     let response = get_ipc_response(
-        &webview,
+        webview,
         invoke_request(
             "ai_provider_models_list",
             serde_json::json!({ "request": { "profileId": "gw-main" } }),
@@ -328,7 +361,7 @@ fn profile_lifecycle_is_cas_and_credential_cleanup_is_reported() {
 
     // 删除：凭据本来就不存在，`credentialDeleted` 如实为 false。
     let response = get_ipc_response(
-        &webview,
+        webview,
         invoke_request(
             "ai_provider_profile_delete",
             serde_json::json!({
@@ -343,7 +376,7 @@ fn profile_lifecycle_is_cas_and_credential_cleanup_is_reported() {
     assert_no_credential_material(&deleted);
 
     let response = get_ipc_response(
-        &webview,
+        webview,
         invoke_request("ai_provider_profile_list", serde_json::json!({})),
     )
     .unwrap();
@@ -353,6 +386,22 @@ fn profile_lifecycle_is_cas_and_credential_cleanup_is_reported() {
         0,
         "删除后不得残留行"
     );
+}
+
+#[test]
+fn profile_lifecycle_is_cas_and_credential_cleanup_is_reported() {
+    let app = app();
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .unwrap();
+
+    // 平台决定断言：Windows 有真实 Windows Credential Manager，非 Windows 只有
+    // `UnsupportedCredentialStore`。两条分支各自断言本平台可验证的事实，不共享断言。
+    #[cfg(windows)]
+    assert_windows_profile_lifecycle(&webview);
+
+    #[cfg(not(windows))]
+    assert_credential_store_unsupported(&webview);
 }
 
 #[test]
