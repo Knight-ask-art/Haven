@@ -791,7 +791,8 @@ mod tests {
                 assert_eq!(hello.protocol_version, 1);
                 assert_eq!(hello.client.name, "claude-code");
             }
-            other => panic!("期望 hello，得到 {other:?}"),
+            // 不格式化帧内容：解析结果可能含对端输入，不得进入 panic 消息。
+            _ => panic!("期望解析出 hello 帧，实际得到了其他类型的帧"),
         }
     }
 
