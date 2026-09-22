@@ -1,3 +1,14 @@
+---
+doc_id: architecture.mcp-external-agent-transport
+type: canonical
+status: active
+owner: architecture
+visibility: public
+source_of_truth: accepted-design-and-runtime-contracts
+last_reviewed: 2026-09-22
+review_after: 2026-12-22
+---
+
 # MCP 外部 Agent 传输设计（A5）
 
 - 状态：**设计已冻结；A5 的核心已落地，但没有任何一项经过完整真实验收**。Rust Broker 内核、
@@ -6,7 +17,7 @@
   真机 UI 与端到端链路尚未验收。
   逐项状态与证据见 §12。
 - 上游边界：[`AI_SYSTEM.md`](./AI_SYSTEM.md)（§5 MCP 边界、§6 Skill 边界）
-- 阶段拆分：[`docs/plans/2026-09-18-ai-provider-mcp-skill-plan.md`](../plans/2026-09-18-ai-provider-mcp-skill-plan.md) 的 A5 节
+- 实施阶段由仓库内部计划跟踪；本文件只以运行时契约、生成绑定和测试为准。
 
 > 本版依据独立审查修订，相对首版有七处实质变更：取消发现文件改为显式端点配置（§4）、
 > 请求集合冻结为 8 个 granted requests（`cancel` 仅为控制帧，见 §5.3）、会话与请求身份改由服务端生成（§6.2）、
@@ -72,7 +83,7 @@ Haven UI 提供的**同一份配置模板**（四个客户端共用；各客户�
   "env": {
     // 由 Haven UI 显示并可一键复制；见 §4.2
     "HAVEN_MCP_BRIDGE": "live",
-    "HAVEN_MCP_ENDPOINT": "\\\\.\\pipe\\haven-agent-v1-3f2a91c4"
+    "HAVEN_MCP_ENDPOINT": "<platform-local-endpoint>"
   }
 }
 ```
@@ -148,8 +159,8 @@ Broker 现在投影 Agent Context 的 6 个 Read 用例和 Agent Settings 的 2 
 
 | 平台 | 端点 | 说明 |
 | --- | --- | --- |
-| Windows | Named Pipe `\\.\pipe\haven-agent-v1-<sid8>` | 不占端口、不进网络栈 |
-| macOS / Linux | `$XDG_RUNTIME_DIR/haven/agent-v1.sock`；若 `XDG_RUNTIME_DIR` 未设置或不是绝对路径，则为 `$HOME/.haven/run/agent-v1.sock` | 目录 `0700`、套接字 `0600` |
+| Windows | Named Pipe，名称为 `haven-agent-v1-<sid8>` | 不占端口、不进网络栈 |
+| macOS / Linux | 当前用户的运行时目录下的 Haven 套接字；若运行时目录不可用，则使用 Haven 的每用户回退目录 | 目录 `0700`、套接字 `0600` |
 
 两者承载**同一个**字节协议（§5），只是 OS 原语不同。不允许"Windows 一套协议、Unix 另一套"。
 
@@ -163,8 +174,8 @@ Broker 现在投影 Agent Context 的 6 个 Read 用例和 Agent Settings 的 2 
 
 - 端点名**每用户稳定**：不随 Haven 重启变化，因此配置文件写一次即可长期有效。
   - Windows：`<sid8>` = 当前用户 SID 的 SHA-256 前 8 位十六进制（稳定、每用户唯一）。
-  - Unix：`<runtime-dir>` = `$XDG_RUNTIME_DIR`（仅当绝对路径）；未设置或不是绝对路径时回退
-    `$HOME/.haven/run`（`0700`）。
+  - Unix：`<runtime-dir>` = 系统提供的用户运行时目录（仅当它是绝对路径）；未设置或不是绝对路径时回退
+    到 Haven 的每用户运行目录（`0700`）。
     该目录本身就是每用户隔离的，因此套接字名固定即可。
 - Haven UI（设置 → 智能功能）在用户开启外部接入后展示：
   1. 端点的**完整字符串**与「复制」按钮；
@@ -188,11 +199,11 @@ OS ACL（§4.4）与"这条通道只暴露两件事"（§8.1），**不**来自�
 
 | 平台 | 形态 | 校验 |
 | --- | --- | --- |
-| Windows | `\\.\pipe\haven-agent-v1-<8 位小写十六进制>` | 前缀精确匹配 `\\.\pipe\haven-agent-v1-`，其后恰好 8 位 `[0-9a-f]`；总长 ≤ 256 |
-| Unix | `$XDG_RUNTIME_DIR/haven/agent-v1.sock`（仅当 `XDG_RUNTIME_DIR` 是绝对路径），或 `$HOME/.haven/run/agent-v1.sock`（回退路径） | 绝对路径；必须精确等于当前用户环境推导出的其中一条固定路径；字节长 ≤ 100（同时低于 Linux 107 与 macOS 103 的 `sun_path` 限制） |
+| Windows | Named Pipe，名称为 `haven-agent-v1-<8 位小写十六进制>` | 名称前缀精确匹配 `haven-agent-v1-`，其后恰好 8 位 `[0-9a-f]`；总长 ≤ 256 |
+| Unix | 当前用户运行时目录下的 `haven/agent-v1.sock`，或 Haven 的每用户回退路径 | 绝对路径；必须精确等于当前用户环境推导出的其中一条固定路径；字节长 ≤ 100（同时低于 Linux 107 与 macOS 103 的 `sun_path` 限制） |
 
-明确拒绝：任何 scheme（`tcp://` / `http://` / `https://` / `ws://` / `file://`）、
-相对路径、含 `..` 的路径、UNC 共享路径（`\\server\share\...`）、超出长度上限的值、
+明确拒绝：任何网络、HTTP、WebSocket 或 file URL scheme、
+相对路径、含父级路径段的路径、网络共享路径、超出长度上限的值、
 以及不匹配上述平台的任何字符串。
 
 **不允许的行为**：扫描文件系统找端点、枚举管道/套接字、探测端口、读取任意路径。

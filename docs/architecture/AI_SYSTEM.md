@@ -1,3 +1,14 @@
+---
+doc_id: architecture.ai-system
+type: canonical
+status: active
+owner: architecture
+visibility: public
+source_of_truth: accepted-design-and-runtime-contracts
+last_reviewed: 2026-09-22
+review_after: 2026-12-22
+---
+
 # Haven AI 系统架构（AI Provider / MCP / Skill 边界）
 
 本文件是 AI 能力在栖阅（Haven）中的**安全边界与分层契约**。它描述的是"什么是允许的"，
@@ -5,7 +16,7 @@
 
 相关文档：
 
-- 阶段计划：[`docs/plans/2026-09-18-ai-provider-mcp-skill-plan.md`](../plans/2026-09-18-ai-provider-mcp-skill-plan.md)
+- 实施阶段由仓库内部计划跟踪；本文件只以运行时契约、生成绑定和测试为准。
 - 外部 Agent 传输设计（A5，**设计已冻结；核心已落地，真实客户端与端到端未验收**）：[`MCP_EXTERNAL_AGENT_TRANSPORT.md`](./MCP_EXTERNAL_AGENT_TRANSPORT.md)
 - Claude Code 子代理工作流（第三方 Provider 已配置时的调用、复审与验收规范）：[`CLAUDE_CODE_AGENT_WORKFLOW.md`](./CLAUDE_CODE_AGENT_WORKFLOW.md)
 - 既有 Proposal 内核：`haven-domain/src/setting_proposal.rs`、`haven-application/src/services/setting_proposals.rs`
