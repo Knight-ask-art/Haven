@@ -1,3 +1,14 @@
+---
+doc_id: architecture.claude-code-agent-workflow
+type: guide
+status: active
+owner: architecture
+visibility: public
+source_of_truth: project-agent-governance
+last_reviewed: 2026-09-22
+review_after: 2026-12-22
+---
+
 # Claude Code 子代理工作流
 
 这份文档说明本项目如何把 Claude Code 当作实现、测试和复审子代理使用。
