@@ -1,8 +1,10 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Permanent+Marker&family=Rock+Salt&display=swap');
 
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+/* Tailwind 4 默认不再读取 tailwind.config.ts；Haven 的颜色、间距、圆角等
+   设计 token 仍定义在 legacy config 中，必须显式 @config 载入。 */
+@config "../tailwind.config.ts";
 
 /* PDF 文本选择层：透明文本覆盖画布，仅提供选区与复制能力。
    容器保持 opacity:1（pdfjs 惯例）——span 文本本身透明，压暗容器会连带削弱选区高亮。 */
