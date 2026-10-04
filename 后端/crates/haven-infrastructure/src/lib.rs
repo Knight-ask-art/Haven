@@ -1,5 +1,6 @@
 //! haven-infrastructure: 基础设施（SQLite、迁移、凭据存储、本地扫描；后续：HTTP、Storage Provider）。
 
+pub mod ai_provider;
 pub mod app_info;
 pub mod artwork_cache;
 pub mod cast;

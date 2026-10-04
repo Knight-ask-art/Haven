@@ -664,6 +664,89 @@ pub struct PreferenceData {
     pub comic: Option<ComicPatch>,
 }
 
+impl PreferenceData {
+    /// 将一个资源级部分 patch 合并到 authoritative 覆盖数据。
+    ///
+    /// 这个方法专门服务于 Agent 提案的“只保存 patch、应用时重读并合并”语义。
+    /// 现有 `ResourcePreference` 仍表示完整覆盖数据，不能拿它替代本方法：
+    /// `None` 在完整覆盖里表示清除该分区，而在 patch 里表示“不触碰该分区”。
+    pub fn apply_patch(&self, patch: &Self) -> Self {
+        let mut next = self.clone();
+        if let Some(reading) = &patch.reading {
+            let mut merged = next.reading.clone().unwrap_or_default();
+            merge_reading_patch(&mut merged, reading);
+            next.reading = Some(merged);
+        }
+        if let Some(comic) = &patch.comic {
+            let mut merged = next.comic.clone().unwrap_or_default();
+            merge_comic_patch(&mut merged, comic);
+            next.comic = Some(merged);
+        }
+        next
+    }
+}
+
+fn merge_reading_patch(current: &mut ReadingPatch, patch: &ReadingPatch) {
+    if let Some(value) = patch.font_family {
+        current.font_family = Some(value);
+    }
+    merge_resource_text(&mut current.custom_font_family, &patch.custom_font_family);
+    if let Some(value) = patch.font_size {
+        current.font_size = Some(value);
+    }
+    if let Some(value) = patch.line_height {
+        current.line_height = Some(value);
+    }
+    if let Some(value) = patch.content_width {
+        current.content_width = Some(value);
+    }
+    if let Some(value) = patch.theme {
+        current.theme = Some(value);
+    }
+    merge_resource_text(&mut current.custom_background, &patch.custom_background);
+    merge_resource_text(&mut current.custom_text, &patch.custom_text);
+    if let Some(value) = patch.font_weight {
+        current.font_weight = Some(value);
+    }
+    if let Some(value) = patch.letter_spacing {
+        current.letter_spacing = Some(value);
+    }
+    if let Some(value) = patch.system_auto {
+        current.system_auto = Some(value);
+    }
+    if let Some(value) = patch.pagination {
+        current.pagination = Some(value);
+    }
+}
+
+/// 资源级 Agent patch 的自由文本规范化。
+///
+/// 全局设置的 patch 用空字符串表示清除；资源级 Agent patch 的 `None` 已经被
+/// 固定为“不触碰”，因此没有第二个“清除”状态可用。这里沿用全局的 trim 规则，
+/// 但把空白值视为“不触碰”，从而避免产生其它写入路径不会产生的 `Some("")`。
+fn merge_resource_text(current: &mut Option<String>, patch: &Option<String>) {
+    let Some(value) = patch else { return };
+    let value = value.trim();
+    if !value.is_empty() {
+        *current = Some(value.to_owned());
+    }
+}
+
+fn merge_comic_patch(current: &mut ComicPatch, patch: &ComicPatch) {
+    if let Some(value) = patch.view_mode {
+        current.view_mode = Some(value);
+    }
+    if let Some(value) = patch.direction {
+        current.direction = Some(value);
+    }
+    if let Some(value) = patch.page_gap {
+        current.page_gap = Some(value);
+    }
+    if let Some(value) = patch.preload_pages {
+        current.preload_pages = Some(value);
+    }
+}
+
 /// 分区部分更新（闭合联合；JSON 形状 `{"section":"general","launchPage":"library"}`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "section", rename_all = "snake_case")]
@@ -777,6 +860,106 @@ impl SettingsPatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preference_data_patch_merges_only_present_fields() {
+        let authoritative = PreferenceData {
+            reading: Some(ReadingPatch {
+                font_size: Some(ReadingFontSize::Large),
+                custom_font_family: Some("D:/private/font.ttf".to_owned()),
+                custom_background: Some("#101418".to_owned()),
+                ..ReadingPatch::default()
+            }),
+            comic: Some(ComicPatch {
+                direction: Some(ComicDirection::Rtl),
+                page_gap: Some(ComicPageGap::TwentyFour),
+                ..ComicPatch::default()
+            }),
+        };
+        let patch = PreferenceData {
+            reading: Some(ReadingPatch {
+                font_size: Some(ReadingFontSize::Small),
+                ..ReadingPatch::default()
+            }),
+            comic: None,
+        };
+
+        let merged = authoritative.apply_patch(&patch);
+        let reading = merged.reading.expect("reading patch keeps the section");
+        assert_eq!(reading.font_size, Some(ReadingFontSize::Small));
+        assert_eq!(
+            reading.custom_font_family.as_deref(),
+            Some("D:/private/font.ttf")
+        );
+        assert_eq!(reading.custom_background.as_deref(), Some("#101418"));
+        assert_eq!(merged.comic, authoritative.comic);
+
+        // 空 patch 不会把已有 section 清掉；`None` 表示“不触碰”而不是“清除”。
+        assert_eq!(
+            authoritative.apply_patch(&PreferenceData::default()),
+            authoritative
+        );
+    }
+
+    #[test]
+    fn preference_data_patch_can_create_missing_section_and_preserve_other_section() {
+        let authoritative = PreferenceData {
+            reading: None,
+            comic: Some(ComicPatch {
+                view_mode: Some(ComicViewMode::Double),
+                ..ComicPatch::default()
+            }),
+        };
+        let patch = PreferenceData {
+            reading: Some(ReadingPatch {
+                font_size: Some(ReadingFontSize::Medium),
+                ..ReadingPatch::default()
+            }),
+            comic: Some(ComicPatch {
+                direction: Some(ComicDirection::Ltr),
+                ..ComicPatch::default()
+            }),
+        };
+
+        let merged = authoritative.apply_patch(&patch);
+        assert_eq!(
+            merged.reading.and_then(|reading| reading.font_size),
+            Some(ReadingFontSize::Medium)
+        );
+        let comic = merged.comic.expect("comic patch keeps the section");
+        assert_eq!(comic.view_mode, Some(ComicViewMode::Double));
+        assert_eq!(comic.direction, Some(ComicDirection::Ltr));
+    }
+
+    #[test]
+    fn preference_data_patch_normalizes_resource_text_and_never_writes_empty_strings() {
+        let authoritative = PreferenceData {
+            reading: Some(ReadingPatch {
+                custom_font_family: Some("Source Han Serif".to_owned()),
+                custom_background: Some("#101418".to_owned()),
+                ..ReadingPatch::default()
+            }),
+            comic: None,
+        };
+        let patch = PreferenceData {
+            reading: Some(ReadingPatch {
+                custom_font_family: Some("   ".to_owned()),
+                custom_background: Some("  #f7f1e3  ".to_owned()),
+                custom_text: Some(String::new()),
+                ..ReadingPatch::default()
+            }),
+            comic: None,
+        };
+
+        let merged = authoritative.apply_patch(&patch);
+        let reading = merged.reading.expect("reading section remains present");
+        assert_eq!(
+            reading.custom_font_family.as_deref(),
+            Some("Source Han Serif")
+        );
+        assert_eq!(reading.custom_background.as_deref(), Some("#f7f1e3"));
+        assert_eq!(reading.custom_text, None);
+    }
 
     #[test]
     fn defaults_are_stable() {

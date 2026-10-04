@@ -110,9 +110,16 @@ import type {
   VideoScreenshotResultDto,
   PeriodicalTreeGetRequest,
   PeriodicalTreeDto,
+  AgentBrokerStatusResultDto,
   AgentCapabilityManifestDto,
   AgentSettingChangeReceiptDto,
   AgentSettingChangeReceiptGetRequest,
+  AgentResourcePreferenceProposalApproveRequest,
+  AgentResourcePreferenceProposalApproveResultDto,
+  AgentResourcePreferenceProposalCreateRequest,
+  AgentResourcePreferenceProposalDto,
+  AgentResourcePreferenceProposalGetRequest,
+  AgentResourcePreferenceProposalGetResultDto,
   AgentSettingsContextDto,
   AgentSettingsProposalApproveRequest,
   AgentSettingsProposalApproveResultDto,
@@ -122,6 +129,18 @@ import type {
   AgentSettingsProposalGetResultDto,
   AgentSettingsProposalRejectRequest,
   AgentSettingsProposalRejectResultDto,
+  AgentTraceGetRequest,
+  AgentTraceGetResultDto,
+  AiProviderModelsCatalogDto,
+  AiProviderModelsListRequest,
+  AiSettingsRecommendationDto,
+  AiSettingsRecommendationGenerateRequest,
+  AiProviderProfileDeleteRequest,
+  AiProviderProfileDeleteResultDto,
+  AiProviderProfileDto,
+  AiProviderProfileGetRequest,
+  AiProviderProfileListResultDto,
+  AiProviderProfileUpsertRequest,
 } from "./generated/wire";
 import type { UpdaterCheckResult, UpdaterInstallResult } from "./client";
 import { HavenError, toHavenError } from "./errors.js";
@@ -1072,6 +1091,151 @@ export class TauriHavenClient implements HavenClient {
       return await invoke<AgentSettingChangeReceiptDto | null>("agent_setting_change_receipt_get", {
         request,
       });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async agentResourcePreferenceProposalCreate(
+    request: AgentResourcePreferenceProposalCreateRequest,
+  ): Promise<AgentResourcePreferenceProposalDto> {
+    try {
+      return await invoke<AgentResourcePreferenceProposalDto>(
+        "agent_resource_preference_proposal_create",
+        { request },
+      );
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async agentResourcePreferenceProposalGet(
+    request: AgentResourcePreferenceProposalGetRequest,
+  ): Promise<AgentResourcePreferenceProposalGetResultDto> {
+    try {
+      return await invoke<AgentResourcePreferenceProposalGetResultDto>(
+        "agent_resource_preference_proposal_get",
+        { request },
+      );
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async agentResourcePreferenceProposalApprove(
+    request: AgentResourcePreferenceProposalApproveRequest,
+  ): Promise<AgentResourcePreferenceProposalApproveResultDto> {
+    try {
+      return await invoke<AgentResourcePreferenceProposalApproveResultDto>(
+        "agent_resource_preference_proposal_approve",
+        { request },
+      );
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async agentTraceGet(request: AgentTraceGetRequest): Promise<AgentTraceGetResultDto> {
+    try {
+      return await invoke<AgentTraceGetResultDto>("agent_trace_get", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  // ---- A2 AI Provider 基础切片 ----
+  // 全部走 Application service：命令层不含 SQL / HTTP；模型发现由 Rust 侧
+  // Infrastructure 适配器发起，WebView 不直接访问 Provider。
+
+  async aiProviderProfileList(): Promise<AiProviderProfileListResultDto> {
+    try {
+      return await invoke<AiProviderProfileListResultDto>("ai_provider_profile_list");
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async aiProviderProfileGet(
+    request: AiProviderProfileGetRequest,
+  ): Promise<AiProviderProfileDto> {
+    try {
+      return await invoke<AiProviderProfileDto>("ai_provider_profile_get", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async aiProviderProfileUpsert(
+    request: AiProviderProfileUpsertRequest,
+  ): Promise<AiProviderProfileDto> {
+    try {
+      return await invoke<AiProviderProfileDto>("ai_provider_profile_upsert", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async aiProviderProfileDelete(
+    request: AiProviderProfileDeleteRequest,
+  ): Promise<AiProviderProfileDeleteResultDto> {
+    try {
+      return await invoke<AiProviderProfileDeleteResultDto>("ai_provider_profile_delete", {
+        request,
+      });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async aiProviderModelsList(
+    request: AiProviderModelsListRequest,
+  ): Promise<AiProviderModelsCatalogDto> {
+    try {
+      return await invoke<AiProviderModelsCatalogDto>("ai_provider_models_list", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async aiSettingsRecommendationGenerate(
+    request: AiSettingsRecommendationGenerateRequest,
+  ): Promise<AiSettingsRecommendationDto> {
+    try {
+      return await invoke<AiSettingsRecommendationDto>("ai_settings_recommendation_generate", {
+        request,
+      });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  // ---- A5 外部 Agent Broker（默认关闭） ----
+  //
+  // 三个命令都无参数：端点由 Rust 按平台解析（Windows Named Pipe / Unix socket），
+  // WebView 既不能指定端点，也不能选择 Broker 背后的 API 实现。这里的 `endpoint`
+  // 原样透传——它是可复制的本地配置值，不是 secret（契约 §4.2）。
+  // busy / unavailable 是 Rust 的 fail-closed 结论，由 `reason` 携带稳定的脱敏文案；
+  // 传输层不解释、不改写这两个状态，也不把它们兜底成 `disabled`。
+
+  async agentBrokerStatus(): Promise<AgentBrokerStatusResultDto> {
+    try {
+      return await invoke<AgentBrokerStatusResultDto>("agent_broker_status");
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async agentBrokerEnable(): Promise<AgentBrokerStatusResultDto> {
+    try {
+      return await invoke<AgentBrokerStatusResultDto>("agent_broker_enable");
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async agentBrokerDisable(): Promise<AgentBrokerStatusResultDto> {
+    try {
+      return await invoke<AgentBrokerStatusResultDto>("agent_broker_disable");
     } catch (error) {
       throw toHavenError(error);
     }

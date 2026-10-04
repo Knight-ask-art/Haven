@@ -6,6 +6,7 @@
 //! - Locator 序列化走 `Locator` 自身的 version + kind + data envelope（未知版本拒绝）。
 
 pub mod agent_bindings;
+pub mod ai_provider_profiles;
 pub mod comic_catalog_refresh_outcomes;
 pub mod comic_identity;
 pub mod comic_progress_migrations;
@@ -37,6 +38,7 @@ use haven_domain::entities::ArtworkSet;
 use haven_domain::locator::Locator;
 
 pub use agent_bindings::SqliteAgentActionBindingRepository;
+pub use ai_provider_profiles::SqliteAiProviderProfileRepository;
 pub use comic_catalog_refresh_outcomes::SqliteComicCatalogRefreshOutcomeRepository;
 pub use comic_identity::{SqliteChapterSourceRepository, SqliteComicPageIdentityRepository};
 pub use comic_progress_migrations::SqliteComicProgressMigrationRepository;
@@ -91,6 +93,7 @@ pub struct SqliteRepositories {
     pub periodical: SqlitePeriodicalRepository,
     pub setting_proposals: SqliteSettingProposalRepository,
     pub agent_bindings: SqliteAgentActionBindingRepository,
+    pub ai_provider_profiles: SqliteAiProviderProfileRepository,
 }
 
 impl SqliteRepositories {
@@ -122,7 +125,8 @@ impl SqliteRepositories {
             catalog_refresh_outcomes: SqliteComicCatalogRefreshOutcomeRepository::new(db.clone()),
             periodical: SqlitePeriodicalRepository::new(db.clone()),
             setting_proposals: SqliteSettingProposalRepository::new(db.clone()),
-            agent_bindings: SqliteAgentActionBindingRepository::new(db),
+            agent_bindings: SqliteAgentActionBindingRepository::new(db.clone()),
+            ai_provider_profiles: SqliteAiProviderProfileRepository::new(db),
         }
     }
 }
@@ -1240,5 +1244,42 @@ impl haven_domain::contracts::AgentActionBindingRepository for SqliteRepositorie
         proposal_id: haven_domain::ids::SettingProposalId,
     ) -> Result<Option<haven_domain::agent::AgentActionBinding>, haven_common::AppError> {
         self.agent_bindings.get(proposal_id).await
+    }
+}
+
+#[async_trait::async_trait]
+impl haven_domain::contracts::AiProviderProfileRepository for SqliteRepositories {
+    async fn list(
+        &self,
+    ) -> Result<Vec<haven_domain::ai_provider::AiProviderProfile>, haven_common::AppError> {
+        self.ai_provider_profiles.list().await
+    }
+
+    async fn get(
+        &self,
+        profile_id: &str,
+    ) -> Result<Option<haven_domain::ai_provider::AiProviderProfile>, haven_common::AppError> {
+        self.ai_provider_profiles.get(profile_id).await
+    }
+
+    async fn cas_upsert(
+        &self,
+        profile: &haven_domain::ai_provider::AiProviderProfile,
+        expected_revision: Option<&str>,
+    ) -> Result<Option<haven_domain::ai_provider::AiProviderProfile>, haven_common::AppError> {
+        self.ai_provider_profiles
+            .cas_upsert(profile, expected_revision)
+            .await
+    }
+
+    async fn cas_delete(
+        &self,
+        profile_id: &str,
+        expected_revision: Option<&str>,
+    ) -> Result<haven_domain::ai_provider::AiProviderProfileDeleteOutcome, haven_common::AppError>
+    {
+        self.ai_provider_profiles
+            .cas_delete(profile_id, expected_revision)
+            .await
     }
 }

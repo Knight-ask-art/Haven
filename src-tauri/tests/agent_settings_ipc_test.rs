@@ -22,8 +22,10 @@ use tauri::utils::acl::manifest::Manifest;
 use tauri::utils::acl::resolved::Resolved;
 use tauri::utils::platform::Target;
 use tauri::webview::InvokeRequest;
-use tauri::{Context, Url};
+use tauri::{Context, Manager, Url};
 
+use haven_application::services::AgentEventKind;
+use haven_domain::ids::AgentSessionId;
 use haven_infrastructure::Db;
 use haven_tauri_lib::state::AppState;
 
@@ -181,9 +183,22 @@ fn capability_manifest_command_reports_closed_capabilities() {
     assert_eq!(json["agentApiVersion"], 1);
     assert_eq!(json["capabilities"]["settingsRead"], true);
     assert_eq!(json["capabilities"]["settingsProposal"], true);
-    // 未实现能力一律 false：清单不是授权开关。
+    // 当前切片已经实现的读取/提案能力必须公开为 true；清单不是授权开关。
     for capability in [
         "librarySummaryRead",
+        "settingSourcesRead",
+        "resourcePreferenceRead",
+        "resourcePreferenceProposal",
+        "mediaCapabilitiesRead",
+        "onboardingRead",
+    ] {
+        assert_eq!(
+            json["capabilities"][capability], true,
+            "{capability} 必须与当前已实现切片一致"
+        );
+    }
+    // 高风险或尚未实现能力一律 false。
+    for capability in [
         "metadataProposal",
         "renameProposal",
         "secretRead",
@@ -287,6 +302,50 @@ fn proposal_creation_and_approval_write_settings_exactly_once() {
     let raw = serde_json::to_string(&result).unwrap();
     for forbidden in ["token", "Token", "approvalToken"] {
         assert!(!raw.contains(forbidden), "批准响应不得包含 {forbidden}");
+    }
+
+    // Trace 只是旁路事实，但生产 AppState 必须把创建/批准阶段接到同一个 collector，
+    // 且 CAS / Apply / Receipt 的顺序不能被 UI 看到成错序。
+    let session_id = "0196f0d2-0000-7000-8000-0000000000f1"
+        .parse::<AgentSessionId>()
+        .unwrap();
+    let trace = app.state::<AppState>().agent_trace.snapshot(session_id);
+    let kinds: Vec<_> = trace.iter().map(|event| event.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            AgentEventKind::RequestStarted,
+            AgentEventKind::ContextLoaded,
+            AgentEventKind::ProposalCreated,
+            AgentEventKind::WaitingForApproval,
+            AgentEventKind::CasStarted,
+            AgentEventKind::Applied,
+            AgentEventKind::ReceiptCreated,
+        ]
+    );
+    assert!(trace
+        .windows(2)
+        .all(|events| events[0].sequence < events[1].sequence));
+
+    let trace_response = get_ipc_response(
+        &webview,
+        invoke_request(
+            "agent_trace_get",
+            serde_json::json!({
+                "request": { "sessionId": session_id.to_string() }
+            }),
+        ),
+    )
+    .expect("agent_trace_get 必须返回同一份有界轨迹");
+    let trace_json: serde_json::Value = trace_response.deserialize().unwrap();
+    assert_eq!(trace_json["schemaVersion"], 1);
+    assert_eq!(trace_json["events"].as_array().unwrap().len(), 7);
+    let trace_raw = serde_json::to_string(&trace_json).unwrap();
+    for forbidden in ["apiKey", "rawResponse", "absolutePath", "sql", "secret"] {
+        assert!(
+            !trace_raw.contains(forbidden),
+            "轨迹响应不得包含 {forbidden}"
+        );
     }
 
     // 回执读取命令与批准结果同源。

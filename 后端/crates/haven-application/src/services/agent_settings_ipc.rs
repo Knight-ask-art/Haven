@@ -16,8 +16,12 @@
 //!    设置 CAS、回执与 Proposal/Binding 状态迁移和它同生共死。令牌原文既不出现在
 //!    返回值里，也不进入 wire / 日志 / provenance。
 
+use std::sync::Arc;
+
 use haven_common::AppError;
-use haven_domain::agent::{AgentSettingsContextSnapshot, AgentSettingsSubject};
+use haven_domain::agent::{
+    AgentSettingsContextSnapshot, AgentSettingsSubject, redact_setting_value_for_agent,
+};
 use haven_domain::ids::{AgentRequestId, AgentSessionId, SettingProposalId};
 use haven_domain::setting_proposal::{
     SettingChangeReceipt, SettingProposal, SettingProposalChange, SettingTarget,
@@ -26,6 +30,7 @@ use haven_domain::setting_proposal::{
 use haven_domain::settings::{ReadingSettings, SettingsPatch, SettingsSection, SettingsValue};
 
 use crate::services::agent::{AgentProposalService, AgentSettingsScopeActionRequest};
+use crate::services::agent_trace::{AgentEventKind, AgentTracePort, record_best_effort};
 use crate::services::setting_proposals::SettingProposalService;
 use crate::services::settings::SettingsService;
 use crate::wire::{
@@ -104,6 +109,7 @@ pub struct AgentSettingsIpcService {
     proposals: SettingProposalService,
     agent: AgentProposalService,
     settings: SettingsService,
+    trace: Option<Arc<dyn AgentTracePort>>,
 }
 
 impl AgentSettingsIpcService {
@@ -116,7 +122,14 @@ impl AgentSettingsIpcService {
             proposals,
             agent,
             settings,
+            trace: None,
         }
+    }
+
+    /// 注入共享轨迹 collector。轨迹写入始终 best-effort，不参与业务成功/失败判定。
+    pub fn with_trace(mut self, trace: Arc<dyn AgentTracePort>) -> Self {
+        self.trace = Some(trace);
+        self
     }
 
     // ---------- Read ----------
@@ -148,6 +161,15 @@ impl AgentSettingsIpcService {
         request_id: AgentRequestId,
         request: &AgentSettingsProposalCreateRequest,
     ) -> Result<AgentSettingsProposalDto, AppError> {
+        record_best_effort(
+            self.trace.as_ref(),
+            session_id,
+            request_id,
+            &request.context_id,
+            &request.context_hash,
+            AgentEventKind::RequestStarted,
+        )
+        .await;
         let requested_context_id = parse_context_id(&request.context_id)?;
         if !is_canonical_digest(&request.context_hash) {
             return Err(invalid_context_hash());
@@ -164,6 +186,15 @@ impl AgentSettingsIpcService {
         if context.context_id() != requested_context_id {
             return Err(context_id_mismatch());
         }
+        record_best_effort(
+            self.trace.as_ref(),
+            session_id,
+            request_id,
+            &request.context_id,
+            &request.context_hash,
+            AgentEventKind::ContextLoaded,
+        )
+        .await;
 
         let patch = domain_reading_patch(&request.patch);
         let change = SettingProposalChange::SettingsPatch(SettingsPatch::Reading(patch.clone()));
@@ -188,7 +219,26 @@ impl AgentSettingsIpcService {
             .get(action.setting_proposal_id())
             .await?
             .ok_or_else(setting_proposal_not_found)?;
-        self.project_proposal(&proposal, &reading)
+        let projected = self.project_proposal(&proposal, &reading)?;
+        record_best_effort(
+            self.trace.as_ref(),
+            session_id,
+            request_id,
+            &request.context_id,
+            &request.context_hash,
+            AgentEventKind::ProposalCreated,
+        )
+        .await;
+        record_best_effort(
+            self.trace.as_ref(),
+            session_id,
+            request_id,
+            &request.context_id,
+            &request.context_hash,
+            AgentEventKind::WaitingForApproval,
+        )
+        .await;
+        Ok(projected)
     }
 
     /// 回读提案（UI 刷新/重开）。回执未产生时为 `None`。
@@ -202,16 +252,23 @@ impl AgentSettingsIpcService {
             .get(proposal_id)
             .await?
             .ok_or_else(setting_proposal_not_found)?;
+        ensure_global_reading_proposal(&proposal)?;
+        let receipt = self.proposals.get_receipt(proposal_id).await?;
         let (_, reading) = self.read_authoritative().await?;
-        let receipt = self
-            .proposals
-            .get_receipt(proposal_id)
-            .await?
-            .map(|receipt| self.project_receipt(&receipt, &proposal, &reading))
+        // 已应用提案的当前值就是 after；用它重新投影会把 Diff 压成空列表。
+        // Receipt 的 before 是同一 UoW 写入的审计事实，因此优先用它重建提案 Diff。
+        let proposal_before = receipt
+            .as_ref()
+            .map(|receipt| receipt_reading(&receipt.before_canonical_json, "回执改前值无法解析"))
+            .transpose()?
+            .unwrap_or_else(|| reading.clone());
+        let projected_receipt = receipt
+            .as_ref()
+            .map(|receipt| self.project_receipt(receipt, &proposal, &reading))
             .transpose()?;
         Ok(AgentSettingsProposalGetResultDto {
-            proposal: self.project_proposal(&proposal, &reading)?,
-            receipt,
+            proposal: self.project_proposal(&proposal, &proposal_before)?,
+            receipt: projected_receipt,
         })
     }
 
@@ -221,6 +278,13 @@ impl AgentSettingsIpcService {
         request: &AgentSettingsProposalRejectRequest,
     ) -> Result<AgentSettingsProposalRejectResultDto, AppError> {
         let proposal_id = parse_proposal_id(&request.proposal_id)?;
+        let stored_proposal = self
+            .proposals
+            .get(proposal_id)
+            .await?
+            .ok_or_else(setting_proposal_not_found)?;
+        ensure_global_reading_proposal(&stored_proposal)?;
+        let binding = self.agent.load_binding(proposal_id).await.ok().flatten();
         self.proposals
             .reject(proposal_id, &request.expected_digest)
             .await?;
@@ -230,6 +294,18 @@ impl AgentSettingsIpcService {
             .await?
             .ok_or_else(setting_proposal_not_found)?;
         let (_, reading) = self.read_authoritative().await?;
+        if let Some(binding) = binding {
+            let context_id = binding.context_snapshot_id().to_string();
+            record_best_effort(
+                self.trace.as_ref(),
+                binding.session_id(),
+                binding.request_id(),
+                &context_id,
+                binding.context_hash(),
+                AgentEventKind::ApprovalRejected,
+            )
+            .await;
+        }
         Ok(AgentSettingsProposalRejectResultDto {
             proposal: self.project_proposal(&proposal, &reading)?,
         })
@@ -247,6 +323,19 @@ impl AgentSettingsIpcService {
         request: &AgentSettingsProposalApproveRequest,
     ) -> Result<AgentSettingsProposalApproveResultDto, AppError> {
         let proposal_id = parse_proposal_id(&request.proposal_id)?;
+        let binding = self.agent.load_binding(proposal_id).await.ok().flatten();
+        if let Some(binding) = binding.as_ref() {
+            let context_id = binding.context_snapshot_id().to_string();
+            record_best_effort(
+                self.trace.as_ref(),
+                binding.session_id(),
+                binding.request_id(),
+                &context_id,
+                binding.context_hash(),
+                AgentEventKind::CasStarted,
+            )
+            .await;
+        }
         // 令牌只在这个 UoW 的闭包里存在一次：签发、摘要落库、CAS、条件消费、
         // 回执与状态迁移全部同生共死；明文不出 Application service 边界。
         let receipt = self
@@ -263,10 +352,31 @@ impl AgentSettingsIpcService {
             .get(proposal_id)
             .await?
             .ok_or_else(setting_proposal_not_found)?;
-        let (_, reading) = self.read_authoritative().await?;
+        let before = receipt_reading(&receipt.before_canonical_json, "回执改前值无法解析")?;
+        if let Some(binding) = binding {
+            let context_id = binding.context_snapshot_id().to_string();
+            record_best_effort(
+                self.trace.as_ref(),
+                binding.session_id(),
+                binding.request_id(),
+                &context_id,
+                binding.context_hash(),
+                AgentEventKind::Applied,
+            )
+            .await;
+            record_best_effort(
+                self.trace.as_ref(),
+                binding.session_id(),
+                binding.request_id(),
+                &context_id,
+                binding.context_hash(),
+                AgentEventKind::ReceiptCreated,
+            )
+            .await;
+        }
         Ok(AgentSettingsProposalApproveResultDto {
-            proposal: self.project_proposal(&proposal, &reading)?,
-            receipt: self.project_receipt(&receipt, &proposal, &reading)?,
+            proposal: self.project_proposal(&proposal, &before)?,
+            receipt: self.project_receipt(&receipt, &proposal, &before)?,
         })
     }
 
@@ -280,6 +390,7 @@ impl AgentSettingsIpcService {
             .get(proposal_id)
             .await?
             .ok_or_else(setting_proposal_not_found)?;
+        ensure_global_reading_proposal(&proposal)?;
         let (_, reading) = self.read_authoritative().await?;
         let Some(receipt) = self.proposals.get_receipt(proposal_id).await? else {
             return Ok(None);
@@ -398,6 +509,13 @@ fn proposal_reading_patch(
     Ok((patch.clone(), changes))
 }
 
+fn ensure_global_reading_proposal(proposal: &SettingProposal) -> Result<(), AppError> {
+    match proposal.change() {
+        SettingProposalChange::SettingsPatch(SettingsPatch::Reading(_)) => Ok(()),
+        _ => Err(agent_scope_mismatch("提案不是全局阅读设置 patch")),
+    }
+}
+
 /// 逐字段比较"当前值 vs patch 应用后的值"，产出可展示的改动列表。
 ///
 /// 这里复用领域 `SettingsPatch::apply_to` 的合并语义（trim、空串清除），因此展示的
@@ -431,8 +549,8 @@ fn describe_changes(
     );
     push(
         "reading.customFontFamily",
-        current.custom_font_family.clone().unwrap_or_default(),
-        merged.custom_font_family.clone().unwrap_or_default(),
+        agent_text(current.custom_font_family.as_deref()),
+        agent_text(merged.custom_font_family.as_deref()),
     );
     push(
         "reading.fontSize",
@@ -456,13 +574,13 @@ fn describe_changes(
     );
     push(
         "reading.customBackground",
-        current.custom_background.clone().unwrap_or_default(),
-        merged.custom_background.clone().unwrap_or_default(),
+        agent_text(current.custom_background.as_deref()),
+        agent_text(merged.custom_background.as_deref()),
     );
     push(
         "reading.customText",
-        current.custom_text.clone().unwrap_or_default(),
-        merged.custom_text.clone().unwrap_or_default(),
+        agent_text(current.custom_text.as_deref()),
+        agent_text(merged.custom_text.as_deref()),
     );
     push(
         "reading.fontWeight",
@@ -520,8 +638,8 @@ fn describe_change_list(
     );
     push(
         "reading.customFontFamily",
-        before.custom_font_family.clone().unwrap_or_default(),
-        after.custom_font_family.clone().unwrap_or_default(),
+        agent_text(before.custom_font_family.as_deref()),
+        agent_text(after.custom_font_family.as_deref()),
     );
     push(
         "reading.fontSize",
@@ -541,13 +659,13 @@ fn describe_change_list(
     push("reading.theme", token(&before.theme)?, token(&after.theme)?);
     push(
         "reading.customBackground",
-        before.custom_background.clone().unwrap_or_default(),
-        after.custom_background.clone().unwrap_or_default(),
+        agent_text(before.custom_background.as_deref()),
+        agent_text(after.custom_background.as_deref()),
     );
     push(
         "reading.customText",
-        before.custom_text.clone().unwrap_or_default(),
-        after.custom_text.clone().unwrap_or_default(),
+        agent_text(before.custom_text.as_deref()),
+        agent_text(after.custom_text.as_deref()),
     );
     push(
         "reading.fontWeight",
@@ -579,6 +697,13 @@ fn token<T: serde::Serialize>(value: &T) -> Result<String, AppError> {
         serde_json::Value::String(text) => Ok(text),
         _ => Err(setting_proposal_integrity("枚举不是字符串表示")),
     }
+}
+
+fn agent_text(value: Option<&str>) -> String {
+    value
+        .map(redact_setting_value_for_agent)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// 领域枚举 → Wire 枚举：两边共用同一个 `snake_case` 字符串表示，
@@ -700,7 +825,7 @@ fn setting_proposal_integrity(detail: &'static str) -> AppError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -736,22 +861,22 @@ mod tests {
         recovery: usize,
     }
 
-    struct FakeStore {
+    pub(crate) struct FakeStore {
         state: Mutex<FakeState>,
     }
 
     impl FakeStore {
-        fn new() -> Arc<Self> {
+        pub(crate) fn new() -> Arc<Self> {
             Arc::new(Self {
                 state: Mutex::new(FakeState::default()),
             })
         }
 
-        fn target_writes(&self) -> usize {
+        pub(crate) fn target_writes(&self) -> usize {
             self.state.lock().unwrap().target_writes
         }
 
-        fn proposal_count(&self) -> usize {
+        pub(crate) fn proposal_count(&self) -> usize {
             self.state.lock().unwrap().proposals.len()
         }
 
@@ -764,13 +889,17 @@ mod tests {
             }
         }
 
-        fn revision(&self) -> Option<String> {
+        pub(crate) fn revision(&self) -> Option<String> {
             self.state
                 .lock()
                 .unwrap()
                 .settings
                 .get("reading")
                 .map(|row| row.revision.clone())
+        }
+
+        pub(crate) fn write_reading_for_test(&self, patch: ReadingPatch) -> String {
+            self.write_reading(patch)
         }
 
         /// 模拟"别处改了设置"：值变化 + 新 revision。
@@ -799,7 +928,7 @@ mod tests {
         }
     }
 
-    fn seed_reading(store: &Arc<FakeStore>, revision: Option<&str>) -> Option<String> {
+    pub(crate) fn seed_reading(store: &Arc<FakeStore>, revision: Option<&str>) -> Option<String> {
         let mut state = store.state.lock().unwrap();
         match revision {
             Some(revision) => {
@@ -1254,7 +1383,7 @@ mod tests {
 
     // ---------- 组装 ----------
 
-    fn service(store: &Arc<FakeStore>) -> AgentSettingsIpcService {
+    pub(crate) fn service(store: &Arc<FakeStore>) -> AgentSettingsIpcService {
         let proposals = SettingProposalService::new(store.clone(), store.clone());
         let settings = SettingsService::new(store.clone());
         let agent =
@@ -1519,6 +1648,20 @@ mod tests {
         assert!(result.receipt.applied_revision.is_some());
         assert_eq!(result.receipt.proposal_digest, proposal.digest);
         assert_eq!(result.receipt.changes, proposal.changes);
+
+        // 批准后重开提案仍必须保留原始 Diff；不能把当前 authoritative after
+        // 当成 before 再次合并，否则 UI 会看到空列表。
+        let reread = service
+            .get_proposal(&crate::wire::AgentSettingsProposalGetRequest {
+                proposal_id: proposal.proposal_id.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(reread.proposal.changes, proposal.changes);
+        assert_eq!(
+            reread.receipt.expect("已批准提案必须回读 receipt").changes,
+            proposal.changes
+        );
         // 真正的设置写入：目标 CAS 恰好一次，且值就是提案里的档位。
         assert_eq!(store.target_writes(), 1);
         assert_eq!(store.stored_reading().font_size, ReadingFontSize::Large);
@@ -1551,6 +1694,64 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
         assert_eq!(keys.len(), 2, "批准响应只有 proposal 与 receipt");
+    }
+
+    #[tokio::test]
+    async fn agent_receipt_redacts_existing_authoritative_free_text_but_keeps_the_setting() {
+        let store = FakeStore::new();
+        seed_reading(&store, Some("rev-0001"));
+        let private_font = "D:/private/font.ttf";
+        store.write_reading_for_test(ReadingPatch {
+            custom_font_family: Some(private_font.to_owned()),
+            ..ReadingPatch::default()
+        });
+
+        // Agent 只提议修改安全的档位字段；它不应复制 authoritative 中既有的字体路径。
+        let (service, proposal) = run_full_flow(&store).await;
+        let proposal_json = serde_json::to_string(&proposal).unwrap();
+        assert!(!proposal_json.contains(private_font));
+        assert!(!proposal_json.contains("font.ttf"));
+        assert_eq!(proposal.changes.len(), 1);
+        assert_eq!(proposal.changes[0].key, "reading.fontSize");
+
+        let result = service
+            .approve_proposal(&crate::wire::AgentSettingsProposalApproveRequest {
+                proposal_id: proposal.proposal_id.clone(),
+                expected_digest: proposal.digest.clone(),
+            })
+            .await
+            .unwrap();
+
+        // authoritative 事实源仍保留用户自己的真实设置，并且 Agent 的安全 patch 已生效。
+        assert_eq!(
+            store.stored_reading().custom_font_family.as_deref(),
+            Some(private_font)
+        );
+        assert_eq!(store.stored_reading().font_size, ReadingFontSize::Large);
+
+        let proposal_id: SettingProposalId = proposal.proposal_id.parse().unwrap();
+        let stored_receipt = store
+            .state
+            .lock()
+            .unwrap()
+            .receipts
+            .get(&proposal_id)
+            .cloned()
+            .expect("批准后必须保存 Receipt");
+        let receipt_json = format!(
+            "{}{}",
+            stored_receipt.before_canonical_json, stored_receipt.after_canonical_json
+        );
+        assert!(!receipt_json.contains(private_font));
+        assert!(!receipt_json.contains("font.ttf"));
+        assert!(receipt_json.contains("[redacted]"));
+
+        // 对外投影同样不能泄漏 authoritative 的自由文本；它只呈现安全的变更事实。
+        let projected_json = serde_json::to_string(&result.receipt).unwrap();
+        assert!(!projected_json.contains(private_font));
+        assert!(!projected_json.contains("font.ttf"));
+        assert_eq!(result.receipt.changes.len(), 1);
+        assert_eq!(result.receipt.changes[0].key, "reading.fontSize");
     }
 
     #[tokio::test]
@@ -1743,7 +1944,12 @@ mod tests {
         let expected = AgentCapabilitySet {
             settings_read: true,
             settings_proposal: true,
-            library_summary_read: false,
+            library_summary_read: true,
+            setting_sources_read: true,
+            resource_preference_read: true,
+            resource_preference_proposal: true,
+            media_capabilities_read: true,
+            onboarding_read: true,
             metadata_proposal: false,
             rename_proposal: false,
             secret_read: false,
@@ -1758,7 +1964,12 @@ mod tests {
             dto.capabilities.capabilities.settings_proposal,
             expected.settings_proposal
         );
-        assert!(!dto.capabilities.capabilities.library_summary_read);
+        assert!(dto.capabilities.capabilities.library_summary_read);
+        assert!(dto.capabilities.capabilities.setting_sources_read);
+        assert!(dto.capabilities.capabilities.resource_preference_read);
+        assert!(dto.capabilities.capabilities.resource_preference_proposal);
+        assert!(dto.capabilities.capabilities.media_capabilities_read);
+        assert!(dto.capabilities.capabilities.onboarding_read);
         assert!(!dto.capabilities.capabilities.metadata_proposal);
         assert!(!dto.capabilities.capabilities.rename_proposal);
         assert!(!dto.capabilities.capabilities.secret_read);
