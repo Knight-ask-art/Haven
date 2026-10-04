@@ -27,6 +27,7 @@ jobs:
       frontend: ${{ steps.scope.outputs.frontend }}
       backend: ${{ steps.scope.outputs.backend }}
       tauri: ${{ steps.scope.outputs.tauri }}
+      mcp: ${{ steps.scope.outputs.mcp }}
       film_tv: ${{ steps.scope.outputs.film_tv }}
       fixtures: ${{ steps.scope.outputs.fixtures }}
       full: ${{ steps.scope.outputs.full }}
@@ -51,6 +52,7 @@ jobs:
               echo 'frontend=true'
               echo 'backend=true'
               echo 'tauri=true'
+              echo 'mcp=true'
               echo 'film_tv=true'
               echo 'fixtures=true'
               echo 'full=true'
@@ -62,6 +64,7 @@ jobs:
           frontend=false
           backend=false
           tauri=false
+          mcp=false
           film_tv=false
           fixtures=false
           full=false
@@ -75,6 +78,8 @@ jobs:
                 backend=true ;;
               src-tauri/*|rust-toolchain.toml)
                 tauri=true ;;
+              mcp/*)
+                mcp=true ;;
             esac
 
             # Film/TV evidence is tied to the public contract, its checker,
@@ -101,6 +106,7 @@ jobs:
             frontend=true
             backend=true
             tauri=true
+            mcp=true
             film_tv=true
             fixtures=true
           fi
@@ -109,6 +115,7 @@ jobs:
             echo "frontend=$frontend"
             echo "backend=$backend"
             echo "tauri=$tauri"
+            echo "mcp=$mcp"
             echo "film_tv=$film_tv"
             echo "fixtures=$fixtures"
             echo "full=$full"
@@ -222,6 +229,40 @@ jobs:
         working-directory: 前端/app
         run: npm run build
 
+  # The MCP server is a separate Node package with its own lockfile, build output
+  # (dist/) and test suite; it is not covered by the frontend job. Build runs
+  # before test because the stdio end-to-end cases need an existing dist/.
+  mcp:
+    name: MCP server checks
+    needs: changes
+    if: needs.changes.outputs.mcp == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: mcp/haven-mcp/package-lock.json
+
+      - name: Install MCP server dependencies
+        working-directory: mcp/haven-mcp
+        run: npm ci --no-audit --no-fund
+
+      - name: MCP server build
+        working-directory: mcp/haven-mcp
+        run: npm run build
+
+      - name: MCP server tests
+        working-directory: mcp/haven-mcp
+        run: npm test
+
   backend:
     name: Backend Rust checks
     needs: changes
@@ -324,6 +365,70 @@ jobs:
         working-directory: src-tauri
         run: cargo test --locked
 
+  tauri-unix:
+    name: Tauri Unix checks
+    needs: changes
+    if: needs.changes.outputs.tauri == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Configure ASCII Cargo target directory
+        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/haven-tauri-unix-target" >> "$GITHUB_ENV"
+
+      - name: Install Linux Tauri build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config \
+            libwayland-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      # The Tauri crate embeds ../前端/app/dist.  A clean Tauri-only checkout does
+      # not contain that ignored build output, so produce it here from the same
+      # root .node-version the other jobs use.  No Linux Rust target is installed:
+      # this job builds the host target only.
+      - name: Setup Node.js for Tauri assets
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: 前端/app/package-lock.json
+
+      - name: Build frontend assets for Tauri
+        working-directory: 前端/app
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+
+      # This job deliberately includes all targets: unlike the Linux CodeQL build,
+      # it compiles and runs #[cfg(test)] Unix endpoint and stale-socket coverage.
+      - name: Tauri Unix format
+        working-directory: src-tauri
+        run: cargo fmt --all -- --check
+
+      - name: Tauri Unix clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tauri Unix tests
+        working-directory: src-tauri
+        run: cargo test --all-targets --locked
+
   film-tv-evidence:
     name: Film/TV blocking evidence
     needs: changes
@@ -397,7 +502,7 @@ jobs:
 
   pr-gate:
     name: PR Gate
-    needs: [changes, base-checks, frontend, backend, tauri, film-tv-evidence]
+    needs: [changes, base-checks, frontend, mcp, backend, tauri, tauri-unix, film-tv-evidence]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -406,10 +511,13 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           BASE_RESULT: ${{ needs['base-checks'].result }}
           FRONTEND_RESULT: ${{ needs.frontend.result }}
+          MCP_RESULT: ${{ needs.mcp.result }}
           BACKEND_RESULT: ${{ needs.backend.result }}
           TAURI_RESULT: ${{ needs.tauri.result }}
+          TAURI_UNIX_RESULT: ${{ needs['tauri-unix'].result }}
           FILM_TV_RESULT: ${{ needs['film-tv-evidence'].result }}
           FRONTEND_REQUIRED: ${{ needs.changes.outputs.frontend }}
+          MCP_REQUIRED: ${{ needs.changes.outputs.mcp }}
           BACKEND_REQUIRED: ${{ needs.changes.outputs.backend }}
           TAURI_REQUIRED: ${{ needs.changes.outputs.tauri }}
           FILM_TV_REQUIRED: ${{ needs.changes.outputs.film_tv }}
@@ -436,6 +544,8 @@ jobs:
           }
 
           require_if_selected "$FRONTEND_REQUIRED" "$FRONTEND_RESULT" frontend
+          require_if_selected "$MCP_REQUIRED" "$MCP_RESULT" mcp
           require_if_selected "$BACKEND_REQUIRED" "$BACKEND_RESULT" backend
           require_if_selected "$TAURI_REQUIRED" "$TAURI_RESULT" tauri
+          require_if_selected "$TAURI_REQUIRED" "$TAURI_UNIX_RESULT" tauri-unix
           require_if_selected "$FILM_TV_REQUIRED" "$FILM_TV_RESULT" film-tv

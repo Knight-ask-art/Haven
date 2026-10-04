@@ -2,6 +2,7 @@
 //! 零框架依赖（不依赖 Tauri / rusqlite / reqwest / Windows API）。
 
 pub mod agent;
+pub mod ai_provider;
 pub mod comic_catalog;
 pub mod comic_identity;
 pub mod comic_progress_subject;

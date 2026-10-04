@@ -143,6 +143,26 @@ define_commands!(
         "allow-agent-setting-change-receipt-get",
         commands::agent::agent_setting_change_receipt_get
     ),
+    (
+        "agent_resource_preference_proposal_create",
+        "allow-agent-resource-preference-proposal-create",
+        commands::agent::agent_resource_preference_proposal_create
+    ),
+    (
+        "agent_resource_preference_proposal_get",
+        "allow-agent-resource-preference-proposal-get",
+        commands::agent::agent_resource_preference_proposal_get
+    ),
+    (
+        "agent_resource_preference_proposal_approve",
+        "allow-agent-resource-preference-proposal-approve",
+        commands::agent::agent_resource_preference_proposal_approve
+    ),
+    (
+        "agent_trace_get",
+        "allow-agent-trace-get",
+        commands::agent::agent_trace_get
+    ),
     ("settings_get", "allow-settings-get", commands::settings::settings_get),
     (
         "settings_update",
@@ -480,5 +500,53 @@ define_commands!(
         "periodical_tree_get",
         "allow-periodical-tree-get",
         commands::periodical::periodical_tree_get
+    ),
+    // A2 AI Provider 基础切片（docs/architecture/AI_SYSTEM.md）。
+    // 只有 profile 生命周期与只读模型目录；没有任何把提示词直通模型的自由入口。
+    (
+        "ai_provider_profile_list",
+        "allow-ai-provider-profile-list",
+        commands::ai_provider::ai_provider_profile_list
+    ),
+    (
+        "ai_provider_profile_get",
+        "allow-ai-provider-profile-get",
+        commands::ai_provider::ai_provider_profile_get
+    ),
+    (
+        "ai_provider_profile_upsert",
+        "allow-ai-provider-profile-upsert",
+        commands::ai_provider::ai_provider_profile_upsert
+    ),
+    (
+        "ai_provider_profile_delete",
+        "allow-ai-provider-profile-delete",
+        commands::ai_provider::ai_provider_profile_delete
+    ),
+    (
+        "ai_provider_models_list",
+        "allow-ai-provider-models-list",
+        commands::ai_provider::ai_provider_models_list
+    ),
+    (
+        "ai_settings_recommendation_generate",
+        "allow-ai-settings-recommendation-generate",
+        commands::ai_provider::ai_settings_recommendation_generate
+    ),
+    // A5 外部 Agent Broker：默认关闭；仅暴露状态与显式启停，不开放任意 invoke。
+    (
+        "agent_broker_status",
+        "allow-agent-broker-status",
+        commands::agent_broker::agent_broker_status
+    ),
+    (
+        "agent_broker_enable",
+        "allow-agent-broker-enable",
+        commands::agent_broker::agent_broker_enable
+    ),
+    (
+        "agent_broker_disable",
+        "allow-agent-broker-disable",
+        commands::agent_broker::agent_broker_disable
     )
 );

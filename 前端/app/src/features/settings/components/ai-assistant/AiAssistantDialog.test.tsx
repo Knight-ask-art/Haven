@@ -110,6 +110,11 @@ function agentContext(revision: string | null = "rev-41") {
         settingsRead: true,
         settingsProposal: true,
         librarySummaryRead: false,
+        settingSourcesRead: false,
+        resourcePreferenceRead: false,
+        resourcePreferenceProposal: false,
+        mediaCapabilitiesRead: false,
+        onboardingRead: false,
         metadataProposal: false,
         renameProposal: false,
         secretRead: false,
@@ -763,6 +768,9 @@ describe("栖伴提案状态机", () => {
 })
 
 describe("设置页智能功能分区的模型空态", () => {
+  // 这些用例保持**只读**：它们断言的是「没有任何 Provider 配置」时的诚实空态。
+  // 写入路径（新建配置、单向提交 API Key）由 `pages/SettingsPage.ai-provider.test.tsx`
+  // 覆盖 —— 那里有独立的模块注册表，不会与这里的 Mock 单例状态互相污染。
   function renderAiSettings() {
     return render(
       <MemoryRouter initialEntries={["/settings/ai"]}>
@@ -773,23 +781,23 @@ describe("设置页智能功能分区的模型空态", () => {
     )
   }
 
-  it("默认模型与识图模型都只显示「无可用模型」，对应选择控件禁用", () => {
+  it("默认模型只显示「无可用模型」，对应选择控件禁用", async () => {
     renderAiSettings()
 
-    for (const label of ["默认模型", "识图模型"]) {
-      const trigger = screen.getByRole("button", { name: label }) as HTMLButtonElement
-      expect(trigger.textContent).toContain("无可用模型")
-      expect(trigger.disabled).toBe(true)
-    }
-    // 两个选择各自一个空态，没有第二组可选项供用户挑选。
-    expect(screen.getAllByText("无可用模型")).toHaveLength(2)
+    const trigger = (await screen.findByRole("button", { name: "默认模型" })) as HTMLButtonElement
+    await waitFor(() => expect(trigger.textContent).toContain("无可用模型"))
+    expect(trigger.disabled).toBe(true)
+    // 默认模型与识图模型两处空态都必须显示，而不是只留一个空白控件。
+    expect(screen.getAllByText("无可用模型").length).toBeGreaterThanOrEqual(2)
   })
 
-  it("禁用的模型选择打不开菜单，示例模型名不会变成可选项", () => {
+  it("禁用的模型选择打不开菜单，示例模型名不会变成可选项", async () => {
     renderAiSettings()
 
-    fireEvent.click(screen.getByRole("button", { name: "默认模型" }))
-    fireEvent.click(screen.getByRole("button", { name: "识图模型" }))
+    const trigger = (await screen.findByRole("button", { name: "默认模型" })) as HTMLButtonElement
+    await waitFor(() => expect(trigger.disabled).toBe(true))
+
+    fireEvent.click(trigger)
     expect(screen.queryByRole("listbox")).toBeNull()
 
     for (const fakeModel of ["gpt-4o", "claude-compatible", "vision-compatible"]) {
@@ -797,13 +805,15 @@ describe("设置页智能功能分区的模型空态", () => {
     }
   })
 
-  it("API 协议、API 地址与拉取模型的既有语义保持不变", () => {
+  it("不再预置示例 API 地址，没有配置时不提供可编辑的地址输入", async () => {
     renderAiSettings()
 
-    const protocol = screen.getByRole("button", { name: "API 协议" }) as HTMLButtonElement
-    expect(protocol.disabled).toBe(false)
-    expect(protocol.textContent).toContain("OpenAI Compatible")
-    expect((screen.getByLabelText("API 地址") as HTMLInputElement).value).toBe("https://api.example.com/v1")
-    expect(screen.getAllByRole("button", { name: "拉取模型" })).toHaveLength(2)
+    // 旧的占位默认值 `https://api.example.com/v1` 不得再出现在界面上。
+    expect(await screen.findByRole("button", { name: "新建配置" })).toBeTruthy()
+    expect(document.body.textContent).not.toContain("api.example.com")
+    expect(screen.queryByLabelText("API 地址")).toBeNull()
+    // 没有 profile 就没有可写的凭据目标：API Key 行整体不渲染。
+    expect(screen.queryByLabelText("API Key")).toBeNull()
+    expect(screen.queryByText("已配置")).toBeNull()
   })
 })

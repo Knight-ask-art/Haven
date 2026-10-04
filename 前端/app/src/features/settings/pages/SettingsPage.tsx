@@ -53,6 +53,15 @@ import {
 import type { ComicSettingsValue, GeneralSettingsValue, AppearanceSettingsValue, PlaybackSettingsValue, PreferenceComicPatchWire, PreferenceGetResult, PreferenceReadingPatchWire, PreferenceTargetWire, PrivacySettingsValue, ReadingSettingsValue, DownloadSettingsValue, SettingsValue } from "@/lib/ipc/settings-wire"
 import type { SettingsFormController } from "@/features/settings/lib/useSettingsForm"
 import { useSettingsForm } from "@/features/settings/lib/useSettingsForm"
+import { useAiProviderSettings } from "@/features/settings/lib/useAiProviderSettings"
+import { NO_MODEL_SELECTED } from "@/features/settings/ipc/ai-provider-gateway"
+import { useAgentBrokerSettings } from "@/features/settings/lib/useAgentBrokerSettings"
+import {
+  AGENT_BROKER_CLIENT_TEMPLATES,
+  AGENT_BROKER_TEMPLATE_NOTE,
+  buildAgentBrokerMcpTemplate,
+  type AgentBrokerClientTemplateId,
+} from "@/features/settings/ipc/agent-broker-gateway"
 import { settingsGateway } from "@/features/settings/ipc/gateway"
 import { clearArtworkCache, clearSearchHistory } from "@/features/settings/ipc/privacy-gateway"
 import {
@@ -67,7 +76,7 @@ import {
   SOURCE_HEALTH_LABELS,
   type SourceDescriptorWire,
 } from "../ipc/sources-gateway"
-import type { SourceCategoryDto, SourceKindDto, SourceModeDto, SourceRegistryDto } from "@/lib/ipc/generated/wire"
+import type { SourceCategoryDto, SourceKindDto, SourceModeDto, SourceRegistryDto, AgentBrokerStatusDto } from "@/lib/ipc/generated/wire"
 import {
   SOURCE_CATEGORY_DESCRIPTIONS,
   SOURCE_CATEGORY_LABELS,
@@ -178,16 +187,10 @@ const DEFAULT_SETTINGS = {
   syncTarget: "尚未配置",
   syncProgress: true,
   syncFavorites: true,
-  aiEnabled: false,
-  // 界面上 aiProvider 是「API 协议」、aiEndpoint 是「API 地址」；底层键名保持不变，
-  // 避免影响既有持久化与 wire 契约。
-  aiProvider: "OpenAI Compatible",
-  aiEndpoint: "https://api.example.com/v1",
-  aiKey: "",
-  // defaultModel / visionModel 保留既有持久化键与默认值；模型列表未接入时它们不参与渲染，
-  // 也不在渲染中改写，避免把占位模型名写成已配置状态。
-  defaultModel: "未配置",
-  visionModel: "未配置",
+  // AI 分组的 aiEnabled / aiProvider / aiEndpoint / aiKey / defaultModel / visionModel
+  // 占位键已随 A2 AI Provider 切片移除：它们既没有后端持久化语义，又带着一个看似
+  // 已配置的示例地址与模型名。真实来源是 AI Provider Profile（后端 CAS 持久化）
+  // 与 CredentialStore（凭据），模型只能来自 Provider 的模型目录。
   autoUpdate: true,
   playbackHistory: true,
   networkDiagnostics: false,
@@ -480,7 +483,7 @@ function renderSettingsSection(
     case "sync":
       return <SyncSettings settings={settings} update={update} />
     case "ai":
-      return <AiSettings settings={settings} update={update} showNotice={showNotice} onOpenAssistant={onOpenAssistant} />
+      return <AiSettings showNotice={showNotice} onOpenAssistant={onOpenAssistant} />
     case "updates":
       return <UpdateSettings showNotice={showNotice} />
     case "privacy":
@@ -2674,37 +2677,371 @@ function SyncSettings({ settings, update }: { settings: SettingsState; update: a
   )
 }
 
-/** API 协议选项：按请求/响应编排语义列出，不绑定具体服务商；写入的仍是 aiProvider 键。 */
-const API_PROTOCOL_OPTIONS = ["OpenAI Compatible", "Anthropic Messages", "Google Gemini", "Ollama"]
+/**
+ * Broker 状态 → 展示文案与色点。
+ *
+ * `busy` / `unavailable` 各有独立文案：它们是 fail-closed 结论，折叠成「已关闭」
+ * 会让用户以为「本来就没开」，从而错过真正的原因与重试入口。
+ */
+function agentBrokerStatusPresentation(status: AgentBrokerStatusDto | null, loading: boolean): { label: string; dot: string } {
+  switch (status) {
+    case "listening":
+      return { label: "监听中", dot: "bg-[#34c759]" }
+    case "busy":
+      return { label: "端点被占用", dot: "bg-[#ff9500]" }
+    case "unavailable":
+      return { label: "不可用", dot: "bg-[#d70015]" }
+    case "disabled":
+      return { label: "已关闭", dot: "bg-[#c7ccd1]" }
+    default:
+      return { label: loading ? "读取中…" : "状态未知", dot: "bg-[#c7ccd1]" }
+  }
+}
 
 /**
- * 模型选择的唯一显示值：Provider 模型发现与能力列表都没有接入，
- * 因此不列出任何示例或占位模型名，也不从模型名推断识图能力。
- * 真实模型只能来自 Provider 的模型列表，能力只能来自 Provider 的能力字段。
+ * 设置页「外部 Agent 接入」分组（A5 接线切片）。
+ *
+ * 数据全部来自 `useAgentBrokerSettings`（→ gateway → Typed HavenClient → Tauri
+ * command → Rust Broker），组件不直接 invoke，也不自己拼端点：
+ * - 默认事实来自客户端：读到 disabled 之前显示「读取中」，绝不预置成已开启；
+ * - 端点只有真实监听（Named Pipe / Unix socket）才可复制，浏览器 Mock 的演示标识
+ *   只标记「没有真实本地监听」，也不提供任何模板；
+ * - 这里没有 approve / apply / reject 按钮：Broker 的请求集只有 context /
+ *   create_proposal，提案的批准与写入只能回到栖阅界面。
  */
-const NO_AVAILABLE_MODEL = "无可用模型"
+function ExternalAgentAccessSettings({ showNotice }: { showNotice: (message: string) => void }) {
+  const broker = useAgentBrokerSettings()
+  const [templateId, setTemplateId] = useState<AgentBrokerClientTemplateId>("codex")
+  const [copyError, setCopyError] = useState<string | null>(null)
 
-function AiSettings({ settings, update, showNotice, onOpenAssistant }: { settings: SettingsState; update: any; showNotice: (message: string) => void; onOpenAssistant: () => void }) {
-  // 没有可用模型时两个选择都保持禁用并只显示空态；defaultModel / visionModel 的原值
-  // 继续留在状态里，渲染过程既不读取也不改写，避免把占位名当成已配置的模型。
+  const presentation = agentBrokerStatusPresentation(broker.status, broker.loading)
+  // 模板只在真实端点下生成：拿 mock:// 拼出来的配置会被粘进客户端然后连不上。
+  const template = broker.endpointKind === "live" && broker.endpoint !== null
+    ? buildAgentBrokerMcpTemplate(broker.endpoint)
+    : null
+  const selectedTemplate = AGENT_BROKER_CLIENT_TEMPLATES.find((item) => item.id === templateId)
+    ?? AGENT_BROKER_CLIENT_TEMPLATES[0]
+  const isListening = broker.status === "listening"
+
+  const copyText = async (text: string, done: string) => {
+    setCopyError(null)
+    try {
+      const clipboard = navigator.clipboard
+      if (!clipboard || typeof clipboard.writeText !== "function") {
+        throw new Error("clipboard unavailable")
+      }
+      await clipboard.writeText(text)
+      showNotice(done)
+    } catch {
+      setCopyError("复制失败：当前环境不允许写入剪贴板，请手动选中上面的文本复制。")
+    }
+  }
+
+  return (
+    <SettingsGroup
+      title="外部 Agent 接入"
+      description="让本机已安装的外部 Agent 通过 MCP 接入栖阅。默认关闭，只有你显式开启后才会创建本地端点。"
+    >
+      <SettingRow
+        title="接入状态"
+        description="外部 Agent 只能读取脱敏上下文和创建待审批 Proposal；批准、拒绝与应用必须回到栖阅界面。它没有 SQL、文件系统、Secret 或任意命令权限。"
+      >
+        <div className="flex items-center gap-3">
+          <span className="flex items-center gap-1.5 text-[13px] font-semibold text-[#1d1d1f] dark:text-[#f5f5f5]">
+            <span className={cn("h-[8px] w-[8px] rounded-full", presentation.dot)} />
+            {presentation.label}
+          </span>
+          {isListening ? (
+            <button type="button" onClick={() => void broker.disable()} disabled={broker.busy} className="inline-flex h-[36px] items-center justify-center rounded-full bg-black/[0.05] px-[16px] text-[12px] font-semibold leading-none text-[#1d1d1f] transition-colors hover:bg-black/[0.08] disabled:cursor-not-allowed disabled:opacity-50 dark:bg-white/[0.08] dark:text-[#f5f5f5] dark:hover:bg-white/[0.12]">停用</button>
+          ) : (
+            <button type="button" onClick={() => void broker.enable()} disabled={broker.busy} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[#007aff] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#006fe6] disabled:cursor-not-allowed disabled:opacity-50">{broker.status === "busy" || broker.status === "unavailable" ? "重试启用" : "启用外部接入"}</button>
+          )}
+        </div>
+      </SettingRow>
+      {broker.reason !== null && (
+        <SettingRow title="无法监听的原因" description={broker.reason}>
+          <span className="text-[13px] text-[#86868b]">由本机如实上报</span>
+        </SettingRow>
+      )}
+      {broker.endpointKind === "live" && (
+        <SettingRow title="本地端点" description="由栖阅按当前用户解析的本地地址。它不是密钥，可以复制给本机 Agent 客户端。">
+          <div className="flex max-w-[420px] items-center gap-2">
+            <code className="truncate rounded-lg bg-[#f5f5f7] px-2 py-1 font-mono text-[11px] text-[#1d1d1f] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]">{broker.endpoint}</code>
+            <button type="button" onClick={() => void copyText(broker.endpoint ?? "", "已复制本地端点")} className="shrink-0 rounded-full px-[8px] py-[8px] text-xs font-semibold text-[#007aff]">复制</button>
+          </div>
+        </SettingRow>
+      )}
+      {broker.endpointKind === "preview" && (
+        <SettingRow title="本地端点" description="这里没有可复制的地址，下面也不会给出连接模板。">
+          <span className="text-[13px] font-semibold text-[#86868b]">浏览器预览：没有真实本地监听</span>
+        </SettingRow>
+      )}
+      {broker.endpointKind === "unknown" && (
+        <SettingRow title="本地端点" description="端点形态不在本机允许的闭合集合内，因此不提供复制。">
+          <span className="text-[13px] font-semibold text-[#86868b]">未识别</span>
+        </SettingRow>
+      )}
+      {template !== null && (
+        <SettingRow
+          title="MCP 连接配置"
+          description="把这段 JSON 放进你所用客户端（Codex / Claude Code / DSH / Pi）的 MCP 服务器配置；四者内容完全相同，差别只在放进哪个配置文件。"
+        >
+          <div className="flex max-w-[440px] flex-col items-end gap-2">
+            <div className="flex items-center gap-3">
+              <span className="text-[12px] text-[#86868b]">客户端</span>
+              <SelectControl
+                value={selectedTemplate.label}
+                options={AGENT_BROKER_CLIENT_TEMPLATES.map((item) => item.label)}
+                onChange={(value) => {
+                  const next = AGENT_BROKER_CLIENT_TEMPLATES.find((item) => item.label === value)
+                  if (next) setTemplateId(next.id)
+                }}
+                ariaLabel="配置模板"
+              />
+            </div>
+            <p className="text-right text-[11px] leading-5 text-[#86868b]">{selectedTemplate.hint}{AGENT_BROKER_TEMPLATE_NOTE}</p>
+            <pre className="max-h-[220px] w-full overflow-auto rounded-xl bg-[#f5f5f7] p-3 text-left font-mono text-[11px] leading-5 text-[#1d1d1f] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]">{template}</pre>
+            <button type="button" onClick={() => void copyText(template, "已复制 MCP 连接配置")} className="rounded-full px-[8px] py-[8px] text-xs font-semibold text-[#007aff]">复制配置</button>
+          </div>
+        </SettingRow>
+      )}
+      {broker.error !== null && (
+        <SettingRow title="接入操作失败" description={broker.error.message}>
+          <div className="flex items-center gap-3">
+            <button type="button" onClick={() => void broker.reload()} disabled={broker.busy} className="text-[13px] font-semibold text-[#007aff] disabled:cursor-not-allowed disabled:text-[#86868b]">重新读取状态</button>
+            <button type="button" onClick={broker.dismissError} className="text-[13px] font-medium text-[#6e6e73]">关闭</button>
+          </div>
+        </SettingRow>
+      )}
+      {copyError !== null && (
+        <SettingRow title="复制失败" description={copyError}>
+          <button type="button" onClick={() => setCopyError(null)} className="text-[13px] font-medium text-[#6e6e73]">关闭</button>
+        </SettingRow>
+      )}
+    </SettingsGroup>
+  )
+}
+
+/**
+ * 设置页 AI 分组的真实接线（A2 AI Provider 基础切片）。
+ *
+ * 数据全部来自 `useAiProviderSettings`（→ gateway → Typed HavenClient → Tauri
+ * command → Application）。组件不直接 invoke，也不接触任何密钥原文：
+ * - API Key 只单向提交，界面只显示「已配置 / 未配置」；
+ * - 模型只能来自 Provider 的模型目录；没有可用模型时显示「无可用模型」，
+ *   绝不写入或推断示例模型名；
+ * - 目录状态与网络错误分开呈现，可重试错误带重试入口。
+ */
+function AiSettings({ showNotice, onOpenAssistant }: { showNotice: (message: string) => void; onOpenAssistant: () => void }) {
+  const ai = useAiProviderSettings()
+  const [draft, setDraft] = useState<{ profileId: string; displayName: string; endpoint: string } | null>(null)
+  const [apiKeyDraft, setApiKeyDraft] = useState("")
+  const [isKeyEditorOpen, setIsKeyEditorOpen] = useState(false)
+
+  const selected = ai.selectedProfile
+  const modelOptionStrings = ai.modelOptions.map((option) => (
+    option.label === option.modelId ? option.modelId : `${option.label} (${option.modelId})`
+  ))
+  // 三个状态必须分开显示：无可用模型（目录为空）/ 未选择（有模型但还没选）/ 已选模型。
+  // 把"还没选"显示成"无可用模型"会在目录非空时谎报没有模型。
+  const selectedModelValue = !ai.hasAvailableModel
+    ? ai.unavailableModelLabel
+    : selected?.selectedModelId
+      ? modelOptionStrings.find((option) => option === selected.selectedModelId
+        || option.endsWith(`(${selected.selectedModelId})`)) ?? NO_MODEL_SELECTED
+      : NO_MODEL_SELECTED
+
+  const draftProfileId = draft?.profileId ?? selected?.profileId ?? ""
+  const draftDisplayName = draft?.displayName ?? selected?.displayName ?? ""
+  const draftEndpoint = draft?.endpoint ?? selected?.endpoint ?? ""
+  const isDirty = draft !== null
+
+  const submitProfile = async () => {
+    const ok = await ai.saveProfile({
+      profileId: draftProfileId,
+      displayName: draftDisplayName,
+      endpoint: draftEndpoint,
+      enabled: selected?.enabled ?? true,
+      selectedModelId: selected?.selectedModelId ?? null,
+    })
+    if (ok) {
+      setDraft(null)
+      showNotice("AI 服务配置已保存")
+    }
+  }
+
+  const submitApiKey = async () => {
+    const secret = apiKeyDraft
+    // 先清空本地草稿，再提交：无论成功与否，密钥原文都不留在组件状态里。
+    setApiKeyDraft("")
+    setIsKeyEditorOpen(false)
+    const ok = await ai.submitApiKey(secret)
+    showNotice(ok ? "API Key 已写入系统凭据管理器" : "API Key 写入失败，请重试")
+  }
+
   return (
     <>
       <SettingsIntro section="AI" title="智能功能" description="AI 采用 BYOK。栖阅不为你的调用计费，也不会通过 Haven 中央服务器接收 API Key。" />
-      <div className="mb-7 flex gap-3 rounded-3xl border border-[#f0b429]/25 bg-[#fff8e5] p-5"><Sparkles className="mt-0.5 h-5 w-5 shrink-0 text-[#b7791f]" /><p className="text-xs leading-5 text-[#7a5a1a]">实际费用由你配置的 AI 服务提供商收取。API 地址、模型和 API Key 将由后端安全存储层接管。</p></div>
+      <div className="mb-7 flex gap-3 rounded-3xl border border-[#f0b429]/25 bg-[#fff8e5] p-5"><Sparkles className="mt-0.5 h-5 w-5 shrink-0 text-[#b7791f]" /><p className="text-xs leading-5 text-[#7a5a1a]">实际费用由你配置的 AI 服务提供商收取。API 地址、模型和 API Key 由后端安全存储层接管：密钥只写入系统凭据管理器，配置行与接口响应都不含密钥。</p></div>
       <SettingsGroup title="配置建议" description="由本机设置快照生成可逐项审查的改动提案；批准前不会写入任何设置。">
-        <SettingRow icon={<Sparkles className="h-[19px] w-[19px]" strokeWidth={1.8} />} title="栖伴" description="栖伴是栖阅的 Haven 智能体：在对话中描述你的需求，它会读取设置快照并给出可逐项审查的提案。当前尚未接入模型服务（无可用模型），提案为确定性模板，必须由你批准后才会写入。">
+        <SettingRow icon={<Sparkles className="h-[19px] w-[19px]" strokeWidth={1.8} />} title="栖伴" description={`栖伴是栖阅的 Haven 智能体：在对话中描述你的需求，它会读取设置快照并给出可逐项审查的提案。当前${ai.hasAvailableModel ? `可用模型 ${ai.modelOptions.length} 个` : "无可用模型"}，提案为确定性模板，必须由你批准后才会写入。`}>
           <button type="button" onClick={onOpenAssistant} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[#007aff] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#006fe6]">打开栖伴</button>
         </SettingRow>
       </SettingsGroup>
       <SettingsGroup title="API 连接" description="按协议选择接入方式；API 地址由你填写，栖阅不代理请求。">
-        <SettingRow title="启用智能功能"><Toggle checked={settings.aiEnabled} onChange={(value) => update("aiEnabled", value)} label="启用智能功能" /></SettingRow>
-        <SettingRow title="API 协议" description="决定请求与响应的编排协议，而不是具体服务商。"><SelectControl value={settings.aiProvider} options={API_PROTOCOL_OPTIONS} onChange={(value) => update("aiProvider", value)} ariaLabel="API 协议" /></SettingRow>
-        <SettingRow title="API 地址" description="协议服务根地址，例如自建网关或本地运行时的入口。"><input value={settings.aiEndpoint} onChange={(event) => update("aiEndpoint", event.target.value)} className="h-10 w-[260px] rounded-xl border border-black/[0.08] bg-[#f5f5f7] px-3 text-sm text-[#1d1d1f] outline-none focus:border-[#007aff]/50 dark:border-white/[0.12] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]" aria-label="API 地址" /></SettingRow>
-        <SettingRow title="API Key" description="密钥只单向写入 Windows 凭据管理器，设置界面不显示原文。"><div className="flex items-center gap-[8px]"><span className="flex items-center gap-1.5 text-[13px] font-semibold text-[#6e6e73]">{settings.aiKey ? "已配置" : "未配置"}{settings.aiKey && <CircleCheck className="h-[15px] w-[15px] text-[#34c759]" strokeWidth={2.2} />}</span><button type="button" onClick={() => showNotice("凭据写入将在后端 Credential Store 接入后开放")} className="rounded-full px-[8px] py-[8px] text-xs font-semibold text-[#007aff]">配置</button></div></SettingRow>
-        <SettingRow title="默认模型" description="模型来自 API 的模型列表；当前没有可用的 Provider 模型发现通道。"><div className="flex items-center gap-4"><SelectControl value={NO_AVAILABLE_MODEL} options={[NO_AVAILABLE_MODEL]} onChange={() => undefined} ariaLabel="默认模型" disabled /><button type="button" onClick={() => showNotice("正在向 API 获取可用模型")} className="text-[13px] font-medium text-[#007aff] transition-colors hover:text-[#005bb5] hover:underline">拉取模型</button></div></SettingRow>
-        <SettingRow title="识图模型" description="默认模型未确认识图能力；需要识图时在这里单独指定模型。"><div className="flex items-center gap-4"><SelectControl value={NO_AVAILABLE_MODEL} options={[NO_AVAILABLE_MODEL]} onChange={() => undefined} ariaLabel="识图模型" disabled /><button type="button" onClick={() => showNotice("正在向 API 获取可用识图模型")} className="text-[13px] font-medium text-[#007aff] transition-colors hover:text-[#005bb5] hover:underline">拉取模型</button></div></SettingRow>
+        {ai.state.loadError && (
+          <div role="alert" className="mx-5 mb-3 flex items-center justify-between gap-3 rounded-2xl border border-[#d70015]/15 bg-[#fff1f0] px-4 py-3 text-xs text-[#d70015]">
+            <span>{ai.state.loadError.message}</span>
+            {ai.state.loadError.retryable && <button type="button" onClick={() => void ai.reload()} className="shrink-0 font-semibold text-[#007aff]">重试</button>}
+          </div>
+        )}
+        {ai.state.loading ? (
+          <SettingRow title="AI 服务配置" description="正在读取本机配置…"><span className="text-[13px] text-[#86868b]">读取中</span></SettingRow>
+        ) : selected ? (
+          <>
+            <SettingRow title="配置名称" description="本机标识，只用于区分多个 Provider。">
+              <input
+                value={draftDisplayName}
+                onChange={(event) => setDraft({ profileId: draftProfileId, displayName: event.target.value, endpoint: draftEndpoint })}
+                className="h-10 w-[260px] rounded-xl border border-black/[0.08] bg-[#f5f5f7] px-3 text-sm text-[#1d1d1f] outline-none focus:border-[#007aff]/50 dark:border-white/[0.12] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]"
+                aria-label="配置名称"
+              />
+            </SettingRow>
+            <SettingRow title="启用智能功能" description="停用后不会向该 Provider 发起任何请求。">
+              <Toggle
+                checked={selected.enabled}
+                onChange={(value) => void ai.saveProfile({
+                  profileId: selected.profileId,
+                  displayName: selected.displayName,
+                  endpoint: selected.endpoint,
+                  enabled: value,
+                  selectedModelId: selected.selectedModelId,
+                })}
+                label="启用智能功能"
+              />
+            </SettingRow>
+            <SettingRow title="API 协议" description="决定请求与响应的编排协议，而不是具体服务商。">
+              <span className="text-[13px] font-semibold text-[#1d1d1f] dark:text-[#f5f5f5]">OpenAI Compatible</span>
+            </SettingRow>
+            <SettingRow title="API 地址" description="协议服务根地址（https，公网主机）。已带 /v1 时不会重复拼接。">
+              <input
+                value={draftEndpoint}
+                onChange={(event) => setDraft({ profileId: draftProfileId, displayName: draftDisplayName, endpoint: event.target.value })}
+                className="h-10 w-[260px] rounded-xl border border-black/[0.08] bg-[#f5f5f7] px-3 text-sm text-[#1d1d1f] outline-none focus:border-[#007aff]/50 dark:border-white/[0.12] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]"
+                aria-label="API 地址"
+              />
+            </SettingRow>
+            {isDirty && (
+              <SettingRow title="保存配置" description="只有本机配置；不包含 API Key。">
+                <div className="flex items-center gap-3">
+                  <button type="button" onClick={() => setDraft(null)} className="text-[13px] font-medium text-[#6e6e73]">放弃</button>
+                  <button type="button" onClick={() => void submitProfile()} disabled={ai.state.saving} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[#007aff] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#006fe6] disabled:cursor-not-allowed disabled:opacity-50">保存</button>
+                </div>
+              </SettingRow>
+            )}
+            <SettingRow title="API Key" description="密钥只单向写入 Windows 凭据管理器，设置界面不显示原文，也不会回填。">
+              <div className="flex items-center gap-[8px]">
+                <span className="flex items-center gap-1.5 text-[13px] font-semibold text-[#6e6e73]">{ai.credentialConfigured ? "已配置" : "未配置"}{ai.credentialConfigured && <CircleCheck className="h-[15px] w-[15px] text-[#34c759]" strokeWidth={2.2} />}</span>
+                {isKeyEditorOpen ? (
+                  <>
+                    <input
+                      type="password"
+                      value={apiKeyDraft}
+                      onChange={(event) => setApiKeyDraft(event.target.value)}
+                      placeholder="粘贴 API Key"
+                      aria-label="API Key"
+                      autoComplete="off"
+                      className="h-10 w-[200px] rounded-xl border border-black/[0.08] bg-[#f5f5f7] px-3 text-sm text-[#1d1d1f] outline-none focus:border-[#007aff]/50 dark:border-white/[0.12] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]"
+                    />
+                    <button type="button" onClick={() => void submitApiKey()} disabled={apiKeyDraft.length === 0 || ai.state.saving} className="rounded-full px-[8px] py-[8px] text-xs font-semibold text-[#007aff] disabled:cursor-not-allowed disabled:opacity-50">保存</button>
+                    <button type="button" onClick={() => { setApiKeyDraft(""); setIsKeyEditorOpen(false) }} className="rounded-full px-[8px] py-[8px] text-xs font-medium text-[#6e6e73]">取消</button>
+                  </>
+                ) : (
+                  <>
+                    <button type="button" onClick={() => setIsKeyEditorOpen(true)} className="rounded-full px-[8px] py-[8px] text-xs font-semibold text-[#007aff]">配置</button>
+                    {ai.credentialConfigured && <button type="button" onClick={() => { void ai.clearApiKey().then((ok) => showNotice(ok ? "已清除 API Key" : "清除失败，请重试")) }} className="rounded-full px-[8px] py-[8px] text-xs font-medium text-[#6e6e73]">清除</button>}
+                  </>
+                )}
+              </div>
+            </SettingRow>
+          </>
+        ) : (
+          <SettingRow title="AI 服务" description="尚未配置任何 Provider。无可用模型，也不会伪造模型列表。">
+            <button type="button" onClick={() => setDraft({ profileId: "default", displayName: "自建网关", endpoint: "https://" })} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[#007aff] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#006fe6]">新建配置</button>
+          </SettingRow>
+        )}
+        {!selected && isDirty && (
+          <>
+            <SettingRow title="配置 ID" description="稳定标识，只允许字母、数字、连字符与下划线。">
+              <input value={draftProfileId} onChange={(event) => setDraft({ profileId: event.target.value, displayName: draftDisplayName, endpoint: draftEndpoint })} className="h-10 w-[260px] rounded-xl border border-black/[0.08] bg-[#f5f5f7] px-3 text-sm text-[#1d1d1f] outline-none focus:border-[#007aff]/50 dark:border-white/[0.12] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]" aria-label="配置 ID" />
+            </SettingRow>
+            <SettingRow title="配置名称">
+              <input value={draftDisplayName} onChange={(event) => setDraft({ profileId: draftProfileId, displayName: event.target.value, endpoint: draftEndpoint })} className="h-10 w-[260px] rounded-xl border border-black/[0.08] bg-[#f5f5f7] px-3 text-sm text-[#1d1d1f] outline-none focus:border-[#007aff]/50 dark:border-white/[0.12] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]" aria-label="配置名称" />
+            </SettingRow>
+            <SettingRow title="API 地址" description="https 公网地址；不接受本地路径、查询参数或私网目标。">
+              <input value={draftEndpoint} onChange={(event) => setDraft({ profileId: draftProfileId, displayName: draftDisplayName, endpoint: event.target.value })} className="h-10 w-[260px] rounded-xl border border-black/[0.08] bg-[#f5f5f7] px-3 text-sm text-[#1d1d1f] outline-none focus:border-[#007aff]/50 dark:border-white/[0.12] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]" aria-label="API 地址" />
+            </SettingRow>
+            <SettingRow title="保存配置">
+              <div className="flex items-center gap-3">
+                <button type="button" onClick={() => setDraft(null)} className="text-[13px] font-medium text-[#6e6e73]">放弃</button>
+                <button type="button" onClick={() => void submitProfile()} disabled={ai.state.saving} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[#007aff] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#006fe6] disabled:cursor-not-allowed disabled:opacity-50">保存</button>
+              </div>
+            </SettingRow>
+          </>
+        )}
+        <SettingRow title="默认模型" description={ai.hasAvailableModel ? "模型与能力都来自 Provider 的模型列表。" : `${ai.unavailableModelLabel}：${ai.unavailableModelHint}`}>
+          <div className="flex items-center gap-4">
+            <SelectControl
+              value={ai.hasAvailableModel ? selectedModelValue : ai.unavailableModelLabel}
+              options={ai.hasAvailableModel ? modelOptionStrings : [ai.unavailableModelLabel]}
+              onChange={(value) => {
+                if (!selected) return
+                const modelId = ai.modelOptions.find((option) => (
+                  option.modelId === value || `${option.label} (${option.modelId})` === value
+                ))?.modelId ?? null
+                void ai.saveProfile({
+                  profileId: selected.profileId,
+                  displayName: selected.displayName,
+                  endpoint: selected.endpoint,
+                  enabled: selected.enabled,
+                  selectedModelId: modelId,
+                })
+              }}
+              ariaLabel="默认模型"
+              disabled={!ai.hasAvailableModel || ai.state.saving}
+            />
+            <button type="button" onClick={() => void ai.refreshModels()} disabled={!selected || ai.state.catalogLoading} className="text-[13px] font-medium text-[#007aff] transition-colors hover:text-[#005bb5] hover:underline disabled:cursor-not-allowed disabled:text-[#86868b]">{ai.state.catalogLoading ? "读取中…" : "拉取模型"}</button>
+          </div>
+        </SettingRow>
+        {selected && !ai.hasAvailableModel && ai.state.catalogError && (
+          <SettingRow title="模型列表" description={ai.state.catalogError.message}>
+            {ai.state.catalogError.retryable
+              ? <button type="button" onClick={() => void ai.refreshModels()} className="text-[13px] font-semibold text-[#007aff]">重试</button>
+              : <span className="text-[13px] text-[#86868b]">请检查 API 地址与 API Key</span>}
+          </SettingRow>
+        )}
+        <SettingRow title="识图模型" description="能力只在 Provider 显式声明时才标注；未声明的模型显示「未声明」，不会按模型名推断。">
+          <div className="flex max-w-[420px] flex-col items-end gap-1">
+            {ai.hasAvailableModel ? ai.modelOptions.map((option) => (
+              <span key={option.modelId} className="text-[11px] text-[#86868b]">{`${option.modelId} · 识图：${option.visionLabel} · 向量：${option.embeddingLabel}`}</span>
+            )) : <span className="text-[13px] font-semibold text-[#6e6e73]">{ai.unavailableModelLabel}</span>}
+          </div>
+        </SettingRow>
       </SettingsGroup>
-      <div className="flex justify-end"><button type="button" onClick={() => showNotice("连接测试将在 AI 服务后端适配后执行")} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[#1d1d1f] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#2c2c2e]">测试连接</button></div>
+      {ai.state.saveError && (
+        <div role="alert" className="mb-4 flex items-center justify-between gap-3 rounded-2xl border border-[#d70015]/15 bg-[#fff1f0] px-4 py-3 text-xs text-[#d70015]">
+          <span>{ai.state.saveError.message}</span>
+          <div className="flex shrink-0 items-center gap-3">
+            {ai.state.saveError.retryable && <button type="button" onClick={() => void ai.refreshModels()} className="font-semibold text-[#007aff]">重试</button>}
+            <button type="button" onClick={ai.dismissSaveError} className="font-medium text-[#6e6e73]">关闭</button>
+          </div>
+        </div>
+      )}
+      <div className="flex items-center justify-end gap-3">
+        {selected && <button type="button" onClick={() => { void ai.deleteProfile().then((ok) => showNotice(ok ? "已删除配置并清除其 API Key" : "删除失败，请重试")) }} className="text-[13px] font-medium text-[#d70015]">删除配置</button>}
+        <button type="button" onClick={() => void ai.refreshModels()} disabled={!selected || ai.state.catalogLoading} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[#1d1d1f] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#2c2c2e] disabled:cursor-not-allowed disabled:opacity-50">测试连接</button>
+      </div>
+      <ExternalAgentAccessSettings showNotice={showNotice} />
     </>
   )
 }
