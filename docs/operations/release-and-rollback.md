@@ -5,7 +5,7 @@ status: active
 owner: release-owner
 visibility: public
 source_of_truth: release-workflows-and-artifacts
-last_reviewed: 2026-09-20
+last_reviewed: 2026-10-04
 review_after: 2026-12-20
 ---
 
@@ -30,6 +30,26 @@ known limits
 ```
 
 “Release created” is not the same as “users can safely upgrade”.
+
+## Signed Windows update channel
+
+Stable tags on protected main use the existing updater public key and the
+GitHub `releases/latest/download/latest.json` endpoint. The release workflow
+first creates a draft, validates version and frontend asset hashes, verifies
+the NSIS signature against the application's tracked public key, and extracts
+the installer to inspect the shipped executable's embedded build manifest.
+Only a verified stable draft is published as latest; prereleases stay drafts.
+
+The updater manifest prefers NSIS. MSI remains a manual-download artifact.
+Published releases are immutable: retries cannot overwrite them, and fixes
+require a new version. Do not rotate the public key as a shortcut for a failed
+signature gate: installed clients depend on that trust chain.
+
+Desktop builds run the frontend build hook. `--verify-bundle` reads the
+executable's embedded provenance without creating a window or opening user
+data. This proves the shipped asset bundle, not interactive desktop acceptance.
+The installation handoff drains the active window's session grants and reading
+records before the official updater starts the Windows installer and restarts.
 
 ## Recovery levers
 
@@ -56,4 +76,5 @@ If a credential is suspected to have entered GitHub, logs or an artifact:
 4. assess whether history rewriting is necessary;
 5. repair the source and verify scanners before resuming release.
 
-An agent must not print, copy or “clean up” a secret while investigating it.
+Do not expose or distribute a secret while investigating it. Preserve only
+redacted evidence and use the appropriate revocation and recovery procedure.

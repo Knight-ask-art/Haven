@@ -28,6 +28,29 @@ import type {
 export const NO_AVAILABLE_MODEL = "无可用模型";
 
 /**
+ * 明文端点的稳定错误码与固定文案。
+ *
+ * 与 Rust 侧 `AI_PROVIDER_ENDPOINT_INSECURE` **逐字对应**：这条路径是唯一会把
+ * `Authorization: Bearer <API Key>` 以及用户设置快照 / 技能正文发出去的地方，
+ * 明文 `http` 会让它们暴露给链路上的任何一跳。
+ *
+ * 前端只做**快速失败**（省一次往返），权威结论仍然来自后端；两侧码值不一致时以后端为准。
+ */
+export const INSECURE_ENDPOINT_CODE = "AI_PROVIDER_ENDPOINT_INSECURE";
+export const INSECURE_ENDPOINT_MESSAGE =
+  "API 地址必须使用 HTTPS：API Key 与设置内容不得经明文连接发送。请把地址改为 https:// 后重新保存。";
+
+/**
+ * 端点是不是 https。
+ *
+ * 只做前缀判断，**不**在 TS 里重建 Rust 的主机 / 端口 / DNS 策略——那会制造两套会漂移
+ * 的真相。这里回答的是唯一一个前端必须知道的机密性问题：明文还是加密。
+ */
+export function isHttpsAiEndpoint(endpoint: string): boolean {
+  return endpoint.trim().toLowerCase().startsWith("https://");
+}
+
+/**
  * 有可用模型、但用户还没选过时的显示文案。
  *
  * 必须与 `NO_AVAILABLE_MODEL` 分开：把"还没选"显示成"无可用模型"会在模型目录明明
@@ -112,6 +135,14 @@ function isOptionalText(value: unknown): value is string | null {
   return value === null || (typeof value === "string" && value.length > 0);
 }
 
+/**
+ * Profile 投影守卫。
+ *
+ * `endpoint` **允许** `http://`：升级前保存的明文行仍然存在，设置页必须能列出它们、
+ * 打开它们、把它们改成 https 或删掉——把这类行判成非法载荷会让整份列表守卫失败，
+ * 用户连修复入口都拿不到。机密性由保存边界（[`isHttpsAiEndpoint`] + 后端）与使用边界
+ * （后端 `require_secure_endpoint`）负责，不由"读不出来"兜底。
+ */
 export function guardAiProviderProfile(value: unknown): value is AiProviderProfileDto {
   if (!isRecord(value) || hasForbiddenField(value)) return false;
   if (!hasExactFields(value, PROFILE_FIELDS)) return false;
@@ -159,13 +190,22 @@ export function guardAiProviderModel(value: unknown): value is AiProviderModelDt
     && MODEL_CAPABILITIES.has(value.embedding);
 }
 
+/**
+ * 模型目录守卫。
+ *
+ * `expectedProfileId` 是**身份边界**：目录必须属于刚请求的那个 profile。少了这条比对，
+ * 一次慢响应（或切换 profile 后的迟到响应）会把另一个 profile 的模型目录当成当前配置的
+ * 结果显示出来——用户会看到一个不属于这份配置的模型列表，而界面上没有任何区别。
+ */
 export function guardAiProviderModelsCatalog(
   value: unknown,
+  expectedProfileId: string,
 ): value is AiProviderModelsCatalogDto {
   if (!isRecord(value) || hasForbiddenField(value)) return false;
   if (!hasExactFields(value, CATALOG_FIELDS)) return false;
   if (value.schemaVersion !== 1) return false;
   if (typeof value.profileId !== "string" || value.profileId.length === 0) return false;
+  if (value.profileId !== expectedProfileId) return false;
   if (typeof value.state !== "string" || !CATALOG_STATES.has(value.state)) return false;
   if (!Array.isArray(value.models) || !value.models.every(guardAiProviderModel)) return false;
   // state 与 models 必须互相印证：只有 ready 才允许非空目录。
@@ -198,24 +238,40 @@ export async function listAiProviderProfiles(): Promise<AiProviderProfileDto[]> 
   }
 }
 
-/** 读取单个 Provider Profile。 */
+/**
+ * 读取单个 Provider Profile。
+ *
+ * **形状守卫不够，还要比对身份。** 只检查"这是一份合法的 profile"的话，一次错配的响应
+ * （迟到的旧请求、重复派发、服务端 id 混用）会被当成刚请求的那一份交出去，调用方随即
+ * 拿着**另一个配置**的 endpoint / 模型继续操作，而界面上没有任何区别。
+ *
+ * 比对是逐字节的，且不会误伤合法流程：`validate_profile_id` 只接受 ASCII 字母数字、
+ * `-` 与 `_`，且后端不对 id 做任何 trim / 大小写归一——能通过校验的 id 就是原样存回来的
+ * 那个（见 `haven-domain` 的 `validate_profile_id`）。
+ */
 export async function getAiProviderProfile(profileId: string): Promise<AiProviderProfileDto> {
   try {
     const value: unknown = await getHavenClient().aiProviderProfileGet({ profileId });
-    if (!guardAiProviderProfile(value)) invalidResponse();
+    if (!guardAiProviderProfile(value) || value.profileId !== profileId) invalidResponse();
     return value;
   } catch (error) {
     throw toHavenError(error);
   }
 }
 
-/** 写入 Provider Profile（非敏感字段）；CAS 冲突由后端返回。 */
+/**
+ * 写入 Provider Profile（非敏感字段）；CAS 冲突由后端返回。
+ *
+ * 返回的必须是**刚写的那一份**：写入结果决定了 Hook 接下来 `load(saved.profileId)` 选中
+ * 哪个配置。放行一份身份不符的响应，界面会切换到另一个 Provider 的 endpoint 与模型，
+ * 看起来就像"A 保存成功了"。
+ */
 export async function upsertAiProviderProfile(
   request: AiProviderProfileUpsertRequest,
 ): Promise<AiProviderProfileDto> {
   try {
     const value: unknown = await getHavenClient().aiProviderProfileUpsert(request);
-    if (!guardAiProviderProfile(value)) invalidResponse();
+    if (!guardAiProviderProfile(value) || value.profileId !== request.profileId) invalidResponse();
     return value;
   } catch (error) {
     throw toHavenError(error);
@@ -252,7 +308,7 @@ export async function listAiProviderModels(
 ): Promise<AiProviderModelsCatalogDto> {
   try {
     const value: unknown = await getHavenClient().aiProviderModelsList({ profileId });
-    if (!guardAiProviderModelsCatalog(value)) invalidResponse();
+    if (!guardAiProviderModelsCatalog(value, profileId)) invalidResponse();
     return value;
   } catch (error) {
     throw toHavenError(error);

@@ -199,6 +199,12 @@ enum ResourceRequest {
         id: String,
         variant: Option<u32>,
     },
+    /// 受控导入字体资源：`interface_font_assets` 的 opaque id（规范 UUID）。
+    ///
+    /// 只按 id 取字节；URL 里不出现任何文件名或路径，未知/已删除 id 一律 404。
+    Font(String),
+    /// 受控外观资产：opaque UUID，字节只能由 AppearanceService 重新授权读取。
+    Appearance(Uuid),
 }
 
 impl fmt::Display for ResourceUriError {
@@ -343,12 +349,20 @@ fn parse_artwork_id(uri: &Uri) -> Result<(String, Option<u32>), ResourceUriError
     Ok((segment.to_owned(), variant))
 }
 
+/// 解析字体请求：路径为 `interface_font_assets.id` 的规范 UUID 字符串。
+///
+/// 与 session/comic-page 同一判定（大小写、括号、百分号编码、多段路径全部拒绝），
+/// 但**不使用** `parse_canonical_resource_id` 之外的文件名信息：字体 URL 里
+/// 不允许出现扩展名或任何用户可控文本，MIME 由数据库列决定而不是由 URL 决定。
+fn parse_font_id(uri: &Uri) -> Result<String, ResourceUriError> {
+    parse_canonical_resource_id(uri).map(|id| id.to_string())
+}
+
 /// Return the opaque registry key (without any URI/path component).
 #[cfg(test)]
 pub(crate) fn parse_resource_session_id(raw: &str) -> Result<String, ResourceUriError> {
     parse_resource_uri(raw).map(|id| id.to_string())
 }
-
 /// MIME allowlist used for resource responses.  Matching is case-insensitive.
 pub(crate) fn mime_for_extension(extension: &str) -> &'static str {
     match extension
@@ -368,12 +382,20 @@ pub(crate) fn mime_for_extension(extension: &str) -> &'static str {
         "md" | "markdown" => "text/markdown; charset=utf-8",
         "html" | "htm" => "text/html; charset=utf-8",
         "vtt" | "webvtt" => "text/vtt; charset=utf-8",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
         "srt" | "sbv" | "ass" | "ssa" | "ttml" | "dfxp" | "sub" | "lrc" => {
             "text/plain; charset=utf-8"
         }
         "jpg" | "jpeg" => "image/jpeg",
         "png" => "image/png",
         "webp" => "image/webp",
+        // GIF 资源走同一条受控读路径：没有这一条会退回 octet-stream，`nosniff` 下
+        // WebView 就不会把它当图片渲染。动态壁纸本身当前不接受 GIF；这里仍保留通用
+        // 资源协议的正确 MIME 映射。
+        "gif" => "image/gif",
         "txt" => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     }
@@ -569,6 +591,49 @@ async fn authorize_session_binding(
         }
         return Ok(());
     }
+    if let PreparedSessionSource::CloudObject { snapshot } = &prepared.source {
+        // 云盘只读 PDF：会话本身不得携带任何本地路径事实，绑定必须与当前 Resource /
+        // StorageLocation 行以及 pinned 快照逐字段一致（与 Session 准备、Resource
+        // 能力投影共用同一处判据），否则一律失效。
+        if prepared.storage_location_id.is_some()
+            || prepared.canonical_root.is_some()
+            || prepared.canonical_file.is_some()
+        {
+            return Err(stale_session());
+        }
+        let resource = state
+            .repos
+            .resource
+            .get(prepared.resource_id)
+            .await?
+            .ok_or_else(stale_session)?;
+        let storage = state
+            .repos
+            .storage_location
+            .get(snapshot.object.location_id)
+            .await?
+            .ok_or_else(stale_session)?;
+        let media_item_id: MediaItemId = prepared
+            .media_item_id
+            .parse()
+            .map_err(|_| stale_session())?;
+        if !haven_application::services::cloud_storage::session_policy::cloud_session_binding_matches(
+            Some(media_item_id),
+            prepared.media_type,
+            &resource,
+            &storage,
+            snapshot,
+        ) {
+            return Err(policy_denied("云盘绑定校验失败"));
+        }
+        if !matches!(
+            resource.availability,
+            Availability::Available | Availability::OfflineAvailable
+        ) {
+            return Err(resource_unavailable());
+        }
+        return Ok(());
+    }
     let resource = state
         .repos
         .resource
@@ -632,12 +697,43 @@ fn resolver_error_response(error: &AppError, origin: Option<&str>) -> Response<V
             "RANGE_INVALID" => 416,
             "SOURCE_RANGE_UNSUPPORTED" => 501,
             "ARTWORK_NOT_FOUND" => 404,
+            "APPEARANCE_ASSET_UNAVAILABLE" => 404,
+            // 外观资产字节的瞬时读取故障：资产本身还在，重试有机会成功——因此是
+            // 「暂时不可用」（503）而不是「不存在」（404）。与 `ARTWORK_CACHE_IO_FAILED`
+            // 同一档。
+            "APPEARANCE_ASSET_STORAGE_FAILED" => 503,
             "ARTWORK_QUERY_INVALID" => 400,
+            // 导入字体资源：未知/已删除 id → 404；导入边界的校验错误不会出现在读路径上，
+            // 这里仍然给出稳定映射，避免它们退化成 500（不可重试）而掩盖真实原因。
+            "FONT_ASSET_NOT_FOUND" => 404,
+            "FONT_FILE_INVALID" => 400,
+            "FONT_FORMAT_UNSUPPORTED" => 415,
             "SESSION_STALE" | "RESOURCE_UNAVAILABLE" => 410,
             "SECURITY_POLICY_DENIED" => 403,
             "FORMAT_UNSUPPORTED" | "ARTWORK_FORMAT_UNSUPPORTED" => 415,
             "ARTWORK_TOO_LARGE" => 413,
             "ARTWORK_FETCH_FAILED" | "SOURCE_UNAVAILABLE" => 502,
+            // 云盘只读 PDF 的稳定错误码：语义与远端正文同一档，绝不能退化成 500
+            // （WebView 会把 500 当成不可重试的内部错误，用户就拿不到「重新连接」入口）。
+            "CLOUD_BINDING_STALE"
+            | "CLOUD_BINDING_INVALID"
+            | "CLOUD_ACCOUNT_STALE"
+            | "CLOUD_OBJECT_CHANGED" => 409,
+            "CLOUD_DRIVE_UNAUTHORIZED"
+            | "CLOUD_CREDENTIAL_UNAVAILABLE"
+            | "CLOUD_CREDENTIAL_INVALID"
+            | "CLOUD_ACCOUNT_NOT_CONNECTED" => 401,
+            "CLOUD_DRIVE_FORBIDDEN" => 403,
+            "CLOUD_DRIVE_NOT_FOUND"
+            | "CLOUD_OBJECT_NOT_FOUND"
+            | "CLOUD_FOLDER_NOT_FOUND"
+            | "CLOUD_ACCOUNT_NOT_FOUND" => 404,
+            "CLOUD_DRIVE_UNSUPPORTED_CONTENT"
+            | "CLOUD_DRIVE_PDF_TOO_LARGE"
+            | "CLOUD_PDF_UNSUPPORTED"
+            | "CLOUD_PDF_WINDOW_TOO_LARGE" => 415,
+            "CLOUD_PDF_RANGE_INVALID" => 416,
+            "CLOUD_DRIVE_UNAVAILABLE" | "CLOUD_DRIVE_RESPONSE_INVALID" => 502,
             "ARTWORK_CACHE_IO_FAILED" => 503,
             "DATABASE_ERROR" => 503,
             _ if error.kind() == ErrorKind::Database => 503,
@@ -728,6 +824,20 @@ pub(crate) fn register_resource_protocol<R: tauri::Runtime>(
                                         .map_err(|_| invalid_remote_range())?;
                                     let body = tauri::async_runtime::block_on(
                                         state.session.read_remote(&prepared, remote_range),
+                                    )?;
+                                    Ok::<_, AppError>(response_for_remote_session(
+                                        &method,
+                                        body,
+                                        origin.as_deref(),
+                                    ))
+                                }
+                                VerifiedSession::Cloud(prepared) => {
+                                    // 云盘只读 PDF：范围语义、单响应上限（32 MiB）与
+                                    // 响应校验和远端正文完全共用同一条路径。
+                                    let cloud_range = parse_remote_byte_range(range.as_deref())
+                                        .map_err(|_| invalid_remote_range())?;
+                                    let body = tauri::async_runtime::block_on(
+                                        state.session.read_cloud(&prepared, cloud_range),
                                     )?;
                                     Ok::<_, AppError>(response_for_remote_session(
                                         &method,
@@ -853,6 +963,53 @@ pub(crate) fn register_resource_protocol<R: tauri::Runtime>(
                                 origin.as_deref(),
                             ))
                         }
+                        ResourceRequest::Font(asset_id) => {
+                            if method == Method::HEAD {
+                                return Ok::<_, AppError>(comic_method_not_allowed_response(
+                                    origin.as_deref(),
+                                ));
+                            }
+                            if range.is_some() {
+                                return Ok::<_, AppError>(error_response(
+                                    416,
+                                    false,
+                                    None,
+                                    origin.as_deref(),
+                                ));
+                            }
+                            let asset = tauri::async_runtime::block_on(
+                                state.interface_fonts.load_bytes(&asset_id),
+                            )?;
+                            let Some(asset) = asset else {
+                                return Ok::<_, AppError>(error_response(
+                                    404,
+                                    false,
+                                    None,
+                                    origin.as_deref(),
+                                ));
+                            };
+                            Ok::<_, AppError>(font_response(
+                                &asset.mime_type,
+                                asset.bytes,
+                                origin.as_deref(),
+                            ))
+                        }
+                        ResourceRequest::Appearance(asset_id) => {
+                            let asset =
+                                tauri::async_runtime::block_on(state.appearance.open_asset(
+                                    haven_domain::appearance::AppearanceAssetId::from_uuid(
+                                        asset_id,
+                                    ),
+                                ))?;
+                            Ok::<_, AppError>(response_for_open_file_with_origin_and_cap(
+                                &method,
+                                asset.file,
+                                &asset.path,
+                                range.as_deref(),
+                                origin.as_deref(),
+                                appearance_response_body_cap(asset.kind),
+                            ))
+                        }
                     }
                 })()
                 .unwrap_or_else(|error| resolver_error_response(&error, origin.as_deref()));
@@ -880,6 +1037,8 @@ fn parse_request_resource(uri: &Uri) -> Result<ResourceRequest, ResourceUriError
             Some("artwork") => {
                 parse_artwork_id(uri).map(|(id, variant)| ResourceRequest::Artwork { id, variant })
             }
+            Some("font") => parse_font_id(uri).map(ResourceRequest::Font),
+            Some("appearance") => parse_canonical_resource_id(uri).map(ResourceRequest::Appearance),
             Some("stream") => parse_stream_request(uri)
                 .map(|(id, target, version)| ResourceRequest::Stream(id, target, version)),
             _ => Err(ResourceUriError::InvalidAuthority),
@@ -902,6 +1061,10 @@ fn parse_request_resource(uri: &Uri) -> Result<ResourceRequest, ResourceUriError
         }
         Some("haven-resource.artwork") => {
             parse_artwork_id(uri).map(|(id, variant)| ResourceRequest::Artwork { id, variant })
+        }
+        Some("haven-resource.font") => parse_font_id(uri).map(ResourceRequest::Font),
+        Some("haven-resource.appearance") => {
+            parse_canonical_resource_id(uri).map(ResourceRequest::Appearance)
         }
         Some("haven-resource.stream") => parse_stream_request(uri)
             .map(|(id, target, version)| ResourceRequest::Stream(id, target, version)),
@@ -1031,10 +1194,47 @@ fn comic_method_not_allowed_response(origin: Option<&str>) -> Response<Vec<u8>> 
 /// bytes and metadata.
 fn response_for_open_file_with_origin(
     method: &Method,
+    file: File,
+    path: &Path,
+    range_header: Option<&str>,
+    origin: Option<&str>,
+) -> Response<Vec<u8>> {
+    response_for_open_file_with_origin_and_cap(
+        method,
+        file,
+        path,
+        range_header,
+        origin,
+        MAX_RESPONSE_BYTES,
+    )
+}
+
+/// 外观资产一次响应允许读进内存的字节数。
+///
+/// 资产种类上限（字体 / 静态壁纸 32 MiB、动态壁纸 256 MiB）是**存储**约束：它说的是
+/// 「这个文件可以有多大」，不是「一次响应可以分配多少内存」。整文件 GET 会把正文整个
+/// 读进一个 `Vec`，把 256 MiB 当作合法响应等于假装那次分配是安全的。
+///
+/// 因此这里取两者的较小值：整文件读取收敛到 [`MAX_RESPONSE_BYTES`]，更大的动态壁纸交给
+/// WebView 的 `<video>` 用 `Range` 分段取（`bytes=0-` 这类开放区间同样按这个上限截断，
+/// 后续分段继续请求）。代价是「不带 Range 的整文件 GET」对超过 32 MiB 的动态壁纸会得到
+/// 413——这是明确的取舍，而不是把上限写成 256 MiB 再假装内存不是问题。
+fn appearance_response_body_cap(kind: haven_domain::appearance::AppearanceAssetKind) -> u64 {
+    kind.max_bytes().min(MAX_RESPONSE_BYTES)
+}
+
+/// 同一套受控文件响应，但允许调用方声明自己的最大响应体积。
+///
+/// 传进来的 `max_response_bytes` 同时决定三件事：整文件 GET 是否放行、`bytes=-N` 后缀
+/// 区间是否被截断、以及为正文 `Vec::with_capacity` 预留多少。因此它是一条**内存**上限，
+/// 不只是「读取多少字节」的提示（见 [`appearance_response_body_cap`]）。
+fn response_for_open_file_with_origin_and_cap(
+    method: &Method,
     mut file: File,
     path: &Path,
     range_header: Option<&str>,
     origin: Option<&str>,
+    max_response_bytes: u64,
 ) -> Response<Vec<u8>> {
     if method != Method::GET && method != Method::HEAD {
         return method_not_allowed_response(origin);
@@ -1050,11 +1250,11 @@ fn response_for_open_file_with_origin(
     };
     let range = range.map(|mut range| {
         if range_header.is_some_and(|header| header.trim_end().ends_with('-'))
-            && range.len() > MAX_RESPONSE_BYTES
+            && range.len() > max_response_bytes
         {
             range.end = range
                 .start
-                .saturating_add(MAX_RESPONSE_BYTES.saturating_sub(1))
+                .saturating_add(max_response_bytes.saturating_sub(1))
                 .min(total.saturating_sub(1));
         }
         range
@@ -1065,7 +1265,7 @@ fn response_for_open_file_with_origin(
     };
 
     // HEAD has no body, so the response body cap applies to actual reads only.
-    if method == Method::GET && content_length > MAX_RESPONSE_BYTES {
+    if method == Method::GET && content_length > max_response_bytes {
         return error_response(413, true, None, origin);
     }
 
@@ -1274,6 +1474,31 @@ fn artwork_response(
         artwork.bytes
     };
     response(200, &headers, body)
+}
+
+// ---------- 受控导入字体资源（BE-INTERFACE-FONT-001） ----------
+
+/// 字体字节只能来自 `interface_font_assets`（迁移 045）。
+///
+/// 与 artwork 同一形状：URL 里只有 opaque id，MIME 由数据库列决定（闭合集合），
+/// `nosniff` 阻止 WebView 把响应重新解释成别的类型。id 在导入时生成、
+/// 删除时整行移除，因此内容对同一 id 恒定（`Cache-Control` 可长缓存）。
+fn font_response(mime_type: &str, bytes: Vec<u8>, origin: Option<&str>) -> Response<Vec<u8>> {
+    // 数据库 CHECK 已把 mime 限制在三种字体类型；这里再兜一次，
+    // 让任何越界值退化为不可执行的 `application/octet-stream`（配合 nosniff 失败关闭）。
+    let mime = match mime_type {
+        "font/ttf" | "font/otf" | "font/woff2" => mime_type,
+        _ => "application/octet-stream",
+    };
+    let mut headers = vec![
+        ("Content-Length", bytes.len().to_string()),
+        ("Content-Type", mime.to_owned()),
+        ("X-Content-Type-Options", "nosniff".to_owned()),
+        ("Cache-Control", "private, max-age=2592000".to_owned()),
+        ("Vary", "Origin".to_owned()),
+    ];
+    push_allowed_origin(&mut headers, origin);
+    response(200, &headers, bytes)
 }
 
 // ---------- 远端流代理（V2-B 实战批次；契约 §36.4） ----------
@@ -2336,6 +2561,62 @@ mod tests {
         );
     }
 
+    /// 导入字体资源只接受规范小写 UUID：地址里不得出现文件名、扩展名或任何路径成分。
+    #[test]
+    fn font_uri_accepts_only_canonical_opaque_ids() {
+        const ASSET_ID: &str = "0f8f7a2c-1b3d-4e5f-8a90-1c2d3e4f5a60";
+        let native = format!("haven-resource://font/{ASSET_ID}")
+            .parse::<Uri>()
+            .unwrap();
+        assert_eq!(
+            parse_request_resource(&native).unwrap(),
+            ResourceRequest::Font(ASSET_ID.to_owned())
+        );
+
+        // Windows WebView 的兼容形态映射到同一请求。
+        let compat = format!("http://haven-resource.font/{ASSET_ID}")
+            .parse::<Uri>()
+            .unwrap();
+        assert_eq!(
+            parse_request_resource(&compat).unwrap(),
+            ResourceRequest::Font(ASSET_ID.to_owned())
+        );
+
+        for invalid in [
+            "haven-resource://font/not-a-uuid",
+            // 大写 UUID 不是规范形式（同一资产只能有一个地址）。
+            "haven-resource://font/0F8F7A2C-1B3D-4E5F-8A90-1C2D3E4F5A60",
+            // 不允许把文件名或扩展名塞进地址。
+            "haven-resource://font/Example.ttf",
+            "haven-resource://font/../secret",
+            "haven-resource://font/0f8f/extra",
+            "haven-resource://font/0f8f7a2c-1b3d-4e5f-8a90-1c2d3e4f5a60?w=200",
+            "haven-resource://other/0f8f7a2c-1b3d-4e5f-8a90-1c2d3e4f5a60",
+        ] {
+            let uri = invalid.parse::<Uri>().unwrap();
+            assert!(parse_request_resource(&uri).is_err(), "accepted {invalid}");
+        }
+    }
+
+    /// 越界 MIME 必须退化为不可执行的类型（配合 `nosniff` 失败关闭）。
+    #[test]
+    fn font_response_never_echoes_an_unlisted_mime() {
+        let allowed = font_response("font/woff2", b"woff".to_vec(), None);
+        assert_eq!(allowed.status().as_u16(), 200);
+        assert_eq!(allowed.headers().get("content-type").unwrap(), "font/woff2");
+        assert_eq!(
+            allowed.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert!(allowed.headers().get("accept-ranges").is_none());
+
+        let rejected = font_response("text/html", b"<script>".to_vec(), None);
+        assert_eq!(
+            rejected.headers().get("content-type").unwrap(),
+            "application/octet-stream"
+        );
+    }
+
     #[test]
     fn byte_ranges_cover_three_forms_and_rejections() {
         assert_eq!(parse_byte_range(None, 10), Ok(None));
@@ -2395,6 +2676,42 @@ mod tests {
             assert!(
                 parse_remote_byte_range(Some(header)).is_err(),
                 "accepted {header}"
+            );
+        }
+    }
+
+    #[test]
+    fn appearance_uri_accepts_only_canonical_asset_ids() {
+        let id = Uuid::new_v4();
+        let native = format!("haven-resource://appearance/{id}")
+            .parse::<Uri>()
+            .unwrap();
+        assert_eq!(
+            parse_request_resource(&native).unwrap(),
+            ResourceRequest::Appearance(id)
+        );
+
+        let windows = format!("http://haven-resource.appearance/{id}")
+            .parse::<Uri>()
+            .unwrap();
+        assert_eq!(
+            parse_request_resource(&windows).unwrap(),
+            ResourceRequest::Appearance(id)
+        );
+
+        for invalid in [
+            format!(
+                "haven-resource://appearance/{}",
+                id.to_string().to_uppercase()
+            ),
+            format!("haven-resource://appearance/{}", id.simple()),
+            format!("haven-resource://appearance/{id}?x=1"),
+            format!("haven-resource://appearance/{id}/extra"),
+        ] {
+            let uri = invalid.parse::<Uri>().unwrap();
+            assert!(
+                parse_request_resource(&uri).is_err(),
+                "should reject {invalid}"
             );
         }
     }
@@ -2830,6 +3147,58 @@ mod tests {
         );
     }
 
+    /// 动态壁纸的种类上限是 256 MiB，但**内存**上限不是它：一次无 Range 的 GET 必须被
+    /// 收敛到单次响应上限，而不是因为「这个文件是一份合法资产」就一次性分配 256 MiB。
+    #[test]
+    fn appearance_assets_are_bounded_by_memory_not_by_the_kind_limit() {
+        use haven_domain::appearance::AppearanceAssetKind;
+
+        let dynamic = AppearanceAssetKind::DynamicWallpaper;
+        assert!(
+            dynamic.max_bytes() > MAX_RESPONSE_BYTES,
+            "本用例的前提是动态壁纸的种类上限确实大于单次响应上限"
+        );
+        assert_eq!(appearance_response_body_cap(dynamic), MAX_RESPONSE_BYTES);
+        // 字体与静态壁纸的种类上限本来就在单次响应上限之内，取值不变。
+        assert_eq!(
+            appearance_response_body_cap(AppearanceAssetKind::Font),
+            AppearanceAssetKind::Font.max_bytes()
+        );
+        assert_eq!(
+            appearance_response_body_cap(AppearanceAssetKind::StaticWallpaper),
+            AppearanceAssetKind::StaticWallpaper.max_bytes()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallpaper.mp4");
+        let file = File::create(&path).unwrap();
+        // 40 MiB：一份合法的动态壁纸（远小于 256 MiB），但大于单次响应上限。
+        file.set_len(MAX_RESPONSE_BYTES + 8 * 1024 * 1024).unwrap();
+
+        let response = response_for_open_file_with_origin_and_cap(
+            &Method::GET,
+            File::open(&path).unwrap(),
+            &path,
+            None,
+            None,
+            appearance_response_body_cap(dynamic),
+        );
+        assert_eq!(response.status().as_u16(), 413);
+        assert!(response.body().is_empty());
+
+        // Range 路径照常工作，并被同一条上限截断：更大的壁纸由 WebView 分段取。
+        let response = response_for_open_file_with_origin_and_cap(
+            &Method::GET,
+            File::open(&path).unwrap(),
+            &path,
+            Some("bytes=0-"),
+            None,
+            appearance_response_body_cap(dynamic),
+        );
+        assert_eq!(response.status().as_u16(), 206);
+        assert_eq!(response.body().len() as u64, MAX_RESPONSE_BYTES);
+    }
+
     #[test]
     fn subtitle_response_is_bounded_and_does_not_offer_ranges() {
         let (_dir, path) = file_with(b"1\n00:00:00,000 --> 00:00:01,000\nhello\n", "srt");
@@ -2861,9 +3230,20 @@ mod tests {
     fn mime_allowlist_is_narrow() {
         assert_eq!(mime_for_extension(".MP4"), "video/mp4");
         assert_eq!(mime_for_extension("webp"), "image/webp");
+        // GIF 资源必须以 image/gif 出去；octet-stream + nosniff 会让 WebView 拒绝把它
+        // 当图片渲染。
+        assert_eq!(mime_for_extension("gif"), "image/gif");
+        assert_eq!(mime_for_extension(".GIF"), "image/gif");
+        assert_eq!(mime_for_path(Path::new("wallpaper.gif")), "image/gif");
         assert_eq!(mime_for_extension("TXT"), "text/plain; charset=utf-8");
         assert_eq!(mime_for_extension("exe"), "application/octet-stream");
         assert_eq!(mime_for_path(Path::new("cover.JPEG")), "image/jpeg");
+        // 导入字体：与迁移 045 的 mime_type 闭合集合一致（大小写不敏感）。
+        assert_eq!(mime_for_extension("ttf"), "font/ttf");
+        assert_eq!(mime_for_extension(".OTF"), "font/otf");
+        assert_eq!(mime_for_extension("WOFF2"), "font/woff2");
+        // 同族的容器格式不在可服务集合内。
+        assert_eq!(mime_for_extension("ttc"), "application/octet-stream");
     }
 
     #[test]
@@ -3123,5 +3503,17 @@ mod tests {
                 .as_str(),
             "SESSION_STALE"
         );
+    }
+
+    #[test]
+    fn resolver_maps_cloud_object_changed_to_conflict() {
+        let error = AppError::new(
+            "CLOUD_OBJECT_CHANGED",
+            ErrorKind::Conflict,
+            "云盘文件已在远端变更，请重新导入后再打开",
+            true,
+        );
+        let response = resolver_error_response(&error, None);
+        assert_eq!(response.status().as_u16(), 409);
     }
 }

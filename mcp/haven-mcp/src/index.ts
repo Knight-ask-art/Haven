@@ -27,7 +27,7 @@ async function main(): Promise<void> {
 
   const bridge = selection.bridge;
   if (bridge.available) {
-    logInfo(`Haven 桥接已接通（kind=${bridge.kind}）。`);
+    logInfo(bridge.statusDetail);
   } else {
     // 仍然启动：只读工具会给出稳定错误，而 `get_system_capabilities` 能如实报告
     // "为什么现在什么都做不了"。直接退出会让客户端只看到"server 启动失败"，

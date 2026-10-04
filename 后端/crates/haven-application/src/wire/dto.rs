@@ -6,6 +6,16 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use haven_common::AppError;
+use haven_domain::appearance::{
+    AppearanceAssetKind, AppearanceAssetMetadata, AssetValidationState, HomeLayout, HomeModuleId,
+    HomeModulePlacement, HomeModuleSize, OverviewLayout, OverviewModuleId, OverviewModulePlacement,
+    OverviewModuleSize,
+};
+use haven_domain::reading_activity::{
+    ReadingCategoryTotal, ReadingDailyBucket, ReadingHeatmapCell, ReadingOverview,
+    ReadingOverviewRange, ReadingSessionCategory,
+};
 use haven_domain::settings::{
     ComicDirection, ComicPageGap, ComicPatch, ComicPreloadPages, ComicSettings, ComicViewMode,
     PreferenceData, ReadingContentWidth, ReadingFontFamily, ReadingFontSize, ReadingFontWeight,
@@ -2749,6 +2759,9 @@ pub struct SourceDescriptorDto {
     pub health: SourceHealthDto,
     /// 用户自填端点（CMS10/M3U）是否已配置；端点本身不出 IPC。
     pub endpoint_configured: bool,
+    /// 该来源是否已写入系统凭据（OPDS 密码 / Komga、Kavita API key）。
+    /// 只投影“有/无”，secret 与 target 永远不出 IPC。
+    pub credential_configured: bool,
     /// 健康探测：最后检测时间（RFC3339），无探测为 null。
     pub last_checked: Option<String>,
     /// 最后一次探测延迟（毫秒），无探测为 null。
@@ -2808,18 +2821,47 @@ pub struct SourceEndpointSetResult {
     pub endpoint_configured: bool,
 }
 
-/// `source_add`：新增自定义 OPDS 书源（V2-H 收尾批次）。
-/// 凭据不随本请求提交；先 add 再 `source_set_credential`（secret 单独走 keyring）。
+/// `source_add` 新增来源的种类。缺省（旧请求）按 OPDS 处理，保持既有行为不变。
+///
+/// 该枚举在 `SourceAddRequest.kind` 上以字面量联合类型进入 wire：单一事实源仍是
+/// 本文件，但登记新的类型别名需要同时改动生成清单（`wire::generate`），本切片
+/// 不越界改动生成器，因此这里刻意不加 `#[ts(export)]`，也不单独生成绑定文件。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum SourceAddKindDto {
+    /// 自定义 OPDS 书库（图书；搜索 + 受控 EPUB 正文）。
+    #[default]
+    Opds,
+    /// 用户登记的 RSS 2.0 / Atom 订阅源（报刊文章）。
+    Feed,
+    /// 用户登记的自托管 Komga 漫画库（漫画；搜索 + 章节在线逐页 + CBZ 下载）。
+    Komga,
+    /// 用户登记的自托管 Kavita 漫画库（漫画；搜索 + 章节在线逐页 + CBZ 下载）。
+    Kavita,
+}
+
+/// `source_add`：新增自定义来源（V2-H 收尾批次；Task 1 增补 kind；Task 2 增补
+/// 自托管漫画库）。凭据不随本请求提交；先 add 再 `source_set_credential`
+/// （secret 单独走 keyring）。
+/// RSS/Atom 订阅源不接受凭据，端点必须使用 HTTPS 且不能带查询串；
+/// Komga/Kavita 端点同样必须使用 HTTPS 且不能带查询串，API key 只经请求头注入。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, rename_all = "camelCase")]
 pub struct SourceAddRequest {
     pub display_name: String,
-    /// OPDS 根目录 URL（http/https 绝对地址）；响应不含端点本身。
+    /// OPDS 根目录 URL（http/https 绝对地址）、RSS/Atom 订阅源地址或 Komga/
+    /// Kavita 漫画库地址（后两者仅 https，不含查询串）；响应不含端点本身。
     pub endpoint: String,
+    /// 来源种类；缺省为 `opds`，与新增该字段之前的请求保持向后兼容。
+    #[serde(default)]
+    #[ts(optional, type = "\"opds\" | \"feed\" | \"komga\" | \"kavita\"")]
+    pub kind: SourceAddKindDto,
 }
 
-/// `source_add` 结果：返回稳定 sourceId（`custom_` 前缀），端点不出 IPC。
+/// `source_add` 结果：返回稳定 sourceId（OPDS 为 `custom_`、RSS/Atom 为
+/// `custom_feed_`、Komga 为 `custom_komga_`、Kavita 为 `custom_kavita_` 前缀），
+/// 端点不出 IPC。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, rename_all = "camelCase")]
@@ -4242,6 +4284,719 @@ pub struct AgentSettingsProposalGetResultDto {
     pub receipt: Option<AgentSettingChangeReceiptDto>,
 }
 
+// ---------- 应用外观（Appearance；契约 §12、045/046） ----------
+//
+// 外观切片的 wire 只有两类东西：**不透明资产身份**与**闭合的布局事实**。
+// 这里没有任何字段能承载路径、URL 或原始文件名——文件来源只由后端 Native 文件
+// 选择器决定，资产字节由受控存储按 ID 解析。
+
+/// 外观资产种类（闭合集合；与 045 的 `appearance_assets.kind` 同集合）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum AppearanceAssetKindDto {
+    Font,
+    StaticWallpaper,
+    DynamicWallpaper,
+}
+
+impl From<AppearanceAssetKind> for AppearanceAssetKindDto {
+    fn from(value: AppearanceAssetKind) -> Self {
+        match value {
+            AppearanceAssetKind::Font => Self::Font,
+            AppearanceAssetKind::StaticWallpaper => Self::StaticWallpaper,
+            AppearanceAssetKind::DynamicWallpaper => Self::DynamicWallpaper,
+        }
+    }
+}
+
+impl From<AppearanceAssetKindDto> for AppearanceAssetKind {
+    fn from(value: AppearanceAssetKindDto) -> Self {
+        match value {
+            AppearanceAssetKindDto::Font => Self::Font,
+            AppearanceAssetKindDto::StaticWallpaper => Self::StaticWallpaper,
+            AppearanceAssetKindDto::DynamicWallpaper => Self::DynamicWallpaper,
+        }
+    }
+}
+
+/// 资产校验状态（闭合集合）。只有 `validated` 代表字节真的通过了后端校验，
+/// 未校验的资产不得被渲染。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum AppearanceAssetValidationStateDto {
+    Pending,
+    Validated,
+    Rejected,
+}
+
+impl From<AssetValidationState> for AppearanceAssetValidationStateDto {
+    fn from(value: AssetValidationState) -> Self {
+        match value {
+            AssetValidationState::Pending => Self::Pending,
+            AssetValidationState::Validated => Self::Validated,
+            AssetValidationState::Rejected => Self::Rejected,
+        }
+    }
+}
+
+/// 外观资产投影。
+///
+/// 这里**没有**路径、URL 或原始文件名：资产身份是不透明 `assetId`，字节由后端受控
+/// 存储按 ID 解析。`displayName` 是用户可读的展示名（后端已修剪并校验），不是文件
+/// 系统上的名字，也不能反向推导出文件位置。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AppearanceAssetDto {
+    pub asset_id: String,
+    pub kind: AppearanceAssetKindDto,
+    pub state: AppearanceAssetValidationStateDto,
+    // 字节长度的 wire 形态是 JSON **number**，不是 bigint：ts-rs 默认把 Rust 的 `u64` 标成
+    // TypeScript 的 `bigint`，而 IPC 载荷走 JSON —— `JSON.parse` 从来不产生 bigint。
+    // 标注必须与真实载荷一致，否则前端拿到的是一个编译得过、运行时对不上的类型。
+    // （资产种类上限 256 MiB，远小于 2^53，number 表达得了全部合法取值。）
+    //
+    // 这段是**实现口径**而非 wire 契约（契约由下面的 `#[ts(type = ...)]` 本身表达），
+    // 因此写成普通注释：`///` 会被 ts-rs 原样搬进生成的 wire.ts。
+    #[ts(type = "number")]
+    pub byte_size: u64,
+    pub display_name: Option<String>,
+}
+
+impl From<AppearanceAssetMetadata> for AppearanceAssetDto {
+    fn from(value: AppearanceAssetMetadata) -> Self {
+        Self {
+            asset_id: value.id.to_string(),
+            kind: value.kind.into(),
+            state: value.state.into(),
+            byte_size: value.byte_size,
+            display_name: value.display_name,
+        }
+    }
+}
+
+/// 资产列表请求；`kind` 为 `null` 表示不按种类过滤。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AppearanceAssetsListRequest {
+    pub kind: Option<AppearanceAssetKindDto>,
+}
+
+/// 资产列表投影（页面 Read Model）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AppearanceAssetsDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub assets: Vec<AppearanceAssetDto>,
+}
+
+/// 资产导入请求。
+///
+/// 这里**没有路径字段**，而且未知字段会被拒绝：WebView 既无法提交裸路径，也无法借
+/// 多写一个 `path`/`url` 字段把文件来源换成任意位置——文件只能由后端 Native 文件
+/// 选择器选定，伪造的字段会在反序列化边界直接失败。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AppearanceAssetImportRequest {
+    pub kind: AppearanceAssetKindDto,
+    /// 可选展示名；`null` 表示不设置展示名（空字符串会被后端归一化为 `null`）。
+    pub display_name: Option<String>,
+}
+
+/// 资产删除请求（只有不透明资产 ID）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AppearanceAssetDeleteRequest {
+    pub asset_id: String,
+}
+
+/// 资产删除结果。
+///
+/// 两部分事实分开报告：`deleted` 是「登记行是否被删除」（资产是否存在、也是读路径的
+/// 唯一依据）；`fileRemoved` 是「字节是否同时清理成功」。登记行先删，所以
+/// `deleted && !fileRemoved` 只意味着留下一个没有任何登记引用的垃圾文件，
+/// 不会是「列表里有、字节没有」的不可用资产。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AppearanceAssetDeleteResultDto {
+    pub deleted: bool,
+    pub file_removed: bool,
+}
+
+/// 首页模块 ID（闭合集合）。
+///
+/// 逐项写出 wire 值而不是用 `rename_all`：`shelf-favorites` 是**连字符**，会被
+/// `snake_case` 悄悄改成下划线（那会变成另一个模块 ID，与 HomeService 的 `shelf_id` 不一致）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub enum HomeModuleIdDto {
+    #[serde(rename = "continue")]
+    #[ts(rename = "continue")]
+    Continue,
+    #[serde(rename = "recently_added")]
+    #[ts(rename = "recently_added")]
+    RecentlyAdded,
+    #[serde(rename = "shelf-favorites")]
+    #[ts(rename = "shelf-favorites")]
+    ShelfFavorites,
+}
+
+impl From<HomeModuleId> for HomeModuleIdDto {
+    fn from(value: HomeModuleId) -> Self {
+        match value {
+            HomeModuleId::Continue => Self::Continue,
+            HomeModuleId::RecentlyAdded => Self::RecentlyAdded,
+            HomeModuleId::ShelfFavorites => Self::ShelfFavorites,
+        }
+    }
+}
+
+impl From<HomeModuleIdDto> for HomeModuleId {
+    fn from(value: HomeModuleIdDto) -> Self {
+        match value {
+            HomeModuleIdDto::Continue => Self::Continue,
+            HomeModuleIdDto::RecentlyAdded => Self::RecentlyAdded,
+            HomeModuleIdDto::ShelfFavorites => Self::ShelfFavorites,
+        }
+    }
+}
+
+/// 首页模块档位（闭合集合）。档位决定模块在网格里占几列。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum HomeModuleSizeDto {
+    Small,
+    Medium,
+    Large,
+}
+
+impl From<HomeModuleSize> for HomeModuleSizeDto {
+    fn from(value: HomeModuleSize) -> Self {
+        match value {
+            HomeModuleSize::Small => Self::Small,
+            HomeModuleSize::Medium => Self::Medium,
+            HomeModuleSize::Large => Self::Large,
+        }
+    }
+}
+
+impl From<HomeModuleSizeDto> for HomeModuleSize {
+    fn from(value: HomeModuleSizeDto) -> Self {
+        match value {
+            HomeModuleSizeDto::Small => Self::Small,
+            HomeModuleSizeDto::Medium => Self::Medium,
+            HomeModuleSizeDto::Large => Self::Large,
+        }
+    }
+}
+
+/// 首页模块放置：模块、档位与网格**起始格**坐标。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct HomeModulePlacementDto {
+    pub module: HomeModuleIdDto,
+    pub size: HomeModuleSizeDto,
+    pub row: u16,
+    pub column: u16,
+    pub order: u16,
+}
+
+impl From<HomeModulePlacement> for HomeModulePlacementDto {
+    fn from(value: HomeModulePlacement) -> Self {
+        Self {
+            module: value.module.into(),
+            size: value.size.into(),
+            row: value.row,
+            column: value.column,
+            order: value.order,
+        }
+    }
+}
+
+/// 反序列化后的放置**必须**重新过一遍领域的坐标/跨度校验：DTO 的 `u16` 只保证类型，
+/// 不保证落在固定网格内，越界坐标要在进入领域之前就被拒绝。
+impl TryFrom<HomeModulePlacementDto> for HomeModulePlacement {
+    type Error = AppError;
+
+    fn try_from(value: HomeModulePlacementDto) -> Result<Self, Self::Error> {
+        Self::new(
+            value.module.into(),
+            value.size.into(),
+            value.row,
+            value.column,
+            value.order,
+        )
+    }
+}
+
+/// 首页布局。空 `modules` 是合法的显式自定义（用户隐藏了全部模块），
+/// 与「从未保存过」是两种不同事实（后者由 `revision` 为 `null` 表达）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct HomeLayoutDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub modules: Vec<HomeModulePlacementDto>,
+}
+
+impl From<HomeLayout> for HomeLayoutDto {
+    fn from(value: HomeLayout) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            modules: value.modules.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// 写入路径同样走领域的全局校验（模块唯一、占用格子不重叠、排序号唯一、schema 版本），
+/// wire 层不重复实现这套规则，也不放宽它。
+impl TryFrom<HomeLayoutDto> for HomeLayout {
+    type Error = AppError;
+
+    fn try_from(value: HomeLayoutDto) -> Result<Self, Self::Error> {
+        let modules = value
+            .modules
+            .into_iter()
+            .map(HomeModulePlacement::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::new(value.schema_version, modules)
+    }
+}
+
+/// 首页布局读取结果。`revision` 为 `null` 表示**从未保存过**自定义布局，此时
+/// `layout` 是领域默认布局；它与「保存了空布局」（`revision` 非 null 且 `modules` 为空）
+/// 是两种不同事实。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct HomeLayoutSnapshotDto {
+    pub layout: HomeLayoutDto,
+    pub revision: Option<String>,
+}
+
+/// 首页布局写入请求。`expectedRevision` 是上一次读取到的 revision；从未保存过时必须
+/// 回传 `null`。对不上 → `REVISION_CONFLICT`（零写入）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct HomeLayoutSaveRequest {
+    pub expected_revision: Option<String>,
+    pub layout: HomeLayoutDto,
+}
+
+/// 首页布局重置请求（回到领域默认布局，删除已保存的自定义）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct HomeLayoutResetRequest {
+    pub expected_revision: Option<String>,
+}
+
+/// 首页布局写入结果。`changed` 为 `false` 表示请求的布局与已保存的规范形态一致
+/// （幂等重放），此时 `revision` 不变。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct HomeLayoutMutationResultDto {
+    pub layout: HomeLayoutDto,
+    pub revision: Option<String>,
+    pub changed: bool,
+}
+
+// ---------- 设置页总览布局（Appearance；048） ----------
+//
+// 与上面的首页布局是两组**平行但独立**的 wire 类型：网格列数（3 对 4）、闭合模块集合
+// 与档位跨度都不同，存储表与 revision 也各自独立。刻意不复用 HomeLayout* 类型——一旦
+// 复用，为其中一侧放宽跨度或改列数就会静默改掉另一侧的合法输入集合，而 wire 层是
+// 「前端能提交什么」的唯一闸门。
+
+/// 总览模块 ID（闭合集合）。
+///
+/// 逐项写出 wire 值而不是用 `rename_all`：`reading-minutes` / `type-share` /
+/// `reading-heatmap` 都是**连字符**，`snake_case` 会把它们悄悄改成下划线（那会变成
+/// 另一个模块 ID，与 048 迁移的 CHECK 不再一致）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub enum OverviewModuleIdDto {
+    #[serde(rename = "preferences")]
+    #[ts(rename = "preferences")]
+    Preferences,
+    #[serde(rename = "metrics")]
+    #[ts(rename = "metrics")]
+    Metrics,
+    #[serde(rename = "reading-minutes")]
+    #[ts(rename = "reading-minutes")]
+    ReadingMinutes,
+    #[serde(rename = "type-share")]
+    #[ts(rename = "type-share")]
+    TypeShare,
+    #[serde(rename = "reading-heatmap")]
+    #[ts(rename = "reading-heatmap")]
+    ReadingHeatmap,
+}
+
+impl From<OverviewModuleId> for OverviewModuleIdDto {
+    fn from(value: OverviewModuleId) -> Self {
+        match value {
+            OverviewModuleId::Preferences => Self::Preferences,
+            OverviewModuleId::Metrics => Self::Metrics,
+            OverviewModuleId::ReadingMinutes => Self::ReadingMinutes,
+            OverviewModuleId::TypeShare => Self::TypeShare,
+            OverviewModuleId::ReadingHeatmap => Self::ReadingHeatmap,
+        }
+    }
+}
+
+impl From<OverviewModuleIdDto> for OverviewModuleId {
+    fn from(value: OverviewModuleIdDto) -> Self {
+        match value {
+            OverviewModuleIdDto::Preferences => Self::Preferences,
+            OverviewModuleIdDto::Metrics => Self::Metrics,
+            OverviewModuleIdDto::ReadingMinutes => Self::ReadingMinutes,
+            OverviewModuleIdDto::TypeShare => Self::TypeShare,
+            OverviewModuleIdDto::ReadingHeatmap => Self::ReadingHeatmap,
+        }
+    }
+}
+
+/// 总览模块档位（闭合集合）。档位决定模块在**三列**网格里占几列。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum OverviewModuleSizeDto {
+    Small,
+    Medium,
+    Large,
+}
+
+impl From<OverviewModuleSize> for OverviewModuleSizeDto {
+    fn from(value: OverviewModuleSize) -> Self {
+        match value {
+            OverviewModuleSize::Small => Self::Small,
+            OverviewModuleSize::Medium => Self::Medium,
+            OverviewModuleSize::Large => Self::Large,
+        }
+    }
+}
+
+impl From<OverviewModuleSizeDto> for OverviewModuleSize {
+    fn from(value: OverviewModuleSizeDto) -> Self {
+        match value {
+            OverviewModuleSizeDto::Small => Self::Small,
+            OverviewModuleSizeDto::Medium => Self::Medium,
+            OverviewModuleSizeDto::Large => Self::Large,
+        }
+    }
+}
+
+/// 总览模块放置：模块、档位与三列网格的**起始格**坐标。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct OverviewModulePlacementDto {
+    pub module: OverviewModuleIdDto,
+    pub size: OverviewModuleSizeDto,
+    pub row: u16,
+    pub column: u16,
+    pub order: u16,
+}
+
+impl From<OverviewModulePlacement> for OverviewModulePlacementDto {
+    fn from(value: OverviewModulePlacement) -> Self {
+        Self {
+            module: value.module.into(),
+            size: value.size.into(),
+            row: value.row,
+            column: value.column,
+            order: value.order,
+        }
+    }
+}
+
+/// 反序列化后的放置**必须**重新过一遍领域的坐标/跨度校验：DTO 的 `u16` 只保证类型，
+/// 不保证落在三列网格内，越界坐标要在进入领域之前就被拒绝。
+impl TryFrom<OverviewModulePlacementDto> for OverviewModulePlacement {
+    type Error = AppError;
+
+    fn try_from(value: OverviewModulePlacementDto) -> Result<Self, Self::Error> {
+        Self::new(
+            value.module.into(),
+            value.size.into(),
+            value.row,
+            value.column,
+            value.order,
+        )
+    }
+}
+
+/// 总览布局。空 `modules` 是合法的显式自定义（用户隐藏了全部模块），与「从未保存过」
+/// 是两种不同事实（后者由 `revision` 为 `null` 表达）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct OverviewLayoutDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub modules: Vec<OverviewModulePlacementDto>,
+}
+
+impl From<OverviewLayout> for OverviewLayoutDto {
+    fn from(value: OverviewLayout) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            modules: value.modules.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// 写入路径同样走领域的全局校验（模块唯一、占用格子不重叠、排序号唯一、schema 版本），
+/// wire 层不重复实现这套规则，也不放宽它。
+impl TryFrom<OverviewLayoutDto> for OverviewLayout {
+    type Error = AppError;
+
+    fn try_from(value: OverviewLayoutDto) -> Result<Self, Self::Error> {
+        let modules = value
+            .modules
+            .into_iter()
+            .map(OverviewModulePlacement::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::new(value.schema_version, modules)
+    }
+}
+
+/// 总览布局读取结果。`revision` 为 `null` 表示从未保存过自定义布局，此时 `layout` 是
+/// 领域默认布局；它与「保存了空布局」是两种不同事实。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct OverviewLayoutSnapshotDto {
+    pub layout: OverviewLayoutDto,
+    pub revision: Option<String>,
+}
+
+/// 总览布局写入请求。`expectedRevision` 是上一次读取到的 revision；从未保存过时必须回传
+/// `null`。对不上 → `REVISION_CONFLICT`（零写入）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct OverviewLayoutSaveRequest {
+    pub expected_revision: Option<String>,
+    pub layout: OverviewLayoutDto,
+}
+
+/// 总览布局重置请求（回到领域默认布局，删除已保存的自定义）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct OverviewLayoutResetRequest {
+    pub expected_revision: Option<String>,
+}
+
+/// 总览布局写入结果。`changed` 为 `false` 表示请求的布局与已保存的规范形态一致
+/// （幂等重放），此时 `revision` 不变。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct OverviewLayoutMutationResultDto {
+    pub layout: OverviewLayoutDto,
+    pub revision: Option<String>,
+    pub changed: bool,
+}
+
+// ---------- 阅读总览（Reading Overview；契约 §12） ----------
+//
+// 这一节只投影**已持久化的会话事实**（`reading_sessions`）的聚合结果：每一分钟都能
+// 回溯到一条真实闭合的会话，不从 HistoryEntry 的时间戳或条目数量反推。
+//
+// 空事实的表达方式是「零计数 + `null` 统计量 + 空集合」，而不是 0 分钟：
+// `sessionCount == 0` 时 `categories` / `heatmapCells` 为空，`peakStartHour` /
+// `peakEndHour` 与三个可选统计量都是 `null`，页面据此显示「无」。
+// `daily` 仍然每个窗口日一条（未阅读的日子时长为 0）——它描述的是**窗口本身**
+// （哪些天落在范围内是确定的），不是观察到的阅读，所以它不是伪造出来的统计量。
+
+/// 阅读总览 wire 形态的版本号（与其它只读投影一样是字面量 `1`）。
+pub const READING_OVERVIEW_SCHEMA_VERSION: u32 = 1;
+
+/// 会话归属的一级分类（无 `all`：一次真实会话必然属于某一类）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum ReadingSessionCategoryDto {
+    Video,
+    Book,
+    Comic,
+    Periodical,
+}
+
+impl From<ReadingSessionCategory> for ReadingSessionCategoryDto {
+    fn from(value: ReadingSessionCategory) -> Self {
+        match value {
+            ReadingSessionCategory::Video => Self::Video,
+            ReadingSessionCategory::Book => Self::Book,
+            ReadingSessionCategory::Comic => Self::Comic,
+            ReadingSessionCategory::Periodical => Self::Periodical,
+        }
+    }
+}
+
+/// 总览读取请求：窗口天数 + 显式 UTC 偏移（分钟）。
+///
+/// 偏移由调用方显式给出，而不是后端读运行环境时区：同一份事实在任何机器上都聚合出
+/// 同一份结果，「某个会话属于哪一天/哪个小时」这种边界也就可复现、可测试。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ReadingOverviewGetRequest {
+    pub days: u32,
+    pub utc_offset_minutes: i32,
+}
+
+/// 统计窗口：按请求的 UTC 偏移换算出的本地日期闭区间。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ReadingOverviewRangeDto {
+    pub start_local_date: String,
+    pub end_local_date: String,
+    pub days: u32,
+    pub utc_offset_minutes: i32,
+}
+
+/// 单个本地日的时长（窗口内每一天一条，含未阅读的空日）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ReadingDailyBucketDto {
+    pub local_date: String,
+    /// ISO 星期序号：1 = 周一 … 7 = 周日。
+    pub weekday: u8,
+    #[ts(type = "number")]
+    pub duration_ms: u64,
+}
+
+/// 分类时长合计（只出现在真的有时长的分类上）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ReadingCategoryTotalDto {
+    pub category: ReadingSessionCategoryDto,
+    #[ts(type = "number")]
+    pub duration_ms: u64,
+}
+
+/// 热力图格子（只出现在真的有时长的「星期 × 小时」上）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ReadingHeatmapCellDto {
+    /// ISO 星期序号：1 = 周一 … 7 = 周日。
+    pub weekday: u8,
+    /// 本地小时 0..=23。
+    pub hour: u8,
+    #[ts(type = "number")]
+    pub duration_ms: u64,
+}
+
+/// 总览聚合结果。
+///
+/// 所有字段都是对已持久化会话事实的求和或由它直接导出的结论；没有任何记录时
+/// `sessionCount == 0` 且可选统计量保持 `null`（不是 0）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct ReadingOverviewDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub range: ReadingOverviewRangeDto,
+    #[ts(type = "number")]
+    pub session_count: u64,
+    #[ts(type = "number")]
+    pub total_duration_ms: u64,
+    pub daily: Vec<ReadingDailyBucketDto>,
+    pub categories: Vec<ReadingCategoryTotalDto>,
+    pub heatmap_cells: Vec<ReadingHeatmapCellDto>,
+    /// 高峰时段的起点（本地小时）；窗口内没有任何记录时为 `null`。
+    pub peak_start_hour: Option<u8>,
+    /// 高峰时段的右端点（= 起点 + 1，可能为 24）；无记录时为 `null`。
+    pub peak_end_hour: Option<u8>,
+    /// 窗口内最长的连续活跃阅读天数；无记录时为 `null`。
+    pub longest_streak_days: Option<u32>,
+    #[ts(type = "number | null")]
+    pub average_daily_duration_ms: Option<u64>,
+    #[ts(type = "number | null")]
+    pub recent_week_duration_ms: Option<u64>,
+}
+
+impl From<ReadingOverviewRange> for ReadingOverviewRangeDto {
+    fn from(value: ReadingOverviewRange) -> Self {
+        Self {
+            start_local_date: value.start_local_date,
+            end_local_date: value.end_local_date,
+            days: value.days,
+            utc_offset_minutes: value.utc_offset_minutes,
+        }
+    }
+}
+
+impl From<ReadingDailyBucket> for ReadingDailyBucketDto {
+    fn from(value: ReadingDailyBucket) -> Self {
+        Self {
+            local_date: value.local_date,
+            weekday: value.weekday,
+            duration_ms: value.duration_ms,
+        }
+    }
+}
+
+impl From<ReadingCategoryTotal> for ReadingCategoryTotalDto {
+    fn from(value: ReadingCategoryTotal) -> Self {
+        Self {
+            category: value.category.into(),
+            duration_ms: value.duration_ms,
+        }
+    }
+}
+
+impl From<ReadingHeatmapCell> for ReadingHeatmapCellDto {
+    fn from(value: ReadingHeatmapCell) -> Self {
+        Self {
+            weekday: value.weekday,
+            hour: value.hour,
+            duration_ms: value.duration_ms,
+        }
+    }
+}
+
+impl From<ReadingOverview> for ReadingOverviewDto {
+    fn from(value: ReadingOverview) -> Self {
+        Self {
+            schema_version: READING_OVERVIEW_SCHEMA_VERSION,
+            range: value.range.into(),
+            session_count: value.session_count,
+            total_duration_ms: value.total_duration_ms,
+            daily: value.daily.into_iter().map(Into::into).collect(),
+            categories: value.categories.into_iter().map(Into::into).collect(),
+            heatmap_cells: value.heatmap_cells.into_iter().map(Into::into).collect(),
+            peak_start_hour: value.peak_start_hour,
+            peak_end_hour: value.peak_end_hour,
+            longest_streak_days: value.longest_streak_days,
+            average_daily_duration_ms: value.average_daily_duration_ms,
+            recent_week_duration_ms: value.recent_week_duration_ms,
+        }
+    }
+}
+
 // ---------- 外部 Agent Broker（A5；默认关闭） ----------
 
 /// Broker 当前生命周期状态。它是运行时状态，不是用户授权开关；授权边界仍由
@@ -4466,6 +5221,8 @@ pub struct AiSettingsRecommendationGenerateRequest {
     pub profile_id: String,
     pub session_id: String,
     pub request_id: String,
+    /// 用户明确提交给其配置的 Provider 的建议目标；不持久化，也不写入轨迹。
+    pub user_intent: String,
     pub context_id: String,
     pub context_hash: String,
     pub base_revision: Option<String>,
@@ -4555,4 +5312,123 @@ impl AiProviderModelDto {
             embedding: value.embedding.into(),
         }
     }
+}
+
+// ---------- TVBox / FongMi 配置预览（Film/TV Provider 基础切片） ----------
+
+/// 配置声明的第三方实现种类（闭合集合）。
+///
+/// 识别到即代表「运行需要第三方代码」；本切片只标记，不下载、不加载、不执行。
+//
+// Rust 侧说明（不进 wire 契约）：`JavaScript` 手写稳定值 `javascript`，因为
+// `rename_all = "snake_case"` 会把它拆成 `java_script`——那不是任何权威实现使用的
+// 名字，不能成为契约值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename_all = "snake_case")]
+pub enum TvboxConfigImplementationKindDto {
+    /// `.jar`（TVBox Spider 容器）。
+    Jar,
+    /// `.js`（远程 JavaScript）。
+    #[serde(rename = "javascript")]
+    #[ts(rename = "javascript")]
+    JavaScript,
+    /// `.py`（远程 Python）。
+    Python,
+    /// `.json`（spider 清单，不是可执行代码）。
+    JsonManifest,
+    /// 有 references 但无法从形态判断；保持未识别，不猜语义。
+    Unidentified,
+}
+
+/// `tvbox_config_preview` 请求：待预览的配置地址。
+///
+/// 请求里只有用户输入的地址本身，没有 header、凭据或保存意图。
+//
+// Rust 侧说明（不进 wire 契约）：该类型刻意不 derive `Debug`，而是手工实现成常量。
+// 地址可能带 token，任何日志、panic 或错误包装都不得打印出原文。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct TvboxConfigPreviewRequest {
+    pub url: String,
+}
+
+impl std::fmt::Debug for TvboxConfigPreviewRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TvboxConfigPreviewRequest { url: <redacted> }")
+    }
+}
+
+/// `tvbox_config_preview` 响应：配置的**形态摘要**。
+///
+/// 只含计数、形态分类、固定白名单字段名与第三方实现种类；不含配置地址、原始 JSON、
+/// 站点端点、header 值、`ext` 内容、Cookie、Token 或任何凭据。数字 `type` 的语义
+/// **不做解释**：站点分类只依据 `api` 的形态，未确认的形态只计入
+/// `unclassifiedSiteCount`，不声明支持也不声明不支持。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct TvboxConfigPreviewDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub site_count: u32,
+    pub live_count: u32,
+    pub parser_count: u32,
+    pub skipped_site_rows: u32,
+    pub skipped_live_rows: u32,
+    pub skipped_parser_rows: u32,
+    pub spider_configured: bool,
+    pub spider_kind: Option<TvboxConfigImplementationKindDto>,
+    pub spider_has_integrity_digest: bool,
+    /// `api` 是 http(s) 端点的站点数（协议细节本轮不判定）。
+    pub http_endpoint_site_count: u32,
+    /// `api` 使用 spider 协议前缀的站点数（运行需要第三方代码，本轮不执行）。
+    pub spider_site_count: u32,
+    /// 证据不足、无法从形态归类的站点数。保留原文，不猜语义。
+    pub unclassified_site_count: u32,
+    /// 已识别但本轮未结构化的顶层字段名（`wallpaper` / `rules` / `flags` / `doh` /
+    /// `ads` / `logo` / `epg` / `danmaku` 的固定白名单子集）。
+    pub opaque_top_level_field_names: Vec<String>,
+    /// 未识别顶层字段的**条数**；字段名与取值都不回传。
+    pub unrecognized_top_level_field_count: u32,
+    /// 因条数上限被丢弃的顶层字段数（不静默：调用方能看到有东西没被保留）。
+    pub withheld_top_level_field_count: u32,
+}
+
+/// `tvbox_config_save` 请求：用户为一份 TVBox / FongMi 配置起的显示名与配置地址。
+///
+/// 请求里只有用户输入：没有 header、没有凭据，也没有任何配置内容。地址可能带访问
+/// 令牌，因此它只出现在请求方向上，响应里没有它。
+//
+// Rust 侧说明（不进 wire 契约）：该类型刻意不 derive `Debug`，而是手工实现成常量。
+// 地址可能带 token，任何日志、panic 或错误包装都不得打印出原文。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct TvboxConfigSaveRequest {
+    pub display_name: String,
+    pub url: String,
+}
+
+impl std::fmt::Debug for TvboxConfigSaveRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TvboxConfigSaveRequest { display_name: <redacted>, url: <redacted> }")
+    }
+}
+
+/// `tvbox_config_save` 响应：稳定来源 ID + 配置的**形态摘要**。
+///
+/// 摘要与 `tvbox_config_preview` 响应是同一个形状：不含配置地址、原始 JSON、站点
+/// 端点、header 值、`ext` 内容、Cookie、Token 或任何凭据。来源被登记后**默认停用**，
+/// 启用状态由来源注册表持有，本响应不重复声明。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct TvboxConfigSaveResult {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    /// 由来源注册表生成的稳定 `custom_tvbox_` 前缀 sourceId。
+    pub source_id: String,
+    pub preview: TvboxConfigPreviewDto,
 }

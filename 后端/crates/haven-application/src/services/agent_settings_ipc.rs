@@ -1062,6 +1062,15 @@ pub(crate) mod tests {
             state.settings.insert(section.to_owned(), row.clone());
             Ok(true)
         }
+
+        /// 这个替身没有资产表：外观资产引用一律引用不上（如实返回 `None`），
+        /// 这里的用例只覆盖 reading 分区的提案应用。
+        fn validated_appearance_asset_kind(
+            &self,
+            _id: haven_domain::appearance::AppearanceAssetId,
+        ) -> Result<Option<haven_domain::appearance::AppearanceAssetKind>, AppError> {
+            Ok(None)
+        }
     }
 
     impl SettingProposalTxPorts for FakeTx<'_> {

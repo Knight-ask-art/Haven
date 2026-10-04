@@ -186,7 +186,7 @@ authoritative 设置仍保存真实值，MCP v1 不暴露 Receipt 读取或 Appl
 | --- | --- | --- |
 | `HAVEN_BRIDGE_UNAVAILABLE` | Haven 运行时桥接没接通（默认关闭、端点未配置或 Haven 未运行） | 如实说明 + 给手动路径；确认 Broker 已开启且端点配置正确后再试。 |
 | `HAVEN_CAPABILITY_UNAVAILABLE` | 当前 Haven 版本没有开放该能力 | 如实说明。**重试无用**，不要换工具凑近似答案。 |
-| `HAVEN_BRIDGE_TIMEOUT` | 桥接超时 | 可重试；告知用户"应用可能正忙"。 |
+| `HAVEN_BRIDGE_TIMEOUT` | 桥接超时，操作结果可能尚未确认 | 不要自动重试。先检查栖阅中是否已有待审批提案；确认没有后，再由用户决定是否重新提交。 |
 | `HAVEN_BRIDGE_PROTOCOL_ERROR` | 桥接返回了不符合契约的载荷 | 视为实现缺陷，如实报告，不要解释成用户输入问题。 |
 | `INVALID_ARGUMENT` | 输入不合法（字段名、取值、锚点格式） | 自己改正后重试一次；仍失败就把字段名报给用户。 |
 | `HAVEN_RESPONSE_TOO_LARGE` | 响应超限且无法收缩 | 用更小的 `limit` 或更窄的条件重试。 |

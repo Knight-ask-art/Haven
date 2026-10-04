@@ -7,4 +7,8 @@
  * `baseRevision` 必须来自最近一次 authoritative 上下文读取，最终仍停在
  * `pending` Proposal，不包含任何 Apply / Approval / Token 字段。
  */
-export type AiSettingsRecommendationGenerateRequest = { profileId: string, sessionId: string, requestId: string, contextId: string, contextHash: string, baseRevision: string | null, };
+export type AiSettingsRecommendationGenerateRequest = { profileId: string, sessionId: string, requestId: string, 
+/**
+ * 用户明确提交给其配置的 Provider 的建议目标；不持久化，也不写入轨迹。
+ */
+userIntent: string, contextId: string, contextHash: string, baseRevision: string | null, };

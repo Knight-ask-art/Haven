@@ -6,23 +6,40 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait = "0.1.92"
+# PKCE 的 base64url（无填充）编码。0.23.1 本来就在 Cargo.lock 里（此前是本 crate 的
+# dev-dependency），提升为普通依赖只增加一条依赖边，不新增包，--offline / --locked 可用。
+base64 = "0.23"
 fast-webp = { version = "=0.1.1", default-features = false, features = ["image"] }
 fs2 = "0.4.3"
-haven-application = { version = "0.1.0-beta.1", path = "../haven-application" }
+haven-application = { version = "0.1.0", path = "../haven-application" }
 haven-common = { path = "../haven-common" }
 haven-domain = { path = "../haven-domain" }
-reqwest = { workspace = true }
+# workspace 的 reqwest 关掉了默认特性，因此不含任何压缩解码器。TVBox / FongMi 配置
+# 的托管方普遍按 `Accept-Encoding` 协商 gzip / Brotli，若服务端返回压缩正文而本 crate
+# 无法解码，`chunk()` 拿到的就是压缩字节，JSON 解析会以「非法 JSON」失败——那是可见的
+# 能力缺口，不是安全问题。这里只为本 crate 打开 `gzip` 与 `brotli` 两组解码特性：
+# Cargo 的特性是并集，其它 crate 的 Cargo.toml 不变，只是同一次构建里 reqwest 会多编
+# 几个解码器。`Accept-Encoding` 由 reqwest 自动补，模块自身仍然只发 GET、不带任何调用
+# 方 header。解码在 reqwest 的正文流内部完成，`chunk()` 已经给出解码后的字节，所以
+# 正文大小上限天然落在**解码后**的字节上。
+reqwest = { workspace = true, features = ["gzip", "brotli"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = "1.0.229"
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 # 大文件全量哈希走 spawn_blocking（审查 P1-1）；与 haven-application 同版本。
+# 结构化编辑用户客户端配置里的 `[mcp_servers.haven]`（`~/.codex/config.toml`）。
+#
+# 版本刻意定在 0.20.2：它**已经**在 workspace 的 Cargo.lock 里（由其它依赖间接引入），
+# 因此提升为直接依赖只是在本 crate 的依赖列表里加一条边，不会新增任何包——`--offline`
+# 与 `--locked` 的构建流程都不需要联网或重新解析版本。
+toml_edit = "0.20.2"
 tokio = { version = "1.53.1", features = ["rt", "fs", "io-util", "sync", "net", "time", "macros"] }
 uuid = { version = "1.24.0", features = ["v4"] }
 walkdir = "2.5.0"
 axum = { version = "0.8", features = ["json"] }
 mdns-sd = "0.21"
-quick-xml = { version = "0.42", features = ["serialize"] }
+quick-xml = { version = "0.41", features = ["serialize"] }
 rfd = "0.17"
 if-addrs = "0.15"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
@@ -33,8 +50,14 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2
 
 [target."cfg(windows)".dependencies]
 keyring-core = "1.0.0"
+# `Win32_Security` / `Win32_Security_Authorization` 是**纯模块开关**（`windows` crate 里
+# 每个 feature 只是 `["Win32"]` 的一层，不牵扯任何可选依赖），因此这两条不会给
+# Cargo.lock 增加包、也不需要重新解析版本：0.62.2 本来就是这个 crate 的直接依赖。
+# 用途：替换用户客户端配置时**保留原文件的 DACL**（见 src/mcp_client_config.rs）。
 windows = { version = "=0.62.2", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_System_Com",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
@@ -42,7 +65,6 @@ windows = { version = "=0.62.2", features = [
 windows-native-keyring-store = "1.1.0"
 
 [dev-dependencies]
-base64 = "0.23"
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
 uuid = { version = "1.24.0", features = ["v7"] }

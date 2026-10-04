@@ -381,6 +381,7 @@ function guardSourceRegistry(dto: unknown): dto is SourceRegistryDto {
     if (typeof s.enabled !== "boolean") fail("SourceDescriptorDto.enabled", s);
     if (!SOURCE_HEALTHS.includes(s.health as string)) fail("SourceDescriptorDto.health 闭合枚举", s);
     if (typeof s.endpointConfigured !== "boolean") fail("SourceDescriptorDto.endpointConfigured", s);
+    if (typeof s.credentialConfigured !== "boolean") fail("SourceDescriptorDto.credentialConfigured", s);
     for (const forbidden of ["endpointUrl", "endpoint", "url", "credentialRef"]) {
       if (Object.prototype.hasOwnProperty.call(s, forbidden)) fail(`来源描述符禁止 ${forbidden}`, s);
     }

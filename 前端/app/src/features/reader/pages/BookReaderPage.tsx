@@ -30,7 +30,7 @@ import {
 import { PdfReader } from "../components/PdfReader"
 import type { PdfDocumentSource } from "../lib/pdf-document"
 import { useReadingSettings } from "../lib/use-reading-settings"
-import { resolveReadingPresentation } from "../lib/reading-settings-mapping"
+import { READING_FONT_CLASSES, READING_THEME_PRESENTATION, resolveReadingCustomAppearance, resolveReadingCustomRender, resolveReadingPresentation, type ReaderTheme } from "../lib/reading-settings-mapping"
 import { resolveBookReaderHeaderContext } from "../lib/book-reader-header"
 import { bookMarkerLocator, createMarker, deleteMarker, listMarkers } from "@/features/markers/ipc/marker-gateway"
 import type { MarkerDto, TocItemDto } from "@/lib/ipc/generated/wire"
@@ -55,7 +55,6 @@ import {
   type BookPaginationViewport,
 } from "../lib/book-pagination"
 
-type ReaderTheme = "paper" | "warm" | "slate" | "dark" | "sepia" | "eyeCare" | "custom"
 type FontFamily = "sans" | "serif" | "kai" | "heiti" | "fangsong" | "mianfei" | "custom"
 type ColumnWidth = "narrow" | "medium" | "wide"
 type ReaderLineHeight = "compact" | "comfortable" | "airy"
@@ -329,6 +328,10 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
     ? state.session.editionId
     : undefined
   const { settings: readingSettings, status: readingSettingsStatus, scopeKey: readingSettingsScopeKey } = useReadingSettings(mediaItemId, preferenceEditionId)
+  // 自定义配色/字体族的取值来自设置，但 theme/fontFamily 以会话内状态为准（阅读器
+  // 工具栏允许临时切换），所以这里只固定设置侧的校验结果，实际渲染值在下面按当前
+  // 状态组合；设置读取失败时用的是安全默认值，校验后自然是「未设置」。
+  const readingCustomAppearance = useMemo(() => resolveReadingCustomAppearance(readingSettings), [readingSettings])
 
   const [theme, setTheme] = useState<ReaderTheme>("warm")
   const [fontFamily, setFontFamily] = useState<FontFamily>("serif")
@@ -441,16 +444,10 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
     contentErrorMessage: contentState.status === "retryable_error" || contentState.status === "terminal_error" ? contentState.error.message : null,
   })
 
-  const themeClass = {
-    paper: "bg-[#fcfcfc] text-[#1d1d1f]",
-    warm: "bg-[#f5efe3] text-[#3c332b]",
-    slate: "bg-[#292a2d] text-[#e3e3e8]",
-    dark: "bg-[#0f0f11] text-[#d4d4d8]",
-    sepia: "bg-[#f4ecd8] text-[#5b4636]",
-    eyeCare: "bg-[#cce8cc] text-[#2e4a2e]",
-    custom: "bg-[#f5efe3] text-[#3c332b]",
-  }[theme]
-  const isDark = theme === "slate" || theme === "dark"
+  const themeClass = READING_THEME_PRESENTATION[theme].className
+  const readingCustom = resolveReadingCustomRender(theme, fontFamily, readingCustomAppearance)
+  // 自定义的深色背景同样需要深色外壳（页头/抽屉/工具面板），所以不能只看主题枚举。
+  const isDark = readingCustom.darkShell
   // 会话内工具栏调整优先于全局设置；全局 Reading 只负责首次加载时的初始值。
   const contentWidthPx = columnWidth === "narrow" ? 620 : columnWidth === "wide" ? 820 : 700
   const contentWidth = `${contentWidthPx}px`
@@ -516,6 +513,11 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
       fontSize: `${fontSize}px`,
       lineHeight: contentLineHeight,
     }
+  // FONT_CLASSES 只有预设类名；选了自定义字体时用 inline style 叠加真实族名，
+  // 字体名未设置或未通过校验时不加这个属性，正文回落到预设类名。
+  const articleFontStyle: CSSProperties = readingCustom.fontFamilyCss
+    ? { ...articleStyle, fontFamily: readingCustom.fontFamilyCss }
+    : articleStyle
 
   useEffect(() => {
     recordDemoBookReaderHistory(clientMode, storageId, recordHistory)
@@ -1167,7 +1169,10 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
   }
 
   return (
-    <div className={cn("relative h-[100dvh] min-h-screen w-full overflow-hidden transition-colors duration-500", themeClass)}>
+    <div
+      className={cn("relative h-[100dvh] min-h-screen w-full overflow-hidden transition-colors duration-500", themeClass)}
+      style={readingCustom.colors ? { backgroundColor: readingCustom.colors.backgroundColor, color: readingCustom.colors.color } : undefined}
+    >
       <header className={cn(
         "fixed inset-x-0 top-0 z-50 flex h-[68px] items-center justify-between border-b px-5 backdrop-blur-2xl transition-all duration-500 sm:px-[32px]",
         isDark ? "border-white/10 bg-[#18181b]/80" : "border-black/[0.07] bg-white/80",
@@ -1267,7 +1272,7 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
           pdfProgressControllerRef.current?.locatorChange(locator)
         }} className="h-full overflow-y-auto" />}
         {contentReady && !pdfSource && <div ref={readerScrollRef} style={readerFrameStyle} className={cn("h-full overscroll-contain scroll-smooth [scrollbar-width:none] [&::-webkit-scrollbar]:hidden", isTextPagination ? "overflow-x-auto overflow-y-hidden" : "overflow-x-hidden overflow-y-auto")} aria-label={isTextPagination ? "图书分页阅读区" : "图书纵向阅读区"}>
-          <article ref={articleRef} className={cn("mx-auto w-full select-text pb-[128px] pt-14 sm:pt-[80px]", isTextPagination ? "px-6" : "px-6 sm:px-10", FONT_CLASSES[fontFamily], isTextPagination && "break-inside-avoid")} style={articleStyle}>
+          <article ref={articleRef} className={cn("mx-auto w-full select-text pb-[128px] pt-14 sm:pt-[80px]", isTextPagination ? "px-6" : "px-6 sm:px-10", FONT_CLASSES[fontFamily], isTextPagination && "break-inside-avoid")} style={articleFontStyle}>
             <header className="break-inside-avoid border-b border-current/15 pb-[48px]">
               <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-primary">{demoRuntime ? demoPresentation.label : "BOOK · LOCAL READER"}</p>
               <h1 className="mt-6 text-4xl font-semibold leading-[1.08] tracking-[-0.055em] sm:text-6xl">{bookTitle}</h1>
@@ -1350,15 +1355,7 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
   )
 }
 
-const FONT_CLASSES: Record<FontFamily, string> = {
-  sans: "font-sans",
-  serif: "font-serif",
-  kai: "font-serif italic",
-  heiti: "font-sans font-bold",
-  fangsong: "font-serif",
-  mianfei: "font-sans",
-  custom: "font-sans",
-}
+const FONT_CLASSES: Record<FontFamily, string> = READING_FONT_CLASSES
 
 function readBookmarks(key: string): BookmarkType[] {
   try {

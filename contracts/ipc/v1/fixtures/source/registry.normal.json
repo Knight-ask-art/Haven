@@ -10,7 +10,8 @@
       "notes": "公开影视资料 API，支持剧集标题搜索。",
       "enabled": false,
       "health": "unknown",
-      "endpointConfigured": false
+      "endpointConfigured": false,
+      "credentialConfigured": false
     },
     {
       "sourceId": "bangumi",
@@ -21,7 +22,8 @@
       "notes": "公开作品资料 API，支持动画与漫画标题搜索。",
       "enabled": true,
       "health": "ok",
-      "endpointConfigured": false
+      "endpointConfigured": false,
+      "credentialConfigured": false
     },
     {
       "sourceId": "anilist",
@@ -32,7 +34,8 @@
       "notes": "公开 GraphQL 资料 API，支持动画与漫画标题搜索。",
       "enabled": false,
       "health": "unknown",
-      "endpointConfigured": false
+      "endpointConfigured": false,
+      "credentialConfigured": false
     },
     {
       "sourceId": "itunes",
@@ -43,7 +46,8 @@
       "notes": "Apple 公开剧集季搜索 API，支持剧集标题搜索。",
       "enabled": false,
       "health": "unknown",
-      "endpointConfigured": false
+      "endpointConfigured": false,
+      "credentialConfigured": false
     },
     {
       "sourceId": "mangadex",
@@ -54,7 +58,8 @@
       "notes": "公开漫画 API，支持漫画搜索、章节在线阅读和下载 CBZ。",
       "enabled": true,
       "health": "unknown",
-      "endpointConfigured": false
+      "endpointConfigured": false,
+      "credentialConfigured": false
     },
     {
       "sourceId": "gutenberg",
@@ -65,7 +70,8 @@
       "notes": "Gutenberg 公开 OPDS 图书 API，支持书名搜索。",
       "enabled": false,
       "health": "unknown",
-      "endpointConfigured": false
+      "endpointConfigured": false,
+      "credentialConfigured": false
     },
     {
       "sourceId": "archive",
@@ -76,7 +82,8 @@
       "notes": "公开图书资料搜索 API，限定文本类条目，提供作品标题和描述。",
       "enabled": false,
       "health": "unknown",
-      "endpointConfigured": false
+      "endpointConfigured": false,
+      "credentialConfigured": false
     },
     {
       "sourceId": "opds_gutenberg",
@@ -87,7 +94,8 @@
       "notes": "公开 OPDS 图书目录，搜索后可在线读取 EPUB，也可下载保存。",
       "enabled": false,
       "health": "unknown",
-      "endpointConfigured": true
+      "endpointConfigured": true,
+      "credentialConfigured": false
     },
     {
       "sourceId": "arxiv",
@@ -98,7 +106,8 @@
       "notes": "公开 Atom API，支持学术文章搜索、在线 PDF（服务端支持范围读取时）和下载。",
       "enabled": true,
       "health": "unknown",
-      "endpointConfigured": false
+      "endpointConfigured": false,
+      "credentialConfigured": false
     },
     {
       "sourceId": "europepmc",
@@ -109,7 +118,8 @@
       "notes": "开放获取文章搜索、在线安全全文和 HTML 快照下载。",
       "enabled": true,
       "health": "unknown",
-      "endpointConfigured": false
+      "endpointConfigured": false,
+      "credentialConfigured": false
     },
     {
       "sourceId": "wikisource",
@@ -120,7 +130,8 @@
       "notes": "中文公版文本搜索、在线安全正文和 HTML 快照下载。",
       "enabled": true,
       "health": "unknown",
-      "endpointConfigured": false
+      "endpointConfigured": false,
+      "credentialConfigured": false
     },
     {
       "sourceId": "crossref",
@@ -131,7 +142,8 @@
       "notes": "公开 DOI 元数据 API，支持期刊与文章搜索。",
       "enabled": false,
       "health": "unknown",
-      "endpointConfigured": false
+      "endpointConfigured": false,
+      "credentialConfigured": false
     },
     {
       "sourceId": "openalex",
@@ -142,7 +154,8 @@
       "notes": "公开学术作品 API，支持文章、期刊和作者元数据搜索。",
       "enabled": false,
       "health": "unknown",
-      "endpointConfigured": false
+      "endpointConfigured": false,
+      "credentialConfigured": false
     },
     {
       "sourceId": "cms10",
@@ -153,7 +166,8 @@
       "notes": "聚合来源：配置采集接口后可搜索、在线播放并按需下载视频。",
       "enabled": false,
       "health": "unknown",
-      "endpointConfigured": true
+      "endpointConfigured": true,
+      "credentialConfigured": false
     },
     {
       "sourceId": "m3u",
@@ -164,7 +178,8 @@
       "notes": "聚合来源：配置 M3U 地址后可按频道名称搜索。",
       "enabled": false,
       "health": "down",
-      "endpointConfigured": false
+      "endpointConfigured": false,
+      "credentialConfigured": false
     }
   ]
 }

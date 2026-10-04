@@ -189,5 +189,41 @@ describe("四个客户端共用的 MCP 连接模板", () => {
     expect(AGENT_BROKER_TEMPLATE_NOTE).toContain("approve")
     expect(AGENT_BROKER_TEMPLATE_NOTE).toContain("apply")
     expect(AGENT_BROKER_TEMPLATE_NOTE).toContain("栖阅")
+    // 说明必须把"路径是占位符、产物不随包分发、客户端未实测"三件事说全——少了任何一条，
+    // 这段 JSON 都会被读成"复制粘贴就能连上"。
+    expect(AGENT_BROKER_TEMPLATE_NOTE).toContain("<path-to-haven>")
+    expect(AGENT_BROKER_TEMPLATE_NOTE).toContain("占位符")
+    expect(AGENT_BROKER_TEMPLATE_NOTE).toContain("不会替你安装")
+    expect(AGENT_BROKER_TEMPLATE_NOTE).toContain("verified: false")
+    for (const falseClaim of ["自动安装", "自动写入", "已实测", "开箱即用"]) {
+      expect(AGENT_BROKER_TEMPLATE_NOTE).not.toContain(falseClaim)
+    }
+  })
+
+  it("把「复制模板」与「一键配置」分成两条路径，并各自说对前置条件", () => {
+    const note = AGENT_BROKER_TEMPLATE_NOTE
+
+    // 复制模板这一条：自建产物，前置条件是**本机** Node，版本必须与
+    // mcp/haven-mcp/package.json 的 engines 一致。这里曾经写着 ≥ 20，而 engines 是
+    // ≥ 22.12.0——照着旧文案准备环境的人会在 npm test 上撞墙。
+    expect(note).toContain("22.12.0")
+    expect(note).not.toContain("Node ≥ 20")
+    // 模板本身不写任何配置，也不替用户安装产物。
+    expect(note).toContain("不会替你安装")
+    expect(note).toContain("不会写入任何客户端配置")
+
+    // 一键配置那一条**必须被单独点明**：它是另一条路径，由用户主动点击触发，写的是随包
+    // 分发的运行时（因此用户机上不需要 Node），且只写授权范围内的那一条固定条目。
+    // 少了这一段，这段 JSON 会被读成"栖阅不碰客户端配置"或"一键配置也是复制粘贴"。
+    expect(note).toContain("一键配置")
+    expect(note).toContain("主动点击")
+    expect(note).toContain("随安装包分发")
+    expect(note).toContain("不需要 Node")
+    expect(note).toContain("固定 MCP 条目")
+    expect(note).toContain("不是同一条命令")
+
+    // 审批边界与"未实测"的警告一个字都不能少。
+    expect(note).toContain("由你审批")
+    expect(note).toContain("verified: false")
   })
 })

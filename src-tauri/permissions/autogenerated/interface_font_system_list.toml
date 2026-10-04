@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-interface-font-system-list"
+description = "Enables the interface_font_system_list command without any pre-configured scope."
+commands.allow = ["interface_font_system_list"]
+
+[[permission]]
+identifier = "deny-interface-font-system-list"
+description = "Denies the interface_font_system_list command without any pre-configured scope."
+commands.deny = ["interface_font_system_list"]

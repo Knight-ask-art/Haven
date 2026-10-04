@@ -5,7 +5,11 @@
 //! 两条平台规则都在这里落地，**不伪造**：
 //! - Windows：首实例用 **`CreateNamedPipeW` + `SECURITY_ATTRIBUTES`** 创建，DACL 只含
 //!   当前用户 SID 的一个 ACE。后续实例传 null 安全属性——同一 pipe 的所有实例共享
-//!   首实例的安全描述符（MSDN 语义），因此只需构造一次。
+//!   首实例的安全描述符（MSDN 语义），因此只需构造一次。模式位里带
+//!   **`PIPE_REJECT_REMOTE_CLIENTS`**，远程（SMB）客户端在内核里就被拒绝；这一位由
+//!   Windows `platform` 模块里的 `pipe_mode()` 定义，并由测试直接在真实模式上断言
+//!   （见该函数的文档；这里刻意不写成文档链接——`platform` 是按平台裁剪的私有模块，
+//!   链接在别的平台上解析不到）。
 //! - Unix：先在每用户 runtime 根下以 `0700` 建目录，再取 **每用户活实例锁**
 //!   （`flock(LOCK_EX | LOCK_NB)`，锁文件 `0600`），然后 `bind`，最后把 socket 置为
 //!   `0600`。目录模式已经把"bind 到 chmod 之间的窗口"关掉——其他用户进不到这个目录。
@@ -346,15 +350,21 @@ async fn drive_connection_with_timeouts<S>(
             }
             frame = frame_receiver.recv() => {
                 let Some(frame) = frame else { break; };
-                last_activity = tokio::time::Instant::now();
                 match session.prepare(&frame).await {
                     super::session::Prepared::Immediate(outcome) => {
+                        // **被拒绝的帧不延长空闲期限。** 一次未知帧、一次不合法的载荷、
+                        // 一次重复 `hello` 都不代表这条连接"还在被正常使用"。把每一次拒绝
+                        // 都记成活动，等于让一个只会灌垃圾帧的客户端把连接无限期留住——
+                        // 每帧刷新一次 deadline，空闲上限永远够不着，而它占着的 permit
+                        // 与在途配额也不会释放。真正的活动只有两类：开始一个新请求
+                        // （下面的 Dispatch 分支）与完成一个在途请求（join 分支）。
                         match write_outcome(&mut writer, outcome, timeouts.write).await {
                             Ok(true) | Err(()) => break,
                             Ok(false) => {}
                         }
                     }
                     super::session::Prepared::Dispatch(dispatch) => {
+                        last_activity = tokio::time::Instant::now();
                         let id = dispatch.id;
                         let cancel = session.cancel_receiver(id).await;
                         let session_for_task = session.clone();
@@ -899,6 +909,9 @@ mod platform {
     ///   成立**：后续实例不带该标志，其 `ERROR_ACCESS_DENIED` 归为
     ///   `HAVEN_BROKER_ENDPOINT_UNAVAILABLE`，见 [`classify_create_error`]。
     ///
+    /// 模式位（`dwPipeMode`）与打开模式分成两个函数，是为了让"远程客户端被拒绝"这条
+    /// 安全属性可以被直接断言，而不是只能靠读一遍调用参数来相信它。
+    ///
     /// 句柄以 `FILE_FLAG_OVERLAPPED` 创建后交给 tokio，由它负责异步 `ConnectNamedPipe`。
     fn create_instance(
         name: &str,
@@ -906,15 +919,7 @@ mod platform {
         sid: Option<&str>,
     ) -> Result<NamedPipeServer, BrokerError> {
         use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE};
-        // `PIPE_ACCESS_DUPLEX` 在 windows-sys 里归在 Storage::FileSystem（它是 winbase.h 的
-        // FILE_* 家族），其余 PIPE_* 模式常量在 System::Pipes。
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
-        };
-        use windows_sys::Win32::System::Pipes::{
-            CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
-            PIPE_WAIT,
-        };
+        use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, PIPE_UNLIMITED_INSTANCES};
 
         let wide: Vec<u16> = OsStr::new(name)
             .encode_wide()
@@ -933,16 +938,11 @@ mod platform {
 
         // SAFETY：`wide` 与 `security` 在本调用期间存活；`sa_ptr` 要么为空，要么指向同一
         // 作用域内已初始化的 `SECURITY_ATTRIBUTES`。
-        let open_mode = if first {
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE
-        } else {
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED
-        };
         let handle = unsafe {
             CreateNamedPipeW(
                 wide.as_ptr(),
-                open_mode,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                pipe_open_mode(first),
+                pipe_mode(),
                 PIPE_UNLIMITED_INSTANCES,
                 PIPE_BUFFER_BYTES,
                 PIPE_BUFFER_BYTES,
@@ -965,6 +965,44 @@ mod platform {
                 false,
             )
         })
+    }
+
+    /// `CreateNamedPipeW` 的 `dwOpenMode`。
+    ///
+    /// `PIPE_ACCESS_DUPLEX` 在 windows-sys 里归在 `Storage::FileSystem`（它是 winbase.h 的
+    /// `FILE_*` 家族），而 `FILE_FLAG_*` 也来自同一处。
+    ///
+    /// `pub(super)` 是这里唯一需要的放宽：断言真实模式位的用例住在兄弟模块
+    /// [`super::tests`] 里，而 `platform` 与 `tests` 互不为祖先。父模块内的 `pub(super)`
+    /// 正好覆盖「`platform` + `listener` + `listener` 的后代」，不多不少。
+    pub(super) fn pipe_open_mode(first: bool) -> u32 {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
+        };
+        if first {
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE
+        } else {
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED
+        }
+    }
+
+    /// `CreateNamedPipeW` 的 `dwPipeMode`。
+    ///
+    /// **`PIPE_REJECT_REMOTE_CLIENTS` 是这里的安全属性，不是可选优化。** 名字管道可以被
+    /// 通过 SMB 访问本机的远程客户端打开；少了这一位，只有 DACL 挡在前面。加上它之后，
+    /// 远程客户端的连接请求在内核里就被拒绝，与调用方身份无关——本机 Broker 的任何一条
+    /// 请求路径都不需要来自其它主机的客户端。
+    ///
+    /// 该常量来自 `windows-sys 0.59.0` 的 `Win32::System::Pipes`（与 `PIPE_READMODE_BYTE`
+    /// 等同一模块）；它存在与否由编译与兄弟模块里的
+    /// [`super::tests::pipe_mode_rejects_remote_clients`] 直接断言，文档不单独主张这件事。
+    ///
+    /// `pub(super)` 的理由与 [`pipe_open_mode`] 同：断言它的用例不在 `platform` 内部。
+    pub(super) fn pipe_mode() -> u32 {
+        use windows_sys::Win32::System::Pipes::{
+            PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+        };
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS
     }
 
     /// 持有 ACL 与安全描述符缓冲区（`SECURITY_ATTRIBUTES` 只持裸指针，必须有人保活）。
@@ -1596,6 +1634,43 @@ mod tests {
             .unwrap();
     }
 
+    /// 首帧**解析失败**时，驱动必须回复一条协议错误并立刻断连。
+    ///
+    /// 这条用例钉住的是一处真实的分叉：`BrokerSession::prepare` 的解析失败路径过去只回一条
+    /// 普通 `Reply`，驱动于是把它当成"握手已完成"继续跑主循环——而 `HANDSHAKE_TIMEOUT`
+    /// 只在握手阶段生效，那个连接再也管不到了。一个连上就发垃圾的客户端因此能一直占着
+    /// 连接配额。现在所有非法 / 不完整的首帧都在握手窗口内收尾并释放 permit。
+    #[tokio::test]
+    async fn drive_connection_closes_when_first_frame_is_unparsable() {
+        for first in ["not json at all", "{}", r#"{"type":"nope"}"#] {
+            let (mut client, server) = tokio::io::duplex(8 * 1024);
+            let (_shutdown_tx, handle) = spawn_driver(server);
+
+            client
+                .write_all(&encode_frame(first))
+                .await
+                .expect("写入首帧");
+
+            let reply = read_one(&mut client).await;
+            assert_eq!(reply["type"], "error", "首帧 {first} 必须得到错误回复");
+            assert_eq!(reply["id"], 0, "握手阶段没有成立的请求 id");
+            assert_eq!(reply["error"]["code"], "HAVEN_BROKER_UNKNOWN_FRAME");
+
+            // 回复之后必须断连：再读只会读到 EOF，而不是"连接还开着、等着下一条请求"。
+            let mut buffer = [0u8; 1];
+            let read =
+                tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buffer))
+                    .await
+                    .expect("非法首帧必须立刻断连，而不是留在连接上占配额");
+            assert!(matches!(read, Ok(0) | Err(_)), "期望断连，得到 {read:?}");
+
+            tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+                .await
+                .expect("非法首帧后连接任务必须结束，permit 随之释放")
+                .unwrap();
+        }
+    }
+
     /// 写出超时：对端不读时 welcome 写不出去，驱动必须在短时间内收尾而不是永远卡在写上。
     ///
     /// duplex 容量刻意小于一帧：客户端只发 `hello`、之后**不读**，welcome 会填满缓冲并阻塞，
@@ -1688,6 +1763,77 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), handle)
             .await
             .expect("空闲超时后连接任务必须结束，permit 随之释放")
+            .unwrap();
+    }
+
+    /// 一条**必然被拒绝**的帧：未知类型。`prepare` 会回一条
+    /// `HAVEN_BROKER_UNKNOWN_FRAME` 并**保留**连接——因此这条连接的唯一出路就是空闲超时。
+    fn unknown_frame() -> Vec<u8> {
+        encode_frame(r#"{"type":"nope","id":1}"#)
+    }
+
+    /// **被拒绝的帧不延长空闲期限。**
+    ///
+    /// 回归点：驱动曾经在"收到任意一帧"时就刷新 `last_activity`，`prepare` 判为协议错误的
+    /// 那些帧也算在内。于是一个只会灌垃圾帧的客户端每帧都把 deadline 往后推，空闲上限
+    /// 永远够不着：连接、它的 permit 与在途配额都不会释放，而 Haven 侧看不出任何异常。
+    ///
+    /// 用例只做正向断言：以**远小于**空闲窗口的间隔持续发送被拒绝的帧，连接仍然必须
+    /// 按时收尾。修复前它会一直活着，这条断言会超时失败。
+    #[tokio::test]
+    async fn rejected_frames_do_not_extend_the_idle_deadline() {
+        const IDLE: std::time::Duration = std::time::Duration::from_millis(60);
+        const SPAM: std::time::Duration = std::time::Duration::from_millis(15);
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        // `_shutdown_tx` 必须活到用例结束：drop 它会让连接因停机而不是空闲而结束。
+        let (_shutdown_tx, handle) = spawn_driver_with_timeouts(
+            server,
+            ConnectionTimeouts {
+                idle: IDLE,
+                ..ConnectionTimeouts::default()
+            },
+        );
+
+        client.write_all(&hello_frame()).await.unwrap();
+        assert_eq!(read_one(&mut client).await["type"], "welcome");
+
+        let started = tokio::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(3);
+        let mut closed = false;
+        let mut buffer = [0u8; 512];
+        while tokio::time::Instant::now() < deadline {
+            // 写失败 = 服务端已经收尾，正是我们期望的结果。
+            if client.write_all(&unknown_frame()).await.is_err() {
+                closed = true;
+                break;
+            }
+            // 把错误回复读掉，否则写缓冲会满，驱动会卡在 write 上——那是另一种收尾，
+            // 会让这条用例不再是在验证空闲定时器。
+            match tokio::time::timeout(SPAM, client.read(&mut buffer)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => {
+                    closed = true;
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                Err(_) => {}
+            }
+            tokio::time::sleep(SPAM).await;
+        }
+
+        assert!(
+            closed,
+            "持续发送被拒绝的帧不能把连接一直保活：空闲上限必须仍然够得着"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "收尾必须发生在有界的空闲窗口内，实际用了 {:?}",
+            started.elapsed()
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("拒绝帧不再延长空闲期限后，连接任务必须结束、permit 随之释放")
             .unwrap();
     }
 
@@ -1794,13 +1940,22 @@ mod tests {
         let _serialized = endpoint_test_guard();
 
         let Ok(endpoint) = super::super::endpoint::resolve_endpoint() else {
-            return;
+            panic!("Windows 上端点必须可解析（DACL 用例的前提）");
         };
         let BrokerEndpoint::NamedPipe(name) = &endpoint else {
-            return;
+            panic!("Windows 上端点必须是命名管道");
         };
-        let Ok(listener) = bind(&endpoint).await else {
-            return; // 端点被占用
+        let listener = match bind(&endpoint).await {
+            Ok(listener) => listener,
+            // 本机已有活 Haven 在提供 Broker：环境问题，不是被测行为。
+            Err(error) if error.code() == "HAVEN_BROKER_ENDPOINT_BUSY" => {
+                eprintln!("skip: 端点已被另一个活实例占用（HAVEN_BROKER_ENDPOINT_BUSY）");
+                return;
+            }
+            // 其余绑定失败**不能**静默通过：DACL 构造被拒（例如安全描述符非法）正是走这
+            // 一条路，而"DACL 只授当前用户"恰恰是本用例存在的理由。悄悄 return 会让这条
+            // 断言在真正出问题时显示为绿色。
+            Err(error) => panic!("绑定端点失败，无法断言 DACL：{}", error.code()),
         };
 
         // ---- DACL：恰好一个 ACE，且是当前用户 ----
@@ -1871,6 +2026,46 @@ mod tests {
             }
         }
         drop(first);
+    }
+
+    /// 真实 pipe 的 `dwPipeMode` 必须带 `PIPE_REJECT_REMOTE_CLIENTS`。
+    ///
+    /// 这条断言存在的理由：设计文档过去声称"用 `PIPE_REJECT_REMOTE_CLIENTS` 拒绝 SMB 等
+    /// 远程客户端"，而代码里**没有**这一位——文档描述了一个内核并不执行的保护。现在两者
+    /// 一致，且由这个直接读回模式的用例钉住：谁把这一位去掉，测试立刻失败，而不是等文档
+    /// 与实现再次分叉。
+    ///
+    /// DACL（只含当前用户 SID）仍然是本机侧的另一道控制；两者互补，不能互相替代：
+    /// DACL 管"哪个本机身份"，这一位管"连接是否来自远端主机"。
+    #[cfg(windows)]
+    #[test]
+    fn pipe_mode_rejects_remote_clients() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
+        };
+        use windows_sys::Win32::System::Pipes::PIPE_REJECT_REMOTE_CLIENTS;
+
+        // 这一位必须是真实存在、非零的模式位（`PIPE_TYPE_BYTE` / `PIPE_READMODE_BYTE` /
+        // `PIPE_WAIT` 都是 0，所以"非零且被置上"本身就是有效断言）。
+        assert_ne!(PIPE_REJECT_REMOTE_CLIENTS, 0);
+        let mode = platform::pipe_mode();
+        assert_eq!(
+            mode & PIPE_REJECT_REMOTE_CLIENTS,
+            PIPE_REJECT_REMOTE_CLIENTS,
+            "真实 CreateNamedPipeW 模式必须拒绝远程客户端"
+        );
+
+        // 打开模式：首实例才带 FILE_FLAG_FIRST_PIPE_INSTANCE。
+        assert_ne!(
+            platform::pipe_open_mode(true) & FILE_FLAG_FIRST_PIPE_INSTANCE,
+            0
+        );
+        assert_eq!(
+            platform::pipe_open_mode(false) & FILE_FLAG_FIRST_PIPE_INSTANCE,
+            0,
+            "后续实例不带 FIRST_PIPE_INSTANCE：它的 ERROR_ACCESS_DENIED 有别的含义"
+        );
+        assert_ne!(platform::pipe_open_mode(false) & FILE_FLAG_OVERLAPPED, 0);
     }
 
     /// `ERROR_ACCESS_DENIED` 只在首实例才是「端点已被另一个实例占用」的证据（设计 §7.4）。

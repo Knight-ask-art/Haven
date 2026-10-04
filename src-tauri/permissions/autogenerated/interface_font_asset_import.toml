@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-interface-font-asset-import"
+description = "Enables the interface_font_asset_import command without any pre-configured scope."
+commands.allow = ["interface_font_asset_import"]
+
+[[permission]]
+identifier = "deny-interface-font-asset-import"
+description = "Denies the interface_font_asset_import command without any pre-configured scope."
+commands.deny = ["interface_font_asset_import"]

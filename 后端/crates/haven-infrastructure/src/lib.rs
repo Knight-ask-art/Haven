@@ -1,25 +1,61 @@
 //! haven-infrastructure: 基础设施（SQLite、迁移、凭据存储、本地扫描；后续：HTTP、Storage Provider）。
 
+pub mod agent_skill;
 pub mod ai_provider;
 pub mod app_info;
+pub mod appearance_assets;
+pub mod article_feeds;
 pub mod artwork_cache;
 pub mod cast;
+pub mod cloud_drive;
 pub mod cms10;
 pub mod comic;
+pub mod comic_library_sources;
 pub mod credential;
 pub mod db;
 pub mod download;
 pub mod epub;
 pub mod error_report;
 mod http_security;
+pub mod mcp_client_config;
 pub mod metadata_sources;
 pub mod online_sources;
 pub mod opds;
 pub mod periodical;
 pub mod reader_search;
 pub mod scanner;
+pub mod system_fonts;
 pub mod trending;
+pub mod tvbox_config;
+pub mod tvbox_config_fetch;
 pub mod video_screenshot;
 
 pub use credential::credential_store;
 pub use db::Db;
+
+pub(crate) fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[(byte >> 4) as usize]));
+        encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+    encoded
+}
+
+pub(crate) fn unescape_xml_text(text: &quick_xml::events::BytesText<'_>) -> Option<String> {
+    let decoded = text.xml10_content().ok()?;
+    quick_xml::escape::unescape(&decoded)
+        .ok()
+        .map(|value| value.into_owned())
+}
+
+pub(crate) fn unescape_xml_reference(
+    reference: &quick_xml::events::BytesRef<'_>,
+) -> Option<String> {
+    let decoded = reference.decode().ok()?;
+    let escaped = format!("&{decoded};");
+    quick_xml::escape::unescape(&escaped)
+        .ok()
+        .map(|value| value.into_owned())
+}

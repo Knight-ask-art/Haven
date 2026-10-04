@@ -9,7 +9,12 @@ use async_trait::async_trait;
 use haven_common::{AppError, ErrorKind};
 
 use crate::agent::AgentActionBinding;
+use crate::agent_skill::{AgentSkillEnablement, AgentSkillId};
 use crate::ai_provider::{AiProviderProfile, AiProviderProfileDeleteOutcome};
+use crate::appearance::{
+    AppearanceAssetDeleteOutcome, AppearanceAssetId, AppearanceAssetKind, AppearanceAssetMetadata,
+    HomeLayout, OverviewLayout,
+};
 use crate::comic_catalog::{ComicCatalogRefreshReceipt, ComicChapterCatalogState};
 use crate::comic_identity::{
     ChapterSourceIdentity, ChapterSourceRef, ComicPageIdentitySnapshot,
@@ -22,6 +27,7 @@ use crate::ids::*;
 use crate::periodical::{
     Issn, Periodical, PeriodicalArticle, PeriodicalIssue, PeriodicalPlacement, PeriodicalVolume,
 };
+use crate::reading_activity::ReadingSession;
 use crate::setting_proposal::{SettingChangeReceipt, SettingProposal};
 use crate::settings::PreferenceData;
 
@@ -744,6 +750,36 @@ pub trait AiProviderProfileRepository: Send + Sync {
     ) -> Result<AiProviderProfileDeleteOutcome, AppError>;
 }
 
+/// 内置 Agent Skill 启用状态的持久化契约（`docs/architecture/AI_SYSTEM.md` §6）。
+///
+/// 这是**唯一**的技能启用事实源：不是 localStorage、不是 React 状态、不是内存缓存。
+/// 契约刻意只提供"读全部 / 读一条 / 写一条"三个方法：
+///
+/// - 没有 `enable_all` / `disable_all` 这类批量入口——启用是逐项的用户决定，
+///   提供批量开关就等于提供"一键放行所有技能"。
+/// - 没有"删除"方法：禁用是一条 `enabled = false` 的记录，不是把证据抹掉。
+/// - 写入必须携带内容摘要（见 [`AgentSkillEnablement`]），因此"内容换了"这件事
+///   在数据库层就是可检测的，而不是靠调用方自觉。
+///
+/// 记录里没有正文、没有提示词、没有路径：它只是"某个 id 的某份内容被用户启用过"。
+#[async_trait]
+pub trait AgentSkillStateRepository: Send + Sync {
+    /// 列出全部启用记录（按 `skill_id` 升序）。没有任何记录时返回空数组，不是错误。
+    async fn list(&self) -> Result<Vec<AgentSkillEnablement>, AppError>;
+
+    /// 读取单项；从未写过返回 `None`。
+    async fn get(&self, skill_id: &AgentSkillId) -> Result<Option<AgentSkillEnablement>, AppError>;
+
+    /// 写入一条记录（存在即覆盖）。`updated_at_ms` 只在内容真正变化时更新：
+    /// 重复写同样的 `(skill_id, enabled, instructions_hash)` 是幂等的，
+    /// 不能让 UI 的重复点击伪造出"刚刚改过"的时间线。
+    async fn put(
+        &self,
+        enablement: &AgentSkillEnablement,
+        updated_at_ms: i64,
+    ) -> Result<(), AppError>;
+}
+
 /// Enrichment 流水线状态记录（契约 §36.8）。
 /// 每个 Work 至多一条；匹配失败不回滚扫描，保留原始名并标 failed。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -781,4 +817,196 @@ pub struct SettingsRow {
     pub revision: String,
     pub data_json: String,
     pub updated_at: haven_common::UtcMillis,
+}
+
+/// 本机已安装字体族（BE-INTERFACE-FONT-001）。
+///
+/// 只承载**族名**：枚举结果永不携带文件路径，WebView 与设置 JSON 也永远不接触路径；
+/// `localized_family` 是同一族的中文名（Windows 中文/繁体语言 ID），用于搜索与展示。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemFontFamily {
+    pub family: String,
+    pub localized_family: Option<String>,
+}
+
+/// 只读系统字体目录。实现必须：
+/// - 枚举失败（目录不存在/无权限）时返回空列表或稳定错误，不得 panic；
+/// - 永不返回文件路径；
+/// - 结果去重并按族名排序，保证同一台机器上结果稳定。
+pub trait SystemFontCatalog: Send + Sync {
+    fn list_families(&self) -> Result<Vec<SystemFontFamily>, AppError>;
+}
+
+/// 导入字体文件识别结果（扩展名与 MIME 都来自闭合集合）。
+///
+/// `sha256` 是**内容摘要**（小写十六进制，64 字符），由识别实现一并算出：
+/// 导入去重、持久化列与「同一份文件重复导入复用已有行」都只依赖它，
+/// 因此它必须与 `bytes` 来自同一次读取，不能在别处重算。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectedFont {
+    pub family_name: String,
+    pub extension: String,
+    pub mime_type: String,
+    pub sha256: String,
+}
+
+/// 字体文件边界校验：扩展名、大小、文件签名必须三者自洽，才允许进入持久化。
+/// 实现不得返回路径，也不得把原始字节写入错误信息。
+pub trait FontFileInspector: Send + Sync {
+    fn inspect(&self, file_name: &str, bytes: &[u8]) -> Result<InspectedFont, AppError>;
+}
+
+/// 已导入字体资产的**元数据投影**（不含字节）。
+///
+/// `file_name` 只用于展示与识别，任何路径拼接都不允许使用它；被 WebView 引用与
+/// 写入设置 JSON 的标识只有 opaque `id`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceFontAsset {
+    pub id: String,
+    pub family_name: String,
+    pub file_name: String,
+    pub extension: String,
+    pub mime_type: String,
+    pub byte_size: u64,
+    pub sha256: String,
+    pub created_at: haven_common::UtcMillis,
+}
+
+/// 新导入字体资产的写入载荷（元数据 + 原始字节，一次事务写入）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceFontAssetInsert {
+    pub id: String,
+    pub family_name: String,
+    pub file_name: String,
+    pub extension: String,
+    pub mime_type: String,
+    pub sha256: String,
+    pub bytes: Vec<u8>,
+    pub created_at: haven_common::UtcMillis,
+}
+
+/// 按 opaque id 取回字体字节（仅供 `haven-resource://font/<id>` 使用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceFontAssetBytes {
+    pub id: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+
+/// 导入字体资产仓储（迁移 045）。
+///
+/// 只提供基础原语；「删除时不得删除正在使用的字体」这类跨表不变量由 Application
+/// 层在同一个事务内校验（见 `services/interface_fonts.rs`），Repository 不复制该规则。
+#[async_trait]
+pub trait InterfaceFontAssetRepository: Send + Sync {
+    /// 全部资产元数据，按导入时间倒序（新的在前）。
+    async fn list(&self) -> Result<Vec<InterfaceFontAsset>, AppError>;
+    /// 按 opaque id 读取元数据（不存在返回 None）。
+    async fn get(&self, id: &str) -> Result<Option<InterfaceFontAsset>, AppError>;
+    /// 按内容摘要查重（同文件重复导入复用已有资产）。
+    async fn find_by_digest(&self, sha256: &str) -> Result<Option<InterfaceFontAsset>, AppError>;
+    /// 写入新资产（含字节）。
+    async fn insert(&self, asset: &InterfaceFontAssetInsert) -> Result<(), AppError>;
+    /// 按 opaque id 删除资产（含字节）。不存在返回 false。
+    ///
+    /// 「不得删除正在使用的字体」由 Application 层在同一事务内校验，本方法不复制该规则；
+    /// 允许直接调用它的只有该事务路径与测试。
+    async fn delete(&self, id: &str) -> Result<bool, AppError>;
+    /// 读取字节（不存在返回 None）。
+    async fn load_bytes(&self, id: &str) -> Result<Option<InterfaceFontAssetBytes>, AppError>;
+    /// 资产数量（导入数量上限约束用）。
+    async fn count(&self) -> Result<u32, AppError>;
+}
+
+/// 应用外观 Foundation 持久化契约。
+///
+/// 外观设置本身仍通过 `SettingsRepository` 的 typed `appearance` section 走统一 CAS；
+/// 这里承载不能塞进 settings JSON 的资产元数据、首页布局与总览布局事实。两种布局的
+/// `None` 与 `Some(empty)` 都有意不同：前者表示用户从未自定义，后者表示用户显式隐藏了
+/// 全部模块。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HomeLayoutSnapshot {
+    pub layout: HomeLayout,
+    pub revision: String,
+}
+
+/// 设置页总览布局的持久化快照。
+///
+/// 与 [`HomeLayoutSnapshot`] 是**两个独立事实**（两套网格、两套闭合模块集合、两张表、
+/// 两条 revision）：`None` 与 `Some(empty)` 的区别同样有意保留——前者表示用户从未
+/// 自定义过总览，后者表示用户显式隐藏了全部模块。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverviewLayoutSnapshot {
+    pub layout: OverviewLayout,
+    pub revision: String,
+}
+
+#[async_trait]
+pub trait AppearanceRepository: Send + Sync {
+    async fn get_asset(
+        &self,
+        id: AppearanceAssetId,
+    ) -> Result<Option<AppearanceAssetMetadata>, AppError>;
+    async fn list_assets(
+        &self,
+        kind: Option<AppearanceAssetKind>,
+    ) -> Result<Vec<AppearanceAssetMetadata>, AppError>;
+    async fn create_asset(&self, asset: &AppearanceAssetMetadata) -> Result<(), AppError>;
+    /// 删除资产。实现必须在**同一个数据库写事务**里先判定该资产是否仍被
+    /// `settings.appearance` 引用（`customFontAssetId` / `wallpaper.assetId`）：
+    /// 被引用时零写入并返回 [`AppearanceAssetDeleteOutcome::blocked`]。
+    ///
+    /// 「同一事务」是硬要求，而不是「同一把进程内锁」：判定与删除分成两次独立提交时，
+    /// 另一条连接（第二个窗口、另一个进程）可以在两次提交之间把引用写进去，于是留下
+    /// 一条指向已删除资产的外观设置。反过来，本事务若排在引用写入之前提交，那条写入
+    /// 侧的同事务资产校验会拒绝悬空引用——两侧各占一半，这条缝隙才是闭合的。
+    async fn delete_asset(
+        &self,
+        id: AppearanceAssetId,
+    ) -> Result<AppearanceAssetDeleteOutcome, AppError>;
+
+    async fn get_home_layout(&self) -> Result<Option<HomeLayoutSnapshot>, AppError>;
+    async fn cas_save_home_layout(
+        &self,
+        expected_revision: Option<&str>,
+        layout: &HomeLayout,
+        revision: &str,
+        updated_at: haven_common::UtcMillis,
+    ) -> Result<bool, AppError>;
+    async fn cas_reset_home_layout(
+        &self,
+        expected_revision: Option<&str>,
+    ) -> Result<bool, AppError>;
+
+    /// 读取总览布局；`None` 表示用户从未自定义过总览。
+    async fn get_overview_layout(&self) -> Result<Option<OverviewLayoutSnapshot>, AppError>;
+    /// 以 `expected_revision` 做 CAS 保存总览布局（同一事务内写模块行与 meta 行）。
+    async fn cas_save_overview_layout(
+        &self,
+        expected_revision: Option<&str>,
+        layout: &OverviewLayout,
+        revision: &str,
+        updated_at: haven_common::UtcMillis,
+    ) -> Result<bool, AppError>;
+    /// 以 `expected_revision` 做 CAS 重置总览布局（删除已保存的自定义）。
+    async fn cas_reset_overview_layout(
+        &self,
+        expected_revision: Option<&str>,
+    ) -> Result<bool, AppError>;
+}
+
+/// 阅读活动事实契约：记录已闭合的内容会话，并按 UTC 时间窗读取。
+///
+/// 这一层是「阅读总览」唯一的持久化来源。读取按 `started_at` 落在 `[from, to)`
+/// 的 UTC 半开区间进行——本地日历的换算属于领域聚合，Repository 不做时区判断。
+#[async_trait]
+pub trait ReadingActivityRepository: Send + Sync {
+    /// 记录一次会话。以 `session.id` 为幂等键：重复上报不会产生第二行。
+    async fn record_session(&self, session: &ReadingSession) -> Result<(), AppError>;
+    /// 读取开始时刻落在 `[from, to)` 内的会话，按开始时刻升序。
+    async fn list_sessions_between(
+        &self,
+        from: haven_common::UtcMillis,
+        to: haven_common::UtcMillis,
+    ) -> Result<Vec<ReadingSession>, AppError>;
 }

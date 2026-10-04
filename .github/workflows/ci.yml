@@ -28,6 +28,7 @@ jobs:
       backend: ${{ steps.scope.outputs.backend }}
       tauri: ${{ steps.scope.outputs.tauri }}
       mcp: ${{ steps.scope.outputs.mcp }}
+      skills: ${{ steps.scope.outputs.skills }}
       film_tv: ${{ steps.scope.outputs.film_tv }}
       fixtures: ${{ steps.scope.outputs.fixtures }}
       full: ${{ steps.scope.outputs.full }}
@@ -53,6 +54,7 @@ jobs:
               echo 'backend=true'
               echo 'tauri=true'
               echo 'mcp=true'
+              echo 'skills=true'
               echo 'film_tv=true'
               echo 'fixtures=true'
               echo 'full=true'
@@ -65,6 +67,7 @@ jobs:
           backend=false
           tauri=false
           mcp=false
+          skills=false
           film_tv=false
           fixtures=false
           full=false
@@ -72,14 +75,69 @@ jobs:
           for path in "${changed[@]}"; do
             lower="${path,,}"
             case "$path" in
+              # `case` takes the FIRST matching arm, so the Skill-load-bearing files
+              # that also live under a component scope have to be matched *before*
+              # the component arms below.  Listing them on the `skills` arm further
+              # down would be dead code: `mcp/haven-mcp/src/constants.ts` matches
+              # `mcp/*` first and the Skill contract gate would silently be skipped.
+              #
+              # The frozen tool list, the capability port, and the strict provider
+              # schema are the legs of the tool contract the Skill document has to
+              # agree with; `constants.ts` and `bridge.ts` are read directly by the
+              # contract checker as its authority, and `schemas.ts` / `tools.ts` are
+              # the strict (`.strictObject`) input schemas that document drives.
+              mcp/haven-mcp/src/constants.ts|mcp/haven-mcp/src/bridge.ts|mcp/haven-mcp/src/schemas.ts|mcp/haven-mcp/src/tools.ts|mcp/haven-mcp/src/errors.ts)
+                mcp=true
+                skills=true ;;
+              # The MCP server version must equal the product version, or the packer
+              # refuses to package at all.
+              mcp/haven-mcp/package.json)
+                mcp=true
+                skills=true ;;
               前端/*|.node-version)
                 frontend=true ;;
               后端/*|rust-toolchain.toml|Cargo.toml|Cargo.lock)
                 backend=true ;;
+              # 自动配置把"安装包里的运行时目录名"钉在三处：产物目录、Tauri 的资源映射与
+              # Rust 侧的路径常量。改其中任何一处都必须重跑 `mcp-launcher` 作业里那条
+              # 跨边界断言（它同时读这三个文件），因此这些路径在 `src-tauri/*` 之前匹配。
+              src-tauri/src/commands/mcp_client.rs|src-tauri/tauri.conf.json|src-tauri/resources/*)
+                mcp=true
+                tauri=true ;;
               src-tauri/*|rust-toolchain.toml)
                 tauri=true ;;
               mcp/*)
                 mcp=true ;;
+              # The Skill packages and their checker are consumed by both runtimes:
+              # the bundled document is embedded in the binary and shipped verbatim
+              # to external clients, so a Skill-only change must select this gate
+              # even though it touches no component code.
+              # (The product version that the packer reads lives in
+              # `前端/app/package.json`, which selects `full` below and therefore
+              # this gate too.)
+              skills/*)
+                skills=true
+                backend=true ;;
+              tools/skills/*)
+                skills=true ;;
+              # The MCP runtime packager and its tests are part of the shipped
+              # launcher contract; a change there must rebuild the bundle.
+              tools/mcp/*)
+                mcp=true ;;
+            esac
+
+            # The Skill runtime/parser lives in several components (the domain
+            # parser, the infrastructure loader that embeds the document, the
+            # application service, the Tauri commands and their permissions, the SQL
+            # repo, the frontend gateway).  This is a second, unordered pass rather
+            # than another arm above: `case` takes the first match only, so a
+            # `.../agent_skill.rs` arm placed after `后端/*` would never be reached.
+            case "$lower" in
+              # The native Skill's exact output shape is defined by the AI provider's
+              # strict schema and read by the contract tests; changing it must rerun
+              # the Skill gate even when no `agent_skill` symbol/path changes.
+              *agent_skill*|*agent-skill*|*agentskill*|后端/crates/haven-infrastructure/src/ai_provider.rs)
+                skills=true ;;
             esac
 
             # Film/TV evidence is tied to the public contract, its checker,
@@ -107,6 +165,7 @@ jobs:
             backend=true
             tauri=true
             mcp=true
+            skills=true
             film_tv=true
             fixtures=true
           fi
@@ -116,6 +175,7 @@ jobs:
             echo "backend=$backend"
             echo "tauri=$tauri"
             echo "mcp=$mcp"
+            echo "skills=$skills"
             echo "film_tv=$film_tv"
             echo "fixtures=$fixtures"
             echo "full=$full"
@@ -154,6 +214,18 @@ jobs:
       - name: Test release version policy
         run: python tools/release/version-check.test.py
 
+      - name: Test desktop provenance and signed updater manifest policy
+        shell: pwsh
+        run: |
+          python tools/release/bundle-version.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'Bundle version policy regression' }
+          python tools/release/desktop-assets-check.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop provenance policy regression' }
+          python tools/release/updater-manifest-check.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'Updater metadata policy regression' }
+          python tools/release/desktop-executable-check.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'Shipped executable policy regression' }
+
       - name: Check committed secret markers
         shell: bash
         run: |
@@ -167,7 +239,7 @@ jobs:
           fi
 
       - name: Check release versions
-        run: python tools/release/version-check.py --version 0.1.0-beta.1
+        run: python tools/release/version-check.py --version 0.1.0
 
       - name: Check repository whitespace integrity
         shell: pwsh
@@ -262,6 +334,179 @@ jobs:
       - name: MCP server tests
         working-directory: mcp/haven-mcp
         run: npm test
+
+  # The installed MCP launcher.  This job is the only place that actually builds
+  # the distributable MCP runtime, so it is also the only place that can assert
+  # the bundle's contents, the exact command a client config will get, and that
+  # the bundled Node binary really runs at the version the manifest declares.
+  #
+  # It runs on Windows because the launcher contract is a Windows `.cmd` plus a
+  # bundled `node.exe`.  The packager itself is platform-neutral, but the
+  # "installed distribution" promise is only implemented for the installer
+  # target this repository actually ships (msi / nsis); see the packager
+  # docstring.  Nothing here may claim a cross-platform launcher.
+  mcp-launcher:
+    name: MCP runtime launcher
+    needs: changes
+    if: needs.changes.outputs.mcp == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: mcp/haven-mcp/package-lock.json
+
+      - name: Test the MCP runtime packager
+        run: python tools/mcp/package-runtime.test.py
+
+      # 组装到 **bundle resources** 目录：`tauri build` 只是把已经存在的目录搬进
+      # MSI / NSIS，它不会替我们编译 server 或下载 Node。因此这一步必须在打包之前跑，
+      # 而且产物目录就是 `src-tauri/tauri.conf.json` 里 `bundle.resources` 的映射源。
+      - name: Assemble the MCP runtime into the bundle resources
+        shell: pwsh
+        run: pwsh tools/mcp/assemble-runtime.ps1 -Out src-tauri/resources
+
+      - name: Assert the bundle contents, the installer mapping and the declared command
+        shell: pwsh
+        run: |
+          $manifests = @(Get-ChildItem -Path src-tauri/resources -Filter *.manifest.json)
+          if ($manifests.Count -ne 1) { throw "产物里应当恰好有一份清单，实际 $($manifests.Count) 份" }
+          $manifest = Get-Content -LiteralPath $manifests[0].FullName -Raw | ConvertFrom-Json
+          $bundle = "src-tauri/resources/$($manifest.layout.bundleDirectory)"
+
+          # 声明要随包分发的每一份文件都必须真的在里面。
+          foreach ($file in $manifest.files) {
+            if (-not (Test-Path -LiteralPath (Join-Path $bundle $file.path) -PathType Leaf)) {
+              throw "清单声明了 $($file.path)，产物里却没有"
+            }
+          }
+
+          # 安装包资源映射：tauri.conf.json 必须把产物目录带进 bundle，
+          # 否则安装后 `<resource_dir>/haven-mcp` 不存在，自动配置写出的命令就是死路。
+          $config = Get-Content -LiteralPath src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $mapped = $config.bundle.resources.'resources/haven-mcp'
+          if ($mapped -ne $manifest.layout.bundleDirectory) {
+            throw "bundle.resources 把它映射成 '$mapped'，而产物目录叫 '$($manifest.layout.bundleDirectory)'"
+          }
+
+          # 客户端命令必须是随包分发的**真实可执行文件** + 入口脚本：
+          # 不是 `.cmd` 启动器（shell:false 创建不了脚本），不是裸 `node`（用户机器上不一定有），
+          # 也不是仓库路径（那要求用户保留 checkout）。
+          $placeholder = '<installed-resource-dir>'
+          $command = [string]$manifest.clientConfig.command
+          if (-not $command.StartsWith($placeholder)) { throw "客户端命令不是安装后的路径：$command" }
+          if ($command -like '*.cmd') { throw "客户端命令不能是 .cmd 启动器：$command" }
+          if ($command -notlike '*/runtime/node.exe') { throw "客户端命令不是随包分发的运行时：$command" }
+          $argumentList = @($manifest.clientConfig.args)
+          if ($argumentList.Count -ne 1 -or $argumentList[0] -notlike '*/dist/index.js') {
+            throw "客户端参数应当只有一个 entry 脚本，实际 $argumentList"
+          }
+          # 占位符只允许出现在**最前面**（它就是留给栖阅替换安装根的位置），
+          # 其余任何 `<...>` 都是模板残留——写进用户配置就是一条永远启动不了的命令。
+          $residue = ([string]$command + " " + [string]$argumentList[0]).Replace($placeholder, "")
+          if ($residue.Contains('<') -or $residue.Contains('>')) {
+            throw "客户端命令/参数里残留了模板占位符：$command $argumentList"
+          }
+          $env_keys = $manifest.clientConfig.env.PSObject.Properties.Name | Sort-Object
+          if (($env_keys -join ",") -ne "HAVEN_MCP_BRIDGE,HAVEN_MCP_ENDPOINT") {
+            throw "客户端环境变量集合不对：$env_keys"
+          }
+
+          # 随包分发的 Node 必须真的能跑，且版本与声明一致。
+          $runtime = Join-Path $bundle $manifest.layout.runtime
+          $declared = (Get-Content -LiteralPath .node-version -Raw).Trim()
+          $actual = (& $runtime --version).Trim()
+          if ($actual -ne "v$declared") { throw "产物里的 Node 是 $actual，声明的是 v$declared" }
+
+          # **安装路径含空格**时的真实往返：把产物整体复制到一段带空格的路径（模拟
+          # `C:\Program Files\...`），然后用清单里那**确切**的命令与参数启动一次服务端，
+          # 要求它在 stdout 上回答一次 JSON-RPC。空格路径是客户端参数引号的经典陷阱，
+          # 只在无空格路径上验证等于没验证。
+          $installRoot = Join-Path $env:RUNNER_TEMP "Program Files/Haven 栖阅"
+          New-Item -ItemType Directory -Force -Path $installRoot | Out-Null
+          Copy-Item -Recurse -Force $bundle (Join-Path $installRoot "haven-mcp")
+          $installedCommand = $command.Replace($placeholder, $installRoot)
+          $installedArguments = @($argumentList | ForEach-Object { $_.Replace($placeholder, $installRoot) })
+          foreach ($value in @($installedCommand) + $installedArguments) {
+            if (-not [System.IO.Path]::IsPathRooted($value)) { throw "安装后的路径不是绝对路径：$value" }
+            if (-not (Test-Path -LiteralPath $value -PathType Leaf)) { throw "安装后找不到：$value" }
+          }
+          $probe = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}'
+          $response = $probe | & $installedCommand @installedArguments 2>$null | Select-Object -First 1
+          if ($response -notmatch '"jsonrpc"') {
+            throw "含空格安装路径下，清单声明的命令没有给出 JSON-RPC 应答：$response"
+          }
+
+      - name: Upload the MCP runtime bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mcp-runtime-${{ github.run_id }}
+          path: |
+            src-tauri/resources/haven-mcp
+            src-tauri/resources/*.manifest.json
+          if-no-files-found: error
+
+  # The Skill contract gate.  It is selected by anything that can change what a
+  # valid Skill document is, or what the distributed package contains:
+  #
+  #   - the Skill packages themselves and their checker (`skills/**`, `tools/skills/**`);
+  #   - the MCP tool contract the document has to agree with — the frozen tool names,
+  #     the capability port, and the strict input schemas;
+  #   - the MCP server version, which must equal the product version or the packer
+  #     refuses to package;
+  #   - the Skill runtime/parser files in any component;
+  #   - the product version (via the `full` scope, since it lives in
+  #     `前端/app/package.json`).
+  #
+  # Both runtimes must agree on "what is a valid Skill document" — the Rust loader
+  # fails the application at startup on a malformed document, so CI has to reach the
+  # same conclusion first.  The checker is the single entry point; the tests below it
+  # pin the grammar to the runtime rather than restating the rules.
+  skill-contract:
+    name: Skill contract checks
+    needs: changes
+    if: needs.changes.outputs.skills == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      # These scripts print Chinese to stdout/stderr.  On Windows a *piped* stdout
+      # defaults to the legacy ANSI code page (cp1252 on the runners), where those
+      # writes raise UnicodeEncodeError and fail the job for a reason that has
+      # nothing to do with the Skill contract.  UTF-8 mode makes every step in this
+      # job locale-independent, not just the packer.
+      PYTHONUTF8: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
+      - name: Check the shipped Skill contract
+        run: python tools/skills/skill-contract-check.py
+
+      - name: Test the Skill contract checker
+        run: python tools/skills/skill-contract-check.test.py
+
+      - name: Test the Skill packer
+        run: python tools/skills/pack-skill.test.py
 
   backend:
     name: Backend Rust checks
@@ -364,6 +609,10 @@ jobs:
       - name: Tauri tests
         working-directory: src-tauri
         run: cargo test --locked
+
+      - name: Verify the desktop embedded frontend
+        working-directory: src-tauri
+        run: cargo test --locked --features custom-protocol --test frontend_bundle
 
   tauri-unix:
     name: Tauri Unix checks
@@ -502,7 +751,7 @@ jobs:
 
   pr-gate:
     name: PR Gate
-    needs: [changes, base-checks, frontend, mcp, backend, tauri, tauri-unix, film-tv-evidence]
+    needs: [changes, base-checks, frontend, mcp, mcp-launcher, skill-contract, backend, tauri, tauri-unix, film-tv-evidence]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -512,12 +761,15 @@ jobs:
           BASE_RESULT: ${{ needs['base-checks'].result }}
           FRONTEND_RESULT: ${{ needs.frontend.result }}
           MCP_RESULT: ${{ needs.mcp.result }}
+          MCP_LAUNCHER_RESULT: ${{ needs['mcp-launcher'].result }}
+          SKILL_RESULT: ${{ needs['skill-contract'].result }}
           BACKEND_RESULT: ${{ needs.backend.result }}
           TAURI_RESULT: ${{ needs.tauri.result }}
           TAURI_UNIX_RESULT: ${{ needs['tauri-unix'].result }}
           FILM_TV_RESULT: ${{ needs['film-tv-evidence'].result }}
           FRONTEND_REQUIRED: ${{ needs.changes.outputs.frontend }}
           MCP_REQUIRED: ${{ needs.changes.outputs.mcp }}
+          SKILL_REQUIRED: ${{ needs.changes.outputs.skills }}
           BACKEND_REQUIRED: ${{ needs.changes.outputs.backend }}
           TAURI_REQUIRED: ${{ needs.changes.outputs.tauri }}
           FILM_TV_REQUIRED: ${{ needs.changes.outputs.film_tv }}
@@ -545,6 +797,8 @@ jobs:
 
           require_if_selected "$FRONTEND_REQUIRED" "$FRONTEND_RESULT" frontend
           require_if_selected "$MCP_REQUIRED" "$MCP_RESULT" mcp
+          require_if_selected "$MCP_REQUIRED" "$MCP_LAUNCHER_RESULT" mcp-launcher
+          require_if_selected "$SKILL_REQUIRED" "$SKILL_RESULT" skill-contract
           require_if_selected "$BACKEND_REQUIRED" "$BACKEND_RESULT" backend
           require_if_selected "$TAURI_REQUIRED" "$TAURI_RESULT" tauri
           require_if_selected "$TAURI_REQUIRED" "$TAURI_UNIX_RESULT" tauri-unix

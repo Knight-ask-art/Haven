@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-interface-font-asset-delete"
+description = "Enables the interface_font_asset_delete command without any pre-configured scope."
+commands.allow = ["interface_font_asset_delete"]
+
+[[permission]]
+identifier = "deny-interface-font-asset-delete"
+description = "Denies the interface_font_asset_delete command without any pre-configured scope."
+commands.deny = ["interface_font_asset_delete"]

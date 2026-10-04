@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cloud-account-connect-begin"
+description = "Enables the cloud_account_connect_begin command without any pre-configured scope."
+commands.allow = ["cloud_account_connect_begin"]
+
+[[permission]]
+identifier = "deny-cloud-account-connect-begin"
+description = "Denies the cloud_account_connect_begin command without any pre-configured scope."
+commands.deny = ["cloud_account_connect_begin"]

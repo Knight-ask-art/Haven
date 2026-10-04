@@ -9,6 +9,7 @@
 
 pub mod migrations;
 pub mod repos;
+pub(crate) mod storage_content;
 pub mod uow;
 
 use std::path::Path;

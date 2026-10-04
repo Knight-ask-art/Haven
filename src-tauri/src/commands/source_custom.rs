@@ -1,23 +1,28 @@
-//! 自定义 OPDS 书源命令（V2-H 收尾批次；契约 §36.2 演进）。
+//! 自定义来源命令（V2-H 收尾批次；契约 §36.2 演进；Task 1 增补 RSS/Atom kind；
+//! Task 2 增补 Komga/Kavita 自托管漫画库）。
 //!
 //! - `source_add` / `source_update` / `source_remove`：自定义源生命周期管理。
 //! - `source_set_credential`：secret 只写系统 keyring（ADR-001）；持久化仅存 credential_ref；
-//!   secret 与 target 禁止出 IPC、日志。
-//! - `source_remove` 走 ADR-001 删除顺序：先删系统凭据，再清持久化引用。
+//!   secret 与 target 禁止出 IPC、日志。RSS/Atom 订阅源不使用该路径；
+//!   Komga/Kavita 的 API key 走该路径（只作为请求头注入，绝不进 URL）。
+//! - `source_remove` 走 ADR-001 删除顺序：先删系统凭据，再清持久化引用，最后清掉该
+//!   来源缓存的原始配置（TVBox 配置来源会用到；没有缓存的来源删到 0 行不是错误）。
 //!
 //! Command 只做不可信输入校验、Application 调用与错误映射。
 
 use tauri::State;
 
+use haven_application::services::source_registry::CustomSourceKind;
 use haven_application::wire::{
-    ErrorDto, SourceAddRequest, SourceAddResult, SourceRemoveRequest, SourceRemoveResult,
-    SourceSetCredentialRequest, SourceUpdateRequest, SourceUpdateResult,
+    ErrorDto, SourceAddKindDto, SourceAddRequest, SourceAddResult, SourceRemoveRequest,
+    SourceRemoveResult, SourceSetCredentialRequest, SourceUpdateRequest, SourceUpdateResult,
 };
 
 use crate::ipc::{invalid_argument, run_blocking, to_error_dto};
 use crate::state::AppState;
 
-/// `source_add` 命令核心。
+/// `source_add` 命令核心。种类由 `request.kind` 决定，缺省为 OPDS，
+/// 因此新增该字段之前的调用行为完全不变。
 pub async fn run_source_add(
     state: &AppState,
     request: SourceAddRequest,
@@ -28,11 +33,31 @@ pub async fn run_source_add(
     if request.endpoint.trim().is_empty() || request.endpoint.len() > 500 {
         return Err(invalid_argument("端点地址不能为空且不超过 500 字符"));
     }
-    state
-        .source_registry
-        .add_custom_source(&request.display_name, &request.endpoint)
-        .await
-        .map_err(|e| to_error_dto(&e))
+    let added = match request.kind {
+        SourceAddKindDto::Opds => {
+            state
+                .source_registry
+                .add_custom_source(&request.display_name, &request.endpoint)
+                .await
+        }
+        SourceAddKindDto::Feed => {
+            state
+                .source_registry
+                .add_feed_source(&request.display_name, &request.endpoint)
+                .await
+        }
+        SourceAddKindDto::Komga | SourceAddKindDto::Kavita => {
+            let kind = match request.kind {
+                SourceAddKindDto::Komga => CustomSourceKind::Komga,
+                _ => CustomSourceKind::Kavita,
+            };
+            state
+                .source_registry
+                .add_comic_library_source(&request.display_name, &request.endpoint, kind)
+                .await
+        }
+    };
+    added.map_err(|e| to_error_dto(&e))
 }
 
 #[tauri::command]
@@ -88,9 +113,14 @@ pub async fn run_source_remove(
     }
     let store =
         haven_infrastructure::credential::credential_store().map_err(|e| to_error_dto(&e))?;
+    // 删除路径同时清掉该来源的 last-known-good 原始配置（TVBox 配置来源会用到）。
     state
         .source_registry
-        .remove_custom_source(&request.source_id, store.as_ref())
+        .remove_custom_source(
+            &request.source_id,
+            store.as_ref(),
+            &state.repos.source_config_cache,
+        )
         .await
         .map_err(|e| to_error_dto(&e))
 }
@@ -156,23 +186,81 @@ mod tests {
             SourceAddRequest {
                 display_name: " ".into(),
                 endpoint: "https://a.example.com/opds".into(),
+                kind: SourceAddKindDto::Opds,
             },
             SourceAddRequest {
                 display_name: "x".repeat(101),
                 endpoint: "https://a.example.com/opds".into(),
+                kind: SourceAddKindDto::Opds,
             },
             SourceAddRequest {
                 display_name: "ok".into(),
                 endpoint: "".into(),
+                kind: SourceAddKindDto::Opds,
             },
             SourceAddRequest {
                 display_name: "ok".into(),
                 endpoint: "ftp://a/x".into(),
+                kind: SourceAddKindDto::Opds,
+            },
+            // 订阅源：明文 HTTP 与带 query 的地址都必须被拒绝。
+            SourceAddRequest {
+                display_name: "ok".into(),
+                endpoint: "http://a.example.com/rss.xml".into(),
+                kind: SourceAddKindDto::Feed,
+            },
+            SourceAddRequest {
+                display_name: "ok".into(),
+                endpoint: "https://a.example.com/rss.xml?token=secret".into(),
+                kind: SourceAddKindDto::Feed,
             },
         ] {
             let err = run_source_add(&state, bad).await.unwrap_err();
             assert_eq!(err.code, "INVALID_ARGUMENT");
         }
+    }
+
+    #[tokio::test]
+    async fn add_accepts_opds_or_feed_kinds_and_defaults_stay_backwards_compatible() {
+        let state = app_state();
+
+        // 缺省 kind（旧请求）仍然是 OPDS。
+        let legacy: SourceAddRequest = serde_json::from_value(serde_json::json!({
+            "displayName": "旧调用",
+            "endpoint": "https://legacy.example.invalid/opds/"
+        }))
+        .expect("缺少 kind 的旧请求必须仍可反序列化");
+        assert_eq!(legacy.kind, SourceAddKindDto::Opds);
+        let legacy_added = run_source_add(&state, legacy).await.unwrap();
+        assert!(legacy_added.source_id.starts_with("custom_"));
+        assert!(!legacy_added.source_id.starts_with("custom_feed_"));
+
+        let feed_added = run_source_add(
+            &state,
+            SourceAddRequest {
+                display_name: "我的订阅".into(),
+                endpoint: "https://feeds.example.invalid/rss.xml".into(),
+                kind: SourceAddKindDto::Feed,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(feed_added.source_id.starts_with("custom_feed_"));
+
+        let registry = state.source_registry.list().await.unwrap();
+        let feed = registry
+            .sources
+            .iter()
+            .find(|source| source.source_id == feed_added.source_id)
+            .unwrap();
+        assert_eq!(
+            feed.categories,
+            vec![haven_application::wire::SourceCategoryDto::Periodical]
+        );
+        assert!(
+            !feed.notes.contains("feeds.example.invalid"),
+            "来源说明不得回显端点"
+        );
     }
 
     #[tokio::test]
@@ -183,6 +271,7 @@ mod tests {
             SourceAddRequest {
                 display_name: "我的书源".into(),
                 endpoint: "https://example.invalid/opds/".into(),
+                kind: SourceAddKindDto::Opds,
             },
         )
         .await

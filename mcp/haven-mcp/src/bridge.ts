@@ -16,11 +16,22 @@
 // [`UnavailableHavenAgentBridge`]。桥接只承载已经由 Haven Application service 投影的
 // 读结果或 pending Proposal，不拥有 Apply / Approve / 文件 / SQL / secret 能力。
 
-import { BRIDGE_TIMEOUT_MS, ERROR_CODES } from "./constants.js";
-import { HavenMcpError, bridgeUnavailable } from "./errors.js";
+import { BRIDGE_TIMEOUT_MS } from "./constants.js";
+import { bridgeCancelled, bridgeTimeout, bridgeUnavailable } from "./errors.js";
 
 /** 桥接类型。生产默认是 `unavailable`；用户显式配置本地 Broker 后可为 `live`。 */
 export type BridgeKind = "unavailable" | "fixture" | "live";
+
+/**
+ * 一次桥接调用的传输上下文。
+ *
+ * 目前只有一个字段：MCP 客户端取消（`notifications/cancelled`）时触发的 `AbortSignal`。
+ * 传输适配器必须**响应**它——收到取消就立刻释放本地连接，而不是继续等到超时；否则
+ * 取消只是一个"客户端不再看结果"的假象，Broker 侧的工作照旧占着连接与配额。
+ */
+export interface BridgeCallContext {
+  signal?: AbortSignal;
+}
 
 /** 全局设置分区（当前只有 reading，与 `AgentSettingsSection` 一致）。 */
 export type SettingsSection = "reading";
@@ -185,7 +196,11 @@ export interface ResourcePreferenceProposalRequest {
  * Typed Haven Agent Bridge。
  *
  * 实现方必须先通过 `assertBridgeResult` 之类的方式自证返回形状；本文件提供的
- * [`withBridgeTimeout`] 是唯一允许的调用包装，用来把"无限等待"变成稳定超时错误。
+ * [`withBridgeTimeout`] 是唯一允许的调用包装，用来把"无限等待"变成稳定超时错误，
+ * 并把客户端取消传下去。
+ *
+ * 每个方法的最后一个可选参数都是 [`BridgeCallContext`]（当前只承载取消信号）。
+ * 允许实现方忽略它——但真实传输实现必须响应：收到取消就断开本地连接。
  */
 export interface HavenAgentBridge {
   readonly kind: BridgeKind;
@@ -194,19 +209,34 @@ export interface HavenAgentBridge {
   /** 人类可读的当前状态说明（会进 `get_system_capabilities`）。 */
   readonly statusDetail: string;
 
-  getCapabilityManifest(): Promise<HavenCapabilityReport>;
-  getSettingsSnapshot(): Promise<SettingsSnapshotResult>;
-  getSettingSources(): Promise<SettingSourcesResult>;
-  getResourcePreferenceSnapshot(request: {
-    target_scope: PreferenceScope;
-    edition_id: string;
-    media_item_id: string | null;
-  }): Promise<ResourcePreferenceSnapshotResult>;
-  getLibrarySummary(request: { limit: number }): Promise<LibrarySummaryResult>;
-  getMediaCapabilities(request: { media_item_id: string | null; limit: number }): Promise<MediaCapabilitiesResult>;
-  getOnboardingState(): Promise<OnboardingStateResult>;
-  proposeSettingsPatch(request: SettingsProposalRequest): Promise<ProposalOutcome>;
-  proposeResourcePreferencePatch(request: ResourcePreferenceProposalRequest): Promise<ProposalOutcome>;
+  getCapabilityManifest(context?: BridgeCallContext): Promise<HavenCapabilityReport>;
+  getSettingsSnapshot(context?: BridgeCallContext): Promise<SettingsSnapshotResult>;
+  getSettingSources(context?: BridgeCallContext): Promise<SettingSourcesResult>;
+  getResourcePreferenceSnapshot(
+    request: {
+      target_scope: PreferenceScope;
+      edition_id: string;
+      media_item_id: string | null;
+    },
+    context?: BridgeCallContext,
+  ): Promise<ResourcePreferenceSnapshotResult>;
+  getLibrarySummary(
+    request: { limit: number },
+    context?: BridgeCallContext,
+  ): Promise<LibrarySummaryResult>;
+  getMediaCapabilities(
+    request: { media_item_id: string | null; limit: number },
+    context?: BridgeCallContext,
+  ): Promise<MediaCapabilitiesResult>;
+  getOnboardingState(context?: BridgeCallContext): Promise<OnboardingStateResult>;
+  proposeSettingsPatch(
+    request: SettingsProposalRequest,
+    context?: BridgeCallContext,
+  ): Promise<ProposalOutcome>;
+  proposeResourcePreferencePatch(
+    request: ResourcePreferenceProposalRequest,
+    context?: BridgeCallContext,
+  ): Promise<ProposalOutcome>;
 }
 
 /**
@@ -267,27 +297,73 @@ export class UnavailableHavenAgentBridge implements HavenAgentBridge {
 }
 
 /**
- * 给桥接调用套上超时。
+ * 给桥接调用套上超时**与取消**。
  *
- * 没有超时的桥接会让 MCP 客户端无限挂起；超时被归一为稳定、可重试的错误码。
+ * 没有超时的桥接会让 MCP 客户端无限挂起；没有取消的桥接会让"用户按了停止"变成一个
+ * 只有客户端一侧生效的姿态。两者都被归一为稳定错误码，且**重试语义由调用方按副作用
+ * 决定**（见 [`BridgeTimeoutOptions.retryableOnCancel`]）：只读操作可以重试，提案创建
+ * 不可以——它可能已经落库。
+ *
  * `operation` 只用于错误文案，必须是不含用户数据的固定短语。
  */
+export interface BridgeTimeoutOptions {
+  timeoutMs?: number;
+  /**
+   * 调用方取消信号。触发时本函数立刻以 `HAVEN_BRIDGE_CANCELLED` 收尾，并把这个信号
+   * 转发给 `call`，让传输层能销毁底层连接、释放工作。
+   */
+  signal?: AbortSignal;
+  /**
+   * 取消 / 超时之后是否可以安全重试。
+   *
+   * 默认 `false`（保守）：不知道副作用的调用方不该被鼓励重试。只读工具显式传 `true`。
+   */
+  retryableOnCancel?: boolean;
+}
+
 export async function withBridgeTimeout<T>(
   operation: string,
-  call: () => Promise<T>,
-  timeoutMs: number = BRIDGE_TIMEOUT_MS,
+  call: (signal: AbortSignal) => Promise<T>,
+  options: BridgeTimeoutOptions = {},
 ): Promise<T> {
+  const timeoutMs = options.timeoutMs ?? BRIDGE_TIMEOUT_MS;
+  const retryable = options.retryableOnCancel === true;
+
+  // 一个内部控制器的两个用途：把"调用方取消"和"本地超时"合流给 `call`，让传输层
+  // 只需要监听一个信号；同时保证超时也会断开底层连接，而不是留一个孤儿请求。
+  const controller = new AbortController();
+  const forwardAbort = (): void => controller.abort();
+  if (options.signal?.aborted) {
+    controller.abort();
+  } else {
+    options.signal?.addEventListener("abort", forwardAbort, { once: true });
+  }
+
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
-      call(),
+      call(controller.signal),
       new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => {
-          reject(new HavenMcpError(ERROR_CODES.BRIDGE_TIMEOUT, `Haven 桥接在 ${operation} 上超时。`, true));
+          // 先让超时错误成为 race 的第一个落定值，再中止底层连接。顺序反过来的话，
+          // abort 监听器会同步抢先 reject，用户看到的就会是"被取消"而不是"超时"。
+          reject(bridgeTimeout(operation, retryable));
+          controller.abort();
         }, timeoutMs);
+      }),
+      new Promise<never>((_resolve, reject) => {
+        const onAbort = (): void => {
+          reject(bridgeCancelled(operation, !retryable));
+        };
+        if (controller.signal.aborted) {
+          onAbort();
+          return;
+        }
+        controller.signal.addEventListener("abort", onAbort, { once: true });
       }),
     ]);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+    options.signal?.removeEventListener("abort", forwardAbort);
   }
 }

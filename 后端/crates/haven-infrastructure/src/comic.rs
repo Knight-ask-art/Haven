@@ -901,7 +901,7 @@ mod tests {
             zip.by_index(0)
                 .unwrap()
                 .data_start()
-                .expect("archive entry must expose its data start")
+                .expect("zip entry must have a local data offset")
         };
         let mut file = File::options().write(true).open(&archive).unwrap();
         file.seek(SeekFrom::Start(data_start + 16 * 1024)).unwrap();

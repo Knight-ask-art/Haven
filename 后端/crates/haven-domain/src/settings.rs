@@ -10,6 +10,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::appearance::{AppTheme, AppearanceAssetId, WallpaperSelection};
+
 /// 设置分区（闭合枚举；新增分区为向后兼容扩展，未知字符串一律拒绝）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,6 +79,7 @@ pub enum Theme {
     System,
     Light,
     Dark,
+    Custom,
 }
 
 /// 密度（appearance.density）。
@@ -94,6 +97,17 @@ pub enum SidebarPreference {
     Expanded,
     Collapsed,
     Auto,
+}
+
+/// 应用界面字体方案（appearance.uiFontPreset）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiFontPreset {
+    #[default]
+    System,
+    HumanistSerif,
+    ModernSans,
+    CustomSystem,
 }
 
 /// general 分区设置（Typed DTO；JSON 字段 camelCase，与 wire 规则一致）。
@@ -117,6 +131,92 @@ impl Default for GeneralSettings {
     }
 }
 
+/// 界面字体模式（appearance.interfaceFontMode）。
+///
+/// 四个互斥模式对应设置页的四张字体卡片，各自有真实 CSS 字体栈消费者
+/// （`applyInterfaceFont` → `--ds-font-interface`），不是占位枚举：
+/// - `System`：随操作系统界面字体（等价于栖阅既有字体栈）；
+/// - `Sans` / `Serif`：显式指定无衬线 / 衬线优先栈；
+/// - `Custom`：由用户在本机字体或已导入字体中选择，选择结果分别落在
+///   `interfaceFontFamily` / `interfaceFontAssetId`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterfaceFontMode {
+    System,
+    Sans,
+    Serif,
+    Custom,
+}
+
+fn default_interface_font_mode() -> InterfaceFontMode {
+    InterfaceFontMode::System
+}
+
+/// 界面字体族名安全上界（与设置页输入提示一致）。
+const MAX_INTERFACE_FONT_FAMILY_LEN: usize = 120;
+
+/// 界面字体族名是否可安全拼进 CSS `font-family` 列表。
+///
+/// 族名只允许来自本机字体枚举或用户显式输入；这里拒绝控制字符、引号、分号、
+/// 大括号、反斜杠和 `/*`，避免保存出可以逃出 `font-family` 声明的值。
+/// 该函数是**保存边界校验**，渲染端仍会再做一次同样的判断。
+pub fn is_safe_interface_font_family(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_INTERFACE_FONT_FAMILY_LEN {
+        return false;
+    }
+    !trimmed.chars().any(|c| {
+        c.is_control()
+            || c == '"'
+            || c == '\''
+            || c == ';'
+            || c == '{'
+            || c == '}'
+            || c == '\\'
+            || c == '<'
+            || c == '>'
+    }) && !trimmed.contains("/*")
+}
+
+/// 把任意来源（字体 `name` 表或文件名）的族名修成可安全保存的形式。
+///
+/// 导入字体的族名来自第三方文件，必须能落进 `font-family`：
+/// 去掉不安全字符、折叠空白、截断到长度上限；结果为空时退化为 `fallback`。
+/// 与 [`is_safe_interface_font_family`] 互为「修 → 验」，修复后必然通过校验。
+pub fn sanitize_interface_font_family(name: &str, fallback: &str) -> String {
+    let mut out = String::new();
+    let mut pending_space = false;
+    let mut length = 0usize;
+    for ch in name.chars() {
+        if ch.is_control() || matches!(ch, '"' | '\'' | ';' | '{' | '}' | '\\' | '<' | '>') {
+            continue;
+        }
+        if ch.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        let additional = if pending_space { 2 } else { 1 };
+        if length + additional > MAX_INTERFACE_FONT_FAMILY_LEN {
+            break;
+        }
+        if pending_space {
+            out.push(' ');
+            length += 1;
+            pending_space = false;
+        }
+        out.push(ch);
+        length += 1;
+    }
+    let cleaned = out.trim();
+    // `/*` 只能由 `/` 与 `*` 相邻产生；两者本身合法，因此单独再兜一次。
+    let cleaned = cleaned.replace("/*", " ");
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() || !is_safe_interface_font_family(cleaned) {
+        return fallback.to_owned();
+    }
+    cleaned.to_owned()
+}
+
 /// appearance 分区设置（Typed DTO；JSON 字段 camelCase，与 wire 规则一致）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -125,6 +225,30 @@ pub struct AppearanceSettings {
     pub density: Density,
     pub sidebar: SidebarPreference,
     pub reduce_motion: bool,
+    /// 旧版本设置行没有界面字体字段时，按原观感回落到系统默认字体。
+    #[serde(default = "default_interface_font_mode")]
+    pub interface_font_mode: InterfaceFontMode,
+    /// 仅 `Custom` 且选择本机字体时生效：已安装字体族名（永不保存路径）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_font_family: Option<String>,
+    /// 仅 `Custom` 且选择导入字体时生效：`font_assets` 的 opaque id。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_font_asset_id: Option<String>,
+    /// 用户保存的应用级明/暗调色板与强调色。`None` 表示尚未创建自定义主题。
+    #[serde(default)]
+    pub custom_theme: Option<AppTheme>,
+    /// 首页壁纸只引用不透明资产 ID；`none` 是明确的无壁纸状态。
+    #[serde(default)]
+    pub wallpaper: WallpaperSelection,
+    /// 阅读运行时加载的自定义字体资产；字体资产本身由 Appearance Repository 管理。
+    #[serde(default)]
+    pub custom_font_asset_id: Option<AppearanceAssetId>,
+    /// 应用 UI 使用的字体方案；缺失时跟随系统默认字体。
+    #[serde(default)]
+    pub ui_font_preset: UiFontPreset,
+    /// 仅 `customSystem` 方案下读取；只保存系统字体族名，不包含路径或 CSS 声明。
+    #[serde(default, deserialize_with = "deserialize_ui_font_family")]
+    pub ui_font_family: Option<String>,
 }
 
 impl Default for AppearanceSettings {
@@ -134,6 +258,14 @@ impl Default for AppearanceSettings {
             density: Density::Comfortable,
             sidebar: SidebarPreference::Auto,
             reduce_motion: false,
+            interface_font_mode: InterfaceFontMode::System,
+            interface_font_family: None,
+            interface_font_asset_id: None,
+            custom_theme: None,
+            wallpaper: WallpaperSelection::None,
+            custom_font_asset_id: None,
+            ui_font_preset: UiFontPreset::System,
+            ui_font_family: None,
         }
     }
 }
@@ -599,6 +731,100 @@ pub struct AppearancePatch {
     pub density: Option<Density>,
     pub sidebar: Option<SidebarPreference>,
     pub reduce_motion: Option<bool>,
+    pub interface_font_mode: Option<InterfaceFontMode>,
+    pub interface_font_family: Option<String>,
+    pub interface_font_asset_id: Option<String>,
+    /// 缺失 = 不改；显式 null = 清除自定义主题。
+    #[serde(
+        default,
+        deserialize_with = "deserialize_nullable_patch_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub custom_theme: Option<Option<AppTheme>>,
+    /// 缺失 = 不改；显式 null = 清除壁纸（等价于 `WallpaperSelection::None`）。
+    ///
+    /// 与 `custom_theme` / `custom_font_asset_id` 同形是刻意的：三个字段都是
+    /// 「可以真的被清空」的外观字段，如果壁纸单独用 `Option<WallpaperSelection>`，
+    /// 那么 `{"wallpaper": null}` 会在这一项上静默变成「不改」，而在另外两项上变成
+    /// 「清除」——同一个 JSON 形状在两个相邻字段上表达两种不同的意思。
+    /// （清空壁纸也可以显式写 `{"kind":"none"}`，两种写法结果一致。）
+    #[serde(
+        default,
+        deserialize_with = "deserialize_nullable_patch_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub wallpaper: Option<Option<WallpaperSelection>>,
+    /// 缺失 = 不改；显式 null = 回到预设字体。
+    #[serde(
+        default,
+        deserialize_with = "deserialize_nullable_patch_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub custom_font_asset_id: Option<Option<AppearanceAssetId>>,
+    /// 缺失 = 不改；字体方案是闭合枚举。
+    pub ui_font_preset: Option<UiFontPreset>,
+    /// 缺失 = 不改；显式 null = 清除自定义系统字体名。
+    #[serde(
+        default,
+        deserialize_with = "deserialize_nullable_ui_font_family_patch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ui_font_family: Option<Option<String>>,
+}
+
+const MAX_UI_FONT_FAMILY_CHARS: usize = 64;
+
+fn normalize_ui_font_family(value: String) -> Result<String, &'static str> {
+    let normalized = value.trim();
+    if normalized.is_empty()
+        || normalized.chars().count() > MAX_UI_FONT_FAMILY_CHARS
+        || !normalized.chars().all(|character| {
+            character.is_alphanumeric()
+                || character.is_whitespace()
+                || " ._-()+&'".contains(character)
+        })
+    {
+        return Err("invalid UI font family name");
+    }
+    Ok(normalized.to_owned())
+}
+
+fn deserialize_ui_font_family<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?
+        .map(normalize_ui_font_family)
+        .transpose()
+        .map_err(serde::de::Error::custom)
+}
+
+fn deserialize_nullable_ui_font_family_patch<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<String>::deserialize(deserializer)? {
+        Some(value) => normalize_ui_font_family(value)
+            .map(|value| Some(Some(value)))
+            .map_err(serde::de::Error::custom),
+        None => Ok(Some(None)),
+    }
+}
+
+/// 保留 patch 字段的三态：缺失 = 不修改，JSON null = 清除，有值 = 替换。
+///
+/// serde 对普通 `Option<Option<T>>` 的派生反序列化会把缺失与显式 null 都解成外层
+/// `None`；自定义反序列化器只在字段出现时调用，因此在这里把字段存在性包成外层 `Some`。
+fn deserialize_nullable_patch_field<'de, T, D>(
+    deserializer: D,
+) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 /// playback 分区部分更新。
@@ -790,6 +1016,38 @@ impl SettingsPatch {
                     density: patch.density.unwrap_or(current.density),
                     sidebar: patch.sidebar.unwrap_or(current.sidebar),
                     reduce_motion: patch.reduce_motion.unwrap_or(current.reduce_motion),
+                    interface_font_mode: patch
+                        .interface_font_mode
+                        .unwrap_or(current.interface_font_mode),
+                    // 空字符串表示“清除该项选择”，与 reading 的 custom 字段同一语义。
+                    interface_font_family: match &patch.interface_font_family {
+                        Some(s) if s.trim().is_empty() => None,
+                        Some(s) => Some(s.trim().to_owned()),
+                        None => current.interface_font_family.clone(),
+                    },
+                    interface_font_asset_id: match &patch.interface_font_asset_id {
+                        Some(s) if s.trim().is_empty() => None,
+                        Some(s) => Some(s.trim().to_owned()),
+                        None => current.interface_font_asset_id.clone(),
+                    },
+                    custom_theme: match &patch.custom_theme {
+                        Some(value) => value.clone(),
+                        None => current.custom_theme.clone(),
+                    },
+                    wallpaper: match &patch.wallpaper {
+                        // 显式 null 与 `{"kind":"none"}` 是同一种「清除」。
+                        Some(value) => (*value).unwrap_or(WallpaperSelection::None),
+                        None => current.wallpaper,
+                    },
+                    custom_font_asset_id: match &patch.custom_font_asset_id {
+                        Some(value) => *value,
+                        None => current.custom_font_asset_id,
+                    },
+                    ui_font_preset: patch.ui_font_preset.unwrap_or(current.ui_font_preset),
+                    ui_font_family: match &patch.ui_font_family {
+                        Some(value) => value.clone(),
+                        None => current.ui_font_family.clone(),
+                    },
                 })
             }
             (Self::Playback(patch), SettingsValue::Playback(current)) => {
@@ -860,6 +1118,36 @@ impl SettingsPatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_app_theme() -> AppTheme {
+        let palette = serde_json::json!({
+            "background": "#111111",
+            "foreground": "#222222",
+            "card": "#333333",
+            "cardForeground": "#444444",
+            "popover": "#555555",
+            "popoverForeground": "#666666",
+            "primary": "#777777",
+            "primaryForeground": "#888888",
+            "secondary": "#999999",
+            "secondaryForeground": "#aaaaaa",
+            "muted": "#bbbbbb",
+            "mutedForeground": "#cccccc",
+            "accent": "#dddddd",
+            "accentForeground": "#eeeeee",
+            "destructive": "#123123",
+            "destructiveForeground": "#234234",
+            "border": "#3c3c4329",
+            "input": "#3c3c4329",
+            "ring": "#007aff",
+        });
+        serde_json::from_value(serde_json::json!({
+            "light": palette.clone(),
+            "dark": palette,
+            "accentColor": "#007aff",
+        }))
+        .unwrap()
+    }
 
     #[test]
     fn preference_data_patch_merges_only_present_fields() {
@@ -979,6 +1267,14 @@ mod tests {
                 density: Density::Comfortable,
                 sidebar: SidebarPreference::Auto,
                 reduce_motion: false,
+                interface_font_mode: InterfaceFontMode::System,
+                interface_font_family: None,
+                interface_font_asset_id: None,
+                custom_theme: None,
+                wallpaper: WallpaperSelection::None,
+                custom_font_asset_id: None,
+                ui_font_preset: UiFontPreset::System,
+                ui_font_family: None,
             })
         );
         assert_eq!(
@@ -1114,6 +1410,109 @@ mod tests {
         let current = SettingsValue::default_for(SettingsSection::Appearance);
         let patch: SettingsPatch = serde_json::from_str(r#"{"section":"appearance"}"#).unwrap();
         assert_eq!(patch.apply_to(&current), current);
+    }
+
+    #[test]
+    fn appearance_patch_distinguishes_missing_nullable_fields_from_explicit_null() {
+        let missing: AppearancePatch = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.custom_theme, None);
+        assert_eq!(missing.custom_font_asset_id, None);
+        assert_eq!(missing.ui_font_preset, None);
+        assert_eq!(missing.ui_font_family, None);
+        let serialized_missing = serde_json::to_value(&missing).unwrap();
+        assert!(serialized_missing.get("customTheme").is_none());
+        assert!(serialized_missing.get("customFontAssetId").is_none());
+        assert!(serialized_missing.get("uiFontFamily").is_none());
+
+        let clear: SettingsPatch = serde_json::from_str(
+            r#"{"section":"appearance","customTheme":null,"customFontAssetId":null,"uiFontFamily":null,"uiFontPreset":"modern_sans"}"#,
+        )
+        .unwrap();
+        let current = SettingsValue::Appearance(AppearanceSettings {
+            theme: Theme::Custom,
+            custom_theme: Some(test_app_theme()),
+            custom_font_asset_id: Some(AppearanceAssetId::new()),
+            ui_font_preset: UiFontPreset::CustomSystem,
+            ui_font_family: Some("Microsoft YaHei UI".to_owned()),
+            ..AppearanceSettings::default()
+        });
+
+        let unchanged = SettingsPatch::Appearance(missing).apply_to(&current);
+        assert_eq!(unchanged, current, "缺失字段必须保留当前自定义值");
+
+        let cleared = clear.apply_to(&current);
+        let SettingsValue::Appearance(cleared) = cleared else {
+            panic!("appearance patch 必须返回 appearance 设置");
+        };
+        assert_eq!(cleared.custom_theme, None, "显式 null 必须清除自定义主题");
+        assert_eq!(
+            cleared.custom_font_asset_id, None,
+            "显式 null 必须恢复预设字体"
+        );
+        assert_eq!(cleared.ui_font_preset, UiFontPreset::ModernSans);
+        assert_eq!(cleared.ui_font_family, None, "显式 null 必须清除系统字体名");
+    }
+
+    #[test]
+    fn ui_font_family_rejects_css_syntax_and_normalizes_a_valid_family_name() {
+        let valid: AppearanceSettings = serde_json::from_str(
+            r#"{"theme":"system","density":"comfortable","sidebar":"auto","reduceMotion":false,"uiFontPreset":"custom_system","uiFontFamily":"  思源宋体  "}"#,
+        )
+        .unwrap();
+        assert_eq!(valid.ui_font_family.as_deref(), Some("思源宋体"));
+
+        let invalid: Result<AppearanceSettings, _> = serde_json::from_str(
+            r#"{"theme":"system","density":"comfortable","sidebar":"auto","reduceMotion":false,"uiFontFamily":"Test; color:red"}"#,
+        );
+        assert!(invalid.is_err(), "字体名不能带 CSS 声明分隔符");
+    }
+
+    /// 壁纸与另外两个可空字段**同形**：缺失 = 不改，显式 null = 清除，有值 = 替换。
+    ///
+    /// 三者都是「可以真的被清空」的外观字段。壁纸曾经是单层 `Option`，于是
+    /// `{"wallpaper": null}` 在这一项上静默变成「不改」，而在相邻两项上变成「清除」——
+    /// 同一个 JSON 形状在两个紧挨着的字段上表达两种不同的意思，调用方无从预判。
+    #[test]
+    fn appearance_patch_treats_wallpaper_null_like_its_siblings() {
+        let asset_id = AppearanceAssetId::new();
+        let current = SettingsValue::Appearance(AppearanceSettings {
+            wallpaper: WallpaperSelection::Static(asset_id),
+            ..AppearanceSettings::default()
+        });
+
+        let missing: SettingsPatch = serde_json::from_str(r#"{"section":"appearance"}"#).unwrap();
+        assert_eq!(missing.apply_to(&current), current, "缺失必须保留当前壁纸");
+
+        let cleared: SettingsPatch =
+            serde_json::from_str(r#"{"section":"appearance","wallpaper":null}"#).unwrap();
+        let SettingsValue::Appearance(cleared) = cleared.apply_to(&current) else {
+            panic!("appearance patch 必须返回 appearance 设置");
+        };
+        assert_eq!(
+            cleared.wallpaper,
+            WallpaperSelection::None,
+            "显式 null 必须清除壁纸"
+        );
+
+        // 显式 `{"kind":"none"}` 是同一件事的另一种写法：两条路都通向「无壁纸」。
+        let explicit: SettingsPatch =
+            serde_json::from_str(r#"{"section":"appearance","wallpaper":{"kind":"none"}}"#)
+                .unwrap();
+        let SettingsValue::Appearance(explicit) = explicit.apply_to(&current) else {
+            panic!("appearance patch 必须返回 appearance 设置");
+        };
+        assert_eq!(explicit.wallpaper, WallpaperSelection::None);
+
+        // 有值 = 替换。
+        let other = AppearanceAssetId::new();
+        let replaced: SettingsPatch = serde_json::from_str(&format!(
+            r#"{{"section":"appearance","wallpaper":{{"kind":"dynamic","assetId":"{other}"}}}}"#
+        ))
+        .unwrap();
+        let SettingsValue::Appearance(replaced) = replaced.apply_to(&current) else {
+            panic!("appearance patch 必须返回 appearance 设置");
+        };
+        assert_eq!(replaced.wallpaper, WallpaperSelection::Dynamic(other));
     }
 
     #[test]
@@ -1357,5 +1756,148 @@ mod tests {
                 playback_history: false,
             })
         );
+    }
+
+    /// 旧 appearance 行没有界面字体字段：升级后必须仍能读取，并回落到系统默认字体，
+    /// 不能让整区反序列化失败（那会变成“设置数据损坏”）。
+    #[test]
+    fn appearance_legacy_rows_fill_interface_font_defaults() {
+        let legacy: SettingsValue = serde_json::from_str(
+            r#"{"section":"appearance","theme":"dark","density":"compact","sidebar":"collapsed","reduceMotion":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy,
+            SettingsValue::Appearance(AppearanceSettings {
+                theme: Theme::Dark,
+                density: Density::Compact,
+                sidebar: SidebarPreference::Collapsed,
+                reduce_motion: true,
+                interface_font_mode: InterfaceFontMode::System,
+                interface_font_family: None,
+                interface_font_asset_id: None,
+                ..AppearanceSettings::default()
+            })
+        );
+
+        // 旧行 + 只改模式的 patch：其余字段保持原值，字体选择仍为空。
+        let mode_only: SettingsPatch =
+            serde_json::from_str(r#"{"section":"appearance","interfaceFontMode":"serif"}"#)
+                .unwrap();
+        let next = mode_only.apply_to(&legacy);
+        match &next {
+            SettingsValue::Appearance(v) => {
+                assert_eq!(v.interface_font_mode, InterfaceFontMode::Serif);
+                assert_eq!(v.theme, Theme::Dark);
+                assert_eq!(v.interface_font_family, None);
+                assert_eq!(v.interface_font_asset_id, None);
+            }
+            _ => panic!("section 必须一致"),
+        }
+
+        // 非 `custom` 模式下也允许保留选择，渲染端只在 custom 时读取；
+        // 空字符串表示清除选择，与 reading 的 custom 字段同一语义。
+        let cleared: SettingsPatch = serde_json::from_str(
+            r#"{"section":"appearance","interfaceFontFamily":"  ","interfaceFontAssetId":""}"#,
+        )
+        .unwrap();
+        match cleared.apply_to(&next) {
+            SettingsValue::Appearance(v) => {
+                assert_eq!(v.interface_font_family, None);
+                assert_eq!(v.interface_font_asset_id, None);
+            }
+            _ => panic!("section 必须一致"),
+        }
+
+        // 未知模式值必须在反序列化边界拒绝。
+        assert!(
+            serde_json::from_str::<SettingsPatch>(
+                r#"{"section":"appearance","interfaceFontMode":"comic-sans"}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn interface_font_selection_roundtrips_through_json() {
+        let value = SettingsValue::Appearance(AppearanceSettings {
+            theme: Theme::Light,
+            density: Density::Comfortable,
+            sidebar: SidebarPreference::Auto,
+            reduce_motion: false,
+            interface_font_mode: InterfaceFontMode::Custom,
+            interface_font_family: Some("Microsoft YaHei UI".to_owned()),
+            interface_font_asset_id: Some("7f2c1b90-0f4a-4c2f-9a4d-1b2c3d4e5f60".to_owned()),
+            ..AppearanceSettings::default()
+        });
+        let json = serde_json::to_string(&value).unwrap();
+        assert!(json.contains(r#""interfaceFontMode":"custom""#));
+        assert!(json.contains(r#""interfaceFontFamily":"Microsoft YaHei UI""#));
+        let back: SettingsValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, value);
+
+        // 未选择时字段不落盘，保持旧的 appearance JSON 形状。
+        let plain = serde_json::to_string(&SettingsValue::default_for(SettingsSection::Appearance))
+            .unwrap();
+        assert!(!plain.contains("interfaceFontFamily"));
+        assert!(!plain.contains("interfaceFontAssetId"));
+    }
+
+    #[test]
+    fn interface_font_family_names_are_bounded() {
+        assert!(is_safe_interface_font_family("Microsoft YaHei UI"));
+        assert!(is_safe_interface_font_family(" 思源黑体 "));
+        assert!(is_safe_interface_font_family("Noto Sans CJK SC"));
+
+        assert!(!is_safe_interface_font_family(""));
+        assert!(!is_safe_interface_font_family("   "));
+        assert!(!is_safe_interface_font_family("Bad\";color:red"));
+        assert!(!is_safe_interface_font_family("Bad;color:red"));
+        assert!(!is_safe_interface_font_family("Bad{}"));
+        assert!(!is_safe_interface_font_family("Bad\\65scape"));
+        assert!(!is_safe_interface_font_family("a/*b*/"));
+        assert!(!is_safe_interface_font_family("<script>"));
+        assert!(!is_safe_interface_font_family("bad\nnewline"));
+        assert!(!is_safe_interface_font_family(&"x".repeat(121)));
+    }
+
+    #[test]
+    fn interface_font_family_names_are_repaired_for_imported_files() {
+        // 正常族名原样保留（含中文与内部空格）。
+        assert_eq!(
+            sanitize_interface_font_family("Microsoft YaHei UI", "导入字体"),
+            "Microsoft YaHei UI"
+        );
+        assert_eq!(
+            sanitize_interface_font_family("  思源  黑体  ", "导入字体"),
+            "思源 黑体"
+        );
+
+        // 第三方字体文件里的危险字符被剥离，结果必然通过安全校验。
+        let repaired = sanitize_interface_font_family("Bad\";color:red{}", "导入字体");
+        assert_eq!(repaired, "Badcolor:red");
+        assert!(is_safe_interface_font_family(&repaired));
+        let repaired = sanitize_interface_font_family("a/*b*/c", "导入字体");
+        assert!(is_safe_interface_font_family(&repaired));
+
+        // 全是非法字符 → 退化到兜底名，绝不产出空族名。
+        assert_eq!(
+            sanitize_interface_font_family("\"';{}\\<>", "导入字体"),
+            "导入字体"
+        );
+        assert_eq!(
+            sanitize_interface_font_family("   ", "导入字体"),
+            "导入字体"
+        );
+
+        // 超长族名被截断到上限内。
+        let long = sanitize_interface_font_family(&"字".repeat(500), "导入字体");
+        assert_eq!(long.chars().count(), 120);
+        assert!(is_safe_interface_font_family(&long));
+
+        let spaced = format!("{} X", "x".repeat(MAX_INTERFACE_FONT_FAMILY_LEN - 1));
+        let bounded = sanitize_interface_font_family(&spaced, "导入字体");
+        assert_eq!(bounded, "x".repeat(MAX_INTERFACE_FONT_FAMILY_LEN - 1));
+        assert!(is_safe_interface_font_family(&bounded));
     }
 }

@@ -59,11 +59,8 @@ also declare `generated_from` and `generated_by`.
 to resolve drift, for example `runtime-contracts`, `accepted-decisions`,
 `GitHub-settings-and-workflows` or `review-evidence-lifecycle-index`.
 
-The work index additionally declares the ledger state that the checker
-enforces: `active_ledger` names the one live ledger, `ledger_cutover` is
-`pending` or `complete`, `ledger_state` is `current` or `stale`, and
-`ledger_as_of` is an ISO date. These fields describe migration state; they do
-not create a second ledger or promote stale evidence.
+Private execution state and operational catalogs are not public metadata.
+Public work descriptions refer to issues, pull requests and release notes.
 
 ## File placement and naming
 
@@ -77,8 +74,9 @@ not create a second ledger or promote stale evidence.
   records lifecycle; it does not duplicate the area's canonical content.
 - Put generated files only at a path owned by their generator and declare
   `generated_from` and `generated_by`. Never hand-edit generated output.
-- Keep raw logs, machine inventories and private evidence outside the curated
-  public tree even when a public index records that they exist.
+- Keep raw logs, private filenames, development-tool procedures and operational
+  inventories outside the curated public tree. Product AI/MCP integration
+  documentation remains public when it describes Haven's user-facing contract.
 
 ## Migration map
 
@@ -96,7 +94,7 @@ reason
 links_checked
 ```
 
-The map is the review surface for cleanup. A completed review is not silently
+Internal migration maps remain private. A completed review is not silently
 rewritten into a current status page; its conclusions are extracted into a new
 canonical document and the original remains historical evidence.
 
@@ -117,12 +115,11 @@ The `python tools/docs/check.py` command verifies:
 - Markdown link targets and private-path boundaries;
 - every curated public document declares public visibility;
 - no secrets, signed URLs, cookies or absolute local paths;
-- local historical records remain subject to their lifecycle-register checks;
+- no developer-tool operating procedures or private per-file catalogs;
 - generated-document metadata (`generated_from` and `generated_by`);
 - stale review warnings;
-- the declared ledger and cutover state cannot create a competing live ledger;
-- every local plan, review and legacy record is named in its lifecycle register
-  when those private directories are present.
+- local lifecycle and ledger checks use private registers when private records
+  are present; no public index is required to list them.
 
 The public snapshot check additionally protects required public files, local-only
 directories, generated artifacts and the distinction between repository-local

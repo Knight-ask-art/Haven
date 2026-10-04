@@ -1,7 +1,7 @@
 """Validate the curated public documentation surface.
 
-This checker is deliberately small and dependency-free so it can run in local
-Vibe Coding sessions and in the Public CI Windows runner. It does not mutate
+This checker is deliberately small and dependency-free so it can run locally
+and in the Public CI Windows runner. It does not mutate
 files or decide whether a historical review is correct.
 """
 
@@ -12,11 +12,16 @@ import sys
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from unicodedata import normalize
+
+from publication_policy import developer_document_path, disclosure_errors
 
 
 ROOT = Path(__file__).resolve().parents[2]
 DOCS = ROOT / "docs"
 SKIP_DIRS = {
+    "aegis",
+    "agents",
     "internal",
     "private",
     "reviews",
@@ -34,10 +39,11 @@ PUBLIC_INDEXES = {
 }
 PUBLIC_INDEXES_CASEFOLDED = frozenset(path.as_posix().casefold() for path in PUBLIC_INDEXES)
 GRANDFATHERED_PUBLIC_DOCUMENTS: set[Path] = set()
+PRIVATE_REGISTERS = DOCS / "internal" / "documentation-registers"
 LOCAL_RECORD_REGISTERS = (
-    (DOCS / "plans", DOCS / "plans" / "README.md", False, frozenset({"README.md"})),
-    (DOCS / "reviews", DOCS / "reviews" / "README.md", False, frozenset({"README.md"})),
-    (DOCS / "superpowers", DOCS / "engineering" / "documentation-migration.md", True, frozenset()),
+    (DOCS / "plans", PRIVATE_REGISTERS / "plans.md", False, frozenset({"README.md"})),
+    (DOCS / "reviews", PRIVATE_REGISTERS / "reviews.md", False, frozenset({"README.md"})),
+    (DOCS / "superpowers", PRIVATE_REGISTERS / "legacy.md", True, frozenset()),
 )
 MAX_PUBLIC_DOCUMENT_BYTES = 64 * 1024
 REQUIRED_FIELDS = {
@@ -111,9 +117,11 @@ def public_documents() -> list[Path]:
     return sorted(
         path
         for path in DOCS.rglob("*.md")
-        if path.relative_to(DOCS).as_posix().casefold() in PUBLIC_INDEXES_CASEFOLDED
-        or path.relative_to(DOCS).parts[0].casefold()
-        not in SKIP_DIRS_CASEFOLDED
+        if not developer_document_path(path.relative_to(ROOT).as_posix())
+        and (
+            path.relative_to(DOCS).as_posix().casefold() in PUBLIC_INDEXES_CASEFOLDED
+            or path.relative_to(DOCS).parts[0].casefold() not in SKIP_DIRS_CASEFOLDED
+        )
     )
 
 
@@ -186,6 +194,8 @@ def is_private_repository_target(candidate: Path) -> bool:
     if relative.name.casefold() == "agents.md":
         return True
     normalized = relative.as_posix().casefold()
+    if developer_document_path(normalized):
+        return True
     if any(part.casefold() in PRIVATE_DIRECTORY_NAMES for part in relative.parts):
         return True
     if normalized in PRIVATE_ROOT_PATHS:
@@ -249,21 +259,33 @@ def check_body(document: Document) -> list[str]:
             f"{relative}: public document exceeds {MAX_PUBLIC_DOCUMENT_BYTES} bytes"
         )
     if document.fields.get("visibility") == "public":
-        if ABSOLUTE_PATH_RE.search(document.body):
+        public_text = normalize("NFKC", "\n".join(
+            f"{key}: {value}" for key, value in document.fields.items()
+        ) + "\n" + document.body)
+        if ABSOLUTE_PATH_RE.search(public_text):
             errors.append(f"{relative}: public document contains an absolute path or file URI")
-        if PRIVATE_PATH_RE.search(document.body):
+        if PRIVATE_PATH_RE.search(public_text):
             errors.append(f"{relative}: public document contains a private runtime path")
-        if SIGNED_URL_RE.search(document.body):
+        if SIGNED_URL_RE.search(public_text):
             errors.append(f"{relative}: public document contains a signed URL or bearer token")
-        if SECRET_MARKER_RE.search(document.body):
+        if SECRET_MARKER_RE.search(public_text):
             errors.append(f"{relative}: public document contains a credential marker")
-        if COOKIE_HEADER_RE.search(document.body):
+        if COOKIE_HEADER_RE.search(public_text):
             errors.append(f"{relative}: public document contains a raw cookie header")
+        errors.extend(
+            f"{relative}: public document contains {category}"
+            for category in disclosure_errors(public_text)
+        )
     return errors
 
 
 def check_surface(document: Document) -> list[str]:
     if document.fields.get("visibility") == "public":
+        private_fields = {"active_ledger", "ledger_cutover", "ledger_state", "ledger_as_of"}
+        if private_fields & document.fields.keys():
+            return [
+                f"{document.path.relative_to(ROOT)}: private execution metadata is not public"
+            ]
         return []
     return [
         f"{document.path.relative_to(ROOT)}: curated public surface must declare visibility: public"
@@ -295,20 +317,20 @@ def check_record_register(
     recursive: bool,
     excluded_names: frozenset[str],
 ) -> list[str]:
-    """Require local-only records to be named in their public lifecycle register."""
+    """Require local-only records to be named in their private register."""
 
     if not directory.exists():
+        return []
+    candidates = directory.rglob("*.md") if recursive else directory.glob("*.md")
+    records = sorted(path for path in candidates if path.name not in excluded_names)
+    if not records:
         return []
     try:
         register_text = register.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
         return [f"{register.relative_to(ROOT)}: cannot read local record register ({error})"]
-
-    candidates = directory.rglob("*.md") if recursive else directory.glob("*.md")
     errors: list[str] = []
-    for path in sorted(candidates):
-        if path.name in excluded_names:
-            continue
+    for path in records:
         relative = path.relative_to(ROOT).as_posix()
         if f"`{relative}`" not in register_text:
             errors.append(
@@ -320,9 +342,9 @@ def check_record_register(
 
 def check_plan_register(
     plan_directory: Path = ROOT / "plan",
-    register: Path = DOCS / "engineering" / "documentation-migration.md",
+    register: Path = PRIVATE_REGISTERS / "legacy.md",
 ) -> list[str]:
-    """Compare the local plan corpus with the committed root-plan register."""
+    """Compare the local plan corpus with its private root-plan register."""
 
     if not plan_directory.exists():
         return []
@@ -379,7 +401,7 @@ def check_ledger_policy(documents: list[Document]) -> tuple[list[str], list[str]
     ]
 
     if len(work_indexes) != 1:
-        return ["exactly one work.index document must declare the active ledger"], warnings
+        return ["exactly one private work.index must declare the active ledger"], warnings
 
     work_index = work_indexes[0]
     relative_index = work_index.path.relative_to(ROOT)
@@ -388,20 +410,20 @@ def check_ledger_policy(documents: list[Document]) -> tuple[list[str], list[str]
     state = work_index.fields.get("ledger_state")
     as_of = work_index.fields.get("ledger_as_of")
 
+    if not declared or Path(declared).is_absolute() or ".." in Path(declared).parts:
+        errors.append(f"{relative_index}: active_ledger must be a private repository path")
+    elif not is_private_repository_target(ROOT / declared):
+        errors.append(f"{relative_index}: active_ledger must remain private")
+
     if cutover == "pending":
-        if declared != "plan/IMPLEMENTATION_STATUS.md":
-            errors.append(
-                f"{relative_index}: pending cutover must declare "
-                "plan/IMPLEMENTATION_STATUS.md as active_ledger"
-            )
         if active_ledgers:
             errors.append(
-                f"{relative_index}: pending cutover forbids an active public work.status ledger"
+                f"{relative_index}: pending cutover forbids a competing work.status ledger"
             )
     elif cutover == "complete":
         if len(active_ledgers) != 1:
             errors.append(
-                f"{relative_index}: completed cutover requires exactly one active work.status ledger"
+                f"{relative_index}: completed cutover requires exactly one active private work.status ledger"
             )
         elif declared != active_ledgers[0].path.relative_to(ROOT).as_posix():
             errors.append(
@@ -426,6 +448,32 @@ def check_ledger_policy(documents: list[Document]) -> tuple[list[str], list[str]
         )
 
     return errors, warnings
+
+
+def check_local_ledger_policy() -> tuple[list[str], list[str]]:
+    """Keep private execution governance out of the public document plane."""
+    index = PRIVATE_REGISTERS / "work.md"
+    if not index.exists():
+        if (ROOT / "plan").exists():
+            return [f"{index.relative_to(ROOT)}: missing private ledger register"], []
+        return [], []
+    document, errors = parse_document(index)
+    if document is None:
+        return errors, []
+    documents = [document]
+    declared = document.fields.get("active_ledger", "")
+    if declared and not Path(declared).is_absolute() and ".." not in Path(declared).parts:
+        ledger = ROOT / declared
+        if is_private_repository_target(ledger):
+            if not ledger.is_file():
+                errors.append(f"{index.relative_to(ROOT)}: declared private ledger is missing")
+            elif document.fields.get("ledger_cutover") == "complete":
+                active, parse_errors = parse_document(ledger)
+                errors.extend(parse_errors)
+                if active is not None:
+                    documents.append(active)
+    policy_errors, warnings = check_ledger_policy(documents)
+    return [*errors, *policy_errors], warnings
 
 
 def emit_results(
@@ -486,7 +534,7 @@ def main() -> int:
         errors.extend(check_links(document))
         errors.extend(check_body(document))
 
-    ledger_errors, ledger_warnings = check_ledger_policy(documents)
+    ledger_errors, ledger_warnings = check_local_ledger_policy()
     errors.extend(ledger_errors)
     warnings.extend(ledger_warnings)
 

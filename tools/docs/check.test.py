@@ -8,6 +8,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 
 MODULE_PATH = Path(__file__).with_name("check.py")
@@ -29,12 +30,12 @@ class DocumentationCheckerTests(unittest.TestCase):
         self.assertIn("plans/README.md", relative_paths)
         self.assertIn("reviews/README.md", relative_paths)
         self.assertNotIn(
-            "plans/2026-09-15-v1.0.0-release-readiness-plan.md",
+            "plans/example-plan.md",
             relative_paths,
         )
-        self.assertNotIn("reviews/2026-09-05-product-review.md", relative_paths)
+        self.assertNotIn("reviews/example-review.md", relative_paths)
         self.assertNotIn(
-            "superpowers/specs/2026-09-10-comic-reading-center-design.md",
+            "superpowers/specs/example-design.md",
             relative_paths,
         )
         grandfathered = {
@@ -181,6 +182,11 @@ class DocumentationCheckerTests(unittest.TestCase):
 
         self.assertTrue(DOCS_CHECK.is_private_repository_target(candidate))
 
+    def test_method_pack_work_records_stay_internal(self) -> None:
+        candidate = DOCS_CHECK.ROOT / "docs" / "aegis" / "work" / "checkpoint.md"
+        self.assertTrue(DOCS_CHECK.is_private_repository_target(candidate))
+        self.assertNotIn(candidate, DOCS_CHECK.public_documents())
+
     def test_public_link_cannot_target_ignored_internal_material(self) -> None:
         document = DOCS_CHECK.Document(
             path=DOCS_CHECK.ROOT / "docs" / "README.md",
@@ -298,12 +304,12 @@ class DocumentationCheckerTests(unittest.TestCase):
         self.assertTrue(any("has no local file" in error for error in errors))
         self.assertEqual(registered_errors, [])
 
-    def test_pending_ledger_cutover_rejects_public_active_ledger(self) -> None:
+    def test_pending_private_ledger_cutover_rejects_competing_active_ledger(self) -> None:
         work_index = DOCS_CHECK.Document(
-            path=DOCS_CHECK.ROOT / "docs" / "work" / "README.md",
+            path=DOCS_CHECK.PRIVATE_REGISTERS / "work.md",
             fields={
                 "doc_id": "work.index",
-                "active_ledger": "plan/IMPLEMENTATION_STATUS.md",
+                "active_ledger": "plan/current.md",
                 "ledger_cutover": "pending",
                 "ledger_state": "stale",
                 "ledger_as_of": "2026-09-15",
@@ -311,7 +317,7 @@ class DocumentationCheckerTests(unittest.TestCase):
             body="",
         )
         public_ledger = DOCS_CHECK.Document(
-            path=DOCS_CHECK.ROOT / "docs" / "work" / "STATUS.md",
+            path=DOCS_CHECK.ROOT / "docs" / "internal" / "current-status.md",
             fields={"doc_id": "work.status", "status": "active"},
             body="",
         )
@@ -321,12 +327,12 @@ class DocumentationCheckerTests(unittest.TestCase):
         self.assertTrue(any("pending cutover forbids" in error for error in errors))
         self.assertTrue(any("STALE_LEDGER" in warning for warning in warnings))
 
-    def test_completed_ledger_cutover_requires_declared_public_ledger(self) -> None:
+    def test_completed_ledger_cutover_requires_declared_private_ledger(self) -> None:
         work_index = DOCS_CHECK.Document(
-            path=DOCS_CHECK.ROOT / "docs" / "work" / "README.md",
+            path=DOCS_CHECK.PRIVATE_REGISTERS / "work.md",
             fields={
                 "doc_id": "work.index",
-                "active_ledger": "docs/work/STATUS.md",
+                "active_ledger": "docs/internal/current-status.md",
                 "ledger_cutover": "complete",
                 "ledger_state": "current",
                 "ledger_as_of": "2026-09-20",
@@ -334,7 +340,7 @@ class DocumentationCheckerTests(unittest.TestCase):
             body="",
         )
         public_ledger = DOCS_CHECK.Document(
-            path=DOCS_CHECK.ROOT / "docs" / "work" / "STATUS.md",
+            path=DOCS_CHECK.ROOT / "docs" / "internal" / "current-status.md",
             fields={"doc_id": "work.status", "status": "active"},
             body="",
         )
@@ -343,6 +349,124 @@ class DocumentationCheckerTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
         self.assertEqual(warnings, [])
+
+    def test_public_docs_cannot_contain_development_cli_or_private_catalog(self) -> None:
+        samples = (
+            "claude --print --permission-mode plan",
+            "claude --continue",
+            "--no-session-persistence",
+            "Allowed Paths: src",
+            "Allowed Paths：src",
+            "Forbidden Paths / 不在范围内：src",
+            "Vibe Coding task",
+            "Use Claude Code as a subagent.",
+            "`plan/private-note.md`",
+            "[private](../../plan/private-note.md)",
+            "`docs\\internal\\private-note.md`",
+            "`docs/internal/private-review.json`",
+            "见plan/private-note.md",
+            "`docs/drafts/private-note.md`",
+            "`docs/project/private-note.md`",
+            "`docs/tmp/private-note.md`",
+            "`docs/.tmp/private-note.md`",
+            "CLAUDE_CODE_AGENT_WORKFLOW.md",
+        )
+        for text in samples:
+            with self.subTest(text=text):
+                document = DOCS_CHECK.Document(
+                    path=DOCS_CHECK.DOCS / "README.md",
+                    fields={"visibility": "public"},
+                    body=text,
+                )
+                self.assertTrue(DOCS_CHECK.check_body(document))
+
+    def test_sensitive_paths_are_normalized_in_body_and_metadata(self) -> None:
+        samples = ("C：\\Users\\example\\private.md", "file：／／／private.md")
+        for text in samples:
+            for metadata in (False, True):
+                with self.subTest(text=text, metadata=metadata):
+                    fields = {"visibility": "public"}
+                    if metadata:
+                        fields["owner"] = text
+                    document = DOCS_CHECK.Document(
+                        path=DOCS_CHECK.DOCS / "README.md",
+                        fields=fields,
+                        body="" if metadata else text,
+                    )
+                    self.assertTrue(any("absolute path" in error for error in DOCS_CHECK.check_body(document)))
+
+    def test_product_mcp_integration_is_not_a_development_sop(self) -> None:
+        document = DOCS_CHECK.Document(
+            path=DOCS_CHECK.DOCS / "architecture" / "AI_SYSTEM.md",
+            fields={"visibility": "public"},
+            body=(
+                "Haven MCP: Codex / Claude Code connect using stdio. "
+                "claude mcp add haven --scope user. "
+                "Proposal → UI approval → CAS → Receipt. "
+                "skills/haven-agent-proposal/SKILL.md"
+            ),
+        )
+        self.assertEqual(DOCS_CHECK.check_body(document), [])
+
+    def test_private_inventory_is_not_echoed_in_errors(self) -> None:
+        document = DOCS_CHECK.Document(
+            path=DOCS_CHECK.DOCS / "README.md",
+            fields={"visibility": "public"},
+            body="`plan/confidential-project-note.md`",
+        )
+        errors = DOCS_CHECK.check_body(document)
+        self.assertTrue(errors)
+        self.assertTrue(all("confidential-project-note" not in error for error in errors))
+
+    def test_development_documents_are_private_even_outside_private_directory(self) -> None:
+        for relative in ("docs/agents/notes.md", "docs/architecture/CLAUDE_CODE_AGENT_WORKFLOW.md"):
+            with self.subTest(relative=relative):
+                self.assertTrue(DOCS_CHECK.is_private_repository_target(DOCS_CHECK.ROOT / relative))
+
+    def test_public_execution_metadata_is_rejected(self) -> None:
+        document = DOCS_CHECK.Document(
+            path=DOCS_CHECK.DOCS / "work" / "README.md",
+            fields={"visibility": "public", "active_ledger": "plan/current.md"},
+            body="",
+        )
+        self.assertTrue(DOCS_CHECK.check_surface(document))
+
+    def test_all_internal_registers_stay_in_private_plane(self) -> None:
+        for _, register, _, _ in DOCS_CHECK.LOCAL_RECORD_REGISTERS:
+            self.assertTrue(register.is_relative_to(DOCS_CHECK.DOCS / "internal"))
+
+    def test_clean_public_clone_needs_no_private_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(DOCS_CHECK, "ROOT", root), patch.object(
+                DOCS_CHECK, "PRIVATE_REGISTERS", root / "docs" / "internal" / "registers"
+            ):
+                self.assertEqual(DOCS_CHECK.check_local_ledger_policy(), ([], []))
+
+    def test_missing_private_register_is_not_hidden_when_local_plan_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "plan").mkdir()
+            with patch.object(DOCS_CHECK, "ROOT", root), patch.object(
+                DOCS_CHECK, "PRIVATE_REGISTERS", root / "docs" / "internal" / "registers"
+            ):
+                errors, _ = DOCS_CHECK.check_local_ledger_policy()
+        self.assertTrue(any("missing private ledger register" in error for error in errors))
+
+    def test_public_ledger_target_is_rejected(self) -> None:
+        index = DOCS_CHECK.Document(
+            path=DOCS_CHECK.PRIVATE_REGISTERS / "work.md",
+            fields={
+                "doc_id": "work.index",
+                "active_ledger": "docs/work/STATUS.md",
+                "ledger_cutover": "pending",
+                "ledger_state": "current",
+                "ledger_as_of": "2026-10-04",
+            },
+            body="",
+        )
+        errors, _ = DOCS_CHECK.check_ledger_policy([index])
+        self.assertTrue(any("active_ledger must remain private" in error for error in errors))
 
     def test_warnings_are_emitted_even_when_errors_exist(self) -> None:
         stdout = io.StringIO()

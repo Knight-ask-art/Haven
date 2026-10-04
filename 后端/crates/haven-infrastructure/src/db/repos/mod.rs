@@ -6,7 +6,10 @@
 //! - Locator 序列化走 `Locator` 自身的 version + kind + data envelope（未知版本拒绝）。
 
 pub mod agent_bindings;
+pub mod agent_skills;
 pub mod ai_provider_profiles;
+pub mod appearance;
+pub mod cloud_storage;
 pub mod comic_catalog_refresh_outcomes;
 pub mod comic_identity;
 pub mod comic_progress_migrations;
@@ -19,15 +22,18 @@ pub mod favorite;
 pub mod hierarchy;
 pub mod history;
 pub mod image_proxy;
+pub mod interface_font_assets;
 pub mod marker;
 pub mod media_item;
 pub mod periodicals;
 pub mod progress;
+pub mod reading_activity;
 pub mod resource;
 pub mod resource_preferences;
 pub mod search_history;
 pub mod setting_proposals;
 pub mod settings;
+pub mod source_config_cache;
 pub mod storage_location;
 pub mod trending_cache;
 pub mod work;
@@ -38,7 +44,10 @@ use haven_domain::entities::ArtworkSet;
 use haven_domain::locator::Locator;
 
 pub use agent_bindings::SqliteAgentActionBindingRepository;
+pub use agent_skills::SqliteAgentSkillStateRepository;
 pub use ai_provider_profiles::SqliteAiProviderProfileRepository;
+pub use appearance::SqliteAppearanceRepository;
+pub use cloud_storage::SqliteCloudStorageRepository;
 pub use comic_catalog_refresh_outcomes::SqliteComicCatalogRefreshOutcomeRepository;
 pub use comic_identity::{SqliteChapterSourceRepository, SqliteComicPageIdentityRepository};
 pub use comic_progress_migrations::SqliteComicProgressMigrationRepository;
@@ -50,15 +59,18 @@ pub use enrichment::SqliteEnrichmentRepository;
 pub use favorite::SqliteFavoriteRepository;
 pub use history::SqliteHistoryRepository;
 pub use image_proxy::SqliteImageProxyRepository;
+pub use interface_font_assets::{SqliteInterfaceFontAssetRepository, SqliteInterfaceFontUoW};
 pub use marker::SqliteMarkerRepository;
 pub use media_item::SqliteMediaItemRepository;
 pub use periodicals::SqlitePeriodicalRepository;
 pub use progress::SqliteProgressRepository;
+pub use reading_activity::SqliteReadingActivityRepository;
 pub use resource::SqliteResourceRepository;
 pub use resource_preferences::SqliteResourcePreferenceRepository;
 pub use search_history::SqliteSearchHistoryRepository;
 pub use setting_proposals::{SqliteSettingProposalRepository, SqliteSettingProposalUow};
 pub use settings::{SqliteSettingsRepository, SqliteSettingsUoW};
+pub use source_config_cache::SqliteSourceConfigCache;
 pub use storage_location::SqliteStorageLocationRepository;
 pub use trending_cache::SqliteTrendingCacheRepository;
 pub use work::SqliteWorkRepository;
@@ -79,6 +91,7 @@ pub struct SqliteRepositories {
     pub favorite: SqliteFavoriteRepository,
     pub history: SqliteHistoryRepository,
     pub settings: SqliteSettingsRepository,
+    pub source_config_cache: SqliteSourceConfigCache,
     pub search_history: SqliteSearchHistoryRepository,
     pub image_proxy: SqliteImageProxyRepository,
     pub enrichment: SqliteEnrichmentRepository,
@@ -93,6 +106,10 @@ pub struct SqliteRepositories {
     pub periodical: SqlitePeriodicalRepository,
     pub setting_proposals: SqliteSettingProposalRepository,
     pub agent_bindings: SqliteAgentActionBindingRepository,
+    pub interface_font_assets: SqliteInterfaceFontAssetRepository,
+    pub appearance: SqliteAppearanceRepository,
+    pub reading_activity: SqliteReadingActivityRepository,
+    pub agent_skills: SqliteAgentSkillStateRepository,
     pub ai_provider_profiles: SqliteAiProviderProfileRepository,
 }
 
@@ -112,6 +129,7 @@ impl SqliteRepositories {
             favorite: SqliteFavoriteRepository::new(db.clone()),
             history: SqliteHistoryRepository::new(db.clone()),
             settings: SqliteSettingsRepository::new(db.clone()),
+            source_config_cache: SqliteSourceConfigCache::new(db.clone()),
             search_history: SqliteSearchHistoryRepository::new(db.clone()),
             image_proxy: SqliteImageProxyRepository::new(db.clone()),
             enrichment: SqliteEnrichmentRepository::new(db.clone()),
@@ -126,6 +144,10 @@ impl SqliteRepositories {
             periodical: SqlitePeriodicalRepository::new(db.clone()),
             setting_proposals: SqliteSettingProposalRepository::new(db.clone()),
             agent_bindings: SqliteAgentActionBindingRepository::new(db.clone()),
+            interface_font_assets: SqliteInterfaceFontAssetRepository::new(db.clone()),
+            appearance: SqliteAppearanceRepository::new(db.clone()),
+            reading_activity: SqliteReadingActivityRepository::new(db.clone()),
+            agent_skills: SqliteAgentSkillStateRepository::new(db.clone()),
             ai_provider_profiles: SqliteAiProviderProfileRepository::new(db),
         }
     }
@@ -725,6 +747,113 @@ impl haven_domain::contracts::SettingsRepository for SqliteRepositories {
 }
 
 #[async_trait::async_trait]
+impl haven_domain::contracts::AppearanceRepository for SqliteRepositories {
+    async fn get_asset(
+        &self,
+        id: haven_domain::appearance::AppearanceAssetId,
+    ) -> Result<Option<haven_domain::appearance::AppearanceAssetMetadata>, haven_common::AppError>
+    {
+        self.appearance.get_asset(id).await
+    }
+
+    async fn list_assets(
+        &self,
+        kind: Option<haven_domain::appearance::AppearanceAssetKind>,
+    ) -> Result<Vec<haven_domain::appearance::AppearanceAssetMetadata>, haven_common::AppError>
+    {
+        self.appearance.list_assets(kind).await
+    }
+
+    async fn create_asset(
+        &self,
+        asset: &haven_domain::appearance::AppearanceAssetMetadata,
+    ) -> Result<(), haven_common::AppError> {
+        self.appearance.create_asset(asset).await
+    }
+
+    async fn delete_asset(
+        &self,
+        id: haven_domain::appearance::AppearanceAssetId,
+    ) -> Result<haven_domain::appearance::AppearanceAssetDeleteOutcome, haven_common::AppError>
+    {
+        self.appearance.delete_asset(id).await
+    }
+
+    async fn get_home_layout(
+        &self,
+    ) -> Result<Option<haven_domain::contracts::HomeLayoutSnapshot>, haven_common::AppError> {
+        self.appearance.get_home_layout().await
+    }
+
+    async fn cas_save_home_layout(
+        &self,
+        expected_revision: Option<&str>,
+        layout: &haven_domain::appearance::HomeLayout,
+        revision: &str,
+        updated_at: haven_common::UtcMillis,
+    ) -> Result<bool, haven_common::AppError> {
+        self.appearance
+            .cas_save_home_layout(expected_revision, layout, revision, updated_at)
+            .await
+    }
+
+    async fn cas_reset_home_layout(
+        &self,
+        expected_revision: Option<&str>,
+    ) -> Result<bool, haven_common::AppError> {
+        self.appearance
+            .cas_reset_home_layout(expected_revision)
+            .await
+    }
+
+    async fn get_overview_layout(
+        &self,
+    ) -> Result<Option<haven_domain::contracts::OverviewLayoutSnapshot>, haven_common::AppError>
+    {
+        self.appearance.get_overview_layout().await
+    }
+
+    async fn cas_save_overview_layout(
+        &self,
+        expected_revision: Option<&str>,
+        layout: &haven_domain::appearance::OverviewLayout,
+        revision: &str,
+        updated_at: haven_common::UtcMillis,
+    ) -> Result<bool, haven_common::AppError> {
+        self.appearance
+            .cas_save_overview_layout(expected_revision, layout, revision, updated_at)
+            .await
+    }
+
+    async fn cas_reset_overview_layout(
+        &self,
+        expected_revision: Option<&str>,
+    ) -> Result<bool, haven_common::AppError> {
+        self.appearance
+            .cas_reset_overview_layout(expected_revision)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl haven_domain::contracts::ReadingActivityRepository for SqliteRepositories {
+    async fn record_session(
+        &self,
+        session: &haven_domain::reading_activity::ReadingSession,
+    ) -> Result<(), haven_common::AppError> {
+        self.reading_activity.record_session(session).await
+    }
+
+    async fn list_sessions_between(
+        &self,
+        from: haven_common::UtcMillis,
+        to: haven_common::UtcMillis,
+    ) -> Result<Vec<haven_domain::reading_activity::ReadingSession>, haven_common::AppError> {
+        self.reading_activity.list_sessions_between(from, to).await
+    }
+}
+
+#[async_trait::async_trait]
 impl haven_domain::contracts::ResourcePreferenceRepository for SqliteRepositories {
     async fn get_edition(
         &self,
@@ -787,6 +916,34 @@ impl haven_application::services::trending::TrendingCachePort for SqliteReposito
         entry: &haven_application::services::trending::TrendingBoardCacheEntry,
     ) -> Result<(), AppError> {
         self.trending_cache.upsert(entry).await
+    }
+}
+
+#[async_trait::async_trait]
+impl haven_application::services::source_config_cache::SourceConfigCache for SqliteRepositories {
+    async fn put(
+        &self,
+        source_id: &str,
+        body: &[u8],
+        fetched_at: haven_common::UtcMillis,
+    ) -> Result<(), AppError> {
+        self.source_config_cache
+            .put(source_id, body, fetched_at)
+            .await
+    }
+
+    async fn get(
+        &self,
+        source_id: &str,
+    ) -> Result<
+        Option<haven_application::services::source_config_cache::CachedSourceConfig>,
+        AppError,
+    > {
+        self.source_config_cache.get(source_id).await
+    }
+
+    async fn delete(&self, source_id: &str) -> Result<bool, AppError> {
+        self.source_config_cache.delete(source_id).await
     }
 }
 
@@ -1248,6 +1405,52 @@ impl haven_domain::contracts::AgentActionBindingRepository for SqliteRepositorie
 }
 
 #[async_trait::async_trait]
+impl haven_domain::contracts::InterfaceFontAssetRepository for SqliteRepositories {
+    async fn list(
+        &self,
+    ) -> Result<Vec<haven_domain::contracts::InterfaceFontAsset>, haven_common::AppError> {
+        self.interface_font_assets.list().await
+    }
+
+    async fn get(
+        &self,
+        id: &str,
+    ) -> Result<Option<haven_domain::contracts::InterfaceFontAsset>, haven_common::AppError> {
+        self.interface_font_assets.get(id).await
+    }
+
+    async fn find_by_digest(
+        &self,
+        sha256: &str,
+    ) -> Result<Option<haven_domain::contracts::InterfaceFontAsset>, haven_common::AppError> {
+        self.interface_font_assets.find_by_digest(sha256).await
+    }
+
+    async fn insert(
+        &self,
+        asset: &haven_domain::contracts::InterfaceFontAssetInsert,
+    ) -> Result<(), haven_common::AppError> {
+        self.interface_font_assets.insert(asset).await
+    }
+
+    async fn delete(&self, id: &str) -> Result<bool, haven_common::AppError> {
+        self.interface_font_assets.delete(id).await
+    }
+
+    async fn load_bytes(
+        &self,
+        id: &str,
+    ) -> Result<Option<haven_domain::contracts::InterfaceFontAssetBytes>, haven_common::AppError>
+    {
+        self.interface_font_assets.load_bytes(id).await
+    }
+
+    async fn count(&self) -> Result<u32, haven_common::AppError> {
+        self.interface_font_assets.count().await
+    }
+}
+
+#[async_trait::async_trait]
 impl haven_domain::contracts::AiProviderProfileRepository for SqliteRepositories {
     async fn list(
         &self,
@@ -1281,5 +1484,30 @@ impl haven_domain::contracts::AiProviderProfileRepository for SqliteRepositories
         self.ai_provider_profiles
             .cas_delete(profile_id, expected_revision)
             .await
+    }
+}
+
+#[async_trait::async_trait]
+impl haven_domain::contracts::AgentSkillStateRepository for SqliteRepositories {
+    async fn list(
+        &self,
+    ) -> Result<Vec<haven_domain::agent_skill::AgentSkillEnablement>, haven_common::AppError> {
+        self.agent_skills.list().await
+    }
+
+    async fn get(
+        &self,
+        skill_id: &haven_domain::agent_skill::AgentSkillId,
+    ) -> Result<Option<haven_domain::agent_skill::AgentSkillEnablement>, haven_common::AppError>
+    {
+        self.agent_skills.get(skill_id).await
+    }
+
+    async fn put(
+        &self,
+        enablement: &haven_domain::agent_skill::AgentSkillEnablement,
+        updated_at_ms: i64,
+    ) -> Result<(), haven_common::AppError> {
+        self.agent_skills.put(enablement, updated_at_ms).await
     }
 }

@@ -8,6 +8,7 @@
 import { connect, type Socket } from "node:net";
 
 import type {
+  BridgeCallContext,
   HavenAgentBridge,
   HavenCapabilityReport,
   LibrarySummaryResult,
@@ -26,6 +27,7 @@ import {
   HavenMcpError,
   capabilityUnavailable,
   endpointInvalid,
+  bridgeCancelled,
   bridgeProtocolError,
   bridgeTimeout,
 } from "./errors.js";
@@ -141,11 +143,23 @@ function protocolFailure(): HavenMcpError {
   return bridgeProtocolError("Haven Broker 返回了不符合协议的响应。");
 }
 
-function transportFailure(): HavenMcpError {
+/**
+ * 传输层失败。
+ *
+ * `retryable` **必须**由调用方按操作的副作用给出，理由与 [`bridgeTimeout`] 相同：
+ * 一次已经发出去的 `create_proposal` 如果只是"响应没回来"，Broker 可能已经落库了。
+ * 把它报成"可重试"会让调用方再发一次，用户于是看到两条一模一样的待审批提案，
+ * 而调用方以为自己只成功了一次。
+ *
+ * 默认 `true` 只覆盖"什么都还没发出去"的阶段（连接、握手）——那时重试确实安全。
+ */
+function transportFailure(retryable = true): HavenMcpError {
   return new HavenMcpError(
     ERROR_CODES.BRIDGE_UNAVAILABLE,
-    "无法连接到正在运行的栖阅；请确认外部 Agent 接入已开启。",
-    true,
+    retryable
+      ? "无法连接到正在运行的栖阅；请确认外部 Agent 接入已开启。"
+      : "与栖阅的本地连接在等待结果时断开，本次请求的结果未确认：请先检查栖阅中是否已创建对应的待审批提案，再决定是否重试。",
+    retryable,
   );
 }
 
@@ -277,36 +291,60 @@ class BrokerClient {
     timer: ReturnType<typeof setTimeout>;
   }> = [];
   private closed = false;
+  /**
+   * 当前在途请求"失败后能不能安全重试"。
+   *
+   * 一条连接的生命周期分两段，两段的答案不同：
+   * - **握手前**（连接建立、hello/welcome）：什么都还没发出去，重试安全 → `true`；
+   * - **请求在途**：取决于那个请求有没有副作用——只读读取是 `true`，提案创建是
+   *   `false`（请求可能已被处理并落库）。
+   *
+   * 因此它必须是一个随请求类型切换的状态，而不是写死在错误构造函数里的常量；
+   * 传输错误可能在**任何时候**发生（socket error / close / 超时），错误发生时
+   * 已经没有别的信息可以判断，只能靠进入请求前记下的这一位。
+   */
+  private failureRetryable = true;
 
   constructor(private readonly socket: Socket) {
     socket.on("data", (chunk: Buffer) => this.onData(chunk));
-    socket.on("error", () => this.fail(transportFailure()));
-    socket.on("close", () => this.fail(transportFailure()));
+    socket.on("error", () => this.fail(this.transportError()));
+    socket.on("close", () => this.fail(this.transportError()));
+  }
+
+  /** 标记接下来这条请求失败后的重试语义。必须在 `send` 之前调用。 */
+  expectRetryableOnFailure(retryable: boolean): void {
+    this.failureRetryable = retryable;
+  }
+
+  private transportError(): HavenMcpError {
+    return transportFailure(this.failureRetryable);
   }
 
   async send(frame: JsonRecord): Promise<void> {
-    if (this.closed) throw transportFailure();
+    if (this.closed) throw this.transportError();
     const payload = Buffer.from(JSON.stringify(frame), "utf8");
     if (payload.length > BROKER_MAX_REQUEST_BYTES) throw protocolFailure();
     const output = Buffer.allocUnsafe(4 + payload.length);
     output.writeUInt32BE(payload.length, 0);
     payload.copy(output, 4);
     await new Promise<void>((resolve, reject) => {
-      try {
-        this.socket.write(output, () => resolve());
-      } catch {
-        reject(transportFailure());
-      }
+      // 写回调的参数是错误对象：socket 已经断掉时 `write` 不会抛，而是把失败交给
+      // 回调。忽略它会让一次**没有发出去**的请求被当成发送成功，调用方只能等到
+      // 超时才知道结果。
+      this.socket.write(output, (error?: Error | null) => {
+        if (error) reject(this.transportError());
+        else resolve();
+      });
     });
   }
 
   async nextFrame(timeoutMs: number): Promise<unknown> {
     if (this.frames.length > 0) return this.frames.shift();
-    if (this.closed) throw transportFailure();
+    if (this.closed) throw this.transportError();
     return await new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.removeWaiter(resolve, reject);
-        reject(bridgeTimeout("Haven Broker 本地请求"));
+        reject(bridgeTimeout("Haven Broker 本地请求", this.failureRetryable));
       }, timeoutMs);
       this.waiters.push({ resolve, reject, timer });
     });
@@ -315,7 +353,7 @@ class BrokerClient {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    this.rejectWaiters(transportFailure());
+    this.rejectWaiters(this.transportError());
     this.socket.destroy();
   }
 
@@ -376,16 +414,80 @@ class BrokerClient {
   }
 }
 
-async function openClient(endpoint: string, connectFn: ConnectFn): Promise<BrokerClient> {
+/**
+ * 把一个 promise 与取消信号竞速。
+ *
+ * 保留 `promise` 自己的 then/catch，因此竞速失败时底层 promise 仍然有处理者：
+ * 不会因为"它已经没人等了"而变成 unhandled rejection。
+ */
+function raceWithAbort<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+  operation: string,
+): Promise<T> {
+  if (signal === undefined) return promise;
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const onAbort = (): void => {
+      if (settled) return;
+      settled = true;
+      reject(bridgeCancelled(operation, false));
+    };
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        if (settled) return;
+        settled = true;
+        reject(error);
+      },
+    );
+  });
+}
+
+async function openClient(
+  endpoint: string,
+  connectFn: ConnectFn,
+  signal?: AbortSignal,
+): Promise<BrokerClient> {
+  // 取消要在**连接之前**就生效：否则"用户按了停止"之后我们还会去创建一个新连接。
+  if (signal?.aborted) throw bridgeCancelled("连接 Haven Broker", false);
+
   const socket = await new Promise<Socket>((resolve, reject) => {
     let settled = false;
+    let candidate: Socket | undefined;
+    const removeAbortListener = (): void => signal?.removeEventListener("abort", onAbort);
+    function onAbort(): void {
+      if (settled) return;
+      settled = true;
+      removeAbortListener();
+      candidate?.destroy();
+      reject(bridgeCancelled("连接 Haven Broker", false));
+    }
     const fail = (): void => {
       if (settled) return;
       settled = true;
+      removeAbortListener();
       candidate?.destroy();
       reject(transportFailure());
     };
-    let candidate: Socket | undefined;
+    // 监听器在 `connectFn` **之前**注册：`connect` 事件最早只能在下一个 tick 到达，
+    // 但把注册放在后面会让"连接已建立、监听器还没挂上"这段窗口里的取消事件无处可去。
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
     try {
       candidate = connectFn(endpoint);
     } catch {
@@ -395,25 +497,44 @@ async function openClient(endpoint: string, connectFn: ConnectFn): Promise<Broke
     candidate.once("connect", () => {
       if (settled) return;
       settled = true;
-      candidate.setTimeout(0);
-      resolve(candidate);
+      removeAbortListener();
+      candidate?.setTimeout(0);
+      resolve(candidate as Socket);
     });
     candidate.once("error", fail);
     candidate.setTimeout(BRIDGE_TIMEOUT_MS, fail);
   });
 
   const client = new BrokerClient(socket);
+  // 握手全程同样受取消与超时控制。
+  //
+  // 曾经的版本在 TCP `connect` 完成时就把 abort 监听器摘掉，于是"连上了、但对方不回应
+  // welcome"这段路既不受取消控制，也不受调用方超时控制：MCP 侧已经以 `CANCELLED`
+  // 收尾，连接却继续挂在 Broker 的配额里直到握手上限。取消必须覆盖**整条**生命周期：
+  // 连接、握手、发送、等待响应、清理。
   try {
-    await client.send({
-      type: "hello",
-      protocol_version: BROKER_PROTOCOL_VERSION,
-      client: { name: "haven-mcp-server", version: SERVER_VERSION },
-    });
-    const welcome = assertWelcome(await client.nextFrame(BROKER_HANDSHAKE_TIMEOUT_MS));
+    await raceWithAbort(
+      client.send({
+        type: "hello",
+        protocol_version: BROKER_PROTOCOL_VERSION,
+        client: { name: "haven-mcp-server", version: SERVER_VERSION },
+      }),
+      signal,
+      "连接 Haven Broker",
+    );
+    const welcome = assertWelcome(
+      await raceWithAbort(
+        client.nextFrame(BROKER_HANDSHAKE_TIMEOUT_MS),
+        signal,
+        "连接 Haven Broker",
+      ),
+    );
     // 让连接对象持有 welcome，调用者无需重复完成握手。
     (client as BrokerClient & { welcome?: BrokerWelcome }).welcome = welcome;
     return client;
   } catch (error) {
+    // 取消 / 超时也要**断开底层连接**：否则一个已经没人等待的握手会继续占着
+    // Broker 的连接 permit。
     client.close();
     throw error;
   }
@@ -444,7 +565,11 @@ async function requestPayload(
   id: number,
   type: BrokerRequestType,
   payload: JsonRecord,
+  retryableOnFailure: boolean,
 ): Promise<JsonRecord> {
+  // 先记录这次请求的副作用语义，再发出去：失败可能在任何时刻发生，而失败处理路径
+  // 只能读到此刻已记录的那一位。
+  client.expectRetryableOnFailure(retryableOnFailure);
   await client.send({ type, id, payload });
   const frame = await client.nextFrame(BRIDGE_TIMEOUT_MS);
   assertFrameRecord(frame);
@@ -946,8 +1071,8 @@ export class LiveHavenAgentBridge implements HavenAgentBridge {
       : "HAVEN_MCP_ENDPOINT 无效；未尝试连接。";
   }
 
-  async getCapabilityManifest(): Promise<HavenCapabilityReport> {
-    const client = await this.open();
+  async getCapabilityManifest(context?: BridgeCallContext): Promise<HavenCapabilityReport> {
+    const client = await this.open(context?.signal);
     try {
       return this.toCapabilityReport(welcomeOf(client));
     } finally {
@@ -955,130 +1080,183 @@ export class LiveHavenAgentBridge implements HavenAgentBridge {
     }
   }
 
-  async getSettingsSnapshot(): Promise<SettingsSnapshotResult> {
-    const client = await this.open();
+  async getSettingsSnapshot(context?: BridgeCallContext): Promise<SettingsSnapshotResult> {
+    const client = await this.open(context?.signal);
     try {
       const welcome = welcomeOf(client);
       ensureCapability(welcome, "settings_read");
-      const response = await requestPayload(client, 1, "context", {});
+      const response = await requestPayload(client, 1, "context", {}, true);
       return assertContextPayload(response.payload as JsonRecord);
     } finally {
       client.close();
     }
   }
 
-  async proposeSettingsPatch(request: SettingsProposalRequest): Promise<ProposalOutcome> {
-    const client = await this.open();
+  async proposeSettingsPatch(
+    request: SettingsProposalRequest,
+    context?: BridgeCallContext,
+  ): Promise<ProposalOutcome> {
+    const client = await this.open(context?.signal);
     try {
       const welcome = welcomeOf(client);
       ensureCapability(welcome, "settings_proposal");
-      const response = await requestPayload(client, 1, "create_proposal", {
-        section: request.section,
-        context_id: request.context_id,
-        context_hash: request.context_hash,
-        base_revision: request.base_revision,
-        patch: request.patch,
-      });
+      // 提案创建**不可重试**：请求一旦发出去，Broker 可能已经落库了一条 pending 提案。
+      const response = await requestPayload(
+        client,
+        1,
+        "create_proposal",
+        {
+          section: request.section,
+          context_id: request.context_id,
+          context_hash: request.context_hash,
+          base_revision: request.base_revision,
+          patch: request.patch,
+        },
+        false,
+      );
       return assertProposalPayload(response.payload as JsonRecord);
     } finally {
       client.close();
     }
   }
 
-  async getSettingSources(): Promise<SettingSourcesResult> {
-    const client = await this.open();
+  async getSettingSources(context?: BridgeCallContext): Promise<SettingSourcesResult> {
+    const client = await this.open(context?.signal);
     try {
       const welcome = welcomeOf(client);
       ensureCapability(welcome, "setting_sources_read");
-      const response = await requestPayload(client, 1, "setting_sources", { section: "reading" });
+      const response = await requestPayload(client, 1, "setting_sources", { section: "reading" }, true);
       return assertSettingSourcesPayload(response.payload as JsonRecord);
     } finally {
       client.close();
     }
   }
 
-  async getResourcePreferenceSnapshot(request: {
-    target_scope: PreferenceScope;
-    edition_id: string;
-    media_item_id: string | null;
-  }): Promise<ResourcePreferenceSnapshotResult> {
-    const client = await this.open();
+  async getResourcePreferenceSnapshot(
+    request: {
+      target_scope: PreferenceScope;
+      edition_id: string;
+      media_item_id: string | null;
+    },
+    context?: BridgeCallContext,
+  ): Promise<ResourcePreferenceSnapshotResult> {
+    const client = await this.open(context?.signal);
     try {
       const welcome = welcomeOf(client);
       ensureCapability(welcome, "resource_preference_read");
-      const response = await requestPayload(client, 1, "resource_preference", {
-        target_scope: request.target_scope,
-        edition_id: request.edition_id,
-        media_item_id: request.media_item_id,
-      });
+      const response = await requestPayload(
+        client,
+        1,
+        "resource_preference",
+        {
+          target_scope: request.target_scope,
+          edition_id: request.edition_id,
+          media_item_id: request.media_item_id,
+        },
+        true,
+      );
       return assertResourcePreferencePayload(response.payload as JsonRecord);
     } finally {
       client.close();
     }
   }
 
-  async getLibrarySummary(request: { limit: number }): Promise<LibrarySummaryResult> {
-    const client = await this.open();
+  async getLibrarySummary(
+    request: { limit: number },
+    context?: BridgeCallContext,
+  ): Promise<LibrarySummaryResult> {
+    const client = await this.open(context?.signal);
     try {
       const welcome = welcomeOf(client);
       ensureCapability(welcome, "library_summary_read");
-      const response = await requestPayload(client, 1, "library_summary", { limit: request.limit });
+      const response = await requestPayload(client, 1, "library_summary", { limit: request.limit }, true);
       return assertLibrarySummaryPayload(response.payload as JsonRecord);
     } finally {
       client.close();
     }
   }
 
-  async getMediaCapabilities(request: { media_item_id: string | null; limit: number }): Promise<MediaCapabilitiesResult> {
-    const client = await this.open();
+  async getMediaCapabilities(
+    request: { media_item_id: string | null; limit: number },
+    context?: BridgeCallContext,
+  ): Promise<MediaCapabilitiesResult> {
+    const client = await this.open(context?.signal);
     try {
       const welcome = welcomeOf(client);
       ensureCapability(welcome, "media_capabilities_read");
-      const response = await requestPayload(client, 1, "media_capabilities", {
-        media_item_id: request.media_item_id,
-        limit: request.limit,
-      });
+      const response = await requestPayload(
+        client,
+        1,
+        "media_capabilities",
+        {
+          media_item_id: request.media_item_id,
+          limit: request.limit,
+        },
+        true,
+      );
       return assertMediaCapabilitiesPayload(response.payload as JsonRecord);
     } finally {
       client.close();
     }
   }
 
-  async getOnboardingState(): Promise<OnboardingStateResult> {
-    const client = await this.open();
+  async getOnboardingState(context?: BridgeCallContext): Promise<OnboardingStateResult> {
+    const client = await this.open(context?.signal);
     try {
       const welcome = welcomeOf(client);
       ensureCapability(welcome, "onboarding_read");
-      const response = await requestPayload(client, 1, "onboarding", {});
+      const response = await requestPayload(client, 1, "onboarding", {}, true);
       return assertOnboardingPayload(response.payload as JsonRecord);
     } finally {
       client.close();
     }
   }
 
-  async proposeResourcePreferencePatch(request: ResourcePreferenceProposalRequest): Promise<ProposalOutcome> {
-    const client = await this.open();
+  async proposeResourcePreferencePatch(
+    request: ResourcePreferenceProposalRequest,
+    context?: BridgeCallContext,
+  ): Promise<ProposalOutcome> {
+    const client = await this.open(context?.signal);
     try {
       const welcome = welcomeOf(client);
       ensureCapability(welcome, "resource_preference_proposal");
-      const response = await requestPayload(client, 1, "create_resource_proposal", {
-        target_scope: request.target_scope,
-        edition_id: request.edition_id,
-        media_item_id: request.media_item_id,
-        context_id: request.context_id,
-        context_hash: request.context_hash,
-        base_revision: request.base_revision,
-        patch: request.patch,
-      });
+      // 与 proposeSettingsPatch 同一条理由：提案创建不可重试。
+      const response = await requestPayload(
+        client,
+        1,
+        "create_resource_proposal",
+        {
+          target_scope: request.target_scope,
+          edition_id: request.edition_id,
+          media_item_id: request.media_item_id,
+          context_id: request.context_id,
+          context_hash: request.context_hash,
+          base_revision: request.base_revision,
+          patch: request.patch,
+        },
+        false,
+      );
       return assertProposalPayload(response.payload as JsonRecord);
     } finally {
       client.close();
     }
   }
 
-  private async open(): Promise<BrokerClient> {
+  private async open(signal?: AbortSignal): Promise<BrokerClient> {
     if (this.endpointError !== null) throw this.endpointError;
-    return openClient(this.endpoint, this.connectFn);
+    const client = await openClient(this.endpoint, this.connectFn, signal);
+    // 取消发生在**握手之后、响应之前**时，`withBridgeTimeout` 已在竞速层收尾；这里再把
+    // 底层连接断掉，否则一个已经没人等待的请求会继续占着 Broker 的连接与配额——
+    // 那正是"取消"想要释放的东西。
+    if (signal !== undefined) {
+      const closeOnAbort = (): void => client.close();
+      if (signal.aborted) {
+        closeOnAbort();
+      } else {
+        signal.addEventListener("abort", closeOnAbort, { once: true });
+      }
+    }
+    return client;
   }
 
   private toCapabilityReport(welcome: BrokerWelcome): HavenCapabilityReport {

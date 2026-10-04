@@ -2751,6 +2751,16 @@ mod tests {
                 "articles",
                 b"<!doctype html><article>test</article>".to_vec(),
             ),
+            (
+                "feed",
+                MediaType::Article,
+                ResourceType::ArticleSnapshot,
+                "text/html; charset=utf-8",
+                "custom_feed_0123456789ab:0123456789abcdef0123456789abcdef",
+                "html",
+                "articles",
+                b"<!doctype html><article>feed snapshot</article>".to_vec(),
+            ),
         ];
 
         for (

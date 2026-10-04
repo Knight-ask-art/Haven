@@ -152,7 +152,7 @@ fn parse_atom(xml: &str, base: &str) -> (Vec<OpdsEntry>, Vec<(String, String)>) 
             }
             Ok(Event::Text(t)) => {
                 if let Some(field) = text_target {
-                    let text = decode_xml_text(&t).unwrap_or_default();
+                    let text = crate::unescape_xml_text(&t).unwrap_or_default();
                     apply_text(field, &text, &mut builder);
                 }
             }
@@ -164,9 +164,8 @@ fn parse_atom(xml: &str, base: &str) -> (Vec<OpdsEntry>, Vec<(String, String)>) 
                 }
             }
             Ok(Event::GeneralRef(reference)) => {
-                if let Some(field) = text_target
-                    && let Some(text) = decode_xml_reference(&reference)
-                {
+                if let Some(field) = text_target {
+                    let text = crate::unescape_xml_reference(&reference).unwrap_or_default();
                     apply_text(field, &text, &mut builder);
                 }
             }
@@ -176,9 +175,9 @@ fn parse_atom(xml: &str, base: &str) -> (Vec<OpdsEntry>, Vec<(String, String)>) 
                     depth_entry -= 1;
                     if depth_entry == 0 && !builder.id.is_empty() && !builder.title.is_empty() {
                         entries.push(OpdsEntry {
-                            entry_id: std::mem::take(&mut builder.id),
-                            title: std::mem::take(&mut builder.title),
-                            author: builder.author.take(),
+                            entry_id: std::mem::take(&mut builder.id).trim().to_owned(),
+                            title: clean_text(&builder.title),
+                            author: builder.author.take().map(|value| clean_text(&value)),
                             summary: take_summary(&mut builder.summary),
                             pic: builder.pic.take(),
                             epub_href: builder.epub_href.take(),
@@ -219,14 +218,18 @@ fn book_candidates(entries: Vec<OpdsEntry>) -> Vec<OpdsEntry> {
 }
 
 fn take_summary(raw: &mut str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    let cleaned = clean_text(raw);
+    if cleaned.is_empty() {
         None
     } else {
-        let mut out = trimmed.to_owned();
+        let mut out = cleaned;
         out.truncate(2000);
         Some(out)
     }
+}
+
+fn clean_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn local_name_of(raw: &[u8]) -> String {
@@ -238,27 +241,15 @@ fn local_name(e: &quick_xml::events::BytesStart<'_>) -> String {
     local_name_of(e.name().as_ref())
 }
 
-fn decode_xml_text(text: &quick_xml::events::BytesText<'_>) -> Option<String> {
-    let decoded = text.decode().ok()?;
-    quick_xml::escape::unescape(decoded.as_ref())
-        .ok()
-        .map(|value| value.into_owned())
-}
-
-fn decode_xml_reference(reference: &quick_xml::events::BytesRef<'_>) -> Option<String> {
-    let name = reference.decode().ok()?;
-    let raw = format!("&{name};");
-    quick_xml::escape::unescape(&raw)
-        .ok()
-        .map(|value| value.into_owned())
-}
-
 fn apply_text(field: &str, text: &str, builder: &mut EntryBuilder) {
     match field {
-        "title" => builder.title.push_str(text.trim()),
-        "summary" => builder.summary.push_str(text.trim()),
-        "id" => builder.id.push_str(text.trim()),
-        "author" => builder.author = Some(text.trim().to_owned()),
+        "title" => builder.title.push_str(text),
+        "summary" => builder.summary.push_str(text),
+        "id" => builder.id.push_str(text),
+        "author" => builder
+            .author
+            .get_or_insert_with(String::new)
+            .push_str(text),
         _ => {}
     }
 }
@@ -1143,11 +1134,25 @@ impl RemoteSessionPort for OpdsCatalogProvider {
 pub struct RoutingRemoteAcquisitionPort {
     opds: Arc<OpdsCatalogProvider>,
     online: Arc<dyn RemoteAcquisitionPort>,
+    /// 用户登记的自托管漫画库（Komga/Kavita）获取端口。未注入时漫画库下载
+    /// 明确失败（fail closed），不会落到固定来源的 `online` 路由器。
+    comic_library: Option<Arc<dyn RemoteAcquisitionPort>>,
 }
 
 impl RoutingRemoteAcquisitionPort {
     pub fn new(opds: Arc<OpdsCatalogProvider>, online: Arc<dyn RemoteAcquisitionPort>) -> Self {
-        Self { opds, online }
+        Self {
+            opds,
+            online,
+            comic_library: None,
+        }
+    }
+
+    /// 注入自托管漫画库获取端口（组合根必须与 `SourceImportService` 注入的
+    /// 漫画库 Provider 指向同一个实例）。
+    pub fn with_comic_library(mut self, provider: Arc<dyn RemoteAcquisitionPort>) -> Self {
+        self.comic_library = Some(provider);
+        self
     }
 }
 
@@ -1161,6 +1166,20 @@ impl RemoteAcquisitionPort for RoutingRemoteAcquisitionPort {
     ) -> Result<RemoteAcquiredFile, AppError> {
         if source_key == OPDS_SOURCE_GUTENBERG {
             self.opds.acquire(source_key, remote_id, destination).await
+        } else if matches!(
+            source_key,
+            haven_application::services::source_import::KOMGA_SOURCE_KEY
+                | haven_application::services::source_import::KAVITA_SOURCE_KEY
+        ) {
+            let provider = self.comic_library.as_ref().ok_or_else(|| {
+                AppError::new(
+                    "SOURCE_UNAVAILABLE",
+                    ErrorKind::Network,
+                    "自托管漫画库尚未接入当前运行实例",
+                    true,
+                )
+            })?;
+            provider.acquire(source_key, remote_id, destination).await
         } else {
             self.online
                 .acquire(source_key, remote_id, destination)
@@ -1196,6 +1215,65 @@ impl RemoteSessionPort for RoutingRemoteSessionPort {
         } else {
             self.online.read(source_key, remote_id, range).await
         }
+    }
+}
+
+/// 路由远端漫画页 Provider：固定来源（MangaDex）与用户登记的漫画库各自处理
+/// 自己的 source_key，`ComicPageService` 只依赖一个窄端口。
+pub struct RoutingRemoteComicPageProvider {
+    online: Arc<dyn haven_application::services::comic::RemoteComicPageProvider>,
+    comic_library: Arc<dyn haven_application::services::comic::RemoteComicPageProvider>,
+}
+
+impl RoutingRemoteComicPageProvider {
+    pub fn new(
+        online: Arc<dyn haven_application::services::comic::RemoteComicPageProvider>,
+        comic_library: Arc<dyn haven_application::services::comic::RemoteComicPageProvider>,
+    ) -> Self {
+        Self {
+            online,
+            comic_library,
+        }
+    }
+
+    fn owner(
+        &self,
+        session: &haven_application::services::session::PreparedSession,
+    ) -> &Arc<dyn haven_application::services::comic::RemoteComicPageProvider> {
+        match &session.source {
+            haven_application::services::session::PreparedSessionSource::Remote {
+                source_key,
+                ..
+            } if matches!(
+                source_key.as_str(),
+                haven_application::services::source_import::KOMGA_SOURCE_KEY
+                    | haven_application::services::source_import::KAVITA_SOURCE_KEY
+            ) =>
+            {
+                &self.comic_library
+            }
+            _ => &self.online,
+        }
+    }
+}
+
+#[async_trait]
+impl haven_application::services::comic::RemoteComicPageProvider
+    for RoutingRemoteComicPageProvider
+{
+    async fn inspect(
+        &self,
+        session: &haven_application::services::session::PreparedSession,
+    ) -> Result<Vec<haven_application::services::comic::PreparedComicPage>, AppError> {
+        self.owner(session).inspect(session).await
+    }
+
+    async fn read_page(
+        &self,
+        session: &haven_application::services::session::PreparedSession,
+        page: &haven_application::services::comic::PreparedComicPage,
+    ) -> Result<haven_application::services::comic::ComicPageBody, AppError> {
+        self.owner(session).read_page(session, page).await
     }
 }
 
@@ -1385,6 +1463,30 @@ impl RoutingSourceCatalogProvider {
     fn route(&self, source_id: &str) -> Result<Arc<dyn SourceCatalogProvider>, AppError> {
         if let Some(provider) = self.routes.get(source_id) {
             return Ok(provider.clone());
+        }
+        // 用户登记的 RSS/Atom 订阅源属于 `custom_` 家族，但不是 OPDS 书源。它们的
+        // 条目身份与地址形态与 OPDS 完全不同，绝不能落到下面的 OPDS 兜底：那会把
+        // 订阅条目身份当成 OPDS 条目地址去请求。订阅源候选由
+        // `SourceImportService` 显式注入的订阅源 Provider 处理，这里 fail closed。
+        if SourceRegistryService::is_feed_source_id(source_id) {
+            return Err(AppError::new(
+                "INVALID_ARGUMENT",
+                ErrorKind::Validation,
+                "未知来源目录",
+                false,
+            ));
+        }
+        // 用户登记的自托管漫画库（Komga/Kavita）同样属于 `custom_` 家族，但既不是
+        // OPDS 书源、也不是订阅源。它们的目录/章节/页面身份由专用 Provider 按动态
+        // sourceId 处理（`SourceImportService` 显式注入），这里 fail closed，避免把
+        // 漫画库身份当成 OPDS 条目地址去请求。
+        if SourceRegistryService::is_comic_library_source_id(source_id) {
+            return Err(AppError::new(
+                "INVALID_ARGUMENT",
+                ErrorKind::Validation,
+                "未知来源目录",
+                false,
+            ));
         }
         // 自定义源：detail 与内置 OPDS 共用同一 provider（凭据由 client 按需解析）。
         if source_id.starts_with(haven_application::services::source_registry::CUSTOM_SOURCE_PREFIX)
@@ -1669,8 +1771,8 @@ mod tests {
   <entry>
     <updated>2026-08-25T13:47:38Z</updated>
     <id>https://other.example.org/item/9</id>
-    <title>Direct Download Book</title>
-    <author><name>Anon</name></author>
+    <title>Direct &amp; Download Book</title>
+    <author><name>Anon &amp; Co</name></author>
     <link rel="http://opds-spec.org/acquisition" type="application/epub+zip" href="/files/9.epub"/>
     <link type="image/png" rel="http://opds-spec.org/image/thumbnail" href="/files/9.png"/>
   </entry>
@@ -1694,6 +1796,8 @@ mod tests {
             books[1].pic.as_deref(),
             Some("https://m.gutenberg.org/files/9.png")
         );
+        assert_eq!(books[1].title, "Direct & Download Book");
+        assert_eq!(books[1].author.as_deref(), Some("Anon & Co"));
     }
 
     // ---- 自定义源凭据（V2-H 收尾批次） ----
@@ -1769,5 +1873,43 @@ mod tests {
         // 内置源路径不传 source_id → 不注入凭据。
         let _ = client.get_feed(None, &url).await;
         assert_eq!(rx.await.unwrap(), "", "内置源必须匿名访问");
+    }
+
+    /// 回归（RSS/Atom Task 1）：`custom_feed_` 属于 `custom_` 家族，但订阅源绝不是
+    /// OPDS 书源。目录路由器必须 fail closed，而不是把订阅条目身份当作 OPDS 条目
+    /// 地址交给 OPDS Provider 去请求。
+    #[tokio::test]
+    async fn feed_sources_never_fall_back_to_the_opds_catalog() {
+        let online: Arc<dyn SourceCatalogProvider> =
+            Arc::new(crate::online_sources::OnlineCatalogProvider::new(Arc::new(
+                crate::online_sources::OnlineContentClient::new().unwrap(),
+            )));
+        let router = RoutingSourceCatalogProvider::new(
+            Arc::new(Cms10CatalogProvider::new(Arc::new(
+                crate::cms10::Cms10Client::new().unwrap(),
+            ))),
+            Arc::new(OpdsCatalogProvider::new(Arc::new(
+                OpdsClient::new().unwrap(),
+            ))),
+            online,
+        );
+
+        assert!(
+            router.route("custom_0123456789ab").is_ok(),
+            "普通自定义 OPDS 书源仍然走 OPDS 兜底"
+        );
+        assert!(
+            router.route("custom_feed_0123456789ab").is_err(),
+            "订阅源不得落到 OPDS 兜底"
+        );
+        let error = router
+            .detail(
+                "custom_feed_0123456789ab",
+                "",
+                "0123456789abcdef0123456789abcdef",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), "INVALID_ARGUMENT");
     }
 }

@@ -4,7 +4,8 @@
     "theme": "system",
     "density": "comfortable",
     "sidebar": "auto",
-    "reduceMotion": false
+    "reduceMotion": false,
+    "interfaceFontMode": "system"
   },
   "revision": null
 }

@@ -13,10 +13,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use rusqlite::OptionalExtension;
 
 use haven_application::services::settings::{SettingsTxPorts, SettingsUoW};
 use haven_common::AppError;
+use haven_domain::appearance::{AppearanceAssetId, AppearanceAssetKind, AssetValidationState};
 use haven_domain::contracts::{SettingsRepository, SettingsRow};
+use haven_domain::settings::{SettingsValue, is_safe_interface_font_family};
 
 use crate::db::Db;
 use crate::db::repos::map_db_error;
@@ -191,6 +194,79 @@ impl SettingsTxPorts for SqliteSettingsTx<'_> {
             )
             .map_err(|e| tx_err("保存设置失败", e))?;
         Ok(affected > 0)
+    }
+
+    /// 事务内跨表引用校验：`appearance` 的界面字体字段必须在**同一连接**上落地。
+    ///
+    /// - `interfaceFontAssetId` 指向已导入字体资产 → 必须存在。资产在同一事务内被
+    ///   删除是不可能的（删除路径也走同一把 Db 锁），因此这里读到的存在性就是
+    ///   提交时的存在性，已删除的 stale id 无法被写进设置。
+    /// - `interfaceFontFamily` 会直接进 CSS `font-family` → 必须通过 Domain 的
+    ///   安全校验（长度上界 + 拒绝控制字符/引号/分号/大括号/反斜杠/注释起始）。
+    fn validate_references(&self, value: &SettingsValue) -> Result<(), AppError> {
+        let SettingsValue::Appearance(appearance) = value else {
+            return Ok(());
+        };
+        if let Some(family) = appearance.interface_font_family.as_deref()
+            && !is_safe_interface_font_family(family)
+        {
+            return Err(AppError::new(
+                "INVALID_ARGUMENT",
+                haven_common::ErrorKind::Validation,
+                "界面字体名称包含不允许的字符或超出长度上限",
+                false,
+            ));
+        }
+        let Some(id) = appearance.interface_font_asset_id.as_deref() else {
+            return Ok(());
+        };
+        let exists = self
+            .tx
+            .query_row(
+                "SELECT 1 FROM interface_font_assets WHERE id = ?1",
+                rusqlite::params![id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|e| tx_err("查询导入字体失败", e))?
+            .is_some();
+        if !exists {
+            return Err(AppError::new(
+                "FONT_ASSET_NOT_FOUND",
+                haven_common::ErrorKind::NotFound,
+                "所选导入字体不存在或已被删除，请重新选择",
+                false,
+            ));
+        }
+        Ok(())
+    }
+
+    /// 已验证外观资产登记行的种类（同一事务内）。
+    ///
+    /// 这里直接读 `appearance_assets` 而不是绕道 `AppearanceRepository`：后者的入口各自
+    /// 取一次连接锁，拿到的就不是本事务这份快照了——删除资产与写入引用必须互相看得见。
+    /// 未知种类按「没有可引用的登记行」处理（045 的 CHECK 已经把 kind 限死在闭合集合内，
+    /// 这条分支只可能来自被手工改坏的库；把读不懂的行当成可用资产才是真正危险的那一侧）。
+    fn validated_appearance_asset_kind(
+        &self,
+        id: AppearanceAssetId,
+    ) -> Result<Option<AppearanceAssetKind>, AppError> {
+        use rusqlite::OptionalExtension;
+        let asset: Option<(String, String)> = self
+            .tx
+            .query_row(
+                "SELECT kind, validation_state FROM appearance_assets WHERE id = ?1",
+                rusqlite::params![id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| tx_err("查询外观资产失败", e))?;
+        Ok(asset.and_then(|(kind, state)| {
+            if !AssetValidationState::parse(&state).is_some_and(AssetValidationState::is_usable) {
+                return None;
+            }
+            AppearanceAssetKind::parse(&kind)
+        }))
     }
 }
 

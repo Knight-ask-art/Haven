@@ -19,6 +19,7 @@ use async_trait::async_trait;
 
 use haven_common::{AppError, ErrorKind};
 use haven_domain::agent::AgentReadingSnapshot;
+use haven_domain::agent_skill::ActiveAgentSkill;
 use haven_domain::ai_provider::{
     AiModelCapability, AiModelDescriptor, AiProviderKind, AiProviderProfile,
     AiProviderProfileDeleteOutcome, AiSettingsRecommendation,
@@ -29,6 +30,7 @@ use haven_domain::ids::{AgentRequestId, AgentSessionId, CredentialRef};
 
 use crate::mapper::time::utc_millis_to_rfc3339;
 use crate::services::agent_settings_ipc::AgentSettingsIpcService;
+use crate::services::agent_skill::AgentSkillService;
 use crate::services::agent_trace::{AgentEventKind, AgentTracePort, record_best_effort};
 use crate::wire::{
     AgentSettingsProposalCreateRequest, AgentSettingsProposalDto, AiProviderKindDto,
@@ -73,10 +75,17 @@ pub trait AiSettingsRecommendationPort: Send + Sync {
     ) -> Result<AiSettingsRecommendation, AppError>;
 }
 
+/// 一次设置建议请求的输入。
+///
+/// `skills` 是**服务端解析出来**的启用技能说明，不是调用方参数：它由
+/// [`AgentSkillService::active_skills`] 从"分发内容 + 权威启用状态"推导，
+/// 调用方无法通过任何 wire 字段提供或替换它。空数组表示本次不带技能上下文。
 #[derive(Debug, Clone)]
 pub struct AiSettingsRecommendationInput {
     pub model_id: String,
+    pub user_intent: String,
     pub reading: AgentReadingSnapshot,
+    pub skills: Vec<ActiveAgentSkill>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +93,7 @@ pub struct AiSettingsRecommendationRequest {
     pub profile_id: String,
     pub session_id: String,
     pub request_id: String,
+    pub user_intent: String,
     pub context_id: String,
     pub context_hash: String,
     pub base_revision: Option<String>,
@@ -146,6 +156,9 @@ pub struct AiProviderProfileService {
     catalog: Arc<dyn AiModelCatalogPort>,
     recommender: Arc<dyn AiSettingsRecommendationPort>,
     agent_settings: Option<AgentSettingsIpcService>,
+    /// 内置技能运行时。缺省（`None`）表示本组装层没有技能目录，
+    /// 此时请求**不带**任何技能上下文——不是"带一份默认技能"，也不是错误。
+    agent_skills: Option<AgentSkillService>,
     trace: Option<Arc<dyn AgentTracePort>>,
 }
 
@@ -161,6 +174,7 @@ impl AiProviderProfileService {
             catalog,
             recommender: Arc::new(UnavailableSettingsRecommendation),
             agent_settings: None,
+            agent_skills: None,
             trace: None,
         }
     }
@@ -175,6 +189,16 @@ impl AiProviderProfileService {
 
     pub fn with_agent_settings(mut self, agent_settings: AgentSettingsIpcService) -> Self {
         self.agent_settings = Some(agent_settings);
+        self
+    }
+
+    /// 注入内置技能运行时。注入之后，每次设置建议请求都会先解析"当前真正生效的技能"，
+    /// 并把它们的说明性正文带进 Provider 请求。
+    ///
+    /// 注意这**不**改变权限：技能正文只是上下文，Proposal 仍由本服务创建并停在
+    /// `pending`，批准仍只在 Haven UI 里由用户完成。
+    pub fn with_agent_skills(mut self, agent_skills: AgentSkillService) -> Self {
+        self.agent_skills = Some(agent_skills);
         self
     }
 
@@ -290,6 +314,12 @@ impl AiProviderProfileService {
     /// - Provider 成功返回但没有模型 → `Empty`。
     ///
     /// 只有真正的失败（不可达 / 非 2xx / 非法 JSON）才返回 `Err`；不吞错、不伪造模型。
+    ///
+    /// **机密性前置检查**：历史行里可能存着明文 `http` 端点（旧版本允许保存）。这种行
+    /// 会以固定的 `AI_PROVIDER_ENDPOINT_INSECURE` 失败，且**不读取凭据、不发起任何请求**
+    /// ——"行读得出来"不等于"可以用它把 API Key 发出去"。检查放在凭据读取之前，是因为
+    /// "地址必须改成 https"才是用户此刻真正要做的动作；报成"尚未配置密钥"会把可执行的
+    /// 结论藏起来。
     pub async fn models_catalog(
         &self,
         request: AiProviderModelsListRequest,
@@ -301,6 +331,7 @@ impl AiProviderProfileService {
                 AiProviderModelsCatalogStateDto::Disabled,
             ));
         }
+        profile.require_secure_endpoint()?;
         let target = credential_target(profile.profile_id())?;
         let Some(secret) = self.credentials.get(&target).await? else {
             return Ok(empty_catalog(
@@ -333,6 +364,7 @@ impl AiProviderProfileService {
         &self,
         request: AiSettingsRecommendationRequest,
     ) -> Result<AiSettingsRecommendationResult, AppError> {
+        let user_intent = validate_recommendation_intent(&request.user_intent)?;
         let session_id = request
             .session_id
             .parse::<AgentSessionId>()
@@ -354,6 +386,9 @@ impl AiProviderProfileService {
         if !profile.enabled() {
             return Err(recommendation_disabled());
         }
+        // 与 `models_catalog` 同一条机密性前置检查：这一次出站的不只是 API Key，
+        // 还有用户的建议原文与启用技能的原生投影，明文连接一律不允许。
+        profile.require_secure_endpoint()?;
         let target = credential_target(profile.profile_id())?;
         let Some(secret) = self.credentials.get(&target).await? else {
             return Err(recommendation_no_credential());
@@ -392,6 +427,13 @@ impl AiProviderProfileService {
         )
         .await;
 
+        // 技能上下文在**调用前**解析：读取权威启用状态，丢弃未启用 / 已 stale 的记录。
+        // 解析失败即整次请求失败——悄悄降级成"这次不带技能"会让用户以为启用的技能
+        // 生效了，而实际没有。
+        let skills = match self.agent_skills.as_ref() {
+            Some(agent_skills) => agent_skills.active_skills().await?,
+            None => Vec::new(),
+        };
         record_best_effort(
             self.trace.as_ref(),
             session_id,
@@ -409,7 +451,9 @@ impl AiProviderProfileService {
                 &secret,
                 &AiSettingsRecommendationInput {
                     model_id: model.model_id.clone(),
+                    user_intent,
                     reading: context.snapshot().reading().clone(),
+                    skills,
                 },
             )
             .await?;
@@ -540,6 +584,21 @@ fn invalid_argument(message: impl Into<String>) -> AppError {
     AppError::new("INVALID_ARGUMENT", ErrorKind::Validation, message, false)
 }
 
+const MAX_RECOMMENDATION_INTENT_CHARS: usize = 2_000;
+
+fn validate_recommendation_intent(raw: &str) -> Result<String, AppError> {
+    let intent = raw.trim();
+    if intent.is_empty()
+        || intent.chars().count() > MAX_RECOMMENDATION_INTENT_CHARS
+        || intent
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+    {
+        return Err(invalid_argument("建议目标为空、过长或包含不支持的字符"));
+    }
+    Ok(intent.to_owned())
+}
+
 fn recommendation_unavailable() -> AppError {
     AppError::new(
         "AI_PROVIDER_RECOMMENDATION_UNAVAILABLE",
@@ -601,6 +660,19 @@ mod tests {
     use haven_domain::ai_provider::AiModelCapability;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    #[test]
+    fn recommendation_intent_is_bounded_and_rejects_control_characters() {
+        assert_eq!(
+            validate_recommendation_intent("  优化阅读\n排版  ").unwrap(),
+            "优化阅读\n排版"
+        );
+        let too_long = "x".repeat(MAX_RECOMMENDATION_INTENT_CHARS + 1);
+        for invalid in ["", " \t ", "含有\u{7}控制符", &too_long] {
+            let error = validate_recommendation_intent(invalid).unwrap_err();
+            assert_eq!(error.code().as_str(), "INVALID_ARGUMENT");
+        }
+    }
 
     #[derive(Default)]
     struct MemoryCredentialStore {
@@ -771,6 +843,12 @@ mod tests {
     #[derive(Default)]
     struct RecordingRecommender {
         calls: Mutex<Vec<String>>,
+        seen_intents: Mutex<Vec<String>>,
+        /// 每次调用实际收到的技能载荷：`<skill_id>\n<正文>` 一行。
+        ///
+        /// 这里记录的是**请求侧看到的原文**，因此"用户启用的技能真的进了这次请求"
+        /// 不靠服务自述，而靠这份记录。
+        seen_skills: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -783,6 +861,20 @@ mod tests {
             input: &AiSettingsRecommendationInput,
         ) -> Result<AiSettingsRecommendation, AppError> {
             self.calls.lock().unwrap().push(input.model_id.clone());
+            self.seen_intents
+                .lock()
+                .unwrap()
+                .push(input.user_intent.clone());
+            self.seen_skills.lock().unwrap().push(
+                input
+                    .skills
+                    .iter()
+                    .map(|skill| {
+                        format!("{}\n{}", skill.id().as_str(), skill.instructions().as_str())
+                    })
+                    .collect::<Vec<String>>()
+                    .join("\n---\n"),
+            );
             AiSettingsRecommendation::new(
                 haven_domain::settings::ReadingPatch {
                     font_size: Some(haven_domain::settings::ReadingFontSize::Large),
@@ -831,6 +923,37 @@ mod tests {
         }
     }
 
+    /// 直接往内存仓储里写一行，绕过 `upsert` 的保存期校验。
+    ///
+    /// 存在的理由：升级前的版本允许保存明文 `http` 端点，而**现在的**保存边界会拒绝它。
+    /// 要测"历史行还能不能用"，就必须能造出这样一行——这正是读取路径刻意宽松的用途。
+    fn seed_stored_profile(
+        profiles: &MemoryProfileRepository,
+        profile_id: &str,
+        endpoint: &str,
+        enabled: bool,
+        selected_model_id: Option<&str>,
+    ) {
+        let revision = "rev-legacy".to_owned();
+        let stored = AiProviderProfile::from_stored(
+            profile_id.to_owned(),
+            "旧网关".to_owned(),
+            AiProviderKind::OpenAiCompatible,
+            endpoint.to_owned(),
+            enabled,
+            selected_model_id.map(str::to_owned),
+            revision.clone(),
+            1,
+            1,
+        )
+        .expect("历史行必须仍可被读取");
+        profiles
+            .rows
+            .lock()
+            .unwrap()
+            .insert(profile_id.to_owned(), (stored, revision));
+    }
+
     #[tokio::test]
     async fn upsert_then_list_then_get_round_trip() {
         let fixture = fixture();
@@ -870,6 +993,15 @@ mod tests {
                     ..upsert_request("gw", None)
                 },
                 "AI_PROVIDER_ENDPOINT_INVALID",
+            ),
+            // 明文公网地址：URL 形状合法，但凭据会以明文出站，因此保存边界拒绝。
+            // 与上面的私网地址**必须**是两个不同的码：一个要改地址，一个要换协议。
+            (
+                AiProviderProfileUpsertRequest {
+                    endpoint: "http://gateway.example.invalid/v1".into(),
+                    ..upsert_request("gw", None)
+                },
+                "AI_PROVIDER_ENDPOINT_INSECURE",
             ),
             (
                 AiProviderProfileUpsertRequest {
@@ -1336,6 +1468,112 @@ mod tests {
         assert!(error.retryable());
     }
 
+    /// 历史明文行：**可列出、可编辑，但绝不会被用于出站**。
+    ///
+    /// 这条用例把三件事同时钉住，缺一不可：
+    /// 1. 读取宽松——升级之后设置页仍能读出这一行（严格读取会让用户连"改成 https"的
+    ///    入口都没有）；
+    /// 2. 使用严格——模型发现与设置建议都以固定的 `AI_PROVIDER_ENDPOINT_INSECURE` 失败，
+    ///    且**零出站请求、零提案**。凭据在这一行上是已配置的，所以"使用边界失效"在这里
+    ///    会真的把 Bearer 发出去，用例不会因为"反正没密钥"而空过；
+    /// 3. 迁移可行——把地址改成 https 之后，同一个调用立刻恢复正常。
+    #[tokio::test]
+    async fn a_legacy_plaintext_profile_is_listable_but_never_used_outbound() {
+        const LEGACY: &str = "http://gateway.example.invalid/v1";
+        let fixture = fixture();
+        seed_stored_profile(
+            &fixture.profiles,
+            "gw-legacy",
+            LEGACY,
+            true,
+            Some("reader-model"),
+        );
+        let target = credential_target("gw-legacy").unwrap();
+        fixture
+            .credentials
+            .set(&target, &SecretString::new("sk-test-only"))
+            .await
+            .unwrap();
+
+        // ① 可列出：明文行仍然是设备上的事实，界面必须能显示它。
+        let listed = fixture.service.list().await.unwrap();
+        assert_eq!(listed.profiles.len(), 1);
+        assert_eq!(listed.profiles[0].endpoint, LEGACY);
+        assert!(listed.profiles[0].credential_configured);
+
+        // ② 模型发现：固定错误、零请求。
+        let error = fixture
+            .service
+            .models_catalog(AiProviderModelsListRequest {
+                profile_id: "gw-legacy".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), "AI_PROVIDER_ENDPOINT_INSECURE");
+        assert!(!error.retryable(), "只有改地址才有用");
+        assert!(
+            fixture.catalog.calls.lock().unwrap().is_empty(),
+            "明文端点不得发起任何出站请求"
+        );
+
+        // ③ 设置建议：同上，且不得产生任何提案。
+        let agent_store = crate::services::agent_settings_ipc::tests::FakeStore::new();
+        crate::services::agent_settings_ipc::tests::seed_reading(&agent_store, Some("rev-0001"));
+        let agent_settings = crate::services::agent_settings_ipc::tests::service(&agent_store);
+        let context = agent_settings.context().await.unwrap();
+        let recommender = Arc::new(RecordingRecommender::default());
+        let service = AiProviderProfileService::new(
+            fixture.profiles.clone(),
+            fixture.credentials.clone(),
+            fixture.catalog.clone(),
+        )
+        .with_settings_recommendation(recommender.clone())
+        .with_agent_settings(agent_settings);
+
+        let error = service
+            .generate_settings_recommendation(AiSettingsRecommendationRequest {
+                profile_id: "gw-legacy".into(),
+                session_id: AgentSessionId::new().to_string(),
+                request_id: AgentRequestId::new().to_string(),
+                user_intent: "优化阅读".into(),
+                context_id: context.context_id().to_string(),
+                context_hash: context.context_hash().to_owned(),
+                base_revision: context.revision().map(str::to_owned),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), "AI_PROVIDER_ENDPOINT_INSECURE");
+        assert!(recommender.calls.lock().unwrap().is_empty());
+        assert!(fixture.catalog.calls.lock().unwrap().is_empty());
+        assert_eq!(agent_store.target_writes(), 0);
+        assert_eq!(agent_store.proposal_count(), 0);
+
+        // ④ 可编辑：改成 https 就能保存，不需要先删掉重来。
+        let migrated = fixture
+            .service
+            .upsert(AiProviderProfileUpsertRequest {
+                endpoint: "https://gateway.example.invalid/v1".into(),
+                ..upsert_request("gw-legacy", Some("rev-legacy"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(migrated.endpoint, "https://gateway.example.invalid/v1");
+
+        // ⑤ 反向证据：迁移之后同一个调用真的会走到端口（否则上面的"零请求"可以靠
+        //    "这条路径根本不通"通过）。
+        fixture
+            .service
+            .models_catalog(AiProviderModelsListRequest {
+                profile_id: "gw-legacy".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.catalog.calls.lock().unwrap().as_slice(),
+            ["https://gateway.example.invalid/v1"]
+        );
+    }
+
     #[tokio::test]
     async fn model_dto_never_carries_secret_material() {
         let fixture = fixture();
@@ -1426,6 +1664,7 @@ mod tests {
                 profile_id: "gw".into(),
                 session_id: AgentSessionId::new().to_string(),
                 request_id: AgentRequestId::new().to_string(),
+                user_intent: "把字体调大一点".into(),
                 context_id: context.context_id().to_string(),
                 context_hash: context.context_hash().to_owned(),
                 base_revision: context.revision().map(str::to_owned),
@@ -1465,6 +1704,10 @@ mod tests {
             recommender.calls.lock().unwrap().as_slice(),
             ["reader-model"]
         );
+        assert_eq!(
+            recommender.seen_intents.lock().unwrap().as_slice(),
+            ["把字体调大一点"]
+        );
 
         let encoded = serde_json::to_string(&result).unwrap();
         for forbidden in ["sk-test-only", "haven:ai:", "credentialRef", "secret"] {
@@ -1472,6 +1715,162 @@ mod tests {
                 !encoded.contains(forbidden),
                 "建议结果不得携带敏感材料：{forbidden}"
             );
+        }
+    }
+
+    /// 内置技能运行时接进**真实**请求路径（原生 Skill 运行时，AI_SYSTEM.md §6）。
+    ///
+    /// 覆盖四件事，缺一不可：
+    /// 1. 默认（从未启用）时请求里**没有**技能载荷——不是"带一份默认技能"；
+    /// 2. 用户在设置页启用之后，**同一段分发正文**真的进了这次 Provider 请求；
+    /// 3. 关闭之后立刻不再出现（fail closed，而不是沿用上一次的同意）；
+    /// 4. 整条链路仍然只产出 `pending` 提案，且没有任何设置写入——技能不改变权限。
+    ///
+    /// 技能正文由服务端从分发内容解析，调用方（wire / IPC / Provider 端口）无法提供它，
+    /// 因此本用例同时钉住"技能不是任意提示词通道"。
+    #[tokio::test]
+    async fn enabled_builtin_skill_reaches_the_provider_request_and_still_only_creates_a_pending_proposal()
+     {
+        /// 只有被启用时才允许进入请求的标记文本。
+        const MARKER: &str = "这段正文只有在用户启用本技能后才会进入模型请求。";
+        const DOCUMENT: &str = "---\nname: haven-agent-proposal\ndescription: 读取脱敏上下文并创建待批准提案\n---\n\n# 标题\n\n这段正文只有在用户启用本技能后才会进入模型请求。\n";
+
+        let fixture = fixture();
+        let created = fixture
+            .service
+            .upsert(AiProviderProfileUpsertRequest {
+                selected_model_id: Some("reader-model".into()),
+                ..upsert_request("gw", None)
+            })
+            .await
+            .unwrap();
+        let target = credential_target(&created.profile_id).unwrap();
+        fixture
+            .credentials
+            .set(&target, &SecretString::new("sk-test-only"))
+            .await
+            .unwrap();
+        *fixture.catalog.models.lock().unwrap() = vec![
+            AiModelDescriptor::new(
+                "reader-model".into(),
+                Some("Reader Model".into()),
+                None,
+                Some("fixture".into()),
+                AiModelCapability::Supported,
+                AiModelCapability::Unknown,
+                AiModelCapability::Unknown,
+            )
+            .unwrap(),
+        ];
+
+        let agent_store = crate::services::agent_settings_ipc::tests::FakeStore::new();
+        crate::services::agent_settings_ipc::tests::seed_reading(&agent_store, Some("rev-0001"));
+        let agent_settings = crate::services::agent_settings_ipc::tests::service(&agent_store);
+        let recommender = Arc::new(RecordingRecommender::default());
+        let (skills, _skill_states) = crate::services::agent_skill::tests::service(&[DOCUMENT]);
+        let service = AiProviderProfileService::new(
+            fixture.profiles.clone(),
+            fixture.credentials.clone(),
+            fixture.catalog.clone(),
+        )
+        .with_settings_recommendation(recommender.clone())
+        .with_agent_settings(agent_settings.clone())
+        .with_agent_skills(skills.clone());
+
+        let request = |context: &crate::services::agent_settings_ipc::AgentSettingsContext| {
+            AiSettingsRecommendationRequest {
+                profile_id: "gw".into(),
+                session_id: AgentSessionId::new().to_string(),
+                request_id: AgentRequestId::new().to_string(),
+                user_intent: "优化当前阅读排版".into(),
+                context_id: context.context_id().to_string(),
+                context_hash: context.context_hash().to_owned(),
+                base_revision: context.revision().map(str::to_owned),
+            }
+        };
+
+        // ① 从未启用：请求里没有技能载荷。
+        let context = agent_settings.context().await.unwrap();
+        let first = service
+            .generate_settings_recommendation(request(&context))
+            .await
+            .unwrap();
+        assert_eq!(
+            recommender.seen_skills.lock().unwrap().as_slice(),
+            [""],
+            "没有启用任何技能时，请求不得携带技能载荷"
+        );
+        assert_eq!(
+            first.proposal.status,
+            crate::wire::AgentSettingsProposalStatusDto::Pending
+        );
+
+        // ② 用户在设置页启用：权威状态由服务写库（这里是 SQLite 仓储的内存替身）。
+        let enabled = skills
+            .set_enabled(&crate::services::agent_skill::AgentSkillSetEnabledRequest {
+                skill_id: "haven-agent-proposal".into(),
+                enabled: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            enabled.state,
+            crate::services::agent_skill::AgentSkillActivationDto::Enabled
+        );
+
+        let context = agent_settings.context().await.unwrap();
+        let second = service
+            .generate_settings_recommendation(request(&context))
+            .await
+            .unwrap();
+        let seen = recommender.seen_skills.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            seen[1].starts_with("haven-agent-proposal\n"),
+            "技能载荷必须带上它的 id：{}",
+            seen[1]
+        );
+        assert!(
+            seen[1].contains(MARKER),
+            "启用后的技能正文必须真的进入这次请求"
+        );
+        drop(seen);
+
+        // ③ 技能只是上下文：Proposal 仍然停在 pending，且没有任何设置写入。
+        assert_eq!(
+            second.proposal.status,
+            crate::wire::AgentSettingsProposalStatusDto::Pending
+        );
+        assert_eq!(
+            agent_store.target_writes(),
+            0,
+            "技能不得带来任何 Apply 路径"
+        );
+        assert_eq!(agent_store.revision().as_deref(), Some("rev-0001"));
+
+        // ④ 关闭后立刻停止消费（fail closed，而不是沿用最后一次的同意）。
+        skills
+            .set_enabled(&crate::services::agent_skill::AgentSkillSetEnabledRequest {
+                skill_id: "haven-agent-proposal".into(),
+                enabled: false,
+            })
+            .await
+            .unwrap();
+        let context = agent_settings.context().await.unwrap();
+        service
+            .generate_settings_recommendation(request(&context))
+            .await
+            .unwrap();
+        let seen = recommender.seen_skills.lock().unwrap();
+        assert_eq!(seen.len(), 3, "三个阶段各应发起一次 Provider 请求");
+        assert!(seen[0].is_empty(), "启用前不得携带技能载荷");
+        assert!(seen[1].contains(MARKER), "启用期间应携带技能正文");
+        assert!(seen[2].is_empty(), "停用之后不得再携带技能载荷");
+
+        // 结果里仍然不出现任何敏感材料。
+        let encoded = serde_json::to_string(&second).unwrap();
+        for forbidden in ["sk-test-only", "haven:ai:", "credentialRef"] {
+            assert!(!encoded.contains(forbidden), "建议结果不得携带 {forbidden}");
         }
     }
 
@@ -1534,6 +1933,7 @@ mod tests {
                     profile_id: profile_id.into(),
                     session_id: AgentSessionId::new().to_string(),
                     request_id: AgentRequestId::new().to_string(),
+                    user_intent: "优化阅读".into(),
                     context_id: context.context_id().to_string(),
                     context_hash: context.context_hash().to_owned(),
                     base_revision: context.revision().map(str::to_owned),
@@ -1599,6 +1999,7 @@ mod tests {
                     profile_id: "gw".into(),
                     session_id: AgentSessionId::new().to_string(),
                     request_id: AgentRequestId::new().to_string(),
+                    user_intent: "优化阅读".into(),
                     context_id: context.context_id().to_string(),
                     context_hash: context.context_hash().to_owned(),
                     base_revision: context.revision().map(str::to_owned),
@@ -1664,6 +2065,7 @@ mod tests {
                 profile_id: "gw".into(),
                 session_id: AgentSessionId::new().to_string(),
                 request_id: AgentRequestId::new().to_string(),
+                user_intent: "优化阅读".into(),
                 context_id: old_context.context_id().to_string(),
                 context_hash: old_context.context_hash().to_owned(),
                 base_revision: old_context.revision().map(str::to_owned),

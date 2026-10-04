@@ -22,9 +22,9 @@ protocol, changes a Registry, or changes a release/CI contract.
 5. Define failure, cancellation, retry, race and rollback paths.
 6. Implement through the existing layer chain.
 7. Add tests at the boundary where the invariant is enforced.
-8. Run an independent quality review after the specification review.
+8. Review correctness and compatibility independently of the implementation.
 
 The frontend must not compensate for a missing backend invariant by guessing
 IDs, paths, media types, capabilities or permissions. If the allowed scope is
-too small to repair the actual invariant, report `NEEDS_CONTEXT` instead of
+too small to repair the actual invariant, explain the required scope change instead of
 papering over the defect with retries, local locks or fake state.

@@ -1,0 +1,49 @@
+.haven-ai-workbench {
+  container-type: inline-size;
+  display: flex;
+  height: min(849px, calc(100dvh - 152px));
+  min-height: 440px;
+  min-width: 0;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--haven-settings-border);
+  border-radius: 20px;
+  background: var(--haven-settings-card);
+  color: var(--haven-settings-foreground);
+}
+.haven-ai-workbench__toolbar { display: flex; flex: 0 0 auto; align-items: center; gap: 16px; padding: 20px 24px; border-bottom: 1px solid var(--haven-settings-border-subtle); }
+.haven-ai-workbench__title { flex: 1; min-width: 0; }
+.haven-ai-workbench__title h2 { margin: 0; font-size: 18px; font-weight: 600; }
+.haven-ai-workbench__title p { margin: 4px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--haven-settings-muted-strong); font-size: 12px; }
+.haven-ai-workbench__actions { display: flex; gap: 6px; flex: 0 0 auto; }
+.haven-ai-workbench__actions button { display: inline-flex; width: auto; height: 34px; gap: 6px; padding: 0 10px; border: 1px solid var(--haven-settings-control-border); background: transparent; color: var(--haven-settings-muted-strong); font-size: 12px; }
+.haven-ai-workbench__actions button svg { flex: 0 0 auto; width: 16px; height: 16px; }
+.haven-ai-workbench__actions button[aria-pressed="true"] { border-color: var(--haven-settings-primary-40); background: var(--haven-settings-primary-12); color: var(--haven-settings-primary); }
+.haven-ai-workbench__actions button:hover { background: var(--haven-settings-card-hover); color: var(--haven-settings-foreground); }
+.haven-ai-workbench button:focus-visible { outline: 2px solid var(--haven-settings-primary); outline-offset: 3px; }
+.haven-ai-workbench__context { display: flex; flex: 0 0 auto; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 24px; color: var(--haven-settings-muted-strong); font-size: 11px; }
+.haven-ai-workbench__context button { display: inline-flex; align-items: center; gap: 6px; color: var(--haven-settings-primary); }
+.haven-ai-workbench__messages { width: 100%; max-width: 800px; margin: 0 auto; padding: 20px 24px; scrollbar-gutter: stable; }
+.haven-ai-workbench__suggestions { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 8px; }
+.haven-ai-workbench__suggestions button { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border: 1px solid var(--haven-settings-control-border); border-radius: 10px; color: var(--haven-settings-muted-strong); font-size: 12px; }
+.haven-ai-workbench__suggestions button:hover { background: var(--haven-settings-card-hover); color: var(--haven-settings-foreground); }
+.haven-ai-workbench__composer { width: 100%; max-width: 800px; margin: 0 auto; padding: 16px 24px 20px; border: 0; background: transparent; }
+.haven-ai-workbench__composer > div { align-items: flex-end; min-height: 84px; padding: 12px 14px; background: var(--haven-settings-control); border-color: var(--haven-settings-control-border); }
+.haven-ai-workbench__composer > div:focus-within { outline: 2px solid var(--haven-settings-primary); outline-offset: 2px; border-color: var(--haven-settings-primary); }
+.haven-ai-workbench__composer textarea::placeholder { color: var(--haven-settings-muted-strong); opacity: 1; }
+.haven-ai-workbench__composer textarea { padding: 0; }
+.haven-ai-workbench__composer button[type="submit"] { width: auto; height: 36px; padding: 0 14px; border-radius: 10px; }
+/* 紧凑设置导航移到顶部后多占 70px；双行导航再多占 48px，不借用 Dock 安全区。 */
+@media (max-width: 767px) {
+  .haven-ai-workbench { height: min(849px, calc(100dvh - 222px)); }
+}
+@media (max-width: 420px) {
+  .haven-ai-workbench { height: min(849px, calc(100dvh - 270px)); }
+}
+@container (max-width: 620px) {
+  .haven-ai-workbench__toolbar { padding: 16px; gap: 10px; }
+  .haven-ai-workbench__actions button { width: 32px; padding: 0; }
+  .haven-ai-workbench__actions button span { display: none; }
+  .haven-ai-workbench__messages, .haven-ai-workbench__composer { padding-right: 16px; padding-left: 16px; }
+  .haven-ai-workbench__context { padding-right: 16px; padding-left: 16px; }
+}

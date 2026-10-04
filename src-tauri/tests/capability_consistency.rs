@@ -484,6 +484,15 @@ fn csp_does_not_allow_remote_origins() {
         !directive("media-src").contains("haven-resource.comic-page"),
         "漫画页面 host 不得扩大到媒体播放边界"
     );
+    assert!(
+        directive("font-src").contains("http://haven-resource.font"),
+        "导入字体必须只在字体边界显式允许 Windows custom-protocol host"
+    );
+    assert!(
+        !directive("font-src").contains("haven-resource.comic-page")
+            && !directive("font-src").contains("haven-resource.session"),
+        "字体 host 不得把页面/会话 host 一并放宽"
+    );
     // 流代理 host 不得放宽到任意远程 origin。
     for directive_name in ["media-src", "connect-src"] {
         let value = directive(directive_name);

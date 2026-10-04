@@ -887,7 +887,7 @@ mod tests {
             "mangadex" => Some("application/vnd.comicbook+zip".to_owned()),
             "arxiv" => Some("application/pdf".to_owned()),
             "opds_gutenberg" => Some("application/epub+zip".to_owned()),
-            "europepmc" | "wikisource" => Some("text/html; charset=utf-8".to_owned()),
+            "europepmc" | "wikisource" | "feed" => Some("text/html; charset=utf-8".to_owned()),
             _ => None,
         };
         Resource {
@@ -965,5 +965,25 @@ mod tests {
         let mut wrong_mime = valid;
         wrong_mime.mime_type = Some("application/pdf".into());
         assert!(validate_download_source_object(&wrong_mime).is_err());
+
+        // RSS/Atom must pass the same DownloadTask admission gate as the
+        // ArticleSnapshot providers whose runtime acquisition it shares.
+        let feed_source_id = "custom_feed_0123456789ab";
+        let feed_remote_id = crate::services::source_import::feed_remote_id(
+            feed_source_id,
+            &crate::services::source_import::feed_entry_digest("post-1"),
+        )
+        .unwrap();
+        let feed = remote_resource(
+            crate::services::source_import::FEED_SOURCE_KEY,
+            ResourceType::ArticleSnapshot,
+            &feed_remote_id,
+            None,
+        );
+        assert!(validate_download_source_object(&feed).is_ok());
+
+        let mut feed_with_wrong_mime = feed;
+        feed_with_wrong_mime.mime_type = Some("application/pdf".into());
+        assert!(validate_download_source_object(&feed_with_wrong_mime).is_err());
     }
 }

@@ -7,10 +7,17 @@ import type {
   ComicPageProgressRemapRequestDto,
   ComicProgressMigrationRevertRequestDto,
   ComicPageManifestGetRequest,
+  AiSettingsRecommendationGenerateRequest,
+  AiSettingsRecommendationDto,
   ProgressSaveRequest,
   ReaderTocGetRequest,
 } from "./generated/wire"
-import type { SettingsUpdateRequest } from "./settings-wire"
+import type {
+  HomeLayoutSaveRequestWire,
+  OverviewLayoutSaveRequestWire,
+  SettingsUpdateRequest,
+} from "./settings-wire"
+import { defaultHomeLayout, defaultOverviewLayout } from "./settings-wire"
 
 const { invoke, check } = vi.hoisted(() => ({ invoke: vi.fn(), check: vi.fn() }))
 vi.mock("@tauri-apps/api/core", () => ({
@@ -348,6 +355,121 @@ describe("TauriHavenClient agent broker", () => {
   })
 })
 
+describe("TauriHavenClient 内置技能", () => {
+  const SKILL = {
+    schemaVersion: 1,
+    skillId: "haven-agent-proposal",
+    description: "读取脱敏上下文并创建待批准提案",
+    instructionsChars: 5_800,
+    state: "disabled",
+  } as const
+
+  it("列表无参数、启停只传 skillId 与布尔值", async () => {
+    invoke.mockResolvedValueOnce({ schemaVersion: 1, skills: [SKILL] })
+    await expect(new TauriHavenClient().agentSkillList()).resolves.toEqual({
+      schemaVersion: 1,
+      skills: [SKILL],
+    })
+    expect(invoke).toHaveBeenLastCalledWith("agent_skill_list")
+    // 列表命令不接受任何参数：没有"按路径列出技能"这种自由输入。
+    expect(invoke.mock.calls[invoke.mock.calls.length - 1].length).toBe(1)
+
+    invoke.mockResolvedValueOnce({ ...SKILL, state: "enabled" })
+    await new TauriHavenClient().agentSkillSetEnabled({ skillId: SKILL.skillId, enabled: true })
+    // 传输层只能提交 id 与布尔值：没有正文、没有摘要、没有路径可以夹带。
+    expect(invoke).toHaveBeenLastCalledWith("agent_skill_set_enabled", {
+      request: { skillId: "haven-agent-proposal", enabled: true },
+    })
+  })
+
+  it("在类型边界拒绝畸形响应，而不是把它当作合法状态渲染", async () => {
+    // 多带一段技能正文 = 契约漂移（正文必须留在 Rust 侧）。
+    invoke.mockResolvedValueOnce({
+      schemaVersion: 1,
+      skills: [{ ...SKILL, instructions: "任意正文" }],
+    })
+    await expect(new TauriHavenClient().agentSkillList())
+      .rejects.toMatchObject({ code: "INTERNAL_ERROR" })
+
+    // 三态之外的取值不得被当成"未知但可用"。
+    invoke.mockResolvedValueOnce({ ...SKILL, state: "active" })
+    await expect(new TauriHavenClient().agentSkillSetEnabled({ skillId: SKILL.skillId, enabled: true }))
+      .rejects.toMatchObject({ code: "INTERNAL_ERROR" })
+  })
+
+  it("把契约错误与未知拒绝都归一成 HavenError", async () => {
+    invoke.mockRejectedValueOnce({
+      code: "AGENT_SKILL_UNKNOWN",
+      userMessage: "没有这项内置技能",
+      retryable: false,
+    })
+    await expect(new TauriHavenClient().agentSkillSetEnabled({ skillId: "nope", enabled: true }))
+      .rejects.toMatchObject({ code: "AGENT_SKILL_UNKNOWN", retryable: false })
+
+    invoke.mockRejectedValueOnce(new Error("ipc exploded"))
+    await expect(new TauriHavenClient().agentSkillList())
+      .rejects.toMatchObject({ code: "INTERNAL_ERROR", retryable: false })
+  })
+})
+
+describe("TauriHavenClient AI 推荐生成", () => {
+  const request: AiSettingsRecommendationGenerateRequest = {
+    profileId: "provider-main",
+    sessionId: "session-1",
+    requestId: "request-1",
+    userIntent: "把正文字号调大一级，不要改动其他项目",
+    contextId: "context-1",
+    contextHash: "a".repeat(64),
+    baseRevision: "revision-1",
+  }
+
+  function response(): AiSettingsRecommendationDto {
+    return {
+      schemaVersion: 1,
+      profileId: request.profileId,
+      modelId: "reader-model",
+      explanation: null,
+      recommendedPatch: { fontSize: "large" },
+      proposal: {
+        schemaVersion: 1,
+        proposalId: "proposal-1",
+        status: "pending",
+        subject: { section: "reading" },
+        targetLabel: "全局阅读设置",
+        baseRevision: "revision-1",
+        digest: "b".repeat(64),
+        createdAt: "2026-09-27T00:00:00Z",
+        expiresAt: "2026-09-27T00:15:00Z",
+        changes: [{ key: "reading.fontSize", before: "medium", after: "large" }],
+      },
+    }
+  }
+
+  it("把用户原话与最近一次上下文锚点通过固定命令载荷传入", async () => {
+    const recommendation = response()
+    invoke.mockResolvedValueOnce(recommendation)
+
+    await expect(new TauriHavenClient().aiSettingsRecommendationGenerate(request)).resolves.toBe(recommendation)
+    expect(invoke).toHaveBeenCalledWith("ai_settings_recommendation_generate", { request })
+  })
+
+  it("对缺字段、错 profile 或非待批准提案 fail closed", async () => {
+    const malformed = [
+      {},
+      { ...response(), modelId: undefined },
+      { ...response(), profileId: "another-profile" },
+      { ...response(), proposal: { ...response().proposal, status: "applied" } },
+      { ...response(), unexpected: "not in the wire contract" },
+    ]
+
+    for (const value of malformed) {
+      invoke.mockResolvedValueOnce(value)
+      await expect(new TauriHavenClient().aiSettingsRecommendationGenerate(request))
+        .rejects.toMatchObject({ code: "INTERNAL_ERROR", retryable: false })
+    }
+  })
+})
+
 describe("TauriHavenClient updater", () => {
   beforeEach(() => {
     check.mockReset()
@@ -363,12 +485,14 @@ describe("TauriHavenClient updater", () => {
       releaseNotes: null,
       publishedAt: null,
     })
-    expect(check).toHaveBeenCalledWith({ timeout: 10_000 })
+    expect(check).toHaveBeenCalledWith({ timeout: 15_000 })
   })
 
   it("keeps only bounded update metadata and installs the pending update", async () => {
+    invoke.mockResolvedValue(undefined)
     const close = vi.fn().mockResolvedValue(undefined)
-    const downloadAndInstall = vi.fn().mockResolvedValue(undefined)
+    const download = vi.fn().mockResolvedValue(undefined)
+    const install = vi.fn().mockResolvedValue(undefined)
     check.mockResolvedValueOnce({
       currentVersion: "0.1.0-beta.1",
       version: "0.1.1",
@@ -376,7 +500,8 @@ describe("TauriHavenClient updater", () => {
       date: "2026-08-30T00:00:00Z",
       rawJson: { signature: "must-not-cross-boundary", body: "raw" },
       close,
-      downloadAndInstall,
+      download,
+      install,
     })
 
     const client = new TauriHavenClient()
@@ -388,8 +513,11 @@ describe("TauriHavenClient updater", () => {
       publishedAt: "2026-08-30T00:00:00Z",
     })
     await expect(client.updateInstall()).resolves.toEqual({ status: "installed" })
-    expect(downloadAndInstall).toHaveBeenCalledOnce()
-    expect(close).not.toHaveBeenCalled()
+    expect(download).toHaveBeenCalledOnce()
+    expect(invoke).toHaveBeenCalledWith("app_update_prepare")
+    expect(invoke).toHaveBeenCalledWith("app_update_cancel")
+    expect(install).toHaveBeenCalledWith({ restartAfterInstall: true })
+    expect(close).toHaveBeenCalledOnce()
   })
 
   it("rejects install before a check without exposing updater internals", async () => {
@@ -397,5 +525,349 @@ describe("TauriHavenClient updater", () => {
       code: "UPDATER_NO_UPDATE",
       retryable: true,
     })
+  })
+})
+
+describe("TauriHavenClient appearance commands", () => {
+  const ASSET_ID = "0196f0d2-0000-7000-8000-00000000a301"
+
+  it("maps the asset list request under the command's request argument", async () => {
+    const payload = {
+      schemaVersion: 1,
+      assets: [
+        { assetId: ASSET_ID, kind: "font", state: "validated", byteSize: 1024, displayName: "霞鹜文楷" },
+      ],
+    }
+    invoke.mockResolvedValueOnce(payload)
+
+    await expect(new TauriHavenClient().appearanceAssetsList({ kind: "font" })).resolves.toBe(payload)
+    expect(invoke).toHaveBeenCalledWith("appearance_assets_list", { request: { kind: "font" } })
+  })
+
+  it("refuses a response that carries a path instead of an opaque asset id", async () => {
+    invoke.mockResolvedValueOnce({
+      schemaVersion: 1,
+      assets: [
+        {
+          assetId: ASSET_ID,
+          kind: "font",
+          state: "validated",
+          byteSize: 1024,
+          displayName: null,
+          path: "C:/Users/me/font.ttf",
+        },
+      ],
+    })
+
+    await expect(new TauriHavenClient().appearanceAssetsList({ kind: null }))
+      .rejects.toMatchObject({ code: "INTERNAL_ERROR", retryable: false })
+  })
+
+  it("imports only the typed request (no path field) and surfaces a user cancel verbatim", async () => {
+    invoke.mockRejectedValueOnce({
+      code: "OPERATION_CANCELLED",
+      userMessage: "已取消选择文件",
+      retryable: false,
+    })
+
+    await expect(
+      new TauriHavenClient().appearanceAssetImport({ kind: "static_wallpaper", displayName: "落日" }),
+    ).rejects.toMatchObject({ code: "OPERATION_CANCELLED", retryable: false })
+
+    expect(invoke).toHaveBeenCalledWith("appearance_asset_import", {
+      request: { kind: "static_wallpaper", displayName: "落日" },
+    })
+    const [, args] = invoke.mock.calls[0] as [string, { request: Record<string, unknown> }]
+    expect(Object.keys(args.request).sort()).toEqual(["displayName", "kind"])
+  })
+
+  it("deletes through the typed asset id request and keeps both facts separate", async () => {
+    invoke.mockResolvedValueOnce({ deleted: true, fileRemoved: false })
+
+    await expect(new TauriHavenClient().appearanceAssetDelete({ assetId: ASSET_ID }))
+      .resolves.toEqual({ deleted: true, fileRemoved: false })
+    expect(invoke).toHaveBeenCalledWith("appearance_asset_delete", { request: { assetId: ASSET_ID } })
+  })
+
+  it("reads the home layout with no arguments and guards the snapshot", async () => {
+    const snapshot = { layout: { schemaVersion: 1, modules: [] }, revision: null }
+    invoke.mockResolvedValueOnce(snapshot)
+
+    await expect(new TauriHavenClient().homeLayoutGet()).resolves.toBe(snapshot)
+    expect(invoke).toHaveBeenCalledWith("home_layout_get")
+  })
+
+  it("rejects a home layout response that is out of the fixed grid", async () => {
+    invoke.mockResolvedValueOnce({
+      layout: {
+        schemaVersion: 1,
+        modules: [{ module: "continue", size: "large", row: 0, column: 1, order: 0 }],
+      },
+      revision: "appearance-1",
+    })
+
+    await expect(new TauriHavenClient().homeLayoutGet())
+      .rejects.toMatchObject({ code: "INTERNAL_ERROR" })
+  })
+
+  it("sends the expected revision and layout under the request argument", async () => {
+    const request: HomeLayoutSaveRequestWire = {
+      expectedRevision: "appearance-1",
+      layout: { schemaVersion: 1, modules: [] },
+    }
+    invoke.mockResolvedValueOnce({
+      layout: { schemaVersion: 1, modules: [] },
+      revision: "appearance-2",
+      changed: true,
+    })
+
+    await expect(new TauriHavenClient().homeLayoutSave(request))
+      .resolves.toMatchObject({ changed: true, revision: "appearance-2" })
+    expect(invoke).toHaveBeenCalledWith("home_layout_save", { request })
+  })
+
+  it("maps the reset CAS through its own command and normalizes the conflict error", async () => {
+    invoke.mockRejectedValueOnce({
+      code: "REVISION_CONFLICT",
+      userMessage: "外观设置已被其他窗口更新，请重新加载后再保存",
+      retryable: false,
+    })
+
+    await expect(new TauriHavenClient().homeLayoutReset({ expectedRevision: null }))
+      .rejects.toMatchObject({ code: "REVISION_CONFLICT", retryable: false })
+    expect(invoke).toHaveBeenCalledWith("home_layout_reset", { request: { expectedRevision: null } })
+  })
+})
+
+describe("TauriHavenClient overview layout commands", () => {
+  it("reads the overview layout with no arguments and guards the snapshot", async () => {
+    const snapshot = { layout: defaultOverviewLayout(), revision: null }
+    invoke.mockResolvedValueOnce(snapshot)
+
+    await expect(new TauriHavenClient().overviewLayoutGet()).resolves.toBe(snapshot)
+    expect(invoke).toHaveBeenCalledWith("overview_layout_get")
+  })
+
+  it("rejects a home layout response coming back from the overview command", async () => {
+    // 两份布局各有自己的闭合模块集合：首页布局的形状不是合法的总览布局。
+    invoke.mockResolvedValueOnce({ layout: defaultHomeLayout(), revision: "overview-1" })
+
+    await expect(new TauriHavenClient().overviewLayoutGet())
+      .rejects.toMatchObject({ code: "INTERNAL_ERROR" })
+  })
+
+  it("rejects an overview layout response that is out of the three-column grid", async () => {
+    invoke.mockResolvedValueOnce({
+      layout: {
+        schemaVersion: 1,
+        modules: [{ module: "preferences", size: "medium", row: 0, column: 2, order: 0 }],
+      },
+      revision: "overview-1",
+    })
+
+    await expect(new TauriHavenClient().overviewLayoutGet())
+      .rejects.toMatchObject({ code: "INTERNAL_ERROR" })
+  })
+
+  it("sends the expected revision and layout under the request argument", async () => {
+    const request: OverviewLayoutSaveRequestWire = {
+      expectedRevision: "overview-1",
+      layout: { schemaVersion: 1, modules: [] },
+    }
+    invoke.mockResolvedValueOnce({
+      layout: { schemaVersion: 1, modules: [] },
+      revision: "overview-2",
+      changed: true,
+    })
+
+    await expect(new TauriHavenClient().overviewLayoutSave(request))
+      .resolves.toMatchObject({ changed: true, revision: "overview-2" })
+    expect(invoke).toHaveBeenCalledWith("overview_layout_save", { request })
+  })
+
+  it("maps the reset CAS through its own command and normalizes the conflict error", async () => {
+    invoke.mockRejectedValueOnce({
+      code: "REVISION_CONFLICT",
+      userMessage: "外观设置已被其他窗口更新，请重新加载后再保存",
+      retryable: false,
+    })
+
+    await expect(new TauriHavenClient().overviewLayoutReset({ expectedRevision: null }))
+      .rejects.toMatchObject({ code: "REVISION_CONFLICT", retryable: false })
+    expect(invoke).toHaveBeenCalledWith("overview_layout_reset", { request: { expectedRevision: null } })
+  })
+})
+
+describe("TauriHavenClient reading overview command", () => {
+  const REQUEST = { days: 7, utcOffsetMinutes: 480 }
+
+  /** 空库的 wire 形态（`daily` 与窗口同长，可选统计量为 null）。 */
+  function emptyOverview() {
+    const localDates = [
+      "2026-03-05",
+      "2026-03-06",
+      "2026-03-07",
+      "2026-03-08",
+      "2026-03-09",
+      "2026-03-10",
+      "2026-03-11",
+    ]
+    // ISO 星期序号：2026-03-05 是星期四。
+    const weekdays = [4, 5, 6, 7, 1, 2, 3]
+    return {
+      schemaVersion: 1,
+      range: {
+        startLocalDate: localDates[0],
+        endLocalDate: localDates[localDates.length - 1],
+        days: 7,
+        utcOffsetMinutes: 480,
+      },
+      sessionCount: 0,
+      totalDurationMs: 0,
+      daily: localDates.map((localDate, index) => ({
+        localDate,
+        weekday: weekdays[index],
+        durationMs: 0,
+      })),
+      categories: [],
+      heatmapCells: [],
+      peakStartHour: null,
+      peakEndHour: null,
+      longestStreakDays: null,
+      averageDailyDurationMs: null,
+      recentWeekDurationMs: null,
+    }
+  }
+
+  it("sends the window under the command's request argument", async () => {
+    const payload = emptyOverview()
+    invoke.mockResolvedValueOnce(payload)
+
+    await expect(new TauriHavenClient().readingOverviewGet(REQUEST)).resolves.toBe(payload)
+    expect(invoke).toHaveBeenCalledWith("reading_overview_get", { request: REQUEST })
+    const [, args] = invoke.mock.calls[0] as [string, { request: Record<string, unknown> }]
+    expect(Object.keys(args.request).sort()).toEqual(["days", "utcOffsetMinutes"])
+  })
+
+  it("rejects an overview that fabricates zeroed aggregates for an empty library", async () => {
+    // 空库必须表达为 null（没有记录），把「没有数据」写成 0 分钟是伪造统计量。
+    invoke.mockResolvedValueOnce({
+      ...emptyOverview(),
+      peakStartHour: 0,
+      averageDailyDurationMs: 0,
+    })
+
+    await expect(new TauriHavenClient().readingOverviewGet(REQUEST))
+      .rejects.toMatchObject({ code: "INTERNAL_ERROR", retryable: false })
+  })
+
+  it("rejects an overview whose daily buckets do not cover the whole window", async () => {
+    const payload = emptyOverview()
+    invoke.mockResolvedValueOnce({ ...payload, daily: payload.daily.slice(0, 3) })
+
+    await expect(new TauriHavenClient().readingOverviewGet(REQUEST))
+      .rejects.toMatchObject({ code: "INTERNAL_ERROR" })
+  })
+
+  it("normalizes the domain range error without inventing a fallback window", async () => {
+    invoke.mockRejectedValueOnce({
+      code: "READING_OVERVIEW_INVALID_RANGE",
+      userMessage: "总览统计天数超出允许范围",
+      retryable: false,
+    })
+
+    await expect(new TauriHavenClient().readingOverviewGet({ days: 0, utcOffsetMinutes: 0 }))
+      .rejects.toMatchObject({ code: "READING_OVERVIEW_INVALID_RANGE", retryable: false })
+  })
+})
+
+describe("TauriHavenClient tvbox_config_preview", () => {
+  it("maps the address under the command's request argument", async () => {
+    const request = { url: "https://config.example.invalid/tvbox.json" }
+    const response = {
+      schemaVersion: 1,
+      siteCount: 2,
+      liveCount: 0,
+      parserCount: 0,
+      skippedSiteRows: 0,
+      skippedLiveRows: 0,
+      skippedParserRows: 0,
+      spiderConfigured: false,
+      spiderKind: null,
+      spiderHasIntegrityDigest: false,
+      httpEndpointSiteCount: 2,
+      spiderSiteCount: 0,
+      unclassifiedSiteCount: 0,
+      opaqueTopLevelFieldNames: [],
+      unrecognizedTopLevelFieldCount: 0,
+      withheldTopLevelFieldCount: 0,
+    } as const
+    invoke.mockResolvedValueOnce(response)
+
+    await expect(new TauriHavenClient().tvboxConfigPreview(request)).resolves.toBe(response)
+    expect(invoke).toHaveBeenCalledWith("tvbox_config_preview", { request })
+  })
+
+  it("keeps the stable backend error code and does not echo the address", async () => {
+    invoke.mockRejectedValueOnce({
+      code: "SECURITY_POLICY_DENIED",
+      userMessage: "TVBox 配置地址不安全",
+      retryable: false,
+    })
+
+    const rejection = await new TauriHavenClient()
+      .tvboxConfigPreview({ url: "http://127.0.0.1/tvbox.json" })
+      .catch((error: unknown) => error)
+    expect(rejection).toMatchObject({ code: "SECURITY_POLICY_DENIED", retryable: false })
+    expect(String((rejection as Error).message)).not.toContain("127.0.0.1")
+  })
+})
+
+describe("TauriHavenClient tvbox_config_save", () => {
+  it("maps the request under the command's request argument", async () => {
+    const request = { displayName: "电视源", url: "https://config.example.invalid/tvbox.json" }
+    const response = {
+      schemaVersion: 1,
+      sourceId: "custom_tvbox_0123456789ab",
+      preview: {
+        schemaVersion: 1,
+        siteCount: 2,
+        liveCount: 0,
+        parserCount: 0,
+        skippedSiteRows: 0,
+        skippedLiveRows: 0,
+        skippedParserRows: 0,
+        spiderConfigured: false,
+        spiderKind: null,
+        spiderHasIntegrityDigest: false,
+        httpEndpointSiteCount: 2,
+        spiderSiteCount: 0,
+        unclassifiedSiteCount: 0,
+        opaqueTopLevelFieldNames: [],
+        unrecognizedTopLevelFieldCount: 0,
+        withheldTopLevelFieldCount: 0,
+      },
+    } as const
+    invoke.mockResolvedValueOnce(response)
+
+    await expect(new TauriHavenClient().tvboxConfigSave(request)).resolves.toBe(response)
+    expect(invoke).toHaveBeenCalledWith("tvbox_config_save", { request })
+  })
+
+  it("keeps the stable backend error code and does not echo the address", async () => {
+    invoke.mockRejectedValueOnce({
+      code: "INVALID_ARGUMENT",
+      userMessage: "该端点的自定义来源已存在",
+      retryable: false,
+    })
+
+    const rejection = await new TauriHavenClient()
+      .tvboxConfigSave({
+        displayName: "电视源",
+        url: "https://config.example.invalid/a.json?token=secret-value",
+      })
+      .catch((error: unknown) => error)
+    expect(rejection).toMatchObject({ code: "INVALID_ARGUMENT", retryable: false })
+    expect(String((rejection as Error).message)).not.toContain("secret-value")
   })
 })

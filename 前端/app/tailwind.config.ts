@@ -23,17 +23,7 @@ export default {
     },
     extend: {
       fontFamily: {
-        sans: [
-          'Inter',
-          '-apple-system',
-          'BlinkMacSystemFont',
-          '"SF Pro Text"',
-          '"Segoe UI"',
-          'Roboto',
-          '"Helvetica Neue"',
-          'Arial',
-          'sans-serif'
-        ],
+        sans: ['var(--haven-font-ui-system)'],
       },
       colors: {
         // shadcn/ui mapped colors

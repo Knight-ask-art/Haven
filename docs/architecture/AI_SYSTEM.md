@@ -5,508 +5,227 @@ status: active
 owner: architecture
 visibility: public
 source_of_truth: accepted-design-and-runtime-contracts
-last_reviewed: 2026-09-22
-review_after: 2026-12-22
+last_reviewed: 2026-10-04
+review_after: 2027-01-04
 ---
 
-# Haven AI 系统架构（AI Provider / MCP / Skill 边界）
+# Haven AI 系统架构
 
-本文件是 AI 能力在栖阅（Haven）中的**安全边界与分层契约**。它描述的是"什么是允许的"，
-不是"未来可能做什么"：任何与本文件冲突的实现都属于缺陷，必须先改本文件再改代码。
+本文维护 Haven 产品的 Provider、Proposal、MCP、Skill 与凭据边界。
+它不是开发工具操作手册，也不以设计目标代替发布版的实际能力清单。
+传输协议见 [MCP 外部 Agent 传输](MCP_EXTERNAL_AGENT_TRANSPORT.md)。
 
-相关文档：
+## 1. Proposal、批准与回执
 
-- 实施阶段由仓库内部计划跟踪；本文件只以运行时契约、生成绑定和测试为准。
-- 外部 Agent 传输设计（A5，**设计已冻结；核心已落地，真实客户端与端到端未验收**）：[`MCP_EXTERNAL_AGENT_TRANSPORT.md`](./MCP_EXTERNAL_AGENT_TRANSPORT.md)
-- Claude Code 子代理工作流（第三方 Provider 已配置时的调用、复审与验收规范）：[`CLAUDE_CODE_AGENT_WORKFLOW.md`](./CLAUDE_CODE_AGENT_WORKFLOW.md)
-- 既有 Proposal 内核：`haven-domain/src/setting_proposal.rs`、`haven-application/src/services/setting_proposals.rs`
-- 既有 Typed IPC 切片：`haven-application/src/services/agent_settings_ipc.rs`、`src-tauri/src/commands/agent.rs`
-- 凭据契约：`haven-domain/src/credential.rs`（ADR-001，Windows Credential Manager）
-- 出站 HTTP 约束：`haven-common/src/network.rs`、`haven-infrastructure/src/http_security.rs`
-
----
-
-## 0. 一句话结论
-
-> **AI Provider 只能生成结构化建议与上下文；唯一能改变本机状态的路径是
-> 「User 在 UI 上批准一份 Rust 生成的 canonical digest」。**
-
-Provider 不是执行者。模型输出不是权限。MCP 不是写入通道。Skill 不是能力提升。
-任何"让模型直接改设置 / 直接调 IPC / 直接写 SQLite"的设计都违反本文件。
-
----
-
-## 1. 已落地的链路（A1 设置智能体，现状）
-
-当前仓库中已经存在并在运行的一条闭环，AI Provider 切片必须复用它、不得另起一条：
+模型只能读取受控上下文、返回结构化建议。改变用户设置的唯一授权路径是：
+**用户在 Haven 界面逐项检查并批准 Rust 生成的 canonical digest**。
 
 ```text
-① 读取上下文
-   React UI (AiAssistantDialog)
-     → feature hook / AiAssistant 客户端
-     → HavenClient.agentSettingsContextGet()
-     → Tauri command `agent_settings_context_get`
-     → AgentSettingsIpcService
-     → SettingsService（authoritative 读取）
-   ← AgentSettingsContextDto { contextId, contextHash, revision, 脱敏快照, capabilities }
-
-② 生成提案（Provider 的唯一产出）
-   AgentSettingsProposalCreateRequest { sessionId, requestId, contextId, contextHash, baseRevision, patch }
-     → Tauri command `agent_settings_proposal_create`
-     → AgentSettingsIpcService（重新读取 authoritative 设置、重建上下文、逐项比对）
-     → SettingProposal::new(...)
-     → canonical JSON（对象键按 UTF-8 字节序升序、紧凑输出、UTF-8 直出）
-     → SHA-256 → digest（64 位小写十六进制）
-     → SQLite setting_proposals（payload_json + digest + status=pending）
-
-③ UI Diff
-   AgentSettingsProposalDto { proposalId, digest, status, subject, targetLabel, baseRevision,
-                               createdAt, expiresAt, changes[] }
-     → UI 逐项渲染 key / before / after，并**逐字显示** digest
-       （本地预览摘要必须标注"本地预览"，不得当作领域 digest）
-
-④ 用户批准
-   AgentSettingsProposalApproveRequest { proposalId, expectedDigest }
-     → Tauri command `agent_settings_proposal_approve`
-     → 单一 UoW（BEGIN IMMEDIATE）：
-         digest 比对 + 目标 CAS + 一次性 Approval Token 签发/消费 + 设置写入 + 回执写入
-         + Proposal/Binding 状态迁移
-
-⑤ Receipt
-   AgentSettingChangeReceiptDto { receiptId, proposalId, proposalDigest, status,
-                                  appliedRevision, changed, changes[], appliedAt }
-     → 可独立重放、可回读（`agent_setting_change_receipt_get`）
+读取 authoritative 上下文
+  → contextId / contextHash / revision / 脱敏快照 / capabilities
+  → Provider 结构化建议或 MCP 提案请求
+  → Application 重新校验上下文
+  → pending Proposal + canonical JSON + SHA-256 digest
+  → Haven UI 展示作用域、before/after、digest 与过期时间
+  → 用户批准 expectedDigest
+  → 单一 UoW：digest 校验 + CAS + 一次性批准 token + 写入 + Receipt
 ```
 
-关键不变量（已实现，AI 切片必须继承）：
+- digest 由 Rust 生成；UI 只显示并回传它，不自行生成领域摘要。
+- 创建 pending 提案不应用设置；拒绝、过期和上下文冲突不写目标状态。
+- 批准绑定 proposal、digest、目标 revision 与一次性 token，不能被模型代替。
+- Receipt 是可回读的审计事实，必须与实际 changed、revision 和 changes 自洽。
+- 原始凭据、文件路径、正文与 Provider 报文不进入 Agent 上下文或审计投影。
 
-1. **digest 只由 Rust 生成**。UI 不计算领域 digest，只回传它显示的那一份。
-2. **只有批准会写设置**。创建/拒绝/过期都是零写入。
-3. **旧快照 fail-closed**。`contextId` / `contextHash` / `baseRevision` 任一不匹配即拒绝。
-4. **回执是审计事实**。删除目标不会删除提案与回执；回执必须自洽（`changed` 与 before/after 一致）。
-5. **token / secret / 路径 / 正文不进 wire**。DSO 只暴露 code / message / retryable。
+实现入口为 Application 的 `agent_settings_ipc`、`setting_proposals` 服务，
+Domain 的 `setting_proposal` 内核和 Tauri 的 `commands/agent.rs`。
 
-### 1.1 资源级 Agent Proposal 的部分 Patch 语义
+### 1.1 资源级部分 patch
 
-全局阅读设置与资源级偏好都复用同一套 Proposal / Approval / CAS / Receipt 内核，但
-Agent 的资源级提案有一个必须保持的存储差异：
+Agent 资源提案只存请求修改的字段，不复制合并后的完整偏好。
+资源级 Agent patch 的顶层和字段级 `None` 均表示不触碰该部分；
+普通完整资源偏好的覆盖语义不因此改变。
 
-- `AgentResourcePreferencePatch` 只把 Agent 请求修改的部分 `PreferenceData` 写进 Proposal
-  的 canonical JSON。它**不**把当前 authoritative 偏好合并成完整快照再保存，因此已有的字体路径、
-  endpoint 样式文本或其它敏感自由文本不会因为 Agent 只改字号而被复制进 Proposal。
-- `PreferenceData::apply_patch` 明确区分 `None` 的含义：资源级 Agent patch 中顶层 `None`
-  表示“不触碰该分区”，字段级 `None` 表示“不触碰该字段”；普通 `ResourcePreference`
-  仍表示完整覆盖数据，不能用另一种语义替代。
-- 用户批准资源提案时，Application service 在同一个 UoW 内重新读取 authoritative 资源偏好，
-  校验 `base_revision`，合并 Agent patch，再执行 CAS。冲突、过期、digest 不一致或 token
-  失败都不会留下目标写入或 Receipt。
-- Agent Receipt 的 `before_canonical_json` / `after_canonical_json` 是**脱敏审计投影**：
-  Agent 可能看到的 Receipt 不包含路径、endpoint、Bearer 或凭据样式文本；Haven authoritative
-  设置事实源仍保存用户真实值。所有 Agent Receipt 应用入口必须共用这条投影逻辑。
+批准时在同一个 UoW 内重读 authoritative 偏好、检查 base revision、
+合并部分 patch 并 CAS。任何校验失败都不能留下目标写入或回执。
+Agent Receipt 的 before/after 是脱敏审计投影，不能成为完整设置快照。
 
-因此，Proposal/Receipt 展示层可以安全地说“本次 Agent 请求改了哪些字段”，但不能把它们当作
-完整资源设置快照或 secret 容器。后续 UI 只消费这套投影，不能在前端重新拼一份 authoritative
-值，也不能为 Agent 增加直接读取 Receipt 的权限。
-
----
-
-## 2. 分层与依赖方向（强制）
+## 2. 分层与依赖方向
 
 ```text
 React UI
-  → Feature Hook / Action        （features/<domain>/lib/use*.ts）
-  → Feature Gateway              （features/<domain>/ipc/*-gateway.ts，运行时形状守卫）
-  → Typed HavenClient            （lib/ipc/client.ts 接口）
-      ├─ TauriClient             （lib/ipc/tauri-client.ts → invoke）
-      └─ MockClient              （lib/ipc/mock-client.ts → contracts/ipc/v1/fixtures）
-  → Tauri command                （src-tauri/src/commands/*.rs，只做解析 + 调用 + 错误映射）
-  → Application service          （haven-application/src/services/*.rs，唯一用例编排点）
-  → Domain / Port                （haven-domain 契约，无框架依赖）
-  → Infrastructure               （haven-infrastructure：SQLite / HTTP / keyring）
+  → Feature Hook / Action
+  → Feature API / Gateway
+  → Typed HavenClient
+  → Tauri Command
+  → Application Service
+  → Domain / Port
+  → Infrastructure
 ```
 
-**禁止**：
+组件不得直接 invoke、读取 SQLite 或 fetch Provider。Application 是用例编排点；
+Infrastructure 实现受控 HTTP、存储和 keyring。生成 Wire 只能由 Rust 定义和
+规范生成流程更新。
 
-- 组件直接 `invoke(...)`、直接读 SQLite、直接 `fetch` 任何 Provider。
-- Provider 适配器从 React 或 IPC 层被绕过 Application 调用。
-- 引入"自由调用"入口（例如 `agent_invoke`、`ai_complete`、`ai_chat` 这类把任意
-  提示词/任意工具直接转发给模型的命令）。
-- 自由 JSON 穿透 IPC（`serde_json::Value` 作为请求或响应载荷）。
-
-**唯一例外**：还没有 Application 服务的**纯读**能力可以在基础设施层直接实现，
-但必须经由 Application service 暴露，命令层不得直接持有基础设施类型。
-
----
+不开放将任意 prompt、tool、URL、SQL、文件路径或命令直接转发到模型或系统的入口。
+新增能力必须同时审查契约、权限、上下文投影和实际消费者。
 
 ## 3. Provider 契约
 
-### 3.1 Provider 能做什么
+Provider 可以返回有界解释和闭合的设置 patch，不能批准、Apply、
+访问 Repository/UoW、创建 Receipt 或自行决定权限。
 
-| 允许 | 说明 |
-| --- | --- |
-| 生成**结构化建议** | 例如一份阅读排版 patch，字段落在闭合 DTO 上 |
-| 生成**上下文解释** | 对已脱敏快照的自然语言说明，不参与写入 |
-| 读取**已脱敏上下文** | 只能看到服务端裁剪后的快照与能力清单 |
-
-### 3.2 Provider 绝对不能做什么
-
-| 禁止 | 理由 |
-| --- | --- |
-| Apply / 写设置 | 写入只认用户批准的 digest |
-| 读取 secret / API key | 凭据只存在于 CredentialStore |
-| 读绝对路径 / 目录树 | 扫描与路径事实不出 Rust |
-| 直接 HTTP 绕过 Application | 出站请求必须由 Infrastructure 适配器发起 |
-| 决定自己的能力 | 能力清单是服务端固定投影，不是调用方参数 |
-| 伪造模型或能力 | 模型目录必须来自 Provider `/models`；缺字段即 `unknown` |
-
-### 3.3 Allowed / Forbidden 速查
+设置建议路径：
 
 ```text
-ALLOWED
-  read: 脱敏设置快照、revision、能力清单、模型目录（id/显示名/created/ownedBy/显式能力）
-  write: 创建 Proposal（一条 pending 行）
-  never: 直接写入任何 authoritative 状态
-
-FORBIDDEN
-  read:  API key 原文、credentialRef / target 名、绝对路径、正文、Cookie、请求头
-  write: 设置、文件、数据库行、provenance、receipt、MCP 返回
-  call:  Tauri IPC、SQLite、文件系统、任意 URL（只能走 profile.endpoint 的兼容 /models）
+启用的 profile + CredentialStore + selectedModelId
+  → 模型目录中的同一 id，且显式 chat=Supported
+  → authoritative 设置上下文
+  → AiSettingsRecommendationPort
+  → strict json_schema structured output
+  → 验证 ReadingPatch 与有界 explanation
+  → Application 创建 pending Proposal
 ```
 
----
+调用前后必须绑定同一份 context id/hash/base revision。Provider 端口不能自己
+创建提案；领域 digest 仍由 Haven 生成。Structured Output 要求闭合键集合、
+合法枚举、长度和控制字符约束；缺失或未知键都拒绝，不从自由文本中猜测 JSON。
 
-## 4. 凭据边界（唯一事实源）
+没有可用 profile、凭据、选中模型或显式 chat 能力时，不发模型请求，也不拿模板
+冒充模型响应。错误只返回稳定、脱敏的 code/message/retryable。
 
-- 统一使用 `CredentialRef::new_scoped("ai", profile_id)`，形成 `haven:ai:<profile-id>`。
-  该 target 的字符约束由 `haven-domain/src/credential.rs` 强制
-  （拒绝控制字符、冒号、反斜杠、空白；单段 ≤ 60，总长 ≤ 128）。
-- 凭据 Provider 枚举 `CredentialProviderDto` 扩展 `ai` 变体，**只**用于受控的
-  credential status / set / delete；任何响应都不得回显 secret。
-- **API key 绝不进入**：普通 settings JSON、SQLite profile 行、TS wire、
-  localStorage、日志、provenance、receipt、MCP 返回、错误消息。
-- 读取路径：`CredentialStore::get()` → `SecretString`（`Debug`/`Display` 均为
-  `[REDACTED]`，`Drop` 清零，不实现 `Clone`）→ 只在 Provider 适配器调用栈内
-  `expose()`，随即随栈释放。
-- **profile 删除的凭据清理语义**：调用方携带的 `expectedRevision` **先**与刚读到的版本
-  比对（零副作用地拒绝过期的删除请求），通过之后才对凭据执行受控 `delete`，最后对
-  profile 行做 CAS 删除。顺序不可颠倒：
-  - 若不先做版本比对，一次"UI 拿着旧列表点删除"就会先销毁 API Key、再返回冲突——
-    操作报告失败，却已经做完了不可逆的破坏。
-  - 若先删行再删凭据，凭据删除失败会留下**没有任何行引用的孤儿 secret**——用户再也
-    无法从 UI 管理它。
-  - 剩下唯一无法用单条 SQL 消除的窗口是"读之后、CAS 之前被并发写者推进版本"。该窗口
-    内凭据已删而 CAS 失败，留下的是一个"存在但未配置密钥"的 profile：状态可见、
-    可重新配置、可再次删除。这是可恢复的那一侧。
-  - 凭据删除失败（keyring 不可用等）必须**中止整次删除**并把错误返回 UI，不得静默跳过。
+## 4. 凭据与隐私
 
----
+AI 凭据使用 Domain 的 scoped `CredentialRef`，真实 secret 只属于
+CredentialStore。普通 settings、SQLite profile、TS 响应、localStorage、
+日志、Proposal、Receipt 和 MCP 响应都不得保存或回显 API key。
+
+Secret 在受控适配器调用栈内短暂暴露；Debug/Display 必须脱敏，释放时清零。
+Provider profile 删除先验证 expected revision，再受控清理凭据，最后 CAS 删除
+profile；凭据清理失败必须中止，不能留下不可管理的孤儿 secret。
+跨凭据库与数据库的并发窗口不能冒充单条 SQL 事务：若凭据已删但 CAS 冲突，
+profile 必须呈现可恢复的“未配置凭据”状态。
+
+出站请求使用共享 URL、DNS、连接和响应策略，不允许 userinfo、非法 scheme、
+DNS 重绑定或无界响应。每次请求校验目的地址并固定已验证解析结果；
+重定向不能绕过地址策略。AI endpoint 采用自己的策略类别，不能继承其它来源的
+测试例外或局域网授权。
 
 ## 5. MCP 边界
 
-MCP 只允许两类工具：
+MCP 只提供两类业务能力：读取脱敏、有界上下文；创建 pending 提案。
+它不是写入、批准或通用系统工具通道。
 
-| 允许 | 语义 |
-| --- | --- |
-| `Read` | 读取已脱敏、已投影的上下文（与 `agent_settings_context_get` 同一份 DTO） |
-| `Propose` | 创建一份 pending Proposal（与 `agent_settings_proposal_create` 同一条路径） |
+### 5.1 闭合工具清单
 
-**禁止**：`Apply`、`Approve`、`Reject`、`Write`、`Delete`、`metadata_patch`、`file_renames`、
-任意文件系统工具、任意 shell、任意 SQL、任意 secret 读取、任意"直接把 prompt / 命令转发
-给模型或系统"的工具。MCP 客户端拿不到比 WebView 更多的权限——它只是同一 API 的另一个
-调用方。控制点不在 ACL（那是 WebView 的边界），而在**工具清单本身**：不允许的动词压根
-没有工具。
-
-### 5.1 冻结的工具清单（第一版，恰好 9 个）
+唯一工具名声明在 `mcp/haven-mcp/src/constants.ts`：
 
 ```text
-get_system_capabilities            propose_settings_patch
-get_settings_snapshot              propose_resource_preference_patch
+get_system_capabilities
+get_settings_snapshot
 get_setting_sources
 get_resource_preference_snapshot
 get_library_summary
 get_media_capabilities
 get_onboarding_state
+propose_settings_patch
+propose_resource_preference_patch
 ```
 
-清单是闭合集合：`mcp/haven-mcp/src/constants.ts` 的 `TOOL_NAMES` 是唯一声明处，
-`test/tools.test.ts` 断言真实注册结果与它完全相等，并对工具名跑禁用词根扫描。
+工具不得包含 Apply、Approve、Reject、Delete、文件系统、SQL、Shell、
+Secret、直接 IPC、metadata patch 或文件重命名。输入 schema 必须 strict；
+文本与 structuredContent 同源，输出受单字段、列表和整体上限约束。
 
-当前 `AgentCapabilityManifest::for_current_slice()` 的有效能力投影为：
+### 5.2 同一安全内核
 
 ```text
-settings_read                 true
-settings_proposal             true
-setting_sources_read          true
-resource_preference_read      true
-resource_preference_proposal  true
-library_summary_read          true
-media_capabilities_read       true
-onboarding_read               true
-
-metadata_proposal             false
-rename_proposal               false
-secret_read                   false
-filesystem_write              false
+外部 MCP 客户端
+  → Haven MCP strict tool
+  → Typed Haven Agent Bridge
+  → 本地 Rust Broker
+  → Typed Application service
+  → pending Proposal
+  → 用户在 Haven UI 批准 → CAS/Apply → Receipt
 ```
 
-能力清单是服务端权威声明，不是 Agent 自带的授权凭证；Skill、MCP 客户端或 Provider
-不能通过提交另一份 manifest 打开关闭项。
+MCP server 不读取数据库、文件或凭据库，也不 invoke Tauri。
+`get_system_capabilities` 在 Node 本地投影桥接状态；其余八个业务请求经过 Broker。
+能力由 Haven 逐请求校验，客户端身份、模型输出和 Skill 都不是权限来源。
 
-### 5.2 链路（不可绕过）
-
-```text
-MCP client
-  → MCP tool（Strict Zod 输入）
-  → Typed Haven Agent Bridge 端口          ← MCP 侧唯一的出口
-  → Haven Application service（Typed）
-  → SettingProposal（canonical JSON + SHA-256 digest）
-  → UI Approval（用户逐项核对 digest）
-  → Rust CAS / Apply
-  → Receipt
-```
-
-MCP server **不读** SQLite、**不碰**文件系统、**不访问** CredentialStore、**不**
-invoke Tauri。它只调用桥接端口，端口只承载已经投影、已经脱敏的载荷。
-
-### 5.3 传输与接通状态（截至 2026-09-20）
-
-| 层 | 状态 |
-| --- | --- |
-| MCP 协议面（工具名 / schema / outputSchema / 注解 / 错误语义） | **已实现并冻结** |
-| Typed Haven Agent Bridge 端口 | **已实现**（`mcp/haven-mcp/src/bridge.ts`） |
-| 显式不可用适配器 | **已实现**，且是生产默认 |
-| 本地传输适配器（端口 → 运行中的 Haven 进程） | **已实现**（`mcp/haven-mcp/src/local-broker.ts` 的 `LiveHavenAgentBridge`；Rust 侧 Broker、Tauri 命令与设置页「外部 Agent 接入」分组均已落地），但**默认关闭**，真实链路**未验收** |
-| 9 个工具对应的 Haven 后端用例 | **9 个均已实现**（Application / Rust Broker / Node live 路径具备；真实客户端与端到端未验收） |
-
-运行时桥接的设计已冻结（[A5 传输设计](./MCP_EXTERNAL_AGENT_TRANSPORT.md)），A5.1–A5.5 与
-A5.7/A5.8 的核心也已落地：Rust Broker、Tauri 命令、设置页分组与 Node live 适配器都在仓库里
-并有测试。**但"有实现"不等于"已接通"**：默认关闭、默认不可用，四个真实客户端、真实 Windows
-WebView2 界面与 Haven→Node→MCP 的端到端都**未验收**。A5.6 的四份配置夹具与契约测试已经落地，
-但夹具明确标记 `verified: false`，不代表真实客户端兼容性已经验证。
-逐项证据与边界见该文件 §11.1 与 §12。
-
-目标接入方是**用户已经装好的**外部 Agent（Codex、Claude Code、DSH、Pi …），
-它们共用**同一套** 9 工具契约；客户端之间的差异只是 stdio 配置写法，
-不存在任何客户端专属工具或特权模式。设置页已提供四客户端共用的**同一份**配置模板，仓库也
-提供四份 `verified: false` 配置夹具；四个客户端**均未实测**，见
-[`MCP_EXTERNAL_AGENT_TRANSPORT.md`](./MCP_EXTERNAL_AGENT_TRANSPORT.md) §9 的兼容矩阵。
-
-因此默认行为是**显式不可用**，而不是伪造接通：
-
-- 默认（未设 `HAVEN_MCP_BRIDGE`）→ `UnavailableHavenAgentBridge`；
-- `HAVEN_MCP_BRIDGE=live` **但未配置 `HAVEN_MCP_ENDPOINT`** → 仍是显式不可用桥接
-  （说明缺哪个变量，不猜、不扫描、不回退）；
-- `HAVEN_MCP_BRIDGE=live` 且端点形态合法 → 连接本地 Broker。**`available = true` 只表示
-  端点形态通过校验，连接状态要到调用时才确认**（Broker 未开启或 Haven 未运行时，调用仍拿到
-  `HAVEN_BRIDGE_UNAVAILABLE`）；
-- `HAVEN_MCP_BRIDGE=live` 且端点形态非法 → `HAVEN_MCP_ENDPOINT_INVALID`，**不尝试连接**；
-- `HAVEN_MCP_BRIDGE=fixture` → **拒绝启动**：测试替身需要环境变量**与**注入的工厂
-  同时存在，而生产入口不注入工厂，因此假桥接不可能成为生产数据源。
-
-两种不可用的含义必须区分开，`get_system_capabilities` 会如实报告：
-
-- `HAVEN_BRIDGE_UNAVAILABLE`：桥接没接通，**换一个 Haven 版本可能就行**；
-- `HAVEN_CAPABILITY_UNAVAILABLE`：当前 Haven 版本没有开放这个能力，**重试无用**。
-
-**9 个冻结工具均已具备后端运行路径。** 这表示每个工具都能从 Node Bridge 经过 Rust
-Broker 分派到 Application service，并经过能力、输入、脱敏与有界校验；它不表示默认 Broker
-已开启，也不表示 Codex / Claude Code / DSH / Pi、Windows WebView2 或真实
-Haven→Node→MCP 链路已经验收。
-
-**外部 Agent 接入默认关闭。** 只有用户在设置页显式开启后才会创建本地端点；未开启时
-`agent_broker_status` 返回 `disabled` 且不带端点，界面不给端点、不给模板。
-
----
+外部接入默认关闭。未配置 live bridge 或端点不可用时明确报告
+`HAVEN_BRIDGE_UNAVAILABLE`；服务端没有开放能力时报告
+`HAVEN_CAPABILITY_UNAVAILABLE`。两者不得混淆。
+非法端点不尝试连接；生产入口不注入 fixture bridge，也不返回测试数据。
 
 ## 6. Skill 边界
 
-**Skill 是行为协议，不是权限。**
+Skill 是说明性行为协议，不是权限。它不能改变能力位、ACL、凭据可达性、
+MCP 工具集合或批准路径。
 
-- Skill 描述"这件事按什么顺序做、产出什么形状"，它可以被模型、被模板、被人执行。
-- Skill 不携带授权，不提升能力，不改变 ACL，不改变 CredentialStore 的可达性。
-- 一个 Skill 无论怎么写，都不能让模型获得 `Apply`；它只能产出 Proposal。
-- 因此 Skill 的评审标准是**正确性与可读性**，而权限评审标准在 Provider / MCP 边界上。
+### 6.1 同一份产品内容
 
-### 6.1 第一个正式 Skill：`skills/haven-agent-proposal`
+`skills/haven-agent-proposal/SKILL.md` 是内置运行时与外部分发的同一份内容源。
+产品 Skill 引导先读取能力和上下文，再提出 pending Proposal；
+不能声称提案已应用，也不能通过 MCP 回读本来没有开放的 Receipt。
 
-它是上面这条边界的具体化：教模型**怎么用** MCP 的 9 个工具，而不是给模型更多工具。
+### 6.2 原生加载与状态
 
-协议要点（全文见 `skills/haven-agent-proposal/SKILL.md`）：
+内置文档经编译期嵌入、严格解析后进入 BuiltinAgentSkillRegistry。
+Application 的 AgentSkillService 管理 list/set_enabled；
+SQLite 的 agent_skill_states 是启用状态的事实源，不使用页面状态替代。
 
-1. **永远先调 `get_system_capabilities`**，据此判断桥接状态、能力位与各工具是否 implemented。
-   读不到就如实说读不到，不编造数据 / 模型 / 能力。
-2. **先读后提议**。改全局阅读设置前必须 `get_settings_snapshot`，并把
-   `context_id` / `context_hash` / `base_revision` **逐字**回传给提案工具。
-3. **改全局只调 `propose_settings_patch`**；资源级改动只有在能力与工具都可用时才允许，
-   否则明确告知不可用——不拿全局提案去近似资源级请求（那会改错范围）。
-4. **提案只是 pending**。必须告诉用户 digest、逐项 changes、作用域、过期时间，并说明
-   "尚未应用"；审批只能在 Haven UI 里由本人完成。用户说"直接应用"时**仍然拒绝绕过 UI**。
-5. **不读不回显** API key / `credentialRef` / 绝对路径 / 文件内容 / SQL / Provider 原始响应；
-   不做 `metadata_patch` / `file_renames`；不从模型名猜能力；MCP 断开时给安全的手动路径。
-6. **不声称"已应用"**。本 Skill 没有读取回执的能力，因此它连"刚才那次批准成功了"都
-   无法确认；在存在独立的 Receipt 读取事实之前，只描述到 `pending` 为止。
+只有启用且 instructions_hash 与当前原生投影一致的技能生效。
+摘要变化时状态为 stale，需要用户重新确认；禁用是幂等状态更新，不是删除。
+IPC 只引用 skill id，不接受任意路径或远程正文。
 
-这条边界是**可执行的**，不是口号：`tools/skills/skill-contract-check.py` 会校验
+### 6.3 外部分发
 
-- frontmatter 形状、`SKILL.md` 行数上限；
-- `evals/evals.json` 可解析、`skill_name` 与 frontmatter 一致、eval 数量与字段完整；
-- 技能包里出现的每个"像工具名"的标识符都必须在 MCP 冻结的 9 项里（清单**从
-  `mcp/haven-mcp/src/constants.ts` 现读**，不另抄一份）；
-- 白名单之外的工具名只允许出现在**禁止语境**里（该行含否定标记），
-  因此"❌ 做 `metadata_patch`"合法，而"调用 `apply_settings`"会被抓住。
+技能 zip 与源码内容逐字节一致，manifest 标明版本、文件摘要及面向的工具清单。
+技能包安装由用户管理；Haven 不写客户端 Skill 目录。
+用户主动触发的 MCP 连接配置是另一项独立能力，其窄化边界见传输文档。
 
----
+### 6.4 预览与生产
 
-## 7. 出站 HTTP 安全约束（Provider 模型发现）
+浏览器 Mock 和开发预览必须明确标识，不得替代真实持久化、模型请求或能力。
+生产技能启用经 typed IPC 写入权威状态；建议生成消费同一份启用记录。
 
-Provider 的模型发现是当前唯一由用户配置端点的出站请求，必须复用项目既有约束：
-
-- **URL 语法**：只接受 `http` / `https`；拒绝 userinfo（`user:pass@`）、fragment、
-  显式空端口、单标签主机（`localhost`、`media`、`*.local`、`*.internal`）、
-  非公网字面 IP（回环、私网、链路本地、CGNAT、文档网段等）。
-- **端口**：仅 `80 / 443 / 8080 / 8443`（外加 `film-tv-fixture` feature 下
-  字面 `127.0.0.1` 的临时端口，仅编译期开启，仅测试用）。
-- **DNS**：每次请求重新解析，任一解析结果非公网即整体拒绝（fail closed，不做"取第一条
-  公网地址"的降级）；解析结果通过 `resolve_to_addrs` 固定到连接上。
-- **重定向**：关闭。手动跟随的调用方必须对每一跳重新走完整策略。
-- **不静默发现**：不做 mDNS / SSDP / 局域网扫描来"找" Provider；端点只能来自用户显式配置。
-
-**已记录的决策（与需求的冲突点）**：
-
-需求希望"沿用项目的 HTTP 安全约束，同时不能静默发现局域网目标"。当前共享策略
-（`HttpUrlPolicy`）**同时拒绝**显式配置的回环/私网端点。这意味着第一版**不支持**
-`http://127.0.0.1:11434/v1` 这类本机运行时端点。我们选择**保留现有安全边界**而不是
-为本切片放宽它：
-
-- 放宽需要新的 ADR（明确"用户显式配置的私网端点"这一类别、其提示 UI、以及它与 SSRF
-  防护的关系），而不是在 AI 切片里顺手打开。
-- 现有代码里唯一的回环例外是编译期 feature（`film-tv-fixture`），它是测试夹具，不是
-  产品能力；复用它会让"测试路径"变成"生产后门"。
-- 因此本切片新增 `HttpUrlPolicy::AiProviderEndpoint` 变体，语义与 `SourceEndpoint`
-  一致，只是把上下文显式化，防止未来某个上下文被放宽时被另一个悄悄继承。
-
----
-
-## 8. 模型与能力（诚实原则）
-
-- 模型目录**只能**来自 Provider 的兼容 `/models` 响应。任何"内置候选模型名"都是伪造。
-- **不通过模型名猜测能力**。`gpt-4o` / `*-vision` / `text-embedding-*` 这类名字
-  **不**构成 vision / embedding / chat 的证据。
-- 能力字段是三态闭合集合：`supported` / `unsupported` / `unknown`。第三方响应缺字段时
-  一律 `unknown`，UI 显示"未声明"，不得显示为"不支持"或"支持"。
-- endpoint 已带 `/v1` 时不重复拼接；已以 `/models` 结尾时不再追加。
-- 未配置密钥 / profile 被禁用 / 目录为空 → 返回**空目录 + 明确 state**，不是错误，
-  也不是假模型。
-- 网络失败 / 非 2xx / 响应非法 → 返回**稳定可行动 ErrorDto**，不吞错、不伪造模型。
-
----
-
-## 8.1 Provider Structured Outputs（A7，已落地）
-
-设置建议不是自由文本到 JSON 的解析捷径，而是一条受限的 typed 端口：
+### 6.5 受众投影
 
 ```text
-AiProviderProfileService
-  → profile enabled / CredentialStore / selected_model_id
-  → /models 目录中同 id 且 chat == Supported
-  → AgentSettingsIpcService.context()（authoritative 快照）
-  → AiSettingsRecommendationPort
-  → OpenAiCompatibleSettingsRecommender
-       /chat/completions + response_format=json_schema + strict=true
-  → AiSettingsRecommendation（只含 ReadingPatch + 有界 explanation）
-  → AgentSettingsIpcService.create_proposal()
-  → pending Proposal
+<!-- haven:audience=native --> … <!-- /haven:audience -->
+<!-- haven:audience=external --> … <!-- /haven:audience -->
 ```
 
-硬规则：
+标记外正文共用。frontmatter 是元数据，不进入正文投影或 instructions_hash。
+未知受众、嵌套、未闭合、多余闭合或非规范标记均在加载时拒绝。
+原生投影不含外部 MCP 工具说明，外部分发保留整份文件。
 
-1. 没有 enabled profile、凭据、selected model 或显式 `chat=Supported` 时，不发起模型请求；
-   不内置、不猜测 `gpt-4o` 或任何其它模型名。
-2. Provider 端口不能创建 Proposal、批准、Apply 或 Receipt；Proposal 只能由 Haven
-   Application service 创建，因此 digest 仍由 Rust canonical JSON + SHA-256 生成。
-3. `context_id` / `context_hash` / `base_revision` 在调用 Provider 前后都绑定到
-   authoritative 设置上下文；过期上下文以 `AI_PROVIDER_SETTINGS_CONTEXT_STALE` 失败，零写入。
-4. Structured Output 外层与 12 个阅读字段都要求 exact keys；未知字段、缺失字段、非法枚举、
-   超长解释或控制字符全部 fail-closed。响应正文、API key、endpoint 与 credential target
-   不进入错误、Proposal、wire 或日志。
-5. 本轮故意不接 AI 前端对话框、设置页聊天框或轨迹图；后端端口与 Proposal 领域能力先独立
-   可测，前端可以在后续按同一 typed 契约接线。
+原生模型没有工具，只返回 Provider 的 camelCase structured output；
+外部 MCP patch 使用自己的 snake_case 契约。投影只转换说明文字，不转换字段协议。
+摘要绑定原生投影：改共用/原生正文使启用失效，仅改元数据或外部正文不使其失效。
 
-资源级 Agent patch 同样遵守这条边界：Provider 只能返回部分 patch，不能返回“已合并后的
-完整偏好”来冒充权威事实；合并、CAS、Receipt 都由 Haven Application service 完成。
+### 6.6 请求消费者
 
----
+AiProviderProfileService 解析当前启用技能，将原生投影交给设置建议适配器的
+system 消息。前端只提交 profileId、用户目标和上下文锚点，不推断模型或拼接
+权威设置。无选中配置时失败；生产路径不能静默退回 Mock 模板。
 
-## 8.2 Agent Event / Trace（A8，已落地）
+## 7. 模型与能力
 
-后端提供 `AgentTracePort` 与有界内存 collector，事件类型是闭合集合：
+模型目录只来自 Provider 的兼容 models 响应，不能内置猜测候选名。
+能力为 supported/unsupported/unknown；缺字段即 unknown，不从模型名猜
+chat、vision 或 embedding。空目录、未配置和禁用各有明确状态；
+网络或非法响应返回稳定错误，不伪造目录。
 
-```text
-request_started → context_loaded → provider_request → provider_response
-→ structured_output_validated → proposal_created → waiting_for_approval
-→ approval_rejected | cas_started → applied → receipt_created
-```
+Settings Registry、Wire、Binding、持久化和运行时消费者必须指向同一份能力。
+页面视觉完整与编译成功都不能单独建立产品兼容性承诺。
 
-另外允许 `cancelled` / `retrying` / `failed` 作为终止或重试事件。每条事件只绑定：
-`session_id`、`request_id`、`context_id`、`context_hash`、服务端分配的 `sequence`、
-可选 `duration_ms` 与时间戳。collector 按会话最多保留 256 条，拒绝调用方伪造序号，
-不接受自由文本，因此轨迹不是 Provider 原文、聊天历史或权限通道。
+## 8. 事件与安全回归
 
-目前它是后端 typed 基础与测试替身，尚未接入 AI 前端展示；未来 UI 必须消费同一组事件，
-不能重新引入 raw response、secret、绝对路径、SQL 或正文。
+AgentTracePort 使用闭合事件、服务端 sequence、上下文关联和有界 collector。
+事件不是 Provider 原文、聊天历史或权限通道；不得附带 secret、路径、SQL 或正文。
 
----
-
-## 9. 验收门禁
-
-任何 AI 相关改动合并前必须全部为真：
-
-| # | 门禁 | 证据 |
-| --- | --- | --- |
-| G1 | Provider 不写入 | 代码搜索：Provider 适配器不持有 repository / UoW / command 类型 |
-| G2 | 无自由调用入口 | `command-manifest.rs` 中不存在把任意 prompt/tool 直通的命令 |
-| G3 | secret 不出 wire | wire 生成物与 `Reflect.ownKeys` 兜底守卫测试；fixture 序列化断言 |
-| G4 | secret 只走 CredentialStore | `haven:ai:<profile-id>` 命名空间单测 + 普通存储/日志断言 |
-| G5 | 命令清单单一事实源 | `capability_consistency.rs`：`TARGET_PERMISSIONS` == 生成 ACL == `capabilities/main.json` |
-| G6 | wire 生成物无漂移 | `wire_bindings_consistency.rs` + `cargo run -p haven-application --example gen_wire_bindings` |
-| G7 | 模型能力不猜 | 单测：只有名字、没有能力字段的模型 → `unknown` |
-| G8 | 无可用模型诚实 | 单测 + Mock fixture：未配置/禁用/空目录 → 空目录 + `无可用模型` |
-| G9 | profile 删除清理凭据 | 单测：删除后 `credential_status` 为未配置；凭据删除失败时中止 |
-| G10 | 出站 URL 策略 | 单测：私网 / 单标签 / 非 http(s) / userinfo / 超范围端口全部拒绝 |
-| G11 | CAS 有效 | 单测：过期 revision 更新返回冲突且零写入 |
-| G12 | 文档同步 | 本文件与阶段计划描述的状态与代码一致 |
-| G13 | MCP 无写入工具 | `mcp/haven-mcp/test/tools.test.ts`：注册结果 == 冻结 9 项；工具名禁用词根扫描 |
-| G14 | MCP 桥接 fail-closed | `bridge-selection.test.ts` + `stdio-e2e.test.ts` + `local-broker.test.ts`：`fixture` 与未知取值拒绝启动；`live` 缺端点时显式不可用、端点非法时 `HAVEN_MCP_ENDPOINT_INVALID` 且**不尝试连接**；绝不静默降级成"已接通" |
-| G15 | MCP 只读零写入 | 工具层与端口层各一轮：调用全部只读工具后写入计数为 0 |
-| G16 | MCP 输出脱敏且有界 | 泄漏夹具 + 逐字段断言；单字段 512 / 列表 50 / 整份 24 000 字符上限 |
-| G17 | MCP 文本与结构化同源 | json 格式 `JSON.parse(text)` 深度相等；markdown 覆盖全部标量 |
-| G18 | MCP stdout 洁净 | 真实子进程端到端：stdout 每行都是 JSON-RPC，日志只在 stderr |
-| G19 | Skill 不越权 | `tools/skills/skill-contract-check.py`：工具名只来自 MCP 冻结 9 项；白名单外的工具名仅允许出现在禁止语境；evals 与 frontmatter 一致；`SKILL.md` < 500 行 |
-| G20 | Agent 资源 Patch 与审计脱敏 | Domain `apply_patch` 单测 + Application/Infrastructure 资源审批单测：部分 patch 不覆盖未请求字段；CAS 冲突零写入；Agent Proposal / Receipt 不泄漏 authoritative 路径或 endpoint |
-
----
-
-## 10. 阶段划分
-
-| 阶段 | 内容 | 状态 |
-| --- | --- | --- |
-| **A1** | 设置智能体闭环：Proposal → canonical JSON → SHA-256 → Diff → 批准 → CAS/Apply → Receipt | **已落地** |
-| **A2** | AI Provider Profile 基础切片：profile 持久化 + 凭据引用 + 模型发现 + Typed IPC + 设置页接线 | **已落地** |
-| **A3** | MCP 协议面 + Typed Bridge 端口：9 个冻结工具、strict schema、脱敏/有界/同源响应、显式不可用桥接 | **已落地** |
-| **A4** | 正式 Skill：`skills/haven-agent-proposal` 行为协议 + 契约校验与 evals | **已落地** |
-| **A5** | MCP 运行时传输适配器：把端口接到运行中的 Haven（认证/来源、生命周期、能力协商）——设计已冻结，见 [`MCP_EXTERNAL_AGENT_TRANSPORT.md`](./MCP_EXTERNAL_AGENT_TRANSPORT.md)，拆分见计划 A5.1–A5.8 | **核心已落地，未验收**：Rust Broker（A5.1–A5.4）、Windows 命名管道（A5.2）、Tauri 接线与设置页「外部 Agent 接入」分组、Node live 适配器（A5.5）与四客户端 `verified: false` 配置夹具（A5.6）均已实现并有契约测试；Unix 侧未编译验证，四客户端 / 真机 UI / 端到端均未验收 |
-| **A6** | 将 9 个 MCP 工具全部接入 Haven 后端（library summary / media capabilities / onboarding / setting sources / 资源偏好读与提案等） | **已落地**；真实数据库数据与端到端尚未验收 |
-| **A7** | Provider Structured Output 生成 typed 设置建议并接进 A1 Proposal 路径（仍无 Apply 权限） | **已落地**；无 profile / 凭据 / 选中模型 / 显式 chat 能力时诚实失败 |
-| **A8** | Agent Event / Trace typed 基础（闭合事件、上下文绑定、序号与上限） | **已落地**；本轮暂不接 AI 前端轨迹 UI |
-
-仍**不含**：Python sidecar、PydanticAI、完整 Agent runtime、MCP 的任何写入/审批工具、
-`metadata_patch` / `file_renames`、任何自动 Apply，以及任何给 Skill 的额外权限。
-
-**A3 + A4 + A5 合起来的边界必须说清楚**：MCP 的**协议面**、**桥接端口**与**行为协议 Skill**
-都已完成并冻结；A5 的运行时传输适配器（Rust Broker + Tauri 接线 + 设置页分组 + Node live
-适配器）也已实现，但它**默认关闭**，且**从未在真实客户端、真机或端到端链路上验收过**。
-9 个工具的后端路径现在均已实现；默认配置下它们仍可能因为 Broker 未开启或端点未配置
-返回 `HAVEN_BRIDGE_UNAVAILABLE`。**"链路上线"不等于"已完成真实客户端验收"，任何文档
-都不得把单元测试通过写成已接通生产 MCP。**
-Skill 的价值在于：在这些不可用的前提下，模型也会**如实说明**并给出安全的手动路径，
-而不是编造数据或绕过审批。
+相关测试分别覆盖 canonical digest、批准/CAS/Receipt、资源部分 patch、
+凭据脱敏、模型能力、命令/ACL/Wire 一致性、MCP strict schema 与取消、
+Skill 解析/投影/摘要及其真实请求消费者。
+自动化、交互运行和发行产物验证的范围分别记录，不能互相替代。

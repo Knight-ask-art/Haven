@@ -163,3 +163,52 @@ describe("测试替身不进入生产模块图", () => {
     expect(testOnly).toContain("class FixtureHavenAgentBridge");
   });
 });
+
+/**
+ * `engines.node` 必须说得出**真实**的最低版本。
+ *
+ * 曾经写着 `>=20`，而锁定的 vitest 5 只支持 `^22.12.0 || ^24.0.0 || >=26.0.0`：
+ * 照着 `package.json` 准备 Node 20 环境的人能装完，然后在 `npm test` 上撞墙——声明比
+ * 工具链宽松，是"文档说可以、实际不行"的那一类缺陷，只能靠对着锁文件断言来防。
+ */
+describe("包声明的 Node 版本与锁定的工具链一致", () => {
+  const packageJson = JSON.parse(
+    readFileSync(path.join(PACKAGE_ROOT, "package.json"), "utf8"),
+  ) as { engines?: { node?: string } };
+  const lock = JSON.parse(
+    readFileSync(path.join(PACKAGE_ROOT, "package-lock.json"), "utf8"),
+  ) as { packages: Record<string, { engines?: { node?: string } } | undefined> };
+
+  /**
+   * 从一个 semver 范围里取出"允许的最低版本"。
+   *
+   * 这里出现的范围只有 `>=x.y.z` 与 `^x.y.z || …` 两种形态，两者的最低允许版本都是
+   * 文本里第一个完整的 `x.y.z`，不需要引入 semver 依赖。
+   */
+  function lowestVersion(range: string): [number, number, number] {
+    const match = /(\d+)\.(\d+)\.(\d+)/.exec(range);
+    if (match === null) throw new Error(`无法从范围里读出最低版本：${range}`);
+    return [Number(match[1]), Number(match[2]), Number(match[3])];
+  }
+
+  function asNumber([major, minor, patch]: [number, number, number]): number {
+    return major * 1_000_000 + minor * 1_000 + patch;
+  }
+
+  it("声明的最低 Node 版本不低于锁定工具链的最低版本", () => {
+    const declared = packageJson.engines?.node;
+    expect(declared, "package.json 必须声明 engines.node").toBeTruthy();
+    const locked = lock.packages["node_modules/vitest"]?.engines?.node;
+    expect(locked, "锁文件里必须有 vitest 的 engines.node").toBeTruthy();
+    expect(
+      asNumber(lowestVersion(declared as string)),
+      `engines.node=${declared} 比锁定的 vitest（${locked}）宽松`,
+    ).toBeGreaterThanOrEqual(asNumber(lowestVersion(locked as string)));
+  });
+
+  it("锁文件的根条目与 package.json 的 engines 逐字一致", () => {
+    // npm 会把根 package.json 的 engines 镜像进 lock 的 `""` 条目；两处不一致时下一次
+    // `npm install` 会静默改写其中一处，于是声明与实现对不上。
+    expect(lock.packages[""]?.engines?.node).toBe(packageJson.engines?.node);
+  });
+});

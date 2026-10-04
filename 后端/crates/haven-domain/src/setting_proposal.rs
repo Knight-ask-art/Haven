@@ -711,10 +711,18 @@ pub fn canonical_json_of<T: Serialize + ?Sized>(value: &T) -> Result<String, App
 
 /// canonical JSON 的 SHA-256 小写十六进制摘要。
 pub fn canonical_digest(canonical_json: &str) -> String {
-    Sha256::digest(canonical_json.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    lower_hex(&Sha256::digest(canonical_json.as_bytes()))
+}
+
+/// 将摘要字节编码为小写十六进制，避免依赖 Digest 输出类型的格式化实现。
+pub(crate) fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[(byte >> 4) as usize]));
+        encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+    encoded
 }
 
 /// 摘要的严格形状：恰好 64 个 ASCII **小写**十六进制字符。

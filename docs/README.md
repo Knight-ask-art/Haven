@@ -5,84 +5,58 @@ status: active
 owner: repository-steward
 visibility: public
 source_of_truth: documentation-system
-last_reviewed: 2026-09-20
-review_after: 2026-12-20
+last_reviewed: 2026-10-04
+review_after: 2027-01-04
 ---
 
 # Haven Documentation
 
-This is the public documentation entrypoint for Haven (栖阅). The directory
-uses semantic names rather than numeric ordering. `docs/README.md` is the
-navigation map; it is not a second product specification.
+This is the public documentation entrypoint for Haven (栖阅). It covers the
+product, technical contracts and contributor guidance; it is not a second
+product specification.
 
 ## Start here
 
-1. [Source of Truth](SOURCE_OF_TRUTH.md): stable product scope, boundaries and
-   authority rules.
-2. [Architecture Roadmap](ARCHITECTURE_ROADMAP.md): the architecture map and
-   staged documentation migration.
-3. [Task Workflow](TASK_WORKFLOW.md): the Vibe Coding loop from intent to
-   verified merge.
-4. [Documentation System](engineering/documentation-system.md): document
-   ownership, lifecycle, visibility and freshness.
-5. [Git and Worktrees](engineering/git-worktree-and-commits.md): safe isolation,
-   commit discipline and cleanup.
-6. [Testing and Evidence](engineering/testing-and-evidence.md): what each kind
-   of validation can and cannot prove.
-7. [Documentation Migration](engineering/documentation-migration.md): the
-   inventory and treatment of legacy plans, reviews and internal material.
-8. [Plan Archive Index](plans/README.md) and
-   [Review Evidence Index](reviews/README.md): public lifecycle maps for
-   internal historical records.
+1. [Source of Truth](SOURCE_OF_TRUTH.md): product boundaries and technical authority.
+2. [Architecture Roadmap](ARCHITECTURE_ROADMAP.md): runtime layers and design constraints.
+3. [Engineering Change Workflow](TASK_WORKFLOW.md): scope, implementation, tests, review and integration.
+4. [Contributing](engineering/contributing.md): contributor, reviewer and maintainer responsibilities.
+5. [Documentation System](engineering/documentation-system.md): ownership, lifecycle and publication rules.
+6. [Testing and Evidence](engineering/testing-and-evidence.md): validation scope and evidence quality.
+7. [Release and Rollback](operations/release-and-rollback.md): signed delivery and recovery.
 
 ## Areas
 
 | Area | Purpose | Entry point |
 | --- | --- | --- |
-| Product | Scope, content model and product boundaries | [product](product/README.md) |
-| Architecture | Frontend, backend, IPC, storage and media boundaries | [architecture](architecture/README.md) |
-| Engineering | Development, testing, dependencies and documentation rules | [engineering](engineering/README.md) |
-| Design | Design system, accessibility and Figma boundaries | [design](design/README.md) |
+| Product | Scope, content model and user-facing boundaries | [product](product/README.md) |
+| Architecture | Frontend, backend, IPC, storage, media and product AI/MCP contracts | [architecture](architecture/README.md) |
+| Engineering | Contributing, tests, dependencies and documentation | [engineering](engineering/README.md) |
+| Design | Design system, accessibility and presentation | [design](design/README.md) |
 | Operations | GitHub, CI, release, rollback and incidents | [operations](operations/README.md) |
-| Agents | Engineering-agent roles, Claude Code and handoffs | [agents](agents/README.md) |
-| Decisions | Accepted long-lived architectural decisions | [decisions](decisions/README.md) |
+| Decisions | Accepted architectural decisions | [decisions](decisions/README.md) |
 | Reference | Terminology and generated references | [reference](reference/README.md) |
-| Work | Task workflow and the status-ledger transition | [work](work/README.md) |
+| Work | Public issue and pull-request status | [work](work/README.md) |
 
-## Document planes
+## Public documentation boundary
 
-The public repository contains stable, non-sensitive engineering and product
-documentation. Internal reviews, raw diagnostics, worktree inventories and
-environment-specific evidence belong in the private engineering workspace.
+Publish durable product behavior, architecture, security constraints and
+general contributor guidance. Haven's own AI/MCP interfaces are product
+contracts and may be documented here.
 
-The existing locations remain available during migration:
+Developer-tool operating procedures, orchestration prompts, session-management
+instructions, private inventories and raw diagnostics are not public
+documentation. Neither their contents nor their per-file catalogs belong in
+public indexes. Preserve needed originals privately.
 
-| Existing location | Current role | Target treatment |
-| --- | --- | --- |
-| `plan/` | Local planning and current implementation ledger | Migrate stable facts; keep one live ledger until explicit cutover |
-| `docs/plans/` | Public lifecycle index plus internal dated plans | Promote durable decisions; never execute a stale baseline |
-| `docs/reviews/` | Public evidence index plus internal review records | Keep raw evidence append-only; never treat it as current capability truth |
-| `docs/superpowers/` | Internal legacy execution material | Keep all material private; extract durable decisions selectively and register local records in the migration map |
-| `docs/internal/` and `docs/private/` | Local-only material | Never publish |
+Never publish secrets, tokens, cookies, signed URLs, user data or machine-local
+paths. Capability claims must follow real contracts, bindings and consumers;
+a plan, design or historical test result cannot prove current behavior.
+Generated documents identify their generator and must not be hand-edited.
 
-No document is removed merely because a newer document exists. A migration map,
-link update and explicit cleanup decision are required.
+## Checks
 
-## Public documentation rules
-
-- Do not include secrets, tokens, cookies, signed URLs, user data, absolute
-  local paths or raw diagnostic bundles.
-- Claims about current capability must link to code, a contract, a Registry,
-  tests or runtime evidence.
-- Historical review evidence must include its commit/date boundary and must not
-  be presented as proof for a different HEAD.
-- Generated documents identify their generator and are never hand-edited.
-- New documents use the metadata fields defined in
-  [Documentation System](engineering/documentation-system.md).
-
-## Local check
-
-From the repository root, run both checks:
+From the repository root:
 
 ```text
 python tools/docs/check.py
@@ -91,10 +65,8 @@ python tools/release/public-snapshot-check.py
 python tools/release/public-snapshot-check.test.py
 ```
 
-The documentation checker validates curated public content and, when local
-legacy directories exist, checks that every record is named in its lifecycle
-register. The snapshot checker reads Git's tracked index, so a newly authored
-required public file can pass the first check and still fail the second until
-it is tracked; arbitrary untracked files are outside both public surfaces.
-Before a commit, also run
-`git diff --cached --check` on the exact staged allowlist.
+These checks validate the public documentation and tracked publication tree.
+Before committing, review the exact staged paths and run
+`git diff --cached --check`. Publication policy and migration guidance are in
+[Documentation System](engineering/documentation-system.md) and
+[Documentation Migration](engineering/documentation-migration.md).

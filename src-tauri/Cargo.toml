@@ -1,6 +1,6 @@
 [package]
 name = "haven-tauri"
-version = "0.1.0-beta.1"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 description = "栖阅 Haven Tauri 壳（IPC-TAURI-001A：library_list / favorite_set）"
@@ -26,9 +26,9 @@ tauri-build = { version = "2", features = [] }
 # tauri "test" feature（mock runtime）只在测试目标需要——移入 dev-dependencies，
 # 避免测试桩编译进 release 产物（审查 P3）。
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-tauri = "2"
+tauri = { version = "2", features = [] }
 tauri-plugin-window-state = "2"
-tauri-plugin-updater = "2.10.1"
+tauri-plugin-updater = "2.11.0"
 chrono = "0.4.45"
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
@@ -57,8 +57,9 @@ tokio = { version = "1.53.1", features = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# 仅 Windows：Named Pipe 的 DACL 收紧与读回断言。版本与 lockfile 中的 0.59.0 对齐，
-# 不引入新的 windows-sys 大版本。
+# 仅 Windows：Named Pipe 的 DACL 收紧与读回断言，以及用系统 API ShellExecuteW 打开默认
+# 浏览器（`Win32_UI_Shell` / `Win32_UI_WindowsAndMessaging`，不经过 cmd / PowerShell）。
+# 版本与 lockfile 中的 0.59.0 对齐：只加 feature，不引入新的 windows-sys 包。
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59.0", features = [
     "Win32_Foundation",
@@ -67,9 +68,13 @@ windows-sys = { version = "0.59.0", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Pipes",
     "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }
 tempfile = "3.27.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+base64 = "0.22.1"
+minisign-verify = "0.2.5"

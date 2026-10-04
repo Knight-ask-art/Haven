@@ -1,5 +1,5 @@
 import { createElement, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
-import type { KeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode } from "react"
+import type { CSSProperties, KeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode } from "react"
 import { useNavigate, useParams } from "react-router"
 import {
   ArrowLeft,
@@ -49,7 +49,7 @@ import {
 import { PdfReader } from "../components/PdfReader"
 import { PDF_RANGE_CHUNK_SIZE, type PdfSessionSource } from "../lib/pdf-document"
 import { useReadingSettings } from "../lib/use-reading-settings"
-import { resolveReadingPresentation } from "../lib/reading-settings-mapping"
+import { READING_FONT_CLASSES, READING_THEME_PRESENTATION, resolveReadingCustomAppearance, resolveReadingCustomRender, resolveReadingPresentation } from "../lib/reading-settings-mapping"
 import { articleMarkerLocator, createMarker, deleteMarker, listMarkers } from "@/features/markers/ipc/marker-gateway"
 import type { MarkerDto, TextAnchorDto } from "@/lib/ipc/generated/wire"
 import {
@@ -304,6 +304,10 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
   const readingSettingsAppliedRef = useRef(false)
   const readingSettingsTouchedRef = useRef(false)
   const readingLayout = resolveReadingPresentation(readingSettings, false)
+  // 自定义外观的取值来自设置，但 theme/font 以会话内状态为准（阅读器工具栏允许临时
+  // 切换），所以这里只固定设置侧的校验结果，渲染值在下面按当前状态组合；设置读取
+  // 失败时读的是安全默认值，校验后自然是「未设置」。
+  const readingCustomAppearance = useMemo(() => resolveReadingCustomAppearance(readingSettings), [readingSettings])
   // scroll 监听是空依赖 effect；用 ref 读取最新 activeHeading 作为 blockId。
   const activeHeadingRef = useRef(demoRuntime ? DEMO_OUTLINE[0].id : "")
 
@@ -347,24 +351,23 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
     : null
   const pdfSource = contentState.status === "pdf_ready" && contentMatchesSession ? contentState.source : null
 
-  const isDark = theme === "slate" || theme === "dark" || theme === "custom"
-  const themeClass = {
-    paper: "bg-[#fbfbfb] text-[#242426]",
-    warm: "bg-[#f4eee1] text-[#3b3226]",
-    slate: "bg-[#25262a] text-[#e1e2e6]",
-    dark: "bg-[#0e0f12] text-[#d4d5d9]",
-    sepia: "bg-[#f4ecd8] text-[#5b4636]",
-    eyeCare: "bg-[#cce8cc] text-[#2e4a2e]",
-    custom: "bg-[#f4eee1] text-[#3b3226]",
-  }[theme]
-  const bodyFont = font === "serif"
-    ? "font-serif"
-    : font === "kai"
-      ? "font-serif italic"
-      : "font-sans"
+  const readingCustom = resolveReadingCustomRender(theme, font, readingCustomAppearance)
+  // 自定义的浅色背景同样要用浅色外壳：外壳明暗由实际背景亮度决定，不再把 custom
+  // 一律当成深色。
+  const isDark = readingCustom.darkShell
+  const themeClass = READING_THEME_PRESENTATION[theme].className
+  const bodyFont = READING_FONT_CLASSES[font]
   // 会话内排版工具调整优先于全局 Reading 初始值。
   const bodyLineHeight = lineHeight === "compact" ? 1.65 : lineHeight === "airy" ? 2.05 : 1.85
   const contentWidth = `${readingLayout.contentWidthPx}px`
+  // bodyFont 只有预设类名；选了自定义字体时用 inline style 叠加真实族名，字体名
+  // 未设置或未通过校验时不加这个属性，正文回落到预设类名。
+  const bodyStyle: CSSProperties = {
+    maxWidth: contentWidth,
+    fontSize: `${fontSize}px`,
+    lineHeight: bodyLineHeight,
+    ...(readingCustom.fontFamilyCss ? { fontFamily: readingCustom.fontFamilyCss } : {}),
+  }
 
   useEffect(() => {
     recordDemoArticleReaderHistory(clientMode, storageId, recordHistory)
@@ -1063,7 +1066,10 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
   }
 
   return (
-    <div className={cn("min-h-[100dvh] overflow-x-hidden transition-colors duration-500", themeClass)}>
+    <div
+      className={cn("min-h-[100dvh] overflow-x-hidden transition-colors duration-500", themeClass)}
+      style={readingCustom.colors ? { backgroundColor: readingCustom.colors.backgroundColor, color: readingCustom.colors.color } : undefined}
+    >
       <header className={cn(
         "fixed inset-x-0 top-0 z-50 flex h-[68px] items-center justify-between border-b px-5 backdrop-blur-2xl transition-opacity duration-500 sm:px-[32px]",
         isDark ? "border-white/10 bg-[#0e0f12]/80" : "border-black/[0.07] bg-white/75",
@@ -1144,7 +1150,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
           pdfProgressControllerRef.current?.locatorChange(locator)
         }} />}
         {contentReady && articleDocument && (
-          <article ref={articleRef} onClick={handleArticleHighlightClick} onMouseUp={handleSelection} onTouchEnd={handleSelection} className={cn("mx-auto w-full select-text", bodyFont)} style={{ maxWidth: contentWidth, fontSize: `${fontSize}px`, lineHeight: bodyLineHeight }}>
+          <article ref={articleRef} onClick={handleArticleHighlightClick} onMouseUp={handleSelection} onTouchEnd={handleSelection} className={cn("mx-auto w-full select-text", bodyFont)} style={bodyStyle}>
             <header className="border-b border-current/15 pb-[48px]">
               <p className="text-xs font-semibold uppercase tracking-[0.22em] text-primary">
                 {tauriRuntime ? "LOCAL ARTICLE" : "《Torto 架构专栏》 · 2026.08"}

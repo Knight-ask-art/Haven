@@ -190,8 +190,40 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../../../../migrations/044_agent_approval_tokens.sql"),
     ),
     (
-        "045_ai_provider_profiles",
-        include_str!("../../../../migrations/045_ai_provider_profiles.sql"),
+        "045_interface_font_assets",
+        include_str!("../../../../migrations/045_interface_font_assets.sql"),
+    ),
+    (
+        "045_appearance_foundation",
+        include_str!("../../../../migrations/045_appearance_foundation.sql"),
+    ),
+    (
+        "046_appearance_layout_state",
+        include_str!("../../../../migrations/046_appearance_layout_state.sql"),
+    ),
+    (
+        "047_reading_activity",
+        include_str!("../../../../migrations/047_reading_activity.sql"),
+    ),
+    (
+        "048_overview_layout",
+        include_str!("../../../../migrations/048_overview_layout.sql"),
+    ),
+    (
+        "049_ai_provider_profiles",
+        include_str!("../../../../migrations/049_ai_provider_profiles.sql"),
+    ),
+    (
+        "050_agent_skills",
+        include_str!("../../../../migrations/050_agent_skills.sql"),
+    ),
+    (
+        "051_source_config_cache",
+        include_str!("../../../../migrations/051_source_config_cache.sql"),
+    ),
+    (
+        "052_cloud_drive_storage",
+        include_str!("../../../../migrations/052_cloud_drive_storage.sql"),
     ),
 ];
 
@@ -291,10 +323,7 @@ pub fn run(conn: &mut Connection) -> Result<(), AppError> {
 
 fn checksum(sql: &str) -> String {
     let normalized = sql.replace("\r\n", "\n");
-    Sha256::digest(normalized.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    crate::lower_hex(&Sha256::digest(normalized.as_bytes()))
 }
 
 fn db_err(msg: &'static str) -> impl Fn(rusqlite::Error) -> AppError {
@@ -436,6 +465,39 @@ mod tests {
             |row| row.get(0),
         )
         .ok()
+    }
+
+    /// 逐列读出全部设置行，用于断言迁移不改写既有设置事实。
+    fn settings_rows(conn: &Connection) -> Vec<(String, i64, String, String, i64)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT section, schema_version, revision, data_json, updated_at
+                 FROM settings ORDER BY section",
+            )
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    }
+
+    /// 按应用顺序读出全部迁移记录（version, checksum），用于断言只追加。
+    fn recorded_migrations(conn: &Connection) -> Vec<(String, String)> {
+        let mut stmt = conn
+            .prepare("SELECT version, checksum FROM schema_migrations ORDER BY rowid")
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
     }
 
     /// 阻塞 B（runner 成功路径）：真实 migration runner 从 legacy 005 升级——
@@ -2530,5 +2592,1163 @@ mod tests {
                 .unwrap();
             assert_eq!(remaining, 1, "删除目标后 {table} 的审计事实必须保留");
         }
+    }
+
+    #[test]
+    fn applies_ai_migrations_after_an_existing_048_database() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // 旧库停在 048：按版本名定位切点，而不是 `len() - 2`——后者在每次追加迁移后
+        // 都会悄悄改变「旧库停在哪一版」，让断言的语义随追加漂移。
+        let split = MIGRATIONS
+            .iter()
+            .position(|(version, _)| *version == "048_overview_layout")
+            .expect("迁移列表必须包含 048_overview_layout")
+            + 1;
+        apply_legacy_through(&mut conn, split);
+        let before = recorded_migrations(&conn);
+        assert_eq!(
+            before.last().map(|(version, _)| version.as_str()),
+            Some("048_overview_layout"),
+        );
+
+        run(&mut conn).unwrap();
+
+        let after = recorded_migrations(&conn);
+        assert_eq!(
+            &after[..before.len()],
+            before.as_slice(),
+            "已有 001-048 迁移记录必须原样保留",
+        );
+        assert_eq!(after.len(), before.len() + 4);
+        assert_eq!(
+            after[before.len()..]
+                .iter()
+                .map(|(version, _)| version.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "049_ai_provider_profiles",
+                "050_agent_skills",
+                "051_source_config_cache",
+                "052_cloud_drive_storage",
+            ],
+        );
+
+        for table in ["ai_provider_profiles", "agent_skill_states"] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "升级后必须创建 {table}");
+        }
+    }
+
+    /// 045 建立外观 Foundation 的两张规范化表：资产元数据按种类分档设上限，资产 ID
+    /// 只接受规范小写 UUID（永不接受路径或 URL），首页模块的集合/档位/坐标/唯一性
+    /// 全部落在数据库层；既有 settings 行逐列不变（只追加迁移，不改写 001..044）。
+    #[test]
+    fn migration_045_builds_appearance_foundation_without_touching_settings() {
+        // 045 的**发布形态** checksum（SHA-256 小写十六进制摘要）。与 011 的
+        // `LEGACY_011_CHECKSUM` 同一条约定：写成字面量，而不是
+        // `checksum(include_str!("...045..."))`——后者与被测对象同源，SQL 一旦被改写，
+        // 期望值会跟着一起变，测试永远是绿的，等于没有守住「已发布的迁移不得改写」。
+        // 字面量则相反：改 045 就必须显式改这个常量，而那正是「需要受控升级」的信号
+        // （已落库的库会因为 checksum 变化报 `MIGRATION_CHECKSUM_MISMATCH`）。
+        // 重新计算（runner 的 `checksum` 先把 CRLF 归一化成 LF，所以这里也必须归一化）：
+        //   tr -d '\r' < 后端/migrations/045_appearance_foundation.sql | sha256sum
+        const LEGACY_045_CHECKSUM: &str =
+            "b2a774d3d8b5995d9454651405711c9f142ee695880ebe80042ab70cba1e5e6d";
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_legacy_through(&mut conn, 44);
+        assert!(
+            recorded_checksum(&conn, "044_agent_approval_tokens").is_some(),
+            "045 之前必须有真实的 001..044 已应用记录"
+        );
+
+        // 代表性旧设置行：当前 appearance 形状，以及 b60661e 之前的五字段 reading 形状。
+        conn.execute(
+            "INSERT INTO settings (section, schema_version, revision, data_json, updated_at)
+             VALUES ('appearance', 1, 'legacy-appearance',
+                     '{\"section\":\"appearance\",\"theme\":\"system\",\"density\":\"comfortable\",\"sidebar\":\"auto\",\"reduceMotion\":false}', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO settings (section, schema_version, revision, data_json, updated_at)
+             VALUES ('reading', 1, 'legacy-reading',
+                     '{\"section\":\"reading\",\"fontFamily\":\"kai\",\"fontSize\":\"large\",\"lineHeight\":\"airy\",\"contentWidth\":\"wide\",\"theme\":\"dark\"}', 2)",
+            [],
+        )
+        .unwrap();
+        let checksum_044 = recorded_checksum(&conn, "044_agent_approval_tokens").unwrap();
+        let settings_before = settings_rows(&conn);
+        let migrations_before = recorded_migrations(&conn);
+
+        run(&mut conn).unwrap();
+
+        // 045 恰好一次，且 checksum 必须等于**发布形态**的字面量（断言见函数开头）。
+        let applied_checksums: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT checksum FROM schema_migrations
+                     WHERE version = '045_appearance_foundation'",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(applied_checksums.len(), 1, "045 必须恰好记录 1 条");
+        assert_eq!(
+            applied_checksums[0], LEGACY_045_CHECKSUM,
+            "045 checksum 必须与发布形态一致（不一致说明 045 的 SQL 被改写，需要受控升级）"
+        );
+
+        // append-only：044 的注册内容与既有设置行都不变。
+        assert_eq!(
+            recorded_checksum(&conn, "044_agent_approval_tokens").as_deref(),
+            Some(checksum_044.as_str()),
+            "045 不得改写 044 的注册内容"
+        );
+        assert_eq!(
+            settings_rows(&conn),
+            settings_before,
+            "045 不得改写任何既有设置行"
+        );
+
+        // 只追加：既有迁移记录逐行不变；新 AI 迁移使用 049、050，不能插入已发布的 045-048。
+        let migrations_after = recorded_migrations(&conn);
+        assert_eq!(
+            &migrations_after[..migrations_before.len()],
+            migrations_before.as_slice(),
+            "既有迁移记录必须逐行不变（只追加，不改写已发布迁移）"
+        );
+        assert_eq!(
+            migrations_after.len(),
+            migrations_before.len() + 9,
+            "只允许追加 045-048 外观/总览迁移、049、050 AI 迁移、051 来源配置缓存与 052 云盘存储"
+        );
+        assert_eq!(
+            migrations_after.last().map(|(version, _)| version.as_str()),
+            Some("052_cloud_drive_storage")
+        );
+        for expected in [
+            "045_interface_font_assets",
+            "045_appearance_foundation",
+            "046_appearance_layout_state",
+            "047_reading_activity",
+            "048_overview_layout",
+            "049_ai_provider_profiles",
+            "050_agent_skills",
+            "051_source_config_cache",
+            "052_cloud_drive_storage",
+        ] {
+            assert!(
+                recorded_checksum(&conn, expected).is_some(),
+                "缺少迁移记录 {expected}"
+            );
+        }
+
+        for table in [
+            "appearance_assets",
+            "appearance_home_modules",
+            "appearance_home_layout_meta",
+            "appearance_overview_modules",
+            "appearance_overview_layout_meta",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "缺少外观表 {table}");
+        }
+        let asset_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_appearance_assets_kind_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(asset_index, 1, "资产读取路径索引必须建立");
+        // 首页模块的排序键由 `UNIQUE (sort_order)` 自带的索引承担，不得再声明同列的
+        // `idx_appearance_home_modules_order`：那不会更安全，只会多一份写入/维护成本。
+        let duplicated_order_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_appearance_home_modules_order'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            duplicated_order_index, 0,
+            "sort_order 的唯一约束已经提供同列索引，不得再建重复索引"
+        );
+
+        let now = haven_common::UtcMillis::now().0;
+        let insert_asset = |conn: &Connection,
+                            id: &str,
+                            kind: &str,
+                            state: &str,
+                            byte_size: i64,
+                            display_name: Option<&str>| {
+            conn.execute(
+                "INSERT INTO appearance_assets
+                    (id, kind, validation_state, byte_size, display_name, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                params![id, kind, state, byte_size, display_name, now],
+            )
+        };
+
+        let font_max = haven_domain::MAX_FONT_BYTES as i64;
+        let static_max = haven_domain::MAX_STATIC_WALLPAPER_BYTES as i64;
+        let dynamic_max = haven_domain::MAX_DYNAMIC_WALLPAPER_BYTES as i64;
+        let display_name_max = haven_domain::MAX_ASSET_DISPLAY_NAME_CHARS;
+
+        insert_asset(
+            &conn,
+            "0196f0d2-0000-7000-8000-0000000a0001",
+            "font",
+            "validated",
+            font_max,
+            Some("思源宋体"),
+        )
+        .unwrap();
+
+        // 种类与校验状态是闭合集合。
+        assert!(
+            insert_asset(
+                &conn,
+                "0196f0d2-0000-7000-8000-0000000a0002",
+                "video",
+                "validated",
+                1,
+                None
+            )
+            .is_err(),
+            "未知资产种类必须拒绝"
+        );
+        assert!(
+            insert_asset(
+                &conn,
+                "0196f0d2-0000-7000-8000-0000000a0002",
+                "font",
+                "unknown",
+                1,
+                None
+            )
+            .is_err(),
+            "未知校验状态必须拒绝"
+        );
+        // 体积必须为正，且不得超过该种类上限（上限与领域常量一一对应）。
+        assert!(
+            insert_asset(
+                &conn,
+                "0196f0d2-0000-7000-8000-0000000a0002",
+                "font",
+                "pending",
+                0,
+                None
+            )
+            .is_err(),
+            "零字节资产必须拒绝"
+        );
+        assert!(
+            insert_asset(
+                &conn,
+                "0196f0d2-0000-7000-8000-0000000a0002",
+                "font",
+                "pending",
+                -1,
+                None
+            )
+            .is_err(),
+            "负体积必须拒绝"
+        );
+        assert!(
+            insert_asset(
+                &conn,
+                "0196f0d2-0000-7000-8000-0000000a0002",
+                "font",
+                "pending",
+                font_max + 1,
+                None
+            )
+            .is_err(),
+            "字体超出上限必须拒绝"
+        );
+        assert!(
+            insert_asset(
+                &conn,
+                "0196f0d2-0000-7000-8000-0000000a0002",
+                "static_wallpaper",
+                "pending",
+                static_max + 1,
+                None
+            )
+            .is_err(),
+            "静态壁纸不得使用动态壁纸的上限"
+        );
+        insert_asset(
+            &conn,
+            "0196f0d2-0000-7000-8000-0000000a0002",
+            "static_wallpaper",
+            "pending",
+            static_max,
+            None,
+        )
+        .unwrap();
+        // 动态壁纸的上限本身可接受，但 max+1 必须拒绝：上限是边界，不是「更大就都行」。
+        assert!(
+            insert_asset(
+                &conn,
+                "0196f0d2-0000-7000-8000-0000000a0003",
+                "dynamic_wallpaper",
+                "pending",
+                dynamic_max + 1,
+                None
+            )
+            .is_err(),
+            "动态壁纸超出上限必须拒绝"
+        );
+        insert_asset(
+            &conn,
+            "0196f0d2-0000-7000-8000-0000000a0003",
+            "dynamic_wallpaper",
+            "validated",
+            dynamic_max,
+            None,
+        )
+        .unwrap();
+
+        // 资产 ID：不是路径或 URL，也不接受大写/无连字符 UUID；同一 ID 只能登记一次。
+        assert!(
+            insert_asset(&conn, "C:/assets/font.ttf", "font", "pending", 1, None).is_err(),
+            "资产 ID 不得是路径"
+        );
+        assert!(
+            insert_asset(
+                &conn,
+                "https://example.com/font.ttf",
+                "font",
+                "pending",
+                1,
+                None
+            )
+            .is_err(),
+            "资产 ID 不得是 URL"
+        );
+        assert!(
+            insert_asset(
+                &conn,
+                "0196F0D2-0000-7000-8000-0000000A0004",
+                "font",
+                "pending",
+                1,
+                None
+            )
+            .is_err(),
+            "大写 UUID 不是规范文本身份"
+        );
+        assert!(
+            insert_asset(
+                &conn,
+                "0196f0d20000700080000000a0004",
+                "font",
+                "pending",
+                1,
+                None
+            )
+            .is_err(),
+            "无连字符 UUID 不是规范文本身份"
+        );
+        assert!(
+            insert_asset(
+                &conn,
+                "0196f0d2-0000-7000-8000-0000000a0001",
+                "font",
+                "pending",
+                1,
+                None
+            )
+            .is_err(),
+            "同一资产 ID 不得重复登记"
+        );
+        // SQLite 不会为 TEXT 主键隐式加 NOT NULL：NULL 资产 ID 必须被显式约束拒绝。
+        assert!(
+            conn.execute(
+                "INSERT INTO appearance_assets
+                    (id, kind, validation_state, byte_size, display_name, created_at, updated_at)
+                 VALUES (NULL, 'font', 'pending', 1, NULL, 1, 1)",
+                [],
+            )
+            .is_err(),
+            "资产 ID 不得为空"
+        );
+
+        // 展示名：NULL 合法；未修剪、超长都不合法。
+        let max_len_name = "名".repeat(display_name_max);
+        insert_asset(
+            &conn,
+            "0196f0d2-0000-7000-8000-0000000a0005",
+            "font",
+            "pending",
+            1,
+            Some(max_len_name.as_str()),
+        )
+        .unwrap();
+        assert!(
+            insert_asset(
+                &conn,
+                "0196f0d2-0000-7000-8000-0000000a0006",
+                "font",
+                "pending",
+                1,
+                Some(" 名字 ")
+            )
+            .is_err(),
+            "未修剪的展示名不得入库"
+        );
+        assert!(
+            insert_asset(
+                &conn,
+                "0196f0d2-0000-7000-8000-0000000a0006",
+                "font",
+                "pending",
+                1,
+                Some("")
+            )
+            .is_err(),
+            "空展示名不得入库"
+        );
+        let too_long_name = "n".repeat(display_name_max + 1);
+        assert!(
+            insert_asset(
+                &conn,
+                "0196f0d2-0000-7000-8000-0000000a0006",
+                "font",
+                "pending",
+                1,
+                Some(too_long_name.as_str())
+            )
+            .is_err(),
+            "展示名超长必须拒绝"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO appearance_assets
+                    (id, kind, validation_state, byte_size, display_name, created_at, updated_at)
+                 VALUES ('0196f0d2-0000-7000-8000-0000000a0007', 'font', 'pending', 1, NULL, 10, 9)",
+                [],
+            )
+            .is_err(),
+            "updated_at 不得早于 created_at"
+        );
+
+        let insert_module = |conn: &Connection,
+                             module: &str,
+                             size: &str,
+                             row: i64,
+                             column: i64,
+                             order: i64,
+                             version: i64| {
+            conn.execute(
+                "INSERT INTO appearance_home_modules
+                    (module_id, size, row_index, column_index, sort_order, schema_version, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![module, size, row, column, order, version, now],
+            )
+        };
+
+        let grid_rows = haven_domain::HOME_LAYOUT_GRID_ROWS as i64;
+        let grid_columns = haven_domain::HOME_LAYOUT_GRID_COLUMNS as i64;
+        let max_modules = haven_domain::HOME_LAYOUT_MAX_MODULES as i64;
+
+        insert_module(&conn, "continue", "small", 0, 0, 0, 1).unwrap();
+
+        // 闭合集合：未知模块（含下划线写法）与未知档位都进不来；schema 版本同样闭合。
+        assert!(
+            insert_module(&conn, "trending", "small", 3, 0, 3, 1).is_err(),
+            "未知模块 ID 必须拒绝"
+        );
+        assert!(
+            insert_module(&conn, "shelf_favorites", "small", 3, 0, 3, 1).is_err(),
+            "下划线写法不是合法模块 ID"
+        );
+        assert!(
+            insert_module(&conn, "recently_added", "huge", 3, 0, 3, 1).is_err(),
+            "未知档位必须拒绝"
+        );
+        assert!(
+            insert_module(&conn, "recently_added", "small", 3, 0, 3, 2).is_err(),
+            "未知 schema 版本必须拒绝"
+        );
+        // 坐标与排序有界。
+        assert!(
+            insert_module(&conn, "recently_added", "small", grid_rows, 0, 3, 1).is_err(),
+            "越界行坐标必须拒绝"
+        );
+        assert!(
+            insert_module(&conn, "recently_added", "small", 3, grid_columns, 3, 1).is_err(),
+            "越界列坐标必须拒绝"
+        );
+        assert!(
+            insert_module(&conn, "recently_added", "small", 3, 0, max_modules, 1).is_err(),
+            "越界排序必须拒绝"
+        );
+        // 档位跨度不得越出右侧边界。
+        assert!(
+            insert_module(
+                &conn,
+                "shelf-favorites",
+                "medium",
+                4,
+                grid_columns - 1,
+                4,
+                1
+            )
+            .is_err(),
+            "medium 不得越出右侧边界"
+        );
+        assert!(
+            insert_module(&conn, "shelf-favorites", "large", 5, 1, 5, 1).is_err(),
+            "large 不得从非零列开始"
+        );
+        insert_module(&conn, "recently_added", "small", 1, grid_columns - 1, 1, 1).unwrap();
+        insert_module(&conn, "shelf-favorites", "large", 2, 0, 2, 1).unwrap();
+
+        // 模块唯一：同一模块不得出现在第二个位置（位置本身是空闲的）。
+        assert!(
+            insert_module(&conn, "continue", "small", 6, 0, 6, 1)
+                .expect_err("同一首页模块不得登记两次")
+                .to_string()
+                .contains("UNIQUE"),
+            "拒绝原因必须是模块唯一约束"
+        );
+        // 占格重叠：换一个模块也不能压在已占用的格子上（continue 占着 (0,0)）。
+        // 起始格相同只是重叠的一种情形；按档位跨度展开的真实判断见专门的测试。
+        conn.execute(
+            "DELETE FROM appearance_home_modules WHERE module_id = 'recently_added'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            insert_module(&conn, "recently_added", "medium", 0, 0, 1, 1)
+                .expect_err("占格重叠的模块不得登记")
+                .to_string()
+                .contains("must not overlap"),
+            "拒绝原因必须是占格重叠不变量（BEFORE 触发器先于唯一性检查执行）"
+        );
+
+        let layout_rows: Vec<(String, String, i64, i64, i64)> = conn
+            .prepare(
+                "SELECT module_id, size, row_index, column_index, sort_order
+                 FROM appearance_home_modules ORDER BY module_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            layout_rows,
+            vec![
+                ("continue".to_owned(), "small".to_owned(), 0, 0, 0),
+                ("shelf-favorites".to_owned(), "large".to_owned(), 2, 0, 2),
+            ],
+            "被拒绝的写入不得留下任何行"
+        );
+
+        // 只追加：重复 run 不重复应用，也不改写设置行。
+        run(&mut conn).unwrap();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            total as usize,
+            MIGRATIONS.len(),
+            "重复 run 不得重复应用 045"
+        );
+        assert_eq!(
+            settings_rows(&conn),
+            settings_before,
+            "重复 run 也不得改写既有设置行"
+        );
+    }
+
+    /// 045 的 `display_name` CHECK 必须与 haven-domain 的 `bounded_display_name`
+    /// 对同一组输入给出同一结论：首尾空白按 Unicode White_Space 全集修剪（与 Rust
+    /// `str::trim` 同一集合，SQLite 默认的 `trim(X)` 只去半角空格），控制字符覆盖
+    /// 0x00..0x1f 与 0x7f（与 `has_opaque_control_character` 同一集合），
+    /// 格式/双向控制字符覆盖 18 个码位（与 `has_display_name_format_control` 同一集合）。
+    /// 领域侧对应的钉住测试是 `display_name_trims_exactly_unicode_white_space`、
+    /// `display_name_rejects_c0_control_characters_and_del` 与
+    /// `display_name_rejects_format_and_bidi_control_characters`。
+    #[test]
+    fn migration_045_display_name_semantics_match_the_domain() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+
+        let now = haven_common::UtcMillis::now().0;
+        let mut next_id = 0u32;
+        let mut insert_name = |conn: &Connection, name: Option<&str>| {
+            next_id += 1;
+            let id = format!("0196f0d2-0000-7000-8000-{next_id:012x}");
+            conn.execute(
+                "INSERT INTO appearance_assets
+                    (id, kind, validation_state, byte_size, display_name, created_at, updated_at)
+                 VALUES (?1, 'font', 'pending', 1, ?2, ?3, ?3)",
+                params![id, name, now],
+            )
+        };
+        // 同一串文本也过一遍领域：两端要么都收、要么都拒，测试才有「同集合」的证据。
+        let domain_reads = |raw: &str| {
+            haven_domain::AppearanceAssetMetadata::new(
+                "0196f0d2-0000-7000-8000-0000000a0001"
+                    .parse::<haven_domain::AppearanceAssetId>()
+                    .unwrap(),
+                haven_domain::AppearanceAssetKind::Font,
+                haven_domain::AssetValidationState::Pending,
+                1,
+                Some(raw.to_owned()),
+            )
+        };
+
+        // Unicode White_Space 全集（与 haven-domain 的 UNICODE_WHITE_SPACE 逐项对应）。
+        const UNICODE_WHITE_SPACE: [u32; 25] = [
+            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20, 0x85, 0xa0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003,
+            0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f,
+            0x3000,
+        ];
+        // 格式/双向控制字符：与领域 `has_display_name_format_control` 逐项一致的 18 个
+        // 码位（零宽字符、双向嵌入/隔离、行/段分隔符、BOM）。它们不打印任何字形，却能让
+        // 两个不同的展示名在界面上渲染成同一串字，因此与 C0/DEL 一样任何位置都拒绝。
+        const FORMAT_CONTROLS: [u32; 18] = [
+            0x200b, 0x200c, 0x200d, 0x200e, 0x200f, // 零宽与双向标记
+            0x2028, 0x2029, // 行分隔符 / 段分隔符
+            0x202a, 0x202b, 0x202c, 0x202d, 0x202e, // 双向嵌入/覆盖
+            0x2060, // 无宽不换行
+            0x2066, 0x2067, 0x2068, 0x2069, // 双向隔离
+            0xfeff, // BOM / 零宽不换行
+        ];
+
+        for code_point in UNICODE_WHITE_SPACE {
+            let character = char::from_u32(code_point).unwrap();
+            // 首尾空白 = 未修剪，库侧只接受修剪后的形态。
+            assert!(
+                insert_name(
+                    &conn,
+                    Some(format!("{character}思源宋体{character}").as_str())
+                )
+                .is_err(),
+                "U+{code_point:04X} 作为首尾空白必须拒绝（落库只接受修剪后的形态）"
+            );
+            let interior = format!("思源{character}宋体");
+            if code_point <= 0x1f {
+                // 0x09..0x0d 同时属于 C0：它们在任何位置都被控制字符检查拒绝。
+                assert!(
+                    insert_name(&conn, Some(interior.as_str())).is_err(),
+                    "U+{code_point:04X} 是 C0，出现在中间同样必须拒绝"
+                );
+            } else if FORMAT_CONTROLS.contains(&code_point) {
+                // 0x2028/0x2029 同时属于格式字符：首尾只可能被 trim 掉（上面那条断言），
+                // 出现在中间则按格式字符拒绝——两端都只收修剪后的形态，结论一致。
+                assert!(
+                    insert_name(&conn, Some(interior.as_str())).is_err(),
+                    "U+{code_point:04X} 是格式字符，出现在中间必须拒绝"
+                );
+                assert!(
+                    domain_reads(&interior).is_err(),
+                    "领域必须与 SQL 同集合地拒绝中间的 U+{code_point:04X}"
+                );
+            } else {
+                assert!(
+                    insert_name(&conn, Some(interior.as_str())).is_ok(),
+                    "U+{code_point:04X} 只算首尾空白，中间位置不得被修剪"
+                );
+                assert!(
+                    domain_reads(&interior).is_ok(),
+                    "U+{code_point:04X} 在中间位置两端都必须照常接受"
+                );
+            }
+        }
+
+        // 与空白或控制字符「长得像」但不在任何拒绝清单里的码位：两端都必须原样保留
+        // （清单是精确的，不是「0x20xx 一律拒绝」）。
+        for code_point in [0x00ad, 0x180e, 0x2065, 0xfe00] {
+            let character = char::from_u32(code_point).unwrap();
+            let raw = format!("{character}名{character}");
+            assert!(
+                insert_name(&conn, Some(raw.as_str())).is_ok(),
+                "U+{code_point:04X} 不在任何拒绝清单里，不得被拒绝"
+            );
+            assert_eq!(
+                domain_reads(&raw)
+                    .unwrap_or_else(|e| panic!("领域同样不得拒绝 U+{code_point:04X}: {e}"))
+                    .display_name
+                    .as_deref(),
+                Some(raw.as_str()),
+                "U+{code_point:04X} 必须原样保留"
+            );
+        }
+
+        // 控制字符：C0（0x00..0x1f）与 DEL（0x7f）在任何位置都拒绝。
+        // 0x00 由 `instr(display_name, char(0))` 覆盖（GLOB 的字符类承载不了 NUL）。
+        for code_point in (0x00u32..=0x1f).chain(std::iter::once(0x7f)) {
+            let character = char::from_u32(code_point).unwrap();
+            for raw in [
+                format!("名{character}字"),
+                format!("{character}名"),
+                format!("名{character}"),
+            ] {
+                assert!(
+                    insert_name(&conn, Some(raw.as_str())).is_err(),
+                    "U+{code_point:04X} 不得入库：{raw:?}"
+                );
+            }
+        }
+
+        // 格式/双向控制字符逐项过两端。
+        for code_point in FORMAT_CONTROLS {
+            let character = char::from_u32(code_point).unwrap();
+            // 中间位置：两端都拒绝（修剪救不了它）。
+            let interior = format!("名{character}字");
+            assert!(
+                insert_name(&conn, Some(interior.as_str())).is_err(),
+                "U+{code_point:04X} 出现在中间时必须拒绝：{interior:?}"
+            );
+            assert!(
+                domain_reads(&interior).is_err(),
+                "领域必须与 SQL 同集合地拒绝中间的 U+{code_point:04X}"
+            );
+            // 首尾位置：SQL 只收修剪后的形态，所以原样形态一律拒绝；领域对同时是
+            // White_Space 的 0x2028/0x2029 只是修剪（`"\u{2028}名"` → `"名"`），
+            // 对其余 16 个码位才整段拒绝。
+            for edge in [format!("{character}名"), format!("名{character}")] {
+                assert!(
+                    insert_name(&conn, Some(edge.as_str())).is_err(),
+                    "未修剪的形态不得入库：{edge:?}"
+                );
+                if character.is_whitespace() {
+                    assert_eq!(
+                        domain_reads(&edge)
+                            .unwrap_or_else(|e| panic!("U+{code_point:04X} 在首尾只是被修剪: {e}"))
+                            .display_name
+                            .as_deref(),
+                        Some("名"),
+                        "U+{code_point:04X} 同时是 White_Space，首尾只被修剪"
+                    );
+                } else {
+                    assert!(
+                        domain_reads(&edge).is_err(),
+                        "U+{code_point:04X} 在首尾同样必须拒绝：{edge:?}"
+                    );
+                }
+            }
+        }
+
+        // 长度按码位计数（与领域的 `chars().count()` 一致，不是字节数）。
+        assert!(insert_name(&conn, Some("名".repeat(120).as_str())).is_ok());
+        assert!(
+            insert_name(&conn, Some("名".repeat(121).as_str())).is_err(),
+            "超出 120 个码位必须拒绝"
+        );
+        let long_emoji = "😀".repeat(120);
+        assert_eq!("😀".chars().count(), 1);
+        assert!(
+            insert_name(&conn, Some(long_emoji.as_str())).is_ok(),
+            "多字节码位必须按码位计数，不能按字节数拒绝"
+        );
+        assert!(
+            insert_name(&conn, Some("😀".repeat(121).as_str())).is_err(),
+            "121 个多字节码位必须拒绝"
+        );
+
+        // 库能存下的每个规范形态，领域都必须原样读回：不能出现「库里有、域读不了」
+        // （域在写入前已修剪，因此未修剪的形态只可能被 SQL 拒绝，不会造成漂移）。
+        let canonical: [&str; 6] = [
+            "思源宋体",
+            "思源 宋体",
+            "名\u{00a0}别 名",
+            "名\u{2065}字",
+            "混合 Latin 名称.txt",
+            long_emoji.as_str(),
+        ];
+        for (index, value) in canonical.iter().enumerate() {
+            let id = format!("0196f0d2-0000-7000-8000-{:012x}", 0xf00 + index);
+            conn.execute(
+                "INSERT INTO appearance_assets
+                    (id, kind, validation_state, byte_size, display_name, created_at, updated_at)
+                 VALUES (?1, 'font', 'pending', 1, ?2, ?3, ?3)",
+                params![id, value, now],
+            )
+            .unwrap_or_else(|e| panic!("规范展示名必须入库 {value:?}: {e}"));
+            let stored: String = conn
+                .query_row(
+                    "SELECT display_name FROM appearance_assets WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, *value, "落库文本不得被 SQLite 静默改写");
+            assert_eq!(
+                domain_reads(&stored)
+                    .unwrap_or_else(|e| panic!("领域必须能读回库里的展示名 {value:?}: {e}"))
+                    .display_name
+                    .as_deref(),
+                Some(*value),
+                "落库形态必须是领域修剪后的不动点"
+            );
+        }
+    }
+
+    /// 045 的 `UNIQUE (sort_order)`：并列排序号不得入库，否则领域侧承诺的稳定顺序
+    /// 在持久化后不再成立。领域侧对应的钉住测试是 `home_layout_rejects_duplicate_order`。
+    #[test]
+    fn migration_045_rejects_duplicate_home_module_order() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+
+        let now = haven_common::UtcMillis::now().0;
+        let insert_module = |conn: &Connection,
+                             module: &str,
+                             size: &str,
+                             row: i64,
+                             column: i64,
+                             order: i64| {
+            conn.execute(
+                    "INSERT INTO appearance_home_modules
+                        (module_id, size, row_index, column_index, sort_order, schema_version, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+                    params![module, size, row, column, order, now],
+                )
+        };
+
+        insert_module(&conn, "continue", "small", 0, 0, 0).unwrap();
+        insert_module(&conn, "recently_added", "small", 1, 0, 1).unwrap();
+
+        // 模块与网格位置都是空闲的，唯一冲突只可能来自 sort_order。
+        assert!(
+            insert_module(&conn, "shelf-favorites", "small", 5, 0, 1)
+                .expect_err("并列 sort_order 必须拒绝")
+                .to_string()
+                .contains("sort_order"),
+            "拒绝原因必须是 sort_order 唯一约束"
+        );
+        // 换一个空闲位置、重复另一个既有排序号：同样拒绝（位置不是拒绝原因）。
+        assert!(
+            insert_module(&conn, "shelf-favorites", "small", 6, 0, 0)
+                .expect_err("并列 sort_order 必须拒绝")
+                .to_string()
+                .contains("sort_order")
+        );
+
+        // 唯一排序号照常登记，读取顺序与 sort_order 一致。
+        insert_module(&conn, "shelf-favorites", "medium", 2, 0, 2).unwrap();
+        let orders: Vec<i64> = {
+            let mut stmt = conn
+                .prepare("SELECT sort_order FROM appearance_home_modules ORDER BY sort_order")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(orders, vec![0, 1, 2], "合法布局的顺序必须是全序");
+
+        // 被拒绝的写入不得留下任何行。
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM appearance_home_modules", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 3, "被拒绝的写入不得留下任何行");
+    }
+
+    /// 045 的占格重叠不变量：起始格不同也可能压在同一个格子上，所以拒绝必须按档位跨度
+    /// 展开后的**实际占格**判断，而不是只比较起始格。INSERT 与 UPDATE 两条写入路径都要
+    /// 守住，否则「移动模块 / 改档位」就能绕过它。领域侧对应
+    /// `home_layout_rejects_span_expanded_cell_overlap` 与
+    /// `placement_occupied_cells_expand_by_size_span`。
+    #[test]
+    fn migration_045_rejects_span_expanded_home_module_overlap() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+
+        let now = haven_common::UtcMillis::now().0;
+        let insert_module = |conn: &Connection,
+                             module: &str,
+                             size: &str,
+                             row: i64,
+                             column: i64,
+                             order: i64| {
+            conn.execute(
+                "INSERT INTO appearance_home_modules
+                    (module_id, size, row_index, column_index, sort_order, schema_version, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+                params![module, size, row, column, order, now],
+            )
+        };
+        let cells_of = |conn: &Connection, module: &str| -> (i64, i64, String) {
+            conn.query_row(
+                "SELECT row_index, column_index, size FROM appearance_home_modules
+                 WHERE module_id = ?1",
+                params![module],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+        };
+
+        // medium 从第 1 列开始占 (0,0)(0,1)：它的起始格是 (0,0)，第 2 列也属于它。
+        insert_module(&conn, "continue", "medium", 0, 0, 0).unwrap();
+        // 起始格不同（(0,1) 对 (0,0)），但第 2 列同时属于两者。
+        assert!(
+            insert_module(&conn, "recently_added", "small", 0, 1, 1)
+                .expect_err("起始格不同但占格重叠的模块不得登记")
+                .to_string()
+                .contains("must not overlap"),
+            "拒绝原因必须是占格重叠不变量"
+        );
+        // 换成不重叠的位置照常登记（只比较起始格的写法会在这里放过 (0,1)，所以这条不能少）。
+        insert_module(&conn, "recently_added", "small", 1, 1, 1).unwrap();
+        insert_module(&conn, "shelf-favorites", "large", 2, 0, 2).unwrap();
+
+        // UPDATE 路径：把模块挪到别人的格子上同样拒绝。
+        assert!(
+            conn.execute(
+                "UPDATE appearance_home_modules SET row_index = 0
+                 WHERE module_id = 'recently_added'",
+                [],
+            )
+            .expect_err("移动模块不得压到别的模块的格子上")
+            .to_string()
+            .contains("must not overlap"),
+            "拒绝原因必须是占格重叠不变量"
+        );
+        assert_eq!(
+            cells_of(&conn, "recently_added"),
+            (1, 1, "small".to_owned()),
+            "被拒绝的移动不得留下任何字段改动"
+        );
+
+        // 档位变更会扩大占格：medium 从第 3 列开始占 (0,2)(0,3)，与同行的 small 相邻而不
+        // 重叠，必须照常成功；换成同段 medium 则完全重叠，必须拒绝。
+        conn.execute(
+            "UPDATE appearance_home_modules SET size = 'medium', column_index = 2
+             WHERE module_id = 'recently_added'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            cells_of(&conn, "recently_added"),
+            (1, 2, "medium".to_owned())
+        );
+        assert!(
+            conn.execute(
+                "UPDATE appearance_home_modules SET row_index = 1, column_index = 2
+                 WHERE module_id = 'continue'",
+                [],
+            )
+            .expect_err("同段 medium 不得压在同一格上")
+            .to_string()
+            .contains("must not overlap")
+        );
+
+        // 被拒绝的写入不得留下任何行或字段改动。
+        let rows: Vec<(String, String, i64, i64, i64)> = conn
+            .prepare(
+                "SELECT module_id, size, row_index, column_index, sort_order
+                 FROM appearance_home_modules ORDER BY module_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("continue".to_owned(), "medium".to_owned(), 0, 0, 0),
+                ("recently_added".to_owned(), "medium".to_owned(), 1, 2, 1),
+                ("shelf-favorites".to_owned(), "large".to_owned(), 2, 0, 2),
+            ],
+            "被拒绝的写入不得留下任何行"
+        );
+    }
+
+    /// 048 的占格重叠不变量：与 045 同形，但网格换成**三列**、large 的跨度换成 3。
+    ///
+    /// 这条测试同时是「总览与首页不是同一张表」的证据：同样的 `large` 在首页占 4 列、
+    /// 在总览占 3 列，`column_index` 的合法上界也因此不同（2 而不是 3）。领域侧对应
+    /// `overview_layout_rejects_duplicates_positions_and_bad_versions` 与
+    /// `overview_placement_occupied_cells_expand_by_size_span`。
+    #[test]
+    fn migration_048_rejects_span_expanded_overview_module_overlap() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+
+        let now = haven_common::UtcMillis::now().0;
+        let insert_module = |conn: &Connection,
+                             module: &str,
+                             size: &str,
+                             row: i64,
+                             column: i64,
+                             order: i64| {
+            conn.execute(
+                "INSERT INTO appearance_overview_modules
+                    (module_id, size, row_index, column_index, sort_order, schema_version, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+                params![module, size, row, column, order, now],
+            )
+        };
+        let cells_of = |conn: &Connection, module: &str| -> (i64, i64, String) {
+            conn.query_row(
+                "SELECT row_index, column_index, size FROM appearance_overview_modules
+                 WHERE module_id = ?1",
+                params![module],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+        };
+
+        // medium 从第 1 列开始占 (0,0)(0,1)：起始格是 (0,0)，第 2 列也属于它。
+        insert_module(&conn, "preferences", "medium", 0, 0, 0).unwrap();
+        // 起始格不同（(0,1) 对 (0,0)），但第 2 列同时属于两者。
+        assert!(
+            insert_module(&conn, "metrics", "small", 0, 1, 1)
+                .expect_err("起始格不同但占格重叠的模块不得登记")
+                .to_string()
+                .contains("must not overlap"),
+            "拒绝原因必须是占格重叠不变量"
+        );
+        // 换成第 3 列（三列网格的最后一列）就不重叠，必须照常登记。
+        insert_module(&conn, "metrics", "small", 0, 2, 1).unwrap();
+        // large 占满整行三列。
+        insert_module(&conn, "reading-minutes", "large", 1, 0, 2).unwrap();
+        // 同一行再放一个模块必然与 large 重叠，哪怕起始格是最后一列。
+        assert!(
+            insert_module(&conn, "type-share", "small", 1, 2, 3)
+                .expect_err("large 占满整行，同一行的任何模块都与它重叠")
+                .to_string()
+                .contains("must not overlap")
+        );
+
+        // 越界与闭合集合的负向断言都用**尚未登记**的 `type-share` 做探针，避免主键冲突
+        // 掩盖真正的拒绝原因。
+        // 三列网格里 medium 从第 3 列开始会越出右侧边界（首页的四列网格允许它）。
+        assert!(
+            insert_module(&conn, "type-share", "medium", 2, 2, 3).is_err(),
+            "medium 在第 3 列的跨度越出三列网格"
+        );
+        assert!(
+            insert_module(&conn, "type-share", "small", 12, 0, 3).is_err(),
+            "行坐标必须小于 12"
+        );
+        // 首页的模块 ID 不得进入总览布局：两套闭合集合互不通用。
+        assert!(
+            insert_module(&conn, "shelf-favorites", "small", 2, 0, 3).is_err(),
+            "首页模块 ID 不得登记到总览布局"
+        );
+        // 下划线写法不是合法总览模块 ID（连字符才是）。
+        assert!(insert_module(&conn, "type_share", "small", 2, 0, 3).is_err());
+        // 并列排序号必须拒绝（稳定顺序是库里的既成事实，不是读取时的巧合）。
+        assert!(
+            insert_module(&conn, "type-share", "small", 2, 0, 2).is_err(),
+            "并列 sort_order 必须拒绝"
+        );
+
+        insert_module(&conn, "type-share", "small", 2, 2, 3).unwrap();
+        insert_module(&conn, "reading-heatmap", "large", 3, 0, 4).unwrap();
+
+        // UPDATE 路径：把模块挪到别人的格子上同样拒绝。
+        assert!(
+            conn.execute(
+                "UPDATE appearance_overview_modules SET row_index = 1
+                 WHERE module_id = 'metrics'",
+                [],
+            )
+            .expect_err("移动模块不得压到别的模块的格子上")
+            .to_string()
+            .contains("must not overlap")
+        );
+        assert_eq!(
+            cells_of(&conn, "metrics"),
+            (0, 2, "small".to_owned()),
+            "被拒绝的移动不得留下任何字段改动"
+        );
+
+        // 档位变更会扩大占格：把第 3 行的 small 挪到同行的第 1 列并扩成 medium，占 (2,0)(2,1)，
+        // 与第 3 列的空格相邻而不重叠，必须照常成功（证明这条不变量不是「同行只能有一个模块」）。
+        conn.execute(
+            "UPDATE appearance_overview_modules SET size = 'medium', column_index = 0
+             WHERE module_id = 'type-share'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(cells_of(&conn, "type-share"), (2, 0, "medium".to_owned()));
+        // 扩到越界则必须拒绝：同一行的第 2 列起放 medium 会超出三列网格。
+        assert!(
+            conn.execute(
+                "UPDATE appearance_overview_modules SET column_index = 2
+                 WHERE module_id = 'type-share'",
+                [],
+            )
+            .is_err()
+        );
+
+        // 「从未保存过」与「显式保存了空布局」由 meta 行区分（与 046 同形）。
+        let meta_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM appearance_overview_layout_meta",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(meta_rows, 0, "只写模块行不得产生 meta 行");
+
+        // 被拒绝的写入不得留下任何行。
+        let modules: Vec<String> = conn
+            .prepare("SELECT module_id FROM appearance_overview_modules ORDER BY sort_order")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            modules,
+            vec![
+                "preferences".to_owned(),
+                "metrics".to_owned(),
+                "reading-minutes".to_owned(),
+                "type-share".to_owned(),
+                "reading-heatmap".to_owned(),
+            ]
+        );
     }
 }

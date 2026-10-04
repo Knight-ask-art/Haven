@@ -175,9 +175,30 @@ export const AGENT_BROKER_CLIENT_TEMPLATES: readonly AgentBrokerClientTemplate[]
   { id: "pi", label: "Pi", hint: "放进 Pi 的 MCP 服务器配置（具体位置见 Pi 自己的文档）。" },
 ];
 
-/** 模板旁的固定说明：它只是连接配置，不构成任何写入授权。 */
+/**
+ * 模板旁的固定说明。
+ *
+ * 这段 JSON 与设置页里那条「一键配置」**不是同一条路径**，而两者的前置条件完全相反：
+ * 模板是给"自己 clone 仓库、自己构建"的人复制粘贴的（因此需要本机 Node，且栖阅不会替他
+ * 安装产物、也不会因为这段 JSON 去改写任何客户端配置）；一键配置写的是随安装包分发的那份
+ * 运行时（因此用户机上不需要 Node），并且只在用户主动点击时才写授权范围内的那一条固定
+ * MCP 条目。把这两件事混成一句，就是在把"复制粘贴"读成"点一下就好"，或者反过来。
+ *
+ * 另外两件事也必须一起说清楚：
+ * - 它只是连接配置，不构成任何写入授权；
+ * - `args` 里的 `<path-to-haven>` 是**占位符**，只能由用户替换成自己构建出来的那一份；
+ * - 没有任何客户端经过真实连接实测。
+ */
 export const AGENT_BROKER_TEMPLATE_NOTE =
-  "这只是 MCP 连接配置，不授予批准或应用权限（approve / apply）：提案仍必须回到栖阅界面由你审批。";
+  "这只是 MCP 连接配置，不授予批准或应用权限（approve / apply）：提案仍必须回到栖阅界面由你审批。" +
+  "args 里的 <path-to-haven> 是占位符，属于「自建」这一条路径：把你自己构建出的 " +
+  "mcp/haven-mcp/dist/index.js 绝对路径填进去。这条路径要求本机自装 Node ≥ 22.12.0" +
+  "（与 mcp/haven-mcp/package.json 的 engines 一致）：模板里的 command 就是 node，" +
+  "构建与运行都靠它；栖阅不会替你安装这个产物，这段 JSON 本身也不会写入任何客户端配置。" +
+  "设置页里另有一条由你主动点击触发的「一键配置」：它写的是随安装包分发的那份运行时，" +
+  "因此用户机上不需要 Node，且只写授权范围内的那一条固定 MCP 条目；" +
+  "它与这里这段模板不是同一条命令。" +
+  "Codex / Claude Code / DSH / Pi 都没有经过真实连接实测（verified: false）。";
 
 export const AGENT_BROKER_TEMPLATE_PATH = "<path-to-haven>/mcp/haven-mcp/dist/index.js";
 

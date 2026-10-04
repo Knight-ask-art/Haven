@@ -2,9 +2,9 @@ import { describe, expect, it, vi } from "vitest"
 import { loadDemoSearchHistory, resolveSearchRuntimeState } from "./search-runtime-state"
 
 describe("resolveSearchRuntimeState", () => {
-  it("keeps sample search available only for the explicit mock client", () => {
-    expect(resolveSearchRuntimeState("mock", "")).toBe("demo")
-    expect(resolveSearchRuntimeState("mock", "haven")).toBe("demo")
+  it("renders fixture results through the same ready path for the explicit mock client", () => {
+    expect(resolveSearchRuntimeState("mock", "")).toBe("ready_empty")
+    expect(resolveSearchRuntimeState("mock", "haven")).toBe("ready_query")
   })
 
   it("uses the local library for Tauri while keeping the empty state explicit", () => {

@@ -313,6 +313,15 @@ mod tests {
         ) -> Result<bool, AppError> {
             Ok(false)
         }
+
+        /// 这个替身只服务 privacy 分区的读取：它没有资产表，因此任何外观资产引用都
+        /// 引用不上（如实返回 `None`，而不是假装存在）。
+        fn validated_appearance_asset_kind(
+            &self,
+            _id: haven_domain::appearance::AppearanceAssetId,
+        ) -> Result<Option<haven_domain::appearance::AppearanceAssetKind>, AppError> {
+            Ok(None)
+        }
     }
 
     impl SettingsUoW for StaticSettingsUow {

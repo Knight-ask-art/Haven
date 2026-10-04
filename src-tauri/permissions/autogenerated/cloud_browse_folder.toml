@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cloud-browse-folder"
+description = "Enables the cloud_browse_folder command without any pre-configured scope."
+commands.allow = ["cloud_browse_folder"]
+
+[[permission]]
+identifier = "deny-cloud-browse-folder"
+description = "Denies the cloud_browse_folder command without any pre-configured scope."
+commands.deny = ["cloud_browse_folder"]

@@ -29,6 +29,7 @@ use haven_application::wire::{
     AgentResourcePreferenceProposalCreateRequest, AgentResourcePreferenceProposalDto,
     AgentResourcePreferenceScopeDto, AgentSettingsProposalCreateRequest, AgentSettingsProposalDto,
 };
+use haven_common::AppError;
 use haven_domain::ids::{AgentRequestId, AgentSessionId};
 
 use endpoint::BrokerEndpoint;
@@ -50,24 +51,41 @@ impl AgentSettingsBrokerApi {
     }
 }
 
+/// 把一次 Application 调用搬到 blocking 线程池上执行。
+///
+/// **为什么必须搬**：这些 service 底下是同步 SQLite（rusqlite + 进程内 `Mutex`）。
+/// 直接在 Tokio worker 上跑，一次慢查询就会占住一个 worker；而 Broker 的连接驱动、
+/// 20 秒请求超时、空闲超时与取消全都跑在同一组 worker 上——一个外部 Agent 的读取
+/// 会把 Haven 的其它异步任务一起拖慢，且症状（"界面偶尔卡一下"）与原因隔得很远。
+///
+/// 模式与 Tauri 命令层的 `ipc::run_blocking` 完全一致：`spawn_blocking` 里
+/// `block_on` 驱动那个 future，service 与请求数据**先 clone 进闭包**。因此闭包内
+/// 不会跨 `await` 持有任何来自调用方的 guard——`AgentSettingsIpcService` 自己在
+/// UoW 内部加的锁仍然只覆盖它自己的同步段。
+async fn run_application<T, F, Fut>(f: F) -> Result<T, BrokerError>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<T, AppError>>,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || tauri::async_runtime::block_on(f()))
+        .await
+        .map_err(|_| BrokerError::internal())?
+        .map_err(|error| BrokerError::from(&error))
+}
+
 #[async_trait]
 impl BrokerAgentApi for AgentSettingsBrokerApi {
     async fn context(&self) -> Result<ContextPayload, BrokerError> {
-        let context = self
-            .settings
-            .context()
-            .await
-            .map_err(|error| BrokerError::from(&error))?;
+        let settings = self.settings.clone();
+        let context = run_application(move || async move { settings.context().await }).await?;
         // 投影成 DTO 再序列化：只有经过既有投影的类型才可能出现在响应里。
         serde_json::to_value(context.to_dto()).map_err(|_| BrokerError::internal())
     }
 
     async fn setting_sources(&self) -> Result<serde_json::Value, BrokerError> {
-        let value = self
-            .context
-            .setting_sources()
-            .await
-            .map_err(|error| BrokerError::from(&error))?;
+        let context = self.context.clone();
+        let value = run_application(move || async move { context.setting_sources().await }).await?;
         serde_json::to_value(value).map_err(|_| BrokerError::internal())
     }
 
@@ -89,20 +107,20 @@ impl BrokerAgentApi for AgentSettingsBrokerApi {
                     .map_err(|_| BrokerError::invalid_argument("media_item_id 非法。"))
             })
             .transpose()?;
-        let value = self
-            .context
-            .resource_preference_snapshot(scope, edition_id, media_item_id)
-            .await
-            .map_err(|error| BrokerError::from(&error))?;
+        let context = self.context.clone();
+        let value = run_application(move || async move {
+            context
+                .resource_preference_snapshot(scope, edition_id, media_item_id)
+                .await
+        })
+        .await?;
         serde_json::to_value(value).map_err(|_| BrokerError::internal())
     }
 
     async fn library_summary(&self, limit: u32) -> Result<serde_json::Value, BrokerError> {
-        let value = self
-            .context
-            .library_summary(limit)
-            .await
-            .map_err(|error| BrokerError::from(&error))?;
+        let context = self.context.clone();
+        let value =
+            run_application(move || async move { context.library_summary(limit).await }).await?;
         serde_json::to_value(value).map_err(|_| BrokerError::internal())
     }
 
@@ -118,20 +136,18 @@ impl BrokerAgentApi for AgentSettingsBrokerApi {
                     .map_err(|_| BrokerError::invalid_argument("media_item_id 非法。"))
             })
             .transpose()?;
-        let value = self
-            .context
-            .media_capabilities(media_item_id, limit)
-            .await
-            .map_err(|error| BrokerError::from(&error))?;
+        let context = self.context.clone();
+        let value = run_application(move || async move {
+            context.media_capabilities(media_item_id, limit).await
+        })
+        .await?;
         serde_json::to_value(value).map_err(|_| BrokerError::internal())
     }
 
     async fn onboarding(&self) -> Result<serde_json::Value, BrokerError> {
-        let value = self
-            .context
-            .onboarding_state()
-            .await
-            .map_err(|error| BrokerError::from(&error))?;
+        let context = self.context.clone();
+        let value =
+            run_application(move || async move { context.onboarding_state().await }).await?;
         serde_json::to_value(value).map_err(|_| BrokerError::internal())
     }
 
@@ -141,10 +157,14 @@ impl BrokerAgentApi for AgentSettingsBrokerApi {
         request_id: AgentRequestId,
         request: &AgentSettingsProposalCreateRequest,
     ) -> Result<AgentSettingsProposalDto, BrokerError> {
-        self.settings
-            .create_proposal(session_id, request_id, request)
-            .await
-            .map_err(|error| BrokerError::from(&error))
+        let settings = self.settings.clone();
+        let request = request.clone();
+        run_application(move || async move {
+            settings
+                .create_proposal(session_id, request_id, &request)
+                .await
+        })
+        .await
     }
 
     async fn create_resource_proposal(
@@ -156,10 +176,13 @@ impl BrokerAgentApi for AgentSettingsBrokerApi {
         let mut request = request.clone();
         request.session_id = session_id.to_string();
         request.request_id = request_id.to_string();
-        self.context
-            .create_resource_preference_proposal(session_id, request_id, &request)
-            .await
-            .map_err(|error| BrokerError::from(&error))
+        let context = self.context.clone();
+        run_application(move || async move {
+            context
+                .create_resource_preference_proposal(session_id, request_id, &request)
+                .await
+        })
+        .await
     }
 }
 

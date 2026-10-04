@@ -1,20 +1,12 @@
-# Haven Claude Code entrypoint
+# Haven contribution reference
 
-When an applicable `AGENTS.md` is present in the checkout, Claude Code must
-read it and the relevant documents under `docs/` before acting. `AGENTS.md`
-contains repository-local safety rules;
-`docs/agents/claude-code.md` contains the Claude Code delegation contract.
-If no `AGENTS.md` is present in a fresh clone, use the public documents and
-the delegation contract as the repository guidance; do not infer missing
-machine-local rules.
+For product boundaries and technical authority, see
+[Source of Truth](docs/SOURCE_OF_TRUTH.md).
 
-This file is intentionally thin. It is an entrypoint, not a second source of
-truth. When it conflicts with `AGENTS.md`, the repository rules and the user's
-explicit instruction win.
+For contributing, review [Contributor responsibilities](docs/engineering/contributing.md),
+[Engineering Change Workflow](docs/TASK_WORKFLOW.md) and
+[Testing and Evidence](docs/engineering/testing-and-evidence.md).
 
-Every task uses the canonical brief in
-`docs/TASK_WORKFLOW.md#task-brief` and the execution rules in
-`docs/agents/claude-code.md`.
-
-Read-only inspection is the default. Do not edit, commit, push, merge, delete,
-or clean anything unless the current task explicitly authorizes that operation.
+Keep changes scoped, preserve existing work, protect credentials and derive IPC
+bindings from their canonical Rust definitions. Product behavior is established
+by contracts, consumers and appropriate tests, not by a design mock or a build alone.

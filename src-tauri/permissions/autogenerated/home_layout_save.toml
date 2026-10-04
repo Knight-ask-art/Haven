@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-home-layout-save"
+description = "Enables the home_layout_save command without any pre-configured scope."
+commands.allow = ["home_layout_save"]
+
+[[permission]]
+identifier = "deny-home-layout-save"
+description = "Denies the home_layout_save command without any pre-configured scope."
+commands.deny = ["home_layout_save"]

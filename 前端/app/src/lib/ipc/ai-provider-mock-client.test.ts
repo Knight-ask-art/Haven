@@ -57,7 +57,7 @@ describe("MockHavenClient AI Provider Profile", () => {
     const noCredential = await haven.aiProviderModelsList({ profileId: PROFILE_ID })
     expect(noCredential.state).toBe("no_credential")
     expect(noCredential.models).toEqual([])
-    expect(guardAiProviderModelsCatalog(noCredential)).toBe(true)
+    expect(guardAiProviderModelsCatalog(noCredential, PROFILE_ID)).toBe(true)
 
     // 写入凭据后才出现来自共享 fixture 的目录；能力值原样来自 fixture 的显式声明。
     await haven.credentialSet({ provider: "ai", profileId: PROFILE_ID, secret: API_KEY })

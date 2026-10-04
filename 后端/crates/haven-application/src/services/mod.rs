@@ -8,11 +8,14 @@
 pub mod agent;
 pub mod agent_context;
 pub mod agent_settings_ipc;
+pub mod agent_skill;
 pub mod agent_trace;
 pub mod ai_provider;
 pub mod app_info;
+pub mod appearance;
 pub mod cache;
 pub mod cast;
+pub mod cloud_storage;
 pub mod comic;
 pub mod comic_catalog;
 pub mod comic_page_identity;
@@ -26,14 +29,17 @@ pub mod error_report;
 pub mod favorite;
 pub mod history;
 pub mod home;
+pub mod interface_fonts;
 pub mod library;
 pub mod marker;
+pub mod mcp_client_config;
 pub mod periodical;
 pub mod periodical_query;
 pub mod ports;
 pub mod progress;
 pub mod reader_search;
 pub mod reader_toc;
+pub mod reading_overview;
 pub mod resource;
 pub mod resource_preferences;
 pub mod scan;
@@ -43,11 +49,14 @@ pub mod session;
 pub mod setting_proposals;
 pub mod settings;
 pub mod settings_file;
+pub mod source_config_cache;
 pub mod source_import;
 pub mod source_registry;
 pub mod storage_location;
 pub mod stream;
 pub mod trending;
+pub mod tvbox_config_import;
+pub mod tvbox_config_preview;
 pub mod video_screenshot;
 pub mod work;
 
@@ -57,6 +66,10 @@ pub use agent::{
 };
 pub use agent_context::AgentContextQueryService;
 pub use agent_settings_ipc::{AgentSettingsContext, AgentSettingsIpcService};
+pub use agent_skill::{
+    AgentSkillActivationDto, AgentSkillListResultDto, AgentSkillRegistryPort, AgentSkillService,
+    AgentSkillSetEnabledRequest, AgentSkillStateDto,
+};
 pub use agent_trace::{
     AgentEventKind, AgentTraceContext, AgentTraceEvent, AgentTraceEventDraft, AgentTracePort,
     AgentTraceQueryPort, AgentTraceQueryService, InMemoryAgentTraceCollector,
@@ -69,6 +82,10 @@ pub use ai_provider::{
     credential_target as ai_provider_credential_target,
 };
 pub use app_info::{AppInfoPorts, AppInfoService, DirectoryKind};
+pub use appearance::{
+    AppearanceAssetDeleteResult, AppearanceAssetImportResult, AppearanceAssetStorage,
+    AppearanceService, HomeLayoutResult,
+};
 pub use cache::{ArtworkCacheClearPort, CacheService};
 pub use cast::{CastControlPort, CastDiscoveryPort, CastGrantRegistry, CastMediaPort, CastService};
 pub use comic::{
@@ -93,6 +110,10 @@ pub use error_report::{
 pub use favorite::FavoriteService;
 pub use history::{HistoryPorts, HistoryService};
 pub use home::HomeService;
+pub use interface_fonts::{
+    InterfaceFontImportOutcome, InterfaceFontService, InterfaceFontTxPorts, InterfaceFontUoW,
+    MAX_INTERFACE_FONT_ASSETS,
+};
 pub use library::LibraryService;
 pub use marker::{MarkerPorts, MarkerService};
 pub use periodical::{
@@ -106,6 +127,7 @@ pub use ports::SessionOpenPorts;
 pub use ports::{FavoritePorts, LibraryPorts};
 pub use progress::{ProgressPorts, ProgressService};
 pub use reader_search::{RawBookContent, RawChapter, ReaderSearchProvider, ReaderSearchService};
+pub use reading_overview::{ReadingOverviewPorts, ReadingOverviewService};
 pub use resource::ResourceService;
 pub use resource_preferences::{
     PreferenceSnapshot, PreferenceTarget, PreferenceUpdateResult, ResourcePreferenceService,
@@ -129,11 +151,12 @@ pub use setting_proposals::{
 pub use settings::{
     SettingsService, SettingsSnapshot, SettingsTxPorts, SettingsUoW, SettingsUpdateResult,
 };
+pub use source_config_cache::{CachedSourceConfig, InMemorySourceConfigCache, SourceConfigCache};
 pub use source_import::{
-    CMS10_CANDIDATE_PREFIX, ImportedWork, OPDS_CANDIDATE_PREFIX, SourceCatalogEntry,
-    SourceCatalogProvider, SourceImportService,
+    CMS10_CANDIDATE_PREFIX, FEED_SOURCE_KEY, ImportedWork, OPDS_CANDIDATE_PREFIX,
+    SourceCatalogEntry, SourceCatalogProvider, SourceImportService,
 };
-pub use source_registry::SourceRegistryService;
+pub use source_registry::{CUSTOM_FEED_SOURCE_PREFIX, CustomSourceKind, SourceRegistryService};
 pub use storage_location::{
     DefaultRootProbe, ProbeOutcome, RootProbe, ScanTarget, ScanTargetToken, StorageLocationService,
     StorageLocationUoW, StorageTxPorts,
@@ -143,6 +166,13 @@ pub use trending::{
     ArtworkCachePort, CANONICAL_BOARD_IDS, RemoteArtworkCandidate, TrendingBoardCacheEntry,
     TrendingBoardCandidate, TrendingCachePort, TrendingItemCandidate, TrendingProvider,
     TrendingService,
+};
+pub use tvbox_config_import::{
+    MAX_TVBOX_DISPLAY_NAME_CHARS, TvboxConfigFetch, TvboxConfigImportPort, TvboxConfigSaveService,
+};
+pub use tvbox_config_preview::{
+    MAX_CONFIG_URL_CHARS, TvboxConfigImplementationKind, TvboxConfigPreviewFacts,
+    TvboxConfigPreviewPort, TvboxConfigPreviewService,
 };
 pub use video_screenshot::{VideoScreenshotService, VideoScreenshotStoragePort};
 pub use work::WorkService;

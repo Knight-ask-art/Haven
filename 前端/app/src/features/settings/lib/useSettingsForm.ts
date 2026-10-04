@@ -107,6 +107,19 @@ export function useSettingsForm(
   const stateRef = useRef(state)
   stateRef.current = state
 
+  /**
+   * 发布一次「正在保存」：**同步**写进 `stateRef`，再交给 React 渲染。
+   *
+   * React 的渲染是异步的，只调用 `setState` 时 `stateRef.current` 要等到下一次渲染才
+   * 更新；在那之前发生的第二次提交读到的仍是 `dirty`，`formSave` 于是把**同一个** patch
+   * 再发一次（两个请求带同一个 `expectedRevision`，后一个必然撞 `REVISION_CONFLICT`）。
+   * 同步落地之后，第二次提交读到的是 `saving`，`formSave` 返回空 patch，直接成为空操作。
+   */
+  const publishSaving = useCallback((next: SettingsFormState): void => {
+    stateRef.current = next
+    setState(next)
+  }, [])
+
   const fetchSnapshot = useCallback(async (rebase: boolean): Promise<void> => {
     const id = ++requestId.current
     const result = await runSettingsRebaseFetch(gateway, section)
@@ -142,12 +155,13 @@ export function useSettingsForm(
     if (prepared.state.status !== "saving") return
     const id = ++requestId.current
     const savingState = prepared.state
-    setState(savingState)
+    publishSaving(savingState)
     const outcome = await runSettingsSaveOperation(gateway, section, savingState)
     if (id !== requestId.current) return
+    stateRef.current = outcome.state
     setState(outcome.state)
     if (outcome.state.status === "ready") onSaved?.(outcome.changed, outcome.state.saved)
-  }, [gateway, section, onSaved])
+  }, [gateway, section, onSaved, publishSaving])
 
   const retry = useCallback(async () => {
     const current = stateRef.current
@@ -163,13 +177,14 @@ export function useSettingsForm(
       const id = ++requestId.current
       const retryState = formRetrySave(current)
       if (retryState.status !== "saving") return
-      setState(retryState)
+      publishSaving(retryState)
       const outcome = await runSettingsSaveOperation(gateway, section, retryState)
       if (id !== requestId.current) return
+      stateRef.current = outcome.state
       setState(outcome.state)
       if (outcome.state.status === "ready") onSaved?.(outcome.changed, outcome.state.saved)
     }
-  }, [gateway, section, load, fetchSnapshot, onSaved])
+  }, [gateway, section, load, fetchSnapshot, onSaved, publishSaving])
 
   const reload = useCallback(() => {
     void load()

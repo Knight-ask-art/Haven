@@ -30,10 +30,6 @@ use haven_application::services::ports::{
     PeriodicalImportPlan, UnitOfWork,
 };
 
-/// R-MAIN-09D：purge 中间表唯一内部名（明确 temp schema；DROP 用同一定义，避免散落字符串）。
-const PURGE_TEMP_TABLE: &str = "temp._haven_storage_purge_media_ids";
-const PURGE_TEMP_DROP_SQL: &str = "DROP TABLE IF EXISTS temp._haven_storage_purge_media_ids";
-
 /// SQLite 版 UnitOfWork。
 pub struct SqliteUnitOfWork {
     db: Arc<Db>,
@@ -1583,7 +1579,7 @@ impl haven_application::services::storage_location::StorageLocationUoW for Sqlit
         // 因此在事务开始前把旧表清走，事务失败回滚后就不会有旧表残留。
         let guard = self.db.lock();
         guard
-            .execute_batch(PURGE_TEMP_DROP_SQL)
+            .execute_batch(crate::db::storage_content::PURGE_TEMP_DROP_SQL)
             .map_err(|e| tx_err("清理 purge 临时表失败", e))?;
 
         let tx = guard
@@ -1601,7 +1597,7 @@ impl haven_application::services::storage_location::StorageLocationUoW for Sqlit
         // 事务已结束（commit consume 或 drop），仍持同一 guard 清理（不持有 Transaction、
         // 不释放 guard）。
         let cleanup = guard
-            .execute_batch(PURGE_TEMP_DROP_SQL)
+            .execute_batch(crate::db::storage_content::PURGE_TEMP_DROP_SQL)
             .map_err(|e| tx_err("清理 purge 临时表失败", e));
 
         // 错误优先级：主操作 Err 优先返回原错误（cleanup 失败不得把失败变成成功）；
@@ -1717,38 +1713,14 @@ impl haven_application::services::storage_location::StorageTxPorts for SqliteSto
         availability: haven_domain::enums::Availability,
         source: haven_domain::enums::AvailabilitySource,
     ) -> Result<(), AppError> {
-        // R-MAIN-08 覆盖规则（位置失效/无效化）只允许：
-        //   a) 当前 availability='available' 的资源（即便 source=user，位置不可达时有效可用性必须失效）；或
-        //   b) availability_source='storage' 的资源（重复/状态迁移收敛）。
-        // 不得覆盖 source=user 且当前为 SourceUnavailable/TemporarilyUnavailable/Unknown/自身 Missing。
-        self.tx
-            .execute(
-                "UPDATE resources SET availability = ?1, availability_source = ?2, updated_at = ?3
-                 WHERE storage_location_id = ?4
-                   AND (availability = 'available' OR availability_source = 'storage')",
-                rusqlite::params![
-                    serde_json::to_string(&availability)
-                        .map_err(|e| {
-                            tx_err(
-                                "序列化可用性失败",
-                                rusqlite::Error::ToSqlConversionFailure(Box::new(e)),
-                            )
-                        })?
-                        .trim_matches('"'),
-                    serde_json::to_string(&source)
-                        .map_err(|e| {
-                            tx_err(
-                                "序列化可用性来源失败",
-                                rusqlite::Error::ToSqlConversionFailure(Box::new(e)),
-                            )
-                        })?
-                        .trim_matches('"'),
-                    haven_common::UtcMillis::now().0,
-                    storage_location_id.to_string()
-                ],
-            )
-            .map_err(|e| tx_err("批量标记资源可用性失败", e))?;
-        Ok(())
+        // R-MAIN-08 覆盖规则（位置失效/无效化）的唯一实现在 `storage_content`：
+        // 本地位置与云盘目录共用同一份 SQL，不允许在这里复制第二套等价实现。
+        crate::db::storage_content::set_resources_availability_on_conn(
+            self.tx,
+            storage_location_id,
+            availability,
+            source,
+        )
     }
 
     /// 读取某存储位置下的全部 Resource（rebind rebase 用；失败回滚整个事务）。
@@ -1781,169 +1753,20 @@ impl haven_application::services::storage_location::StorageTxPorts for SqliteSto
         &self,
         storage_location_id: haven_domain::ids::StorageLocationId,
     ) -> Result<(), AppError> {
-        self.tx
-            .execute(
-                "DELETE FROM resources WHERE storage_location_id = ?1",
-                rusqlite::params![storage_location_id.to_string()],
-            )
-            .map_err(|e| tx_err("删除位置索引资源失败", e))?;
-        Ok(())
+        crate::db::storage_content::delete_resources_on_conn(self.tx, storage_location_id)
     }
 
     /// INTEGRATION-SLICE-001 真机验收发现（「选错目录」缺口）：remove 只删
     /// resources + storage_locations 会留下孤儿 works/editions/media_items，
     /// 媒体库仍显示已移除位置扫出的内容。
     ///
-    /// 本方法在**同一事务**内：删除该位置 Resource 后，级联清理**仅由该位置派生**
-    /// 的孤儿内容链（media_items → editions → works）及其用户状态
-    /// （progress / markers / favorites / history_entries，均为 RESTRICT 须先行删除）。
-    /// 其他位置仍引用的内容（共享 edition/work）完整保留；`work_favorite_versions`
-    /// 随 works 外键 CASCADE。孤儿判定经连接级临时表传递（无 IN 参数上限问题）。
+    /// 算法是 `storage_content::purge_location_content`（R-MAIN-09D 的 TEMP 中间表
+    /// 自清理也在那里）：本地位置与云盘目录 remove 共用**同一份**实现，这里只做事务内委托。
     fn purge_location_content(
         &self,
         storage_location_id: haven_domain::ids::StorageLocationId,
     ) -> Result<(), AppError> {
-        let loc = storage_location_id.to_string();
-        let exec = |sql: &str| {
-            self.tx
-                .execute(sql, [])
-                .map_err(|e| tx_err("位置内容清理失败", e))?;
-            Ok::<(), AppError>(())
-        };
-
-        // R-MAIN-09C/09D Important 1：TEMP 中间表用唯一内部名并**明确限定 temp schema**，
-        // 避免共享 SQLite 连接上跨事务残留、以及未限定 DROP 误伤 main 同名对象。
-        // 事务开始前的防御性清理由 `SqliteStorageUoW::run` 在事务边界外（同一 guard）完成，
-        // 因此此处不再需要开头 DROP；成功后仍保留 DROP 作为局部自清理。
-        let purge_temp = PURGE_TEMP_TABLE;
-        exec(
-            "CREATE TEMP TABLE _haven_storage_purge_media_ids(
-                 stage INTEGER NOT NULL, id TEXT NOT NULL, parent TEXT, depth INTEGER NOT NULL DEFAULT 0)",
-        )?;
-        self.tx
-            .execute(
-                "INSERT INTO temp._haven_storage_purge_media_ids(stage, id, parent, depth)
-                 SELECT DISTINCT 0, media_item_id, NULL, 0 FROM resources
-                 WHERE storage_location_id = ?1",
-                rusqlite::params![&loc],
-            )
-            .map_err(|e| tx_err("位置内容清理失败", e))?;
-
-        // 下载任务先行清理：source_resource_id（RESTRICT）与 target_storage_id
-        // （RESTRICT）指向被移除位置的任务已失去内容源/目标，随位置一并删除。
-        // offline_resource_id 为 ON DELETE SET NULL，不构成阻塞。
-        exec(&format!(
-            "DELETE FROM download_tasks
-             WHERE source_resource_id IN (SELECT id FROM resources WHERE storage_location_id = '{loc}')
-                OR target_storage_id = '{loc}'"
-        ))?;
-
-        self.delete_resources(storage_location_id)?;
-
-        // stage 1：从已删资源的 media_item 沿 parent_id 向上闭包，记录深度。
-        // 删除时按 depth 升序（child first），满足 parent_id ON DELETE RESTRICT；仍被其他资源或
-        // 子节点引用的候选会在实际 DELETE 条件中保留，从而支持共享层级。
-        exec(&format!(
-            "INSERT INTO {purge_temp}(stage, id, parent, depth)
-             WITH RECURSIVE candidates(id, depth, path) AS (
-                 SELECT id, 0, ',' || id || ',' FROM {purge_temp} WHERE stage = 0
-                 UNION ALL
-                 SELECT m.parent_id, c.depth + 1, c.path || m.parent_id || ','
-                 FROM media_items m
-                 JOIN candidates c ON m.id = c.id
-                 WHERE m.parent_id IS NOT NULL
-                   AND instr(c.path, ',' || m.parent_id || ',') = 0
-             )
-             SELECT 1, m.id, m.edition_id, MAX(c.depth)
-             FROM media_items m
-             JOIN candidates c ON c.id = m.id
-             WHERE NOT EXISTS (SELECT 1 FROM resources r WHERE r.media_item_id = m.id)
-             GROUP BY m.id, m.edition_id"
-        ))?;
-
-        let max_depth: Option<i64> = self
-            .tx
-            .query_row(
-                &format!("SELECT MAX(depth) FROM {purge_temp} WHERE stage = 1"),
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| tx_err("计算层级清理深度失败", e))?;
-        if let Some(max_depth) = max_depth {
-            let mut depth = 0;
-            while depth <= max_depth {
-                // 只有本轮确实可删的叶节点才允许先清用户状态。候选父条目若仍有
-                // 另一个非候选/共享子节点，必须连同 progress/history/marker/favorite
-                // 一起保留，不能因为它出现在祖先闭包里就提前丢用户数据。
-                exec(&format!("DELETE FROM {purge_temp} WHERE stage = 4"))?;
-                let mark_deletable = format!(
-                    "INSERT INTO {purge_temp}(stage, id, parent, depth)
-                     SELECT DISTINCT 4, m.id, m.edition_id, {depth}
-                     FROM media_items m
-                     JOIN {purge_temp} p ON p.stage = 1 AND p.id = m.id AND p.depth = {depth}
-                     WHERE NOT EXISTS (SELECT 1 FROM resources r WHERE r.media_item_id = m.id)
-                       AND NOT EXISTS (SELECT 1 FROM media_items child WHERE child.parent_id = m.id)"
-                );
-                exec(&mark_deletable)?;
-                exec(&format!(
-                    "DELETE FROM history_entries WHERE media_item_id IN (SELECT id FROM {purge_temp} WHERE stage = 4)"
-                ))?;
-                exec(&format!(
-                    "DELETE FROM progress WHERE media_item_id IN (SELECT id FROM {purge_temp} WHERE stage = 4)"
-                ))?;
-                exec(&format!(
-                    "DELETE FROM markers WHERE media_item_id IN (SELECT id FROM {purge_temp} WHERE stage = 4)"
-                ))?;
-                exec(&format!(
-                    "DELETE FROM favorites WHERE media_item_id IN (SELECT id FROM {purge_temp} WHERE stage = 4)"
-                ))?;
-                exec(&format!(
-                    "DELETE FROM download_tasks WHERE media_item_id IN (SELECT id FROM {purge_temp} WHERE stage = 4)"
-                ))?;
-                exec(&format!(
-                    "DELETE FROM media_items WHERE id IN (SELECT id FROM {purge_temp} WHERE stage = 4)"
-                ))?;
-                depth += 1;
-            }
-        }
-
-        // stage 2：孤儿 edition（media_item 已删，NOT EXISTS 即孤儿；共享 edition 保留）。
-        exec(&format!(
-            "INSERT INTO {purge_temp}(stage, id, parent, depth)
-             SELECT DISTINCT 2, e.id, e.work_id, 0 FROM editions e
-             WHERE e.id IN (SELECT parent FROM {purge_temp} WHERE stage = 1 AND parent IS NOT NULL)
-               AND NOT EXISTS (SELECT 1 FROM media_items m WHERE m.edition_id = e.id)"
-        ))?;
-        exec(&format!(
-            "DELETE FROM favorites WHERE edition_id IN (SELECT id FROM {purge_temp} WHERE stage = 2)"
-        ))?;
-        exec(&format!(
-            "DELETE FROM download_tasks WHERE edition_id IN (SELECT id FROM {purge_temp} WHERE stage = 2)"
-        ))?;
-        exec(&format!(
-            "DELETE FROM editions WHERE id IN (SELECT id FROM {purge_temp} WHERE stage = 2)"
-        ))?;
-
-        // stage 3：孤儿 work（edition 已删；共享 work 保留）。
-        exec(&format!(
-            "INSERT INTO {purge_temp}(stage, id, parent, depth)
-             SELECT DISTINCT 3, w.id, NULL, 0 FROM works w
-             WHERE w.id IN (SELECT parent FROM {purge_temp} WHERE stage = 2 AND parent IS NOT NULL)
-               AND NOT EXISTS (SELECT 1 FROM editions e WHERE e.work_id = w.id)"
-        ))?;
-        exec(&format!(
-            "DELETE FROM favorites WHERE work_id IN (SELECT id FROM {purge_temp} WHERE stage = 3)"
-        ))?;
-        exec(&format!(
-            "DELETE FROM download_tasks WHERE work_id IN (SELECT id FROM {purge_temp} WHERE stage = 3)"
-        ))?;
-        // work_favorite_versions 随 works 外键 CASCADE。
-        exec(&format!(
-            "DELETE FROM works WHERE id IN (SELECT id FROM {purge_temp} WHERE stage = 3)"
-        ))?;
-        // 成功收尾：必须 DROP，不只 DELETE（释放连接级 TEMP 表，避免跨事务残留）。
-        exec("DROP TABLE IF EXISTS temp._haven_storage_purge_media_ids")?;
-        Ok(())
+        crate::db::storage_content::purge_location_content(self.tx, storage_location_id)
     }
 
     fn delete_location(&self, id: haven_domain::ids::StorageLocationId) -> Result<bool, AppError> {

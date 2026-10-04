@@ -43,11 +43,38 @@ export function bridgeNotImplemented(detail: string): HavenMcpError {
   return new HavenMcpError(ERROR_CODES.BRIDGE_NOT_IMPLEMENTED, detail, false);
 }
 
-export function bridgeTimeout(operation: string): HavenMcpError {
+/**
+ * 桥接超时。
+ *
+ * `retryable` 必须由调用方按**操作的副作用**给出，不能一律写死：
+ * - 只读读取超时 → 没有落任何东西，重试是安全的；
+ * - 提案创建超时 → 请求可能已经被 Broker 处理并落库，"重试"会再创建一条提案，
+ *   而调用方以为上一次失败了。这种结果必须是非重试的，并要求先回栖阅确认。
+ */
+export function bridgeTimeout(operation: string, retryable = false): HavenMcpError {
   return new HavenMcpError(
     ERROR_CODES.BRIDGE_TIMEOUT,
-    `Haven 桥接在 ${operation} 上超时；应用可能正忙，可稍后重试。`,
-    true,
+    retryable
+      ? `${operation}超时，本次没有产生任何写入，可以重试。`
+      : `Haven 桥接在 ${operation} 上超时，操作结果可能尚未确认。请先检查栖阅中是否已有待审批提案，再决定是否重试。`,
+    retryable,
+  );
+}
+
+/**
+ * 调用方取消。
+ *
+ * `mayHavePersisted` 来自工具自身：提案类工具的请求一旦发出，就可能已经在 Haven 里
+ * 创建了一条 pending 提案，因此取消后的结果同样"未确认"，必须非重试并让调用方去核对。
+ * 只读工具没有这个风险：取消就是取消。
+ */
+export function bridgeCancelled(operation: string, mayHavePersisted: boolean): HavenMcpError {
+  return new HavenMcpError(
+    ERROR_CODES.BRIDGE_CANCELLED,
+    mayHavePersisted
+      ? `调用方取消了${operation}。该请求可能已经在栖阅中创建了待审批提案，结果未确认：请先在栖阅界面检查是否已有这条提案，不要直接重试。`
+      : `调用方取消了${operation}，本次没有产生任何写入。`,
+    !mayHavePersisted,
   );
 }
 
@@ -70,7 +97,7 @@ export function invalidArgument(detail: string): HavenMcpError {
 export function responseTooLarge(tool: string): HavenMcpError {
   return new HavenMcpError(
     ERROR_CODES.RESPONSE_TOO_LARGE,
-    `${tool} 的响应在收缩后仍超出上限；请用更小的 limit 或更窄的过滤条件重试。`,
+    `${tool} 的响应超过当前上限；请用更小的 limit 或更窄的过滤条件重试。`,
     false,
   );
 }
