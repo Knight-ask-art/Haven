@@ -190,7 +190,11 @@ async fn client_secret_is_optional_but_validated_before_any_io() {
         let error = oauth
             .ensure_configured()
             .expect_err("非法 client secret 应被拒绝");
-        assert_eq!(code(&error), "CLOUD_OAUTH_CONFIG_INVALID", "{secret:?}");
+        assert_eq!(
+            code(&error),
+            "CLOUD_OAUTH_CONFIG_INVALID",
+            "非法凭据必须被拒绝"
+        );
         assert!(fake.seen.lock().unwrap().is_empty());
     }
     let (_, oauth) = client(Some(CLIENT_ID), Some("GOCSPX-valid_secret"), vec![]);
@@ -352,10 +356,7 @@ async fn upstream_statuses_map_without_leaking_bodies() {
             "{status}"
         );
         let rendered = format!("{error:?} {error}");
-        assert!(
-            !rendered.contains(SENTINEL),
-            "错误泄露了上游正文或令牌: {rendered}"
-        );
+        assert!(!rendered.contains(SENTINEL), "错误不得暴露上游正文或令牌");
     }
 }
 
@@ -413,9 +414,9 @@ async fn secrets_never_render_in_debug_output() {
     );
     let granted = exchange(&oauth, REDIRECT).await.expect("交换应成功");
     let rendered = format!("{granted:?}");
+    assert!(!rendered.contains(SENTINEL), "凭据 Debug 不得暴露令牌");
     assert!(
-        !rendered.contains(SENTINEL),
-        "凭据 Debug 泄露了令牌: {rendered}"
+        rendered.contains("[REDACTED]"),
+        "凭据 Debug 必须包含脱敏标记"
     );
-    assert!(rendered.contains("[REDACTED]"), "{rendered}");
 }

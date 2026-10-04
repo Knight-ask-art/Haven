@@ -235,8 +235,9 @@ pub struct AppearanceSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_font_asset_id: Option<String>,
     /// 用户保存的应用级明/暗调色板与强调色。`None` 表示尚未创建自定义主题。
+    /// 大调色板独立分配，避免放大所有分区设置；序列化仍是原有主题对象。
     #[serde(default)]
-    pub custom_theme: Option<AppTheme>,
+    pub custom_theme: Option<Box<AppTheme>>,
     /// 首页壁纸只引用不透明资产 ID；`none` 是明确的无壁纸状态。
     #[serde(default)]
     pub wallpaper: WallpaperSelection,
@@ -740,7 +741,7 @@ pub struct AppearancePatch {
         deserialize_with = "deserialize_nullable_patch_field",
         skip_serializing_if = "Option::is_none"
     )]
-    pub custom_theme: Option<Option<AppTheme>>,
+    pub custom_theme: Option<Option<Box<AppTheme>>>,
     /// 缺失 = 不改；显式 null = 清除壁纸（等价于 `WallpaperSelection::None`）。
     ///
     /// 与 `custom_theme` / `custom_font_asset_id` 同形是刻意的：三个字段都是
@@ -1413,6 +1414,42 @@ mod tests {
     }
 
     #[test]
+    fn appearance_theme_roundtrips_as_an_object_without_changing_the_wire_shape() {
+        let theme = test_app_theme();
+        let expected_theme = serde_json::to_value(&theme).unwrap();
+        let patch_json = serde_json::json!({
+            "section": "appearance",
+            "customTheme": expected_theme,
+        });
+        let patch: SettingsPatch = serde_json::from_value(patch_json).unwrap();
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap()["customTheme"],
+            expected_theme
+        );
+
+        let current = SettingsValue::default_for(SettingsSection::Appearance);
+        let next = patch.apply_to(&current);
+        let serialized = serde_json::to_value(&next).unwrap();
+        assert_eq!(serialized["section"], "appearance");
+        assert_eq!(serialized["customTheme"], expected_theme);
+        assert_eq!(
+            serde_json::from_value::<SettingsValue>(serialized).unwrap(),
+            next
+        );
+
+        let mut invalid_theme = expected_theme;
+        invalid_theme["unexpected"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<SettingsPatch>(serde_json::json!({
+                "section": "appearance",
+                "customTheme": invalid_theme,
+            }))
+            .is_err(),
+            "主题载荷仍须拒绝未知字段"
+        );
+    }
+
+    #[test]
     fn appearance_patch_distinguishes_missing_nullable_fields_from_explicit_null() {
         let missing: AppearancePatch = serde_json::from_str("{}").unwrap();
         assert_eq!(missing.custom_theme, None);
@@ -1428,9 +1465,13 @@ mod tests {
             r#"{"section":"appearance","customTheme":null,"customFontAssetId":null,"uiFontFamily":null,"uiFontPreset":"modern_sans"}"#,
         )
         .unwrap();
+        assert_eq!(
+            serde_json::to_value(&clear).unwrap()["customTheme"],
+            serde_json::Value::Null
+        );
         let current = SettingsValue::Appearance(AppearanceSettings {
             theme: Theme::Custom,
-            custom_theme: Some(test_app_theme()),
+            custom_theme: Some(Box::new(test_app_theme())),
             custom_font_asset_id: Some(AppearanceAssetId::new()),
             ui_font_preset: UiFontPreset::CustomSystem,
             ui_font_family: Some("Microsoft YaHei UI".to_owned()),

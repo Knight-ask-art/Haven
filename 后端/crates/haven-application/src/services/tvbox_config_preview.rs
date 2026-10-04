@@ -362,12 +362,9 @@ mod tests {
             "{:?}",
             request("https://config.example.invalid/tvbox.json?token=secret-value")
         );
-        assert!(
-            rendered.contains("<redacted>"),
-            "请求 Debug 必须脱敏: {rendered}"
-        );
+        assert!(rendered.contains("<redacted>"), "请求 Debug 必须脱敏");
         for secret in ["example.invalid", "token", "secret-value"] {
-            assert!(!rendered.contains(secret), "请求 Debug 泄露了 {secret}");
+            assert!(!rendered.contains(secret), "请求 Debug 不得暴露敏感字段");
         }
     }
 }

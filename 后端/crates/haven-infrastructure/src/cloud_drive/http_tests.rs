@@ -368,7 +368,7 @@ fn debug_output_hides_urls_queries_and_credentials() {
     for secret in ["ya29.test-token", "secret", "/drive/v3/"] {
         assert!(
             !rendered.contains(secret),
-            "Debug 泄露了 {secret}: {rendered}"
+            "Debug 不得暴露请求地址、查询参数或凭据"
         );
     }
     let rendered = format!("{:?}", token_request("https://oauth2.googleapis.com/token"));
@@ -377,10 +377,7 @@ fn debug_output_hides_urls_queries_and_credentials() {
         "verifier-test-value",
         "4/0AeanS-test-code",
     ] {
-        assert!(
-            !rendered.contains(secret),
-            "Debug 泄露了 {secret}: {rendered}"
-        );
+        assert!(!rendered.contains(secret), "Debug 不得暴露 OAuth 请求参数");
     }
 }
 

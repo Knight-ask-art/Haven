@@ -755,7 +755,7 @@ mod tests {
         let bare_carriage_return =
             "---\nname: haven-agent-proposal\ndescription: d\n---\n\n正文\rX。\n";
         assert!(
-            BuiltinAgentSkill::from_document(&bare_carriage_return).is_err(),
+            BuiltinAgentSkill::from_document(bare_carriage_return).is_err(),
             "没有跟随换行的 CR 必须被拒绝"
         );
     }

@@ -527,10 +527,7 @@ mod tests {
             "csp_Demo",
             "./js/demo.js",
         ] {
-            assert!(
-                !rendered.contains(secret),
-                "摘要泄露了 {secret}: {rendered}"
-            );
+            assert!(!rendered.contains(secret), "摘要不得暴露原始配置值");
         }
     }
 
@@ -758,10 +755,7 @@ mod tests {
             "d.example.invalid",
             "config.example.invalid",
         ] {
-            assert!(
-                !rendered.contains(secret),
-                "错误泄露了 {secret}: {rendered}"
-            );
+            assert!(!rendered.contains(secret), "错误不得暴露重定向地址");
         }
     }
 
@@ -803,10 +797,7 @@ mod tests {
             "示例解析",
             "vendorExtension",
         ] {
-            assert!(
-                !rendered.contains(secret),
-                "预览事实泄露了 {secret}: {rendered}"
-            );
+            assert!(!rendered.contains(secret), "预览事实不得暴露原始配置值");
         }
     }
 
@@ -840,7 +831,7 @@ mod tests {
         ] {
             assert!(
                 !rendered.contains(secret),
-                "预览事实泄露了 {secret}: {rendered}"
+                "预览事实不得暴露非白名单字段或原始值"
             );
         }
     }

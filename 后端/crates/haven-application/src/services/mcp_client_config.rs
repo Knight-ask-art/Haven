@@ -695,10 +695,10 @@ mod tests {
 
     const ENDPOINT: &str = r"\\.\pipe\haven-agent-v1-abc";
 
-    fn target_status<'a>(
-        status: &'a McpClientConfigStatusDto,
+    fn target_status(
+        status: &McpClientConfigStatusDto,
         target: McpClientTargetDto,
-    ) -> &'a McpClientTargetStatusDto {
+    ) -> &McpClientTargetStatusDto {
         status
             .targets
             .iter()

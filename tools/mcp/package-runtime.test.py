@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -97,7 +98,70 @@ def _run_main(arguments: list[str]) -> int:
         return PACK.main(arguments)
 
 
+def _run_cli_with_legacy_codepage(arguments: list[str]) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        [sys.executable, str(REPOSITORY_ROOT / "tools/mcp/package-runtime.py"), *arguments],
+        env={**os.environ, "PYTHONIOENCODING": "cp1252:strict", "PYTHONUTF8": "0"},
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+
 class PackageRuntimeTests(unittest.TestCase):
+    def test_importing_the_packager_does_not_reconfigure_caller_streams(self) -> None:
+        streams = (sys.stdout, sys.stderr)
+        encodings = tuple(stream.encoding for stream in streams)
+        _load("package-runtime.py")
+        self.assertIs(sys.stdout, streams[0])
+        self.assertIs(sys.stderr, streams[1])
+        self.assertEqual(tuple(stream.encoding for stream in streams), encodings)
+
+    def test_cli_packages_non_ascii_paths_with_inherited_legacy_codepage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base = Path(temporary_directory)
+            root = base / "输入 仓库"
+            _make_minimal_repository(root)
+            node = _stub_node(base)
+            for quiet in (False, True):
+                with self.subTest(quiet=quiet):
+                    out = base / "产物 输出" / ("quiet" if quiet else "verbose")
+                    arguments = ["--root", str(root), "--out", str(out), "--node", str(node)]
+                    if quiet:
+                        arguments.append("--quiet")
+                    result = _run_cli_with_legacy_codepage(arguments)
+                    stdout = result.stdout.decode("utf-8")
+                    stderr = result.stderr.decode("utf-8")
+                    self.assertEqual(result.returncode, 0, stderr)
+                    self.assertEqual(stderr, "")
+                    self.assertIn(f"package-runtime: PASS -> {out}", stdout)
+                    self.assertEqual("版本：" in stdout, not quiet)
+                    self.assertTrue((out / PACK.BUNDLE_DIR_NAME / PACK.LAUNCHER_NAME).is_file())
+
+    def test_cli_help_is_utf8_with_inherited_legacy_codepage(self) -> None:
+        result = _run_cli_with_legacy_codepage(["--help"])
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
+        self.assertIn("组装随安装包分发的 Haven MCP 运行时", result.stdout.decode("utf-8"))
+        self.assertEqual(result.stderr, b"")
+
+    def test_cli_rejection_is_utf8_and_still_fails_with_inherited_legacy_codepage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base = Path(temporary_directory)
+            root = base / "输入 仓库"
+            _make_minimal_repository(root)
+            out = base / "拒绝 产物"
+            result = _run_cli_with_legacy_codepage(
+                ["--root", str(root), "--out", str(out), "--node", str(base / "不存在.exe")]
+            )
+            stderr = result.stderr.decode("utf-8")
+            self.assertEqual(result.returncode, 1, stderr)
+            self.assertEqual(result.stdout, b"")
+            self.assertIn("package-runtime: 拒绝打包", stderr)
+            self.assertIn("找不到 Node 运行时二进制", stderr)
+            self.assertNotIn("Traceback", stderr)
+            self.assertNotIn("UnicodeEncodeError", stderr)
+            self.assertFalse((out / PACK.BUNDLE_DIR_NAME).exists())
+
     def test_the_bundle_carries_the_launcher_runtime_entry_and_production_dependencies(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             base = Path(temporary_directory)

@@ -723,7 +723,7 @@ mod tests {
         let request = ReadingOverviewRequest::new(1, 0).unwrap();
         let now = UtcMillis(10 * 3_600_000);
         let sessions = vec![
-            session(1 * 3_600_000, 60_000, ReadingSessionCategory::Book),
+            session(3_600_000, 60_000, ReadingSessionCategory::Book),
             session(5 * 3_600_000, 60_000, ReadingSessionCategory::Comic),
         ];
         let overview = aggregate(&sessions, &request, now);

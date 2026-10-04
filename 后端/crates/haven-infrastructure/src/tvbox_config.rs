@@ -943,11 +943,7 @@ fn classify_site(api: Option<&str>, ext: Option<&TvboxExt>) -> TvboxSiteKind {
 fn detect_implementation(reference: &str) -> TvboxImplementationKind {
     // TVBox 形如 `path;md5;digest`：只取第一段，摘要值不参与判断也不保存。
     let candidate = reference.split(';').next().unwrap_or("").trim();
-    let candidate = candidate
-        .split(|character| character == '?' || character == '#')
-        .next()
-        .unwrap_or("")
-        .trim();
+    let candidate = candidate.split(['?', '#']).next().unwrap_or("").trim();
     let file = candidate
         .rsplit('/')
         .next()
@@ -1003,8 +999,8 @@ fn scalar_bool(value: &Value) -> Option<bool> {
                 };
             }
             match number.as_f64() {
-                Some(float) if float == 0.0 => Some(false),
-                Some(float) if float == 1.0 => Some(true),
+                Some(0.0) => Some(false),
+                Some(1.0) => Some(true),
                 _ => None,
             }
         }
@@ -1200,6 +1196,23 @@ fn limit_error(code: &'static str, message: &'static str) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floating_boolean_flags_preserve_zero_negative_zero_and_one() {
+        for (raw, expected) in [
+            ("0.0", Some(false)),
+            ("-0.0", Some(false)),
+            ("1.0", Some(true)),
+            ("2.0", None),
+        ] {
+            let value: Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(
+                scalar_bool(&value),
+                expected,
+                "浮点布尔标志的兼容语义必须保持"
+            );
+        }
+    }
 
     const SAMPLE_CONFIG: &str = r#"{
       "spider": "./spider.jar;md5;deadbeefdeadbeef",
@@ -1484,7 +1497,7 @@ mod tests {
             "sessionKey",
             "authToken",
         ] {
-            assert!(!rendered.contains(secret), "摘要不得出现 {secret}");
+            assert!(!rendered.contains(secret), "摘要不得暴露敏感字段或原始值");
         }
     }
 

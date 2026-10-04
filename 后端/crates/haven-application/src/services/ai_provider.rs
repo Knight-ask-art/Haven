@@ -1823,18 +1823,19 @@ mod tests {
             .generate_settings_recommendation(request(&context))
             .await
             .unwrap();
-        let seen = recommender.seen_skills.lock().unwrap();
-        assert_eq!(seen.len(), 2);
-        assert!(
-            seen[1].starts_with("haven-agent-proposal\n"),
-            "技能载荷必须带上它的 id：{}",
-            seen[1]
-        );
-        assert!(
-            seen[1].contains(MARKER),
-            "启用后的技能正文必须真的进入这次请求"
-        );
-        drop(seen);
+        {
+            let seen = recommender.seen_skills.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            assert!(
+                seen[1].starts_with("haven-agent-proposal\n"),
+                "技能载荷必须带上它的 id：{}",
+                seen[1]
+            );
+            assert!(
+                seen[1].contains(MARKER),
+                "启用后的技能正文必须真的进入这次请求"
+            );
+        }
 
         // ③ 技能只是上下文：Proposal 仍然停在 pending，且没有任何设置写入。
         assert_eq!(

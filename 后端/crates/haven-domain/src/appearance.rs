@@ -267,17 +267,12 @@ impl<'de> Deserialize<'de> for AppearanceAssetId {
 ///
 /// 静态与动态壁纸**只持有资产 ID**，不持有路径或 URL：真实字节由资产存储按 ID 解析，
 /// 领域模型里不存在可以被当作文件系统或网络地址使用的字段。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum WallpaperSelection {
+    #[default]
     None,
     Static(AppearanceAssetId),
     Dynamic(AppearanceAssetId),
-}
-
-impl Default for WallpaperSelection {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl WallpaperSelection {
@@ -1783,7 +1778,7 @@ mod tests {
     #[test]
     fn asset_metadata_enforces_per_kind_byte_limits() {
         assert_eq!(AppearanceAssetKind::Font.max_bytes(), MAX_FONT_BYTES);
-        assert!(MAX_DYNAMIC_WALLPAPER_BYTES > MAX_STATIC_WALLPAPER_BYTES);
+        const { assert!(MAX_DYNAMIC_WALLPAPER_BYTES > MAX_STATIC_WALLPAPER_BYTES) };
 
         let font = AppearanceAssetMetadata::new(
             asset_id(),

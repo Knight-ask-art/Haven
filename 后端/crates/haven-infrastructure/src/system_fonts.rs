@@ -379,9 +379,7 @@ fn face_family_names(bytes: &[u8], face_offset: usize) -> Option<(String, Option
     let num_tables = u16_at(bytes, face_offset.checked_add(4)?)? as usize;
     for index in 0..num_tables.min(512) {
         let record = face_offset.checked_add(12 + index * 16)?;
-        let Some(tag) = tag_at(bytes, record) else {
-            return None;
-        };
+        let tag = tag_at(bytes, record)?;
         if &tag != b"name" {
             continue;
         }

@@ -191,14 +191,13 @@ fn credential(
     fallback_refresh: Option<&SecretString>,
 ) -> Result<CloudDriveCredential, AppError> {
     let body = zeroize::Zeroizing::new(response.bytes);
-    let outcome = match response.status {
+    match response.status {
         200 if body.len() <= MAX_TOKEN_RESPONSE_BYTES => parse(&body, fallback_refresh),
         200 => Err(malformed()),
         400 | 401 | 403 => Err(rejection(&body)),
         // 5xx / 429 / 其它意外状态都当作上游暂时不可用，可重试。
         _ => Err(err(CLOUD_DRIVE_UNAVAILABLE)),
-    };
-    outcome
+    }
 }
 
 /// 严格有界 schema：不合规的形状一律拒绝，不做兼容猜测。

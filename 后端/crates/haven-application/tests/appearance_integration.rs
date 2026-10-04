@@ -774,7 +774,7 @@ async fn concurrent_delete_and_reference_write_never_leave_a_dangling_reference(
         .unwrap();
     let still_registered = registered.iter().any(|asset| asset.id == font_id);
     assert!(
-        !(value.custom_font_asset_id == Some(font_id) && !still_registered),
+        value.custom_font_asset_id != Some(font_id) || still_registered,
         "并发结束后不得留下指向已删除资产的外观设置"
     );
 

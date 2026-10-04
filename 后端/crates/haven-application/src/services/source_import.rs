@@ -144,6 +144,9 @@ pub trait SourceCatalogProvider: Send + Sync {
     }
 }
 
+/// 漫画候选的内部路由结果：Provider、固定来源键、分发 ID、远端作品身份。
+type ComicContentCandidateRoute = (Arc<dyn SourceCatalogProvider>, &'static str, String, String);
+
 /// 来源入库服务。
 #[derive(Clone)]
 pub struct SourceImportService {
@@ -735,7 +738,7 @@ impl SourceImportService {
     fn route_comic_content_candidate(
         &self,
         handle: &str,
-    ) -> Result<(Arc<dyn SourceCatalogProvider>, &'static str, String, String), AppError> {
+    ) -> Result<ComicContentCandidateRoute, AppError> {
         let handle = handle.trim();
         let rest = handle
             .strip_prefix(CONTENT_CANDIDATE_PREFIX)

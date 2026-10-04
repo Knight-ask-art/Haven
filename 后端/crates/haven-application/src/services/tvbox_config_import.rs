@@ -654,7 +654,7 @@ mod tests {
         );
         assert!(rendered.contains("<redacted>"), "请求 Debug 必须脱敏");
         for secret in ["example.invalid", "token", "secret-value"] {
-            assert!(!rendered.contains(secret), "请求 Debug 泄露了 {secret}");
+            assert!(!rendered.contains(secret), "请求 Debug 不得暴露敏感字段");
         }
     }
 
@@ -682,10 +682,7 @@ mod tests {
             "示例站点",
             "sites",
         ] {
-            assert!(
-                !rendered.contains(secret),
-                "结果泄露了 {secret}: {rendered}"
-            );
+            assert!(!rendered.contains(secret), "结果不得暴露配置地址或原始配置");
         }
     }
 

@@ -234,13 +234,13 @@ pub(super) fn assert_current(
                     && account.generation == snapshot.account_generation => {}
             _ => return Err(cloud_binding_stale()),
         }
-        let Some(current) = get_object_on_conn(&conn, &snapshot.object.id)? else {
+        let Some(current) = get_object_on_conn(conn, &snapshot.object.id)? else {
             return Err(cloud_binding_stale());
         };
         if current != snapshot.object {
             return Err(cloud_binding_stale());
         }
-        let Some((folder, location, _)) = load_bound_context_on_conn(&conn, &current)? else {
+        let Some((folder, location, _)) = load_bound_context_on_conn(conn, &current)? else {
             return Err(cloud_binding_stale());
         };
         if folder != snapshot.folder
