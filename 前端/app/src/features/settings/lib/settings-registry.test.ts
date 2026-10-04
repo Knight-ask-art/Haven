@@ -77,6 +77,16 @@ describe("settings registry", () => {
     expect(features).not.toContain("appearance.uiFont")
   })
 
+  it("hides the retired home layout while preserving its persistence contract", () => {
+    const feature = FEATURE_REGISTRY["appearance.homeLayout"]
+    expect(feature.status).toBe("absent")
+    expect(feature.consumer).toBeNull()
+    expect(feature.binding).toContain("homeLayoutGet/homeLayoutSave/homeLayoutReset")
+    expect(settingsRegistryEntry("appearance")?.features).not.toContain("appearance.homeLayout")
+    expect(settingsRegistryEntry("appearance")?.hiddenFeatures).toContain("appearance.homeLayout")
+    expect(FEATURE_REGISTRY["appearance.overviewLayout"].status).toBe("implemented")
+  })
+
   it("registers the RSS/Atom source family as an implemented capability", () => {
     // Task 1：订阅源有真实 gateway 绑定（source_add kind=feed / source_registry_list
     // / source_update / source_remove）与真实页面消费者，因此登记为 implemented，

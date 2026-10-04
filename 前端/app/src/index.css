@@ -627,14 +627,6 @@
   background-color: transparent;
 }
 
-/* 桌面首页按后端保存的 4×12 网格坐标放置模块；窄屏不套坐标，保持自然单列流。 */
-@media (min-width: 1024px) {
-  .haven-home-module-positioned {
-    grid-row-start: var(--haven-home-module-row);
-    grid-column-start: var(--haven-home-module-column);
-  }
-}
-
 /* 设置页总览的三列网格只在 Tailwind 的 `xl`（1280px）分列，因此保存下来的 3×N 网格坐标
    也在这一档才生效：它决定模块落在第几行第几列，与「档位占几列」是两件事。窄屏是单列
    自然流，坐标不参与。取值由渲染器写成 1 基的网格线编号（`row + 1` / `column + 1`）。 */

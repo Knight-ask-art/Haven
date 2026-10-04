@@ -204,10 +204,10 @@ export const FEATURE_REGISTRY: Readonly<Record<FeatureId, FeatureDescriptor>> = 
   },
   "appearance.homeLayout": {
     label: "首页布局",
-    status: "implemented",
+    status: "absent",
     binding: "appearanceGateway.homeLayoutGet/homeLayoutSave/homeLayoutReset",
-    consumer: "features/home/pages/HomePage.tsx",
-    note: "",
+    consumer: null,
+    note: "首页只保留欢迎区与留白，不再渲染内容模块；已有布局持久化契约保留，生产设置页不展示该编辑器。",
   },
   "appearance.overviewLayout": {
     label: "总览布局",
@@ -552,7 +552,6 @@ export const SETTINGS_REGISTRY: readonly SettingsRegistryEntry[] = [
     bindings: [
       "settingsGateway.settingsGet/settingsUpdate(section: appearance)",
       "appearanceGateway.appearanceAssetsList/appearanceAssetImport/appearanceAssetDelete",
-      "appearanceGateway.homeLayoutGet/homeLayoutSave/homeLayoutReset",
       "appearanceGateway.overviewLayoutGet/overviewLayoutSave/overviewLayoutReset",
     ],
     features: [
@@ -563,10 +562,9 @@ export const SETTINGS_REGISTRY: readonly SettingsRegistryEntry[] = [
       "appearance.reduceMotion",
       "appearance.interfaceFont",
       "appearance.wallpaper",
-      "appearance.homeLayout",
       "appearance.overviewLayout",
     ],
-    hiddenFeatures: [],
+    hiddenFeatures: ["appearance.homeLayout"],
   },
   {
     id: "reading",

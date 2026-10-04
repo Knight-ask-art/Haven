@@ -2,9 +2,9 @@
 //
 // 切分区不该把「外观分区持有的编辑器状态」一起卸载。
 //
-// 首页布局编辑器、外观资产列表与外观表单草稿都是**页面级**状态：外观分区只是它们的
+// 总览布局编辑器、外观资产列表与外观表单草稿都是**页面级**状态：外观分区只是它们的
 // 渲染位置。如果它们随分区挂载/卸载，用户「导入资产 → 切到阅读分区 → 切回来」会看到
-// 列表重新读一遍、上一次导入/删除的结果消失，首页布局里还没保存的改动也会被丢掉。
+// 列表重新读一遍、上一次导入/删除的结果消失，总览布局里还没保存的改动也会被丢掉。
 //
 // 这条用例断言的是**行为**而不是接线形状：切走再切回来之后，gateway 的读取次数必须
 // 还是 1（没有重读），而且那份没保存的布局草稿必须还在页面上。
@@ -88,13 +88,15 @@ function navItem(label: string): HTMLButtonElement {
 }
 
 describe("settings section navigation keeps editor state alive", () => {
-  it("does not re-read the asset list or the home layout when switching sections", async () => {
+  it("keeps the asset list and overview draft alive without loading retired home layout", async () => {
     renderSettings("appearance")
-    await waitFor(() => expect(reads.homeLayoutGet).toBe(1))
+    await waitFor(() => expect(reads.overviewLayoutGet).toBe(1))
     await waitFor(() => expect(reads.assetsList).toBe(1))
 
-    // 在首页布局里留下一个**还没保存**的改动：它只活在编辑器的草稿里。
-    fireEvent.click(screen.getByLabelText("显示最近添加"))
+    expect(screen.queryByText("首页布局")).toBeNull()
+    expect(screen.queryByLabelText("显示最近添加")).toBeNull()
+    // 总览布局仍有真实消费者；切换分区不能丢掉它的草稿。
+    fireEvent.click(screen.getByLabelText("显示每日阅读时长"))
     expect(screen.getByText("有未保存的布局修改")).toBeTruthy()
 
     // 切到别的分区，再切回来。
@@ -103,8 +105,9 @@ describe("settings section navigation keeps editor state alive", () => {
     fireEvent.click(navItem("外观"))
     expect(document.querySelector('[aria-label="Appearance"]')).not.toBeNull()
 
-    // 两次读取都还是 1：分区切换没有把这两个编辑器卸载重来。
-    expect(reads.homeLayoutGet).toBe(1)
+    // 活跃资源只读一次，已退役的首页布局不再加载。
+    expect(reads.homeLayoutGet).toBe(0)
+    expect(reads.overviewLayoutGet).toBe(1)
     expect(reads.assetsList).toBe(1)
     // 而且那份没保存的草稿原样还在——这正是「卸载重来」会丢掉的东西。
     expect(screen.getByText("有未保存的布局修改")).toBeTruthy()
@@ -117,8 +120,7 @@ describe("settings section navigation keeps editor state alive", () => {
     fireEvent.click(navItem("阅读"))
     fireEvent.click(navItem("总览"))
 
-    // 总览布局本来就已经是页面级状态；这条顺手把「新增的两个 Hook 也要按同一套标准放」
-    // 这件事钉在同一份断言里。
+    // 总览布局仍是页面级状态，往返导航不会重建它。
     expect(reads.overviewLayoutGet).toBe(1)
   })
 })

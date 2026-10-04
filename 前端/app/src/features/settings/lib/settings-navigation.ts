@@ -35,7 +35,6 @@ export function filterSettingsNavigationGroups<T extends SettingsNavigationSearc
 /** 搜索别名只描述现有控件；可见能力仍由 Registry 决定，不登记另一份功能清单。 */
 const FEATURE_SEARCH_TERMS: Partial<Record<FeatureId, readonly string[]>> = {
   "appearance.interfaceFont": ["界面字体", "自定义字体", "字体导入", "系统字体"],
-  "appearance.homeLayout": ["首页模块", "首页布局"],
   "reading.typography": ["默认字体", "字号", "字体大小", "行高", "正文宽度"],
   "reading.customAppearance": ["阅读底色", "页面底色", "正文颜色", "暖光"],
   "reading.pagination": ["阅读模式", "滚动", "分页", "单页", "双页"],
