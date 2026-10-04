@@ -109,6 +109,9 @@ def _run_cli_with_legacy_codepage(arguments: list[str]) -> subprocess.CompletedP
 
 
 class PackageRuntimeTests(unittest.TestCase):
+    def test_repository_pins_an_exact_node_runtime_version(self) -> None:
+        self.assertRegex(NODE_VERSION, r"^[0-9]+\.[0-9]+\.[0-9]+$")
+
     def test_importing_the_packager_does_not_reconfigure_caller_streams(self) -> None:
         streams = (sys.stdout, sys.stderr)
         encodings = tuple(stream.encoding for stream in streams)
