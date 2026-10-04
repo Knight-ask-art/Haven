@@ -12,6 +12,7 @@ import { PdfReader } from "./PdfReader"
  * it fails in the real renderer instead of only failing the type checker.
  */
 interface RenderParams {
+  canvas: HTMLCanvasElement | null
   canvasContext?: CanvasRenderingContext2D
   viewport: { width: number; height: number }
   transform?: number[]
@@ -98,6 +99,7 @@ describe("PdfReader canvas rendering", () => {
     const canvas = container.querySelector("canvas")
     expect(canvas).not.toBeNull()
     expect(renderCalls).toHaveLength(1)
+    expect(renderCalls[0].canvas).toBeNull()
     expect(renderCalls[0].canvasContext?.canvas).toBe(canvas)
     expect(renderCalls[0].viewport).toMatchObject({ width: 600, height: 800 })
   })

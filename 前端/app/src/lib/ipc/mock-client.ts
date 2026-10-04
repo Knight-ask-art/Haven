@@ -126,10 +126,17 @@ import type {
   PreferenceReadingSettingsDto,
   PeriodicalTreeGetRequest,
   PeriodicalTreeDto,
+  AgentBrokerStatusResultDto,
   AgentCapabilityManifestDto,
   AgentSettingChangeDto,
   AgentSettingChangeReceiptDto,
   AgentSettingChangeReceiptGetRequest,
+  AgentResourcePreferenceProposalApproveRequest,
+  AgentResourcePreferenceProposalApproveResultDto,
+  AgentResourcePreferenceProposalCreateRequest,
+  AgentResourcePreferenceProposalDto,
+  AgentResourcePreferenceProposalGetRequest,
+  AgentResourcePreferenceProposalGetResultDto,
   AgentSettingsContextDto,
   AgentSettingsProposalApproveRequest,
   AgentSettingsProposalApproveResultDto,
@@ -139,6 +146,19 @@ import type {
   AgentSettingsProposalGetResultDto,
   AgentSettingsProposalRejectRequest,
   AgentSettingsProposalRejectResultDto,
+  AgentTraceGetRequest,
+  AgentTraceGetResultDto,
+  AiModelCapabilityDto,
+  AiProviderModelsCatalogDto,
+  AiProviderModelsListRequest,
+  AiSettingsRecommendationDto,
+  AiSettingsRecommendationGenerateRequest,
+  AiProviderProfileDeleteRequest,
+  AiProviderProfileDeleteResultDto,
+  AiProviderProfileDto,
+  AiProviderProfileGetRequest,
+  AiProviderProfileListResultDto,
+  AiProviderProfileUpsertRequest,
 } from "./generated/wire";
 import type {
   SettingsChangedDto,
@@ -196,6 +216,10 @@ import sourceRegistryNormal from "../../../../../contracts/ipc/v1/fixtures/sourc
 import sourceSetErrorUnknown from "../../../../../contracts/ipc/v1/fixtures/source/set.error-unknown-source.json" with { type: "json" };
 import mediaStateNormal from "../../../../../contracts/ipc/v1/fixtures/media-state/state.normal.json" with { type: "json" };
 import appInfoMock from "../../../../../contracts/ipc/v1/fixtures/app-info/mock.json" with { type: "json" };
+// A2 AI Provider：Mock 的默认状态就是「没有任何 profile」，也就是 UI 必须显示的
+// 「无可用模型」。它不会凭空造出一个模型目录来让界面好看。
+import aiProviderProfilesEmpty from "../../../../../contracts/ipc/v1/fixtures/ai-provider/profile.list.empty.json" with { type: "json" };
+import aiProviderModelsReady from "../../../../../contracts/ipc/v1/fixtures/ai-provider/models.catalog.normal.json" with { type: "json" };
 import { HavenError } from "./errors.js";
 
 const RESOURCE_FIXTURE_MEDIA_ITEM_ID = "0196f0d2-0000-7000-8000-000000000000";
@@ -590,6 +614,16 @@ function mockUuidFromDigest(digest: string): string {
   return `${joined.slice(0, 8)}-${joined.slice(8, 12)}-${joined.slice(12, 16)}-${joined.slice(16, 20)}-${joined.slice(20, 32)}`
 }
 
+/**
+ * Browser Demo 的 Broker「端点」。
+ *
+ * 它**不是** Windows Named Pipe，也不是 Unix domain socket：浏览器里没有 Rust
+ * Broker，没有监听，也没有可连接的本地端点。因此这里给的是一个明确标注的演示
+ * 标识，而不是 `\\.\pipe\haven-agent-v1-…` / `…/agent-v1.sock` 形状的假路径——
+ * 伪造一段真实形态的本地地址，会让页面把假端点当可用配置展示或复制给用户。
+ */
+const MOCK_AGENT_BROKER_ENDPOINT = "mock://browser-preview-agent-broker"
+
 export class MockHavenClient implements HavenClient {
   /** 空库模式：libraryList 返回 list.empty（供空态 UI 场景）。 */
   private readonly emptyLibrary: boolean;
@@ -611,10 +645,21 @@ export class MockHavenClient implements HavenClient {
   private readonly markers: MarkerDto[] = [];
   private readonly agentProposals = new Map<string, MockAgentProposalRecord>();
   private agentProposalCounter = 1;
+  /** A5：Broker 与 Rust 侧一样**默认关闭**；只有显式 enable 才是 listening。 */
+  private agentBrokerListening = false;
   private searchOperationCounter = 1;
   private readonly sourceEnabled = new Map<string, boolean>();
   private readonly sourceEndpoints = new Map<string, string>();
   private readonly credentialProfiles = new Set<string>();
+  /// A2：Mock 的初始 Provider Profile 集合直接来自共享 fixture（当前为空），
+  /// 因此默认状态下设置页必须显示「无可用模型」。
+  private readonly aiProfiles = new Map<string, AiProviderProfileDto>(
+    (aiProviderProfilesEmpty.profiles as AiProviderProfileDto[]).map((profile) => [
+      profile.profileId,
+      profile,
+    ]),
+  );
+  private aiProfileRevisionCounter = 1;
   private readonly searchOperations = new Map<
     string,
     { queryKey: string; finished: boolean; onEvent?: (event: SearchSourceEvent) => void; nextSequence: number }
@@ -1723,6 +1768,143 @@ export class MockHavenClient implements HavenClient {
     this.credentialProfiles.delete(this.credentialKey(request));
   }
 
+  // ---- A2 AI Provider 基础切片 ----
+  // Mock 只复现 Application service 的**决策**（CAS、空态、凭据存在性），
+  // 不复现网络：模型目录直接来自共享 fixture，绝不会从模型名推断能力。
+  //
+  // 端点校验在这里只做形状检查（http/https、无查询参数）。主机策略
+  // （公网、多标签、允许端口、DNS 固定）由 Rust 侧唯一实现；在 TS 里再写一份
+  // 安全策略只会制造两套会漂移的真相。
+
+  async aiProviderProfileList(): Promise<AiProviderProfileListResultDto> {
+    const profiles = [...this.aiProfiles.values()]
+      .sort((left, right) => left.profileId.localeCompare(right.profileId))
+      .map((profile) => this.withCredentialState(profile));
+    return { schemaVersion: 1, profiles };
+  }
+
+  async aiProviderProfileGet(request: AiProviderProfileGetRequest): Promise<AiProviderProfileDto> {
+    return this.withCredentialState(this.requireAiProfile(request.profileId));
+  }
+
+  async aiProviderProfileUpsert(
+    request: AiProviderProfileUpsertRequest,
+  ): Promise<AiProviderProfileDto> {
+    if (request.kind !== "openai_compatible") {
+      throw new HavenError({
+        code: "INVALID_ARGUMENT",
+        userMessage: "当前只支持 OpenAI 兼容协议",
+        retryable: false,
+      });
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(request.profileId)) {
+      throw new HavenError({
+        code: "AI_PROVIDER_PROFILE_ID_INVALID",
+        userMessage: "profile id 只允许 ASCII 字母、数字、连字符与下划线",
+        retryable: false,
+      });
+    }
+    if (!/^https?:\/\/[^/?#\s]+/.test(request.endpoint) || request.endpoint.includes("?")) {
+      throw new HavenError({
+        code: "AI_PROVIDER_ENDPOINT_INVALID",
+        userMessage: "API 地址必须是 http/https URL，且不得包含查询参数",
+        retryable: false,
+      });
+    }
+    const current = this.aiProfiles.get(request.profileId);
+    const expected = request.expectedRevision;
+    const matches = expected === null ? current === undefined : current?.revision === expected;
+    if (!matches) {
+      throw new HavenError({
+        code: "AI_PROVIDER_PROFILE_REVISION_CONFLICT",
+        userMessage: "AI Provider 配置已被其它操作修改，请重新读取后再试",
+        retryable: true,
+      });
+    }
+    const revision = `mock-ai-rev-${this.aiProfileRevisionCounter++}`;
+    const now = "2026-09-18T00:00:00Z";
+    const stored: AiProviderProfileDto = {
+      schemaVersion: 1,
+      profileId: request.profileId,
+      displayName: request.displayName,
+      kind: request.kind,
+      endpoint: request.endpoint.replace(/\/+$/, ""),
+      enabled: request.enabled,
+      selectedModelId: request.selectedModelId,
+      credentialConfigured: false,
+      revision,
+      createdAt: current?.createdAt ?? now,
+      updatedAt: now,
+    };
+    this.aiProfiles.set(request.profileId, stored);
+    return this.withCredentialState(stored);
+  }
+
+  async aiProviderProfileDelete(
+    request: AiProviderProfileDeleteRequest,
+  ): Promise<AiProviderProfileDeleteResultDto> {
+    const profile = this.requireAiProfile(request.profileId);
+    // 与后端同样的 CAS 语义：过期版本在**清理凭据之前**被拒绝。
+    // Mock 若在这里放行，UI 的冲突分支在开发环境里永远不会被走到，
+    // 而后端会拒绝并保留数据 —— 这种分歧比"少一个 Mock 分支"危险得多。
+    if (request.expectedRevision !== null && request.expectedRevision !== profile.revision) {
+      throw new HavenError({
+        code: "AI_PROVIDER_PROFILE_REVISION_CONFLICT",
+        userMessage: "AI Provider 配置已被其它操作修改，请重新读取后再试",
+        retryable: true,
+      });
+    }
+    // 与后端同顺序：先清理凭据、再删除行。凭据清理失败会中止整次删除。
+    const credentialDeleted = this.credentialProfiles.delete(`ai:${profile.profileId}`);
+    this.aiProfiles.delete(profile.profileId);
+    return { profileId: profile.profileId, credentialDeleted };
+  }
+
+  async aiProviderModelsList(
+    request: AiProviderModelsListRequest,
+  ): Promise<AiProviderModelsCatalogDto> {
+    const profile = this.requireAiProfile(request.profileId);
+    if (!profile.enabled) {
+      return { schemaVersion: 1, profileId: profile.profileId, state: "disabled", models: [] };
+    }
+    if (!this.credentialProfiles.has(`ai:${profile.profileId}`)) {
+      // 没有密钥就不发请求，也不猜模型：这是 UI 显示「无可用模型」的正常路径。
+      return { schemaVersion: 1, profileId: profile.profileId, state: "no_credential", models: [] };
+    }
+    // 共享 fixture 目录：能力字段全部来自 fixture 的显式声明。
+    const models = aiProviderModelsReady.models.map((model) => ({
+      modelId: model.modelId,
+      displayName: model.displayName,
+      created: model.created,
+      ownedBy: model.ownedBy,
+      chat: model.chat as AiModelCapabilityDto,
+      vision: model.vision as AiModelCapabilityDto,
+      embedding: model.embedding as AiModelCapabilityDto,
+    }));
+    return models.length === 0
+      ? { schemaVersion: 1, profileId: profile.profileId, state: "empty", models: [] }
+      : { schemaVersion: 1, profileId: profile.profileId, state: "ready", models };
+  }
+
+  private requireAiProfile(profileId: string): AiProviderProfileDto {
+    const profile = this.aiProfiles.get(profileId);
+    if (!profile) {
+      throw new HavenError({
+        code: "AI_PROVIDER_PROFILE_NOT_FOUND",
+        userMessage: `未找到 AI Provider 配置：${profileId}`,
+        retryable: false,
+      });
+    }
+    return profile;
+  }
+
+  private withCredentialState(profile: AiProviderProfileDto): AiProviderProfileDto {
+    return {
+      ...profile,
+      credentialConfigured: this.credentialProfiles.has(`ai:${profile.profileId}`),
+    };
+  }
+
   /** `media_state_get`：已知作品返回共享 Fixture 聚合；其余诚实空态。 */
   async mediaStateGet(request: MediaStateGetRequest): Promise<MediaStateDto> {
     if (request.workId.length !== 36) {
@@ -2089,13 +2271,32 @@ export class MockHavenClient implements HavenClient {
       capabilities: {
         settingsRead: true,
         settingsProposal: true,
-        librarySummaryRead: false,
+        librarySummaryRead: true,
+        settingSourcesRead: true,
+        resourcePreferenceRead: true,
+        resourcePreferenceProposal: true,
+        mediaCapabilitiesRead: true,
+        onboardingRead: true,
         metadataProposal: false,
         renameProposal: false,
         secretRead: false,
         filesystemWrite: false,
       },
     }
+  }
+
+  /**
+   * Mock 不伪造模型调用或 AI 推荐；没有真实 Provider 时给出与 Rust 相同的显式空能力错误。
+   * 这样 UI 可以开发错误/未配置状态，但不会把演示数据误显示为模型生成结果。
+   */
+  async aiSettingsRecommendationGenerate(
+    _request: AiSettingsRecommendationGenerateRequest,
+  ): Promise<AiSettingsRecommendationDto> {
+    throw new HavenError({
+      code: "AI_PROVIDER_RECOMMENDATION_UNAVAILABLE",
+      userMessage: "当前演示环境未接入 AI 设置推荐",
+      retryable: false,
+    });
   }
 
   async agentSettingsContextGet(): Promise<AgentSettingsContextDto> {
@@ -2263,6 +2464,40 @@ export class MockHavenClient implements HavenClient {
     return mockReceiptDto(record)
   }
 
+  async agentResourcePreferenceProposalCreate(
+    _request: AgentResourcePreferenceProposalCreateRequest,
+  ): Promise<AgentResourcePreferenceProposalDto> {
+    throw new HavenError({
+      code: "HAVEN_CAPABILITY_UNAVAILABLE",
+      userMessage: "当前能力未开放",
+      retryable: false,
+    });
+  }
+
+  async agentResourcePreferenceProposalGet(
+    _request: AgentResourcePreferenceProposalGetRequest,
+  ): Promise<AgentResourcePreferenceProposalGetResultDto> {
+    throw new HavenError({
+      code: "HAVEN_CAPABILITY_UNAVAILABLE",
+      userMessage: "当前能力未开放",
+      retryable: false,
+    });
+  }
+
+  async agentResourcePreferenceProposalApprove(
+    _request: AgentResourcePreferenceProposalApproveRequest,
+  ): Promise<AgentResourcePreferenceProposalApproveResultDto> {
+    throw new HavenError({
+      code: "HAVEN_CAPABILITY_UNAVAILABLE",
+      userMessage: "当前能力未开放",
+      retryable: false,
+    });
+  }
+
+  async agentTraceGet(request: AgentTraceGetRequest): Promise<AgentTraceGetResultDto> {
+    return { schemaVersion: 1, sessionId: request.sessionId, events: [] };
+  }
+
   /** authoritative 阅读设置（与 `settingsGet("reading")` 同源，不另建状态）。 */
   private mockReadingState(): { revision: string | null; value: SettingsValue } {
     const state = this.settings.get("reading")
@@ -2301,7 +2536,12 @@ export class MockHavenClient implements HavenClient {
         capabilities: {
           settingsRead: true,
           settingsProposal: true,
-          librarySummaryRead: false,
+          librarySummaryRead: true,
+          settingSourcesRead: true,
+          resourcePreferenceRead: true,
+          resourcePreferenceProposal: true,
+          mediaCapabilitiesRead: true,
+          onboardingRead: true,
           metadataProposal: false,
           renameProposal: false,
           secretRead: false,
@@ -2321,6 +2561,44 @@ export class MockHavenClient implements HavenClient {
       })
     }
     return record
+  }
+
+  // ---- A5 外部 Agent Broker（Mock/开发契约；契约 §4.5 默认关闭） ----
+  //
+  // 这里只复现「默认关闭 → 用户显式开启 → 显式关闭」这一个状态机。Mock 不监听、
+  // 不绑定 Named Pipe / Unix socket、不建任何连接，也没有可被外部进程发现的端点：
+  // enable 只是把状态置为 listening，端点值是上面那个明确标注的演示标识。
+  //
+  // `busy` / `unavailable` 是 Rust 对「端点被另一实例占用」与「平台不支持或端点无法
+  // 解析」的 fail-closed 结论。浏览器里根本没有端点可解析，因此 Mock 不伪造这两种
+  // 状态——页面在这两个分支上的行为只能由 Rust 侧与单元测试覆盖。
+
+  async agentBrokerStatus(): Promise<AgentBrokerStatusResultDto> {
+    return this.agentBrokerProjection()
+  }
+
+  /** 幂等：已开启时重复 enable 返回同一端点，与 Rust 的 enable 语义一致。 */
+  async agentBrokerEnable(): Promise<AgentBrokerStatusResultDto> {
+    this.agentBrokerListening = true
+    return this.agentBrokerProjection()
+  }
+
+  /** 幂等：未开启时 disable 也返回 disabled（Rust 侧 disable 不报错）。 */
+  async agentBrokerDisable(): Promise<AgentBrokerStatusResultDto> {
+    this.agentBrokerListening = false
+    return this.agentBrokerProjection()
+  }
+
+  private agentBrokerProjection(): AgentBrokerStatusResultDto {
+    // endpoint 不是秘密（契约 §4.2）：它只在 listening 时出现，且从不进错误文案。
+    return this.agentBrokerListening
+      ? {
+          schemaVersion: 1,
+          status: "listening",
+          endpoint: MOCK_AGENT_BROKER_ENDPOINT,
+          reason: null,
+        }
+      : { schemaVersion: 1, status: "disabled", endpoint: null, reason: null }
   }
 
   private nextRuntimeIdentity(): string {

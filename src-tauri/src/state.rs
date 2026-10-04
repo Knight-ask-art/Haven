@@ -10,7 +10,12 @@ use std::sync::Arc;
 use tauri::Emitter;
 
 use haven_application::services::agent::{AgentProposalService, RepositoryAgentSubjectScope};
+use haven_application::services::agent_context::AgentContextQueryService;
 use haven_application::services::agent_settings_ipc::AgentSettingsIpcService;
+use haven_application::services::agent_trace::{
+    AgentTraceQueryService, InMemoryAgentTraceCollector,
+};
+use haven_application::services::ai_provider::AiProviderProfileService;
 use haven_application::services::cache::CacheService;
 use haven_application::services::cast::{CastGrantRegistry, CastService};
 use haven_application::services::comic::ComicPageService;
@@ -72,6 +77,7 @@ use haven_infrastructure::scanner::LocalLibraryScanner;
 use haven_infrastructure::video_screenshot::LocalVideoScreenshotProvider;
 use haven_infrastructure::Db;
 
+use crate::agent_broker::AgentBrokerManager;
 use crate::download_sink::TauriDownloadEventSink;
 use crate::reader_search_sink::TauriReaderSearchEventSink;
 use crate::scan_sink::TauriScanEventSink;
@@ -134,6 +140,11 @@ pub struct AppState {
     pub stream_registry: Arc<StreamRegistry>,
     /// Provider Profile 凭据（契约 §36.5；WebDAV 前置）。
     pub credential_access: CredentialAccessService,
+    /// AI Provider Profile 的非敏感配置与只读模型目录（A2 基础切片）。
+    ///
+    /// 不持有任何 secret：凭据在 CredentialStore，本服务只在模型发现调用栈内
+    /// 临时取出。Provider 无法通过它写入本机状态。
+    pub ai_provider: AiProviderProfileService,
     pub trending: TrendingService,
     pub artwork_cache: Arc<ArtworkCache>,
     /// About / Diagnostics：只返回构建信息和固定目录的脱敏投影。
@@ -156,6 +167,21 @@ pub struct AppState {
     pub setting_proposals: SettingProposalService,
     /// 全局设置 Agent 的 Typed Application 入口（读取/提案/批准/回执）。
     pub agent_settings: AgentSettingsIpcService,
+    /// Agent 轨迹的有界进程内 collector；未来 UI 通过 `agent_trace_get` 读取。
+    pub agent_trace: Arc<InMemoryAgentTraceCollector>,
+    pub agent_trace_query: AgentTraceQueryService,
+    /// 外部 Agent 共享的只读上下文与资源偏好提案 Application 入口。
+    ///
+    /// Broker 只持有该服务的 Clone，不自行创建 Repository、DB 或 Provider；
+    /// 因此内置 Agent、MCP 与未来其它外部 Agent 入口看到的是同一份 authoritative
+    /// context 与 Proposal 事实。
+    pub agent_context: AgentContextQueryService,
+    /// 外部 Agent 接入 Broker（A5 接线切片；契约 §4.5）。
+    ///
+    /// **默认关闭**：构造它不创建端点，端点只在用户显式开启后才存在。
+    /// manager 内部转调的 `AgentSettingsBrokerApi` 复用上面同一个
+    /// `agent_settings`，因此这里不出现第二套 DB/Repository/UoW。
+    pub agent_broker: Arc<AgentBrokerManager>,
 }
 
 impl AppState {
@@ -186,11 +212,18 @@ impl AppState {
             repos.clone(),
         )
         .with_settings_service(settings.clone());
+        let agent_context_proposals = agent_proposals.clone();
+        let agent_trace = Arc::new(InMemoryAgentTraceCollector::new());
+        let agent_trace_query = AgentTraceQueryService::new(agent_trace.clone());
         let agent_settings = AgentSettingsIpcService::new(
             setting_proposals.clone(),
             agent_proposals,
             settings.clone(),
-        );
+        )
+        .with_trace(agent_trace.clone());
+        // A5 接线：Broker **默认关闭**。构造只建一个空 manager——不解析端点、
+        // 不碰文件系统、不新建 DB 句柄；端点只在用户显式 enable 时创建。
+        let agent_broker = Arc::new(AgentBrokerManager::default());
         let resource_preferences = ResourcePreferenceService::new(
             repos.clone(),
             repos.clone(),
@@ -283,19 +316,23 @@ impl AppState {
         })?);
         // V2-H 收尾批次：自定义源凭据解析器——搜索/导入请求前从系统 keyring 取
         // Basic Auth secret（内存即取即用，禁止落盘/日志）。
+        //
+        // 组合根只构造一个 CredentialStore：自定义源凭据、Provider Profile 凭据与
+        // AI Provider 凭据都是同一个系统凭据库的视图，多建实例只会多出互不相干的句柄。
         let credential_store = haven_infrastructure::credential::credential_store()?;
         let opds_client = Arc::new(
-            haven_infrastructure::opds::OpdsClient::new()?.with_credential_resolver(Arc::new(
+            haven_infrastructure::opds::OpdsClient::new()?.with_credential_resolver(Arc::new({
+                let store = credential_store.clone();
                 move |source_id: &str| {
-                    let store = credential_store.clone();
+                    let store = store.clone();
                     let source_id = source_id.to_owned();
                     Box::pin(async move {
                         let target = haven_application::services::source_registry::SourceRegistryService::custom_credential_target(&source_id).ok()?;
                         let secret = store.get(&target).await.ok()??;
                         Some(secret.expose().to_owned())
                     })
-                },
-            )),
+                }
+            })),
         );
         // V2-H1：OPDS 书源——3 个内置参与者 + 已启用自定义源动态参与者。
         let mut participants: Vec<Arc<dyn SearchSourceParticipant>> = vec![Arc::new(
@@ -451,8 +488,36 @@ impl AppState {
         let stream_ports: Arc<dyn haven_application::services::ports::SessionOpenPorts> =
             repos.clone();
         let stream = StreamService::new(stream_ports.clone());
-        let credential_access =
-            CredentialAccessService::new(haven_infrastructure::credential::credential_store()?);
+        let credential_access = CredentialAccessService::new(credential_store.clone());
+        // A2 AI Provider 基础切片：profile 持久化复用同一份 SqliteRepositories（同一 DB
+        // 句柄，不建第二套连接），凭据复用上面同一个 CredentialStore，出站模型发现走
+        // Infrastructure 适配器。Application service 是命令层唯一可达的入口。
+        let ai_provider_profiles: Arc<dyn haven_domain::contracts::AiProviderProfileRepository> =
+            repos.clone();
+        let ai_provider = AiProviderProfileService::new(
+            ai_provider_profiles,
+            credential_store,
+            Arc::new(haven_infrastructure::ai_provider::OpenAiCompatibleModelCatalog::new()),
+        )
+        .with_settings_recommendation(Arc::new(
+            haven_infrastructure::ai_provider::OpenAiCompatibleSettingsRecommender::new(),
+        ))
+        .with_agent_settings(agent_settings.clone())
+        .with_trace(agent_trace.clone());
+        let agent_context = AgentContextQueryService::new(
+            repos.clone(),
+            repos.clone(),
+            repos.clone(),
+            repos.clone(),
+            repos.clone(),
+            repos.clone(),
+            repos.clone(),
+            repos.clone(),
+            settings.clone(),
+            agent_context_proposals,
+            ai_provider.clone(),
+        )
+        .with_trace(agent_trace.clone());
         // Trending：Query 只读 SQLite 快照；Refresh 才访问豆瓣并写技术缓存。
         // 生产组合根不使用静态榜单兜底，来源不可用时由 Refresh 返回可重试错误。
         let artwork_cache = Arc::new(ArtworkCache::new(
@@ -536,6 +601,7 @@ impl AppState {
             stream,
             stream_registry,
             credential_access,
+            ai_provider,
             trending,
             artwork_cache,
             app_info,
@@ -550,6 +616,10 @@ impl AppState {
             video_screenshot,
             setting_proposals,
             agent_settings,
+            agent_trace,
+            agent_trace_query,
+            agent_context,
+            agent_broker,
         })
     }
 }
