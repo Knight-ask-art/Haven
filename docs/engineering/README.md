@@ -16,7 +16,8 @@ reviewed and integrated.
 
 ## Start here
 
-- [Task Workflow](../TASK_WORKFLOW.md)
+- [Engineering Change Workflow](../TASK_WORKFLOW.md)
+- [Contributor Responsibilities](contributing.md)
 - [Documentation System](documentation-system.md)
 - [Documentation Migration](documentation-migration.md)
 - [Git, Worktrees and Commits](git-worktree-and-commits.md)

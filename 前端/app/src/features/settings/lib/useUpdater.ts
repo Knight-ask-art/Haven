@@ -1,14 +1,16 @@
 import { useCallback, useRef, useState } from "react";
 import type { HavenError } from "@/lib/ipc/errors";
-import type { UpdaterCheckResult } from "@/lib/ipc/client";
+import type { UpdaterCheckResult, UpdaterProgress } from "@/lib/ipc/client";
+import { toHavenError } from "@/lib/ipc/errors";
 import { updaterGateway } from "../ipc/updater-gateway";
 
-export type UpdaterStatus = "idle" | "checking" | "up_to_date" | "available" | "installing" | "error";
+export type UpdaterStatus = "idle" | "checking" | "up_to_date" | "available" | "installing" | "installed" | "error";
 
 export interface UpdaterState {
   status: UpdaterStatus;
   result: UpdaterCheckResult | null;
   error: HavenError | null;
+  progress: UpdaterProgress | null;
   check: () => Promise<boolean>;
   install: () => Promise<boolean>;
 }
@@ -21,12 +23,17 @@ export function useUpdater(): UpdaterState {
   const [status, setStatus] = useState<UpdaterStatus>("idle");
   const [result, setResult] = useState<UpdaterCheckResult | null>(null);
   const [error, setError] = useState<HavenError | null>(null);
+  const [progress, setProgress] = useState<UpdaterProgress | null>(null);
   const requestId = useRef(0);
+  const busy = useRef(false);
 
   const check = useCallback(async () => {
+    if (busy.current) return false;
+    busy.current = true;
     const id = ++requestId.current;
     setStatus("checking");
     setError(null);
+    setProgress(null);
     try {
       const next = await updaterGateway.check();
       if (id !== requestId.current) return false;
@@ -35,29 +42,36 @@ export function useUpdater(): UpdaterState {
       return true;
     } catch (cause) {
       if (id !== requestId.current) return false;
-      setError(cause as HavenError);
+      setError(toHavenError(cause));
       setStatus("error");
       return false;
+    } finally {
+      busy.current = false;
     }
   }, []);
 
   const install = useCallback(async () => {
-    if (!result || result.status !== "available") return false;
+    if (busy.current || !result || result.status !== "available") return false;
+    busy.current = true;
     const id = ++requestId.current;
     setStatus("installing");
     setError(null);
     try {
-      await updaterGateway.install();
+      await updaterGateway.install((next) => {
+        if (id === requestId.current) setProgress(next);
+      });
       if (id !== requestId.current) return false;
-      setStatus("up_to_date");
+      setStatus("installed");
       return true;
     } catch (cause) {
       if (id !== requestId.current) return false;
-      setError(cause as HavenError);
+      setError(toHavenError(cause));
       setStatus("error");
       return false;
+    } finally {
+      busy.current = false;
     }
   }, [result]);
 
-  return { status, result, error, check, install };
+  return { status, result, error, progress, check, install };
 }

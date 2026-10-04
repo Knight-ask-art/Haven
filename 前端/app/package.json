@@ -1,11 +1,11 @@
 {
   "name": "app",
   "private": true,
-  "version": "0.1.0-beta.1",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && node scripts/write-build-info.mjs",
     "test": "vitest run",
     "lint": "oxlint",
     "preview": "vite preview",
@@ -27,6 +27,7 @@
     "lucide-react": "^1.47.0",
     "motion": "^13.4.0",
     "pdfjs-dist": "^6.3.289",
+    "pinyin-pro": "3.29.4",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "react-markdown": "^10.1.0",

@@ -342,11 +342,27 @@ fn response_content_length(_status: reqwest::StatusCode, body: &[u8]) -> Option<
 /// 因此候选缓存和前端操作句柄保持不变。
 pub struct OnlineCatalogProvider {
     client: Arc<OnlineContentClient>,
+    /// 用户登记的 RSS/Atom 订阅源 Provider。未注入时 `feed` 来源保持不可用
+    /// （fail closed），而不是回退到某个固定主机。
+    feed: Option<Arc<crate::article_feeds::FeedProvider>>,
 }
 
 impl OnlineCatalogProvider {
     pub fn new(client: Arc<OnlineContentClient>) -> Self {
-        Self { client }
+        Self { client, feed: None }
+    }
+
+    /// 注入订阅源 Provider。组合根未注入时，`feed` 来源的在线正文会话与
+    /// 离线获取都会明确失败，不会静默改用其它来源。
+    pub fn with_feed_provider(mut self, feed: Arc<crate::article_feeds::FeedProvider>) -> Self {
+        self.feed = Some(feed);
+        self
+    }
+
+    fn feed_provider(&self) -> Result<&Arc<crate::article_feeds::FeedProvider>, AppError> {
+        self.feed
+            .as_ref()
+            .ok_or_else(|| internal_error("订阅源 Provider 未接入当前运行实例"))
     }
 
     async fn prepare_mangadex(&self, manga_id: &str) -> Result<SourceCatalogEntry, AppError> {
@@ -765,6 +781,11 @@ impl RemoteAcquisitionPort for OnlineCatalogProvider {
             "arxiv" => self.acquire_arxiv_to(remote_id, destination).await,
             "europepmc" => self.acquire_europe_pmc_to(remote_id, destination).await,
             "wikisource" => self.acquire_wikisource_to(remote_id, destination).await,
+            "feed" => {
+                self.feed_provider()?
+                    .acquire(source_key, remote_id, destination)
+                    .await
+            }
             _ => Err(invalid_argument("未知远端正文来源")),
         }
     }
@@ -848,6 +869,11 @@ impl RemoteSessionPort for OnlineCatalogProvider {
             "arxiv" => self.read_arxiv_session(remote_id, range).await,
             "europepmc" => self.read_europe_pmc_session(remote_id, range).await,
             "wikisource" => self.read_wikisource_session(remote_id, range).await,
+            "feed" => {
+                self.feed_provider()?
+                    .read(source_key, remote_id, range)
+                    .await
+            }
             _ => Err(invalid_argument("该来源不支持在线正文会话")),
         }
     }
@@ -1000,7 +1026,7 @@ fn validate_range_response(
 /// Build a bounded Article response for both the initial probe and later
 /// range reads. The upstream XML/HTML is still fetched and sanitised inside
 /// Infrastructure; only the requested slice crosses the resource protocol.
-fn bounded_session_body(
+pub(crate) fn bounded_session_body(
     bytes: Vec<u8>,
     range: Option<RemoteByteRange>,
     mime_type: &str,
@@ -1478,7 +1504,7 @@ fn image_extension(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn image_mime(bytes: &[u8]) -> Option<ComicImageMime> {
+pub(crate) fn image_mime(bytes: &[u8]) -> Option<ComicImageMime> {
     match image_extension(bytes)? {
         "jpg" => Some(ComicImageMime::Jpeg),
         "png" => Some(ComicImageMime::Png),
@@ -1500,7 +1526,7 @@ fn encode_query(value: &str) -> String {
     out
 }
 
-async fn write_bytes_to(destination: PathBuf, bytes: Vec<u8>) -> Result<u64, AppError> {
+pub(crate) async fn write_bytes_to(destination: PathBuf, bytes: Vec<u8>) -> Result<u64, AppError> {
     let directory = destination
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -1538,7 +1564,7 @@ async fn write_bytes_to(destination: PathBuf, bytes: Vec<u8>) -> Result<u64, App
     result
 }
 
-async fn write_cbz_to(
+pub(crate) async fn write_cbz_to(
     destination: PathBuf,
     pages: Vec<(String, Vec<u8>)>,
 ) -> Result<u64, AppError> {
@@ -1646,6 +1672,7 @@ fn parse_europe_pmc(xml: &str) -> EuropeDocument {
     let mut document = EuropeDocument::default();
     let mut path: Vec<String> = Vec::new();
     let mut buffer = String::new();
+    let mut text_padding = false;
     // 捕获元素的同时记录它在 `path` 中的深度：内联 XML（如 `<italic>`）和更深的嵌套
     // 元素都只是把文本追加进同一个缓冲区，不会提前结束捕获。
     let mut capture: Option<(EuropeCapture, usize)> = None;
@@ -1663,23 +1690,27 @@ fn parse_europe_pmc(xml: &str) -> EuropeDocument {
             }
             Ok(Event::Text(text)) => {
                 if capture.is_some() {
-                    let value = decode_xml_text(&text).unwrap_or_default();
+                    let value = crate::unescape_xml_text(&text).unwrap_or_default();
                     buffer.push_str(&value);
                     buffer.push(' ');
+                    text_padding = true;
                 }
             }
             Ok(Event::GeneralRef(reference)) => {
-                if capture.is_some()
-                    && let Some(value) = decode_xml_reference(&reference)
-                {
+                if capture.is_some() {
+                    let value = crate::unescape_xml_reference(&reference).unwrap_or_default();
+                    if text_padding {
+                        buffer.pop();
+                    }
                     buffer.push_str(&value);
-                    buffer.push(' ');
+                    text_padding = false;
                 }
             }
             Ok(Event::CData(text)) => {
                 if capture.is_some() {
                     buffer.push_str(&String::from_utf8_lossy(text.as_ref()));
                     buffer.push(' ');
+                    text_padding = true;
                 }
             }
             Ok(Event::End(event)) => {
@@ -1732,20 +1763,19 @@ fn parse_arxiv_metadata(xml: &str) -> Option<(String, String, Option<i32>)> {
                 }
             }
             Ok(Event::Text(text)) if in_entry => {
-                let value = decode_xml_text(&text).unwrap_or_default();
+                let value = crate::unescape_xml_text(&text).unwrap_or_default();
                 match field {
-                    Some("title") => title.push_str(value.trim()),
-                    Some("summary") => summary.push_str(value.trim()),
-                    Some("published") => year = value.get(0..4).and_then(|v| v.parse().ok()),
+                    Some("title") => title.push_str(&value),
+                    Some("summary") => summary.push_str(&value),
+                    Some("published") => year = value.trim().get(0..4).and_then(|v| v.parse().ok()),
                     _ => {}
                 }
             }
             Ok(Event::GeneralRef(reference)) if in_entry => {
-                let value = decode_xml_reference(&reference).unwrap_or_default();
+                let value = crate::unescape_xml_reference(&reference).unwrap_or_default();
                 match field {
-                    Some("title") => title.push_str(value.trim()),
-                    Some("summary") => summary.push_str(value.trim()),
-                    Some("published") => year = value.get(0..4).and_then(|v| v.parse().ok()),
+                    Some("title") => title.push_str(&value),
+                    Some("summary") => summary.push_str(&value),
                     _ => {}
                 }
             }
@@ -1776,31 +1806,18 @@ fn local_name(raw: &[u8]) -> String {
         .to_owned()
 }
 
-fn decode_xml_text(text: &quick_xml::events::BytesText<'_>) -> Option<String> {
-    let decoded = text.decode().ok()?;
-    quick_xml::escape::unescape(decoded.as_ref())
-        .ok()
-        .map(|value| value.into_owned())
-}
-
-fn decode_xml_reference(reference: &quick_xml::events::BytesRef<'_>) -> Option<String> {
-    let name = reference.decode().ok()?;
-    let raw = format!("&{name};");
-    quick_xml::escape::unescape(&raw)
-        .ok()
-        .map(|value| value.into_owned())
-}
-
 fn clean_text(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn html_to_plain_paragraphs(input: &str) -> Vec<String> {
+pub(crate) fn html_to_plain_paragraphs(input: &str) -> Vec<String> {
     let mut paragraphs = Vec::new();
     let mut text = String::new();
     let mut in_tag = false;
     let mut tag = String::new();
-    let mut skip_depth = 0usize;
+    // 被抑制元素的栈（最内层在末尾）。只记录元素名，不记录深度：
+    // 结束标签必须与最内层同名才算真正闭合。
+    let mut skip_stack: Vec<String> = Vec::new();
     let chars = input.chars();
     for ch in chars {
         if ch == '<' {
@@ -1827,13 +1844,21 @@ fn html_to_plain_paragraphs(input: &str) -> Vec<String> {
                 .contains(&lower.as_str())
                 {
                     if closing {
-                        skip_depth = skip_depth.saturating_sub(1);
-                    } else if !raw.ends_with('/')
-                        && !["img", "meta", "link", "embed"].contains(&lower.as_str())
-                    {
-                        skip_depth = skip_depth.saturating_add(1);
+                        // 只允许同名结束标签解除抑制。`<script>…</style>…</script>`
+                        // 里那个不匹配的 `</style>` 既不能提前放行脚本内容，
+                        // 也不能把整个抑制状态清零。
+                        if skip_stack.last().is_some_and(|open| *open == lower) {
+                            skip_stack.pop();
+                        }
+                    } else if !["img", "meta", "link", "embed"].contains(&lower.as_str()) {
+                        // HTML 里自闭合写法（`<script/>`）对非 void 元素没有意义：
+                        // 浏览器仍然把它当成开始标签，其后文本属于该元素的内容。
+                        // 因此这里不能因为看到 `/` 就放行后续文本——否则
+                        // `<script/>alert(1)`、`<style/>…`、`<iframe/>…` 或
+                        // `<object/>回退文本` 的内容会直接漏成可见正文。
+                        skip_stack.push(lower);
                     }
-                } else if skip_depth == 0
+                } else if skip_stack.is_empty()
                     && [
                         "p", "div", "br", "li", "h1", "h2", "h3", "h4", "h5", "h6", "tr",
                     ]
@@ -1846,7 +1871,7 @@ fn html_to_plain_paragraphs(input: &str) -> Vec<String> {
             }
             continue;
         }
-        if skip_depth == 0 {
+        if skip_stack.is_empty() {
             text.push(ch);
         }
     }
@@ -1872,7 +1897,7 @@ fn decode_basic_entities(value: &str) -> String {
         .replace("&#39;", "'")
 }
 
-fn safe_article_html(title: &str, paragraphs: &[String]) -> String {
+pub(crate) fn safe_article_html(title: &str, paragraphs: &[String]) -> String {
     let mut html =
         String::from("<!doctype html><html><head><meta charset=\"utf-8\"></head><body><article>");
     html.push_str("<h1>");
@@ -2020,6 +2045,59 @@ mod tests {
         assert!(validate_mangadex_id("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n").is_err());
         assert!(validate_page_name("page-0001.png").is_ok());
         assert!(validate_page_name("../page.png").is_err());
+    }
+
+    #[test]
+    fn self_closing_dangerous_elements_do_not_leak_their_fallback_text() {
+        // HTML 对非 void 元素忽略自闭合斜杠：`<script/>alert(1)</script>` 里的
+        // `alert(1)` 仍属于脚本内容，`<object/>回退文本</object>` 的回退文本也
+        // 不能变成可见正文。
+        let paragraphs = html_to_plain_paragraphs(
+            "<p>前文</p><script/>alert(1)</script><p>中段</p><object/>回退文本</object><p>后文</p>",
+        );
+        assert_eq!(paragraphs, vec!["前文", "中段", "后文"]);
+        for leaked in ["alert(1)", "回退文本"] {
+            assert!(
+                !paragraphs
+                    .iter()
+                    .any(|paragraph| paragraph.contains(leaked)),
+                "自闭合危险元素的内容泄漏成了正文: {leaked}"
+            );
+        }
+
+        // 带属性的自闭合形式同样如此。
+        let with_attributes = html_to_plain_paragraphs(
+            "<iframe src=\"https://evil.example/a\"/>内联文本</iframe><p>正文</p>",
+        );
+        assert_eq!(with_attributes, vec!["正文"]);
+
+        // 真正的 void 元素（无内容）不受影响。
+        let void_only =
+            html_to_plain_paragraphs("<img src=\"x\"/><meta charset=\"utf-8\"/><p>正文</p>");
+        assert_eq!(void_only, vec!["正文"]);
+    }
+
+    #[test]
+    fn mismatched_dangerous_closing_tag_cannot_reveal_suppressed_content() {
+        // 只用一个深度计数器时，脚本或样式内容里出现的任意危险结束标签都会把
+        // 抑制状态提前清零：`<script>…</style>…</script>` 中 `</script>` 之前的
+        // 文本会漏成可见正文。结束标签必须与最内层被抑制元素同名才算闭合。
+        let paragraphs = html_to_plain_paragraphs(
+            "<p>前文</p><script>var css = '</style>';泄露脚本</script><p>中段</p><style>body{}</script>泄露样式</style><p>后文</p>",
+        );
+        assert_eq!(paragraphs, vec!["前文", "中段", "后文"]);
+        for leaked in ["泄露脚本", "泄露样式", "var css"] {
+            assert!(
+                !paragraphs
+                    .iter()
+                    .any(|paragraph| paragraph.contains(leaked)),
+                "不匹配的危险结束标签泄漏了被抑制内容: {leaked}"
+            );
+        }
+
+        // 未闭合的危险元素仍然 fail closed：其后文本全部保持被抑制。
+        let unclosed = html_to_plain_paragraphs("<p>前文</p><script>alert(1)");
+        assert_eq!(unclosed, vec!["前文"]);
     }
 
     #[test]

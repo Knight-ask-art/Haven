@@ -5,6 +5,8 @@ include!("command-manifest.rs");
 fn main() {
     // 单真源文件变化时重跑 build（tauri-build 可能不监听它）。
     println!("cargo:rerun-if-changed=command-manifest.rs");
+    println!("cargo:rerun-if-env-changed=HAVEN_GOOGLE_OAUTH_CLIENT_ID");
+    println!("cargo:rerun-if-env-changed=HAVEN_GOOGLE_OAUTH_CLIENT_SECRET");
 
     // P0-2：为每个自定义命令生成 `allow-<command>` / `deny-<command>` 权限，
     // capability 通过 `allow-*` 形式授予；invoke_handler / AppManifest / Capability 同源。

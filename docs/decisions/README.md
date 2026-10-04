@@ -31,6 +31,6 @@ Evidence:
 An ADR is not a task plan and a task plan is not an ADR. Proposed decisions do
 not authorize implementation until the specification review accepts them.
 
-The repository already contains architecture and planning material under
-`plan/`. During migration, link to the original file and commit instead of
-inventing a second decision with the same meaning.
+Revalidate an existing decision before promoting it to a public ADR. Preserve
+its rationale without publishing private record names or operational details;
+do not invent a second conflicting authority for the same invariant.

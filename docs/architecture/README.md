@@ -23,6 +23,10 @@ the current implementation.
   defines the review sequence for cross-layer changes.
 - [Source of Truth](../SOURCE_OF_TRUTH.md) defines which artifact owns each kind
   of fact.
+- [AI System](AI_SYSTEM.md) defines the product Provider, Proposal, credential
+  and Skill boundaries.
+- [MCP Transport](MCP_EXTERNAL_AGENT_TRANSPORT.md) defines the external-client
+  protocol, local access controls and user-approved configuration.
 - [Comic Content Identity and Continuity](comic-content-continuity.md) preserves
   the accepted Work, Edition, chapter identity and progress-migration
   invariants extracted from the legacy execution specification.

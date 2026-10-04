@@ -9,6 +9,7 @@ import {
 } from "../src/bridge-selection.js";
 import { UnavailableHavenAgentBridge } from "../src/bridge.js";
 import { HAVEN_ENDPOINT_ENV_VAR, LiveHavenAgentBridge } from "../src/local-broker.js";
+import { redactText } from "../src/redact.js";
 import { FixtureHavenAgentBridge } from "./support/fixture-bridge.js";
 
 describe("selectBridge", () => {
@@ -100,6 +101,24 @@ describe("selectBridge", () => {
     expect(selection.reason).toContain("unavailable");
     expect(selection.reason).toContain("fixture");
     expect(selection.reason).toContain("live");
+  });
+
+  it("未知取值不会被回显进日志文案", () => {
+    // `HAVEN_MCP_BRIDGE` 由用户手填，误填一个 token 是完全可能的；而 `selectBridge` 的
+    // `reason` 会被 `src/index.ts` **原样**交给 `logError` 写进 stderr（客户端通常收进
+    // 日志文件，比响应更容易被分享）。取值刻意选一个**任何脱敏规则都拦不住**的普通
+    // 字符串：这样断言失败就只能归因到"文案里带上了它"，而不是"下游恰好打码了"。
+    const misconfigured = "prod-token-9f8e7d6c5b4a";
+    expect(redactText(misconfigured), "前提：这个值不在脱敏规则里").toBe(misconfigured);
+
+    const selection = selectBridge({ [BRIDGE_ENV_VAR]: misconfigured });
+    expect(selection.ok).toBe(false);
+    if (selection.ok) return;
+    expect(selection.reason).toContain(BRIDGE_ENV_VAR);
+    expect(selection.reason).not.toContain(misconfigured);
+    expect(redactText(selection.reason), "脱敏后的日志文案里同样不能出现它").not.toContain(
+      misconfigured,
+    );
   });
 });
 

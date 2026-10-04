@@ -1,61 +1,61 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
-import type { CSSProperties, ReactNode } from "react"
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react"
+import type { CSSProperties, DragEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react"
 import { useNavigate, useParams, useSearchParams } from "react-router"
 import { createPortal } from "react-dom"
 import {
-  Bell,
-  BookOpen,
   Check,
   Clipboard,
   ChevronDown,
   ChevronRight,
   CircleCheck,
   FileText,
-  Cloud,
-  Download,
-  Folder,
-  Globe2,
-  HardDrive,
-  History,
+  GripVertical,
   Home,
-  Info,
   LockKeyhole,
-  MoreHorizontal,
-  Moon,
-  Palette,
-  PanelsTopLeft,
   PlaySquare,
-  Plug,
+  Plus,
   RefreshCw,
   Search,
-  Server,
   Settings2,
   Shield,
-  SlidersHorizontal,
-  Sparkles,
-  Sun,
+  Trash2,
   TriangleAlert,
+  Upload,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
-import { toHavenError, type HavenError } from "@/lib/ipc/errors"
+import { AppearanceColorPicker } from "@/features/settings/components/AppearanceColorPicker"
+import { StorageSettings } from "../components/StorageSettings"
+import { DownloadSettings } from "../components/DownloadSettings"
+import { SettingsToggle as Toggle } from "../components/SettingsToggle"
+import { SourcesSettings } from "../components/SourcesSettings"
+import { SettingsDialog } from "../components/SettingsDialog"
+import { SettingsNavigation, type SettingsNavId } from "../components/SettingsNavigation"
+import { AboutSettings, GeneralSettings, UpdateSettings } from "../components/SystemSettings"
+import { SystemSettingsRow, SystemSettingsSection } from "../components/SystemSettingsLayout"
+import { toHavenError } from "@/lib/ipc/errors"
 import { getHavenClientMode } from "@/lib/ipc/runtime"
-import { deriveLibrarySliceState, deriveScanSliceState, deriveStorageSliceState } from "@/lib/slice-state"
-import {
-  SCAN_PHASE_LABELS,
-  cancelScan,
-  listStorageLocations,
-  pickLocalDirectory,
-  rebindLocalDirectory,
-  removeStorageLocation,
-  startLibraryScan,
-  type StorageLocationWire,
-} from "../ipc/storage-gateway"
-import type { ComicSettingsValue, GeneralSettingsValue, AppearanceSettingsValue, PlaybackSettingsValue, PreferenceComicPatchWire, PreferenceGetResult, PreferenceReadingPatchWire, PreferenceTargetWire, PrivacySettingsValue, ReadingSettingsValue, DownloadSettingsValue, SettingsValue } from "@/lib/ipc/settings-wire"
+import type { AppearanceAssetKindWire, AppearanceAssetWire, ComicSettingsValue, GeneralSettingsValue, AppearanceSettingsValue, PlaybackSettingsValue, PreferenceComicPatchWire, PreferenceGetResult, PreferenceReadingPatchWire, PreferenceTargetWire, PrivacySettingsValue, ReadingFontFamilyWire, ReadingPatchWire, ReadingSettingsValue, SettingsValue, ThemeWire, UiFontPresetWire, WallpaperSelection } from "@/lib/ipc/settings-wire"
 import type { SettingsFormController } from "@/features/settings/lib/useSettingsForm"
 import { useSettingsForm } from "@/features/settings/lib/useSettingsForm"
 import { useAiProviderSettings } from "@/features/settings/lib/useAiProviderSettings"
-import { NO_MODEL_SELECTED } from "@/features/settings/ipc/ai-provider-gateway"
+import { INSECURE_ENDPOINT_CODE, NO_MODEL_SELECTED } from "@/features/settings/ipc/ai-provider-gateway"
 import { useAgentBrokerSettings } from "@/features/settings/lib/useAgentBrokerSettings"
+import { useAgentSkills } from "@/features/settings/lib/useAgentSkills"
+import { useMcpClientConfig } from "@/features/settings/lib/useMcpClientConfig"
+import {
+  mcpClientActionLabel,
+  mcpClientStateLabel,
+  mcpClientStatusNote,
+  type McpClientTargetStatusWire,
+} from "@/features/settings/ipc/mcp-client-gateway"
+import {
+  NO_BUILTIN_SKILLS,
+  agentSkillActionLabel,
+  agentSkillCharsLabel,
+  agentSkillIsEffective,
+  agentSkillToggleTarget,
+  agentSkillStateLabel,
+} from "@/features/settings/ipc/agent-skill-gateway"
 import {
   AGENT_BROKER_CLIENT_TEMPLATES,
   AGENT_BROKER_TEMPLATE_NOTE,
@@ -63,144 +63,170 @@ import {
   type AgentBrokerClientTemplateId,
 } from "@/features/settings/ipc/agent-broker-gateway"
 import { settingsGateway } from "@/features/settings/ipc/gateway"
+import { appearanceGateway } from "@/features/settings/ipc/appearance-gateway"
 import { clearArtworkCache, clearSearchHistory } from "@/features/settings/ipc/privacy-gateway"
-import {
-  addSource,
-  isCustomSourceId,
-  listSources,
-  removeSource,
-  setSourceCredential,
-  setSourceEnabled,
-  setSourceEndpoint,
-  updateSource,
-  SOURCE_HEALTH_LABELS,
-  type SourceDescriptorWire,
-} from "../ipc/sources-gateway"
-import type { SourceCategoryDto, SourceKindDto, SourceModeDto, SourceRegistryDto, AgentBrokerStatusDto } from "@/lib/ipc/generated/wire"
-import {
-  SOURCE_CATEGORY_DESCRIPTIONS,
-  SOURCE_CATEGORY_LABELS,
-  SOURCE_CATEGORY_ORDER,
-  SOURCE_KIND_LABELS,
-  SOURCE_MODE_DESCRIPTIONS,
-  SOURCE_MODE_LABELS,
-  sourceMatchesCategory,
-  sourceUsesConfiguredEndpoint,
-} from "../lib/source-catalog"
+import type { AgentBrokerStatusDto } from "@/lib/ipc/generated/wire"
 import {
   DENSITY_OPTIONS,
-  DOWNLOAD_CONCURRENCY_OPTIONS,
-  DOWNLOAD_SPEED_LIMIT_OPTIONS,
-  LANGUAGE_OPTIONS,
   LAUNCH_PAGE_OPTIONS,
   PLAYBACK_RATE_OPTIONS,
-  READING_FONT_OPTIONS,
+  READING_CUSTOM_APPEARANCE_HINT,
+  READING_CUSTOM_BACKGROUND_LABEL,
+  READING_CUSTOM_COLOR_DISABLED_HINT,
+  READING_CUSTOM_FONT_HINT,
+  READING_CUSTOM_FONT_INVALID_HINT,
+  READING_CUSTOM_FONT_LABEL,
+  READING_CUSTOM_FONT_PLACEHOLDER,
+  READING_CUSTOM_TEXT_LABEL,
+  READING_FONT_PREVIEW_CLASS,
   READING_FONT_SIZE_OPTIONS,
   READING_LINE_HEIGHT_OPTIONS,
-  READING_PAGINATION_OPTIONS,
+  READING_PAGE_SUBMODE_OPTIONS,
+  READING_PAGINATION_MODE_OPTIONS,
+  READING_PREVIEW_FULL_MEASURE_PX,
   READING_THEME_OPTIONS,
   READING_WIDTH_OPTIONS,
   SIDEBAR_OPTIONS,
   THEME_OPTIONS,
+  INTERFACE_FONT_MODE_DETAILS,
+  INTERFACE_FONT_MODE_OPTIONS,
+  customFontFamilyCommit,
+  customReadingColorInputValue,
+  customReadingColorPatch,
   optionLabel,
   optionValue,
+  readingFontLabel,
+  readingFontPickerOptions,
+  readingPageSubMode,
+  readingPaginationMode,
+  readingPaginationWire,
+  readingPreviewFontLabel,
+  readingPreviewMeasureRatio,
+  readingPreviewPalette,
+  readingThemePatch,
+  readingThemeSwatch,
+  type ReadingPageSubMode,
+  type ReadingPaginationMode,
 } from "@/features/settings/lib/settingsDisplay"
 import {
-  canUseSettingsSection,
+  READING_CUSTOM_BACKGROUND_FALLBACK,
+  READING_CUSTOM_TEXT_FALLBACK,
+  resolveCustomFontFamilyCss,
+  resolveReadingPresentation,
+} from "@/features/reader/lib/reading-settings-mapping"
+import {
   publishSettingsRuntimeValue,
-  type SettingsSectionId,
+  reloadSettingsRuntime,
+  useSettingsRuntimeStatus,
 } from "@/features/settings/lib/settings-runtime-state"
-import type { AppDirectoryKindDto } from "@/lib/ipc/generated/wire"
-import { useAppInfo } from "@/features/settings/lib/useAppInfo"
-import { useUpdater } from "@/features/settings/lib/useUpdater"
+import {
+  describeResolvedInterfaceFont,
+  filterFontFamilies,
+  filterInterfaceFontAssets,
+  fontFamilyPreviewStyle,
+  importedFontCssFamily,
+  INTERFACE_FONT_PRESET_STACKS,
+  resolveInterfaceFont,
+} from "@/features/settings/lib/interface-font"
+import {
+  useInjectedFontFace,
+  useInterfaceFontAssets,
+  useSystemFontFamilies,
+} from "@/features/settings/lib/useInterfaceFonts"
+import { interfaceFontGateway } from "@/features/settings/ipc/interface-font-gateway"
+import type {
+  InterfaceFontAsset,
+  InterfaceFontModeWire,
+} from "@/lib/ipc/interface-font-wire"
+import { controlledResourceUri } from "@/lib/artwork-url"
+import type { SettingsFeatureSearchMatch } from "@/features/settings/lib/settings-navigation"
+import {
+  isSettingsSectionId,
+  type SettingsRegistryEntry,
+  type SettingsSectionId,
+  type FeatureId,
+} from "@/features/settings/lib/settings-registry"
+import { AiAssistantDialog } from "@/features/settings/components/ai-assistant/AiAssistantDialog"
 import { ERROR_REPORT_LEVEL_LABELS } from "@/features/settings/ipc/error-report-gateway"
 import { useErrorReport } from "@/features/settings/lib/useErrorReport"
 import { useNotice } from "@/app/notice-center/notice-context"
-import { AiAssistantDialog } from "@/features/settings/components/ai-assistant/AiAssistantDialog"
+import {
+  READING_OVERVIEW_WINDOW_LABEL,
+  contentCategoryLabel,
+  formatReadingDuration,
+  formatReadingStreak,
+  hasReadingOverviewData,
+  readingOverviewStats,
+  type ReadingOverviewState,
+} from "@/features/settings/lib/reading-overview"
+import { useReadingOverview } from "@/features/settings/lib/useReadingOverview"
+import {
+  THEME_PRESETS,
+  normalizeAppTheme,
+  paletteColorInputValue,
+  themePresetAppTheme,
+  withAccentColor,
+  withPaletteRoleColor,
+  type PaletteColorRole,
+  type ThemePresetId,
+} from "@/features/settings/lib/appearance-palette"
+import {
+  appearanceAssetRequestUri,
+  installAppearanceFontPreview,
+  requestWallpaperRetry,
+  useHomeWallpaperFailure,
+  useSystemPreference,
+  useWallpaperRetryEpoch,
+} from "@/features/settings/lib/appearance-runtime"
+import { UI_FONT_PRESETS, uiFontCssStack } from "@/features/settings/lib/appearance-fonts"
+import { querySystemFontCatalog, searchSystemFonts, type SystemFontCatalogResult, type SystemFontEntry } from "@/features/settings/lib/system-font-catalog"
+import {
+  appearanceAssetDeleteBlockedReason,
+  appearanceAssetLabel,
+  isUsableAppearanceAsset,
+  useAppearanceAssets,
+  type AppearanceAssetActionResult,
+  type AppearanceAssetDeleteSelections,
+  type AppearanceAssetLists,
+  type AppearanceAssetSelection,
+  type AppearanceAssetsController,
+} from "@/features/settings/lib/useAppearanceAssets"
+import { HOME_MODULES, HOME_MODULE_SIZES, homeModuleLabel, homeModuleSettingsToLayout, type HomeModuleId, type HomeModuleSize } from "@/features/settings/lib/home-layout"
+import { useHomeLayout, type HomeLayoutController } from "@/features/settings/lib/useHomeLayout"
+import {
+  OVERVIEW_MODULES,
+  OVERVIEW_MODULE_SIZES,
+  overviewModuleLabel,
+  overviewModuleSettingsToLayout,
+  type OverviewModuleId,
+  type OverviewModulePlacement,
+  type OverviewModuleSize,
+} from "@/features/settings/lib/overview-layout"
+import { homeModuleColumnSpan, overviewModuleColumnSpan } from "@/lib/ipc/settings-wire"
+import {
+  useOverviewLayout,
+  type OverviewLayoutController,
+} from "@/features/settings/lib/useOverviewLayout"
+import {
+  overviewLayoutProjection,
+  type OverviewLayoutProjection,
+} from "@/features/settings/lib/overview-layout-projection"
 
-interface SettingsSection {
-  id: SettingsSectionId
-  label: string
-  description: string
-  icon: typeof SlidersHorizontal
+type SettingsFormSet = {
+  general: SettingsFormController
+  appearance: SettingsFormController
+  playback: SettingsFormController
+  reading: SettingsFormController
+  comic: SettingsFormController
+  downloads: SettingsFormController
+  privacy: SettingsFormController
 }
 
-const SETTINGS_SECTIONS: SettingsSection[] = [
-  { id: "general", label: "通用", description: "启动、语言与通知", icon: SlidersHorizontal },
-  { id: "appearance", label: "外观", description: "主题、密度与动效", icon: Palette },
-  { id: "playback", label: "播放", description: "播放行为与截图", icon: PlaySquare },
-  { id: "reading", label: "阅读", description: "字体、版式与阅读主题", icon: BookOpen },
-  { id: "comic", label: "漫画", description: "阅读方向与预加载", icon: PanelsTopLeft },
-  { id: "sources", label: "来源", description: "来源包与健康状态", icon: Plug },
-  { id: "storage", label: "存储", description: "媒体位置与空间管理", icon: HardDrive },
-  { id: "downloads", label: "下载", description: "离线位置与队列策略", icon: Download },
-  { id: "sync", label: "同步与备份", description: "用户自己的同步目标", icon: Cloud },
-  { id: "ai", label: "智能功能", description: "本地配置的 AI 服务", icon: Sparkles },
-  { id: "updates", label: "更新", description: "应用与 Source Pack", icon: RefreshCw },
-  { id: "privacy", label: "隐私与网络", description: "本地数据与网络行为", icon: Shield },
-  { id: "about", label: "关于", description: "版本、许可与路径", icon: Info },
-]
+type RegisterSettingsSectionReloader = (
+  section: SettingsSectionId,
+  reload: () => void,
+) => () => void
 
-const SETTINGS_NAV_GROUPS: Array<{ label: string; sectionIds: SettingsSectionId[] }> = [
-  { label: "使用体验", sectionIds: ["general", "appearance", "playback"] },
-  { label: "内容阅读", sectionIds: ["reading", "comic"] },
-  { label: "资源与存储", sectionIds: ["sources", "downloads", "storage"] },
-  { label: "数据与连接", sectionIds: ["sync", "privacy"] },
-  { label: "系统", sectionIds: ["updates", "about"] },
-]
-
-const MORE_SETTINGS_GROUP = { label: "更多设置", sectionIds: ["ai"] as SettingsSectionId[] }
-
-// playback 仅开放默认倍速与自动继续；截图使用播放器固定快捷键，不是设置事实；
-// reading 开放文本类 Reader 的全局排版偏好；
-// comic 开放已有 Comic Reader 消费的全局模式、方向、间距和预加载窗口。
-// sync/ai/updates 仍不进入 Tauri；
-// Downloads 只展示真实服务边界并将未接入策略置为 disabled。General/Appearance/Privacy
-// 由 SettingsFormController 驱动，Sources/Storage/About 使用真实 Gateway。
-// 注意：本对象不得包含 secret 原文（aiKey 恒为空字符串，只显示 configured/status）。
-const DEFAULT_SETTINGS = {
-  playbackRate: "1.0x",
-  autoNext: true,
-  autoResume: true,
-  readingFont: "系统无衬线",
-  fontSize: "中",
-  lineHeight: "舒适",
-  readingWidth: "适中",
-  readingMode: "连续滚动",
-  readingTheme: "跟随系统",
-  comicMode: "单页",
-  comicDirection: "从右向左",
-  pageGap: "12 px",
-  preloadPages: "3 页",
-  ocrLanguage: "自动识别",
-  translation: "关闭",
-  // 下载目录由本地 DownloadService/StorageLocation 选择；这里仅保留浏览器 Mock 的
-  // 逻辑展示值，不能伪造一个用户机器上的绝对路径。
-  downloadPath: "下载 / 栖阅（默认）",
-  concurrentDownloads: "3 个任务",
-  quality: "自动",
-  autoContinueDownloads: true,
-  downloadNotifications: true,
-  meteredNetwork: "询问",
-  speedLimit: "不限速",
-  syncEnabled: false,
-  syncTarget: "尚未配置",
-  syncProgress: true,
-  syncFavorites: true,
-  // AI 分组的 aiEnabled / aiProvider / aiEndpoint / aiKey / defaultModel / visionModel
-  // 占位键已随 A2 AI Provider 切片移除：它们既没有后端持久化语义，又带着一个看似
-  // 已配置的示例地址与模型名。真实来源是 AI Provider Profile（后端 CAS 持久化）
-  // 与 CredentialStore（凭据），模型只能来自 Provider 的模型目录。
-  autoUpdate: true,
-  playbackHistory: true,
-  networkDiagnostics: false,
-  keepLogs: "最近 30 天",
-  proxyMode: "系统代理",
-  customProxy: "",
-  limitTracking: true,
-}
-
-type SettingsState = typeof DEFAULT_SETTINGS
 
 type ResourcePreferenceContext = {
   workId: string | null
@@ -228,14 +254,14 @@ export function SettingsPage() {
 
 function SettingsUnavailableState() {
   return (
-    <div className="flex h-full min-h-0 items-center justify-center bg-[#f5f5f7] px-6 dark:bg-[#000000]">
+    <div className="flex h-full min-h-0 items-center justify-center bg-[var(--haven-settings-control)] px-6">
       <section
         aria-live="polite"
-        className="w-full max-w-[560px] rounded-[20px] border border-black/[0.06] bg-white p-8 text-center shadow-[0_20px_60px_rgba(0,0,0,0.06)] dark:border-white/[0.08] dark:bg-[#1c1c1e] dark:shadow-[0_20px_60px_rgba(0,0,0,0.5)]"
+        className="w-full max-w-[560px] rounded-[20px] border border-[var(--haven-settings-border-subtle)] bg-[var(--haven-settings-card)] p-8 text-center shadow-[0_20px_60px_rgba(0,0,0,0.06)]"
       >
-        <Settings2 className="mx-auto h-10 w-10 text-[#86868b]" strokeWidth={1.7} />
-        <h1 className="mt-4 text-xl font-semibold text-[#1d1d1f] dark:text-[#f5f5f5]">设置暂不可用</h1>
-        <p className="mt-2 text-sm leading-6 text-[#6e6e73] dark:text-[#98989d]">
+        <Settings2 className="mx-auto h-10 w-10 text-[var(--haven-settings-muted)]" strokeWidth={1.7} />
+        <h1 className="mt-4 text-xl font-semibold text-[var(--haven-settings-foreground)]">设置暂不可用</h1>
+        <p className="mt-2 text-sm leading-6 text-[var(--haven-settings-muted-strong)]">
           当前运行环境不支持应用数据访问，请在栖阅桌面应用内打开设置。
         </p>
       </section>
@@ -243,16 +269,43 @@ function SettingsUnavailableState() {
   )
 }
 
-function SettingsSectionUnavailable() {
+/**
+ * 运行时设置读盘失败时的用户可见提示。
+ *
+ * AppRoot 会在读盘失败后把外观/启动页投影收敛到契约默认值；这不是一份可以被当成
+ * 用户已保存配置的结果，所以设置页必须把「当前使用默认值」和「可以重读」明确说出来。
+ * 组件本身只消费状态，不自行触达 IPC；重读仍然通过 settings-runtime-state 的统一入口
+ * 让 AppRoot 重跑原来的加载 effect。
+ */
+export function SettingsRuntimeStatusNotice({
+  status,
+  onRetry,
+}: {
+  status: "loading" | "ready" | "degraded"
+  onRetry: () => void
+}) {
+  if (status !== "degraded") return null
+
   return (
-    <div className="flex min-h-[360px] w-full items-center justify-center rounded-3xl border border-black/[0.06] bg-white/70 p-8 text-center shadow-sm dark:border-white/[0.08] dark:bg-[#1c1c1e]/70">
-      <div className="max-w-[520px]">
-        <TriangleAlert className="mx-auto h-9 w-9 text-[#b7791f]" strokeWidth={1.8} />
-        <h2 className="mt-4 text-xl font-semibold">当前版本不可用</h2>
-        <p className="mt-2 text-sm leading-6 text-[#6e6e73] dark:text-[#98989d]">
-          该设置分区尚未接入栖阅桌面端的数据服务，当前版本不会展示或保存模拟配置。
+    <div
+      role="alert"
+      className="mb-[24px] flex w-full items-start gap-[12px] rounded-[14px] border border-[var(--haven-settings-danger-20)] bg-[var(--haven-settings-danger-surface)] px-[16px] py-[13px] text-[var(--haven-settings-foreground)]"
+    >
+      <TriangleAlert className="mt-[1px] h-[17px] w-[17px] shrink-0 text-[var(--haven-settings-danger)]" strokeWidth={1.8} />
+      <div className="min-w-0 flex-1">
+        <p className="text-[13px] font-medium leading-5">外观配置读取不完整</p>
+        <p className="mt-[2px] text-[12px] leading-5 text-[var(--haven-settings-muted-strong)]">
+          当前页面使用安全默认值，不会覆盖已保存配置。重新读取后可恢复你的外观设置。
         </p>
       </div>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="inline-flex shrink-0 items-center gap-[6px] rounded-[9px] border border-[var(--haven-settings-danger-20)] px-[10px] py-[7px] text-[12px] font-medium text-[var(--haven-settings-danger)] transition-colors hover:bg-[var(--haven-settings-danger-06)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-danger-20)]"
+      >
+        <RefreshCw className="h-[13px] w-[13px]" strokeWidth={1.8} />
+        重新读取
+      </button>
     </div>
   )
 }
@@ -261,18 +314,63 @@ function SettingsContent() {
   const navigate = useNavigate()
   const { section: sectionParam } = useParams<{ section?: string }>()
   const [searchParams] = useSearchParams()
-  const runtimeMode = getHavenClientMode()
-  const [settings, setSettings] = useState<SettingsState>(DEFAULT_SETTINGS)
-  const [searchQuery, setSearchQuery] = useState("")
-  const [showMoreSettings, setShowMoreSettings] = useState(false)
-  const [assistantOpen, setAssistantOpen] = useState(false)
-  const requestedSection = sectionParam as SettingsSectionId | null
-  const activeSection = SETTINGS_SECTIONS.some((section) => section.id === requestedSection)
-    ? requestedSection as SettingsSectionId
-    : "general"
-  const sectionAvailable = canUseSettingsSection(runtimeMode, activeSection)
+  const isLegacySkillsRoute = sectionParam === "skills"
+  const [searchDestination, setSearchDestination] = useState<SettingsFeatureSearchMatch | null>(null)
+  const contentRef = useRef<HTMLElement>(null)
+  // 只有登记表里的分区可导航；未知或已隐藏的分区（sync / 拼错的名字）一律回落到
+  // 总览，而不是渲染一块不可用的占位。
+  const requestedNavId: SettingsNavId | null = isLegacySkillsRoute
+    ? "ai"
+    : sectionParam === "overview"
+    ? "overview"
+    : sectionParam !== undefined && isSettingsSectionId(sectionParam)
+      ? sectionParam
+      : null
+  const activeNavId: SettingsNavId = requestedNavId ?? "overview"
+  const activeSection = activeNavId === "overview" ? null : activeNavId
+  const [aiSettingsOpen, setAiSettingsOpen] = useState(isLegacySkillsRoute)
+  const aiSettingsTitleId = useId()
+  /**
+   * 用户在「智能功能」里选中的 AI Provider 配置 id。
+   *
+   * 它必须活在**分区切换之上**：每个分区各自挂载自己的设置组件，切到别的分区再切回来，
+   * `AiSettings` 会连同 `useAiProviderSettings` 一起重新挂载。选择只留在那个组件里，
+   * 重挂载就会静默回落到列表第一项——用户选的是 B，回来变成 A，而「打开栖伴」取的正是
+   * 这个值，于是外部模型请求被发给了另一个 Provider。
+   *
+   * 它只是本次 WebView 会话内的记忆：不持久化、不进 settings wire，刷新页面即失效。
+   */
+  const [aiProfileId, setAiProfileId] = useState<string | null>(null)
+  // 没有表单控制器的分区（「智能功能」/「内置技能」）把自己的重读入口登记在这里，
+  // 「重新加载配置」按当前分区转调，页面不需要知道具体 hook。
+  const sectionReloaders = useRef(new Map<SettingsSectionId, Set<() => void>>())
+  const registerSectionReloader = useCallback<RegisterSettingsSectionReloader>((section, reload) => {
+    const reloaders = sectionReloaders.current.get(section) ?? new Set<() => void>()
+    reloaders.add(reload)
+    sectionReloaders.current.set(section, reloaders)
+    return () => {
+      reloaders.delete(reload)
+      if (reloaders.size === 0) sectionReloaders.current.delete(section)
+    }
+  }, [])
+
   const resourceQuery = searchParams.toString()
   const resourceContext = useMemo(() => parseResourcePreferenceContext(new URLSearchParams(resourceQuery)), [resourceQuery])
+
+  useLayoutEffect(() => {
+    if (!searchDestination || activeNavId !== (searchDestination.navId ?? searchDestination.section)) return
+    const inAiSettings = searchDestination.section === "ai" && searchDestination.featureId !== "ai.recommendation"
+    // 模态表单负责自己的初始焦点，避免父子生命周期互相覆盖。
+    if (inAiSettings) return
+    const scope = contentRef.current
+    if (!scope) return
+    const target = scope.querySelector<HTMLElement>(`[data-settings-features~="${searchDestination.featureId}"]`)
+      ?? scope.querySelector<HTMLElement>("h2") ?? scope
+    target.tabIndex = -1
+    target.focus({ preventScroll: true })
+    target.scrollIntoView?.({ block: "center", behavior: "auto" })
+    setSearchDestination(null)
+  }, [activeNavId, searchDestination])
 
   const { push } = useNotice()
   const showNotice = useCallback((message: string) => {
@@ -295,179 +393,576 @@ function SettingsContent() {
   const downloadsForm = useSettingsForm("downloads", settingsGateway, onFormSaved)
   const privacyForm = useSettingsForm("privacy", settingsGateway, onFormSaved)
   const forms = { general: generalForm, appearance: appearanceForm, playback: playbackForm, reading: readingForm, comic: comicForm, downloads: downloadsForm, privacy: privacyForm }
+  // 阅读总览：真实聚合（7 天窗口 + 当前环境的显式 UTC 偏移）。loading / empty / ready /
+  // error 四态都由后端事实决定，页面不再持有一份手写的统计。
+  const readingOverview = useReadingOverview()
+  const readingOverviewState: ReadingOverviewState = readingOverview.state
+  // 总览布局只读一次、只持有一个 revision：总览渲染器与外观分区里的布局编辑器共用同一份
+  // 状态，因此「编辑器保存后总览立刻按新排列渲染」是同一次读取的结果，而不是两个各自
+  // 缓存的副本。两个独立 hook 实例会让编辑器拿着过期 revision 去保存。
+  //
+  // 首页布局是**另一份**布局（另一个 hook、另一条 revision），两者互不影响。
+  const overviewLayout = useOverviewLayout(appearanceGateway, showNotice)
+  const overviewLayoutState = overviewLayout.state
+  // 首页布局编辑器与外观资产列表同样是**页面级**状态，而不是外观分区的局部状态：切换分区
+  // 不该把它们连同「正在飞的导入 / 删除 / 还没保存的布局草稿」一起卸载。放在这里之后，
+  // 分区之间来回切只会换渲染器，不会重读一遍列表、也不会丢掉上一次操作的结果。
+  const homeLayout = useHomeLayout(appearanceGateway, showNotice)
+  const appearanceAssets = useAppearanceAssets(
+    appearanceAssetSelection(appearanceForm),
+    appearanceGateway,
+  )
+  const runtimeStatus = useSettingsRuntimeStatus()
 
-  if (!sectionAvailable) {
-    return <SettingsSectionUnavailable />
-  }
+  useEffect(() => {
+    if (isLegacySkillsRoute) setAiSettingsOpen(true)
+  }, [isLegacySkillsRoute])
 
-  const update = <K extends keyof SettingsState>(key: K, value: SettingsState[K]) => {
-    setSettings((current) => ({ ...current, [key]: value }))
-  }
-
-  const resetSettings = () => {
-    generalForm.resetToDefaults()
-    appearanceForm.resetToDefaults()
-    playbackForm.resetToDefaults()
-    readingForm.resetToDefaults()
-    comicForm.resetToDefaults()
-    downloadsForm.resetToDefaults()
-    privacyForm.resetToDefaults()
-    setSettings(DEFAULT_SETTINGS)
-    showNotice("已恢复默认设置")
-  }
-
-  const reloadSettings = () => {
-    generalForm.reload()
-    appearanceForm.reload()
-    playbackForm.reload()
-    readingForm.reload()
-    comicForm.reload()
-    downloadsForm.reload()
-    privacyForm.reload()
-    setSettings(DEFAULT_SETTINGS)
-    showNotice("已重新加载配置")
-  }
-
-  const selectSection = (section: SettingsSectionId) => {
+  const selectSection = (section: SettingsNavId) => {
+    if (section === "sync") return
+    if (section !== "overview" && !isSettingsSectionId(section)) return
+    setSearchDestination(null)
+    if (section === "ai") setAiSettingsOpen(false)
     navigate(`/settings/${section}`, { replace: true })
   }
 
-  const normalizedQuery = searchQuery.trim().toLocaleLowerCase()
-  const visibleNavGroups = SETTINGS_NAV_GROUPS.map((group) => ({
-    ...group,
-    sections: group.sectionIds
-      .map((id) => SETTINGS_SECTIONS.find((section) => section.id === id))
-      .filter((section): section is SettingsSection => {
-        if (!section || !canUseSettingsSection(runtimeMode, section.id)) return false
-        if (!normalizedQuery) return true
-        return `${section.label} ${section.description} ${group.label}`.toLocaleLowerCase().includes(normalizedQuery)
-      }),
-  })).filter((group) => group.sections.length > 0)
-  const visibleMoreSettings = MORE_SETTINGS_GROUP.sectionIds
-    .map((id) => SETTINGS_SECTIONS.find((section) => section.id === id))
-    .filter((section): section is SettingsSection => {
-      if (!section || !canUseSettingsSection(runtimeMode, section.id)) return false
-      if (!normalizedQuery) return true
-      return `${section.label} ${section.description} ${MORE_SETTINGS_GROUP.label}`.toLocaleLowerCase().includes(normalizedQuery)
-    })
-  const isMoreSettingsActive = MORE_SETTINGS_GROUP.sectionIds.includes(activeSection)
-  const shouldShowMoreSettings = showMoreSettings || Boolean(normalizedQuery) || isMoreSettingsActive
-
   return (
-    <div className="settings-page h-full min-h-0 overflow-hidden bg-[#f5f5f7] dark:bg-[#000000] text-[#1d1d1f] dark:text-[#f5f5f5]">
-      <main className="mx-auto h-full min-h-0 w-full overflow-hidden px-[24px] pb-[16px] pt-[16px] sm:px-[32px]">
-        <div className="grid h-full min-h-0 overflow-hidden rounded-[20px] border border-white/90 dark:border-white/10 bg-white/55 dark:bg-[#1c1c1e]/60 shadow-[0_20px_60px_rgba(0,0,0,0.06)] dark:shadow-[0_20px_60px_rgba(0,0,0,0.5)] backdrop-blur-2xl lg:grid-cols-[240px_minmax(0,1fr)]">
-          <aside className="flex min-h-0 flex-col border-b border-black/[0.06] dark:border-white/[0.06] bg-white/[0.32] dark:bg-[#1c1c1e]/40 p-[24px] lg:border-b-0 lg:border-r">
-            <div className="flex h-[48px] shrink-0 items-center gap-[10px] rounded-xl border border-black/[0.06] dark:border-white/[0.06] bg-white/75 dark:bg-[#2c2c2e]/75 px-[14px] shadow-[0_2px_8px_rgba(0,0,0,0.025)] focus-within:border-[#007aff]/40 focus-within:ring-4 focus-within:ring-[#007aff]/10">
-              <Search className="h-[17px] w-[17px] shrink-0 text-[#86868b] dark:text-[#98989d]" strokeWidth={2} />
-              <input
-                value={searchQuery}
-                onChange={(event) => setSearchQuery(event.target.value)}
-                placeholder="搜索设置..."
-                aria-label="搜索设置"
-                className="min-w-0 flex-1 bg-transparent text-[13px] text-[#1d1d1f] dark:text-[#f5f5f5] outline-none placeholder:text-[#a1a1a6] dark:placeholder:text-[#8e8e93]"
-              />
-              <kbd className="hidden rounded-md bg-black/[0.04] dark:bg-white/[0.08] px-1.5 py-0.5 text-[10px] font-medium text-[#86868b] dark:text-[#98989d] sm:inline">Ctrl K</kbd>
+    <div className="settings-page h-full min-h-0 overflow-hidden bg-[var(--haven-settings-background)] text-[var(--haven-settings-foreground)]">
+      <main className="mx-auto h-full min-h-0 w-full overflow-hidden px-0 pb-0 pt-0">
+        <div className="settings-layout h-full min-h-0 overflow-hidden rounded-[24px] border border-[var(--haven-settings-border)] bg-[var(--haven-settings-background)] shadow-none">
+          <SettingsNavigation activeId={activeNavId} onSelectSection={selectSection} onSelectFeature={(match) => {
+            selectSection(match.navId ?? match.section)
+            setSearchDestination(match)
+            if (match.section === "ai") setAiSettingsOpen(match.featureId !== "ai.recommendation")
+          }} />
+
+          <section ref={contentRef} className="settings-scrollbar-hidden min-h-0 min-w-0 flex-1 overflow-y-auto bg-[var(--haven-settings-background)] p-[24px] pb-[112px] sm:p-[32px] sm:pb-[112px] lg:px-[52px] lg:pb-[112px] lg:pt-[24px]">
+            <div className="mx-auto w-full max-w-[1240px]">
+              <SettingsRuntimeStatusNotice status={runtimeStatus} onRetry={reloadSettingsRuntime} />
             </div>
-
-            <nav aria-label="设置分类" className="settings-scrollbar-hidden mt-[32px] min-h-0 flex-1 space-y-[20px] overflow-y-auto pr-1">
-              {visibleNavGroups.length > 0 ? visibleNavGroups.map((group) => (
-                <div key={group.label}>
-                  <p className="mb-2 px-2 text-[11px] font-semibold tracking-[0.04em] text-[#86868b]">{group.label}</p>
-                  <div className="space-y-0.5">
-                    {group.sections.map((section) => {
-                      const Icon = section.icon
-                      const isActive = section.id === activeSection
-                      return (
-                        <button
-                          key={section.id}
-                          type="button"
-                          onClick={() => selectSection(section.id)}
-                          className={cn(
-                            "group flex min-h-[46px] w-full items-center gap-3 rounded-xl px-2.5 py-1.5 text-left transition-colors duration-200",
-                            isActive ? "bg-[#007aff]/[0.12] dark:bg-[#007aff]/[0.2] text-[#007aff]" : "text-[#1d1d1f] dark:text-[#f5f5f5] hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
-                          )}
-                        >
-                          <Icon className={cn("h-[20px] w-[20px] shrink-0", isActive ? "text-[#007aff]" : "text-[#6e6e73] dark:text-[#98989d]")} strokeWidth={1.8} />
-                          <span className="min-w-0 flex-1">
-                            <span className={cn("block truncate text-[14px]", isActive ? "font-semibold" : "font-medium")}>{section.label}</span>
-                            <span className="mt-0.5 block truncate text-[11px] text-[#86868b] dark:text-[#98989d]">{section.description}</span>
-                          </span>
-                          <ChevronRight className={cn("h-[15px] w-[15px] shrink-0", isActive ? "text-[#007aff]" : "text-[#c7c7cc] dark:text-[#636366]")} />
-                        </button>
-                      )
-                    })}
-                  </div>
-                </div>
-              )) : null}
-
-              {(visibleNavGroups.length === 0 && visibleMoreSettings.length === 0) && (
-                <p className="px-2 text-[13px] leading-5 text-[#86868b]">没有找到匹配的设置。</p>
-              )}
-
-              {visibleMoreSettings.length > 0 && <div className="pt-1">
-                <button type="button" onClick={() => setShowMoreSettings((current) => !current)} className="flex min-h-[36px] w-full items-center justify-between rounded-xl px-2.5 text-left text-[13px] font-medium text-[#6e6e73] dark:text-[#98989d] transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.06] hover:text-[#1d1d1f] dark:hover:text-[#f5f5f5]">
-                  <span>{MORE_SETTINGS_GROUP.label}</span>
-                  <ChevronRight className={cn("h-[15px] w-[15px] transition-transform", shouldShowMoreSettings && "rotate-90")} />
-                </button>
-                {shouldShowMoreSettings && visibleMoreSettings.length > 0 && (
-                  <div className="mt-1 space-y-0.5">
-                    {visibleMoreSettings.map((section) => {
-                      const Icon = section.icon
-                      const isActive = section.id === activeSection
-                      return (
-                        <button key={section.id} type="button" onClick={() => selectSection(section.id)} className={cn("group flex min-h-[46px] w-full items-center gap-3 rounded-xl px-2.5 py-1.5 text-left transition-colors duration-200", isActive ? "bg-[#007aff]/[0.12] dark:bg-[#007aff]/[0.2] text-[#007aff]" : "text-[#1d1d1f] dark:text-[#f5f5f5] hover:bg-black/[0.04] dark:hover:bg-white/[0.06]")}>
-                          <Icon className={cn("h-[20px] w-[20px] shrink-0", isActive ? "text-[#007aff]" : "text-[#6e6e73] dark:text-[#98989d]")} strokeWidth={1.8} />
-                          <span className="min-w-0 flex-1"><span className={cn("block truncate text-[14px]", isActive ? "font-semibold" : "font-medium")}>{section.label}</span><span className="mt-0.5 block truncate text-[11px] text-[#86868b] dark:text-[#98989d]">{section.description}</span></span>
-                          <ChevronRight className={cn("h-[15px] w-[15px] shrink-0", isActive ? "text-[#007aff]" : "text-[#c7c7cc] dark:text-[#636366]")} />
-                        </button>
-                      )
-                    })}
-                  </div>
+            <div className={cn("mx-auto w-full", activeSection === "ai" ? "max-w-[1108px]" : activeSection ? "max-w-[1052px]" : "max-w-[1080px]")}>
+              <div className={cn("relative min-w-0 w-full space-y-6", activeSection === "ai" && "min-h-0")} data-settings-features={activeSection === "ai" ? "ai.recommendation" : undefined} tabIndex={activeSection === "ai" ? -1 : undefined}>
+                {activeNavId === "overview"
+                  ? <SettingsOverview
+                      state={readingOverviewState}
+                      forms={forms}
+                      layout={overviewLayoutProjection(overviewLayoutState)}
+                      onSelectSection={selectSection}
+                      onRetryOverview={readingOverview.reload}
+                      onRetryLayout={overviewLayout.reload}
+                    />
+                  : activeSection === "ai"
+                    ? <AiAssistantDialog
+                        open
+                        embedded
+                        onOpenChange={() => undefined}
+                        onOpenSettings={() => { setSearchDestination(null); setAiSettingsOpen(true) }}
+                        profileId={aiProfileId}
+                      />
+                    : activeSection && renderSettingsSection(
+                      activeSection,
+                      forms,
+                      showNotice,
+                      resourceContext,
+                      overviewLayout,
+                      homeLayout,
+                      appearanceAssets,
+                    )}
+                {activeSection === "ai" && aiSettingsOpen && (
+                  <SettingsDialog
+                    title="AI 设置"
+                    titleId={aiSettingsTitleId}
+                    description="管理模型服务、外部 Agent / MCP 接入与本机 Skills。"
+                    initialFocusSelector={searchDestination?.section === "ai" ? `[data-settings-features~="${searchDestination.featureId}"]` : undefined}
+                    closeLabel="关闭 AI 设置"
+                    onClose={() => { setAiSettingsOpen(false); setSearchDestination(null) }}
+                  >
+                      <div className="space-y-7">
+                        <AiSettings
+                          showNotice={showNotice}
+                          registerReloader={registerSectionReloader}
+                          aiSelection={{ profileId: aiProfileId, onSelect: setAiProfileId }}
+                        />
+                        <SkillsSettings showNotice={showNotice} registerReloader={registerSectionReloader} />
+                      </div>
+                  </SettingsDialog>
                 )}
-              </div>}
-            </nav>
-
-            <div className="mt-4 shrink-0 border-t border-black/[0.06] dark:border-white/[0.06] px-2 pb-1 pt-4">
-              <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[#86868b] dark:text-[#98989d]">Haven Local-first</p>
-              <p className="mt-2 text-[12px] leading-relaxed text-[#6e6e73] dark:text-[#8e8e93]">没有中心化 Haven 账户。设置与内容状态默认留在本机。</p>
-            </div>
-          </aside>
-
-          <section className="settings-scrollbar-hidden min-h-0 min-w-0 flex-1 overflow-y-auto bg-[#f5f5f7]/50 dark:bg-[#000000]/20 p-[20px] pb-[112px] sm:p-[32px] sm:pb-[112px] lg:px-[48px] lg:pt-[40px]">
-            <div className="mx-auto flex max-w-[1240px] flex-col items-start gap-[32px] xl:flex-row xl:justify-center xl:gap-[48px]">
-              <div className="min-w-0 w-full flex-1 space-y-6 xl:max-w-[860px]">
-                {renderSettingsSection(activeSection, settings, update, forms, showNotice, resourceContext, () => setAssistantOpen(true))}
-              </div>
-              <div className="w-full shrink-0 xl:w-[320px]">
-                <SettingsSummaryRail activeSection={activeSection} settings={settings} forms={forms} onReset={resetSettings} onReload={reloadSettings} showNotice={showNotice} />
               </div>
             </div>
           </section>
         </div>
       </main>
 
-      {/* 助手只作为设置页内的浮层入口，不改变全局路由，也不接入第二套设置事实源。 */}
-      {/* 运行时可用则走 Typed IPC（Tauri 真实客户端 / 浏览器 dev 的 Mock）；*/}
-      {/* 不可用时明确进入本地预览，不伪造任何模型结果。 */}
-      <AiAssistantDialog open={assistantOpen} onOpenChange={setAssistantOpen} />
-
     </div>
   )
 }
 
+type ReadingOverviewMetric = {
+  label: string
+  value: string
+  foot: string
+  dark?: boolean
+}
+
+/**
+ * 总览错误态的固定文案。
+ *
+ * 「读不到」与「没有记录」是两种不同的事实：前者可以说清是读取失败、并给出重试，
+ * 后者才能说「暂无本机阅读记录」。错误态绝不能借用空态那句话——那会把一次失败的
+ * 读取伪装成一份「你确实什么都没读」的结论。
+ */
+const OVERVIEW_UNAVAILABLE_VALUE = "不可用"
+const OVERVIEW_ERROR_TITLE = "统计暂时不可用"
+const OVERVIEW_ERROR_HINT = "读取失败，请重试。"
+
+/**
+ * 总览渲染器：页头 + 按**已保存布局**排列的模块。
+ *
+ * 页头（标题与统计范围）与阅读统计错误横幅**不是**可管理的模块，因此不参与布局：它们
+ * 是页面的身份与失败事实，做成可隐藏的模块等于允许用户把一次读取失败藏起来。
+ *
+ * 模块排列来自 `layout`（见 [`overviewLayoutProjection`]）：`order` 决定 DOM 顺序，
+ * **存储里的 `row` / `column` 决定它在三列网格里的起始格**，档位决定它占几列。位置不再由
+ * CSS 自动猜（旧实现是写死的四段，坐标只挂在 data 属性上、不参与任何摆放），但也不接受
+ * 任意坐标——见 `overview-layout.ts` 对「确定性网格摆放」的说明。
+ * 三列网格只在 `xl` 分列，坐标因此也只在 `xl` 生效（见 index.css 的
+ * `.haven-overview-module-positioned`）；窄屏保持自然单列流。
+ * 导出是为了让状态语义（loading / empty / ready / error）能被直接挂载断言。
+ */
+export function SettingsOverview({ state, forms, layout, onSelectSection, onRetryOverview, onRetryLayout }: { state: ReadingOverviewState; forms: SettingsFormSet; layout: OverviewLayoutProjection; onSelectSection: (section: SettingsNavId) => void; onRetryOverview: () => void; onRetryLayout: () => void }) {
+  const stats = readingOverviewStats(state)
+  const hasData = state.status === "ready" && hasReadingOverviewData(stats)
+  const isLoading = state.status === "loading"
+  const isError = state.status === "error"
+  const appearance = appearanceDisplayValue(forms.appearance)
+  const reading = readingDisplayValue(forms.reading)
+  const general = generalDisplayValue(forms.general)
+  const playback = playbackDisplayValue(forms.playback)
+  const preferences = [
+    { label: "当前主题", value: optionLabel(THEME_OPTIONS, appearance.theme), section: "appearance" as const },
+    { label: "阅读字体", value: readingFontLabel(reading.fontFamily), section: "reading" as const },
+    { label: "启动页", value: optionLabel(LAUNCH_PAGE_OPTIONS, general.launchPage), section: "general" as const },
+    { label: "默认播放倍速", value: optionLabel(PLAYBACK_RATE_OPTIONS, playback.defaultPlaybackRate), section: "playback" as const },
+  ]
+  // 四种状态各自的取值/脚注：loading 说在读、error 说读不到、ready 有数据才下结论、
+  // empty 才是真正的「暂无记录」。
+  const metricValue = (ready: string) =>
+    isLoading ? "…" : isError ? OVERVIEW_UNAVAILABLE_VALUE : ready
+  const metricFoot = (ready: string) =>
+    isLoading ? "正在读取" : isError ? OVERVIEW_ERROR_TITLE : hasData ? ready : "暂无本机阅读记录"
+  const metrics: ReadingOverviewMetric[] = [
+    {
+      label: "首选类型",
+      value: metricValue(contentCategoryLabel(stats.summary.preferredType)),
+      foot: metricFoot("按阅读时长计算"),
+    },
+    {
+      label: "最长连续",
+      value: metricValue(formatReadingStreak(stats.summary.longestStreakDays)),
+      foot: metricFoot("连续活跃阅读日"),
+    },
+    {
+      label: "日均时长",
+      value: metricValue(formatReadingDuration(stats.summary.averageDailyMinutes)),
+      foot: metricFoot(`按${READING_OVERVIEW_WINDOW_LABEL}计算`),
+    },
+    {
+      // 后端算的是「窗口末尾最近 7 个本地日」，不是自然周：跨周也照样取满 7 天。
+      // 因此标签与脚注都只能说「最近 7 天」，说「本周」等于给用户一个后端从没算过的范围。
+      label: READING_OVERVIEW_WINDOW_LABEL,
+      value: metricValue(formatReadingDuration(stats.summary.recentSevenDayMinutes)),
+      foot: metricFoot(`本地时间 · ${READING_OVERVIEW_WINDOW_LABEL}`),
+      dark: true,
+    },
+  ]
+  const rangeLabel = state.status === "empty" || state.status === "ready"
+    ? `${stats.range.startLocalDate} 至 ${stats.range.endLocalDate}`
+    : READING_OVERVIEW_WINDOW_LABEL
+  const moduleContext: OverviewModuleContext = { state, preferences, metrics, onSelectSection }
+
+  return (
+    <div className="w-full max-w-[1044px] space-y-[34px] pb-[24px]" data-settings-features="reading.overview" tabIndex={-1}>
+      <header className="flex items-start justify-between gap-6">
+        <div>
+          <p className="text-[11px] font-normal tracking-[0.1em] text-[var(--haven-settings-muted-subtle)]">READING OVERVIEW / PERSONAL SIGNAL</p>
+          <h2 className="mt-[8px] text-[31px] font-bold leading-[1.12] tracking-[-0.025em] text-[var(--haven-settings-foreground)]">总览</h2>
+          <p className="mt-[10px] max-w-[720px] text-[15px] leading-6 text-[var(--haven-settings-muted-subtle)]">先看你花了多少时间，再看你把时间交给了什么。</p>
+        </div>
+        <div className="shrink-0 pt-[18px] text-right">
+          <div className="flex h-[25px] w-[164px] items-center justify-center rounded-full border border-[var(--haven-settings-border)] text-[10px] text-[var(--haven-settings-muted-subtle)]">{READING_OVERVIEW_WINDOW_LABEL}</div>
+          <p className="mt-[13px] text-[10px] text-[var(--haven-settings-muted-subtle)]">{state.status === "empty" || state.status === "ready" ? `${stats.range.timezone} · ${rangeLabel}` : "统计范围 · 本机阅读记录"}</p>
+        </div>
+      </header>
+
+      {state.status === "error" && (
+        <div role="alert" className="flex items-center justify-between gap-4 rounded-[14px] border border-[var(--haven-settings-danger-20)] bg-[var(--haven-settings-danger-surface)] px-[16px] py-[12px] text-[12px] text-[var(--haven-settings-danger)]">
+          <span>阅读统计暂时不可用：{state.message}</span>
+          <button type="button" onClick={onRetryOverview} className="shrink-0 rounded-full border border-[var(--haven-settings-danger-20)] px-[10px] py-[4px] text-[11px] font-semibold text-[var(--haven-settings-danger)] transition-colors hover:bg-[var(--haven-settings-card-hover)]">重试</button>
+        </div>
+      )}
+
+      {/* 布局读不到时绝不能装作「这就是你保存的排列」：横幅说明当前显示的是默认布局，
+          并给出重新读取的入口。这与 stats 的错误态是两件独立的事（一个读不到统计，
+          一个读不到排列），所以各自有自己的横幅。 */}
+      {layout.status === "error" && (
+        <div role="alert" className="flex items-center justify-between gap-4 rounded-[14px] border border-[var(--haven-settings-danger-20)] bg-[var(--haven-settings-danger-surface)] px-[16px] py-[12px] text-[12px] text-[var(--haven-settings-danger)]">
+          <span>总览布局暂时不可用：{layout.message} 以下按默认布局显示，不会覆盖你保存过的排列。</span>
+          <button type="button" onClick={onRetryLayout} className="shrink-0 rounded-full border border-[var(--haven-settings-danger-20)] px-[10px] py-[4px] text-[11px] font-semibold text-[var(--haven-settings-danger)] transition-colors hover:bg-[var(--haven-settings-card-hover)]">重新读取布局</button>
+        </div>
+      )}
+
+      {layout.status === "ready" && layout.stale && (
+        <p role="status" className="rounded-[14px] border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-[16px] py-[10px] text-[11px] leading-5 text-[var(--haven-settings-muted-strong)]">
+          总览布局可能已被其他窗口更新；以下按最近一次读取到的排列显示。
+        </p>
+      )}
+
+      {layout.status === "loading" ? (
+        <p role="status" className="text-[12px] text-[var(--haven-settings-muted)]">正在读取总览布局…</p>
+      ) : layout.placements.length === 0 ? (
+        <div className="rounded-[22px] border border-dashed border-[var(--haven-settings-border)] px-[20px] py-[28px] text-center">
+          <p className="text-[14px] font-semibold text-[var(--haven-settings-foreground)]">已隐藏全部总览模块</p>
+          <p className="mt-[6px] text-[12px] leading-5 text-[var(--haven-settings-muted)]">
+            这是你保存过的排列，不是读取失败。可在「外观 › 总览布局」里重新打开需要的模块，页头与统计范围始终保留。
+          </p>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 gap-x-[16px] gap-y-[34px] xl:grid-cols-3" aria-label="总览模块">
+          {layout.placements.map((placement) => (
+            <div
+              key={placement.module}
+              data-overview-module={placement.module}
+              data-overview-module-size={placement.size}
+              data-overview-module-row={placement.row}
+              data-overview-module-column={placement.column}
+              style={{
+                "--haven-overview-module-row": placement.row + 1,
+                "--haven-overview-module-column": placement.column + 1,
+              } as OverviewModulePositionStyle}
+              className={cn("haven-overview-module-positioned min-w-0", OVERVIEW_MODULE_SPAN_CLASS[placement.size])}
+            >
+              {renderOverviewModule(placement, moduleContext)}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** 档位 → 模块在外层三列网格里占几列（与 Rust `OverviewModuleSize::column_span` 同源）。 */
+const OVERVIEW_MODULE_SPAN_CLASS: Record<OverviewModuleSize, string> = {
+  small: "xl:col-span-1",
+  medium: "xl:col-span-2",
+  large: "xl:col-span-3",
+}
+
+/**
+ * 摆放坐标以 CSS 自定义属性交给 index.css 里的 `xl` 媒体查询（`.haven-overview-module-positioned`）。
+ *
+ * 为什么不是内联的 `gridRow` / `gridColumn`：三列网格只在 `xl` 生效，窄屏是自然单列流，
+ * 而内联样式没有断点。同一个「坐标交给自定义属性、断点交给 CSS」的做法，首页模块区
+ * （`haven-home-module-positioned`）已经在用。
+ *
+ * 取值是 **1 基**的网格线编号：存储里的 `row` / `column` 是 0 基的起始格。
+ */
+type OverviewModulePositionStyle = CSSProperties & {
+  "--haven-overview-module-row": number
+  "--haven-overview-module-column": number
+}
+
+/**
+ * 模块**内部**的卡片网格。
+ *
+ * 必须跟着档位走：把「当前偏好」放进 1/3 宽的格子里却仍然排四列，卡片会被挤成一条
+ * 无法阅读的窄条。基准列数沿用升级前的那一套（偏好从 `sm` 起两列、指标从 `md` 起两列），
+ * 只在 `xl`——也就是外层网格真正分列的那一档——按档位覆盖。
+ */
+const OVERVIEW_MODULE_INNER_COLUMNS: Record<OverviewModuleSize, string> = {
+  small: "xl:grid-cols-1",
+  medium: "xl:grid-cols-2",
+  large: "xl:grid-cols-4",
+}
+
+type OverviewModuleContext = {
+  state: ReadingOverviewState
+  preferences: Array<{ label: string; value: string; section: SettingsNavId }>
+  metrics: ReadingOverviewMetric[]
+  onSelectSection: (section: SettingsNavId) => void
+}
+
+/**
+ * 一个总览模块的实际渲染。
+ *
+ * 每个分支都是升级前那一段真实内容原样搬进来（同一批卡片、同一批图表组件），因此
+ * 「模块化」没有改变任何一块的内容或空/错态语义，只改变了它们的位置与宽度。
+ *
+ * `default` 分支在类型上不可达：`OverviewModuleId` 是闭合联合，而落到这里的未知 ID 早已
+ * 被 `layoutToOverviewModulePlacements` 丢掉。这里返回 null 不是「静默回落」，而是让闭合
+ * 联合新增成员时能在类型检查里暴露出来。
+ */
+function renderOverviewModule(
+  placement: OverviewModulePlacement,
+  context: OverviewModuleContext,
+): ReactNode {
+  switch (placement.module) {
+    case "preferences":
+      return (
+        <section className={cn("grid gap-[14px] sm:grid-cols-2", OVERVIEW_MODULE_INNER_COLUMNS[placement.size])} aria-label="当前偏好">
+          {context.preferences.map((preference) => (
+            <button
+              key={preference.label}
+              type="button"
+              onClick={() => context.onSelectSection(preference.section)}
+              className="group min-h-[112px] rounded-[22px] bg-[var(--haven-settings-card)] p-[20px] text-left transition-colors hover:bg-[var(--haven-settings-card-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-primary-35)]"
+            >
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-[11px] text-[var(--haven-settings-muted-subtle)]">{preference.label}</p>
+                <ChevronRight className="h-[14px] w-[14px] text-[var(--haven-settings-muted-faint)] transition-transform group-hover:translate-x-0.5" strokeWidth={1.8} aria-hidden="true" />
+              </div>
+              <p className="mt-[15px] truncate text-[19px] font-semibold leading-none tracking-[-0.03em] text-[var(--haven-settings-foreground)]">{preference.value}</p>
+              <p className="mt-[13px] text-[10px] text-[var(--haven-settings-muted-faint)]">前往设置</p>
+            </button>
+          ))}
+        </section>
+      )
+    case "metrics":
+      return (
+        <section className={cn("grid gap-[14px] md:grid-cols-2", OVERVIEW_MODULE_INNER_COLUMNS[placement.size])} aria-label="阅读指标">
+          {context.metrics.map((metric) => <ReadingOverviewMetricCard key={metric.label} metric={metric} />)}
+        </section>
+      )
+    case "reading-minutes":
+      return <ReadingMinutesChart state={context.state} />
+    case "type-share":
+      return <ReadingTypeShareChart state={context.state} />
+    case "reading-heatmap":
+      return <ReadingHeatmap state={context.state} />
+    default:
+      return null
+  }
+}
+
+function ReadingOverviewMetricCard({ metric }: { metric: ReadingOverviewMetric }) {
+  return (
+    <article className={cn("min-h-[138px] rounded-[22px] p-[23px]", metric.dark ? "bg-[var(--haven-settings-strong-surface)] text-[var(--haven-settings-strong-foreground)]" : "bg-[var(--haven-settings-card)] text-[var(--haven-settings-foreground)]")}>
+      <div className="flex items-center justify-between gap-3">
+        <p className={cn("text-[11px]", metric.dark ? "text-[var(--haven-settings-strong-foreground)]/75" : "text-[var(--haven-settings-muted-subtle)]")}>{metric.label}</p>
+        <span className={cn("h-[8px] w-[8px] rounded-full", metric.dark ? "bg-[var(--haven-settings-strong-foreground)]" : "bg-[var(--haven-settings-strong-surface)]")} aria-hidden="true" />
+      </div>
+      <p className={cn("mt-[12px] text-[28px] font-bold leading-none tracking-[-0.04em]", metric.dark ? "text-[var(--haven-settings-strong-foreground)]" : "text-[var(--haven-settings-foreground)]")}>{metric.value}</p>
+      <div className={cn("mt-[19px] border-t pt-[11px] text-[10px]", metric.dark ? "border-[var(--haven-settings-strong-foreground)]/30 text-[var(--haven-settings-strong-foreground)]/75" : "border-[var(--haven-settings-border)] text-[var(--haven-settings-muted-subtle)]")}>{metric.foot}</div>
+    </article>
+  )
+}
+
+function ReadingMinutesChart({ state }: { state: ReadingOverviewState }) {
+  const items = readingOverviewStats(state).dailyMinutes
+  const hasData = items.some((item) => item.minutes > 0)
+  const maxMinutes = Math.max(...items.map((item) => item.minutes), 1)
+
+  return (
+    <section className="min-h-[258px] rounded-[22px] bg-[var(--haven-settings-card)] p-[28px]" aria-label="过去七天阅读时长">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h3 className="text-[18px] font-bold tracking-[-0.025em] text-[var(--haven-settings-foreground)]">每日阅读时长</h3>
+          <p className="mt-[5px] text-[11px] text-[var(--haven-settings-muted-subtle)]">过去 7 天 · 阅读时长</p>
+        </div>
+        <span className="pt-[3px] text-[10px] text-[var(--haven-settings-muted-subtle)]">阅读分钟</span>
+      </div>
+      <div className="mt-[20px] flex h-[166px] items-center justify-center border-t border-b border-[var(--haven-settings-border)]">
+        {state.status === "loading" ? (
+          <p className="text-[12px] text-[var(--haven-settings-muted-subtle)]" aria-live="polite">正在读取阅读数据…</p>
+        ) : state.status === "error" ? (
+          <div className="text-center" role="status">
+            <p className="text-[13px] font-semibold text-[var(--haven-settings-muted-strong)]">{OVERVIEW_ERROR_TITLE}</p>
+            <p className="mt-[6px] text-[10px] text-[var(--haven-settings-muted-faint)]">{OVERVIEW_ERROR_HINT}</p>
+          </div>
+        ) : hasData ? (
+          <div className="flex h-full w-full items-end justify-between gap-3 px-[8px] pb-[18px] pt-[18px]">
+            {items.map((item) => (
+              <div key={item.localDate} className="flex h-full min-w-0 flex-1 flex-col items-center justify-end gap-[8px]">
+                <span className="text-[9px] text-[var(--haven-settings-muted-subtle)]">{item.minutes > 0 ? `${Math.round(item.minutes)}M` : ""}</span>
+                <div className="flex h-[106px] w-full items-end justify-center">
+                  <div
+                    className="w-full max-w-[38px] rounded-t-[8px] bg-[var(--haven-settings-muted-strong)] transition-[height] duration-300"
+                    style={{ height: `${item.minutes > 0 ? Math.max(8, (item.minutes / maxMinutes) * 100) : 3}%` }}
+                    aria-label={`${item.label} ${Math.round(item.minutes)} 分钟`}
+                  />
+                </div>
+                <span className="text-[9px] text-[var(--haven-settings-muted-subtle)]">{item.label}</span>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="text-center">
+            <p className="text-[13px] font-semibold text-[var(--haven-settings-muted-strong)]">暂无阅读数据</p>
+            <p className="mt-[6px] text-[10px] text-[var(--haven-settings-muted-faint)]">开始阅读后，这里会显示最近 7 天的阅读时长。</p>
+          </div>
+        )}
+      </div>
+      <p className="mt-[14px] text-[10px] text-[var(--haven-settings-muted-faint)]">来源 · 本机阅读记录</p>
+    </section>
+  )
+}
+
+function ReadingTypeShareChart({ state }: { state: ReadingOverviewState }) {
+  const shares = readingOverviewStats(state).typeShares.filter((item) => item.minutes > 0)
+  const hasData = shares.length > 0
+  // 「读不到」时圆环与图例都必须说读取失败：把它们显示成「无 / 暂无数据」等于替用户
+  // 断言「这段时间没有阅读」，而那正是错误态无从知道的事。
+  const isError = state.status === "error"
+  const totalMinutes = shares.reduce((total, item) => total + item.minutes, 0)
+  const colors = [
+    "var(--haven-settings-strong-surface)",
+    "var(--haven-settings-muted-strong)",
+    "var(--haven-settings-muted)",
+    "var(--haven-settings-muted-faint)",
+  ]
+  let angle = 0
+  const gradient = shares.map((share, index) => {
+    const start = angle
+    angle += (share.minutes / Math.max(totalMinutes, 1)) * 360
+    return `${colors[index % colors.length]} ${start}deg ${angle}deg`
+  }).join(", ")
+
+  return (
+    <section className="min-h-[258px] rounded-[22px] bg-[var(--haven-settings-card)] p-[24px]" aria-label="作品类型占比">
+      <h3 className="text-[18px] font-bold tracking-[-0.025em] text-[var(--haven-settings-foreground)]">作品类型分布</h3>
+      <p className="mt-[5px] text-[11px] text-[var(--haven-settings-muted-subtle)]">按阅读时长计算</p>
+      <div className="mt-[13px] flex min-h-[144px] items-center gap-[18px]">
+        <div className="relative h-[144px] w-[144px] shrink-0 rounded-full" style={{ background: hasData ? `conic-gradient(${gradient})` : "var(--haven-settings-control)" }}>
+          <div className="absolute inset-[27px] flex flex-col items-center justify-center rounded-full bg-[var(--haven-settings-card)]">
+            <span className="text-[22px] font-bold leading-none tracking-[-0.04em] text-[var(--haven-settings-muted-strong)]">{hasData ? `${Math.round(shares[0]?.percentage ?? 0)}%` : isError ? "—" : "无"}</span>
+            <span className="mt-[5px] text-[10px] text-[var(--haven-settings-muted-subtle)]">{hasData ? contentCategoryLabel(shares[0]?.category ?? null) : isError ? OVERVIEW_UNAVAILABLE_VALUE : "暂无数据"}</span>
+          </div>
+        </div>
+        <div className="min-w-0 flex-1">
+          {hasData ? (
+            <div className="space-y-[8px]">
+              {shares.map((share, index) => (
+                <div key={share.category} className="flex items-center justify-between gap-3 text-[10px]">
+                  <span className="flex min-w-0 items-center gap-2 text-[var(--haven-settings-muted-strong)]"><span className="h-[7px] w-[7px] shrink-0 rounded-full" style={{ backgroundColor: colors[index % colors.length] }} />{contentCategoryLabel(share.category)}</span>
+                  <span className="shrink-0 text-[var(--haven-settings-muted-subtle)]">{Math.round(share.percentage)}%</span>
+                </div>
+              ))}
+            </div>
+          ) : isError ? (
+            <p className="text-[11px] leading-5 text-[var(--haven-settings-muted-subtle)]">{OVERVIEW_ERROR_TITLE}：{OVERVIEW_ERROR_HINT}</p>
+          ) : (
+            <p className="text-[11px] leading-5 text-[var(--haven-settings-muted-subtle)]">开始阅读后，这里会显示小说、漫画、影视与报刊的占比。</p>
+          )}
+        </div>
+      </div>
+      <p className="mt-[12px] text-[10px] text-[var(--haven-settings-muted-faint)]">来源 · 本机阅读记录 · 类型分布</p>
+    </section>
+  )
+}
+
+function ReadingHeatmap({ state }: { state: ReadingOverviewState }) {
+  const heatmap = readingOverviewStats(state).heatmap
+  const cells = heatmap.cells.filter((cell) => cell.minutes > 0)
+  const hours = Array.from(new Set(heatmap.cells.map((cell) => cell.hour))).sort((a, b) => a - b)
+  const hasData = cells.length > 0
+  const maxMinutes = Math.max(...cells.map((cell) => cell.minutes), 1)
+  const dayLabels = ["一", "二", "三", "四", "五", "六", "日"]
+  const cellMap = new Map(heatmap.cells.map((cell) => [`${cell.dayOfWeek}:${cell.hour}`, cell.minutes]))
+  // 错误态与空态必须分开：热力图的「无高峰 / 暂无本机阅读记录」是在断言这段时间没有
+  // 阅读，而读取失败时页面根本不知道这件事。
+  const isError = state.status === "error"
+  const peak = heatmap.peakStartHour != null && heatmap.peakEndHour != null
+    ? `${heatmap.peakStartHour}–${heatmap.peakEndHour} 点`
+    : isError ? OVERVIEW_UNAVAILABLE_VALUE : "无"
+  const heatmapGrid = hours.flatMap((hour) => [
+    <span key={`hour-${hour}`} className="text-right">{String(hour).padStart(2, "0")}</span>,
+    ...dayLabels.map((_, index) => {
+      const minutes = cellMap.get(`${index + 1}:${hour}`) ?? 0
+      return <span key={`${hour}-${index}`} title={`${hour} 点 · ${Math.round(minutes)} 分钟`} className="h-[10px] rounded-full" style={{ backgroundColor: minutes > 0 ? `color-mix(in srgb, var(--haven-settings-strong-surface) ${Math.round((0.18 + (minutes / maxMinutes) * 0.72) * 100)}%, transparent)` : "var(--haven-settings-control)" }} />
+    }),
+  ])
+
+  return (
+    <section className="min-h-[204px] rounded-[22px] bg-[var(--haven-settings-card)] p-[28px]" aria-label="阅读时段热力图">
+      <div>
+        <h3 className="text-[18px] font-bold tracking-[-0.025em] text-[var(--haven-settings-foreground)]">阅读时段</h3>
+        <p className="mt-[5px] text-[11px] text-[var(--haven-settings-muted-subtle)]">最近 7 天 · 按阅读时长着色</p>
+      </div>
+      <div className="mt-[18px] grid gap-[24px] md:grid-cols-[260px_minmax(0,1fr)]">
+        <div className="border-r border-[var(--haven-settings-border)] pr-[24px]">
+          <p className="text-[10px] text-[var(--haven-settings-muted-subtle)]">高峰时段</p>
+          <p className="mt-[8px] text-[26px] font-normal leading-none tracking-[-0.035em] text-[var(--haven-settings-foreground)]">{peak}</p>
+          <p className="mt-[8px] text-[11px] text-[var(--haven-settings-muted-subtle)]">{hasData ? "阅读时长最集中" : isError ? OVERVIEW_ERROR_TITLE : "暂无本机阅读记录"}</p>
+        </div>
+        <div className="flex min-h-[94px] items-center justify-center border border-dashed border-[var(--haven-settings-border)] px-[24px] text-center">
+          {hasData ? (
+            <div className="grid w-full grid-cols-[28px_repeat(7,minmax(0,1fr))] items-center gap-[5px] text-[9px] text-[var(--haven-settings-muted-subtle)]">
+              <span aria-hidden="true" />
+              {dayLabels.map((label) => <span key={label} className="text-center">{label}</span>)}
+              {heatmapGrid}
+            </div>
+          ) : isError ? (
+            <div role="status">
+              <p className="text-[13px] font-semibold text-[var(--haven-settings-muted-strong)]">{OVERVIEW_ERROR_TITLE}</p>
+              <p className="mt-[6px] text-[10px] text-[var(--haven-settings-muted-faint)]">{OVERVIEW_ERROR_HINT}</p>
+            </div>
+          ) : (
+            <div>
+              <p className="text-[13px] font-semibold text-[var(--haven-settings-muted-strong)]">暂无阅读数据</p>
+              <p className="mt-[6px] text-[10px] text-[var(--haven-settings-muted-faint)]">开始阅读后，会显示最近 7 天的阅读时段。</p>
+            </div>
+          )}
+        </div>
+      </div>
+      <p className="mt-[10px] text-[10px] text-[var(--haven-settings-muted-faint)]">来源 · 本机阅读记录 · 最近 7 天</p>
+    </section>
+  )
+}
+
+/**
+ * 分区渲染：登记表里的每个分区都有自己的真实组件。
+ *
+ * 没有 `sync` 分支——它不在登记表里，也就是不可导航、不可渲染。栖伴入口挂在
+ * 「智能功能」分区上（`ai.recommendation`，绑定 `aiSettingsRecommendationGenerate`）：
+ * 模型服务已经通过 A2 AI Provider 切片接入，请求仍只生成 pending 提案，批准只能回到
+ * 这个界面完成。
+ *
+ * 未知分区**绝不回落到通用设置**：那会把「这里没有渲染器」伪装成一个看起来正常的
+ * 通用页面，用户以为自己在改 A，实际改的是 B。漏注册是开发期错误，所以这里渲染一个
+ * 说清楚的不可用态；settings-registry.test.ts 另外钉住「登记表的每个 id 都必须有
+ * 自己的 case」，让新增分区在测试里就暴露，而不是等用户看见一个错的分区。
+ */
+
+/**
+ * 分区之上的 AI Provider 选择。
+ *
+ * 由 `SettingsContent` 持有并传给「智能功能」分区，因此切换分区（组件重新挂载）不会
+ * 把它重置成列表第一项——那会让栖伴的请求静默改投另一个 Provider。
+ */
+type AiProviderSelection = {
+  profileId: string | null
+  onSelect: (profileId: string | null) => void
+}
+
 function renderSettingsSection(
-  section: SettingsSectionId,
-  settings: SettingsState,
-  update: <K extends keyof SettingsState>(key: K, value: SettingsState[K]) => void,
-  forms: { general: SettingsFormController; appearance: SettingsFormController; playback: SettingsFormController; reading: SettingsFormController; comic: SettingsFormController; downloads: SettingsFormController; privacy: SettingsFormController },
+  section: SettingsRegistryEntry["id"],
+  forms: SettingsFormSet,
   showNotice: (message: string) => void,
   resourceContext: ResourcePreferenceContext | null,
-  onOpenAssistant: () => void,
+  overviewLayout: OverviewLayoutController,
+  homeLayout: HomeLayoutController,
+  appearanceAssets: AppearanceAssetsController,
 ) {
   switch (section) {
     case "appearance":
-      return <AppearanceSettings form={forms.appearance} />
+      return (
+        <AppearanceSettings
+          form={forms.appearance}
+          showNotice={showNotice}
+          overviewLayout={overviewLayout}
+          homeLayout={homeLayout}
+          assets={appearanceAssets}
+        />
+      )
     case "playback":
       return <PlaybackSettings form={forms.playback} />
     case "reading":
@@ -480,39 +975,57 @@ function renderSettingsSection(
       return <StorageSettings showNotice={showNotice} />
     case "downloads":
       return <DownloadSettings form={forms.downloads} />
-    case "sync":
-      return <SyncSettings settings={settings} update={update} />
-    case "ai":
-      return <AiSettings showNotice={showNotice} onOpenAssistant={onOpenAssistant} />
     case "updates":
       return <UpdateSettings showNotice={showNotice} />
     case "privacy":
       return <PrivacySettings form={forms.privacy} showNotice={showNotice} />
     case "about":
-      return <AboutSettings />
+      return <AboutSettings diagnostics={<ErrorReportSettings />} />
     case "general":
-    default:
       return <GeneralSettings form={forms.general} />
+    default:
+      return <SettingsSectionUnavailable section={section} />
   }
+}
+
+/**
+ * 没有渲染器的分区：登记表里存在、但 `renderSettingsSection` 还没有对应的 case。
+ *
+ * 这不是给用户准备的功能，而是把「开发期漏注册」变成一个看得见的错误——显示通用设置
+ * 会让人以为分区是正常的，从而把配置改到错误的位置。导出以便组件测试直接挂载。
+ */
+export function SettingsSectionUnavailable({ section }: { section: string }) {
+  return (
+    <div aria-label={section} role="alert" className="px-2 pb-2 pt-2">
+      <h2 className="text-[28px] font-bold tracking-[-0.025em] text-[var(--haven-settings-foreground)]">该设置分区暂未注册渲染器</h2>
+      <p className="mt-1.5 max-w-2xl text-[14px] leading-6 text-[var(--haven-settings-muted-strong)]">
+        分区「{section}」在设置登记表里存在，但设置页没有对应它的渲染器。为避免把配置写到错误的分区，
+        这里不显示任何设置项；请更新设置页后再打开该分区。
+      </p>
+    </div>
+  )
 }
 
 function SettingsIntro({ section, title, description }: { section: string; title: string; description: string }) {
   return (
     <div aria-label={section} className="px-2 pb-2 pt-2">
-      <h2 className="text-[28px] font-bold tracking-[-0.025em] text-[#1d1d1f] dark:text-[#f5f5f5]">{title}</h2>
-      <p className="mt-1.5 max-w-2xl text-[14px] leading-6 text-[#6e6e73] dark:text-[#98989d]">{description}</p>
+      <h2 className="text-[28px] font-bold tracking-[-0.025em] text-[var(--haven-settings-foreground)]">{title}</h2>
+      <p className="mt-1.5 max-w-2xl text-[14px] leading-6 text-[var(--haven-settings-muted-strong)]">{description}</p>
     </div>
   )
 }
 
-function SettingsGroup({ title, description, children }: { title: string; description?: string; children: ReactNode }) {
+function SettingsGroup({ title, description, children, action, features }: { title: string; description?: string; children: ReactNode; action?: ReactNode; features?: readonly FeatureId[] }) {
   return (
-    <section className="mb-6 last:mb-0">
-      <div className="px-2 pb-2">
-        <h3 className="text-[11px] font-semibold tracking-[0.12em] uppercase text-[#86868b] dark:text-[#98989d]">{title}</h3>
-        {description && <p className="mt-1 text-[12px] leading-5 text-[#86868b] dark:text-[#8e8e93]">{description}</p>}
+    <section className="mb-6 last:mb-0" data-settings-features={features?.join(" ")} tabIndex={features ? -1 : undefined}>
+      <div className="flex items-start justify-between gap-3 px-2 pb-2">
+        <div className="min-w-0">
+          <h3 className="text-[11px] font-semibold tracking-[0.12em] uppercase text-[var(--haven-settings-muted)]">{title}</h3>
+          {description && <p className="mt-1 text-[12px] leading-5 text-[var(--haven-settings-muted)]">{description}</p>}
+        </div>
+        {action}
       </div>
-      <div className="overflow-hidden rounded-[14px] border border-black/[0.04] dark:border-white/[0.04] bg-white dark:bg-[#1c1c1e] shadow-[0_2px_8px_rgba(0,0,0,0.02)] dark:shadow-[0_2px_8px_rgba(0,0,0,0.1)]">
+      <div className="overflow-hidden rounded-[14px] border border-[var(--haven-settings-border-subtle)] bg-[var(--haven-settings-card)] shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
         {children}
       </div>
     </section>
@@ -521,66 +1034,16 @@ function SettingsGroup({ title, description, children }: { title: string; descri
 
 function SettingRow({ title, description, children, icon, danger = false }: { title: string; description?: string; children: ReactNode; icon?: ReactNode; danger?: boolean }) {
   return (
-    <div className="group/row flex min-h-[68px] items-center gap-4 border-b border-black/[0.04] dark:border-white/[0.04] px-6 py-4 transition-colors hover:bg-black/[0.012] dark:hover:bg-white/[0.015] last:border-b-0">
+    <div data-settings-row="true" className="group/row flex min-h-[68px] items-center gap-4 border-b border-[var(--haven-settings-border-subtle)] px-6 py-4 transition-colors hover:bg-[var(--haven-settings-card-hover)] last:border-b-0">
       <div className="flex min-w-0 flex-1 items-center gap-3.5">
-        {icon && <span className="flex h-[28px] w-[28px] shrink-0 items-center justify-center rounded-lg bg-black/[0.03] dark:bg-white/[0.04] text-[#86868b] dark:text-[#98989d] group-hover/row:text-[#007aff] transition-colors">{icon}</span>}
+        {icon && <span className="flex h-[28px] w-[28px] shrink-0 items-center justify-center rounded-lg bg-[var(--haven-settings-control)] text-[var(--haven-settings-muted)] transition-colors group-hover/row:text-[var(--haven-settings-primary)]">{icon}</span>}
         <div className="min-w-0">
-          <p className={cn("text-[14px] font-semibold tracking-[-0.005em]", danger ? "text-[#ff3b30]" : "text-[#1d1d1f] dark:text-[#f5f5f5]")}>{title}</p>
-          {description && <p className="mt-1 max-w-[520px] text-[12px] leading-[1.65] text-[#86868b] dark:text-[#8e8e93]">{description}</p>}
+          <p className={cn("text-[14px] font-semibold tracking-[-0.005em]", danger ? "text-[var(--haven-settings-danger)]" : "text-[var(--haven-settings-foreground)]")}>{title}</p>
+          {description && <p className="mt-1 max-w-[520px] text-[12px] leading-[1.65] text-[var(--haven-settings-muted)]">{description}</p>}
         </div>
       </div>
       <div className="shrink-0 sm:ml-8">{children}</div>
     </div>
-  )
-}
-
-type SettingsSummaryItem = {
-  label: string
-  value: string
-  icon: ReactNode
-}
-
-function SettingsSummaryRail({ activeSection, settings, forms, onReset, onReload, showNotice }: { activeSection: SettingsSectionId; settings: SettingsState; forms: { general: SettingsFormController; appearance: SettingsFormController; playback: SettingsFormController; reading: SettingsFormController; comic: SettingsFormController; downloads: SettingsFormController; privacy: SettingsFormController }; onReset: () => void; onReload: () => void; showNotice: (message: string) => void }) {
-  const sectionLabel = SETTINGS_SECTIONS.find((item) => item.id === activeSection)?.label ?? "设置"
-  const items = getSettingsSummaryItems(activeSection, settings, forms)
-
-  return (
-    <aside className="hidden min-w-0 xl:block">
-      <div className="sticky top-0 space-y-[16px]">
-        <div className="rounded-[18px] border border-black/[0.06] dark:border-white/[0.06] bg-white/70 dark:bg-[#1c1c1e]/80 p-[20px] shadow-[0_8px_24px_rgba(0,0,0,0.025)] dark:shadow-[0_8px_24px_rgba(0,0,0,0.2)]">
-          <div className="flex items-center justify-between gap-3">
-            <h3 className="text-[16px] font-semibold tracking-[-0.02em] text-[#1d1d1f] dark:text-[#f5f5f5]">当前配置</h3>
-            <button type="button" onClick={onReset} className="text-[12px] font-semibold text-[#007aff] transition-colors hover:text-[#006fe6]">重置</button>
-          </div>
-          <p className="mt-[4px] text-[12px] text-[#86868b] dark:text-[#98989d]">{sectionLabel} · 本机保存</p>
-          <div className="mt-[18px] space-y-[14px]">
-            {items.map((item) => (
-              <div key={item.label} className="flex min-w-0 items-center gap-[10px]">
-                <span className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-[9px] bg-[#f2f2f4] dark:bg-[#2c2c2e] text-[#6e6e73] dark:text-[#98989d]">{item.icon}</span>
-                <div className="min-w-0">
-                  <p className="truncate text-[12px] text-[#6e6e73] dark:text-[#8e8e93]">{item.label}</p>
-                  <p className="truncate text-[13px] font-medium text-[#1d1d1f] dark:text-[#f5f5f5]">{item.value}</p>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="rounded-[18px] border border-black/[0.06] dark:border-white/[0.06] bg-white/70 dark:bg-[#1c1c1e]/80 p-[20px] shadow-[0_8px_24px_rgba(0,0,0,0.025)] dark:shadow-[0_8px_24px_rgba(0,0,0,0.2)]">
-          <h3 className="text-[16px] font-semibold tracking-[-0.02em] text-[#1d1d1f] dark:text-[#f5f5f5]">快速操作</h3>
-          <div className="mt-[14px] space-y-[6px]">
-            <button type="button" onClick={onReload} className="flex min-h-[42px] w-full items-center gap-[10px] rounded-[10px] px-[8px] text-left transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.06]">
-              <RefreshCw className="h-[18px] w-[18px] shrink-0 text-[#5f9ed8]" strokeWidth={1.8} />
-              <span className="min-w-0"><span className="block text-[13px] font-semibold text-[#1d1d1f] dark:text-[#f5f5f5]">重新加载配置</span><span className="mt-[2px] block truncate text-[11px] text-[#86868b] dark:text-[#98989d]">从本地设置恢复当前页面</span></span>
-            </button>
-            <button type="button" onClick={() => showNotice("配置目录将在本地 Storage Manager 接入后开放")} className="flex min-h-[42px] w-full items-center gap-[10px] rounded-[10px] px-[8px] text-left transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.06]">
-              <Folder className="h-[18px] w-[18px] shrink-0 text-[#6e6e73] dark:text-[#98989d]" strokeWidth={1.8} />
-              <span className="min-w-0"><span className="block text-[13px] font-semibold text-[#1d1d1f] dark:text-[#f5f5f5]">打开配置目录</span><span className="mt-[2px] block truncate text-[11px] text-[#86868b] dark:text-[#98989d]">查看或编辑本地配置文件</span></span>
-            </button>
-          </div>
-        </div>
-      </div>
-    </aside>
   )
 }
 
@@ -593,7 +1056,27 @@ function generalDisplayValue(form: SettingsFormController): GeneralSettingsValue
 function appearanceDisplayValue(form: SettingsFormController): AppearanceSettingsValue {
   const value = form.displayValue
   if (value.section === "appearance") return value
-  return { section: "appearance", theme: "system", density: "comfortable", sidebar: "auto", reduceMotion: false }
+  return { section: "appearance", theme: "system", density: "comfortable", sidebar: "auto", reduceMotion: false, interfaceFontMode: "system" }
+}
+
+/**
+ * 外观表单的草稿与最近一次成功读取的持久化选择。
+ *
+ * 未保存草稿用于避免用户误删正在配置的资产；saved 用于保护运行时真正正在使用的资产。
+ * 尚未读取到持久化值时 saved 为 null，删除守卫会失败关闭。
+ */
+function appearanceAssetSelection(form: SettingsFormController): AppearanceAssetDeleteSelections {
+  const toSelection = (value: AppearanceSettingsValue): AppearanceAssetSelection => ({
+    fontAssetId: value.customFontAssetId ?? null,
+    wallpaper: value.wallpaper,
+  })
+  const saved = "saved" in form.state && form.state.saved.section === "appearance"
+    ? form.state.saved
+    : null
+  return {
+    draft: toSelection(appearanceDisplayValue(form)),
+    saved: saved ? toSelection(saved) : null,
+  }
 }
 
 function privacyDisplayValue(form: SettingsFormController): PrivacySettingsValue {
@@ -606,12 +1089,6 @@ function playbackDisplayValue(form: SettingsFormController): PlaybackSettingsVal
   const value = form.displayValue
   if (value.section === "playback") return value
   return { section: "playback", defaultPlaybackRate: "one", autoResume: true, autoNext: true }
-}
-
-function downloadsDisplayValue(form: SettingsFormController): DownloadSettingsValue {
-  const value = form.displayValue
-  if (value.section === "downloads") return value
-  return { section: "downloads", concurrentTasks: "three", speedLimit: "unlimited", autoContinue: true }
 }
 
 function readingDisplayValue(form: SettingsFormController): ReadingSettingsValue {
@@ -640,111 +1117,6 @@ function comicDisplayValue(form: SettingsFormController): ComicSettingsValue {
   return { section: "comic", viewMode: "single", direction: "rtl", pageGap: "twelve", preloadPages: "three" }
 }
 
-function getSettingsSummaryItems(section: SettingsSectionId, settings: SettingsState, forms: { general: SettingsFormController; appearance: SettingsFormController; playback: SettingsFormController; reading: SettingsFormController; comic: SettingsFormController; downloads: SettingsFormController; privacy: SettingsFormController }): SettingsSummaryItem[] {
-  switch (section) {
-    case "general": {
-      const value = generalDisplayValue(forms.general)
-      return [
-        { label: "启动页", value: optionLabel(LAUNCH_PAGE_OPTIONS, value.launchPage), icon: <Home className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "恢复上次状态", value: value.restoreSession ? "已开启" : "已关闭", icon: <History className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "界面语言", value: `${optionLabel(LANGUAGE_OPTIONS, value.language)} · 当前版本不可用`, icon: <Globe2 className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "通知", value: "当前版本不可用", icon: <Bell className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-      ]
-    }
-    case "appearance": {
-      const value = appearanceDisplayValue(forms.appearance)
-      return [
-        { label: "主题", value: optionLabel(THEME_OPTIONS, value.theme), icon: <Palette className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "界面密度", value: optionLabel(DENSITY_OPTIONS, value.density), icon: <SlidersHorizontal className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "侧栏行为", value: optionLabel(SIDEBAR_OPTIONS, value.sidebar), icon: <PanelsTopLeft className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "减少动效", value: value.reduceMotion ? "已开启" : "已关闭", icon: <Sparkles className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-      ]
-    }
-    case "reading": {
-      const value = readingDisplayValue(forms.reading)
-      return [
-        { label: "默认字体", value: optionLabel(READING_FONT_OPTIONS, value.fontFamily), icon: <BookOpen className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "字号与行高", value: `${optionLabel(READING_FONT_SIZE_OPTIONS, value.fontSize)} · ${optionLabel(READING_LINE_HEIGHT_OPTIONS, value.lineHeight)}`, icon: <Settings2 className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "正文宽度", value: optionLabel(READING_WIDTH_OPTIONS, value.contentWidth), icon: <PanelsTopLeft className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "阅读模式", value: optionLabel(READING_PAGINATION_OPTIONS, value.pagination ?? "scroll"), icon: <BookOpen className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-      ]
-    }
-    case "playback": {
-      const value = playbackDisplayValue(forms.playback)
-      return [
-        { label: "默认倍速", value: optionLabel(PLAYBACK_RATE_OPTIONS, value.defaultPlaybackRate), icon: <SlidersHorizontal className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "自动下一集", value: value.autoNext ? "已开启" : "已关闭", icon: <ChevronRight className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "自动继续", value: value.autoResume ? "已开启" : "已关闭", icon: <RefreshCw className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "截图快捷键", value: "Ctrl+Shift+S", icon: <PlaySquare className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-      ]
-    }
-    case "downloads": {
-      const value = downloadsDisplayValue(forms.downloads)
-      return [
-        { label: "下载位置", value: "下载 / 栖阅（默认）", icon: <Download className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "同时下载数量", value: optionLabel(DOWNLOAD_CONCURRENCY_OPTIONS, value.concurrentTasks), icon: <SlidersHorizontal className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "下载速度", value: optionLabel(DOWNLOAD_SPEED_LIMIT_OPTIONS, value.speedLimit), icon: <Download className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "中断任务恢复", value: value.autoContinue ? "自动恢复" : "手动恢复", icon: <RefreshCw className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-      ]
-    }
-    case "comic": {
-      const value = comicDisplayValue(forms.comic)
-      return [
-        { label: "阅读模式", value: value.viewMode === "single" ? "单页" : value.viewMode === "double" ? "双页" : "条漫", icon: <PanelsTopLeft className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "阅读方向", value: value.direction === "rtl" ? "从右向左" : "从左向右", icon: <ChevronRight className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "页面间距", value: value.pageGap === "zero" ? "0 px" : value.pageGap === "twelve" ? "12 px" : "24 px", icon: <SlidersHorizontal className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "预加载页数", value: value.preloadPages === "unlimited" ? "安全上限" : `${value.preloadPages === "one" ? 1 : value.preloadPages === "three" ? 3 : 5} 页`, icon: <Download className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-      ]
-    }
-    case "sync":
-      return [
-        { label: "同步状态", value: settings.syncEnabled ? "已开启" : "已关闭", icon: <Cloud className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "同步目标", value: settings.syncTarget, icon: <Server className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "同步进度与标记", value: settings.syncProgress ? "已开启" : "已关闭", icon: <RefreshCw className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-      ]
-    case "privacy":
-      {
-        const value = privacyDisplayValue(forms.privacy)
-      return [
-        { label: "搜索历史", value: value.searchHistory ? "已开启" : "已关闭", icon: <History className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "播放与阅读历史", value: value.playbackHistory ? "已开启" : "已关闭", icon: <BookOpen className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "网络诊断信息", value: "当前版本不可用", icon: <Shield className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-      ]
-      }
-    default:
-      return [
-        { label: "当前状态", value: "本机保存", icon: <CircleCheck className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "配置来源", value: "Haven Local-first", icon: <HardDrive className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-        { label: "应用版本", value: "由关于页面读取", icon: <Info className="h-[16px] w-[16px]" strokeWidth={1.8} /> },
-      ]
-  }
-}
-
-function Toggle({ checked, onChange, label, disabled = false }: { checked: boolean; onChange: (value: boolean) => void; label: string; disabled?: boolean }) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={label}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      className={cn(
-        "relative h-[32px] w-[52px] rounded-full border border-black/[0.04] dark:border-white/[0.04] p-[2px] transition-colors duration-300 ease-in-out",
-        checked ? "bg-[#34c759]" : "bg-[#e9e9ea] dark:bg-[#39393d] hover:bg-[#e1e1e2] dark:hover:bg-[#454549]",
-        disabled && "cursor-not-allowed opacity-50"
-      )}
-    >
-      <span
-        className={cn(
-          "block h-[26px] w-[26px] rounded-full bg-white shadow-[0_2px_6px_rgba(0,0,0,0.15),0_0_1px_rgba(0,0,0,0.2)] dark:shadow-[0_2px_6px_rgba(0,0,0,0.5),0_0_1px_rgba(0,0,0,0.5)] transition-transform duration-300 ease-in-out",
-          checked && "translate-x-[20px]"
-        )}
-      />
-    </button>
-  )
-}
-
 function SelectControl({ value, options, onChange, ariaLabel, disabled = false }: { value: string; options: string[]; onChange: (value: string) => void; ariaLabel: string; disabled?: boolean }) {
   const rootRef = useRef<HTMLDivElement>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
@@ -754,6 +1126,7 @@ function SelectControl({ value, options, onChange, ariaLabel, disabled = false }
   const [isOpen, setIsOpen] = useState(false)
   const [highlightedIndex, setHighlightedIndex] = useState(selectedIndex)
   const [menuStyle, setMenuStyle] = useState<CSSProperties>({})
+  const [menuContainer, setMenuContainer] = useState<HTMLElement | null>(null)
 
   const updateMenuPosition = useCallback(() => {
     const trigger = triggerRef.current
@@ -786,6 +1159,7 @@ function SelectControl({ value, options, onChange, ariaLabel, disabled = false }
 
   const openMenu = () => {
     if (disabled) return
+    setMenuContainer(triggerRef.current?.closest("dialog") ?? document.body)
     setHighlightedIndex(selectedIndex)
     updateMenuPosition()
     setIsOpen(true)
@@ -794,6 +1168,7 @@ function SelectControl({ value, options, onChange, ariaLabel, disabled = false }
   const selectOption = (option: string) => {
     onChange(option)
     setIsOpen(false)
+    triggerRef.current?.focus()
   }
 
   useEffect(() => {
@@ -843,7 +1218,7 @@ function SelectControl({ value, options, onChange, ariaLabel, disabled = false }
       } else {
         selectOption(options[highlightedIndex])
       }
-    } else if (event.key === "Escape") {
+    } else if (event.key === "Escape" && isOpen) {
       event.preventDefault()
       setIsOpen(false)
     }
@@ -862,23 +1237,30 @@ function SelectControl({ value, options, onChange, ariaLabel, disabled = false }
           onClick={() => (isOpen ? setIsOpen(false) : openMenu())}
           onKeyDown={handleTriggerKeyDown}
           className={cn(
-            "inline-flex h-[36px] min-w-[140px] max-w-[280px] cursor-pointer items-center justify-between gap-[12px] rounded-xl border bg-black/[0.03] dark:bg-white/[0.04] px-[12px] text-[14px] font-medium text-[#1d1d1f] dark:text-[#f5f5f5] outline-none transition-all hover:bg-black/[0.05] dark:hover:bg-white/[0.08]",
-            isOpen ? "border-[#007aff]/50 ring-4 ring-[#007aff]/10" : "border-black/[0.06] dark:border-white/[0.06]",
+            "inline-flex h-[36px] min-w-[140px] max-w-[280px] cursor-pointer items-center justify-between gap-[12px] rounded-xl border bg-[var(--haven-settings-control)] px-[12px] text-[14px] font-medium text-[var(--haven-settings-foreground)] outline-none transition-all hover:bg-[var(--haven-settings-card-hover)]",
+            isOpen ? "border-[var(--haven-settings-primary)] ring-4 ring-[var(--haven-settings-primary-10)]" : "border-[var(--haven-settings-control-border)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--haven-settings-primary)]",
             disabled && "cursor-not-allowed opacity-50"
           )}
         >
           <span className="min-w-0 flex-1 truncate text-right">{value}</span>
-          <ChevronDown className={cn("h-[16px] w-[16px] shrink-0 text-[#86868b] dark:text-[#98989d] transition-transform duration-200", isOpen && "rotate-180 text-[#007aff]")} strokeWidth={2.2} />
+          <ChevronDown className={cn("h-[16px] w-[16px] shrink-0 text-[var(--haven-settings-muted)] transition-transform duration-200", isOpen && "rotate-180 text-[var(--haven-settings-primary)]")} strokeWidth={2.2} />
         </button>
 
-      {isOpen && createPortal(
+      {isOpen && menuContainer && createPortal(
         <div
           ref={menuRef}
           id={menuId}
           role="listbox"
           aria-label={ariaLabel}
           style={menuStyle}
-          className="settings-scrollbar-hidden overflow-y-auto rounded-[12px] border border-black/[0.08] dark:border-white/[0.08] bg-white/[0.97] dark:bg-[#2c2c2e]/[0.97] p-[4px] shadow-[0_14px_36px_rgba(0,0,0,0.16),0_2px_8px_rgba(0,0,0,0.06)] dark:shadow-[0_14px_36px_rgba(0,0,0,0.4),0_2px_8px_rgba(0,0,0,0.2)] backdrop-blur-xl"
+          onKeyDown={(event) => {
+            if (event.key !== "Escape") return
+            event.preventDefault()
+            event.stopPropagation()
+            setIsOpen(false)
+            triggerRef.current?.focus()
+          }}
+          className="settings-scrollbar-hidden overflow-y-auto rounded-[12px] border border-[var(--haven-settings-border)] bg-[var(--haven-settings-card)] p-[4px] shadow-[0_14px_36px_rgba(0,0,0,0.16),0_2px_8px_rgba(0,0,0,0.06)] backdrop-blur-xl"
         >
           {options.map((option, index) => {
             const isSelected = option === value
@@ -894,10 +1276,10 @@ function SelectControl({ value, options, onChange, ariaLabel, disabled = false }
                 className={cn(
                   "flex min-h-[34px] w-full items-center justify-between gap-[8px] rounded-[8px] px-[10px] text-right text-[13px] font-medium transition-colors",
                   isSelected
-                    ? "bg-[#007aff] text-white"
+                    ? "bg-[var(--haven-settings-primary)] text-[var(--haven-settings-primary-foreground)]"
                     : isHighlighted
-                      ? "bg-[#007aff]/[0.08] dark:bg-[#007aff]/[0.2] text-[#007aff]"
-                      : "text-[#1d1d1f] dark:text-[#f5f5f5] hover:bg-[#007aff]/[0.08] dark:hover:bg-[#007aff]/[0.2] hover:text-[#007aff]"
+                      ? "bg-[var(--haven-settings-primary-08)] text-[var(--haven-settings-primary)]"
+                      : "text-[var(--haven-settings-foreground)] hover:bg-[var(--haven-settings-primary-08)] hover:text-[var(--haven-settings-primary)]"
                 )}
               >
                 <span className="min-w-0 flex-1 truncate">{option}</span>
@@ -906,7 +1288,7 @@ function SelectControl({ value, options, onChange, ariaLabel, disabled = false }
             )
           })}
         </div>,
-        document.body
+        menuContainer
       )}
     </div>
   )
@@ -914,16 +1296,18 @@ function SelectControl({ value, options, onChange, ariaLabel, disabled = false }
 
 function SegmentedControl({ value, options, onChange, ariaLabel, disabled = false }: { value: string; options: string[]; onChange: (value: string) => void; ariaLabel: string; disabled?: boolean }) {
   return (
-    <div className="flex flex-wrap items-center gap-1 rounded-xl bg-black/[0.05] dark:bg-white/[0.05] p-1" role="group" aria-label={ariaLabel}>
+    <div className="flex flex-wrap items-center gap-1 rounded-xl bg-[var(--haven-settings-control)] p-1" role="group" aria-label={ariaLabel}>
       {options.map((option) => (
         <button
           key={option}
           type="button"
+          // 选中态此前只有视觉差异；补上 aria-pressed 后读屏与测试都能确认选中的是哪一项。
+          aria-pressed={option === value}
           disabled={disabled}
           onClick={() => onChange(option)}
           className={cn(
             "rounded-[8px] px-3.5 py-1.5 text-[13px] font-medium transition-all duration-200",
-            option === value ? "bg-white dark:bg-[#3a3a3c] text-[#1d1d1f] dark:text-[#f5f5f5] shadow-sm" : "text-[#6e6e73] dark:text-[#98989d] hover:bg-black/[0.02] dark:hover:bg-white/[0.04] hover:text-[#1d1d1f] dark:hover:text-[#f5f5f5]",
+            option === value ? "bg-[var(--haven-settings-primary)] text-[var(--haven-settings-primary-foreground)] shadow-sm" : "text-[var(--haven-settings-muted-strong)] hover:bg-[var(--haven-settings-card-hover)] hover:text-[var(--haven-settings-foreground)]",
             disabled && "cursor-not-allowed opacity-50"
           )}
         >
@@ -939,30 +1323,30 @@ function SettingsFormStatusBar({ form, onReset }: { form: SettingsFormController
   const state = form.state
   let status: ReactNode
   if (state.status === "loading") {
-    status = <span className="flex items-center gap-2 text-[13px] text-[#86868b]"><RefreshCw className="h-[16px] w-[16px] animate-spin" strokeWidth={2.2} />正在加载…</span>
+    status = <span className="flex items-center gap-2 text-[13px] text-[var(--haven-settings-muted)]"><RefreshCw className="h-[16px] w-[16px] animate-spin" strokeWidth={2.2} />正在加载…</span>
   } else if (state.status === "saving") {
-    status = <span className="flex items-center gap-2 text-[13px] text-[#6e6e73]"><RefreshCw className="h-[16px] w-[16px] animate-spin" strokeWidth={2.2} />正在保存…</span>
+    status = <span className="flex items-center gap-2 text-[13px] text-[var(--haven-settings-muted-strong)]"><RefreshCw className="h-[16px] w-[16px] animate-spin" strokeWidth={2.2} />正在保存…</span>
   } else if (form.isDirty) {
-    status = <span className="flex items-center gap-2 text-[13px] font-medium text-[#d97706]"><TriangleAlert className="h-[16px] w-[16px]" strokeWidth={2.2} />有未保存的修改</span>
+    status = <span className="flex items-center gap-2 text-[13px] font-medium text-[var(--haven-settings-warning)]"><TriangleAlert className="h-[16px] w-[16px]" strokeWidth={2.2} />有未保存的修改</span>
   } else {
-    status = <span className="flex items-center gap-2 text-[13px] text-[#6e6e73]"><CircleCheck className="h-[16px] w-[16px] text-[#34c759]" strokeWidth={2.2} />所有设置已保存</span>
+    status = <span className="flex items-center gap-2 text-[13px] text-[var(--haven-settings-muted-strong)]"><CircleCheck className="h-[16px] w-[16px] text-[#34c759]" strokeWidth={2.2} />所有设置已保存</span>
   }
 
   return (
-    <div className="mx-6 mb-1 flex items-center justify-between gap-4 border-b border-black/[0.05] py-4">
-      <div className="flex items-center gap-2 text-[13px] text-[#6e6e73]">{status}</div>
+    <div className="mx-6 mb-1 flex items-center justify-between gap-4 border-b border-[var(--haven-settings-border-subtle)] py-4">
+      <div className="flex items-center gap-2 text-[13px] text-[var(--haven-settings-muted-strong)]">{status}</div>
       <div className="flex items-center gap-6">
         {form.isDirty && (
           <button
             type="button"
             onClick={() => form.save()}
             disabled={form.isSaving}
-            className="text-[13px] font-semibold text-[#007aff] transition-colors hover:text-[#005bb5] hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+            className="text-[13px] font-semibold text-[var(--haven-settings-primary)] transition-colors hover:text-[var(--haven-settings-primary-hover)] hover:underline disabled:cursor-not-allowed disabled:opacity-50"
           >
             保存修改
           </button>
         )}
-        <button type="button" onClick={onReset} className="text-[13px] font-medium text-[#86868b] dark:text-[#98989d] transition-colors hover:text-[#1d1d1f] dark:hover:text-[#f5f5f5] hover:underline">
+        <button type="button" onClick={onReset} className="text-[13px] font-medium text-[var(--haven-settings-muted)] transition-colors hover:text-[var(--haven-settings-foreground)] hover:underline">
           恢复默认
         </button>
       </div>
@@ -979,127 +1363,2203 @@ function SettingsFormError({ form }: { form: SettingsFormController }) {
   }
   const retryLabel = state.status === "save-error" || state.status === "load-error" ? "重试" : "重新加载"
   return (
-    <div className="mx-6 mb-1 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#d70015]/15 bg-[#fff1f0] px-4 py-3">
-      <div className="flex min-w-0 items-center gap-2 text-[13px] leading-5 text-[#d70015]">
+    <div className="mx-6 mb-1 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[var(--haven-settings-danger-15)] bg-[var(--haven-settings-danger-surface)] px-4 py-3">
+      <div className="flex min-w-0 items-center gap-2 text-[13px] leading-5 text-[var(--haven-settings-danger)]">
         <TriangleAlert className="h-[16px] w-[16px] shrink-0" strokeWidth={2.2} />
         <span className="min-w-0">{state.message}</span>
       </div>
-      <button type="button" onClick={() => form.retry()} className="shrink-0 rounded-full border border-[#d70015]/20 bg-white/70 px-3 py-1.5 text-[12px] font-semibold text-[#d70015] transition-colors hover:bg-white">
+      <button type="button" onClick={() => form.retry()} className="shrink-0 rounded-full border border-[var(--haven-settings-danger-20)] bg-[var(--haven-settings-card)] px-3 py-1.5 text-[12px] font-semibold text-[var(--haven-settings-danger)] transition-colors hover:bg-[var(--haven-settings-card-hover)]">
         {retryLabel}
       </button>
     </div>
   )
 }
 
-function GeneralSettings({ form }: { form: SettingsFormController }) {
-  const value = generalDisplayValue(form)
-  return (
-    <>
-      <SettingsIntro section="General" title="通用" description="设置栖阅如何启动、如何回应你，以及默认使用哪种语言。" />
-      <SettingsFormStatusBar form={form} onReset={() => form.resetToDefaults()} />
-      <SettingsFormError form={form} />
+/**
+ * 外观分区。
+ *
+ * 能力都走真实通道，且都是「先保存、再投影」：
+ *   - 主题 / 密度 / 侧栏留白 / 减少动效 → settingsGateway（appearance 分区）；
+ *   - 自定义调色板与强调色 → 同一个分区里的 customTheme（运行时投影成 CSS token）；
+ *   - 字体与壁纸资产 → appearanceGateway（列表 / 导入 / 删除，只有不透明 assetId）；
+ *   - 首页布局 → appearanceGateway 的 homeLayoutGet/Save/Reset（expectedRevision CAS）；
+ *   - 总览布局 → appearanceGateway 的 overviewLayoutGet/Save/Reset（**另一份**布局、
+ *     另一条 revision、三列网格）。
+ *
+ * 没有任何一项是本地假状态：控件改的是表单草稿，草稿经 SettingsFormController 提交；
+ * 资产与两份布局各自的异步结果由对应 Hook 呈现（loading / empty / ready / conflict /
+ * error）。
+ *
+ * 两份布局与资产列表的控制器都由 `SettingsContent` 持有并传入（不是在这里 `use*`）：
+ * 总览页渲染的就是同一份已保存状态，所以保存成功后切回总览立刻按新排列渲染；而外观分区
+ * 只是它们的编辑器——切到别分区再切回来不会重读列表，也不会丢掉还没保存的布局草稿或
+ * 上一次导入/删除的结果。
+ */
+const PALETTE_COLOR_ROLES: ReadonlyArray<{ role: PaletteColorRole; label: string }> = [
+  { role: "background", label: "页面底色" },
+  { role: "card", label: "卡片" },
+  { role: "foreground", label: "文字" },
+]
 
-      <SettingsGroup title="启动行为">
-        <SettingRow icon={<Home className="h-[19px] w-[19px]" strokeWidth={1.8} />} title="默认启动页" description="打开栖阅时首先进入的空间。">
-          <SelectControl value={optionLabel(LAUNCH_PAGE_OPTIONS, value.launchPage)} options={LAUNCH_PAGE_OPTIONS.map((option) => option.label)} onChange={(label) => form.change({ section: "general", launchPage: optionValue(LAUNCH_PAGE_OPTIONS, label) })} ariaLabel="默认启动页" />
-        </SettingRow>
-        <SettingRow icon={<History className="h-[19px] w-[19px]" strokeWidth={1.8} />} title="恢复上次状态" description="恢复上次打开的页面与正在进行的内容。">
-          <Toggle checked={value.restoreSession} onChange={(checked) => form.change({ section: "general", restoreSession: checked })} label="恢复上次状态" />
-        </SettingRow>
-      </SettingsGroup>
-      <SettingsGroup title="语言与区域">
-        <SettingRow icon={<Globe2 className="h-[19px] w-[19px]" strokeWidth={1.8} />} title="界面语言" description="当前版本尚未接入语言包消费者，设置暂不可用。">
-          <SelectControl value={optionLabel(LANGUAGE_OPTIONS, value.language)} options={LANGUAGE_OPTIONS.map((option) => option.label)} onChange={(label) => form.change({ section: "general", language: optionValue(LANGUAGE_OPTIONS, label) })} ariaLabel="界面语言" disabled />
-        </SettingRow>
-      </SettingsGroup>
-      <SettingsGroup title="通知">
-        <SettingRow icon={<Bell className="h-[19px] w-[19px]" strokeWidth={1.8} />} title="通知" description="当前版本尚未接入统一通知发送者，设置暂不可用。">
-          <Toggle checked={value.notifications} onChange={(checked) => form.change({ section: "general", notifications: checked })} label="通知" disabled />
-        </SettingRow>
-      </SettingsGroup>
-    </>
+function ThemePalettePreview({
+  palette,
+  accentColor,
+  mode,
+}: {
+  palette: ReturnType<typeof normalizeAppTheme>["light"]
+  accentColor: string
+  mode: "light" | "dark"
+}) {
+  const modeLabel = mode === "light" ? "浅色" : "深色"
+  // 预览仅把当前表单草稿的颜色映射到小型界面样例；它不会写入 CSS 全局状态或持久化。
+  return (
+    <div className="min-w-0 rounded-[14px] border border-[var(--haven-settings-border-subtle)] bg-[var(--haven-settings-sidebar)] p-4">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <p className="text-[13px] font-semibold text-[var(--haven-settings-foreground)]">实时预览</p>
+        <span className="text-[11px] text-[var(--haven-settings-muted)]">{modeLabel}</span>
+      </div>
+      <div
+        role="img"
+        aria-label={`${modeLabel}主题配色预览`}
+        className="overflow-hidden rounded-[12px] border p-3"
+        style={{ backgroundColor: palette.background, borderColor: palette.border, color: palette.foreground }}
+      >
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-[13px] font-semibold">栖阅</span>
+          <span className="rounded-md px-2 py-1 text-[10px]" style={{ backgroundColor: palette.secondary, color: palette.foreground }}>首页</span>
+        </div>
+        <div className="mt-3 rounded-[10px] border p-3" style={{ backgroundColor: palette.card, borderColor: palette.border }}>
+          <p className="text-[10px]" style={{ color: palette.mutedForeground }}>最近阅读</p>
+          <p className="mt-1 text-[12px] font-medium">在喜欢的配色里，继续阅读</p>
+          <span className="mt-3 inline-flex rounded-md px-2.5 py-1.5 text-[10px] font-semibold" style={{ backgroundColor: accentColor, color: palette.primaryForeground }}>继续阅读</span>
+        </div>
+      </div>
+    </div>
   )
 }
 
-function AppearanceSettings({ form }: { form: SettingsFormController }) {
+function AppearanceSettings({ form, showNotice, overviewLayout, homeLayout, assets }: { form: SettingsFormController; showNotice: (message: string) => void; overviewLayout: OverviewLayoutController; homeLayout: HomeLayoutController; assets: AppearanceAssetsController }) {
   const value = appearanceDisplayValue(form)
+  const selection = appearanceAssetSelection(form)
+  // 预览的减少动效结论与 AppShell 的壁纸投影同源：设置项（appearance.reduceMotion）与
+  // 系统 prefers-reduced-motion **任一**为真就抑制动态预览。只读设置项会让「系统已经
+  // 要求减少动效」的用户在设置页里看到一个正在循环播放的视频。
+  const systemReducedMotion = useSystemPreference("(prefers-reduced-motion: reduce)")
+  const previewReducedMotion = value.reduceMotion || systemReducedMotion
+  const [paletteMode, setPaletteMode] = useState<"light" | "dark">("light")
+  const [recentColors, setRecentColors] = useState<string[]>([])
+  const [palettePreview, setPalettePreview] = useState<{
+    kind: "role"
+    mode: "light" | "dark"
+    role: PaletteColorRole
+    color: string
+  } | {
+    kind: "accent"
+    color: string
+  } | null>(null)
+  const customTheme = value.customTheme == null
+    ? themePresetAppTheme("ink")
+    : normalizeAppTheme(value.customTheme)
+  const previewTheme = palettePreview === null
+    ? customTheme
+    : palettePreview.kind === "accent"
+      ? withAccentColor(customTheme, palettePreview.color)
+      : {
+        ...customTheme,
+        [palettePreview.mode]: withPaletteRoleColor(
+          customTheme[palettePreview.mode],
+          palettePreview.role,
+          palettePreview.color,
+        ),
+      }
+  const rememberColor = (color: string) => {
+    const normalized = color.toLowerCase()
+    setRecentColors((current) => [normalized, ...current.filter((item) => item !== normalized)].slice(0, 6))
+  }
+  // 删除守卫与提交路径共用同一份判断（appearanceAssetDeleteBlockedReason）。
+  const blockedReasonFor = (assetId: string) => appearanceAssetDeleteBlockedReason(assetId, selection)
+
+  const changeTheme = (theme: ThemeWire) => {
+    // 初次进入自定义时从墨黑预设起步，避免把用户直接带入刺眼的蓝色。
+    if (theme === "custom" && value.customTheme == null) {
+      form.change({ section: "appearance", theme, customTheme: themePresetAppTheme("ink") })
+      return
+    }
+    form.change({ section: "appearance", theme })
+  }
+
+  const updatePaletteRole = (role: PaletteColorRole, input: string) => {
+    const palette = customTheme[paletteMode]
+    if (paletteColorInputValue(palette[role]) === input.toLowerCase()) return
+    const nextPalette = withPaletteRoleColor(palette, role, input)
+    if (nextPalette === palette) return
+    const nextTheme = paletteMode === "light"
+      ? { ...customTheme, light: nextPalette }
+      : { ...customTheme, dark: nextPalette }
+    form.change({ section: "appearance", theme: "custom", customTheme: nextTheme })
+  }
+
+  const updateAccent = (input: string) => {
+    if (paletteColorInputValue(customTheme.accentColor) === input.toLowerCase()) return
+    const nextTheme = withAccentColor(customTheme, input)
+    if (nextTheme === customTheme) return
+    form.change({
+      section: "appearance",
+      theme: "custom",
+      customTheme: nextTheme,
+    })
+  }
+
+  const applyThemePreset = (presetId: ThemePresetId) => {
+    form.change({
+      section: "appearance",
+      theme: "custom",
+      customTheme: themePresetAppTheme(presetId),
+    })
+  }
+
   return (
     <>
-      <SettingsIntro section="Appearance" title="外观" description="保持清晰、安静和内容优先。主题设置不会改变媒体内容本身。" />
+      <SettingsIntro section="Appearance" title="外观" description="主题、字体与首页壁纸可以自定义；首页和总览的模块也能分别调整。" />
       <SettingsFormStatusBar form={form} onReset={() => form.resetToDefaults()} />
       <SettingsFormError form={form} />
-      <SettingsGroup title="界面外观">
-        <SettingRow title="主题" description="跟随 Windows 系统设置，或为栖阅指定主题。">
-          <SegmentedControl value={optionLabel(THEME_OPTIONS, value.theme)} options={THEME_OPTIONS.map((option) => option.label)} onChange={(label) => form.change({ section: "appearance", theme: optionValue(THEME_OPTIONS, label) })} ariaLabel="主题" />
+
+      <SettingsGroup title="界面外观" features={["appearance.theme", "appearance.density", "appearance.sidebar", "appearance.reduceMotion"]}>
+        <SettingRow title="主题" description="跟随系统，或选择浅色、深色界面。选择下方的配色方案后会使用自定义主题。">
+          <SegmentedControl value={optionLabel(THEME_OPTIONS, value.theme)} options={THEME_OPTIONS.map((option) => option.label)} onChange={(label) => changeTheme(optionValue(THEME_OPTIONS, label))} ariaLabel="主题" />
         </SettingRow>
         <SettingRow title="界面密度" description="控制列表和卡片之间的留白。">
           <SegmentedControl value={optionLabel(DENSITY_OPTIONS, value.density)} options={DENSITY_OPTIONS.map((option) => option.label)} onChange={(label) => form.change({ section: "appearance", density: optionValue(DENSITY_OPTIONS, label) })} ariaLabel="界面密度" />
         </SettingRow>
-        <SettingRow title="侧栏行为" description="当前桌面壳使用浮动 Dock，此选项控制内容区的导航留白。">
-          <SelectControl value={optionLabel(SIDEBAR_OPTIONS, value.sidebar)} options={SIDEBAR_OPTIONS.map((option) => option.label)} onChange={(label) => form.change({ section: "appearance", sidebar: optionValue(SIDEBAR_OPTIONS, label) })} ariaLabel="侧栏行为" />
+        <SettingRow title="内容边距" description="调整桌面页面内容与窗口边缘之间的留白。">
+          <SelectControl value={optionLabel(SIDEBAR_OPTIONS, value.sidebar)} options={SIDEBAR_OPTIONS.map((option) => option.label)} onChange={(label) => form.change({ section: "appearance", sidebar: optionValue(SIDEBAR_OPTIONS, label) })} ariaLabel="内容边距" />
         </SettingRow>
-        <SettingRow title="减少动效" description="减少背景动画、页面过渡和强调动效。">
+        <SettingRow title="减少动效" description="减少背景动画与页面过渡效果，让界面更安静。">
           <Toggle checked={value.reduceMotion} onChange={(checked) => form.change({ section: "appearance", reduceMotion: checked })} label="减少动效" />
         </SettingRow>
       </SettingsGroup>
-      <SettingsGroup title="当前视觉">
-        <div className="grid gap-3 p-5 sm:grid-cols-3">
-          <ThemePreview icon={<Sun className="h-5 w-5" />} title="浅色" detail="清晰、柔和" active={value.theme === "light"} onClick={() => form.change({ section: "appearance", theme: "light" })} />
-          <ThemePreview icon={<Moon className="h-5 w-5" />} title="深色" detail="沉浸、低亮度" active={value.theme === "dark"} onClick={() => form.change({ section: "appearance", theme: "dark" })} />
-          <ThemePreview icon={<Settings2 className="h-5 w-5" />} title="跟随系统" detail="推荐" active={value.theme === "system"} onClick={() => form.change({ section: "appearance", theme: "system" })} />
+      <SettingsGroup title="主题与配色" features={["appearance.customTheme"]} description="先选择一种预设，再用推荐色或色值微调。预览会随调整同步变化，保存后应用。">
+        <div className="border-b border-[var(--haven-settings-border-subtle)] px-6 py-5">
+          <p className="text-[13px] font-semibold text-[var(--haven-settings-foreground)]">预设配色</p>
+          <p className="mt-1 text-[12px] text-[var(--haven-settings-muted)]">四种低饱和方案，也可以继续自选颜色。</p>
+          <div role="group" aria-label="预设配色" className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {THEME_PRESETS.map((preset) => {
+              const selected = value.theme === "custom"
+                && customTheme.accentColor === preset.theme.accentColor
+                && customTheme.light.background === preset.theme.light.background
+                && customTheme.light.card === preset.theme.light.card
+                && customTheme.light.foreground === preset.theme.light.foreground
+                && customTheme.dark.background === preset.theme.dark.background
+                && customTheme.dark.card === preset.theme.dark.card
+                && customTheme.dark.foreground === preset.theme.dark.foreground
+              return (
+                <button
+                  key={preset.id}
+                  type="button"
+                  aria-pressed={selected}
+                  onClick={() => applyThemePreset(preset.id)}
+                  className={cn(
+                    "flex min-h-[58px] min-w-0 items-center gap-2.5 rounded-[10px] border px-3 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-primary)]",
+                    selected
+                      ? "border-[var(--haven-settings-primary)] bg-[var(--haven-settings-card-hover)]"
+                      : "border-[var(--haven-settings-control-border)] hover:bg-[var(--haven-settings-card-hover)]",
+                  )}
+                >
+                  <span className="flex shrink-0 gap-1" aria-hidden="true">
+                    {preset.swatches.map((color, index) => (
+                      <span key={index} className="h-[17px] w-[9px] rounded-sm border border-black/[0.08]" style={{ backgroundColor: color }} />
+                    ))}
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block truncate text-[12px] font-semibold text-[var(--haven-settings-foreground)]">{preset.label}</span>
+                    <span className="block truncate text-[10px] text-[var(--haven-settings-muted)]">{preset.description}</span>
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+        </div>
+        <div className="grid gap-4 px-6 py-5 lg:grid-cols-[minmax(0,1fr)_minmax(280px,0.9fr)]">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-[13px] font-semibold text-[var(--haven-settings-foreground)]">自选颜色</p>
+                <p className="mt-1 text-[12px] text-[var(--haven-settings-muted)]">选择浅色或深色版本进行微调。</p>
+              </div>
+              <SegmentedControl value={paletteMode === "light" ? "浅色" : "深色"} options={["浅色", "深色"]} onChange={(label) => setPaletteMode(label === "浅色" ? "light" : "dark")} ariaLabel="预览配色模式" />
+            </div>
+            <div className="mt-4 grid grid-cols-2 gap-2">
+              {PALETTE_COLOR_ROLES.map(({ role, label }) => {
+                const modeLabel = paletteMode === "light" ? "浅色" : "深色"
+                const contrastTargets = role === "background"
+                  ? [{ label: "文字", color: customTheme[paletteMode].foreground }]
+                  : role === "card"
+                    ? [{ label: "卡片文字", color: customTheme[paletteMode].cardForeground }]
+                    : [
+                      { label: "页面底色", color: customTheme[paletteMode].background },
+                      { label: "卡片", color: customTheme[paletteMode].card },
+                    ]
+                return (
+                  <AppearanceColorPicker
+                    key={paletteMode + "-" + role}
+                    label={modeLabel + label}
+                    value={paletteColorInputValue(customTheme[paletteMode][role])}
+                    contrastTargets={contrastTargets}
+                    recentColors={recentColors}
+                    onDraftChange={(color) => setPalettePreview(color
+                      ? { kind: "role", mode: paletteMode, role, color }
+                      : null)}
+                    onApply={(color) => updatePaletteRole(role, color)}
+                    onRecentColor={rememberColor}
+                  />
+                )
+              })}
+              <AppearanceColorPicker
+                key="accent"
+                label="强调色"
+                value={paletteColorInputValue(customTheme.accentColor)}
+                contrastTargets={[{ label: "按钮文字", color: customTheme[paletteMode].primaryForeground }]}
+                recentColors={recentColors}
+                onDraftChange={(color) => setPalettePreview(color ? { kind: "accent", color } : null)}
+                onApply={updateAccent}
+                onRecentColor={rememberColor}
+              />
+            </div>
+          </div>
+          <ThemePalettePreview palette={previewTheme[paletteMode]} accentColor={previewTheme.accentColor} mode={paletteMode} />
         </div>
       </SettingsGroup>
 
+      <InterfaceFontSettings form={form} value={value} showNotice={showNotice} />
+
+      <AppearanceWallpaperGroup
+        assets={assets.state.status === "ready" ? assets.state.lists : null}
+        loading={assets.state.status === "loading"}
+        error={assets.state.status === "error" ? assets.state.message : null}
+        selection={value.wallpaper ?? { kind: "none" }}
+        pending={assets.pending === "import"}
+        onImport={(kind) => assets.importAsset(kind)}
+        onSelect={(wallpaper) => form.change({ section: "appearance", wallpaper })}
+        onDelete={assets.deleteAsset}
+        blockedReasonFor={blockedReasonFor}
+        reducedMotion={previewReducedMotion}
+        action={assets.action}
+      />
+
+      <HomeLayoutEditor controller={homeLayout} />
+      <OverviewLayoutEditor controller={overviewLayout} />
     </>
   )
 }
 
-function ThemePreview({ icon, title, detail, active, onClick }: { icon: ReactNode; title: string; detail: string; active: boolean; onClick: () => void }) {
+/** 预览专用 @font-face 宿主；与 AppShell 注入的那条（haven-interface-font-face）分开。 */
+const INTERFACE_FONT_PREVIEW_STYLE_ID = "haven-interface-font-preview-face"
+const INTERFACE_FONT_SELECTION_PANEL_ID = "interface-font-selection-panel"
+
+/**
+ * 界面字体（外观 → 界面字体；BE-INTERFACE-FONT-001）。
+ *
+ * 四张互斥卡片分别是跟随系统 / 人文衬线 / 现代黑体 / 自定义系统字体，选择直接写进
+ * appearance 表单草稿（保存走真实 CAS，这里不落任何本地状态、不用 localStorage）。
+ * 自定义展开两条真实来源：本机已安装字体（Rust 枚举，只回传族名）与导入字体
+ * （Native 选择器 + 迁移 045 持久化，前端只拿 opaque id）。
+ *
+ * 预览与应用端共用 `resolveInterfaceFont`：预览看到的字体栈就是 AppShell 会写进
+ * `--ds-font-interface` 的那一个，不存在「预览一套、生效另一套」。
+ */
+export function InterfaceFontSettings({
+  form,
+  value,
+  showNotice,
+}: {
+  form: SettingsFormController
+  value: AppearanceSettingsValue
+  showNotice: (message: string) => void
+}) {
+  const custom = value.interfaceFontMode === "custom"
+  const assetsState = useInterfaceFontAssets()
+  const familiesState = useSystemFontFamilies(custom)
+  const [query, setQuery] = useState("")
+  const [importing, setImporting] = useState(false)
+  const [deletingId, setDeletingId] = useState<string | null>(null)
+
+  const { assets } = assetsState
+  const selection = {
+    interfaceFontMode: value.interfaceFontMode,
+    interfaceFontFamily: value.interfaceFontFamily,
+    interfaceFontAssetId: value.interfaceFontAssetId,
+  }
+  // 预览用**草稿**解析：选择后立即看到效果；保存后整个界面才跟随。
+  const resolved = resolveInterfaceFont(selection, assets, controlledResourceUri)
+  useInjectedFontFace(INTERFACE_FONT_PREVIEW_STYLE_ID, custom ? resolved.fontFaceCss : null)
+
+  const visibleAssets = filterInterfaceFontAssets(assets, query)
+  const visibleFamilies = filterFontFamilies(familiesState.families, query)
+  const queryHasNoResults =
+    query.trim().length > 0 &&
+    assetsState.status === "ready" &&
+    familiesState.status === "ready" &&
+    visibleAssets.length === 0 &&
+    visibleFamilies.length === 0
+
+  const selectFamily = (family: string) => {
+    // 两个选择字段互斥：选本机字体即清除导入字体引用（后端把空串当「清除」）。
+    form.change({ section: "appearance", interfaceFontMode: "custom", interfaceFontFamily: family, interfaceFontAssetId: "" })
+  }
+  const selectAsset = (assetId: string) => {
+    form.change({ section: "appearance", interfaceFontMode: "custom", interfaceFontAssetId: assetId, interfaceFontFamily: "" })
+  }
+
+  const handleImport = async () => {
+    setImporting(true)
+    try {
+      const result = await interfaceFontGateway.assetImport()
+      const alreadyKnown = assets.some((asset) => asset.id === result.asset.id)
+      assetsState.replace(
+        alreadyKnown
+          ? assets.map((asset) => (asset.id === result.asset.id ? result.asset : asset))
+          : [result.asset, ...assets],
+      )
+      selectAsset(result.asset.id)
+      showNotice(
+        result.deduplicated
+          ? `「${result.asset.familyName}」此前已导入，已选中`
+          : `已导入「${result.asset.familyName}」并选中`,
+      )
+    } catch (cause) {
+      const haven = toHavenError(cause)
+      // 用户取消不是错误，不提示。
+      if (haven.code !== "OPERATION_CANCELLED") showNotice(`导入字体失败：${haven.message}`)
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  const handleDelete = async (asset: InterfaceFontAsset) => {
+    setDeletingId(asset.id)
+    try {
+      await interfaceFontGateway.assetDelete(asset.id)
+      assetsState.replace(assets.filter((candidate) => candidate.id !== asset.id))
+      showNotice(`已删除「${asset.familyName}」`)
+    } catch (cause) {
+      // 正在使用的字体由后端在同一事务内拒绝（FONT_ASSET_IN_USE）；如实展示，不重试。
+      showNotice(`删除字体失败：${toHavenError(cause).message}`)
+    } finally {
+      setDeletingId(null)
+    }
+  }
+
+  const previewStyle = {
+    fontFamily: resolved.fontFamily ?? "var(--ds-font-interface-fallback)",
+  }
+
   return (
-    <button type="button" onClick={onClick} className={cn("group rounded-2xl border p-[16px] text-left transition-all duration-200", active ? "border-[#007aff]/50 bg-[#007aff]/[0.06] dark:bg-[#007aff]/[0.15] shadow-sm" : "border-black/[0.05] dark:border-white/[0.05] bg-black/[0.02] dark:bg-white/[0.02] hover:bg-black/[0.04] dark:hover:bg-white/[0.04] hover:border-black/[0.1] dark:hover:border-white/[0.1]")}>
-      <span className={cn("flex h-10 w-10 items-center justify-center rounded-xl transition-all duration-200", active ? "bg-[#007aff] text-white shadow-md shadow-[#007aff]/20" : "bg-white dark:bg-[#2c2c2e] text-[#6e6e73] dark:text-[#98989d] shadow-sm group-hover:text-[#1d1d1f] dark:group-hover:text-[#f5f5f5]")}>{icon}</span>
-      <span className={cn("mt-3 block text-[15px] font-medium transition-colors", active ? "text-[#007aff]" : "text-[#1d1d1f] dark:text-[#f5f5f5]")}>{title}</span>
-      <span className="mt-1 block text-[13px] text-[#86868b] dark:text-[#8e8e93]">{detail}</span>
+    <SettingsGroup title="界面字体" features={["appearance.interfaceFont"]} description="栖阅界面（导航、列表、设置页）使用的字体。阅读器正文与漫画页有各自的排版设置，不受这里影响。">
+      <div role="group" aria-label="界面字体模式" className="grid gap-3 p-5 sm:grid-cols-2 lg:grid-cols-4">
+        {INTERFACE_FONT_MODE_OPTIONS.map((option) => (
+          <InterfaceFontModeCard
+            key={option.value}
+            mode={option.value}
+            label={option.label}
+            detail={INTERFACE_FONT_MODE_DETAILS[option.value]}
+            active={value.interfaceFontMode === option.value}
+            onSelect={() => form.change({ section: "appearance", interfaceFontMode: option.value })}
+          />
+        ))}
+      </div>
+
+      <div className="border-t border-black/[0.04] px-6 py-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0">
+            <p data-testid="interface-font-preview-title" style={previewStyle} className="text-[19px] leading-8 text-[#1d1d1f] dark:text-white">栖阅 Haven · 界面字体预览</p>
+            <p data-testid="interface-font-preview-sample" style={previewStyle} className="mt-1 text-[13px] text-[var(--haven-settings-muted-strong)] dark:text-white/55">The quick brown fox jumps over the lazy dog · 0123456789 · 字体渲染</p>
+          </div>
+          <span data-testid="interface-font-status" className="shrink-0 rounded-full bg-black/[0.04] px-3 py-1 text-[11px] font-semibold text-[var(--haven-settings-muted-strong)] dark:bg-white/[0.08] dark:text-white/65">
+            {describeResolvedInterfaceFont(resolved, assets)}
+          </span>
+        </div>
+      </div>
+
+      <div id={INTERFACE_FONT_SELECTION_PANEL_ID} hidden={!custom}>
+      {custom && (
+        <>
+          <div className="flex flex-wrap items-center gap-3 border-t border-black/[0.04] px-6 py-4 dark:border-white/[0.08]">
+            <div className="relative min-w-[220px] flex-1">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-[15px] w-[15px] -translate-y-1/2 text-[var(--haven-settings-muted-strong)]" strokeWidth={1.8} />
+              <input
+                type="search"
+                value={query}
+                spellCheck={false}
+                autoComplete="off"
+                aria-label="搜索字体"
+                placeholder="搜索字体：中文、拼音或英文名"
+                onChange={(event) => setQuery(event.target.value)}
+                className="h-10 w-full rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] pl-9 pr-3 text-sm text-[#1d1d1f] outline-none transition-colors placeholder:text-[var(--haven-settings-muted-strong)] focus:border-[#8b806d] focus-visible:ring-2 focus-visible:ring-[#a89c87]/30 dark:border-white/[0.10] dark:bg-white/[0.04] dark:text-white dark:placeholder:text-white/40 dark:focus:border-white/40 dark:focus-visible:ring-white/15"
+              />
+            </div>
+          </div>
+
+          <div className="max-h-[360px] overflow-y-auto border-t border-black/[0.04]">
+            <section aria-label="已导入字体">
+              <div className="flex items-center justify-between gap-3 px-6 pb-2 pt-4">
+                <div className="flex items-center gap-2">
+                  <h4 className="text-[12px] font-semibold text-[#4c4942] dark:text-white/85">已导入字体</h4>
+                  <span className="text-[11px] tabular-nums text-[var(--haven-settings-muted-strong)] dark:text-white/45">
+                    {assetsState.status === "loading" ? "读取中" : assetsState.status === "error" ? "—" : assets.length}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  disabled={importing || deletingId !== null}
+                  onClick={() => void handleImport()}
+                  className="inline-flex min-h-9 items-center gap-2 rounded-xl bg-[#302d27] px-3.5 text-[12px] font-semibold text-white transition-colors hover:bg-[#48443c] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a89c87]/45 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-[#e8e2d6] dark:text-[#25231f] dark:hover:bg-[#f2ede3] dark:focus-visible:ring-white/25"
+                >
+                  <Upload className="h-[14px] w-[14px]" strokeWidth={2} />
+                  {importing ? "正在导入…" : "导入字体"}
+                </button>
+              </div>
+
+              {assetsState.status === "loading" && (
+                <p className="px-6 pb-4 text-[12px] text-[var(--haven-settings-muted-strong)] dark:text-white/50">正在读取已导入字体…</p>
+              )}
+              {assetsState.error !== null && (
+                <div className="flex items-center justify-between gap-3 px-6 pb-4">
+                  <p className="text-[12px] text-[#b42318] dark:text-[#ff8178]">字体列表读取失败：{assetsState.error}</p>
+                  <button type="button" onClick={() => void assetsState.reload()} className="text-[12px] font-semibold text-[#62594b] underline-offset-2 hover:underline dark:text-white/80">重试</button>
+                </div>
+              )}
+              {assetsState.status === "ready" && visibleAssets.length === 0 && query.trim().length === 0 && (
+                <div className="mx-4 mb-3 rounded-xl border border-dashed border-black/[0.12] bg-black/[0.015] px-4 py-3 dark:border-white/[0.14] dark:bg-white/[0.025]">
+                  <p className="text-[12px] font-medium text-[#4c4942] dark:text-white/80">尚未导入字体</p>
+                  <p className="mt-1 text-[11px] text-[var(--haven-settings-muted-strong)] dark:text-white/45">支持 .ttf、.otf 和 .woff2 字体文件</p>
+                </div>
+              )}
+              {visibleAssets.map((asset) => {
+                const isReferenced = value.interfaceFontAssetId === asset.id
+                const isActive = value.interfaceFontMode === "custom" && isReferenced
+                return (
+                  <InterfaceFontRow
+                    key={asset.id}
+                    label={asset.familyName}
+                    detail={`${asset.fileName} · ${formatFontByteSize(asset.byteSize)}`}
+                    previewFamily={importedFontCssFamily(asset.id)}
+                    selected={isActive}
+                    onSelect={() => selectAsset(asset.id)}
+                    action={
+                      <button
+                        type="button"
+                        disabled={isReferenced || deletingId !== null || importing}
+                        title={isReferenced ? "该字体仍保留在界面字体设置中，改选其他字体后才能删除" : "删除该导入字体"}
+                        aria-label={`删除 ${asset.familyName}`}
+                        onClick={() => void handleDelete(asset)}
+                        className="ml-2 shrink-0 rounded-lg p-2 text-[var(--haven-settings-muted-strong)] transition-colors hover:bg-black/[0.05] hover:text-[#a13d31] disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-[var(--haven-settings-muted-strong)] dark:hover:bg-white/[0.08] dark:hover:text-[#ff8178]"
+                      >
+                        <Trash2 className="h-[15px] w-[15px]" strokeWidth={1.8} />
+                      </button>
+                    }
+                  />
+                )
+              })}
+            </section>
+
+            {familiesState.status === "error" && (
+              <div className="flex items-center justify-between gap-3 border-t border-black/[0.04] px-6 py-3 dark:border-white/[0.08]">
+                <p className="text-[12px] text-[#b42318] dark:text-[#ff8178]">本机字体枚举失败：{familiesState.error}</p>
+                <button type="button" onClick={() => void familiesState.reload()} className="text-[12px] font-semibold text-[#62594b] underline-offset-2 hover:underline dark:text-white/80">重试</button>
+              </div>
+            )}
+            {(familiesState.status === "loading" || familiesState.status === "idle") && (
+              <p className="border-t border-black/[0.04] px-6 py-3 text-[12px] text-[var(--haven-settings-muted-strong)] dark:border-white/[0.08] dark:text-white/50">正在读取本机字体…</p>
+            )}
+
+            <section aria-label="本机字体" className="border-t border-black/[0.04] dark:border-white/[0.08]">
+              <div className="flex items-center gap-2 px-6 pb-2 pt-4">
+                <h4 className="text-[12px] font-semibold text-[#4c4942] dark:text-white/85">本机字体</h4>
+                <span className="text-[11px] tabular-nums text-[var(--haven-settings-muted-strong)] dark:text-white/45">
+                  {familiesState.status === "loading" || familiesState.status === "idle" ? "读取中" : familiesState.status === "error" ? "—" : familiesState.families.length}
+                </span>
+              </div>
+              {familiesState.status === "ready" && visibleFamilies.length === 0 && query.trim().length === 0 && (
+                <p className="px-6 pb-4 text-[12px] text-[var(--haven-settings-muted-strong)] dark:text-white/50">未检测到可用的本机字体</p>
+              )}
+              {visibleFamilies.map((entry) => (
+                <InterfaceFontRow
+                  key={entry.family}
+                  label={entry.family}
+                  detail={entry.localizedFamily}
+                  previewFamily={entry.family}
+                  selected={value.interfaceFontMode === "custom" && value.interfaceFontFamily === entry.family}
+                  onSelect={() => selectFamily(entry.family)}
+                />
+              ))}
+            </section>
+
+            {queryHasNoResults && (
+              <div className="px-6 py-5 text-[12px] text-[#6e6a62] dark:text-white/60">
+                没有匹配「{query.trim()}」的字体。
+              </div>
+            )}
+          </div>
+        </>
+      )}
+      </div>
+    </SettingsGroup>
+  )
+}
+
+function InterfaceFontModeCard({ mode, label, detail, active, onSelect }: { mode: InterfaceFontModeWire; label: string; detail: string; active: boolean; onSelect: () => void }) {
+  return (
+    <button
+      type="button"
+      aria-pressed={active}
+      aria-expanded={mode === "custom" ? active : undefined}
+      aria-controls={mode === "custom" ? INTERFACE_FONT_SELECTION_PANEL_ID : undefined}
+      onClick={onSelect}
+      className={cn(
+        "group rounded-2xl border p-[16px] text-left transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a89c87]/40 dark:focus-visible:ring-white/25",
+        active
+          ? "border-[#817765]/55 bg-[#f1eee7] shadow-sm dark:border-white/40 dark:bg-white/[0.12]"
+          : "border-black/[0.06] bg-black/[0.015] hover:border-black/[0.14] hover:bg-black/[0.035] dark:border-white/[0.08] dark:bg-white/[0.025] dark:hover:border-white/[0.16] dark:hover:bg-white/[0.06]",
+      )}
+    >
+      <span className="flex items-center justify-between">
+        <span className={cn("text-[15px] font-medium transition-colors", active ? "text-[#38342e] dark:text-[#f4f0e6]" : "text-[#1d1d1f] dark:text-white/90")}>{label}</span>
+        <span className="flex items-center gap-1.5">
+          {active && <Check aria-hidden="true" className="h-[16px] w-[16px] text-[#675d4f] dark:text-[#f4f0e6]" strokeWidth={2.6} />}
+          {mode === "custom" && <ChevronDown aria-hidden="true" className={cn("h-[15px] w-[15px] text-[var(--haven-settings-muted-strong)] transition-transform", active && "rotate-180 dark:text-white/75")} strokeWidth={2} />}
+        </span>
+      </span>
+      {/* 卡片自己用对应字体栈渲染示例，让「现代黑体 / 人文衬线」的差别可见。 */}
+      <span style={interfaceFontModePreviewStyle(mode)} className="mt-2 block truncate text-[17px] leading-6 text-[#1d1d1f] dark:text-white/90">栖阅 Haven</span>
+      <span className="mt-1 block text-[12px] leading-4 text-[var(--haven-settings-muted-strong)] dark:text-white/50">{detail}</span>
     </button>
   )
 }
 
-function PlaybackSettings({ form }: { form: SettingsFormController }) {
+/** 卡片示例文字的字体栈：系统项使用真实默认栈，预设项明确区分字形。 */
+function interfaceFontModePreviewStyle(mode: InterfaceFontModeWire): CSSProperties | undefined {
+  if (mode === "sans") return { fontFamily: INTERFACE_FONT_PRESET_STACKS.sans }
+  if (mode === "serif") return { fontFamily: INTERFACE_FONT_PRESET_STACKS.serif }
+  if (mode === "system") return { fontFamily: "var(--ds-font-interface-fallback)" }
+  return undefined
+}
+
+/**
+ * 字体列表的一行。
+ *
+ * 行内容**用该字体自己渲染**（`fontFamilyPreviewStyle`），因此「名字写着黑体、
+ * 实际长什么样」在列表里就能看到；族名不合法时该行回退默认字体，不会拼出坏 CSS。
+ */
+function InterfaceFontRow({ label, detail, previewFamily, selected, onSelect, action }: { label: string; detail?: string | null; previewFamily: string; selected: boolean; onSelect: () => void; action?: ReactNode }) {
+  return (
+    <div className="flex items-center border-b border-black/[0.04] px-4 last:border-b-0">
+      <button
+        type="button"
+        aria-pressed={selected}
+        onClick={onSelect}
+        className={cn("my-1 flex min-w-0 flex-1 items-center gap-3 rounded-xl px-3 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a89c87]/35 dark:focus-visible:ring-white/20", selected ? "bg-[#eeeae1] dark:bg-white/[0.10]" : "hover:bg-black/[0.03] dark:hover:bg-white/[0.05]")}
+      >
+        <span className="min-w-0 flex-1">
+          <span style={fontFamilyPreviewStyle(previewFamily)} className="block truncate text-[15px] text-[#1d1d1f] dark:text-white/90">{label}</span>
+          {detail && <span className="mt-0.5 block truncate text-[11px] text-[var(--haven-settings-muted-strong)] dark:text-white/45">{detail}</span>}
+        </span>
+        {selected && <Check aria-hidden="true" className="h-[16px] w-[16px] shrink-0 text-[#675d4f] dark:text-[#e8e2d6]" strokeWidth={2.4} />}
+      </button>
+      {action}
+    </div>
+  )
+}
+
+/** 导入字体字节数的展示格式。 */
+function formatFontByteSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+/** 资产选择卡片：展示名称和预览，不把内部标识暴露给用户。 */
+const APPEARANCE_SELECTED_CARD_CLASS = "border-[var(--haven-settings-primary)] bg-[var(--haven-settings-primary-06)]"
+
+function AppearanceSelectionMark() {
+  return (
+    <span
+      data-selection-mark="true"
+      aria-hidden="true"
+      className="absolute right-2 top-2 z-10 flex h-6 w-6 items-center justify-center rounded-full bg-[var(--haven-settings-primary)] text-[var(--haven-settings-primary-foreground)] shadow-[0_2px_6px_rgba(0,0,0,0.18)]"
+    >
+      <Check className="h-3.5 w-3.5" strokeWidth={2.5} />
+    </span>
+  )
+}
+
+function AppearanceAssetRow({
+  asset,
+  selected,
+  onSelect,
+  onDelete,
+  deleteBlockedReason,
+  preview,
+  selectedStatus,
+}: {
+  asset: AppearanceAssetWire
+  selected: boolean
+  onSelect: () => void
+  onDelete: () => void
+  deleteBlockedReason: string | null
+  preview?: ReactNode
+  selectedStatus?: ReactNode
+}) {
+  const usable = isUsableAppearanceAsset(asset)
+  const label = appearanceAssetLabel(asset)
+  return (
+    <article className={cn(
+      "min-w-0 rounded-[14px] border bg-[var(--haven-settings-card)] p-3 transition-colors",
+      selected
+        ? APPEARANCE_SELECTED_CARD_CLASS
+        : "border-[var(--haven-settings-border-subtle)] hover:bg-[var(--haven-settings-card-hover)]",
+      !usable && "opacity-70",
+    )}>
+      <button
+        type="button"
+        disabled={!usable}
+        onClick={onSelect}
+        aria-pressed={selected}
+        aria-label={`选择${label}`}
+        className={cn(
+          "block w-full min-w-0 rounded-[10px] text-left outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-primary-35)]",
+          !usable && "cursor-not-allowed",
+        )}
+      >
+        <div className="relative mb-3 flex h-[88px] items-center justify-center overflow-hidden rounded-[10px] bg-[var(--haven-settings-sidebar)]">
+          {selected && <AppearanceSelectionMark />}
+          {preview ?? (
+            <div className="flex flex-col items-center gap-2 text-[var(--haven-settings-muted-strong)]">
+              <FileText className="h-6 w-6" strokeWidth={1.7} />
+              <span className="text-[11px]">界面字体</span>
+            </div>
+          )}
+        </div>
+        <div className="flex min-w-0 items-center justify-between gap-2">
+          <span className={cn("min-w-0 truncate text-[13px]", selected ? "font-semibold text-[var(--haven-settings-primary)]" : "font-medium text-[var(--haven-settings-foreground)]")}>
+            {label}
+          </span>
+          {selected && <span className="shrink-0 text-[10px] font-semibold text-[var(--haven-settings-primary)]">使用中</span>}
+        </div>
+        {!usable && <span className="mt-1 block text-[11px] text-[var(--haven-settings-muted)]">暂不可用</span>}
+      </button>
+      <div className="mt-2 flex min-h-[36px] items-center justify-between gap-2">
+        <div className="min-w-0 flex-1">{selected ? selectedStatus : null}</div>
+        <button
+          type="button"
+          onClick={onDelete}
+          disabled={deleteBlockedReason !== null}
+          title={deleteBlockedReason ?? "删除该项目"}
+          aria-label={`删除${label}`}
+          className="min-h-[36px] shrink-0 rounded-full px-3 text-[12px] font-semibold text-[var(--haven-settings-danger)] transition-colors hover:bg-[var(--haven-settings-danger-06)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-danger-20)] disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          删除
+        </button>
+      </div>
+    </article>
+  )
+}
+
+/**
+ * 资产操作结果的落点。
+ *
+ * 三类结果不能用同一副面孔：
+ * - `cancelled`（用户自己取消了选择）**不是**故障：用失败的红字加 `role="alert"` 去播报
+ *   它，等于把一次正常的放弃说成一次出错，屏幕阅读器还会把它当成需要立刻处理的告警；
+ * - `blocked`（资产正在使用中所以不能删）也不是故障，但它要求用户先做点什么，因此按
+ *   「提示」呈现而不是中性的静默；
+ * - `failure` 才是真的失败：只有它配 `role="alert"` 与危险色。
+ */
+function AppearanceAssetAction({ action }: { action: AppearanceAssetActionResult | null }) {
+  if (!action) return null
+  const isFailure = action.kind === "failure"
+  return (
+    <div
+      role={isFailure ? "alert" : "status"}
+      className={cn(
+        "px-6 py-3 text-[12px] leading-5",
+        isFailure
+          ? "text-[var(--haven-settings-danger)]"
+          : "text-[var(--haven-settings-muted-strong)]",
+      )}
+    >
+      {action.message}
+    </div>
+  )
+}
+
+const APPEARANCE_IMPORT_CARD_CLASS = "flex min-h-[156px] w-full flex-col items-center justify-center gap-3 rounded-[14px] border border-dashed border-[var(--haven-settings-border)] bg-[var(--haven-settings-card)] px-3 py-4 text-center transition-colors hover:border-[var(--haven-settings-primary-35)] hover:bg-[var(--haven-settings-card-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-primary-35)] disabled:cursor-not-allowed disabled:opacity-50"
+
+/** 仅供壁纸宫格使用；界面字体不再按文件上传卡片展示。 */
+function AppearanceAssetImportCard({
+  title,
+  description,
+  pending,
+  onClick,
+}: {
+  title: string
+  description: string
+  pending: boolean
+  onClick: () => void
+}) {
+  return (
+    <button type="button" onClick={onClick} disabled={pending} className={APPEARANCE_IMPORT_CARD_CLASS}>
+      <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[var(--haven-settings-sidebar)] text-[var(--haven-settings-primary)]">
+        <Upload className="h-[17px] w-[17px]" strokeWidth={1.9} />
+      </span>
+      <span className="min-w-0 w-full max-w-full text-center">
+        <span className="block text-center text-[13px] font-semibold text-[var(--haven-settings-foreground)]">{pending ? "正在导入…" : title}</span>
+        <span className="mt-1 block text-center text-[11px] leading-4 text-[var(--haven-settings-muted)]">{description}</span>
+      </span>
+    </button>
+  )
+}
+
+type AppearanceFontPreviewChoice =
+  | { kind: "preset"; preset: UiFontPresetWire }
+  | { kind: "system"; family: string }
+  | { kind: "asset"; assetId: string }
+
+type AppearanceFontAssetPreview =
+  | { status: "idle" }
+  | { status: "loading"; assetId: string }
+  | { status: "ready"; assetId: string; family: string }
+  | { status: "error"; assetId: string }
+
+const SYSTEM_FONT_RESULT_LIMIT = 80
+const EMPTY_SYSTEM_FONTS: SystemFontEntry[] = []
+
+export function AppearanceFontPicker({
+  title,
+  description,
+  assets,
+  loading,
+  error,
+  selectedAssetId,
+  preset,
+  family,
+  pending,
+  onImport,
+  onSelectPreset,
+  onSelectSystemFont,
+  onSelectAsset,
+  onDelete,
+  blockedReasonFor,
+  action,
+}: {
+  title: string
+  description: string
+  assets: AppearanceAssetWire[]
+  loading: boolean
+  error: string | null
+  selectedAssetId: string | null
+  preset: UiFontPresetWire
+  family: string | null
+  pending: boolean
+  onImport: () => void
+  onSelectPreset: (preset: UiFontPresetWire) => void
+  onSelectSystemFont: (family: string) => void
+  onSelectAsset: (assetId: string) => void
+  onDelete: (assetId: string) => void
+  blockedReasonFor: (assetId: string) => string | null
+  action: AppearanceAssetActionResult | null
+}) {
+  const [catalog, setCatalog] = useState<SystemFontCatalogResult | null>(null)
+  const [catalogLoading, setCatalogLoading] = useState(false)
+  const [fontSearch, setFontSearch] = useState("")
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const [activeFontIndex, setActiveFontIndex] = useState(0)
+  const [previewChoice, setPreviewChoice] = useState<AppearanceFontPreviewChoice | null>(null)
+  const [assetPreview, setAssetPreview] = useState<AppearanceFontAssetPreview>({ status: "idle" })
+  const comboRef = useRef<HTMLDivElement>(null)
+  const catalogRequestRef = useRef(0)
+  const catalogLoadingRef = useRef(false)
+  const inputId = useId()
+  const listboxId = useId()
+
+  const loadCatalog = (retry = false) => {
+    if (catalogLoadingRef.current || (!retry && catalog !== null)) return
+    catalogLoadingRef.current = true
+    const requestId = ++catalogRequestRef.current
+    setCatalogLoading(true)
+    void querySystemFontCatalog()
+      .then((result) => {
+        if (requestId !== catalogRequestRef.current) return
+        setCatalog(result)
+        setActiveFontIndex(-1)
+      })
+      .catch(() => {
+        if (requestId === catalogRequestRef.current) setCatalog({ status: "error" })
+      })
+      .finally(() => {
+        if (requestId !== catalogRequestRef.current) return
+        catalogLoadingRef.current = false
+        setCatalogLoading(false)
+      })
+  }
+
+  useEffect(() => () => {
+    catalogRequestRef.current += 1
+  }, [])
+
+  const openPicker = () => {
+    setPickerOpen(true)
+    setFontSearch("")
+    setActiveFontIndex(-1)
+    if (catalog === null) loadCatalog()
+  }
+
+  useEffect(() => {
+    if (!pickerOpen) return
+    const closeOutside = (event: PointerEvent) => {
+      if (event.target instanceof Node && !comboRef.current?.contains(event.target)) {
+        setPickerOpen(false)
+        setFontSearch("")
+        setPreviewChoice(null)
+      }
+    }
+    document.addEventListener("pointerdown", closeOutside)
+    return () => document.removeEventListener("pointerdown", closeOutside)
+  }, [pickerOpen])
+
+  const catalogFonts = catalog?.status === "ready" ? catalog.fonts : EMPTY_SYSTEM_FONTS
+  const matchingFonts = useMemo(
+    () => searchSystemFonts(catalogFonts, fontSearch),
+    [catalogFonts, fontSearch],
+  )
+  const visibleFonts = matchingFonts.slice(0, SYSTEM_FONT_RESULT_LIMIT)
+  const selectedPreview: AppearanceFontPreviewChoice = selectedAssetId
+    ? { kind: "asset", assetId: selectedAssetId }
+    : preset === "custom_system" && family
+      ? { kind: "system", family }
+      : { kind: "preset", preset }
+  const specimenChoice = previewChoice ?? selectedPreview
+  const previewAssetId = specimenChoice.kind === "asset" ? specimenChoice.assetId : null
+
+  useEffect(() => {
+    if (!previewAssetId) {
+      return
+    }
+    let active = true
+    let dispose: (() => void) | null = null
+    setAssetPreview({ status: "loading", assetId: previewAssetId })
+    void installAppearanceFontPreview(previewAssetId)
+      .then((result) => {
+        if (!active) {
+          result?.cleanup()
+          return
+        }
+        if (!result) {
+          setAssetPreview({ status: "error", assetId: previewAssetId })
+          return
+        }
+        dispose = result.cleanup
+        setAssetPreview({ status: "ready", assetId: previewAssetId, family: result.family })
+      })
+      .catch(() => {
+        if (active) setAssetPreview({ status: "error", assetId: previewAssetId })
+      })
+    return () => {
+      active = false
+      dispose?.()
+    }
+  }, [previewAssetId])
+
+  const specimenFontFamily = specimenChoice.kind === "asset"
+    ? assetPreview.status === "ready" && assetPreview.assetId === specimenChoice.assetId
+      ? `"${assetPreview.family}", var(--haven-font-ui-system)`
+      : uiFontCssStack(preset, family)
+    : specimenChoice.kind === "system"
+      ? uiFontCssStack("custom_system", specimenChoice.family)
+      : uiFontCssStack(specimenChoice.preset, null)
+
+  const chooseSystemFont = (font: SystemFontEntry) => {
+    onSelectSystemFont(font.family)
+    setPickerOpen(false)
+    setFontSearch("")
+    setPreviewChoice(null)
+  }
+
+  const handleFontKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault()
+      setPickerOpen(false)
+      setFontSearch("")
+      setPreviewChoice(null)
+      return
+    }
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault()
+      if (!pickerOpen) {
+        openPicker()
+        return
+      }
+      if (visibleFonts.length === 0) return
+      const nextIndex = activeFontIndex < 0
+        ? event.key === "ArrowDown" ? 0 : visibleFonts.length - 1
+        : event.key === "ArrowDown"
+          ? Math.min(activeFontIndex + 1, visibleFonts.length - 1)
+          : Math.max(activeFontIndex - 1, 0)
+      const nextFont = visibleFonts[nextIndex]
+      setActiveFontIndex(nextIndex)
+      if (nextFont) setPreviewChoice({ kind: "system", family: nextFont.family })
+      return
+    }
+    if (event.key === "Enter" && pickerOpen) {
+      const activeFont = visibleFonts[activeFontIndex] ?? visibleFonts[0]
+      if (activeFont) {
+        event.preventDefault()
+        chooseSystemFont(activeFont)
+      }
+    }
+  }
+
+  return (
+    <SettingsGroup title={title} description={description}>
+      <div className="px-6 py-5">
+        <div role="group" aria-label="界面字体预设" className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+          {UI_FONT_PRESETS.map((option) => {
+            const selected = selectedAssetId === null && preset === option.id
+            return (
+              <button
+                key={option.id}
+                type="button"
+                aria-pressed={selected}
+                aria-expanded={option.id === "custom_system" ? pickerOpen : undefined}
+                onClick={() => {
+                  if (option.id === "custom_system") {
+                    openPicker()
+                    return
+                  }
+                  setPickerOpen(false)
+                  setPreviewChoice(null)
+                  onSelectPreset(option.id)
+                }}
+                onMouseEnter={() => setPreviewChoice({ kind: "preset", preset: option.id })}
+                onMouseLeave={() => setPreviewChoice(null)}
+                onFocus={() => setPreviewChoice({ kind: "preset", preset: option.id })}
+                onBlur={() => setPreviewChoice(null)}
+                className={cn(
+                  "flex min-h-[46px] min-w-0 flex-col items-start justify-center rounded-[10px] border px-3 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-primary-35)]",
+                  selected
+                    ? "border-[var(--haven-settings-primary-40)] bg-[var(--haven-settings-card-hover)]"
+                    : "border-[var(--haven-settings-border-subtle)] hover:bg-[var(--haven-settings-card-hover)]",
+                )}
+              >
+                <span className="block max-w-full truncate text-[12px] font-semibold text-[var(--haven-settings-foreground)]">{option.label}</span>
+                <span className="mt-0.5 block max-w-full truncate text-[10px] text-[var(--haven-settings-muted)]">{option.sample}</span>
+              </button>
+            )
+          })}
+        </div>
+
+        {(pickerOpen || preset === "custom_system" || selectedAssetId !== null) && (
+          <div className="mt-4" ref={comboRef}>
+            <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
+              <div className="relative min-w-0">
+                <label htmlFor={inputId} className="sr-only">搜索本机字体名称或拼音</label>
+                <Search aria-hidden="true" className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--haven-settings-muted)]" />
+                <input
+                  id={inputId}
+                  role="combobox"
+                  aria-label="搜索本机字体名称或拼音"
+                  aria-autocomplete="list"
+                  aria-expanded={pickerOpen}
+                  aria-controls={pickerOpen ? listboxId : undefined}
+                  aria-activedescendant={pickerOpen && visibleFonts[activeFontIndex] ? `${listboxId}-option-${activeFontIndex}` : undefined}
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={pickerOpen ? fontSearch : selectedAssetId ? "" : family ?? ""}
+                  placeholder="搜索字体名称或拼音"
+                  onFocus={openPicker}
+                  onChange={(event) => {
+                    setFontSearch(event.target.value)
+                    setActiveFontIndex(-1)
+                    setPickerOpen(true)
+                    setPreviewChoice(null)
+                    if (catalog === null) loadCatalog()
+                  }}
+                  onKeyDown={handleFontKeyDown}
+                  className="min-h-[44px] w-full rounded-[10px] border border-[var(--haven-settings-control-border)] bg-[var(--haven-settings-control)] pl-10 pr-3 text-[13px] text-[var(--haven-settings-foreground)] outline-none placeholder:text-[var(--haven-settings-muted)] focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-primary)]"
+                />
+              </div>
+              <button
+                type="button"
+                disabled={pending}
+                onClick={() => {
+                  setPickerOpen(false)
+                  onImport()
+                }}
+                className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-[10px] border border-[var(--haven-settings-control-border)] px-3 text-[12px] font-semibold text-[var(--haven-settings-muted-strong)] transition-colors hover:bg-[var(--haven-settings-card-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Plus aria-hidden="true" className="h-4 w-4" strokeWidth={1.9} />
+                {pending ? "正在导入…" : "导入本地字体"}
+              </button>
+            </div>
+
+            {pickerOpen && (
+              <div className="mt-2 overflow-hidden rounded-[10px] border border-[var(--haven-settings-border-subtle)] bg-[var(--haven-settings-card)]">
+                {catalogLoading ? (
+                  <p role="status" className="px-3 py-3 text-[12px] text-[var(--haven-settings-muted)]">正在读取本机字体…</p>
+                ) : catalog?.status === "unsupported" ? (
+                  <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-3">
+                    <p className="text-[12px] leading-5 text-[var(--haven-settings-muted-strong)]">当前环境暂不支持搜索本机字体；你仍可使用上方预设或导入字体文件。</p>
+                    <button type="button" onClick={() => loadCatalog(true)} className="min-h-[36px] shrink-0 rounded-full px-3 text-[12px] font-semibold text-[var(--haven-settings-primary)] hover:bg-[var(--haven-settings-card-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-primary-35)]">重试</button>
+                  </div>
+                ) : catalog?.status === "denied" ? (
+                  <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-3">
+                    <p className="text-[12px] leading-5 text-[var(--haven-settings-muted-strong)]">没有获得读取本机字体的权限；检查系统权限后可以重试。</p>
+                    <button type="button" onClick={() => loadCatalog(true)} className="min-h-[36px] shrink-0 rounded-full px-3 text-[12px] font-semibold text-[var(--haven-settings-primary)] hover:bg-[var(--haven-settings-card-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-primary-35)]">重试</button>
+                  </div>
+                ) : catalog?.status === "error" ? (
+                  <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-3">
+                    <p role="alert" className="text-[12px] leading-5 text-[var(--haven-settings-danger)]">读取本机字体失败，请稍后重试。</p>
+                    <button type="button" onClick={() => loadCatalog(true)} className="min-h-[36px] shrink-0 rounded-full px-3 text-[12px] font-semibold text-[var(--haven-settings-primary)] hover:bg-[var(--haven-settings-card-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-primary-35)]">重试</button>
+                  </div>
+                ) : catalog?.status === "ready" && catalog.fonts.length === 0 ? (
+                  <p className="px-3 py-3 text-[12px] text-[var(--haven-settings-muted-strong)]">没有检测到可用字体。</p>
+                ) : visibleFonts.length === 0 ? (
+                  <p className="px-3 py-3 text-[12px] text-[var(--haven-settings-muted-strong)]">没有找到匹配的字体，试试英文名或拼音。</p>
+                ) : (
+                  <>
+                    <p className="px-3 py-2 text-[11px] text-[var(--haven-settings-muted)]">
+                      {matchingFonts.length > SYSTEM_FONT_RESULT_LIMIT
+                        ? `找到 ${matchingFonts.length} 款字体，仅显示前 ${SYSTEM_FONT_RESULT_LIMIT} 款，请继续搜索缩小范围。`
+                        : `找到 ${matchingFonts.length} 款字体`}
+                    </p>
+                    <div
+                      id={listboxId}
+                      role="listbox"
+                      aria-label="本机字体"
+                      onMouseLeave={() => {
+                        setActiveFontIndex(-1)
+                        setPreviewChoice(null)
+                      }}
+                      className="max-h-56 overflow-y-auto border-t border-[var(--haven-settings-border-subtle)] py-1"
+                    >
+                      {visibleFonts.map((font, index) => (
+                        <div
+                          key={font.family}
+                          id={`${listboxId}-option-${index}`}
+                          role="option"
+                          aria-selected={font.family === family && selectedAssetId === null}
+                          onMouseDown={(event) => event.preventDefault()}
+                          onMouseEnter={() => {
+                            setActiveFontIndex(index)
+                            setPreviewChoice({ kind: "system", family: font.family })
+                          }}
+                          onClick={() => chooseSystemFont(font)}
+                          className={cn(
+                            "cursor-pointer px-3 py-2 text-[13px] outline-none",
+                            index === activeFontIndex
+                              ? "bg-[var(--haven-settings-card-hover)] text-[var(--haven-settings-foreground)]"
+                              : "text-[var(--haven-settings-muted-strong)] hover:bg-[var(--haven-settings-card-hover)]",
+                          )}
+                          style={{ fontFamily: uiFontCssStack("custom_system", font.family) }}
+                        >
+                          <span className="block truncate">{font.family}</span>
+                          {font.fullName !== font.family && <span className="mt-0.5 block truncate text-[10px] text-[var(--haven-settings-muted)]">{font.fullName}</span>}
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="mt-4 rounded-[10px] border border-[var(--haven-settings-border-subtle)] bg-[var(--haven-settings-sidebar)] px-4 py-3">
+          <p className="text-[10px] font-semibold tracking-[0.08em] text-[var(--haven-settings-muted)]">排版预览</p>
+          <p className="mt-2 text-[15px] font-semibold leading-6 text-[var(--haven-settings-foreground)]" style={{ fontFamily: specimenFontFamily }}>栖阅 · 沉浸阅读体验 0123 Aa</p>
+          <p className="mt-1 text-[14px] leading-6 text-[var(--haven-settings-muted-strong)]" style={{ fontFamily: specimenFontFamily }}>白日依山尽，黄河入海流。</p>
+          {specimenChoice.kind === "asset" && assetPreview.status === "loading" && assetPreview.assetId === specimenChoice.assetId && (
+            <p role="status" className="mt-1 text-[11px] text-[var(--haven-settings-muted)]">正在载入字体预览…</p>
+          )}
+          {specimenChoice.kind === "asset" && assetPreview.status === "error" && assetPreview.assetId === specimenChoice.assetId && (
+            <p role="status" className="mt-1 text-[11px] text-[var(--haven-settings-muted)]">暂时无法预览这款字体，保存后会按可用字体显示。</p>
+          )}
+        </div>
+
+        <div className="mt-4 border-t border-[var(--haven-settings-border-subtle)] pt-3">
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <h4 className="text-[12px] font-semibold text-[var(--haven-settings-foreground)]">已导入字体</h4>
+            <span className="text-[11px] text-[var(--haven-settings-muted)]">{assets.length}</span>
+          </div>
+          {loading && <p role="status" className="py-2 text-[12px] text-[var(--haven-settings-muted)]">正在读取字体…</p>}
+          {error && <p role="alert" className="py-2 text-[12px] text-[var(--haven-settings-danger)]">{error}</p>}
+          {!loading && !error && assets.length === 0 && (
+            <p className="rounded-[9px] border border-dashed border-[var(--haven-settings-border-subtle)] px-3 py-3 text-[12px] text-[var(--haven-settings-muted)]">尚未导入字体</p>
+          )}
+          {assets.length > 0 && (
+            <ul aria-label="已导入字体列表" className="divide-y divide-[var(--haven-settings-border-subtle)] overflow-hidden rounded-[10px] border border-[var(--haven-settings-border-subtle)]">
+              {assets.map((asset) => {
+                const label = appearanceAssetLabel(asset)
+                const selected = asset.assetId === selectedAssetId
+                const usable = isUsableAppearanceAsset(asset)
+                const deleteBlockedReason = blockedReasonFor(asset.assetId)
+                return (
+                  <li key={asset.assetId} className={cn("flex min-w-0 items-center gap-2 px-3 py-1.5", selected && "bg-[var(--haven-settings-card-hover)]")}>
+                    <button
+                      type="button"
+                      disabled={!usable}
+                      aria-pressed={selected}
+                      aria-label={`选择${label}`}
+                      onClick={() => onSelectAsset(asset.assetId)}
+                      onMouseEnter={() => setPreviewChoice({ kind: "asset", assetId: asset.assetId })}
+                      onMouseLeave={() => setPreviewChoice(null)}
+                      onFocus={() => setPreviewChoice({ kind: "asset", assetId: asset.assetId })}
+                      onBlur={() => setPreviewChoice(null)}
+                      className="flex min-h-[42px] min-w-0 flex-1 items-center justify-between gap-3 rounded-md px-2 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-primary-35)] disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      <span className="min-w-0 truncate text-[13px] font-medium text-[var(--haven-settings-foreground)]">{label}</span>
+                      <span className="shrink-0 text-[11px] text-[var(--haven-settings-muted)]">{!usable ? "暂不可用" : selected ? "使用中" : "选择"}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onDelete(asset.assetId)}
+                      disabled={deleteBlockedReason !== null}
+                      title={deleteBlockedReason ?? `删除${label}`}
+                      aria-label={`删除${label}`}
+                      className="min-h-[40px] shrink-0 rounded-full px-3 text-[12px] font-semibold text-[var(--haven-settings-danger)] transition-colors hover:bg-[var(--haven-settings-danger-06)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-danger-20)] disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      删除
+                    </button>
+                  </li>
+                )
+              })}
+            </ul>
+          )}
+        </div>
+      </div>
+      <AppearanceAssetAction action={action} />
+    </SettingsGroup>
+  )
+}
+
+function AppearanceWallpaperThumbnail({
+  asset,
+  reducedMotion,
+  retryEpoch,
+  selected,
+  onPreviewError,
+}: {
+  asset: AppearanceAssetWire
+  reducedMotion: boolean
+  retryEpoch: number
+  selected: boolean
+  onPreviewError?: (uri: string) => void
+}) {
+  const uri = appearanceAssetRequestUri(asset.assetId)
+  const [failedPreview, setFailedPreview] = useState<{ uri: string; epoch: number } | null>(null)
+  const failed = uri !== null && failedPreview?.uri === uri && failedPreview.epoch === retryEpoch
+  const dynamicSuppressed = selected && reducedMotion && asset.kind === "dynamic_wallpaper"
+  const dynamicNotSelected = !selected && asset.kind === "dynamic_wallpaper"
+  const usable = isUsableAppearanceAsset(asset)
+
+  useEffect(() => {
+    if (selected && failed && uri) onPreviewError?.(uri)
+  }, [failed, onPreviewError, selected, uri])
+
+  if (!uri || failed || dynamicSuppressed || dynamicNotSelected || !usable) {
+    const copy = !usable
+      ? "暂不可用"
+      : dynamicSuppressed
+        ? "减少动效已开启"
+        : dynamicNotSelected
+          ? "视频壁纸"
+          : !uri
+            ? "桌面端可预览"
+            : "暂时无法预览"
+    return (
+      <div className="flex h-[88px] items-center justify-center rounded-[10px] bg-[var(--haven-settings-sidebar)] px-2 text-center text-[11px] text-[var(--haven-settings-muted)]">
+        {dynamicNotSelected
+          ? <span className="flex flex-col items-center gap-1"><PlaySquare className="h-5 w-5" strokeWidth={1.7} /><span>{copy}</span></span>
+          : copy}
+      </div>
+    )
+  }
+
+  const handleError = () => setFailedPreview({ uri, epoch: retryEpoch })
+
+  return asset.kind === "dynamic_wallpaper" ? (
+    <video
+      src={uri}
+      aria-label={selected ? "当前动态壁纸预览" : `${appearanceAssetLabel(asset)}预览`}
+      aria-hidden={!selected}
+      autoPlay
+      muted
+      loop
+      playsInline
+      tabIndex={-1}
+      onError={handleError}
+      className="h-[88px] w-full object-cover"
+    />
+  ) : (
+    <img
+      src={uri}
+      alt={selected ? "当前静态壁纸预览" : `${appearanceAssetLabel(asset)}预览`}
+      onError={handleError}
+      className="h-[88px] w-full object-cover"
+    />
+  )
+}
+
+/** 壁纸卡片直接承载预览和选择；预览地址只由受控资产 ID 生成。 */
+export function AppearanceWallpaperGroup({
+  assets,
+  loading,
+  error,
+  selection,
+  pending,
+  onImport,
+  onSelect,
+  onDelete,
+  blockedReasonFor,
+  reducedMotion,
+  action,
+}: {
+  assets: AppearanceAssetLists | null
+  loading: boolean
+  error: string | null
+  selection: WallpaperSelection
+  pending: boolean
+  onImport: (kind: AppearanceAssetKindWire) => void
+  onSelect: (selection: WallpaperSelection) => void
+  onDelete: (assetId: string) => void
+  blockedReasonFor: (assetId: string) => string | null
+  reducedMotion: boolean
+  action: AppearanceAssetActionResult | null
+}) {
+  const selectedId = selection.kind === "none" ? null : selection.assetId
+  // 首页与设置页预览共享受控资源 ID；浏览器预览没有真实壁纸字节。
+  const previewUri = selectedId ? appearanceAssetRequestUri(selectedId) : null
+  const staticAssets = assets?.staticWallpapers ?? []
+  const dynamicAssets = assets?.dynamicWallpapers ?? []
+  // 失败记在当前选中的壁纸和重试代数上；其它卡片只在卡片内部回退。
+  const retryEpoch = useWallpaperRetryEpoch()
+  const homeWallpaperFailure = useHomeWallpaperFailure()
+  const [failedPreview, setFailedPreview] = useState<{ uri: string; epoch: number } | null>(null)
+  const previewUnavailable =
+    previewUri !== null &&
+    failedPreview !== null &&
+    failedPreview.uri === previewUri &&
+    failedPreview.epoch === retryEpoch
+  const homeWallpaperUnavailable =
+    previewUri !== null &&
+    homeWallpaperFailure !== null &&
+    homeWallpaperFailure.uri === previewUri &&
+    homeWallpaperFailure.epoch === retryEpoch
+  // 减少动效开启时不渲染动态视频。
+  const dynamicPreviewSuppressed = reducedMotion && selection.kind === "dynamic"
+  // 抑制态不是一次读取失败：那里没有可重试的东西，给一个重试按钮只会是假动作。
+  const canRetryPreview = (previewUnavailable || homeWallpaperUnavailable) && !dynamicPreviewSuppressed
+  const previewFailed = useCallback((uri: string) => {
+    setFailedPreview((current) =>
+      current?.uri === uri && current.epoch === retryEpoch
+        ? current
+        : { uri, epoch: retryEpoch },
+    )
+  }, [retryEpoch])
+  const retryButton = canRetryPreview ? (
+    <button
+      type="button"
+      onClick={requestWallpaperRetry}
+      className="inline-flex shrink-0 items-center gap-[6px] rounded-full border border-[var(--haven-settings-control-border)] px-[11px] py-[6px] text-[12px] font-semibold text-[var(--haven-settings-primary)] transition-colors hover:bg-[var(--haven-settings-primary-06)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-primary)]"
+    >
+      <RefreshCw className="h-[13px] w-[13px]" strokeWidth={2} />
+      重试预览
+    </button>
+  ) : null
+  const empty = assets !== null && !loading && error === null && staticAssets.length === 0 && dynamicAssets.length === 0
+  const importPending = pending === true
+
+  const wallpaperDescription = empty
+    ? "还没有首页壁纸，导入图片或视频后可从下方选择。减少动效开启时，动态壁纸会暂停。"
+    : "选择图片或视频作为首页背景。减少动效开启时，动态壁纸会暂停。"
+
+  return (
+    <SettingsGroup title="首页壁纸" features={["appearance.wallpaper"]} description={wallpaperDescription}>
+      {loading && <p role="status" className="px-6 pt-4 text-[12px] text-[var(--haven-settings-muted)]">正在读取壁纸…</p>}
+      {error && <p role="alert" className="px-6 pt-4 text-[12px] text-[var(--haven-settings-danger)]">{error}</p>}
+      <div className="px-6 py-5">
+        <div role="group" aria-label="首页壁纸选择" className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+          <button
+            type="button"
+            onClick={() => onSelect({ kind: "none" })}
+            aria-label="不使用壁纸"
+            aria-pressed={selection.kind === "none"}
+            className={cn(
+              "relative min-h-[156px] min-w-0 rounded-[14px] border p-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-primary-35)]",
+              selection.kind === "none"
+                ? APPEARANCE_SELECTED_CARD_CLASS
+                : "border-[var(--haven-settings-border-subtle)] bg-[var(--haven-settings-card)] hover:bg-[var(--haven-settings-card-hover)]",
+            )}
+          >
+            <span className="relative mb-3 flex h-[88px] items-center justify-center rounded-[10px] bg-[var(--haven-settings-sidebar)]">
+              {selection.kind === "none" && <AppearanceSelectionMark />}
+              <Home className="h-6 w-6 text-[var(--haven-settings-muted-strong)]" strokeWidth={1.7} />
+            </span>
+            <span className="block truncate text-[13px] font-semibold text-[var(--haven-settings-foreground)]">不使用壁纸</span>
+            <span className="mt-1 block text-[11px] text-[var(--haven-settings-muted)]">{selection.kind === "none" ? "当前使用" : "保留首页原有背景"}</span>
+          </button>
+          <AppearanceAssetImportCard
+            title="导入图片"
+            description="支持 JPG、PNG、WebP 格式"
+            pending={importPending}
+            onClick={() => onImport("static_wallpaper")}
+          />
+          <AppearanceAssetImportCard
+            title="导入视频"
+            description="支持 MP4、WebM 格式"
+            pending={importPending}
+            onClick={() => onImport("dynamic_wallpaper")}
+          />
+          {staticAssets.map((asset) => {
+            const selected = selection.kind === "static" && asset.assetId === selectedId
+            const failed = selected && previewUnavailable
+            const homeFailed = selected && homeWallpaperUnavailable
+            const status = (failed || homeFailed) ? (
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-[10px] leading-4 text-[var(--haven-settings-muted)]">
+                  {failed ? "当前壁纸暂时不可用。" : "首页背景暂时无法显示。"}
+                </span>
+                {retryButton}
+              </div>
+            ) : null
+            return (
+              <AppearanceAssetRow
+                key={asset.assetId}
+                asset={asset}
+                selected={selected}
+                preview={<AppearanceWallpaperThumbnail asset={asset} reducedMotion={reducedMotion} retryEpoch={retryEpoch} selected={selected} onPreviewError={previewFailed} />}
+                selectedStatus={status}
+                onSelect={() => onSelect({ kind: "static", assetId: asset.assetId })}
+                onDelete={() => onDelete(asset.assetId)}
+                deleteBlockedReason={blockedReasonFor(asset.assetId)}
+              />
+            )
+          })}
+          {dynamicAssets.map((asset) => {
+            const selected = selection.kind === "dynamic" && asset.assetId === selectedId
+            const failed = selected && previewUnavailable
+            const homeFailed = selected && homeWallpaperUnavailable
+            const status = (failed || homeFailed) ? (
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-[10px] leading-4 text-[var(--haven-settings-muted)]">
+                  {failed ? "当前壁纸暂时不可用。" : "首页背景暂时无法显示。"}
+                </span>
+                {retryButton}
+              </div>
+            ) : null
+            return (
+              <AppearanceAssetRow
+                key={asset.assetId}
+                asset={asset}
+                selected={selected}
+                preview={<AppearanceWallpaperThumbnail asset={asset} reducedMotion={reducedMotion} retryEpoch={retryEpoch} selected={selected} onPreviewError={previewFailed} />}
+                selectedStatus={status}
+                onSelect={() => onSelect({ kind: "dynamic", assetId: asset.assetId })}
+                onDelete={() => onDelete(asset.assetId)}
+                deleteBlockedReason={blockedReasonFor(asset.assetId)}
+              />
+            )
+          })}
+        </div>
+        <AppearanceAssetAction action={action} />
+      </div>
+    </SettingsGroup>
+  )
+}
+
+type LayoutPreviewModule = { module: string; size: string; row: number; column: number }
+
+function LayoutWireframePreview({
+  ariaLabel,
+  columns,
+  placements,
+  labelFor,
+  spanFor,
+}: {
+  ariaLabel: string
+  columns: number
+  placements: readonly LayoutPreviewModule[]
+  labelFor: (module: string) => string
+  spanFor: (size: string) => number
+}) {
+  return (
+    <div className="mx-6 my-4 rounded-[12px] border border-[var(--haven-settings-border-subtle)] bg-[var(--haven-settings-sidebar)] p-4">
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+        <span className="text-[11px] font-semibold text-[var(--haven-settings-muted-strong)]">实时布局示意</span>
+        <span className="text-[10px] text-[var(--haven-settings-muted)]">模块顺序与宽度会即时反映在这里</span>
+      </div>
+      {placements.length === 0 ? (
+        <div role="img" aria-label={ariaLabel} className="mt-3 flex min-h-[72px] items-center justify-center rounded-[10px] border border-dashed border-[var(--haven-settings-border-subtle)] bg-[var(--haven-settings-control)] p-3 text-center text-[11px] text-[var(--haven-settings-muted)]">
+          目前没有显示的模块
+        </div>
+      ) : (
+        <div
+          role="img"
+          aria-label={ariaLabel}
+          className="mt-3 grid gap-2 rounded-[12px] bg-[var(--haven-settings-control)] p-3"
+          style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`, gridAutoRows: "28px" }}
+        >
+          {placements.map((placement) => (
+            <span
+              key={placement.module}
+              data-layout-preview-module=""
+              className="flex min-w-0 items-center justify-center overflow-hidden rounded-[4px] border border-[var(--haven-settings-primary-20)] bg-[var(--haven-settings-primary-06)] px-1.5 text-[9px] font-medium text-[var(--haven-settings-muted-strong)]"
+              style={{
+                gridColumn: `${placement.column + 1} / span ${Math.max(1, spanFor(placement.size))}`,
+                gridRow: placement.row + 1,
+              }}
+            >
+              <span className="truncate">{labelFor(placement.module)}</span>
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function LayoutWidthControl<T extends string>({
+  value,
+  options,
+  columns,
+  spanFor,
+  moduleLabel,
+  disabled,
+  onChange,
+}: {
+  value: T
+  options: ReadonlyArray<{ value: T; label: string }>
+  columns: number
+  spanFor: (size: T) => number
+  moduleLabel: string
+  disabled: boolean
+  onChange: (value: T) => void
+}) {
+  return (
+    <div role="group" aria-label={`${moduleLabel}显示宽度`} className="flex shrink-0 items-center gap-1 rounded-[10px] border border-[var(--haven-settings-border-subtle)] bg-[var(--haven-settings-sidebar)] p-1">
+      {options.map((option) => {
+        const selected = value === option.value
+        const gridColumns = Math.max(1, columns)
+        const span = Math.min(gridColumns, Math.max(1, spanFor(option.value)))
+        return (
+          <button
+            key={option.value}
+            type="button"
+            aria-label={`${moduleLabel}：${option.label}`}
+            aria-pressed={selected}
+            title={option.label}
+            disabled={disabled}
+            onClick={() => onChange(option.value)}
+            className={cn(
+              "flex min-h-[42px] min-w-[53px] flex-col items-center justify-center gap-1 rounded-[7px] px-1.5 text-[9px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-primary-35)] disabled:cursor-not-allowed disabled:opacity-40",
+              selected
+                ? "bg-[var(--haven-settings-card)] text-[var(--haven-settings-foreground)] shadow-[0_1px_3px_rgba(0,0,0,0.08)]"
+                : "text-[var(--haven-settings-muted)] hover:bg-[var(--haven-settings-card-hover)] hover:text-[var(--haven-settings-foreground)]",
+            )}
+          >
+            <span
+              aria-hidden="true"
+              data-layout-width-track=""
+              className="relative block h-[9px] w-[32px] overflow-hidden rounded-[3px] border border-[var(--haven-settings-border-subtle)] bg-[var(--haven-settings-control)]"
+            >
+              <span
+                data-layout-width-fill=""
+                className={cn(
+                  "absolute inset-y-0 left-0 rounded-[2px] transition-[width,background-color]",
+                  selected ? "bg-[var(--haven-settings-primary)]" : "bg-[var(--haven-settings-muted-strong)]",
+                )}
+                style={{ width: String((span / gridColumns) * 100) + "%" }}
+              />
+            </span>
+            <span>{option.label}</span>
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+function LayoutEditorRow<TModule extends string, TSize extends string>({
+  module,
+  label,
+  description,
+  visible,
+  size,
+  sizeOptions,
+  columns,
+  spanFor,
+  visibleIndex,
+  canEdit,
+  isSaving,
+  isDragging,
+  isDropTarget,
+  onResize,
+  onVisibilityChange,
+  onReorder,
+  onDragStart,
+  onDragEnd,
+  onDragEnter,
+  onDrop,
+}: {
+  module: TModule
+  label: string
+  description: string
+  visible: boolean
+  size: TSize
+  sizeOptions: ReadonlyArray<{ value: TSize; label: string }>
+  columns: number
+  spanFor: (size: TSize) => number
+  visibleIndex: number
+  canEdit: boolean
+  isSaving: boolean
+  isDragging: boolean
+  isDropTarget: boolean
+  onResize: (size: TSize) => void
+  onVisibilityChange: (visible: boolean) => void
+  onReorder: (targetVisibleIndex: number) => void
+  onDragStart: (module: TModule) => void
+  onDragEnd: () => void
+  onDragEnter: (module: TModule) => void
+  onDrop: (event: DragEvent<HTMLDivElement>) => void
+}) {
+  const canReorder = canEdit && !isSaving && visible
+  const onHandleKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (!canReorder) return
+    const delta = event.key === "ArrowUp" ? -1 : event.key === "ArrowDown" ? 1 : 0
+    if (delta === 0) return
+    event.preventDefault()
+    onReorder(Math.max(0, visibleIndex + delta))
+  }
+
+  return (
+    <div
+      data-layout-module-row={module}
+      onDragOver={(event) => {
+        if (!canReorder || !isDragging) return
+        event.preventDefault()
+        event.dataTransfer.dropEffect = "move"
+      }}
+      onDragEnter={() => { if (canReorder && isDragging) onDragEnter(module) }}
+      onDrop={(event) => {
+        if (!canReorder || !isDragging) return
+        event.preventDefault()
+        onDrop(event)
+      }}
+      className={cn(
+        "flex min-h-[76px] flex-wrap items-center gap-3 border-b border-black/[0.04] px-6 py-3 last:border-b-0",
+        isDropTarget && "border-t-2 border-t-[var(--haven-settings-primary)] bg-[var(--haven-settings-primary-06)]",
+        isDragging && "opacity-60",
+      )}
+    >
+      <div
+        data-layout-static-controls=""
+        className={cn(
+          "flex min-w-0 flex-1 flex-wrap items-center gap-3 transition-opacity",
+          !visible && "pointer-events-none opacity-40",
+        )}
+      >
+      <div
+        role="button"
+        tabIndex={canReorder ? 0 : -1}
+        draggable={canReorder}
+        aria-disabled={!canReorder}
+        aria-label={`拖动或用方向键调整${label}顺序`}
+        aria-description="可拖动此手柄排序；聚焦后按键盘上下方向键调整顺序。"
+        aria-keyshortcuts="ArrowUp ArrowDown"
+        title={canReorder ? "拖动排序，也可聚焦后按上下方向键调整" : "仅显示中的模块可以排序"}
+        onKeyDown={onHandleKeyDown}
+        onDragStart={(event) => {
+          if (!canReorder) {
+            event.preventDefault()
+            return
+          }
+          event.dataTransfer.effectAllowed = "move"
+          event.dataTransfer.setData("text/plain", module)
+          onDragStart(module)
+        }}
+        onDragEnd={onDragEnd}
+        className={cn(
+          "flex h-11 w-11 shrink-0 cursor-grab items-center justify-center rounded-[9px] border border-transparent text-[var(--haven-settings-muted)] transition-colors hover:border-[var(--haven-settings-border-subtle)] hover:bg-[var(--haven-settings-sidebar)] hover:text-[var(--haven-settings-foreground)] active:cursor-grabbing focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-primary-35)]",
+          !canReorder && "cursor-not-allowed",
+          !canReorder && visible && "opacity-35",
+        )}
+      >
+        <GripVertical aria-hidden="true" className="h-[18px] w-[18px]" strokeWidth={2} />
+      </div>
+      <div className="min-w-[150px] min-w-0 flex-1">
+        <p className="truncate text-[13px] font-semibold text-[var(--haven-settings-foreground)]">{label}</p>
+        <p className="mt-[2px] truncate text-[11px] text-[var(--haven-settings-muted)]">{description}</p>
+      </div>
+      <div className="shrink-0">
+        <LayoutWidthControl
+          value={size}
+          options={sizeOptions}
+          columns={columns}
+          spanFor={spanFor}
+          moduleLabel={label}
+          disabled={!canEdit || isSaving || !visible}
+          onChange={onResize}
+        />
+      </div>
+      </div>
+      <div className="flex shrink-0 items-center gap-2">
+        <Toggle
+          checked={visible}
+          onChange={onVisibilityChange}
+          label={`显示${label}`}
+          disabled={!canEdit || isSaving}
+        />
+      </div>
+    </div>
+  )
+}
+
+function layoutDropIndex(
+  modules: readonly { module: string; visible: boolean }[],
+  sourceModule: string,
+  targetModule: string,
+  afterTarget: boolean,
+): number | null {
+  const visible = modules.filter((entry) => entry.visible)
+  const sourceIndex = visible.findIndex((entry) => entry.module === sourceModule)
+  const targetIndex = visible.findIndex((entry) => entry.module === targetModule)
+  if (sourceIndex < 0 || targetIndex < 0) return null
+  let targetPosition = targetIndex + (afterTarget ? 1 : 0)
+  if (sourceIndex < targetPosition) targetPosition -= 1
+  return Math.max(0, Math.min(targetPosition, visible.length - 1))
+}
+
+function LayoutEditorActions({
+  sectionName,
+  label,
+  status,
+  isDirty,
+  isSaving,
+  canEdit,
+  layoutRevisionKnown,
+  onSave,
+  onReset,
+  onReload,
+}: {
+  sectionName: string
+  label: string
+  status: string
+  isDirty: boolean
+  isSaving: boolean
+  canEdit: boolean
+  layoutRevisionKnown: boolean
+  onSave: () => void
+  onReset: () => void
+  onReload: () => void
+}) {
+  const canSave = canEdit && isDirty && !isSaving
+  const showReload = status === "conflict" || status === "error"
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-black/[0.04] px-6 py-3">
+      <p role="status" className={cn(
+        "text-[12px]",
+        status === "conflict" || status === "error" || status === "save-error"
+          ? "text-[var(--haven-settings-danger)]"
+          : "text-[var(--haven-settings-muted-strong)]",
+      )}>{label}</p>
+      <div className="flex items-center gap-3">
+        {showReload && (
+          <button type="button" onClick={onReload} className="min-h-9 rounded-lg px-2 text-[12px] font-semibold text-[var(--haven-settings-primary)] hover:bg-[var(--haven-settings-primary-06)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-primary-35)]">重新加载</button>
+        )}
+        <button type="button" onClick={onReset} disabled={isSaving || !layoutRevisionKnown} className="min-h-9 rounded-lg px-2 text-[12px] font-medium text-[var(--haven-settings-muted)] transition-colors hover:bg-[var(--haven-settings-card-hover)] hover:text-[var(--haven-settings-foreground)] disabled:cursor-not-allowed disabled:opacity-40">恢复默认</button>
+        <button
+          type="button"
+          aria-label={`保存${sectionName}布局`}
+          title={canSave ? "保存当前布局" : isSaving ? "正在保存" : isDirty ? "请先重新读取布局后再保存" : "没有未保存的布局修改"}
+          onClick={onSave}
+          disabled={!canSave}
+          className={cn(
+            "min-h-9 rounded-full border px-4 text-[12px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-primary-35)] disabled:cursor-not-allowed",
+            canSave
+              ? "border-[var(--haven-settings-primary)] bg-[var(--haven-settings-primary)] text-[var(--haven-settings-primary-foreground)] shadow-[0_2px_5px_rgba(0,0,0,0.12)] hover:bg-[var(--haven-settings-primary-hover)]"
+              : "border-[var(--haven-settings-border-subtle)] bg-[var(--haven-settings-sidebar)] text-[var(--haven-settings-muted)] opacity-65",
+          )}
+        >
+          {isSaving ? "正在保存…" : "保存布局"}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function layoutStatusLabel(
+  sectionLabel: string,
+  status: string,
+  message: string | null,
+  isDirty: boolean,
+  revision: string | null,
+): string {
+  if (status === "loading") return `正在读取${sectionLabel}布局…`
+  if (status === "saving") return "正在保存…"
+  if (status === "conflict" || status === "save-error" || status === "error") return message ?? `${sectionLabel}布局暂不可用`
+  if (message) return message
+  if (isDirty) return "有未保存的布局修改"
+  return revision === null ? "当前使用默认布局" : "布局已保存"
+}
+
+/** 首页布局编辑器：真实可用的模块显隐、拖放排序与宽度档位。 */
+export function HomeLayoutEditor({ controller }: { controller: HomeLayoutController }) {
+  const { state, isDirty, isSaving } = controller
+  const canEdit = state.status === "ready" || state.status === "save-error"
+  const layoutRevisionKnown = canEdit || state.status === "saving"
+  const [draggedModule, setDraggedModule] = useState<HomeModuleId | null>(null)
+  const [dropTarget, setDropTarget] = useState<HomeModuleId | null>(null)
+  const visibleModules = state.modules.filter((entry) => entry.visible)
+  const preview = homeModuleSettingsToLayout(state.modules)
+  const onDrop = (event: DragEvent<HTMLDivElement>, targetModule: HomeModuleId) => {
+    const sourceValue = event.dataTransfer.getData("text/plain") || draggedModule
+    const source = state.modules.find((entry) => entry.module === sourceValue && entry.visible)
+    if (!source) return
+    const rect = event.currentTarget.getBoundingClientRect()
+    const targetIndex = layoutDropIndex(
+      state.modules,
+      source.module,
+      targetModule,
+      event.clientY >= rect.top + rect.height / 2,
+    )
+    if (targetIndex !== null) controller.reorder(source.module, targetIndex)
+    setDraggedModule(null)
+    setDropTarget(null)
+  }
+
+  return (
+    <SettingsGroup title="首页布局" features={["appearance.homeLayout"]} description="拖动模块手柄调整顺序，选择紧凑、标准或通栏宽度；窄屏下会自动排成单列。">
+      <LayoutEditorActions
+        sectionName="首页"
+        label={layoutStatusLabel("首页", state.status, state.message, isDirty, state.revision)}
+        status={state.status}
+        isDirty={isDirty}
+        isSaving={isSaving}
+        canEdit={canEdit}
+        layoutRevisionKnown={layoutRevisionKnown}
+        onSave={controller.save}
+        onReset={controller.reset}
+        onReload={controller.reload}
+      />
+      <LayoutWireframePreview
+        ariaLabel="首页布局实时预览"
+        columns={homeModuleColumnSpan("large")}
+        placements={preview.modules}
+        labelFor={(module) => homeModuleLabel(module as HomeModuleId)}
+        spanFor={(size) => homeModuleColumnSpan(size as HomeModuleSize)}
+      />
+      {state.modules.map((entry) => {
+        const visibleIndex = visibleModules.findIndex((item) => item.module === entry.module)
+        return (
+          <LayoutEditorRow
+            key={entry.module}
+            module={entry.module}
+            label={homeModuleLabel(entry.module)}
+            description={HOME_MODULES.find((module) => module.id === entry.module)?.description ?? ""}
+            visible={entry.visible}
+            size={entry.size}
+            sizeOptions={HOME_MODULE_SIZES}
+            columns={homeModuleColumnSpan("large")}
+            spanFor={homeModuleColumnSpan}
+            visibleIndex={visibleIndex}
+            canEdit={canEdit}
+            isSaving={isSaving}
+            isDragging={draggedModule !== null}
+            isDropTarget={dropTarget === entry.module}
+            onResize={(size) => controller.setSize(entry.module, size)}
+            onVisibilityChange={(visible) => controller.setVisible(entry.module, visible)}
+            onReorder={(targetIndex) => controller.reorder(entry.module, targetIndex)}
+            onDragStart={setDraggedModule}
+            onDragEnd={() => { setDraggedModule(null); setDropTarget(null) }}
+            onDragEnter={setDropTarget}
+            onDrop={(event) => onDrop(event, entry.module)}
+          />
+        )
+      })}
+      <p className="px-6 py-3 text-[11px] leading-5 text-[var(--haven-settings-muted)]">隐藏全部模块后，首页仍会显示欢迎区。</p>
+    </SettingsGroup>
+  )
+}
+
+/** 总览布局编辑器：使用同一套拖放与可视宽度控件，但依据总览自己的三列栅格。 */
+export function OverviewLayoutEditor({ controller }: { controller: OverviewLayoutController }) {
+  const { state, isDirty, isSaving } = controller
+  const canEdit = state.status === "ready" || state.status === "save-error"
+  const layoutRevisionKnown = canEdit || state.status === "saving"
+  const [draggedModule, setDraggedModule] = useState<OverviewModuleId | null>(null)
+  const [dropTarget, setDropTarget] = useState<OverviewModuleId | null>(null)
+  const visibleModules = state.modules.filter((entry) => entry.visible)
+  const preview = overviewModuleSettingsToLayout(state.modules)
+  const onDrop = (event: DragEvent<HTMLDivElement>, targetModule: OverviewModuleId) => {
+    const sourceValue = event.dataTransfer.getData("text/plain") || draggedModule
+    const source = state.modules.find((entry) => entry.module === sourceValue && entry.visible)
+    if (!source) return
+    const rect = event.currentTarget.getBoundingClientRect()
+    const targetIndex = layoutDropIndex(
+      state.modules,
+      source.module,
+      targetModule,
+      event.clientY >= rect.top + rect.height / 2,
+    )
+    if (targetIndex !== null) controller.reorder(source.module, targetIndex)
+    setDraggedModule(null)
+    setDropTarget(null)
+  }
+
+  return (
+    <SettingsGroup title="总览布局" features={["appearance.overviewLayout"]} description="拖动卡片调整顺序，选择紧凑、标准或通栏宽度；标题与统计范围始终显示，窄屏下会自动排成单列。">
+      <LayoutEditorActions
+        sectionName="总览"
+        label={layoutStatusLabel("总览", state.status, state.message, isDirty, state.revision)}
+        status={state.status}
+        isDirty={isDirty}
+        isSaving={isSaving}
+        canEdit={canEdit}
+        layoutRevisionKnown={layoutRevisionKnown}
+        onSave={controller.save}
+        onReset={controller.reset}
+        onReload={controller.reload}
+      />
+      <LayoutWireframePreview
+        ariaLabel="总览布局实时预览"
+        columns={overviewModuleColumnSpan("large")}
+        placements={preview.modules}
+        labelFor={(module) => overviewModuleLabel(module as OverviewModuleId)}
+        spanFor={(size) => overviewModuleColumnSpan(size as OverviewModuleSize)}
+      />
+      {state.modules.map((entry) => {
+        const visibleIndex = visibleModules.findIndex((item) => item.module === entry.module)
+        return (
+          <LayoutEditorRow
+            key={entry.module}
+            module={entry.module}
+            label={overviewModuleLabel(entry.module)}
+            description={OVERVIEW_MODULES.find((module) => module.id === entry.module)?.description ?? ""}
+            visible={entry.visible}
+            size={entry.size}
+            sizeOptions={OVERVIEW_MODULE_SIZES}
+            columns={overviewModuleColumnSpan("large")}
+            spanFor={overviewModuleColumnSpan}
+            visibleIndex={visibleIndex}
+            canEdit={canEdit}
+            isSaving={isSaving}
+            isDragging={draggedModule !== null}
+            isDropTarget={dropTarget === entry.module}
+            onResize={(size) => controller.setSize(entry.module, size)}
+            onVisibilityChange={(visible) => controller.setVisible(entry.module, visible)}
+            onReorder={(targetIndex) => controller.reorder(entry.module, targetIndex)}
+            onDragStart={setDraggedModule}
+            onDragEnd={() => { setDraggedModule(null); setDropTarget(null) }}
+            onDragEnter={setDropTarget}
+            onDrop={(event) => onDrop(event, entry.module)}
+          />
+        )
+      })}
+    </SettingsGroup>
+  )
+}
+
+/**
+ * 播放分区。三个可配置项的取值与消费者都已由 Registry / Wire 证明：默认倍速、
+ * 自动继续、自动下一集。截图不是设置项——快捷键与目录由播放器和后端固定，
+ * 这里只如实说明，不给它配一个没有消费者的开关。
+ *
+ * 导出以便组件测试直接挂载它并验证控件真的写进表单草稿。
+ */
+export function PlaybackSettings({ form }: { form: SettingsFormController }) {
   const value = playbackDisplayValue(form)
   return (
     <>
       <SettingsIntro section="Playback" title="播放" description="让播放行为稳定、可恢复。字幕与音轨选择不属于当前产品范围；截图使用播放器固定快捷键。" />
       <SettingsFormStatusBar form={form} onReset={() => form.resetToDefaults()} />
       <SettingsFormError form={form} />
-      <SettingsGroup title="默认播放偏好">
-        <SettingRow title="默认倍速" description="新的视频播放会话默认使用此倍速；播放中的会话仍可在播放器内临时调整。">
-          <SelectControl value={optionLabel(PLAYBACK_RATE_OPTIONS, value.defaultPlaybackRate)} options={PLAYBACK_RATE_OPTIONS.map((option) => option.label)} onChange={(label) => form.change({ section: "playback", defaultPlaybackRate: optionValue(PLAYBACK_RATE_OPTIONS, label) })} ariaLabel="默认倍速" />
-        </SettingRow>
+      <SettingsGroup title="默认播放偏好" features={["playback.defaultPlaybackRate"]}>
+        <div className="px-6 py-5">
+          <p className="text-[14px] font-semibold tracking-[-0.005em] text-[var(--haven-settings-foreground)]">默认倍速</p>
+          <p className="mt-1 max-w-[520px] text-[12px] leading-[1.65] text-[var(--haven-settings-muted)]">新的视频播放会话默认使用此倍速；播放中的会话仍可在播放器内临时调整。</p>
+          <div role="group" aria-label="默认倍速" className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
+            {PLAYBACK_RATE_OPTIONS.map((option) => {
+              const active = value.defaultPlaybackRate === option.value
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  aria-pressed={active}
+                  onClick={() => form.change({ section: "playback", defaultPlaybackRate: option.value })}
+                  className={cn(
+                    "min-h-[52px] min-w-0 rounded-[10px] border text-[13px] font-semibold tabular-nums transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-primary-35)]",
+                    active
+                      ? "border-[var(--haven-settings-primary)] bg-[var(--haven-settings-primary)] text-[var(--haven-settings-primary-foreground)]"
+                      : "border-[var(--haven-settings-border-subtle)] text-[var(--haven-settings-foreground)] hover:bg-[var(--haven-settings-card-hover)]",
+                  )}
+                >
+                  {option.label}
+                </button>
+              )
+            })}
+          </div>
+        </div>
       </SettingsGroup>
-      <SettingsGroup title="连续播放">
-        <SettingRow title="自动下一集" description="当前 Edition 播放到最后一项后，自动打开下一项；播放列表结束时保持结束状态。">
+      <SettingsGroup title="连续播放" features={["playback.autoNext", "playback.autoResume"]}>
+        <SettingRow title="自动下一集" description="当前一集播放结束后继续下一集；播放列表结束时保持结束状态。">
           <Toggle checked={value.autoNext} onChange={(checked) => form.change({ section: "playback", autoNext: checked })} label="自动下一集" />
         </SettingRow>
         <SettingRow title="自动继续" description="从最近一次可靠保存的位置恢复，而不是只在正常退出时保存。">
           <Toggle checked={value.autoResume} onChange={(checked) => form.change({ section: "playback", autoResume: checked })} label="自动继续" />
         </SettingRow>
       </SettingsGroup>
-      <SettingsGroup title="截图" description="截图不会写入进度、标记、Artwork Cache 或普通设置。">
-        <SettingRow title="截图快捷键" description="仅在播放器页面响应；输入框、文本域、可编辑区域和重复按键不会触发。">
-          <kbd className="rounded-lg border border-black/[0.08] bg-black/[0.03] px-3 py-2 font-mono text-xs font-semibold text-[#1d1d1f] dark:border-white/[0.1] dark:bg-white/[0.06] dark:text-[#f5f5f5]">Ctrl+Shift+S</kbd>
+      <SettingsGroup title="截图" description="使用固定快捷键保存当前画面，不会改变阅读或播放进度。">
+        <SettingRow title="截图快捷键" description="仅在播放器页面响应；输入框、文本域、可编辑区域和重复按键不会触发。（播放器固定动作，不可配置）">
+          <kbd className="rounded-lg border border-black/[0.08] bg-black/[0.03] px-3 py-2 font-mono text-xs font-semibold text-[var(--haven-settings-foreground)]">Ctrl+Shift+S</kbd>
         </SettingRow>
-        <SettingRow title="默认保存位置" description="保存时由 Windows 系统对话框确认位置；默认目录为下载 / 栖阅 / 截图。">
-          <span className="text-xs font-semibold text-[#6e6e73] dark:text-[#98989d]">下载 / 栖阅 / 截图</span>
-        </SettingRow>
-        <SettingRow title="硬件解码" description="视频解码由 WebView2 和系统自动管理，当前版本不提供用户开关。">
-          <span className="text-xs font-semibold text-[#86868b] dark:text-[#98989d]">系统默认（由 WebView2 管理）</span>
+        <SettingRow title="默认保存位置" description="保存时仍由 Windows 系统对话框确认位置；对话框的初始目录为下载 / 栖阅 / 截图。">
+          <span className="text-xs font-semibold text-[var(--haven-settings-muted-strong)]">下载 / 栖阅 / 截图</span>
         </SettingRow>
       </SettingsGroup>
     </>
   )
 }
 
-function ReadingSettings({
+/**
+ * 自定义字体族名输入。当前没有可验证的本机字体清单来源，也不做字体文件导入，所以这里
+ * 只保存用户填写的族名本身：通过校验的族名才写入表单草稿（提交后由 Reader 包成单个
+ * CSS 族名），会逃出 font-family 声明的字符只在行内提示，不进入草稿。
+ */
+function CustomFontFamilyRow({ value, onCommit }: { value: string | null; onCommit: (patch: ReadingPatchWire) => void }) {
+  const [text, setText] = useState(value ?? "")
+  const [invalid, setInvalid] = useState(false)
+  /** 最近一次由本输入框提交的值：用于区分「外部改了值」和「自己刚提交的值」。 */
+  const committedRef = useRef(value ?? "")
+  // 表单重置或重新加载后跟随外部值，避免输入框停留在已经作废的草稿上；自己提交的值
+  // 不回灌，否则输入中的首尾空格会被即时裁掉、光标跳到末尾。
+  useEffect(() => {
+    const next = value ?? ""
+    if (next === committedRef.current) return
+    committedRef.current = next
+    setText(next)
+    setInvalid(false)
+  }, [value])
+  return (
+    <SettingRow title={READING_CUSTOM_FONT_LABEL} description={READING_CUSTOM_FONT_HINT}>
+      <div className="flex flex-col items-end gap-1">
+        <input
+          type="text"
+          value={text}
+          spellCheck={false}
+          autoComplete="off"
+          placeholder={READING_CUSTOM_FONT_PLACEHOLDER}
+          aria-label={READING_CUSTOM_FONT_LABEL}
+          aria-invalid={invalid}
+          onChange={(event) => {
+            const next = event.target.value
+            setText(next)
+            const commit = customFontFamilyCommit(next)
+            if (commit.status === "invalid") {
+              setInvalid(true)
+              return
+            }
+            setInvalid(false)
+            committedRef.current = commit.patch.customFontFamily ?? ""
+            onCommit(commit.patch)
+          }}
+          className={cn(
+            "h-10 w-[260px] rounded-xl border bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none",
+            invalid ? "border-[var(--haven-settings-danger)]" : "border-black/[0.08] focus:border-[var(--haven-settings-primary-50)]",
+          )}
+        />
+        {invalid && <p className="max-w-[260px] text-right text-[11px] leading-4 text-[var(--haven-settings-danger)]">{READING_CUSTOM_FONT_INVALID_HINT}</p>}
+      </div>
+    </SettingRow>
+  )
+}
+
+/** 预览样例：《山居秋暝》前四句。固定四行，取值变化只改排版，不改样例长度。 */
+const READING_PREVIEW_SAMPLE_LINES = [
+  "空山新雨后，天气晚来秋。",
+  "明月松间照，清泉石上流。",
+  "竹喧归浣女，莲动下渔舟。",
+  "随意春芳歇，王孙自可留。",
+] as const
+
+/**
+ * 阅读排版预览（卡片左栏）。
+ *
+ * 预览不自己算一套排版：它吃 `resolveReadingPresentation` 的结果，也就是两个文本阅读器
+ * 真正用来渲染正文的那份取值（theme / fontSizePx / lineHeight / contentWidthPx /
+ * customFontFamily）。所以字号、行高、字体、正文宽度一改，样例立刻跟着变，不会出现
+ * 「预览好看、阅读器不是这样」。
+ *
+ * 正文栏按阅读器最宽档（820 px）等比缩放，只是示意：真实像素由阅读器按窗口宽度应用。
+ * 预览框高度由内容决定（四行样例 + 内边距），不锁死行数以外的高度。
+ */
+function ReadingTypographyPreview({ settings }: { settings: ReadingSettingsValue }) {
+  // 与 BookReaderPage / ArticleReaderPage 同一判定：system 主题按系统偏好落到暖纸或夜间。
+  const prefersDark = useSystemPreference("(prefers-color-scheme: dark)")
+  const presentation = resolveReadingPresentation(settings, prefersDark)
+  const palette = readingPreviewPalette(presentation)
+  // 自定义字体族名走阅读器同一套校验与回退；未填或未通过校验时不加这个属性。
+  const customFontCss = resolveCustomFontFamilyCss(presentation.fontFamily, {
+    background: presentation.customBackground,
+    text: presentation.customText,
+    fontFamily: presentation.customFontFamily,
+  })
+  const sampleClass = cn("min-w-0 break-words", READING_FONT_PREVIEW_CLASS[presentation.fontFamily])
+
+  return (
+    <div className="flex min-w-0 flex-col">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-[11px] font-semibold tracking-[0.12em] uppercase text-[var(--haven-settings-muted)]">阅读预览</p>
+        <p data-testid="reading-typography-preview-meta" className="min-w-0 text-[11px] tabular-nums text-[var(--haven-settings-muted-strong)]">
+          {`字号 ${presentation.fontSizePx} px · 行高 ${presentation.lineHeight} · 正文宽度 ${presentation.contentWidthPx} px · ${readingPreviewFontLabel(settings)}`}
+        </p>
+      </div>
+      <div className="mt-3 flex min-h-[212px] flex-1 items-center justify-center overflow-hidden rounded-[12px] border border-[var(--haven-settings-border-subtle)] bg-[var(--haven-settings-control)] px-4 py-6">
+        <div
+          data-testid="reading-typography-preview-measure"
+          data-measure-px={presentation.contentWidthPx}
+          className="min-w-0 max-w-full rounded-[10px] px-4 py-3 shadow-[0_1px_2px_rgba(0,0,0,0.06)]"
+          style={{
+            // presentation.theme 已经解析过（system 会落到暖纸或夜间），这里一定拿到 hex，
+            // 所以只用 backgroundColor；渐变色只出现在上面的主题卡片色块里。
+            backgroundColor: palette.background,
+            color: palette.color,
+            fontSize: `${presentation.fontSizePx}px`,
+            lineHeight: presentation.lineHeight,
+            width: `${Math.round(readingPreviewMeasureRatio(presentation) * 1000) / 10}%`,
+            ...(customFontCss ? { fontFamily: customFontCss } : {}),
+          }}
+        >
+          {READING_PREVIEW_SAMPLE_LINES.map((line, index) => (
+            <p
+              key={line}
+              data-testid={index === 0 ? "reading-typography-preview-sample" : `reading-typography-preview-line-${index}`}
+              className={sampleClass}
+            >
+              {line}
+            </p>
+          ))}
+        </div>
+      </div>
+      <p className="mt-2 text-[11px] leading-5 text-[var(--haven-settings-muted)]">
+        {`示例按最宽 ${READING_PREVIEW_FULL_MEASURE_PX} px 等比示意；真实像素由阅读器按窗口宽度应用。`}
+      </p>
+    </div>
+  )
+}
+
+/**
+ * 阅读字体选择器（全局「默认字体」与「本资源字体」共用同一份选项规则）。
+ *
+ * 选项来自 `readingFontPickerOptions`：渲染等价的取值（`fangsong` / `mianfei`）不再
+ * 作为新选项提供，但旧快照里已经存了它们时仍会显示并回选当前值，所以打开设置不会看到
+ * 空选择、保存也不会静默改掉旧设置。
+ */
+function ReadingFontSelect({
+  value,
+  onChange,
+  ariaLabel,
+  disabled = false,
+}: {
+  value: ReadingFontFamilyWire
+  onChange: (value: ReadingFontFamilyWire) => void
+  ariaLabel: string
+  disabled?: boolean
+}) {
+  const options = readingFontPickerOptions(value)
+  return (
+    <SelectControl
+      value={optionLabel(options, value)}
+      options={options.map((option) => option.label)}
+      onChange={(label) => onChange(optionValue(options, label))}
+      ariaLabel={ariaLabel}
+      disabled={disabled}
+    />
+  )
+}
+
+/**
+ * 排版控件（卡片右栏）：标签列 + 控件列的对齐网格。
+ *
+ * 顺序按设计稿：默认字体 → 正文宽度 → 字号 → 行高。每一行都直接写回表单草稿，
+ * 草稿一变左栏预览立刻重算，不需要先保存。
+ */
+function ReadingTypographyControls({
+  value,
+  onChange,
+}: {
+  value: ReadingSettingsValue
+  onChange: (patch: ReadingPatchWire) => void
+}) {
+  return (
+    <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] content-start items-center gap-x-3 gap-y-4">
+      <p className="whitespace-nowrap text-[12px] font-medium text-[var(--haven-settings-muted-strong)]">默认字体</p>
+      <div className="min-w-0">
+        <ReadingFontSelect
+          value={value.fontFamily}
+          onChange={(fontFamily) => onChange({ section: "reading", fontFamily })}
+          ariaLabel="默认字体"
+        />
+      </div>
+      <p className="whitespace-nowrap text-[12px] font-medium text-[var(--haven-settings-muted-strong)]">正文宽度</p>
+      <div className="min-w-0">
+        <SegmentedControl
+          value={optionLabel(READING_WIDTH_OPTIONS, value.contentWidth)}
+          options={READING_WIDTH_OPTIONS.map((option) => option.label)}
+          onChange={(label) => onChange({ section: "reading", contentWidth: optionValue(READING_WIDTH_OPTIONS, label) })}
+          ariaLabel="正文宽度"
+        />
+      </div>
+      <p className="whitespace-nowrap text-[12px] font-medium text-[var(--haven-settings-muted-strong)]">字号</p>
+      <div className="min-w-0">
+        <SegmentedControl
+          value={optionLabel(READING_FONT_SIZE_OPTIONS, value.fontSize)}
+          options={READING_FONT_SIZE_OPTIONS.map((option) => option.label)}
+          onChange={(label) => onChange({ section: "reading", fontSize: optionValue(READING_FONT_SIZE_OPTIONS, label) })}
+          ariaLabel="字号"
+        />
+      </div>
+      <p className="whitespace-nowrap text-[12px] font-medium text-[var(--haven-settings-muted-strong)]">行高</p>
+      <div className="min-w-0">
+        <SegmentedControl
+          value={optionLabel(READING_LINE_HEIGHT_OPTIONS, value.lineHeight)}
+          options={READING_LINE_HEIGHT_OPTIONS.map((option) => option.label)}
+          onChange={(label) => onChange({ section: "reading", lineHeight: optionValue(READING_LINE_HEIGHT_OPTIONS, label) })}
+          ariaLabel="行高"
+        />
+      </div>
+    </div>
+  )
+}
+
+/**
+ * 阅读分区。导出以便组件测试直接挂载它并验证控件真的写进表单草稿。
+ *
+ * 结构是设计稿的两张主卡片，排版、底色和方式各自不再单独成卡：
+ *   1. 「排版与预览」：左栏是吃 `resolveReadingPresentation` 的实时预览，右栏是
+ *      默认字体 / 正文宽度 / 字号 / 行高的对齐网格；`fontFamily=custom` 时，自定义
+ *      字体族名输入就在这张卡片里，不挪去底色分组。
+ *   2. 「阅读底色与方式」：系统主题 + 六个内置预设 + 自定义主题；底下的取色器在
+ *      非自定义主题下禁用；阅读方式是顶层「连续滚动 / 分页」，「单页 / 双页」只在
+ *      分页时出现的子选择。
+ *
+ * 三处「不做假控件」的边界：
+ *   1. 自定义颜色只在 `theme=custom` 下被阅读器消费，所以其余主题下取色器可见但禁用，
+ *      并说明怎么解锁——不是画一个改了没效果的输入框。
+ *   2. 自定义字体族名只做 CSS 族名写法校验：不查本机字体列表、也不导入字体文件，
+ *      所以文案只说「请填本机已安装的族名」，并说明族名对不上时会退回系统字体栈。
+ *   3. 阅读模式仍然只有一个 wire 字段 `reading.pagination`：顶层「滚动 / 分页」，
+ *      「单页 / 双页」只在分页时可选的子选择，直接写回 paginated / double。
+ */
+export function ReadingSettings({
   form,
   resourceContext,
   showNotice,
@@ -1109,39 +3569,128 @@ function ReadingSettings({
   showNotice: (message: string) => void
 }) {
   const value = readingDisplayValue(form)
+  const pagination = value.pagination ?? "scroll"
+  const paginationMode = readingPaginationMode(pagination)
+  const pageSubMode = readingPageSubMode(pagination)
+  const customColorsEnabled = value.theme === "custom"
+  const selectPaginationMode = (next: ReadingPaginationMode) => {
+    // 顶层模式没变就不写草稿：避免把「点了一下已经选中的项」变成一次空变更。
+    if (next === paginationMode) return
+    form.change({ section: "reading", pagination: readingPaginationWire(next, pageSubMode) })
+  }
+  const selectPageSubMode = (next: ReadingPageSubMode) => {
+    form.change({ section: "reading", pagination: readingPaginationWire("paginated", next) })
+  }
+
   return (
     <>
       <SettingsIntro section="Reading" title="阅读" description="统一图书、文章和部分报刊资料的阅读体验。全局默认值可保存，打开具体资源时也可以单独覆盖。" />
       <SettingsFormStatusBar form={form} onReset={() => form.resetToDefaults()} />
       <SettingsFormError form={form} />
-      <SettingsGroup title="排版">
-        <SettingRow title="默认字体">
-          <SelectControl value={optionLabel(READING_FONT_OPTIONS, value.fontFamily)} options={READING_FONT_OPTIONS.map((option) => option.label)} onChange={(label) => form.change({ section: "reading", fontFamily: optionValue(READING_FONT_OPTIONS, label) })} ariaLabel="默认字体" />
-        </SettingRow>
-        <SettingRow title="字号">
-          <SegmentedControl value={optionLabel(READING_FONT_SIZE_OPTIONS, value.fontSize)} options={READING_FONT_SIZE_OPTIONS.map((option) => option.label)} onChange={(label) => form.change({ section: "reading", fontSize: optionValue(READING_FONT_SIZE_OPTIONS, label) })} ariaLabel="字号" />
-        </SettingRow>
-        <SettingRow title="行高">
-          <SegmentedControl value={optionLabel(READING_LINE_HEIGHT_OPTIONS, value.lineHeight)} options={READING_LINE_HEIGHT_OPTIONS.map((option) => option.label)} onChange={(label) => form.change({ section: "reading", lineHeight: optionValue(READING_LINE_HEIGHT_OPTIONS, label) })} ariaLabel="行高" />
-        </SettingRow>
-        <SettingRow title="正文宽度">
-          <SegmentedControl value={optionLabel(READING_WIDTH_OPTIONS, value.contentWidth)} options={READING_WIDTH_OPTIONS.map((option) => option.label)} onChange={(label) => form.change({ section: "reading", contentWidth: optionValue(READING_WIDTH_OPTIONS, label) })} ariaLabel="正文宽度" />
-        </SettingRow>
+      <SettingsGroup title="排版与预览" features={["reading.typography"]} description="示例会随字体、字号与行高实时变化；保存后用于文本阅读器。">
+        <div className="grid min-w-0 gap-5 px-6 py-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,320px)] lg:items-start">
+          <ReadingTypographyPreview settings={value} />
+          <ReadingTypographyControls value={value} onChange={(patch) => form.change(patch)} />
+        </div>
+        {/* 自定义字体族名属于排版，不放进底色卡片：选「自定义」后就在同一张卡片里填写。 */}
+        {value.fontFamily === "custom" && (
+          <div className="border-t border-[var(--haven-settings-border-subtle)]">
+            <CustomFontFamilyRow value={value.customFontFamily} onCommit={(patch) => form.change(patch)} />
+          </div>
+        )}
       </SettingsGroup>
-      <SettingsGroup title="阅读行为">
-        <SettingRow title="阅读模式" description="文本阅读器支持连续滚动、单页分页和双页分页；PDF 等非文本资源继续使用各自阅读器。">
-          <SelectControl value={optionLabel(READING_PAGINATION_OPTIONS, value.pagination ?? "scroll")} options={READING_PAGINATION_OPTIONS.map((option) => option.label)} onChange={(label) => form.change({ section: "reading", pagination: optionValue(READING_PAGINATION_OPTIONS, label) })} ariaLabel="阅读模式" />
+      <SettingsGroup title="阅读底色与方式" features={["reading.customAppearance", "reading.pagination"]} description={READING_CUSTOM_APPEARANCE_HINT}>
+        <div className="border-b border-[var(--haven-settings-border-subtle)] px-6 py-5">
+          <p className="text-[11px] font-semibold tracking-[0.12em] uppercase text-[var(--haven-settings-muted)]">阅读底色</p>
+          <div role="group" aria-label="主题预设" className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {READING_THEME_OPTIONS.map((option) => {
+              const active = value.theme === option.value
+              const swatch = readingThemeSwatch(option.value, value)
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  aria-pressed={active}
+                  // 「跟随系统」不是一个纯 theme 取值：契约把它拆成 theme=system +
+                  // systemAuto。patch 由 readingThemePatch 统一给出，点已选中的「跟随系统」
+                  // 也会把历史快照里的 systemAuto=false 修回来。
+                  onClick={() => form.change(readingThemePatch(option.value))}
+                  className={cn(
+                    "flex min-h-[58px] min-w-0 items-center gap-2.5 rounded-[10px] border px-3 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--haven-settings-primary)]",
+                    active
+                      ? "border-[var(--haven-settings-primary)] bg-[var(--haven-settings-card-hover)]"
+                      : "border-[var(--haven-settings-control-border)] hover:bg-[var(--haven-settings-card-hover)]",
+                  )}
+                >
+                  <span
+                    aria-hidden="true"
+                    className="flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-[9px] border border-black/[0.08] text-[13px] font-semibold"
+                    style={{ background: swatch.background, color: swatch.color }}
+                  >
+                    文
+                  </span>
+                  <span className="min-w-0 flex-1 truncate text-[12px] font-semibold text-[var(--haven-settings-foreground)]">{option.label}</span>
+                  {active && <Check aria-hidden="true" className="h-[15px] w-[15px] shrink-0 text-[var(--haven-settings-primary)]" strokeWidth={2.6} />}
+                </button>
+              )
+            })}
+          </div>
+        </div>
+        {!customColorsEnabled && (
+          <p data-testid="reading-custom-color-disabled-hint" className="border-b border-[var(--haven-settings-border-subtle)] px-6 py-3 text-[12px] leading-5 text-[var(--haven-settings-muted)]">
+            {READING_CUSTOM_COLOR_DISABLED_HINT}
+          </p>
+        )}
+        <SettingRow title={READING_CUSTOM_BACKGROUND_LABEL}>
+          <input
+            type="color"
+            value={customReadingColorInputValue(value.customBackground, READING_CUSTOM_BACKGROUND_FALLBACK)}
+            aria-label={READING_CUSTOM_BACKGROUND_LABEL}
+            disabled={!customColorsEnabled}
+            onChange={(event) => {
+              const patch = customReadingColorPatch("customBackground", event.target.value)
+              if (patch) form.change(patch)
+            }}
+            className={cn(
+              "h-10 w-[64px] rounded-xl border border-black/[0.08] bg-[var(--haven-settings-control)] p-1",
+              customColorsEnabled ? "cursor-pointer" : "cursor-not-allowed opacity-50",
+            )}
+          />
         </SettingRow>
-        <SettingRow title="默认主题">
-          <SelectControl value={optionLabel(READING_THEME_OPTIONS, value.theme)} options={READING_THEME_OPTIONS.map((option) => option.label)} onChange={(label) => form.change({ section: "reading", theme: optionValue(READING_THEME_OPTIONS, label) })} ariaLabel="默认主题" />
+        <SettingRow title={READING_CUSTOM_TEXT_LABEL}>
+          <input
+            type="color"
+            value={customReadingColorInputValue(value.customText, READING_CUSTOM_TEXT_FALLBACK)}
+            aria-label={READING_CUSTOM_TEXT_LABEL}
+            disabled={!customColorsEnabled}
+            onChange={(event) => {
+              const patch = customReadingColorPatch("customText", event.target.value)
+              if (patch) form.change(patch)
+            }}
+            className={cn(
+              "h-10 w-[64px] rounded-xl border border-black/[0.08] bg-[var(--haven-settings-control)] p-1",
+              customColorsEnabled ? "cursor-pointer" : "cursor-not-allowed opacity-50",
+            )}
+          />
         </SettingRow>
+        <div className="px-6 pb-1 pt-5">
+          <p className="text-[11px] font-semibold tracking-[0.12em] uppercase text-[var(--haven-settings-muted)]">阅读方式</p>
+        </div>
+        <SettingRow title="阅读模式" description="仅对图书文本阅读器生效；文章、PDF 等格式继续使用各自阅读方式。切回连续滚动后会保存为连续滚动。">
+          <SegmentedControl value={optionLabel(READING_PAGINATION_MODE_OPTIONS, paginationMode)} options={READING_PAGINATION_MODE_OPTIONS.map((option) => option.label)} onChange={(label) => selectPaginationMode(optionValue(READING_PAGINATION_MODE_OPTIONS, label))} ariaLabel="阅读模式" />
+        </SettingRow>
+        {paginationMode === "paginated" && (
+          <SettingRow title="分页方式" description="单页一次显示一页；双页一次显示相邻的两页。">
+            <SegmentedControl value={optionLabel(READING_PAGE_SUBMODE_OPTIONS, pageSubMode)} options={READING_PAGE_SUBMODE_OPTIONS.map((option) => option.label)} onChange={(label) => selectPageSubMode(optionValue(READING_PAGE_SUBMODE_OPTIONS, label))} ariaLabel="分页方式" />
+          </SettingRow>
+        )}
       </SettingsGroup>
       <ResourcePreferencePanel section="reading" context={resourceContext} showNotice={showNotice} />
     </>
   )
 }
 
-function ComicSettings({
+export function ComicSettings({
   form,
   resourceContext,
   showNotice,
@@ -1151,23 +3700,221 @@ function ComicSettings({
   showNotice: (message: string) => void
 }) {
   const value = comicDisplayValue(form)
+  const loading = form.isLoading
+  const saving = form.isSaving
+  const statusLabel = loading
+    ? "正在加载…"
+    : saving
+      ? "正在保存…"
+      : form.hasError
+        ? "设置暂不可用"
+        : form.isDirty
+          ? "有未保存的修改"
+          : "所有设置已保存"
+  const statusTone = loading || saving || form.hasError
+    ? "bg-[#b7aa91]"
+    : form.isDirty
+      ? "bg-[#c58d4d]"
+      : "bg-[#79a18a]"
+  const disabled = loading || saving
+  const viewModes = [
+    { value: "single" as const, label: "单页", preview: "single" },
+    { value: "double" as const, label: "双页", preview: "double" },
+    { value: "strip" as const, label: "条漫", preview: "strip" },
+  ]
+  const pageGaps = [
+    { value: "zero" as const, label: "0 px" },
+    { value: "twelve" as const, label: "12 px" },
+    { value: "twenty_four" as const, label: "24 px" },
+  ]
+  const preloadOptions = [
+    { value: "one" as const, label: "1 页" },
+    { value: "three" as const, label: "3 页" },
+    { value: "five" as const, label: "5 页" },
+    { value: "unlimited" as const, label: "不限制" },
+  ]
+
   return (
-    <>
-      <SettingsIntro section="Comic" title="漫画" description="为单页、双页、条漫和从右向左的内容提供独立默认偏好；保存后用于新的漫画阅读会话。" />
-      <SettingsFormStatusBar form={form} onReset={() => form.resetToDefaults()} />
+    <div aria-label="Comic" className="pt-[8px]" data-settings-features="comic.layout" tabIndex={-1}>
+      <header>
+        <p className="h-[16px] text-[10px] font-light leading-[18px] tracking-[0.3px] text-[var(--haven-settings-muted-subtle)]">READING / COMIC LAYOUT</p>
+        <h2 className="mt-[7px] h-[38px] text-[31px] font-bold leading-[38px] tracking-[-0.025em] text-[var(--haven-settings-foreground)]">漫画</h2>
+        <p className="mt-[8px] h-[18px] text-[11px] leading-[18px] text-[var(--haven-settings-muted-strong)]">为漫画调整页面布局、阅读方向与预加载节奏。</p>
+        <div className="mt-[5px] flex h-[30px] items-center justify-between gap-4">
+          <div className="flex min-w-0 items-center gap-[8px] text-[10.5px] text-[var(--haven-settings-muted-strong)]" role="status" aria-live="polite">
+            <span aria-hidden="true" className={cn("h-[8px] w-[8px] shrink-0 rounded-full", statusTone)} />
+            <span className="truncate">{statusLabel}</span>
+          </div>
+          <div className="flex shrink-0 items-center gap-4">
+            {form.isDirty && (
+              <button
+                type="button"
+                onClick={() => { void form.save() }}
+                disabled={disabled}
+                className="text-[10.5px] font-medium text-[var(--haven-settings-foreground)] transition-colors hover:opacity-75 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                保存修改
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => form.resetToDefaults()}
+              disabled={disabled}
+              className="text-[10.5px] font-normal text-[var(--haven-settings-muted-strong)] transition-colors hover:text-[var(--haven-settings-foreground)] disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              恢复默认
+            </button>
+          </div>
+        </div>
+      </header>
       <SettingsFormError form={form} />
-      <SettingsGroup title="阅读方式">
-        <SettingRow title="默认阅读模式"><SelectControl value={value.viewMode === "single" ? "单页" : value.viewMode === "double" ? "双页" : "条漫"} options={["单页", "双页", "条漫"]} onChange={(label) => form.change({ section: "comic", viewMode: label === "单页" ? "single" : label === "双页" ? "double" : "strip" })} ariaLabel="默认漫画阅读模式" /></SettingRow>
-        <SettingRow title="默认阅读方向"><SegmentedControl value={value.direction === "rtl" ? "从右向左" : "从左向右"} options={["从左向右", "从右向左"]} onChange={(label) => form.change({ section: "comic", direction: label === "从右向左" ? "rtl" : "ltr" })} ariaLabel="默认漫画阅读方向" /></SettingRow>
-        <SettingRow title="页面间距"><SelectControl value={value.pageGap === "zero" ? "0 px" : value.pageGap === "twelve" ? "12 px" : "24 px"} options={["0 px", "12 px", "24 px"]} onChange={(label) => form.change({ section: "comic", pageGap: label === "0 px" ? "zero" : label === "12 px" ? "twelve" : "twenty_four" })} ariaLabel="页面间距" /></SettingRow>
-        <SettingRow title="预加载页数" description="页数越多越顺滑，也会占用更多内存；不限制仍受阅读器安全窗口上限保护。"><SelectControl value={value.preloadPages === "unlimited" ? "不限制（安全上限）" : `${value.preloadPages === "one" ? 1 : value.preloadPages === "three" ? 3 : 5} 页`} options={["1 页", "3 页", "5 页", "不限制（安全上限）"]} onChange={(label) => form.change({ section: "comic", preloadPages: label.startsWith("1") ? "one" : label.startsWith("3") ? "three" : label.startsWith("5") ? "five" : "unlimited" })} ariaLabel="预加载页数" /></SettingRow>
-      </SettingsGroup>
-      <SettingsGroup title="辅助功能">
-        <SettingRow title="OCR 默认语言" description="需要 OCR/AI Foundation；当前版本不会保存模拟配置。"><SelectControl value="当前版本不可用" options={["当前版本不可用"]} onChange={() => undefined} ariaLabel="OCR 默认语言" disabled /></SettingRow>
-        <SettingRow title="翻译偏好" description="需要翻译/AI Foundation；当前版本不会保存模拟配置。"><SelectControl value="当前版本不可用" options={["当前版本不可用"]} onChange={() => undefined} ariaLabel="翻译偏好" disabled /></SettingRow>
-      </SettingsGroup>
-      <ResourcePreferencePanel section="comic" context={resourceContext} showNotice={showNotice} />
-    </>
+
+      <div className="mt-[16px] flex flex-col gap-[20px]">
+        <section aria-labelledby="comic-reading-mode-title" className="h-auto rounded-[20px] border border-[var(--haven-settings-border)] bg-[var(--haven-settings-sidebar)] px-[24px] py-[22px] min-[1232px]:min-h-[260px]">
+          <h3 id="comic-reading-mode-title" className="h-[20px] text-[15px] font-bold leading-[20px] text-[var(--haven-settings-card-foreground)]">阅读方式</h3>
+          <p className="mt-[10px] h-[18px] text-[11.5px] leading-[18px] text-[var(--haven-settings-muted-strong)]">为漫画选择合适的页面排列与翻页方向。</p>
+          <div className="mt-[10px] flex flex-col gap-[24px] min-[1232px]:h-[140px] min-[1232px]:flex-row min-[1232px]:items-center">
+            <div className="flex min-w-0 flex-col gap-[6px] min-[1232px]:w-[620px]">
+              <p className="h-[16px] text-[11.5px] font-medium leading-[16px] text-[var(--haven-settings-foreground)]">阅读模式</p>
+              <div className="grid w-full max-w-[572px] grid-cols-1 gap-[10px] sm:grid-cols-3" role="group" aria-label="阅读模式">
+                {viewModes.map((mode) => {
+                  const selected = value.viewMode === mode.value
+                  return (
+                    <button
+                      key={mode.value}
+                      type="button"
+                      aria-pressed={selected}
+                      aria-label={mode.label}
+                      disabled={disabled}
+                      onClick={() => form.change({ section: "comic", viewMode: mode.value })}
+                      className="group flex w-full max-w-[184px] flex-col items-center gap-[6px] rounded-[8px] bg-transparent p-0 text-center outline-none focus-visible:ring-2 focus-visible:ring-[#8d8068] focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-55"
+                    >
+                      <span
+                        aria-hidden="true"
+                        className={cn(
+                          "relative h-[56px] w-full max-w-[172px] overflow-hidden rounded-[8px] border bg-[#f1eee7] dark:bg-[var(--haven-settings-control)]",
+                          selected ? "border-[#b8aa90] dark:border-[var(--haven-settings-primary)]" : "border-[#ddd8ce] dark:border-[var(--haven-settings-border-subtle)]",
+                        )}
+                      >
+                        {mode.preview === "single" && (
+                          <span className="absolute left-1/2 top-[6px] h-[42px] w-[40px] -translate-x-1/2 rounded-[3px] border border-[#d7d0c3] bg-[#fffdfb]" />
+                        )}
+                        {mode.preview === "double" && (
+                          <span className="absolute left-1/2 top-[6px] flex -translate-x-1/2 gap-[4px]">
+                            <span className="h-[42px] w-[30px] rounded-[3px] border border-[#d7d0c3] bg-[#fffdfb]" />
+                            <span className="h-[42px] w-[30px] rounded-[3px] border border-[#d7d0c3] bg-[#fffdfb]" />
+                          </span>
+                        )}
+                        {mode.preview === "strip" && (
+                          <span className="absolute left-1/2 top-[4px] flex -translate-x-1/2 flex-col gap-[3px]">
+                            <span className="h-[13px] w-[44px] rounded-[2px] border border-[#d7d0c3] bg-[#fffdfb]" />
+                            <span className="h-[13px] w-[44px] rounded-[2px] border border-[#d7d0c3] bg-[#ebe5d9]" />
+                            <span className="h-[13px] w-[44px] rounded-[2px] border border-[#d7d0c3] bg-[#fffdfb]" />
+                          </span>
+                        )}
+                      </span>
+                      <span className={cn(
+                        "flex h-[38px] w-[96px] items-center justify-center rounded-[12px] border text-[11.5px] leading-[18px] transition-colors",
+                        selected ? "border-[#252320] bg-[#252320] text-[#f7f4ed] dark:border-[var(--haven-settings-primary)] dark:bg-[var(--haven-settings-primary)] dark:text-[var(--haven-settings-primary-foreground)]" : "border-[#ddd8ce] bg-[#f0ede6] text-[#252320] dark:border-[var(--haven-settings-border-subtle)] dark:bg-[var(--haven-settings-control)] dark:text-[var(--haven-settings-foreground)]",
+                      )}>
+                        {mode.label}
+                      </span>
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+
+            <div className="flex min-w-0 flex-col justify-center gap-[8px] min-[1232px]:h-[140px] min-[1232px]:w-[348px]">
+              <p className="h-[16px] text-[11.5px] font-medium leading-[16px] text-[var(--haven-settings-foreground)]">翻页方向</p>
+              <p className="h-[16px] text-[10.5px] leading-[16px] text-[var(--haven-settings-muted-strong)]">页面按所选方向依次展开。</p>
+              <div className="flex flex-wrap gap-[8px]" role="group" aria-label="翻页方向">
+                {[
+                  { value: "rtl" as const, label: "从右向左" },
+                  { value: "ltr" as const, label: "从左向右" },
+                ].map((direction) => {
+                  const selected = value.direction === direction.value
+                  return (
+                    <button
+                      key={direction.value}
+                      type="button"
+                      aria-pressed={selected}
+                      disabled={disabled}
+                      onClick={() => form.change({ section: "comic", direction: direction.value })}
+                      className={cn(
+                        "h-[38px] w-[96px] rounded-[12px] border text-[11.5px] transition-colors disabled:cursor-not-allowed disabled:opacity-55",
+                        selected ? "border-[#252320] bg-[#252320] text-[#f7f4ed] dark:border-[var(--haven-settings-primary)] dark:bg-[var(--haven-settings-primary)] dark:text-[var(--haven-settings-primary-foreground)]" : "border-[#ddd8ce] bg-[#f0ede6] text-[#252320] hover:bg-[#eae6de] dark:border-[var(--haven-settings-border-subtle)] dark:bg-[var(--haven-settings-control)] dark:text-[var(--haven-settings-foreground)] dark:hover:bg-[var(--haven-settings-card-hover)]",
+                      )}
+                    >
+                      {direction.label}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section aria-labelledby="comic-gap-preload-title" className="h-auto rounded-[20px] border border-[var(--haven-settings-border)] bg-[var(--haven-settings-sidebar)] px-[24px] py-[22px] min-[1232px]:h-[240px]">
+          <h3 id="comic-gap-preload-title" className="h-[20px] text-[15px] font-bold leading-[20px] text-[var(--haven-settings-card-foreground)]">页面间距与预加载</h3>
+          <p className="mt-[10px] h-[18px] text-[11.5px] leading-[18px] text-[var(--haven-settings-muted-strong)]">调整相邻页面的留白，以及阅读时提前准备的页数。</p>
+          <div className="mt-[10px] flex flex-col gap-[24px] min-[1232px]:h-[136px] min-[1232px]:flex-row min-[1232px]:items-center">
+            <div className="flex min-w-0 flex-col gap-[7px] min-[1232px]:w-[420px]">
+              <p className="h-[16px] text-[11.5px] font-medium leading-[16px] text-[var(--haven-settings-foreground)]">页面间距</p>
+              <p className="h-[16px] text-[10.5px] leading-[16px] text-[var(--haven-settings-muted-strong)]">页面留白更多，边界更清楚。</p>
+              <div className="flex flex-wrap gap-[8px]" role="group" aria-label="页面间距">
+                {pageGaps.map((gap) => {
+                  const selected = value.pageGap === gap.value
+                  return (
+                    <button
+                      key={gap.value}
+                      type="button"
+                      aria-pressed={selected}
+                      disabled={disabled}
+                      onClick={() => form.change({ section: "comic", pageGap: gap.value })}
+                      className={cn(
+                        "h-[38px] w-[96px] rounded-[12px] border text-[11.5px] transition-colors disabled:cursor-not-allowed disabled:opacity-55",
+                        selected ? "border-[#252320] bg-[#252320] text-[#f7f4ed] dark:border-[var(--haven-settings-primary)] dark:bg-[var(--haven-settings-primary)] dark:text-[var(--haven-settings-primary-foreground)]" : "border-[#ddd8ce] bg-[#f0ede6] text-[#252320] hover:bg-[#eae6de] dark:border-[var(--haven-settings-border-subtle)] dark:bg-[var(--haven-settings-control)] dark:text-[var(--haven-settings-foreground)] dark:hover:bg-[var(--haven-settings-card-hover)]",
+                      )}
+                    >
+                      {gap.label}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+
+            <div className="flex min-w-0 flex-col gap-[6px] min-[1232px]:w-[548px]">
+              <p className="h-[16px] text-[11.5px] font-medium leading-[16px] text-[var(--haven-settings-foreground)]">预加载页数</p>
+              <p className="h-[16px] text-[10.5px] leading-[16px] text-[var(--haven-settings-muted-strong)]">提前准备后续页面，切页时更顺畅。</p>
+              <div className="flex flex-wrap gap-[8px]" role="group" aria-label="预加载页数">
+                {preloadOptions.map((option) => {
+                  const selected = value.preloadPages === option.value
+                  return (
+                    <button
+                      key={option.value}
+                      type="button"
+                      aria-pressed={selected}
+                      disabled={disabled}
+                      onClick={() => form.change({ section: "comic", preloadPages: option.value })}
+                      className={cn(
+                        "h-[38px] w-[96px] rounded-[12px] border text-[11.5px] transition-colors disabled:cursor-not-allowed disabled:opacity-55",
+                        selected ? "border-[#252320] bg-[#252320] text-[#f7f4ed] dark:border-[var(--haven-settings-primary)] dark:bg-[var(--haven-settings-primary)] dark:text-[var(--haven-settings-primary-foreground)]" : "border-[#ddd8ce] bg-[#f0ede6] text-[#252320] hover:bg-[#eae6de] dark:border-[var(--haven-settings-border-subtle)] dark:bg-[var(--haven-settings-control)] dark:text-[var(--haven-settings-foreground)] dark:hover:bg-[var(--haven-settings-card-hover)]",
+                      )}
+                    >
+                      {option.label}
+                    </button>
+                  )
+                })}
+              </div>
+              <p className="h-[16px] text-[9.5px] leading-[16px] text-[var(--haven-settings-muted-strong)]">不限制时，阅读器仍会控制连续预读的页数。</p>
+            </div>
+          </div>
+        </section>
+
+        <ResourcePreferencePanel section="comic" context={resourceContext} showNotice={showNotice} />
+      </div>
+    </div>
   )
 }
 
@@ -1377,10 +4124,22 @@ function ResourcePreferencePanel({
   }
 
   if (!context) {
+    if (section === "comic") {
+      return (
+        <div data-testid="comic-resource-preferences-empty" className="flex min-h-[68px] w-full items-center gap-[12px] rounded-[14px] border border-[var(--haven-settings-border)] bg-[var(--haven-settings-background)] px-[18px] py-[10px]">
+          <div className="min-w-0 flex-1">
+            <p className="text-[12px] font-medium leading-[18px] text-[var(--haven-settings-foreground)]">漫画资源内设</p>
+            <p className="text-[10.5px] leading-[16px] text-[var(--haven-settings-muted-strong)]">从漫画阅读器打开内容后，可为这部漫画单独调整阅读方式。</p>
+          </div>
+          <span className="w-[148px] shrink-0 text-right text-[10.5px] leading-[16px] text-[var(--haven-settings-muted-strong)]">请从漫画阅读器进入</span>
+        </div>
+      )
+    }
+
     return (
       <SettingsGroup title="资源内设" description="从阅读器或漫画阅读器打开本资源设置后，可在不改变全局默认值的情况下覆盖单个资源。">
-        <SettingRow title="当前资源" description="当前页面没有收到已验证的 Work / Edition / MediaItem 身份，不显示可编辑的资源配置。">
-          <span className="text-[12px] font-medium text-[#86868b]">请从阅读器进入</span>
+        <SettingRow title="当前资源" description="请从阅读器中打开本资源设置，再为这份内容单独调整偏好。">
+          <span className="text-[12px] font-medium text-[var(--haven-settings-muted)]">请从阅读器进入</span>
         </SettingRow>
       </SettingsGroup>
     )
@@ -1391,16 +4150,16 @@ function ResourcePreferencePanel({
       title="资源内设"
       description="优先级：本资源 → 版本 → 全局。资源身份由当前会话提供，保存使用版本校验。"
     >
-      <div className="border-b border-black/[0.05] px-6 py-4 dark:border-white/[0.05]">
-        <div className="flex flex-wrap items-center gap-2 text-[11px] font-semibold text-[#6e6e73] dark:text-[#98989d]">
-          <span className="rounded-md bg-black/[0.04] px-2 py-1 dark:bg-white/[0.06]">Work {workId ?? "未返回"}</span>
+      <div className="border-b border-black/[0.05] px-6 py-4">
+        <div className="flex flex-wrap items-center gap-2 text-[11px] font-semibold text-[var(--haven-settings-muted-strong)]">
+          <span className="rounded-md bg-black/[0.04] px-2 py-1">Work {workId ?? "未返回"}</span>
           <ChevronRight className="h-3.5 w-3.5" />
-          <span className="rounded-md bg-black/[0.04] px-2 py-1 dark:bg-white/[0.06]">Edition {editionId}</span>
+          <span className="rounded-md bg-black/[0.04] px-2 py-1">Edition {editionId}</span>
           <ChevronRight className="h-3.5 w-3.5" />
-          <span className="rounded-md bg-[#007aff]/[0.10] px-2 py-1 text-[#007aff]">MediaItem {mediaItemId}</span>
+          <span className="rounded-md bg-[var(--haven-settings-primary-10)] px-2 py-1 text-[var(--haven-settings-primary)]">MediaItem {mediaItemId}</span>
         </div>
         {status === "ready" && result && (
-          <p className="mt-2 text-[11px] text-[#86868b]">当前生效来源：{resourcePreferenceSource(result, section)}</p>
+          <p className="mt-2 text-[11px] text-[var(--haven-settings-muted)]">当前生效来源：{resourcePreferenceSource(result, section)}</p>
         )}
       </div>
       {status === "ready" && result && (
@@ -1414,25 +4173,26 @@ function ResourcePreferencePanel({
           />
         </SettingRow>
       )}
-      {status === "loading" && <p className="px-6 py-5 text-sm text-[#86868b]">正在读取本资源配置…</p>}
+      {status === "loading" && <p className="px-6 py-5 text-sm text-[var(--haven-settings-muted)]">正在读取本资源配置…</p>}
       {status === "error" && (
         <div className="flex flex-wrap items-center justify-between gap-3 px-6 py-5">
-          <p className="text-sm font-medium text-[#d70015]">{errorMessage ?? "本资源配置暂时不可用"}</p>
-          <button type="button" onClick={() => { void load() }} className="rounded-full border border-[#007aff]/30 px-3 py-1.5 text-xs font-semibold text-[#007aff]">重试</button>
+          <p className="text-sm font-medium text-[var(--haven-settings-danger)]">{errorMessage ?? "本资源配置暂时不可用"}</p>
+          <button type="button" onClick={() => { void load() }} className="rounded-full border border-[var(--haven-settings-primary-30)] px-3 py-1.5 text-xs font-semibold text-[var(--haven-settings-primary)]">重试</button>
         </div>
       )}
       {status === "ready" && result && draft?.section === "reading" && section === "reading" && (
         <>
           <SettingRow title="本资源字体" description="只覆盖当前 MediaItem，未设置的字段继续继承版本或全局值。">
-            <SelectControl value={optionLabel(READING_FONT_OPTIONS, draft.fontFamily)} options={READING_FONT_OPTIONS.map((option) => option.label)} onChange={(label) => updateDraft({ fontFamily: optionValue(READING_FONT_OPTIONS, label) })} ariaLabel="本资源字体" disabled={saving} />
+            <ReadingFontSelect value={draft.fontFamily} onChange={(fontFamily) => updateDraft({ fontFamily })} ariaLabel="本资源字体" disabled={saving} />
           </SettingRow>
           <SettingRow title="本资源主题">
             <SelectControl value={optionLabel(READING_THEME_OPTIONS, draft.theme)} options={READING_THEME_OPTIONS.map((option) => option.label)} onChange={(label) => updateDraft({ theme: optionValue(READING_THEME_OPTIONS, label) })} ariaLabel="本资源主题" disabled={saving} />
           </SettingRow>
-          <SettingRow title="本资源排版" description="字号、行高和正文宽度会在下次打开内容时保持。">
+          <SettingRow title="本资源排版" description="字号、行高和正文宽度会在下次打开内容时保持；未调整的项继续继承版本或全局值。">
             <div className="flex flex-wrap justify-end gap-2">
               <SelectControl value={optionLabel(READING_FONT_SIZE_OPTIONS, draft.fontSize)} options={READING_FONT_SIZE_OPTIONS.map((option) => option.label)} onChange={(label) => updateDraft({ fontSize: optionValue(READING_FONT_SIZE_OPTIONS, label) })} ariaLabel="本资源字号" disabled={saving} />
               <SelectControl value={optionLabel(READING_LINE_HEIGHT_OPTIONS, draft.lineHeight)} options={READING_LINE_HEIGHT_OPTIONS.map((option) => option.label)} onChange={(label) => updateDraft({ lineHeight: optionValue(READING_LINE_HEIGHT_OPTIONS, label) })} ariaLabel="本资源行高" disabled={saving} />
+              <SelectControl value={optionLabel(READING_WIDTH_OPTIONS, draft.contentWidth)} options={READING_WIDTH_OPTIONS.map((option) => option.label)} onChange={(label) => updateDraft({ contentWidth: optionValue(READING_WIDTH_OPTIONS, label) })} ariaLabel="本资源正文宽度" disabled={saving} />
             </div>
           </SettingRow>
           <SettingRow title="本资源阅读模式" description="只影响文本类阅读；PDF 仍使用原生页码。">
@@ -1463,1226 +4223,17 @@ function ResourcePreferencePanel({
         </>
       )}
       {status === "ready" && result && (
-        <div className="flex flex-wrap items-center justify-end gap-4 border-t border-black/[0.05] px-6 py-4 dark:border-white/[0.05]">
-          <button type="button" onClick={() => { void reset() }} disabled={saving} className="text-[13px] font-medium text-[#86868b] transition-colors hover:text-[#1d1d1f] disabled:cursor-not-allowed disabled:opacity-50 dark:hover:text-[#f5f5f5]">重置本资源</button>
-          <button type="button" onClick={() => { void save() }} disabled={saving} className="rounded-full bg-[#007aff] px-4 py-2 text-[13px] font-semibold text-white transition-colors hover:bg-[#006fe6] disabled:cursor-not-allowed disabled:opacity-50">{saving ? "保存中…" : "保存本资源设置"}</button>
+        <div className="flex flex-wrap items-center justify-end gap-4 border-t border-black/[0.05] px-6 py-4">
+          <button type="button" onClick={() => { void reset() }} disabled={saving} className="text-[13px] font-medium text-[var(--haven-settings-muted)] transition-colors hover:text-[var(--haven-settings-foreground)] disabled:cursor-not-allowed disabled:opacity-50">重置本资源</button>
+          <button type="button" onClick={() => { void save() }} disabled={saving} className="rounded-full bg-[var(--haven-settings-primary)] px-4 py-2 text-[13px] font-semibold text-[var(--haven-settings-primary-foreground)] transition-colors hover:bg-[var(--haven-settings-primary-hover)] disabled:cursor-not-allowed disabled:opacity-50">{saving ? "保存中…" : "保存本资源设置"}</button>
         </div>
       )}
     </SettingsGroup>
   )
 }
 
-/** CMS10 端点输入行：仅 cms10 显示；端点必须由用户明确填写。 */
-function Cms10EndpointRow({
-  source,
-  showNotice,
-  onChanged,
-}: {
-  source: SourceDescriptorWire
-  showNotice: (message: string) => void
-  onChanged: () => void
-}) {
-  const [endpoint, setEndpoint] = useState("")
-  const [saving, setSaving] = useState(false)
-  const save = async () => {
-    setSaving(true)
-    try {
-      const result = await setSourceEndpoint({ sourceId: source.sourceId, endpoint })
-      if (result.endpointConfigured) {
-        showNotice("端点已保存")
-      } else {
-        showNotice("端点已清除")
-      }
-      onChanged()
-    } catch (error) {
-      showNotice(toHavenError(error).dto.userMessage)
-    } finally {
-      setSaving(false)
-    }
-  }
-  return (
-    <div className="flex flex-col gap-3 border-t border-black/[0.06] px-5 py-4">
-      <div className="flex flex-col gap-2 border-t border-black/[0.06] pt-3 sm:flex-row sm:items-center">
-        <label className="min-w-0 flex-1 text-xs text-[#86868b]" htmlFor={`endpoint-${source.sourceId}`}>
-          用户配置采集接口地址（http/https，例如 https://host/api.php/provide/vod）
-          <input
-            id={`endpoint-${source.sourceId}`}
-            value={endpoint}
-            onChange={(event) => setEndpoint(event.target.value)}
-            placeholder="https://…/api.php/provide/vod"
-            className="mt-1 w-full rounded-xl border border-black/[0.12] bg-white px-3 py-2 font-mono text-xs text-[#1d1d1f] outline-none focus:border-[#007aff]"
-            autoComplete="off"
-            spellCheck={false}
-          />
-        </label>
-        <button
-          type="button"
-          disabled={saving}
-          onClick={() => { void save() }}
-          className="shrink-0 self-start rounded-full bg-[#007aff] px-[16px] py-[8px] text-xs font-semibold text-white disabled:opacity-50 sm:self-center"
-        >
-          {saving ? "保存中…" : "保存端点"}
-        </button>
-      </div>
-    </div>
-  )
-}
 
-/** M3U 端点输入行：配置后由后端真实解析播放列表并参与视频搜索。 */
-function M3uEndpointRow({
-  source,
-  showNotice,
-  onChanged,
-}: {
-  source: SourceDescriptorWire
-  showNotice: (message: string) => void
-  onChanged: () => void
-}) {
-  const [endpoint, setEndpoint] = useState("")
-  const [saving, setSaving] = useState(false)
-  const save = async () => {
-    setSaving(true)
-    try {
-      const result = await setSourceEndpoint({ sourceId: source.sourceId, endpoint })
-      showNotice(result.endpointConfigured ? "M3U 地址已保存" : "M3U 地址已清除")
-      onChanged()
-    } catch (error) {
-      showNotice(toHavenError(error).dto.userMessage)
-    } finally {
-      setSaving(false)
-    }
-  }
-  return (
-    <div className="flex flex-col gap-2 border-t border-black/[0.06] px-5 py-4 dark:border-white/[0.06]">
-      <p className="text-xs font-semibold text-[#1d1d1f] dark:text-[#f5f5f5]">M3U 播放列表地址</p>
-      <p className="text-[11px] leading-5 text-[#86868b]">填入以 http:// 或 https:// 开头的播放列表地址。保存后可按频道名称搜索；播放地址不会显示在搜索结果中。</p>
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-        <input
-          value={endpoint}
-          onChange={(event) => { setEndpoint(event.target.value) }}
-          placeholder="https://example.org/playlist.m3u"
-          maxLength={500}
-          autoComplete="off"
-          spellCheck={false}
-          className="min-w-0 flex-1 rounded-xl border border-black/[0.12] bg-white px-3 py-2 font-mono text-xs text-[#1d1d1f] outline-none focus:border-[#007aff] dark:border-white/[0.12] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]"
-          aria-label="M3U 播放列表地址"
-        />
-        <button
-          type="button"
-          disabled={saving}
-          onClick={() => { void save() }}
-          className="shrink-0 self-start rounded-full bg-[#007aff] px-4 py-2 text-xs font-semibold text-white disabled:opacity-50 sm:self-auto"
-        >
-          {saving ? "保存中…" : "保存地址"}
-        </button>
-      </div>
-    </div>
-  )
-}
 
-type SourceCategoryTone = {
-  icon: typeof PlaySquare
-  accent: string
-  soft: string
-  darkSoft: string
-}
-
-const SOURCE_CATEGORY_TONES: Record<SourceCategoryDto, SourceCategoryTone> = {
-  video: {
-    icon: PlaySquare,
-    accent: "text-[#ff9500] dark:text-[#ffb340]",
-    soft: "bg-[#fff7e8] border-[#ff9500]/20",
-    darkSoft: "dark:bg-[#3a2b16] dark:border-[#ff9500]/25",
-  },
-  book: {
-    icon: BookOpen,
-    accent: "text-[#007aff] dark:text-[#5aa9ff]",
-    soft: "bg-[#edf6ff] border-[#007aff]/20",
-    darkSoft: "dark:bg-[#132b45] dark:border-[#007aff]/25",
-  },
-  comic: {
-    icon: PanelsTopLeft,
-    accent: "text-[#af52de] dark:text-[#d28bef]",
-    soft: "bg-[#f8effc] border-[#af52de]/20",
-    darkSoft: "dark:bg-[#34203e] dark:border-[#af52de]/25",
-  },
-  periodical: {
-    icon: FileText,
-    accent: "text-[#34a853] dark:text-[#64d98b]",
-    soft: "bg-[#edf9f0] border-[#34a853]/20",
-    darkSoft: "dark:bg-[#183522] dark:border-[#34a853]/25",
-  },
-}
-
-const SOURCE_MODE_TONES: Record<SourceModeDto, {
-  icon: typeof Server
-  accent: string
-  rail: string
-  soft: string
-  darkSoft: string
-}> = {
-  collection: {
-    icon: Server,
-    accent: "text-[#007aff] dark:text-[#5aa9ff]",
-    rail: "bg-[#007aff]",
-    soft: "bg-[#edf6ff] border-[#007aff]/20",
-    darkSoft: "dark:bg-[#132b45] dark:border-[#007aff]/25",
-  },
-  single: {
-    icon: Globe2,
-    accent: "text-[#34a853] dark:text-[#64d98b]",
-    rail: "bg-[#34a853]",
-    soft: "bg-[#edf9f0] border-[#34a853]/20",
-    darkSoft: "dark:bg-[#183522] dark:border-[#34a853]/25",
-  },
-}
-
-const SOURCE_HEALTH_TONES: Record<string, { dot: string; pill: string }> = {
-  unknown: { dot: "bg-[#8e8e93]", pill: "bg-black/[0.05] text-[#6e6e73] dark:bg-white/[0.08] dark:text-[#c7c7cc]" },
-  ok: { dot: "bg-[#34c759]", pill: "bg-[#34c759]/[0.12] text-[#248a3d] dark:bg-[#34c759]/[0.18] dark:text-[#8de6a4]" },
-  degraded: { dot: "bg-[#ff9500]", pill: "bg-[#ff9500]/[0.12] text-[#a85d00] dark:bg-[#ff9500]/[0.18] dark:text-[#ffc266]" },
-  down: { dot: "bg-[#ff3b30]", pill: "bg-[#ff3b30]/[0.12] text-[#c9342b] dark:bg-[#ff3b30]/[0.18] dark:text-[#ff8b84]" },
-}
-
-function SourcesSettings({ showNotice }: { showNotice: (message: string) => void }) {
-  const [registry, setRegistry] = useState<SourceRegistryDto | null>(null)
-  const [isLoading, setIsLoading] = useState(true)
-  const [loadError, setLoadError] = useState<HavenError | null>(null)
-  const [togglingId, setTogglingId] = useState<string | null>(null)
-  const [category, setCategory] = useState<SourceCategoryDto | "all">("all")
-
-  const load = useCallback(async () => {
-    setIsLoading(true)
-    setLoadError(null)
-    try {
-      setRegistry(await listSources())
-    } catch (error) {
-      setLoadError(toHavenError(error))
-    } finally {
-      setIsLoading(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    void load()
-  }, [load])
-
-  const toggleSource = async (source: SourceDescriptorWire) => {
-    setTogglingId(source.sourceId)
-    try {
-      const result = await setSourceEnabled({
-        sourceId: source.sourceId,
-        enabled: !source.enabled,
-      })
-      showNotice(result.enabled ? `${source.displayName} 已启用` : `${source.displayName} 已停用`)
-      await load()
-    } catch (error) {
-      showNotice(toHavenError(error).dto.userMessage)
-    } finally {
-      setTogglingId(null)
-    }
-  }
-
-  const builtinSources = useMemo(
-    () => (registry?.sources ?? []).filter((source) => !isCustomSourceId(source.sourceId)),
-    [registry],
-  )
-  const categoryCounts = useMemo(() => {
-    const counts = {} as Record<SourceCategoryDto, number>
-    SOURCE_CATEGORY_ORDER.forEach((item) => {
-      counts[item] = builtinSources.filter((source) => source.categories.includes(item)).length
-    })
-    return counts
-  }, [builtinSources])
-  return (
-    <>
-      <SettingsIntro section="Sources" title="来源" description="来源负责回答内容在哪里。把它们当作目录来管理：先看来源类型，再看它能做什么，最后决定是否启用。" />
-
-      <SettingsGroup title="按内容类型浏览" description="一个来源可以同时属于多个类型；数字表示当前内置目录中的来源数量。">
-        <div id="source-category-tabs" className="grid grid-cols-2 gap-2 p-4 sm:grid-cols-5" role="tablist" aria-label="来源内容类型">
-          <button
-            type="button"
-            role="tab"
-            aria-selected={category === "all"}
-            aria-controls="source-catalog"
-            onClick={() => setCategory("all")}
-            className={cn(
-              "group relative flex min-h-[64px] flex-col items-center justify-center gap-1 rounded-2xl border px-2 py-2 text-center transition-all duration-200",
-              category === "all"
-                ? "border-[#1d1d1f] bg-[#1d1d1f] text-white shadow-[0_6px_14px_rgba(29,29,31,0.16)] dark:border-white dark:bg-white dark:text-[#1d1d1f]"
-                : "border-black/[0.06] bg-black/[0.025] text-[#6e6e73] hover:border-black/[0.14] hover:bg-black/[0.05] dark:border-white/[0.08] dark:bg-white/[0.04] dark:text-[#c7c7cc] dark:hover:bg-white/[0.07]",
-            )}
-          >
-            <span className={cn("flex h-[28px] w-[28px] shrink-0 items-center justify-center rounded-[9px]", category === "all" ? "bg-white/[0.14] dark:bg-black/[0.08]" : "bg-black/[0.05] dark:bg-white/[0.08]")}>
-              <Plug className="h-[16px] w-[16px]" strokeWidth={1.8} />
-            </span>
-            <span className="block max-w-full whitespace-nowrap text-[11px] font-semibold tracking-[-0.01em]">全部来源</span>
-            <span className={cn("absolute right-1.5 top-1.5 rounded-full px-1.5 py-0.5 text-[9px] font-semibold tabular-nums", category === "all" ? "bg-white/[0.14] dark:bg-black/[0.08]" : "bg-black/[0.06] dark:bg-white/[0.1]")}>{registry ? builtinSources.length : "—"}</span>
-          </button>
-          {SOURCE_CATEGORY_ORDER.map((item) => {
-            const Icon = SOURCE_CATEGORY_TONES[item].icon
-            const active = category === item
-            const tone = SOURCE_CATEGORY_TONES[item]
-            return (
-              <button
-                key={item}
-                type="button"
-                role="tab"
-                aria-selected={active}
-                aria-controls="source-catalog"
-                onClick={() => setCategory(item)}
-                className={cn(
-                  "group relative flex min-h-[64px] flex-col items-center justify-center gap-1 rounded-2xl border px-2 py-2 text-center transition-all duration-200",
-                  active ? `${tone.soft} ${tone.darkSoft} shadow-[0_6px_14px_rgba(29,29,31,0.08)]` : "border-black/[0.06] bg-black/[0.025] hover:border-black/[0.14] hover:bg-black/[0.05] dark:border-white/[0.08] dark:bg-white/[0.04] dark:hover:bg-white/[0.07]",
-                )}
-              >
-                <span className={cn("flex h-[28px] w-[28px] shrink-0 items-center justify-center rounded-[9px] bg-black/[0.05] dark:bg-white/[0.08]", active ? tone.accent : "text-[#6e6e73] dark:text-[#a1a1a6]")}>
-                  <Icon className="h-[16px] w-[16px]" strokeWidth={1.8} />
-                </span>
-                <span className={cn("block max-w-full whitespace-nowrap text-[11px] font-semibold tracking-[-0.01em]", active ? tone.accent : "text-[#1d1d1f] dark:text-[#f5f5f5]")}>{SOURCE_CATEGORY_LABELS[item]}</span>
-                <span className={cn("absolute right-1.5 top-1.5 rounded-full px-1.5 py-0.5 text-[9px] font-semibold tabular-nums", active ? `${tone.soft} ${tone.darkSoft} ${tone.accent}` : "bg-black/[0.06] text-[#86868b] dark:bg-white/[0.1]")}>{registry ? categoryCounts[item] : "—"}</span>
-              </button>
-            )
-          })}
-        </div>
-        {category !== "all" && <p className="border-t border-black/[0.05] px-5 py-3 text-xs text-[#86868b] dark:border-white/[0.06]">{SOURCE_CATEGORY_DESCRIPTIONS[category]}</p>}
-      </SettingsGroup>
-
-      {isLoading && <SettingsGroup title="来源目录"><div className="flex items-center gap-3 px-5 py-7 text-sm text-[#86868b]"><span className="h-[8px] w-[8px] animate-pulse rounded-full bg-[#007aff]" />正在读取内置来源清单…</div></SettingsGroup>}
-      {loadError && <SettingsGroup title="来源目录"><div className="flex flex-col gap-3 px-5 py-7"><div className="flex items-start gap-3"><span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[#ff9500]/[0.12] text-[#a85d00] dark:bg-[#ff9500]/[0.18] dark:text-[#ffc266]"><TriangleAlert className="h-4 w-4" /></span><p className="pt-1 text-sm font-semibold text-[#a85d00] dark:text-[#ffc266]">{loadError.dto.userMessage}</p></div><button type="button" onClick={() => { void load() }} className="self-start rounded-full bg-[#007aff] px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-[#006fe6]">重新读取来源</button></div></SettingsGroup>}
-      {registry && !isLoading && !loadError && (
-        <>
-          {(["collection", "single"] as const).map((mode) => {
-            const sources = builtinSources
-              .filter((source) => !isCustomSourceId(source.sourceId) && source.mode === mode)
-              .filter((source) => sourceMatchesCategory(source, category))
-            return (
-              <SourceModeSection
-                key={mode}
-                mode={mode}
-                sources={sources}
-                togglingId={togglingId}
-                onToggle={toggleSource}
-                showNotice={showNotice}
-                onChanged={() => { void load() }}
-              />
-            )
-          })}
-        </>
-      )}
-      <SettingsGroup title="我的来源" description="这里显示你自己添加的 OPDS 书库。自定义来源默认停用，不会在未确认前参与搜索。">
-        <CustomSourceManager registry={registry} category={category} showNotice={showNotice} onChanged={() => { void load() }} />
-      </SettingsGroup>
-    </>
-  )
-}
-
-function SourceModeSection({
-  mode,
-  sources,
-  togglingId,
-  onToggle,
-  showNotice,
-  onChanged,
-}: {
-  mode: SourceModeDto
-  sources: SourceDescriptorWire[]
-  togglingId: string | null
-  onToggle: (source: SourceDescriptorWire) => void
-  showNotice: (message: string) => void
-  onChanged: () => void
-}) {
-  const columnTemplate = mode === "collection"
-    ? "md:grid-cols-[32px_minmax(0,2.25fr)_minmax(0,0.72fr)_minmax(0,1fr)_minmax(0,1.05fr)_40px]"
-    : "md:grid-cols-[minmax(0,2.15fr)_minmax(0,0.72fr)_minmax(0,1fr)_minmax(0,1.05fr)_40px]"
-  return (
-    <section id={mode === "collection" ? "source-catalog" : undefined} className="mb-7 last:mb-0">
-      <div className="mb-2 flex items-end gap-3 px-2">
-        <div className="min-w-0 flex-1">
-          <h3 className="text-[13px] font-semibold tracking-[-0.01em] text-[#1d1d1f] dark:text-[#f5f5f5]">{SOURCE_MODE_LABELS[mode]}</h3>
-          <p className="mt-0.5 text-[11px] leading-5 text-[#86868b] dark:text-[#8e8e93]">{SOURCE_MODE_DESCRIPTIONS[mode]}</p>
-        </div>
-        <span className="shrink-0 rounded-full bg-black/[0.04] px-2.5 py-1 text-[10px] font-semibold tabular-nums text-[#86868b] dark:bg-white/[0.08] dark:text-[#a1a1a6]">{sources.length} 个来源</span>
-      </div>
-      <div className="relative overflow-visible rounded-[16px] border border-black/[0.06] bg-white shadow-[0_3px_12px_rgba(0,0,0,0.035)] dark:border-white/[0.08] dark:bg-[#1c1c1e] dark:shadow-[0_3px_12px_rgba(0,0,0,0.2)]">
-        {sources.length === 0 ? (
-          <div className="flex min-h-[118px] flex-col items-center justify-center gap-2 px-5 py-7 text-center">
-            <p className="text-sm font-semibold text-[#6e6e73] dark:text-[#c7c7cc]">这个分类暂时没有{SOURCE_MODE_LABELS[mode]}</p>
-            <p className="text-[11px] text-[#a1a1a6]">添加来源后，它会出现在这里。</p>
-          </div>
-        ) : (
-          <>
-            <div className={cn("hidden items-center gap-x-3 border-b border-black/[0.06] bg-black/[0.02] px-4 py-2.5 text-[10px] font-semibold tracking-[0.08em] text-[#86868b] dark:border-white/[0.06] dark:bg-white/[0.03] dark:text-[#8e8e93] md:grid", columnTemplate)}>
-              {mode === "collection" && <span className="text-center">#</span>}
-              <span>名称</span>
-              <span>类型</span>
-              <span>状态</span>
-              <span>能力</span>
-              <span className="text-right">操作</span>
-            </div>
-            <div className="divide-y divide-black/[0.06] dark:divide-white/[0.06]">
-              {sources.map((source, index) => (
-                <SourceCard
-                  key={source.sourceId}
-                  source={source}
-                  index={mode === "collection" ? index + 1 : null}
-                  columnTemplate={columnTemplate}
-                  toggling={togglingId === source.sourceId}
-                  onToggle={() => onToggle(source)}
-                  showNotice={showNotice}
-                  onChanged={onChanged}
-                />
-              ))}
-            </div>
-          </>
-        )}
-      </div>
-    </section>
-  )
-}
-
-function SourceCard({
-  source,
-  index,
-  columnTemplate,
-  toggling,
-  onToggle,
-  showNotice,
-  onChanged,
-}: {
-  source: SourceDescriptorWire
-  index: number | null
-  columnTemplate: string
-  toggling: boolean
-  onToggle: () => void
-  showNotice: (message: string) => void
-  onChanged: () => void
-}) {
-  const healthLabel = SOURCE_HEALTH_LABELS[source.health] ?? "未检测"
-  const healthTone = SOURCE_HEALTH_TONES[source.health] ?? SOURCE_HEALTH_TONES.unknown
-  const modeTone = SOURCE_MODE_TONES[source.mode]
-  const ModeIcon = modeTone.icon
-  const supportsEndpoint = sourceUsesConfiguredEndpoint(source.sourceId)
-  const [detailsOpen, setDetailsOpen] = useState(false)
-  const [endpointOpen, setEndpointOpen] = useState(false)
-  return (
-    <div className="group relative px-4 py-3.5 transition-colors hover:bg-black/[0.018] dark:hover:bg-white/[0.025]">
-      <span className={cn("absolute inset-y-0 left-0 w-0.5 opacity-90", modeTone.rail)} aria-hidden="true" />
-      <div className={cn("grid min-w-0 gap-3 md:items-center md:gap-x-3", columnTemplate)}>
-        {index !== null && <span className="hidden text-center text-[11px] font-semibold tabular-nums text-[#007aff] md:block">{String(index).padStart(2, "0")}</span>}
-        <div className="min-w-0 flex items-start gap-3">
-          <span className={cn("mt-0.5 flex h-[32px] w-[32px] shrink-0 items-center justify-center rounded-xl border", modeTone.soft, modeTone.darkSoft, modeTone.accent)}><ModeIcon className="h-[16px] w-[16px]" strokeWidth={1.8} /></span>
-          <div className="min-w-0">
-            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-              <p className="min-w-0 max-w-full truncate text-[13px] font-semibold tracking-[-0.01em] text-[#1d1d1f] dark:text-[#f5f5f5]">{source.displayName}</p>
-              <span className={cn("max-w-[74px] truncate rounded-md px-1.5 py-0.5 text-[9px] font-semibold", modeTone.soft, modeTone.darkSoft, modeTone.accent)}>{SOURCE_MODE_LABELS[source.mode]}</span>
-            </div>
-            <p className="mt-1 truncate text-[11px] text-[#86868b] dark:text-[#8e8e93]">{source.notes}</p>
-            {detailsOpen && <div className="mt-2 rounded-xl border border-black/[0.05] bg-black/[0.025] px-3 py-2 text-[11px] leading-5 text-[#6e6e73] dark:border-white/[0.07] dark:bg-white/[0.04] dark:text-[#a1a1a6]">维护备注：{source.notes}</div>}
-          </div>
-        </div>
-        <div className="min-w-0 flex items-center gap-2 md:block">
-          <span className="mr-1 text-[10px] text-[#a1a1a6] md:hidden">类型</span>
-          <div className="flex flex-wrap gap-1">
-            {source.categories.map((item) => <span key={item} className={cn("rounded-md border px-1.5 py-0.5 text-[10px] font-medium", SOURCE_CATEGORY_TONES[item].soft, SOURCE_CATEGORY_TONES[item].darkSoft, SOURCE_CATEGORY_TONES[item].accent)}>{SOURCE_CATEGORY_LABELS[item]}</span>)}
-          </div>
-        </div>
-        <div className="min-w-0 flex items-center gap-2 md:block">
-          <span className="mr-1 text-[10px] text-[#a1a1a6] md:hidden">状态</span>
-          <span className={cn("inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-[10px] font-semibold", healthTone.pill)}>
-            <span className={cn("h-[6px] w-[6px] rounded-full", healthTone.dot)} />
-            {source.enabled ? "已启用" : "已停用"}
-          </span>
-          <span className="ml-1 whitespace-nowrap text-[10px] text-[#86868b] md:ml-0 md:block">{healthLabel}</span>
-          {source.lastChecked && <span className="ml-1 hidden whitespace-nowrap text-[10px] text-[#a1a1a6] xl:inline">· {new Date(source.lastChecked).toLocaleDateString()}</span>}
-        </div>
-        <div className="min-w-0 flex items-center gap-1.5 md:flex-wrap">
-          <span className="mr-1 text-[10px] text-[#a1a1a6] md:hidden">能力</span>
-          {source.kinds.map((kind: SourceKindDto) => {
-            const Icon = kind === "online_read" ? PlaySquare : kind === "offline_download" ? Download : Search
-            return <span key={kind} title={SOURCE_KIND_LABELS[kind]} className="inline-flex h-[28px] w-[28px] items-center justify-center rounded-lg border border-black/[0.06] bg-black/[0.025] text-[#6e6e73] dark:border-white/[0.07] dark:bg-white/[0.05] dark:text-[#c7c7cc]"><Icon aria-hidden="true" className="h-[14px] w-[14px]" strokeWidth={1.8} /><span className="sr-only">{SOURCE_KIND_LABELS[kind]}</span></span>
-          })}
-          {supportsEndpoint && <span className="ml-1 truncate text-[10px] text-[#86868b]">{source.endpointConfigured ? "接口已配" : "待配置"}</span>}
-        </div>
-        <div className="flex items-center justify-end gap-1 md:gap-1">
-          <SourceActionMenu
-            source={source}
-            detailsOpen={detailsOpen}
-            endpointOpen={endpointOpen}
-            busy={toggling}
-            onToggle={onToggle}
-            onToggleDetails={() => setDetailsOpen((current) => !current)}
-            onToggleEndpoint={() => setEndpointOpen((current) => !current)}
-          />
-        </div>
-      </div>
-      {source.sourceId === "cms10" && (source.enabled || endpointOpen) && <Cms10EndpointRow source={source} showNotice={showNotice} onChanged={onChanged} />}
-      {source.sourceId === "m3u" && (source.enabled || endpointOpen) && <M3uEndpointRow source={source} showNotice={showNotice} onChanged={onChanged} />}
-    </div>
-  )
-}
-
-function SourceActionMenu({
-  source,
-  detailsOpen,
-  endpointOpen,
-  variant = "builtin",
-  busy = false,
-  onToggle,
-  onToggleDetails,
-  onToggleEndpoint,
-  onEdit,
-  onCredential,
-  onRemove,
-}: {
-  source: SourceDescriptorWire
-  detailsOpen: boolean
-  endpointOpen: boolean
-  variant?: "builtin" | "custom"
-  busy?: boolean
-  onToggle: () => void
-  onToggleDetails?: () => void
-  onToggleEndpoint?: () => void
-  onEdit?: () => void
-  onCredential?: () => void
-  onRemove?: () => void
-}) {
-  const [open, setOpen] = useState(false)
-  const menuRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    if (!open) return undefined
-    const close = (event: PointerEvent) => {
-      if (!menuRef.current?.contains(event.target as Node)) setOpen(false)
-    }
-    document.addEventListener("pointerdown", close)
-    return () => document.removeEventListener("pointerdown", close)
-  }, [open])
-
-  const select = (action: () => void) => {
-    action()
-    setOpen(false)
-  }
-
-  return (
-    <div ref={menuRef} className="relative">
-      <button type="button" aria-label={`${source.displayName} 更多操作`} aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((current) => !current)} className={cn("flex h-[28px] w-[28px] items-center justify-center rounded-lg text-[#86868b] transition-colors hover:bg-black/[0.06] hover:text-[#1d1d1f] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#007aff]/40 dark:hover:bg-white/[0.08] dark:hover:text-[#f5f5f5]", open && "bg-black/[0.06] text-[#1d1d1f] dark:bg-white/[0.08] dark:text-[#f5f5f5]")}>
-        <MoreHorizontal className="h-[16px] w-[16px]" strokeWidth={2} />
-      </button>
-      {open && (
-        <div role="menu" className="absolute right-0 top-9 z-30 min-w-[164px] overflow-hidden rounded-xl border border-black/[0.08] bg-white p-1 shadow-[0_10px_28px_rgba(0,0,0,0.14)] dark:border-white/[0.1] dark:bg-[#2c2c2e] dark:shadow-[0_10px_28px_rgba(0,0,0,0.45)]">
-          <button type="button" role="menuitem" disabled={busy} onClick={() => select(onToggle)} className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-[#1d1d1f] hover:bg-black/[0.05] disabled:cursor-not-allowed disabled:opacity-50 dark:text-[#f5f5f5] dark:hover:bg-white/[0.08]"><Check className="h-[14px] w-[14px] shrink-0 text-[#34a853]" />{busy ? "处理中…" : source.enabled ? "停用来源" : "启用来源"}</button>
-          {variant === "builtin" ? (
-            <>
-              <button type="button" role="menuitem" onClick={() => select(() => onToggleDetails?.())} className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-[#1d1d1f] hover:bg-black/[0.05] dark:text-[#f5f5f5] dark:hover:bg-white/[0.08]"><Info className="h-[14px] w-[14px] text-[#007aff]" />{detailsOpen ? "收起维护说明" : "查看维护说明"}</button>
-              {(source.sourceId === "cms10" || source.sourceId === "m3u") && <button type="button" role="menuitem" onClick={() => select(() => onToggleEndpoint?.())} className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-[#1d1d1f] hover:bg-black/[0.05] dark:text-[#f5f5f5] dark:hover:bg-white/[0.08]"><Settings2 className="h-[14px] w-[14px] text-[#af52de]" />{endpointOpen ? "收起接口配置" : "配置接口"}</button>}
-            </>
-          ) : (
-            <>
-              {onEdit && <button type="button" role="menuitem" onClick={() => select(onEdit)} className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-[#1d1d1f] hover:bg-black/[0.05] dark:text-[#f5f5f5] dark:hover:bg-white/[0.08]"><Settings2 className="h-[14px] w-[14px] text-[#007aff]" />编辑来源</button>}
-              {onCredential && <button type="button" role="menuitem" onClick={() => select(onCredential)} className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-[#1d1d1f] hover:bg-black/[0.05] dark:text-[#f5f5f5] dark:hover:bg-white/[0.08]"><LockKeyhole className="h-[14px] w-[14px] text-[#af52de]" />配置访问凭据</button>}
-              {onRemove && <>
-                <div className="my-1 h-px bg-black/[0.06] dark:bg-white/[0.08]" aria-hidden="true" />
-                <button type="button" role="menuitem" onClick={() => select(onRemove)} className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-[#c9342b] hover:bg-[#ff3b30]/[0.08] dark:text-[#ff8b84] dark:hover:bg-[#ff3b30]/[0.12]"><TriangleAlert className="h-[14px] w-[14px]" />删除来源</button>
-              </>}
-            </>
-          )}
-        </div>
-      )}
-    </div>
-  )
-}
-
-/** 自定义 OPDS 书源管理（V2-H 收尾批次）：添加 / 编辑 / 删除 / 凭据录入。 */
-function CustomSourceManager({
-  registry,
-  category,
-  showNotice,
-  onChanged,
-}: {
-  registry: SourceRegistryDto | null
-  category: SourceCategoryDto | "all"
-  showNotice: (message: string) => void
-  onChanged: () => void
-}) {
-  const { confirm } = useNotice()
-  const [adding, setAdding] = useState(false)
-  const [addStep, setAddStep] = useState<"type" | "details" | "credential" | "done">("type")
-  const [displayName, setDisplayName] = useState("")
-  const [endpoint, setEndpoint] = useState("")
-  const [createdSourceId, setCreatedSourceId] = useState<string | null>(null)
-  const [addError, setAddError] = useState<string | null>(null)
-  const [submitting, setSubmitting] = useState(false)
-  const [editingId, setEditingId] = useState<string | null>(null)
-  const [editName, setEditName] = useState("")
-  const [editEndpoint, setEditEndpoint] = useState("")
-  const [credentialFor, setCredentialFor] = useState<string | null>(null)
-  const [credentialValue, setCredentialValue] = useState("")
-  const [credentialConfigured, setCredentialConfigured] = useState(false)
-  const [customTogglingId, setCustomTogglingId] = useState<string | null>(null)
-
-  const customSources = (registry?.sources ?? [])
-    .filter((s) => isCustomSourceId(s.sourceId))
-    .filter((s) => category === "all" || s.categories.includes(category))
-
-  const resetAddForm = () => {
-    setAdding(false)
-    setAddStep("type")
-    setDisplayName("")
-    setEndpoint("")
-    setCreatedSourceId(null)
-    setAddError(null)
-  }
-
-  const submitAdd = async () => {
-    if (submitting) return
-    setSubmitting(true)
-    try {
-      const result = await addSource({ displayName, endpoint })
-      setCreatedSourceId(result.sourceId)
-      setAddError(null)
-      setAddStep("credential")
-      showNotice("来源已添加，可以现在配置凭据，也可以稍后再配")
-      onChanged()
-    } catch (error) {
-      const message = toHavenError(error).dto.userMessage
-      setAddError(message)
-      showNotice(message)
-    } finally {
-      setSubmitting(false)
-    }
-  }
-
-  const submitEdit = async (sourceId: string) => {
-    if (submitting) return
-    setSubmitting(true)
-    try {
-      await updateSource({ sourceId, displayName: editName || null, endpoint: editEndpoint || null })
-      showNotice("来源已更新")
-      setEditingId(null)
-      onChanged()
-    } catch (error) {
-      showNotice(toHavenError(error).dto.userMessage)
-    } finally {
-      setSubmitting(false)
-    }
-  }
-
-  const submitRemove = async (sourceId: string) => {
-    const confirmed = await confirm({
-      title: "删除自定义来源",
-      message: "删除该自定义来源？其凭据将从系统凭据管理器一并清除。",
-      confirmLabel: "删除",
-      cancelLabel: "取消",
-      dedupeKey: `settings:source:${sourceId}:remove-confirm`,
-    })
-    if (!confirmed) return
-    try {
-      await removeSource({ sourceId })
-      showNotice("来源已删除")
-      onChanged()
-    } catch (error) {
-      showNotice(toHavenError(error).dto.userMessage)
-    }
-  }
-
-  const toggleCustomSource = async (source: SourceDescriptorWire) => {
-    setCustomTogglingId(source.sourceId)
-    try {
-      const result = await setSourceEnabled({ sourceId: source.sourceId, enabled: !source.enabled })
-      showNotice(result.enabled ? `${source.displayName} 已启用` : `${source.displayName} 已停用`)
-      onChanged()
-    } catch (error) {
-      showNotice(toHavenError(error).dto.userMessage)
-    } finally {
-      setCustomTogglingId(null)
-    }
-  }
-
-  const submitCredential = async (sourceId: string) => {
-    if (submitting) return
-    setSubmitting(true)
-    try {
-      await setSourceCredential({
-        sourceId,
-        secret: credentialValue.length > 0 ? credentialValue : null,
-      })
-      setCredentialConfigured(credentialValue.length > 0)
-      setCredentialValue("")
-      showNotice(credentialValue.length > 0 ? "凭据已保存到系统凭据管理器" : "凭据已清除")
-      if (adding) setAddStep("done")
-      onChanged()
-    } catch (error) {
-      showNotice(toHavenError(error).dto.userMessage)
-    } finally {
-      setSubmitting(false)
-    }
-  }
-
-  if (adding) {
-    return (
-      <div className="rounded-3xl border border-black/[0.08] bg-white/70 px-5 py-5 dark:border-white/[0.08] dark:bg-[#1c1c1e]/70">
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <p className="text-sm font-semibold">添加来源</p>
-            <p className="mt-1 text-xs text-[#86868b]">跟着三步完成设置；新来源默认停用，确认无误后再启用。</p>
-          </div>
-          <button type="button" onClick={resetAddForm} className="text-xs font-semibold text-[#6e6e73] hover:text-[#1d1d1f]">取消</button>
-        </div>
-        <div className="mt-4 flex items-center gap-2" aria-label="添加来源步骤">
-          {["选择类型", "填写信息", "配置凭据"].map((label, index) => {
-            const stepIndex = addStep === "type" ? 0 : addStep === "details" ? 1 : 2
-            return <span key={label} className={cn("rounded-full px-3 py-1 text-[11px] font-semibold", index <= stepIndex ? "bg-[#007aff]/[0.12] text-[#007aff]" : "bg-black/[0.05] text-[#86868b]")}>{index + 1}. {label}</span>
-          })}
-        </div>
-        {addStep === "type" && (
-          <div className="mt-5 grid gap-3 sm:grid-cols-2">
-            <button type="button" disabled className="rounded-2xl border border-black/[0.08] bg-black/[0.025] p-4 text-left opacity-60 dark:border-white/[0.08] dark:bg-white/[0.04]">
-              <span className="text-sm font-semibold">聚合来源</span>
-              <span className="mt-1 block text-xs leading-5 text-[#86868b]">一个入口管理多个上游。自定义聚合来源暂未开放。</span>
-              <span className="mt-2 inline-flex rounded-full bg-black/[0.06] px-2 py-1 text-[10px] font-semibold text-[#86868b]">暂不可用</span>
-            </button>
-            <button type="button" onClick={() => setAddStep("details")} className="rounded-2xl border border-[#007aff]/25 bg-[#007aff]/[0.05] p-4 text-left transition-colors hover:border-[#007aff]">
-              <span className="text-sm font-semibold text-[#007aff]">单一来源</span>
-              <span className="mt-1 block text-xs leading-5 text-[#6e6e73]">一个地址对应一个 OPDS 目录，适合个人书库或 Calibre-Web。</span>
-              <span className="mt-2 inline-flex rounded-full bg-[#007aff]/[0.12] px-2 py-1 text-[10px] font-semibold text-[#007aff]">开始填写</span>
-            </button>
-          </div>
-        )}
-        {addStep === "details" && (
-          <div className="mt-5 flex flex-col gap-4">
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-semibold">来源名称</span>
-              <span className="text-[11px] text-[#86868b]">给自己看的名字，例如“我的 Calibre 书库”。</span>
-              <input type="text" value={displayName} onChange={(e) => { setDisplayName(e.target.value); setAddError(null) }} maxLength={100} placeholder="我的 Calibre 书库" autoComplete="off" className="rounded-2xl border border-black/[0.12] bg-white px-4 py-2.5 text-sm outline-none focus:border-[#007aff] dark:border-white/[0.12] dark:bg-[#2c2c2e]" />
-            </label>
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-semibold">OPDS 目录地址</span>
-              <span className="text-[11px] leading-5 text-[#86868b]">这是书库的 OPDS/目录地址，不是浏览器首页；必须以 http:// 或 https:// 开头。</span>
-              <input type="url" value={endpoint} onChange={(e) => { setEndpoint(e.target.value); setAddError(null) }} maxLength={500} placeholder="https://example.org/opds/" autoComplete="url" spellCheck={false} className="rounded-2xl border border-black/[0.12] bg-white px-4 py-2.5 text-sm outline-none focus:border-[#007aff] dark:border-white/[0.12] dark:bg-[#2c2c2e]" />
-            </label>
-            {addError && <p role="alert" className="rounded-xl bg-[#fff1f0] px-3 py-2 text-xs text-[#b42318]">{addError}</p>}
-            <div className="flex justify-end gap-2 text-xs font-semibold">
-              <button type="button" onClick={() => setAddStep("type")} className="rounded-full border border-black/[0.12] px-4 py-2">上一步</button>
-              <button type="button" disabled={submitting || displayName.trim().length === 0 || endpoint.trim().length === 0} onClick={() => { void submitAdd() }} className="rounded-full bg-[#1d1d1f] px-4 py-2 text-white disabled:opacity-50">{submitting ? "添加中…" : "继续"}</button>
-            </div>
-          </div>
-        )}
-        {addStep === "credential" && createdSourceId && (
-          <div className="mt-5 flex flex-col gap-4">
-            <div className="rounded-2xl bg-[#f5f5f7] p-4 dark:bg-white/[0.06]">
-              <p className="text-sm font-semibold">需要登录吗？</p>
-              <p className="mt-1 text-xs leading-5 text-[#6e6e73]">如果书库需要密码，可以现在填写；凭据只保存到系统凭据管理器，不会出现在来源列表或日志中。</p>
-            </div>
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-semibold">访问凭据（可选）</span>
-              <input type="password" value={credentialValue} onChange={(e) => setCredentialValue(e.target.value)} autoComplete="new-password" placeholder="不需要登录可留空" className="rounded-2xl border border-black/[0.12] bg-white px-4 py-2.5 text-sm outline-none focus:border-[#007aff] dark:border-white/[0.12] dark:bg-[#2c2c2e]" />
-            </label>
-            <div className="flex justify-end gap-2 text-xs font-semibold">
-              <button type="button" disabled={submitting} onClick={() => { setCredentialValue(""); setAddStep("done") }} className="rounded-full border border-black/[0.12] px-4 py-2">稍后配置</button>
-              <button type="button" disabled={submitting || credentialValue.length === 0} onClick={() => { void submitCredential(createdSourceId) }} className="rounded-full bg-[#1d1d1f] px-4 py-2 text-white disabled:opacity-50">{submitting ? "保存中…" : "保存并完成"}</button>
-            </div>
-          </div>
-        )}
-        {addStep === "done" && (
-          <div className="mt-5 flex flex-col gap-4">
-            <div className="rounded-2xl border border-[#34a853]/20 bg-[#edf8f0] p-4 dark:bg-[#17351f]">
-              <p className="text-sm font-semibold text-[#216e32] dark:text-[#9be3aa]">来源已准备好</p>
-              <p className="mt-1 text-xs leading-5 text-[#4f7659] dark:text-[#a7cfad]">{displayName} · 单一来源 · OPDS 目录{credentialConfigured ? " · 凭据已配置" : " · 凭据稍后配置"}</p>
-            </div>
-            <div className="flex justify-end"><button type="button" onClick={resetAddForm} className="rounded-full bg-[#1d1d1f] px-4 py-2 text-xs font-semibold text-white">返回来源列表</button></div>
-          </div>
-        )}
-      </div>
-    )
-  }
-
-  return (
-    <>
-      {registry && customSources.length === 0 && (
-        <p className="mb-3 rounded-2xl bg-black/[0.025] px-4 py-3 text-xs leading-5 text-[#86868b] dark:bg-white/[0.04] dark:text-[#a1a1a6]">
-          {category === "all" || category === "book" ? "还没有添加自定义 OPDS 书库。" : "当前筛选下没有自定义来源；自定义 OPDS 书库统一归入图书。"}
-        </p>
-      )}
-      {customSources.map((source) => {
-        const editing = editingId === source.sourceId
-        return (
-          <div key={source.sourceId} className="group relative overflow-visible rounded-[16px] border border-black/[0.08] bg-white/70 dark:border-white/[0.1] dark:bg-[#1c1c1e]/80">
-            <span className="absolute inset-y-0 left-0 w-0.5 bg-[#34a853] opacity-90" aria-hidden="true" />
-            <div className="flex items-start gap-3 px-4 py-3.5">
-              <span className="mt-0.5 flex h-[32px] w-[32px] shrink-0 items-center justify-center rounded-xl border border-[#34a853]/20 bg-[#edf9f0] text-[#34a853] dark:border-[#34a853]/25 dark:bg-[#183522] dark:text-[#64d98b]"><Globe2 className="h-[16px] w-[16px]" strokeWidth={1.8} /></span>
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                      <p className="min-w-0 truncate text-[13px] font-semibold tracking-[-0.01em] text-[#1d1d1f] dark:text-[#f5f5f5]">{source.displayName}</p>
-                      <span className="rounded-md bg-[#edf9f0] px-1.5 py-0.5 text-[9px] font-semibold text-[#248a3d] dark:bg-[#183522] dark:text-[#64d98b]">单一来源</span>
-                    </div>
-                    <p className="mt-1 truncate text-[11px] text-[#86868b] dark:text-[#8e8e93]">
-                      图书 · 单一来源 · 自定义 OPDS 目录
-                    </p>
-                  </div>
-                  <div className="flex shrink-0 items-center gap-2 text-xs font-semibold">
-                    <span className="whitespace-nowrap text-[#86868b]">{source.enabled ? "已启用" : "已停用"}</span>
-                    <SourceActionMenu
-                      source={source}
-                      variant="custom"
-                      detailsOpen={false}
-                      endpointOpen={false}
-                      busy={customTogglingId === source.sourceId}
-                      onToggle={() => { void toggleCustomSource(source) }}
-                      onEdit={() => {
-                        setEditingId(source.sourceId)
-                        setEditName(source.displayName)
-                        setEditEndpoint("")
-                      }}
-                      onCredential={() => {
-                        setCredentialFor(source.sourceId)
-                        setCredentialValue("")
-                        setCredentialConfigured(false)
-                      }}
-                      onRemove={() => { void submitRemove(source.sourceId) }}
-                    />
-                  </div>
-                </div>
-                {editing && (
-                  <div className="mt-3 flex flex-col gap-3">
-                    <input
-                      type="text"
-                      value={editName}
-                      onChange={(e) => { setEditName(e.target.value) }}
-                      maxLength={100}
-                      aria-label="显示名"
-                      className="rounded-2xl border border-black/[0.12] bg-white px-4 py-2 text-sm text-[#1d1d1f] outline-none focus:border-[#007aff] dark:border-white/[0.12] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]"
-                    />
-                    <input
-                      type="url"
-                      value={editEndpoint}
-                      onChange={(e) => { setEditEndpoint(e.target.value) }}
-                      maxLength={500}
-                      placeholder="留空表示端点不变；填入新地址覆盖"
-                      aria-label="OPDS 端点地址"
-                      className="rounded-2xl border border-black/[0.12] bg-white px-4 py-2 text-sm text-[#1d1d1f] outline-none focus:border-[#007aff] dark:border-white/[0.12] dark:bg-[#2c2c2e] dark:text-[#f5f5f5] dark:placeholder:text-[#8e8e93]"
-                    />
-                    <div className="flex justify-end gap-2 text-xs font-semibold">
-                      <button type="button" onClick={() => { setEditingId(null) }} className="rounded-full border border-black/[0.12] px-[16px] py-[8px] text-[#1d1d1f] dark:border-white/[0.12] dark:text-[#f5f5f5]">取消</button>
-                      <button
-                        type="button"
-                        disabled={submitting || (editName.trim().length === 0 && editEndpoint.trim().length === 0)}
-                        onClick={() => { void submitEdit(source.sourceId) }}
-                        className="rounded-full bg-[#1d1d1f] px-[16px] py-[8px] text-white disabled:opacity-50 dark:bg-white dark:text-[#1d1d1f]"
-                      >
-                        保存
-                      </button>
-                    </div>
-                  </div>
-                )}
-                {credentialFor === source.sourceId ? (
-                  <div className="mt-3 flex flex-col gap-2">
-                    <label className="flex flex-col gap-1">
-                      <span className="text-xs text-[#86868b]">
-                        访问密码（仅写入系统凭据管理器，不回显、不落库）
-                      </span>
-                      <input
-                        type="password"
-                        value={credentialValue}
-                        onChange={(e) => { setCredentialValue(e.target.value) }}
-                        autoComplete="new-password"
-                        className="rounded-2xl border border-black/[0.12] bg-white px-4 py-2 text-sm text-[#1d1d1f] outline-none focus:border-[#007aff] dark:border-white/[0.12] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]"
-                      />
-                    </label>
-                    <div className="flex justify-end gap-2 text-xs font-semibold">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setCredentialFor(null)
-                          setCredentialValue("")
-                          setCredentialConfigured(false)
-                        }}
-                        className="rounded-full border border-black/[0.12] px-[14px] py-[6px] text-[#1d1d1f] dark:border-white/[0.12] dark:text-[#f5f5f5]"
-                      >
-                        收起
-                      </button>
-                      <button
-                        type="button"
-                        disabled={submitting}
-                        onClick={() => { void submitCredential(source.sourceId) }}
-                        className="rounded-full bg-[#1d1d1f] px-[14px] py-[6px] text-white disabled:opacity-50 dark:bg-white dark:text-[#1d1d1f]"
-                      >
-                        保存凭据
-                      </button>
-                      {credentialConfigured && (
-                        <button
-                          type="button"
-                          disabled={submitting}
-                          onClick={() => {
-                            setCredentialValue("")
-                            void submitCredential(source.sourceId).then(() => {
-                              setCredentialConfigured(false)
-                            })
-                          }}
-                          className="rounded-full px-[14px] py-[6px] text-[#d97706] dark:text-[#ffc266]"
-                        >
-                          清除凭据
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            </div>
-          </div>
-        )
-      })}
-      <div className="flex items-center justify-between rounded-3xl border border-dashed border-black/[0.12] bg-white/60 px-5 py-[16px] dark:border-white/[0.12] dark:bg-[#1c1c1e]/70">
-        <div>
-          <p className="text-sm font-semibold text-[#1d1d1f] dark:text-[#f5f5f5]">添加来源连接</p>
-          <p className="mt-1 text-xs text-[#86868b] dark:text-[#8e8e93]">连接由用户拥有的存储或官方允许访问的来源。</p>
-        </div>
-        <button
-          type="button"
-          onClick={() => { setAdding(true) }}
-          className="rounded-full bg-[#1d1d1f] px-[16px] py-[8px] text-xs font-semibold text-white"
-        >
-          添加来源
-        </button>
-      </div>
-    </>
-  )
-}
-
-/** 媒体库位置的扫描状态（设置页存储分组；SLICE-SCAN-001）。 */
-interface ScanUiState {
-  taskId: string | null
-  phaseCode: string
-  phase: string
-  filesSeen: number
-  newItem: number
-  message: string | null
-  terminal: boolean
-}
-
-function StorageSettings({ showNotice }: { showNotice: (message: string) => void }) {
-  const [locations, setLocations] = useState<StorageLocationWire[]>([])
-  const [scans, setScans] = useState<Record<string, ScanUiState>>({})
-  const [removingId, setRemovingId] = useState<string | null>(null)
-  const [cancellingTaskId, setCancellingTaskId] = useState<string | null>(null)
-  const [isLoading, setIsLoading] = useState(true)
-  const [loadError, setLoadError] = useState<HavenError | null>(null)
-  const loadRequestRef = useRef(0)
-
-  const loadLocations = async () => {
-    const requestId = ++loadRequestRef.current
-    setIsLoading(true)
-    setLoadError(null)
-    try {
-      const nextLocations = await listStorageLocations()
-      if (loadRequestRef.current === requestId) setLocations(nextLocations)
-    } catch (error) {
-      const normalized = toHavenError(error)
-      if (loadRequestRef.current === requestId) {
-        setLoadError(normalized)
-        showNotice(normalized.message)
-      }
-    } finally {
-      if (loadRequestRef.current === requestId) setIsLoading(false)
-    }
-  }
-
-  useEffect(() => {
-    void loadLocations()
-    return () => {
-      loadRequestRef.current += 1
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- showNotice 为稳定提示函数
-  }, [])
-
-  const handleAddDirectory = async () => {
-    try {
-      const locationId = await pickLocalDirectory()
-      const items = await listStorageLocations()
-      setLocations(items)
-      const added = items.find((item) => item.locationId === locationId)
-      showNotice(`已添加本地目录：${added?.displayName ?? ""}`)
-    } catch (error) {
-      showNotice(error instanceof Error ? error.message : "添加目录失败，请重试")
-    }
-  }
-
-  const handleRebind = async (location: StorageLocationWire) => {
-    try {
-      await rebindLocalDirectory(location.locationId)
-      const items = await listStorageLocations()
-      setLocations(items)
-      showNotice(`已重新绑定：${location.displayName}`)
-    } catch (error) {
-      showNotice(error instanceof Error ? error.message : "重新绑定失败，请重试")
-    }
-  }
-
-  const handleRemove = async (location: StorageLocationWire) => {
-    if (removingId !== location.locationId) {
-      setRemovingId(location.locationId)
-      return
-    }
-    setRemovingId(null)
-    try {
-      await removeStorageLocation(location.locationId)
-      setLocations((prev) => prev.filter((item) => item.locationId !== location.locationId))
-      setScans((prev) => {
-        const next = { ...prev }
-        delete next[location.locationId]
-        return next
-      })
-      showNotice(`已移除：${location.displayName}（其内容退出媒体库，原始文件不受影响）`)
-    } catch (error) {
-      showNotice(error instanceof Error ? error.message : "移除失败，请重试")
-    }
-  }
-
-  const handleScan = async (location: StorageLocationWire) => {
-    try {
-      const result = await startLibraryScan(location.locationId, (event) => {
-        const label = SCAN_PHASE_LABELS[event.kind] ?? event.kind
-        const terminal =
-          event.kind === "completed" || event.kind === "cancelled" || event.kind === "failed"
-        setScans((prev) => ({
-          ...prev,
-          [location.locationId]: {
-            taskId: event.data.taskId,
-            phaseCode: event.kind,
-            phase: label,
-            filesSeen: event.data.filesSeen,
-            newItem: event.data.new,
-            message: event.data.message ?? null,
-            terminal,
-          },
-        }))
-        if (terminal) showNotice(`${location.displayName}：${label}`)
-      })
-      setScans((prev) => ({
-        ...prev,
-        [location.locationId]: prev[location.locationId] ?? {
-          taskId: result.taskId,
-          phaseCode: "started",
-          phase: SCAN_PHASE_LABELS.started,
-          filesSeen: 0,
-          newItem: 0,
-          message: null,
-          terminal: false,
-        },
-      }))
-      if (result.alreadyRunning) showNotice("该目录已有扫描任务在运行，已合并到既有任务")
-    } catch (error) {
-      showNotice(error instanceof Error ? error.message : "扫描启动失败，请重试")
-    }
-  }
-
-  const handleCancelScan = async (location: StorageLocationWire, scan: ScanUiState) => {
-    if (!scan.taskId || cancellingTaskId) return
-    setCancellingTaskId(scan.taskId)
-    try {
-      const result = await cancelScan(scan.taskId)
-      const phase = result.phase
-      setScans((prev) => ({
-        ...prev,
-        [location.locationId]: {
-          ...scan,
-          phaseCode: phase,
-          phase: SCAN_PHASE_LABELS[phase] ?? phase,
-          terminal: true,
-        },
-      }))
-      showNotice(result.alreadyTerminal ? `${location.displayName}：扫描已经结束` : `${location.displayName}：已取消扫描`)
-    } catch (error) {
-      showNotice(error instanceof Error ? error.message : "取消扫描失败，请重试")
-    } finally {
-      setCancellingTaskId(null)
-    }
-  }
-
-  const storageListState = deriveLibrarySliceState({
-    loading: isLoading,
-    itemCount: locations.length,
-    error: loadError,
-  })
-  return (
-    <>
-      <SettingsIntro section="Storage" title="存储" description="统一管理媒体库位置、应用数据、缓存、下载内容和临时文件。" />
-      <SettingsGroup title="媒体库位置" description="扫描已注册的本地目录，把影视、图书与漫画收进统一媒体库。">
-        {storageListState.kind === "loading" && (
-          <div data-slice-state="loading" className="px-5 py-[24px] text-sm text-[#86868b]">正在加载存储位置…</div>
-        )}
-        {storageListState.kind === "offline_partial" && (
-          <div data-slice-state="offline_partial" className="flex items-center justify-between gap-4 px-5 py-[16px] text-sm text-[#8a5a00]">
-            <span>{loadError?.message ?? "正在刷新可用存储位置"}</span>
-            {storageListState.canRetry && <button type="button" onClick={() => void loadLocations()} className="font-semibold text-[#007aff]">重试</button>}
-          </div>
-        )}
-        {(storageListState.kind === "retryable_error" || storageListState.kind === "terminal_error") && (
-          <div data-slice-state={storageListState.kind} className="flex items-center justify-between gap-4 px-5 py-[24px] text-sm">
-            <span>{storageListState.message}</span>
-            {storageListState.canRetry && <button type="button" onClick={() => void loadLocations()} className="font-semibold text-[#007aff]">重试</button>}
-          </div>
-        )}
-        {storageListState.kind === "empty" && (
-          <div className="flex flex-col items-center justify-center px-5 py-[32px] text-center">
-            <HardDrive className="h-6 w-6 text-[#86868b]" />
-            <p className="mt-[10px] text-sm font-semibold">还没有注册媒体库位置</p>
-            <p className="mt-1 max-w-sm text-xs leading-5 text-[#86868b]">添加一个本地目录（影片、电子书或漫画文件夹），栖阅会扫描并把内容整理进媒体库。</p>
-          </div>
-        )}
-        {locations.map((location) => {
-          const scan = scans[location.locationId]
-          const running = scan !== undefined && !scan.terminal
-          const storageState = deriveStorageSliceState(location.status)
-          return (
-            <div key={location.locationId} data-slice-state={storageState.kind} className="flex flex-col gap-[8px] border-b border-black/[0.06] px-5 py-[16px] last:border-b-0">
-              <div className="flex items-center gap-3">
-                <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[#f2f2f4] text-[#6e6e73]"><HardDrive className="h-5 w-5" /></span>
-                <div className="min-w-0 flex-1">
-                  <p className="text-sm font-semibold">{location.displayName}</p>
-                </div>
-                <span className="text-xs font-semibold text-[#6e6e73]">{location.status}</span>
-                {running && scan?.taskId && (
-                  <button
-                    type="button"
-                    disabled={cancellingTaskId === scan.taskId}
-                    onClick={() => void handleCancelScan(location, scan)}
-                    className="rounded-full px-3 py-[8px] text-xs font-semibold text-[#d70015] transition-colors hover:bg-[#d70015]/[0.06] disabled:opacity-45"
-                  >
-                    {cancellingTaskId === scan.taskId ? "正在取消…" : "取消扫描"}
-                  </button>
-                )}
-                <button
-                  type="button"
-                  disabled={running}
-                  onClick={() => handleScan(location)}
-                  className={cn(
-                    "rounded-full px-3 py-[8px] text-xs font-semibold transition-colors",
-                    running
-                      ? "cursor-not-allowed text-[#86868b]"
-                      : "text-[#007aff] hover:bg-[#007aff]/[0.06]",
-                  )}
-                >
-                  {running ? "扫描中…" : "扫描"}
-                </button>
-                <button
-                  type="button"
-                  disabled={running}
-                  onClick={() => handleRebind(location)}
-                  className={cn(
-                    "rounded-full px-3 py-[8px] text-xs font-semibold transition-colors",
-                    running
-                      ? "cursor-not-allowed text-[#86868b]"
-                      : "text-[#6e6e73] hover:bg-black/[0.05]",
-                  )}
-                >
-                  重绑
-                </button>
-                <button
-                  type="button"
-                  disabled={running}
-                  onClick={() => handleRemove(location)}
-                  className={cn(
-                    "rounded-full px-3 py-[8px] text-xs font-semibold transition-colors",
-                    running
-                      ? "cursor-not-allowed text-[#86868b]"
-                      : removingId === location.locationId
-                        ? "bg-[#d70015] text-white"
-                        : "text-[#d70015] hover:bg-[#d70015]/[0.06]",
-                  )}
-                >
-                  {removingId === location.locationId ? "确认移除" : "移除"}
-                </button>
-              </div>
-              {scan && (
-                <div className="flex items-center gap-[8px] pl-[52px] text-[11px] text-[#86868b]">
-                  <span data-slice-state={deriveScanSliceState(scan.phaseCode).kind} className={cn("font-semibold", scan.terminal ? "text-[#34a853]" : "text-[#007aff]")}>{scan.phase}</span>
-                  <span>已见 {scan.filesSeen} 个文件 · 新增 {scan.newItem}</span>
-                  {scan.message && <span className="truncate">{scan.message}</span>}
-                </div>
-              )}
-            </div>
-          )
-        })}
-        <div className="flex justify-end px-5 py-3">
-          <button type="button" onClick={handleAddDirectory} className="rounded-full bg-[#1d1d1f] px-[16px] py-[8px] text-xs font-semibold text-white transition-transform hover:scale-[1.02]">添加本地目录</button>
-        </div>
-      </SettingsGroup>
-    </>
-  )
-}
-
-function DownloadSettings({ form }: { form: SettingsFormController }) {
-  const value = downloadsDisplayValue(form)
-  return (
-    <>
-      <SettingsIntro section="Downloads" title="下载" description="离线内容由本地 DownloadService 管理；设置页只展示已经接入的队列、断点恢复和存储边界。" />
-      <SettingsFormStatusBar form={form} onReset={() => form.resetToDefaults()} />
-      <SettingsFormError form={form} />
-      <div className="mb-7 flex gap-3 rounded-3xl border border-[#007aff]/15 bg-[#007aff]/[0.06] p-5">
-        <Download className="mt-0.5 h-5 w-5 shrink-0 text-[#007aff]" />
-        <div>
-          <p className="text-sm font-semibold">默认下载位置：下载 / 栖阅</p>
-          <p className="mt-1 text-xs leading-5 text-[#6e6e73] dark:text-[#98989d]">首次需要本地离线位置时，桌面端会在当前用户的“下载”目录下创建“栖阅”文件夹。原始媒体和已有离线资源不会因设置页操作被移动或删除。</p>
-        </div>
-      </div>
-      <SettingsGroup title="已接入能力">
-        <SettingRow title="下载位置" description="实际目标由受控 StorageLocation 管理，设置页不接受任意路径。">
-          <span className="text-sm font-semibold text-[#1d1d1f] dark:text-[#f5f5f5]">下载 / 栖阅（默认）</span>
-        </SettingRow>
-        <SettingRow title="队列状态" description="下载任务、暂停/继续、失败重试和完成后的 Offline Resource 已由下载服务管理。">
-          <span className="text-xs font-semibold text-[#248a3d]">已接入</span>
-        </SettingRow>
-        <SettingRow title="自动继续中断任务" description="应用重启后自动恢复 Interrupted 任务；Queued 任务仍按已提交意图启动，用户主动暂停的任务不会被强制启动。">
-          <Toggle checked={value.autoContinue} onChange={(checked) => form.change({ section: "downloads", autoContinue: checked })} label="自动继续中断任务" />
-        </SettingRow>
-      </SettingsGroup>
-      <SettingsGroup title="下载策略" description="并发上限和速度限制由本地 Worker 在新任务开始时读取；自动继续只影响重启后的 Interrupted 任务，运行中的任务不会被强制中断。">
-        <SettingRow title="同时下载数量" description="限制同时写入离线目录的任务数，等待中的任务会保留在队列。">
-          <SelectControl value={optionLabel(DOWNLOAD_CONCURRENCY_OPTIONS, value.concurrentTasks)} options={DOWNLOAD_CONCURRENCY_OPTIONS.map((option) => option.label)} onChange={(label) => form.change({ section: "downloads", concurrentTasks: optionValue(DOWNLOAD_CONCURRENCY_OPTIONS, label) })} ariaLabel="同时下载数量" />
-        </SettingRow>
-        <SettingRow title="下载速度限制" description="对本地复制 Worker 进行软限速，暂停/继续后从当前断点继续计算。">
-          <SelectControl value={optionLabel(DOWNLOAD_SPEED_LIMIT_OPTIONS, value.speedLimit)} options={DOWNLOAD_SPEED_LIMIT_OPTIONS.map((option) => option.label)} onChange={(label) => form.change({ section: "downloads", speedLimit: optionValue(DOWNLOAD_SPEED_LIMIT_OPTIONS, label) })} ariaLabel="下载速度限制" />
-        </SettingRow>
-      </SettingsGroup>
-      <SettingsGroup title="尚未开放的策略" description="以下能力还没有完整的系统服务或来源选择契约，因此不会保存或伪装成已生效。">
-        <SettingRow title="计费网络策略" description="当前没有统一网络状态探测和下载准入策略。">
-          <SelectControl value="当前版本不可用" options={["当前版本不可用"]} onChange={() => undefined} ariaLabel="计费网络策略" disabled />
-        </SettingRow>
-        <SettingRow title="下载完成通知" description="当前没有统一桌面通知发送者。">
-          <Toggle checked={false} onChange={() => undefined} label="下载完成通知" disabled />
-        </SettingRow>
-        <SettingRow title="默认视频质量" description="需要来源/远端资源选择契约后才能安全开放。">
-          <SelectControl value="当前版本不可用" options={["当前版本不可用"]} onChange={() => undefined} ariaLabel="默认视频质量" disabled />
-        </SettingRow>
-      </SettingsGroup>
-    </>
-  )
-}
-
-function SyncSettings({ settings, update }: { settings: SettingsState; update: any }) {
-  return (
-    <>
-      <SettingsIntro section="Sync" title="同步" description="同步目标属于你自己的存储空间。栖阅没有中心化账户，也不会同步云端凭据。" />
-      <div className="mb-7 flex gap-3 rounded-3xl border border-[#007aff]/15 bg-[#007aff]/[0.06] p-5"><LockKeyhole className="mt-0.5 h-5 w-5 shrink-0 text-[#007aff]" /><div><p className="text-sm font-semibold">凭据不会同步</p><p className="mt-1 text-xs leading-5 text-[#6e6e73]">WebDAV 密码、OAuth Refresh Token 和 AI API Key 只保存在 Windows Credential Manager，并且每台设备独立授权。</p></div></div>
-      <SettingsGroup title="同步状态">
-        <SettingRow title="同步" description="关闭时，所有状态仍然保存在本机。"><Toggle checked={settings.syncEnabled} onChange={(value) => update("syncEnabled", value)} label="同步" /></SettingRow>
-        <SettingRow title="同步目标"><SelectControl value={settings.syncTarget} options={["尚未配置", "WebDAV / HavenSync", "OneDrive / HavenSync", "Google Drive / HavenSync"]} onChange={(value) => update("syncTarget", value)} ariaLabel="同步目标" /></SettingRow>
-        <SettingRow title="同步进度与标记"><Toggle checked={settings.syncProgress} onChange={(value) => update("syncProgress", value)} label="同步进度与标记" /></SettingRow>
-        <SettingRow title="同步收藏与设置"><Toggle checked={settings.syncFavorites} onChange={(value) => update("syncFavorites", value)} label="同步收藏与设置" /></SettingRow>
-      </SettingsGroup>
-    </>
-  )
-}
-
-/**
- * Broker 状态 → 展示文案与色点。
- *
- * `busy` / `unavailable` 各有独立文案：它们是 fail-closed 结论，折叠成「已关闭」
- * 会让用户以为「本来就没开」，从而错过真正的原因与重试入口。
- */
 function agentBrokerStatusPresentation(status: AgentBrokerStatusDto | null, loading: boolean): { label: string; dot: string } {
   switch (status) {
     case "listening":
@@ -2699,6 +4250,91 @@ function agentBrokerStatusPresentation(status: AgentBrokerStatusDto | null, load
 }
 
 /**
+ * 外部 MCP 客户端「一键配置」的真实接线（MCP_EXTERNAL_AGENT_TRANSPORT.md §9.1.1）。
+ *
+ * 数据全部来自 `useMcpClientConfig`（→ gateway → Typed HavenClient → Tauri command →
+ * Application service → 用户配置文件），组件不直接 invoke。
+ *
+ * 四条必须留在界面上的事实：
+ * - **授权范围写在界面上**：只会写 `~/.codex/config.toml` 的 `[mcp_servers.haven]` 与
+ *   `~/.claude.json` 的 `mcpServers.haven`；两个客户端之外没有按钮，也没有"自定义路径"。
+ * - **只会新增/更新 Haven 这一条**：其它配置项原样保留，写入前还会留一份可恢复备份。
+ * - **状态是后端读出来的**：`configured` 只表示"这一条与当前运行时一致"，不表示"客户端
+ *   已经连上"；`blocked` / `malformed` 是"没有写入"，必须与"未配置"分开显示。
+ * - **不显示任何文件内容**：这里只显示后端给出的状态、路径与原因。
+ */
+function McpClientAutoConfigRows({ showNotice }: { showNotice: (message: string) => void }) {
+  const clients = useMcpClientConfig()
+
+  const configure = async (entry: McpClientTargetStatusWire) => {
+    const ok = await clients.configure(entry.target)
+    // 只有权威写入成功才提示成功；失败由下面的错误行如实显示。
+    if (ok) showNotice(`已写入 ${entry.label} 的 Haven 配置；其它配置项未改动`)
+  }
+
+  if (clients.status === null) {
+    return (
+      <SettingRow
+        title="一键配置外部 MCP 客户端"
+        description="只写 Codex 的 ~/.codex/config.toml 与 Claude Code 的 ~/.claude.json 里的 Haven 这一条，其它配置保持原样。"
+      >
+        <span className="text-[13px] text-[var(--haven-settings-muted-strong)]">{clients.error === null ? "读取中…" : "未能读取客户端配置状态"}</span>
+      </SettingRow>
+    )
+  }
+
+  return (
+    <>
+      <SettingRow
+        title="一键配置外部 MCP 客户端"
+        description="授权范围只有两个固定位置：Codex 的 ~/.codex/config.toml（[mcp_servers.haven]）与 Claude Code 的 ~/.claude.json（mcpServers.haven）。写入是结构化合并，其它配置项原样保留，并在写入前留一份可恢复备份。"
+      >
+        <span className="text-[13px] text-[var(--haven-settings-muted-strong)]">
+          {clients.status.runtimeReady ? "随包分发的运行时已就绪" : "运行时未就绪"}
+        </span>
+      </SettingRow>
+      {!clients.status.runtimeReady && clients.status.runtimeDetail.length > 0 && (
+        <SettingRow title="运行时不可用" description={clients.status.runtimeDetail}>
+          <button type="button" onClick={() => void clients.reload()} disabled={clients.busy} className="text-[13px] font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:text-[var(--haven-settings-muted-strong)]">重新读取状态</button>
+        </SettingRow>
+      )}
+      {clients.status.targets.map((entry) => (
+        <SettingRow
+          key={entry.target}
+          title={`${entry.label} 的 Haven 配置`}
+          description={entry.configPath === null ? entry.detail : `${entry.configPath} · ${entry.detail}`}
+        >
+          <div className="flex max-w-[420px] flex-col items-end gap-2">
+            <div className="flex items-center gap-3">
+              <span className="text-[13px] font-semibold text-[var(--haven-settings-foreground)]">{mcpClientStateLabel(entry.state)}</span>
+              {entry.writable && (
+                <button
+                  type="button"
+                  onClick={() => void configure(entry)}
+                  disabled={clients.busy}
+                  className="inline-flex h-[36px] items-center justify-center rounded-full bg-[var(--haven-settings-primary)] px-[16px] text-[12px] font-semibold leading-none text-[var(--haven-settings-primary-foreground)] transition-colors hover:bg-[var(--haven-settings-primary-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {clients.pendingTarget === entry.target ? "写入中…" : mcpClientActionLabel(entry.state)}
+                </button>
+              )}
+            </div>
+            <p className="text-right text-[11px] leading-5 text-[var(--haven-settings-muted-strong)] dark:text-[#8e8e93]">{mcpClientStatusNote(entry)}</p>
+          </div>
+        </SettingRow>
+      ))}
+      {clients.error !== null && (
+        <SettingRow title="客户端配置操作失败" description={clients.error.message}>
+          <div className="flex items-center gap-3">
+            <button type="button" onClick={() => void clients.reload()} disabled={clients.busy} className="text-[13px] font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:text-[var(--haven-settings-muted-strong)]">重新读取状态</button>
+            <button type="button" onClick={clients.dismissError} className="text-[13px] font-medium text-[var(--haven-settings-muted-strong)]">关闭</button>
+          </div>
+        </SettingRow>
+      )}
+    </>
+  )
+}
+
+/**
  * 设置页「外部 Agent 接入」分组（A5 接线切片）。
  *
  * 数据全部来自 `useAgentBrokerSettings`（→ gateway → Typed HavenClient → Tauri
@@ -2709,8 +4345,9 @@ function agentBrokerStatusPresentation(status: AgentBrokerStatusDto | null, load
  * - 这里没有 approve / apply / reject 按钮：Broker 的请求集只有 context /
  *   create_proposal，提案的批准与写入只能回到栖阅界面。
  */
-function ExternalAgentAccessSettings({ showNotice }: { showNotice: (message: string) => void }) {
+function ExternalAgentAccessSettings({ showNotice, registerReloader }: { showNotice: (message: string) => void; registerReloader: RegisterSettingsSectionReloader }) {
   const broker = useAgentBrokerSettings()
+  const reloadBroker = broker.reload
   const [templateId, setTemplateId] = useState<AgentBrokerClientTemplateId>("codex")
   const [copyError, setCopyError] = useState<string | null>(null)
 
@@ -2722,6 +4359,8 @@ function ExternalAgentAccessSettings({ showNotice }: { showNotice: (message: str
   const selectedTemplate = AGENT_BROKER_CLIENT_TEMPLATES.find((item) => item.id === templateId)
     ?? AGENT_BROKER_CLIENT_TEMPLATES[0]
   const isListening = broker.status === "listening"
+
+  useEffect(() => registerReloader("ai", () => { void reloadBroker() }), [registerReloader, reloadBroker])
 
   const copyText = async (text: string, done: string) => {
     setCopyError(null)
@@ -2740,45 +4379,50 @@ function ExternalAgentAccessSettings({ showNotice }: { showNotice: (message: str
   return (
     <SettingsGroup
       title="外部 Agent 接入"
+      features={["ai.agentBroker", "ai.clientAutoConfig"]}
       description="让本机已安装的外部 Agent 通过 MCP 接入栖阅。默认关闭，只有你显式开启后才会创建本地端点。"
     >
       <SettingRow
         title="接入状态"
-        description="外部 Agent 只能读取脱敏上下文和创建待审批 Proposal；批准、拒绝与应用必须回到栖阅界面。它没有 SQL、文件系统、Secret 或任意命令权限。"
+        description="外部 Agent 只能读取脱敏信息并提交建议，批准、拒绝与应用改动均需你在栖阅中操作；不会获得本机文件、凭据或命令执行权限。"
       >
         <div className="flex items-center gap-3">
-          <span className="flex items-center gap-1.5 text-[13px] font-semibold text-[#1d1d1f] dark:text-[#f5f5f5]">
+          <span className="flex items-center gap-1.5 text-[13px] font-semibold text-[var(--haven-settings-foreground)]">
             <span className={cn("h-[8px] w-[8px] rounded-full", presentation.dot)} />
             {presentation.label}
           </span>
           {isListening ? (
             <button type="button" onClick={() => void broker.disable()} disabled={broker.busy} className="inline-flex h-[36px] items-center justify-center rounded-full bg-black/[0.05] px-[16px] text-[12px] font-semibold leading-none text-[#1d1d1f] transition-colors hover:bg-black/[0.08] disabled:cursor-not-allowed disabled:opacity-50 dark:bg-white/[0.08] dark:text-[#f5f5f5] dark:hover:bg-white/[0.12]">停用</button>
           ) : (
-            <button type="button" onClick={() => void broker.enable()} disabled={broker.busy} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[#007aff] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#006fe6] disabled:cursor-not-allowed disabled:opacity-50">{broker.status === "busy" || broker.status === "unavailable" ? "重试启用" : "启用外部接入"}</button>
+            <button type="button" onClick={() => void broker.enable()} disabled={broker.busy} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[var(--haven-settings-primary)] px-[16px] text-[12px] font-semibold leading-none text-[var(--haven-settings-primary-foreground)] transition-colors hover:bg-[var(--haven-settings-primary-hover)] disabled:cursor-not-allowed disabled:opacity-50">{broker.status === "busy" || broker.status === "unavailable" ? "重试启用" : "启用外部接入"}</button>
           )}
         </div>
       </SettingRow>
       {broker.reason !== null && (
         <SettingRow title="无法监听的原因" description={broker.reason}>
-          <span className="text-[13px] text-[#86868b]">由本机如实上报</span>
+          <span className="text-[13px] text-[var(--haven-settings-muted-strong)]">由本机如实上报</span>
         </SettingRow>
       )}
+      <details className="border-b border-[var(--haven-settings-border-subtle)] px-6 py-3 text-[12px] text-[var(--haven-settings-muted-strong)]">
+        <summary className="cursor-pointer font-medium">权限与安全边界</summary>
+        <p className="mt-2 leading-5">外部 Agent 没有 SQL、文件系统、Secret 或任意命令权限；只能读取脱敏上下文并创建待审批建议。</p>
+      </details>
       {broker.endpointKind === "live" && (
         <SettingRow title="本地端点" description="由栖阅按当前用户解析的本地地址。它不是密钥，可以复制给本机 Agent 客户端。">
           <div className="flex max-w-[420px] items-center gap-2">
             <code className="truncate rounded-lg bg-[#f5f5f7] px-2 py-1 font-mono text-[11px] text-[#1d1d1f] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]">{broker.endpoint}</code>
-            <button type="button" onClick={() => void copyText(broker.endpoint ?? "", "已复制本地端点")} className="shrink-0 rounded-full px-[8px] py-[8px] text-xs font-semibold text-[#007aff]">复制</button>
+            <button type="button" onClick={() => void copyText(broker.endpoint ?? "", "已复制本地端点")} className="shrink-0 rounded-full px-[8px] py-[8px] text-xs font-semibold text-[var(--haven-settings-primary)]">复制</button>
           </div>
         </SettingRow>
       )}
       {broker.endpointKind === "preview" && (
         <SettingRow title="本地端点" description="这里没有可复制的地址，下面也不会给出连接模板。">
-          <span className="text-[13px] font-semibold text-[#86868b]">浏览器预览：没有真实本地监听</span>
+          <span className="text-[13px] font-semibold text-[var(--haven-settings-muted-strong)]">浏览器预览：没有真实本地监听</span>
         </SettingRow>
       )}
       {broker.endpointKind === "unknown" && (
         <SettingRow title="本地端点" description="端点形态不在本机允许的闭合集合内，因此不提供复制。">
-          <span className="text-[13px] font-semibold text-[#86868b]">未识别</span>
+          <span className="text-[13px] font-semibold text-[var(--haven-settings-muted-strong)]">未识别</span>
         </SettingRow>
       )}
       {template !== null && (
@@ -2788,7 +4432,7 @@ function ExternalAgentAccessSettings({ showNotice }: { showNotice: (message: str
         >
           <div className="flex max-w-[440px] flex-col items-end gap-2">
             <div className="flex items-center gap-3">
-              <span className="text-[12px] text-[#86868b]">客户端</span>
+              <span className="text-[12px] text-[var(--haven-settings-muted-strong)]">客户端</span>
               <SelectControl
                 value={selectedTemplate.label}
                 options={AGENT_BROKER_CLIENT_TEMPLATES.map((item) => item.label)}
@@ -2799,26 +4443,127 @@ function ExternalAgentAccessSettings({ showNotice }: { showNotice: (message: str
                 ariaLabel="配置模板"
               />
             </div>
-            <p className="text-right text-[11px] leading-5 text-[#86868b]">{selectedTemplate.hint}{AGENT_BROKER_TEMPLATE_NOTE}</p>
+            <p className="text-right text-[11px] leading-5 text-[var(--haven-settings-muted-strong)]">{selectedTemplate.hint}{AGENT_BROKER_TEMPLATE_NOTE}</p>
             <pre className="max-h-[220px] w-full overflow-auto rounded-xl bg-[#f5f5f7] p-3 text-left font-mono text-[11px] leading-5 text-[#1d1d1f] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]">{template}</pre>
-            <button type="button" onClick={() => void copyText(template, "已复制 MCP 连接配置")} className="rounded-full px-[8px] py-[8px] text-xs font-semibold text-[#007aff]">复制配置</button>
+            <button type="button" onClick={() => void copyText(template, "已复制 MCP 连接配置")} className="rounded-full px-[8px] py-[8px] text-xs font-semibold text-[var(--haven-settings-primary)]">复制配置</button>
           </div>
         </SettingRow>
       )}
       {broker.error !== null && (
         <SettingRow title="接入操作失败" description={broker.error.message}>
           <div className="flex items-center gap-3">
-            <button type="button" onClick={() => void broker.reload()} disabled={broker.busy} className="text-[13px] font-semibold text-[#007aff] disabled:cursor-not-allowed disabled:text-[#86868b]">重新读取状态</button>
-            <button type="button" onClick={broker.dismissError} className="text-[13px] font-medium text-[#6e6e73]">关闭</button>
+            <button type="button" onClick={() => void broker.reload()} disabled={broker.busy} className="text-[13px] font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:text-[var(--haven-settings-muted-strong)]">重新读取状态</button>
+            <button type="button" onClick={broker.dismissError} className="text-[13px] font-medium text-[var(--haven-settings-muted-strong)]">关闭</button>
           </div>
         </SettingRow>
       )}
+      <McpClientAutoConfigRows showNotice={showNotice} />
       {copyError !== null && (
         <SettingRow title="复制失败" description={copyError}>
-          <button type="button" onClick={() => setCopyError(null)} className="text-[13px] font-medium text-[#6e6e73]">关闭</button>
+          <button type="button" onClick={() => setCopyError(null)} className="text-[13px] font-medium text-[var(--haven-settings-muted-strong)]">关闭</button>
         </SettingRow>
       )}
     </SettingsGroup>
+  )
+}
+
+/**
+ * 设置页「内置技能」分组的真实接线（原生 Skill 运行时）。
+ *
+ * 数据全部来自 `useAgentSkills`（→ gateway → Typed HavenClient → Tauri command →
+ * Application service → SQLite 权威状态），组件不直接 invoke，也不持有第二份状态。
+ *
+ * 三条必须留在界面上的事实：
+ * - **技能正文不进前端**：这里只显示 id、frontmatter 描述与注入字数。正文由 Rust 编译期
+ *   嵌入，只在模型请求内部拼装，因此界面没有"编辑技能 / 导入技能 / 按路径加载"入口。
+ * - **三态分离**：`stale`（启用过，但随应用分发的内容已经变了）必须与「未启用」分开显示。
+ *   把 stale 折叠成「已启用」会让用户以为旧内容还在起作用。
+ * - **启用不等于授权**：技能只是模型请求里的说明性上下文，不新增工具、不改变能力清单，
+ *   也不能写入设置——任何设置改动仍然停在 pending 提案上，批准只能由用户在栖阅界面完成。
+ */
+function SkillsSettings({ showNotice, registerReloader }: { showNotice: (message: string) => void; registerReloader: RegisterSettingsSectionReloader }) {
+  const skills = useAgentSkills()
+  const reloadSkills = skills.reload
+
+  useEffect(() => registerReloader("ai", () => { void reloadSkills() }), [registerReloader, reloadSkills])
+
+  const toggle = async (skillId: string, enabled: boolean) => {
+    const ok = await skills.setEnabled(skillId, enabled)
+    // 只有权威写入成功才提示；失败由下面的错误行如实显示，不在这里说"已启用"。
+    if (ok) showNotice(enabled ? "已启用内置技能；栖伴后续请求会携带相应说明" : "已停用内置技能")
+  }
+
+  return (
+    <>
+      <div className="mb-7 flex gap-3 rounded-3xl border border-[var(--haven-settings-primary)]/15 bg-[var(--haven-settings-primary)]/[0.06] p-5">
+        <LockKeyhole className="mt-0.5 h-5 w-5 shrink-0 text-[var(--haven-settings-primary)]" />
+        <div>
+          <p className="text-sm font-semibold">技能不是权限</p>
+          <p className="mt-1 text-xs leading-5 text-[var(--haven-settings-muted-strong)]">技能为栖伴提供任务说明，不会增加权限；设置改动会形成待批准提案，只有你在栖阅中批准后才会应用。</p>
+        </div>
+      </div>
+      <SettingsGroup
+        title="本机内置技能"
+        features={["skills.builtinRuntime"]}
+        description="随栖阅提供的内置技能，可启用或停用；当前不支持导入或编辑自定义技能。"
+        action={skills.error === null && (
+          <button
+            type="button"
+            aria-label="重新读取内置技能"
+            onClick={() => void skills.reload()}
+            disabled={skills.busy || skills.loading}
+            className="shrink-0 text-[11px] font-semibold text-[var(--haven-settings-primary)] transition-colors hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            重新读取
+          </button>
+        )}
+      >
+        {skills.loading && (
+          <SettingRow title="内置技能目录" description="正在读取本机权威状态…">
+            <span className="text-[13px] text-[var(--haven-settings-muted-strong)]">读取中</span>
+          </SettingRow>
+        )}
+        {skills.error !== null && (
+          <div role="alert">
+            <SettingRow title="读取或写入失败" description={skills.error.message}>
+              <div className="flex items-center gap-3">
+                <button type="button" onClick={() => void skills.reload()} disabled={skills.busy} className="text-[13px] font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:text-[var(--haven-settings-muted-strong)]">重新读取</button>
+                <button type="button" onClick={skills.dismissError} className="text-[13px] font-medium text-[var(--haven-settings-muted-strong)]">关闭</button>
+              </div>
+            </SettingRow>
+          </div>
+        )}
+        {!skills.loading && skills.error === null && skills.skills !== null && skills.skills.length === 0 && (
+          <SettingRow title="内置技能目录为空" description={NO_BUILTIN_SKILLS}>
+            <span className="text-[13px] font-semibold text-[var(--haven-settings-muted-strong)]">目录为空</span>
+          </SettingRow>
+        )}
+        {(skills.skills ?? []).map((skill) => (
+          <SettingRow
+            key={skill.skillId}
+            icon={<FileText className="h-[19px] w-[19px]" strokeWidth={1.8} />}
+            title={skill.skillId}
+            description={skill.description}
+          >
+            <div className="flex items-center gap-3">
+              <span className="flex items-center gap-1.5 text-[13px] font-semibold text-[var(--haven-settings-foreground)]">
+                <span className={cn("h-[8px] w-[8px] rounded-full", agentSkillIsEffective(skill.state) ? "bg-[#34c759]" : skill.state === "stale" ? "bg-[#ff9500]" : "bg-[#c7ccd1]")} />
+                {agentSkillStateLabel(skill.state)}
+              </span>
+              <span className="text-[11px] text-[var(--haven-settings-muted-strong)]">{agentSkillCharsLabel(skill.instructionsChars)}</span>
+              <button
+                type="button"
+                onClick={() => void toggle(skill.skillId, agentSkillToggleTarget(skill.state))}
+                disabled={skills.pendingSkillId !== null || skills.error !== null}
+                className="inline-flex h-[36px] items-center justify-center rounded-full bg-[var(--haven-settings-primary)] px-[16px] text-[12px] font-semibold leading-none text-[var(--haven-settings-primary-foreground)] transition-colors hover:bg-[var(--haven-settings-primary-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {agentSkillActionLabel(skill.state)}
+              </button>
+            </div>
+          </SettingRow>
+        ))}
+      </SettingsGroup>
+    </>
   )
 }
 
@@ -2832,13 +4577,36 @@ function ExternalAgentAccessSettings({ showNotice }: { showNotice: (message: str
  *   绝不写入或推断示例模型名；
  * - 目录状态与网络错误分开呈现，可重试错误带重试入口。
  */
-function AiSettings({ showNotice, onOpenAssistant }: { showNotice: (message: string) => void; onOpenAssistant: () => void }) {
-  const ai = useAiProviderSettings()
-  const [draft, setDraft] = useState<{ profileId: string; displayName: string; endpoint: string } | null>(null)
+type AiProviderProfileDraftState = {
+  mode: "create" | "edit"
+  profileId: string
+  displayName: string
+  endpoint: string
+}
+
+function AiSettings({ showNotice, registerReloader, aiSelection }: { showNotice: (message: string) => void; registerReloader: RegisterSettingsSectionReloader; aiSelection: AiProviderSelection }) {
+  // 选择由分区之上持有：本组件会随分区切换被卸载重建，选中的 Provider 不能因此丢回列表第一项。
+  const ai = useAiProviderSettings({
+    initialProfileId: aiSelection.profileId,
+    onSelectedProfileChange: aiSelection.onSelect,
+  })
+  const reloadAi = ai.reload
+  const [draft, setDraft] = useState<AiProviderProfileDraftState | null>(null)
   const [apiKeyDraft, setApiKeyDraft] = useState("")
   const [isKeyEditorOpen, setIsKeyEditorOpen] = useState(false)
+  /**
+   * 浏览器 Mock / 开发预览。
+   *
+   * Mock 的凭据与模型目录都是**内存 + 契约 fixture**：说"已写入系统凭据管理器"或
+   * "模型来自 Provider 的模型列表"在预览里是假的，而且是很具体的那种假——用户会以为
+   * 本机真的存了密钥、真的探测到了模型。因此预览路径必须逐条改口径，不能复用生产文案。
+   */
+  const mockMode = getHavenClientMode() === "mock"
 
-  const selected = ai.selectedProfile
+  useEffect(() => registerReloader("ai", () => { void reloadAi() }), [registerReloader, reloadAi])
+
+  // Provider 列表读取失败时，保留的快照只供恢复后收敛，不能继续驱动任何动作。
+  const selected = ai.state.loadError === null ? ai.selectedProfile : null
   const modelOptionStrings = ai.modelOptions.map((option) => (
     option.label === option.modelId ? option.modelId : `${option.label} (${option.modelId})`
   ))
@@ -2855,18 +4623,48 @@ function AiSettings({ showNotice, onOpenAssistant }: { showNotice: (message: str
   const draftDisplayName = draft?.displayName ?? selected?.displayName ?? ""
   const draftEndpoint = draft?.endpoint ?? selected?.endpoint ?? ""
   const isDirty = draft !== null
+  const isCreating = draft?.mode === "create"
+  const profileOptions = ai.state.profiles.map((profile) => `${profile.displayName} (${profile.profileId})`)
+  const selectedProfileOption = selected
+    ? `${selected.displayName} (${selected.profileId})`
+    : ""
+
+  const beginCreateProfile = () => {
+    const occupied = new Set(ai.state.profiles.map((profile) => profile.profileId))
+    let index = 1
+    while (occupied.has(`provider-${index}`)) index += 1
+    setDraft({
+      mode: "create",
+      profileId: `provider-${index}`,
+      displayName: "自建网关",
+      endpoint: "https://",
+    })
+  }
+
+  const updateDraft = (patch: Partial<Pick<AiProviderProfileDraftState, "profileId" | "displayName" | "endpoint">>) => {
+    setDraft((current) => ({
+      mode: current?.mode ?? "edit",
+      profileId: current?.profileId ?? selected?.profileId ?? "",
+      displayName: current?.displayName ?? selected?.displayName ?? "",
+      endpoint: current?.endpoint ?? selected?.endpoint ?? "",
+      ...patch,
+    }))
+  }
 
   const submitProfile = async () => {
     const ok = await ai.saveProfile({
       profileId: draftProfileId,
       displayName: draftDisplayName,
       endpoint: draftEndpoint,
-      enabled: selected?.enabled ?? true,
-      selectedModelId: selected?.selectedModelId ?? null,
+      enabled: isCreating ? true : selected?.enabled ?? true,
+      selectedModelId: isCreating ? null : selected?.selectedModelId ?? null,
+      createOnly: isCreating,
     })
     if (ok) {
       setDraft(null)
-      showNotice("AI 服务配置已保存")
+      showNotice(mockMode
+        ? "已保存到浏览器预览（Mock/预览）：没有写入本机数据库。"
+        : "AI 服务配置已保存")
     }
   }
 
@@ -2876,38 +4674,88 @@ function AiSettings({ showNotice, onOpenAssistant }: { showNotice: (message: str
     setApiKeyDraft("")
     setIsKeyEditorOpen(false)
     const ok = await ai.submitApiKey(secret)
-    showNotice(ok ? "API Key 已写入系统凭据管理器" : "API Key 写入失败，请重试")
+    // Mock 只把它记在内存里：这里若照抄生产文案，用户会以为系统凭据管理器里真的有这份密钥。
+    showNotice(ok
+      ? mockMode
+        ? "已保存到浏览器预览的内存状态（Mock/预览）：没有写入系统凭据管理器。"
+        : "API Key 已写入系统凭据管理器"
+      : "API Key 写入失败，请重试")
   }
 
   return (
     <>
-      <SettingsIntro section="AI" title="智能功能" description="AI 采用 BYOK。栖阅不为你的调用计费，也不会通过 Haven 中央服务器接收 API Key。" />
-      <div className="mb-7 flex gap-3 rounded-3xl border border-[#f0b429]/25 bg-[#fff8e5] p-5"><Sparkles className="mt-0.5 h-5 w-5 shrink-0 text-[#b7791f]" /><p className="text-xs leading-5 text-[#7a5a1a]">实际费用由你配置的 AI 服务提供商收取。API 地址、模型和 API Key 由后端安全存储层接管：密钥只写入系统凭据管理器，配置行与接口响应都不含密钥。</p></div>
-      <SettingsGroup title="配置建议" description="由本机设置快照生成可逐项审查的改动提案；批准前不会写入任何设置。">
-        <SettingRow icon={<Sparkles className="h-[19px] w-[19px]" strokeWidth={1.8} />} title="栖伴" description={`栖伴是栖阅的 Haven 智能体：在对话中描述你的需求，它会读取设置快照并给出可逐项审查的提案。当前${ai.hasAvailableModel ? `可用模型 ${ai.modelOptions.length} 个` : "无可用模型"}，提案为确定性模板，必须由你批准后才会写入。`}>
-          <button type="button" onClick={onOpenAssistant} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[#007aff] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#006fe6]">打开栖伴</button>
-        </SettingRow>
-      </SettingsGroup>
-      <SettingsGroup title="API 连接" description="按协议选择接入方式；API 地址由你填写，栖阅不代理请求。">
+      <SettingsGroup title="API 连接" features={["ai.providerProfile", "ai.providerCredential", "ai.providerModel"]} description="当前支持 OpenAI Compatible 协议。填写服务地址与 API Key 后，栖阅直接连接你的服务。">
         {ai.state.loadError && (
           <div role="alert" className="mx-5 mb-3 flex items-center justify-between gap-3 rounded-2xl border border-[#d70015]/15 bg-[#fff1f0] px-4 py-3 text-xs text-[#d70015]">
             <span>{ai.state.loadError.message}</span>
-            {ai.state.loadError.retryable && <button type="button" onClick={() => void ai.reload()} className="shrink-0 font-semibold text-[#007aff]">重试</button>}
+            {ai.state.loadError.retryable && <button type="button" onClick={() => void ai.reload()} className="shrink-0 font-semibold text-[var(--haven-settings-primary)]">重试</button>}
           </div>
         )}
+        {!ai.state.loading && !ai.state.loadError && ai.state.profiles.length > 0 && (
+          <SettingRow title="当前服务" description={`本机已配置 ${ai.state.profiles.length} 个 AI 服务，可分别保存凭据与默认模型。`}>
+            <div className="flex items-center gap-3">
+              <SelectControl
+                value={selectedProfileOption}
+                options={profileOptions}
+                onChange={(value) => {
+                  const profile = ai.state.profiles.find(
+                    (item) => `${item.displayName} (${item.profileId})` === value,
+                  )
+                  if (!profile) return
+                  setDraft(null)
+                  setApiKeyDraft("")
+                  setIsKeyEditorOpen(false)
+                  ai.selectProfile(profile.profileId)
+                }}
+                ariaLabel="当前 AI 服务"
+                disabled={isDirty || ai.state.saving}
+              />
+              <button
+                type="button"
+                onClick={beginCreateProfile}
+                disabled={isDirty || ai.state.saving}
+                className="shrink-0 rounded-full px-[8px] py-[8px] text-xs font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                新建配置
+              </button>
+            </div>
+          </SettingRow>
+        )}
         {ai.state.loading ? (
-          <SettingRow title="AI 服务配置" description="正在读取本机配置…"><span className="text-[13px] text-[#86868b]">读取中</span></SettingRow>
+          <SettingRow title="AI 服务配置" description="正在读取本机配置…"><span className="text-[13px] text-[var(--haven-settings-muted-strong)]">读取中</span></SettingRow>
+        ) : ai.state.loadError ? (
+          <SettingRow title="AI 服务配置暂不可用" description="读取失败时不会显示为空配置，也不会允许覆盖本机服务设置。">
+            {ai.state.loadError.retryable && <button type="button" onClick={() => void ai.reload()} className="text-[13px] font-semibold text-[var(--haven-settings-primary)]">重试读取</button>}
+          </SettingRow>
+        ) : isCreating ? (
+          <>
+            <SettingRow title="配置 ID" description="稳定标识，只允许字母、数字、连字符与下划线。">
+              <input value={draftProfileId} onChange={(event) => updateDraft({ profileId: event.target.value })} className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)]" aria-label="配置 ID" />
+            </SettingRow>
+            <SettingRow title="配置名称">
+              <input value={draftDisplayName} onChange={(event) => updateDraft({ displayName: event.target.value })} className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)]" aria-label="配置名称" />
+            </SettingRow>
+            <SettingRow title="API 地址" description="必须是 https 的公网服务地址；栖阅不会通过明文连接发送 API Key 或设置内容。">
+              <input value={draftEndpoint} onChange={(event) => updateDraft({ endpoint: event.target.value })} className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)]" aria-label="API 地址" />
+            </SettingRow>
+            <SettingRow title="保存配置" description="新服务默认启用；API Key 将单独配置。">
+              <div className="flex items-center gap-3">
+                <button type="button" onClick={() => setDraft(null)} className="text-[13px] font-medium text-[var(--haven-settings-muted-strong)]">放弃</button>
+                <button type="button" onClick={() => void submitProfile()} disabled={ai.state.saving} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[var(--haven-settings-primary)] px-[16px] text-[12px] font-semibold leading-none text-[var(--haven-settings-primary-foreground)] transition-colors hover:bg-[var(--haven-settings-primary-hover)] disabled:cursor-not-allowed disabled:opacity-50">保存</button>
+              </div>
+            </SettingRow>
+          </>
         ) : selected ? (
           <>
             <SettingRow title="配置名称" description="本机标识，只用于区分多个 Provider。">
               <input
                 value={draftDisplayName}
-                onChange={(event) => setDraft({ profileId: draftProfileId, displayName: event.target.value, endpoint: draftEndpoint })}
-                className="h-10 w-[260px] rounded-xl border border-black/[0.08] bg-[#f5f5f7] px-3 text-sm text-[#1d1d1f] outline-none focus:border-[#007aff]/50 dark:border-white/[0.12] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]"
+                onChange={(event) => updateDraft({ displayName: event.target.value })}
+                className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)]"
                 aria-label="配置名称"
               />
             </SettingRow>
-            <SettingRow title="启用智能功能" description="停用后不会向该 Provider 发起任何请求。">
+            <SettingRow title="启用智能功能" description={ai.selectedEndpointInsecure ? "该配置使用 http 明文地址，不能启用：启停会重写同一条配置，而明文地址不允许保存。请先把地址改成 https。" : "停用后不会向该 Provider 发起任何请求。"}>
               <Toggle
                 checked={selected.enabled}
                 onChange={(value) => void ai.saveProfile({
@@ -2917,31 +4765,37 @@ function AiSettings({ showNotice, onOpenAssistant }: { showNotice: (message: str
                   enabled: value,
                   selectedModelId: selected.selectedModelId,
                 })}
+                disabled={ai.selectedEndpointInsecure}
                 label="启用智能功能"
               />
             </SettingRow>
             <SettingRow title="API 协议" description="决定请求与响应的编排协议，而不是具体服务商。">
-              <span className="text-[13px] font-semibold text-[#1d1d1f] dark:text-[#f5f5f5]">OpenAI Compatible</span>
+              <span className="text-[13px] font-semibold text-[var(--haven-settings-foreground)]">OpenAI Compatible</span>
             </SettingRow>
-            <SettingRow title="API 地址" description="协议服务根地址（https，公网主机）。已带 /v1 时不会重复拼接。">
+            <SettingRow title="API 地址" description="协议服务根地址（https，公网主机）。已带 /v1 时不会重复拼接；http 明文地址不能保存，也不能用于发起请求。">
               <input
                 value={draftEndpoint}
-                onChange={(event) => setDraft({ profileId: draftProfileId, displayName: draftDisplayName, endpoint: event.target.value })}
-                className="h-10 w-[260px] rounded-xl border border-black/[0.08] bg-[#f5f5f7] px-3 text-sm text-[#1d1d1f] outline-none focus:border-[#007aff]/50 dark:border-white/[0.12] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]"
+                onChange={(event) => updateDraft({ endpoint: event.target.value })}
+                className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)]"
                 aria-label="API 地址"
               />
             </SettingRow>
+            {ai.selectedEndpointInsecure && (
+              <div role="alert" className="mx-5 mb-3 rounded-2xl border border-[#ff9500]/25 bg-[#fff8e5] px-4 py-3 text-xs leading-5 text-[#7a5a1a] dark:border-[#ff9500]/30 dark:bg-[#3a2f12] dark:text-[#f0b429]">
+                {`该配置保存的是 http 明文地址，因此栖阅不会向它发起任何请求（模型列表与设置建议都会以 ${INSECURE_ENDPOINT_CODE} 失败）。把地址改成 https 并保存后即可恢复；本次没有发送任何密钥或设置内容。`}
+              </div>
+            )}
             {isDirty && (
               <SettingRow title="保存配置" description="只有本机配置；不包含 API Key。">
                 <div className="flex items-center gap-3">
-                  <button type="button" onClick={() => setDraft(null)} className="text-[13px] font-medium text-[#6e6e73]">放弃</button>
-                  <button type="button" onClick={() => void submitProfile()} disabled={ai.state.saving} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[#007aff] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#006fe6] disabled:cursor-not-allowed disabled:opacity-50">保存</button>
+                  <button type="button" onClick={() => setDraft(null)} className="text-[13px] font-medium text-[var(--haven-settings-muted-strong)]">放弃</button>
+                  <button type="button" onClick={() => void submitProfile()} disabled={ai.state.saving} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[var(--haven-settings-primary)] px-[16px] text-[12px] font-semibold leading-none text-[var(--haven-settings-primary-foreground)] transition-colors hover:bg-[var(--haven-settings-primary-hover)] disabled:cursor-not-allowed disabled:opacity-50">保存</button>
                 </div>
               </SettingRow>
             )}
-            <SettingRow title="API Key" description="密钥只单向写入 Windows 凭据管理器，设置界面不显示原文，也不会回填。">
+            <SettingRow title="API Key" description={mockMode ? "Mock/预览：密钥只记在浏览器内存里，刷新即失效，也不会写入任何系统凭据存储。" : "密钥只单向写入系统凭据管理器，设置界面不显示原文，也不会回填。"}>
               <div className="flex items-center gap-[8px]">
-                <span className="flex items-center gap-1.5 text-[13px] font-semibold text-[#6e6e73]">{ai.credentialConfigured ? "已配置" : "未配置"}{ai.credentialConfigured && <CircleCheck className="h-[15px] w-[15px] text-[#34c759]" strokeWidth={2.2} />}</span>
+                <span className="flex items-center gap-1.5 text-[13px] font-semibold text-[var(--haven-settings-muted-strong)]">{ai.credentialConfigured ? "已配置" : "未配置"}{ai.credentialConfigured && <CircleCheck className="h-[15px] w-[15px] text-[#34c759]" strokeWidth={2.2} />}</span>
                 {isKeyEditorOpen ? (
                   <>
                     <input
@@ -2951,15 +4805,19 @@ function AiSettings({ showNotice, onOpenAssistant }: { showNotice: (message: str
                       placeholder="粘贴 API Key"
                       aria-label="API Key"
                       autoComplete="off"
-                      className="h-10 w-[200px] rounded-xl border border-black/[0.08] bg-[#f5f5f7] px-3 text-sm text-[#1d1d1f] outline-none focus:border-[#007aff]/50 dark:border-white/[0.12] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]"
+                      className="h-10 w-[200px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)]"
                     />
-                    <button type="button" onClick={() => void submitApiKey()} disabled={apiKeyDraft.length === 0 || ai.state.saving} className="rounded-full px-[8px] py-[8px] text-xs font-semibold text-[#007aff] disabled:cursor-not-allowed disabled:opacity-50">保存</button>
-                    <button type="button" onClick={() => { setApiKeyDraft(""); setIsKeyEditorOpen(false) }} className="rounded-full px-[8px] py-[8px] text-xs font-medium text-[#6e6e73]">取消</button>
+                    <button type="button" onClick={() => void submitApiKey()} disabled={apiKeyDraft.length === 0 || ai.state.saving} className="rounded-full px-[8px] py-[8px] text-xs font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50">保存</button>
+                    <button type="button" onClick={() => { setApiKeyDraft(""); setIsKeyEditorOpen(false) }} className="rounded-full px-[8px] py-[8px] text-xs font-medium text-[var(--haven-settings-muted-strong)]">取消</button>
                   </>
                 ) : (
                   <>
-                    <button type="button" onClick={() => setIsKeyEditorOpen(true)} className="rounded-full px-[8px] py-[8px] text-xs font-semibold text-[#007aff]">配置</button>
-                    {ai.credentialConfigured && <button type="button" onClick={() => { void ai.clearApiKey().then((ok) => showNotice(ok ? "已清除 API Key" : "清除失败，请重试")) }} className="rounded-full px-[8px] py-[8px] text-xs font-medium text-[#6e6e73]">清除</button>}
+                    {/*
+                      写入与清除是两条互相覆盖的写操作：任一条在途时两条都禁用，避免"先点保存
+                      再点清除"由完成顺序决定最终状态（Hook 里另有一道互斥闸门兜底）。
+                    */}
+                    <button type="button" onClick={() => setIsKeyEditorOpen(true)} disabled={ai.state.saving} className="rounded-full px-[8px] py-[8px] text-xs font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50">配置</button>
+                    {ai.credentialConfigured && <button type="button" onClick={() => { void ai.clearApiKey().then((ok) => showNotice(ok ? mockMode ? "已在浏览器预览的内存状态中清除（Mock/预览）：没有改动系统凭据管理器。" : "已清除 API Key" : "清除失败，请重试")) }} disabled={ai.state.saving} className="rounded-full px-[8px] py-[8px] text-xs font-medium text-[var(--haven-settings-muted-strong)] disabled:cursor-not-allowed disabled:opacity-50">清除</button>}
                   </>
                 )}
               </div>
@@ -2967,29 +4825,14 @@ function AiSettings({ showNotice, onOpenAssistant }: { showNotice: (message: str
           </>
         ) : (
           <SettingRow title="AI 服务" description="尚未配置任何 Provider。无可用模型，也不会伪造模型列表。">
-            <button type="button" onClick={() => setDraft({ profileId: "default", displayName: "自建网关", endpoint: "https://" })} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[#007aff] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#006fe6]">新建配置</button>
+            <button type="button" onClick={beginCreateProfile} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[var(--haven-settings-primary)] px-[16px] text-[12px] font-semibold leading-none text-[var(--haven-settings-primary-foreground)] transition-colors hover:bg-[var(--haven-settings-primary-hover)]">新建配置</button>
           </SettingRow>
         )}
-        {!selected && isDirty && (
-          <>
-            <SettingRow title="配置 ID" description="稳定标识，只允许字母、数字、连字符与下划线。">
-              <input value={draftProfileId} onChange={(event) => setDraft({ profileId: event.target.value, displayName: draftDisplayName, endpoint: draftEndpoint })} className="h-10 w-[260px] rounded-xl border border-black/[0.08] bg-[#f5f5f7] px-3 text-sm text-[#1d1d1f] outline-none focus:border-[#007aff]/50 dark:border-white/[0.12] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]" aria-label="配置 ID" />
-            </SettingRow>
-            <SettingRow title="配置名称">
-              <input value={draftDisplayName} onChange={(event) => setDraft({ profileId: draftProfileId, displayName: event.target.value, endpoint: draftEndpoint })} className="h-10 w-[260px] rounded-xl border border-black/[0.08] bg-[#f5f5f7] px-3 text-sm text-[#1d1d1f] outline-none focus:border-[#007aff]/50 dark:border-white/[0.12] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]" aria-label="配置名称" />
-            </SettingRow>
-            <SettingRow title="API 地址" description="https 公网地址；不接受本地路径、查询参数或私网目标。">
-              <input value={draftEndpoint} onChange={(event) => setDraft({ profileId: draftProfileId, displayName: draftDisplayName, endpoint: event.target.value })} className="h-10 w-[260px] rounded-xl border border-black/[0.08] bg-[#f5f5f7] px-3 text-sm text-[#1d1d1f] outline-none focus:border-[#007aff]/50 dark:border-white/[0.12] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]" aria-label="API 地址" />
-            </SettingRow>
-            <SettingRow title="保存配置">
-              <div className="flex items-center gap-3">
-                <button type="button" onClick={() => setDraft(null)} className="text-[13px] font-medium text-[#6e6e73]">放弃</button>
-                <button type="button" onClick={() => void submitProfile()} disabled={ai.state.saving} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[#007aff] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#006fe6] disabled:cursor-not-allowed disabled:opacity-50">保存</button>
-              </div>
-            </SettingRow>
-          </>
-        )}
-        <SettingRow title="默认模型" description={ai.hasAvailableModel ? "模型与能力都来自 Provider 的模型列表。" : `${ai.unavailableModelLabel}：${ai.unavailableModelHint}`}>
+        {!isCreating && !ai.state.loadError && <SettingRow title="默认模型" description={ai.hasAvailableModel
+          ? (mockMode
+            ? "Mock/预览：这份模型列表来自契约 fixture，不是真实 Provider 的 /models 响应。"
+            : "模型与能力都来自 Provider 的模型列表。")
+          : `${ai.unavailableModelLabel}：${ai.unavailableModelHint}`}>
           <div className="flex items-center gap-4">
             <SelectControl
               value={ai.hasAvailableModel ? selectedModelValue : ai.unavailableModelLabel}
@@ -3010,86 +4853,43 @@ function AiSettings({ showNotice, onOpenAssistant }: { showNotice: (message: str
               ariaLabel="默认模型"
               disabled={!ai.hasAvailableModel || ai.state.saving}
             />
-            <button type="button" onClick={() => void ai.refreshModels()} disabled={!selected || ai.state.catalogLoading} className="text-[13px] font-medium text-[#007aff] transition-colors hover:text-[#005bb5] hover:underline disabled:cursor-not-allowed disabled:text-[#86868b]">{ai.state.catalogLoading ? "读取中…" : "拉取模型"}</button>
+            <button type="button" onClick={() => void ai.refreshModels()} disabled={!selected || ai.state.catalogLoading} className="text-[13px] font-medium text-[var(--haven-settings-primary)] transition-colors hover:text-[#005bb5] hover:underline disabled:cursor-not-allowed disabled:text-[var(--haven-settings-muted-strong)]">{ai.state.catalogLoading ? "读取中…" : "拉取模型"}</button>
           </div>
-        </SettingRow>
-        {selected && !ai.hasAvailableModel && ai.state.catalogError && (
+        </SettingRow>}
+        {!isCreating && selected && !ai.hasAvailableModel && ai.state.catalogError && (
           <SettingRow title="模型列表" description={ai.state.catalogError.message}>
             {ai.state.catalogError.retryable
-              ? <button type="button" onClick={() => void ai.refreshModels()} className="text-[13px] font-semibold text-[#007aff]">重试</button>
-              : <span className="text-[13px] text-[#86868b]">请检查 API 地址与 API Key</span>}
+              ? <button type="button" onClick={() => void ai.refreshModels()} className="text-[13px] font-semibold text-[var(--haven-settings-primary)]">重试</button>
+              : <span className="text-[13px] text-[var(--haven-settings-muted-strong)]">请检查 API 地址与 API Key</span>}
           </SettingRow>
         )}
-        <SettingRow title="识图模型" description="能力只在 Provider 显式声明时才标注；未声明的模型显示「未声明」，不会按模型名推断。">
+        {!isCreating && !ai.state.loadError && <SettingRow title="识图模型" description="能力只在 Provider 显式声明时才标注；未声明的模型显示「未声明」，不会按模型名推断。">
           <div className="flex max-w-[420px] flex-col items-end gap-1">
             {ai.hasAvailableModel ? ai.modelOptions.map((option) => (
-              <span key={option.modelId} className="text-[11px] text-[#86868b]">{`${option.modelId} · 识图：${option.visionLabel} · 向量：${option.embeddingLabel}`}</span>
-            )) : <span className="text-[13px] font-semibold text-[#6e6e73]">{ai.unavailableModelLabel}</span>}
+              <span key={option.modelId} className="text-[11px] text-[var(--haven-settings-muted-strong)]">{`${option.modelId} · 识图：${option.visionLabel} · 向量：${option.embeddingLabel}`}</span>
+            )) : <span className="text-[13px] font-semibold text-[var(--haven-settings-muted-strong)]">{ai.unavailableModelLabel}</span>}
           </div>
-        </SettingRow>
+        </SettingRow>}
       </SettingsGroup>
       {ai.state.saveError && (
         <div role="alert" className="mb-4 flex items-center justify-between gap-3 rounded-2xl border border-[#d70015]/15 bg-[#fff1f0] px-4 py-3 text-xs text-[#d70015]">
           <span>{ai.state.saveError.message}</span>
           <div className="flex shrink-0 items-center gap-3">
-            {ai.state.saveError.retryable && <button type="button" onClick={() => void ai.refreshModels()} className="font-semibold text-[#007aff]">重试</button>}
-            <button type="button" onClick={ai.dismissSaveError} className="font-medium text-[#6e6e73]">关闭</button>
+            {/*
+              重试只在"重试真的会重做那件事"时出现。这里曾经把它接到「拉取模型」上：
+              用户点"重试"，看到的是一次网络请求和一份新目录，而真正失败的写入仍然没有
+              发生。凭据写入不可重试（密钥原文按设计不留存），因此那种失败只给"关闭"。
+            */}
+            {ai.canRetrySaveError && <button type="button" onClick={() => void ai.retrySaveError()} disabled={ai.state.saving} className="font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50">重试</button>}
+            <button type="button" onClick={ai.dismissSaveError} className="font-medium text-[var(--haven-settings-muted-strong)]">关闭</button>
           </div>
         </div>
       )}
       <div className="flex items-center justify-end gap-3">
-        {selected && <button type="button" onClick={() => { void ai.deleteProfile().then((ok) => showNotice(ok ? "已删除配置并清除其 API Key" : "删除失败，请重试")) }} className="text-[13px] font-medium text-[#d70015]">删除配置</button>}
-        <button type="button" onClick={() => void ai.refreshModels()} disabled={!selected || ai.state.catalogLoading} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[#1d1d1f] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#2c2c2e] disabled:cursor-not-allowed disabled:opacity-50">测试连接</button>
+        {selected && !isCreating && <button type="button" onClick={() => { void ai.deleteProfile().then((ok) => { if (ok) { setDraft(null); setApiKeyDraft(""); setIsKeyEditorOpen(false) } showNotice(ok ? mockMode ? "已从浏览器预览移除该配置（Mock/预览）：没有删除本机数据库记录，也没有触碰系统凭据管理器。" : "已删除配置并清除其 API Key" : "删除失败，请重试") }) }} disabled={ai.state.saving || isDirty || ai.state.loadError !== null} className="text-[13px] font-medium text-[#d70015] disabled:cursor-not-allowed disabled:opacity-50">删除配置</button>}
+        {!isCreating && <button type="button" onClick={() => void ai.refreshModels()} disabled={!selected || ai.state.catalogLoading || ai.state.loadError !== null} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[#1d1d1f] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#2c2c2e] disabled:cursor-not-allowed disabled:opacity-50">测试连接</button>}
       </div>
-      <ExternalAgentAccessSettings showNotice={showNotice} />
-    </>
-  )
-}
-
-function UpdateSettings({ showNotice }: { showNotice: (message: string) => void }) {
-  const { info, loading: infoLoading } = useAppInfo()
-  const updater = useUpdater()
-  const statusLabel = updater.status === "checking"
-    ? "正在检查更新…"
-    : updater.status === "available"
-      ? `发现版本 ${updater.result?.availableVersion ?? "新版本"}`
-      : updater.status === "installing"
-        ? "正在下载并安装…"
-        : updater.status === "up_to_date"
-          ? "已是最新版本"
-          : updater.status === "error"
-            ? "检查失败，可重试"
-            : "尚未检查"
-
-  const runCheck = async () => {
-    const ok = await updater.check()
-    if (ok && updater.result?.status === "up_to_date") showNotice("当前已是最新版本")
-  }
-
-  const runInstall = async () => {
-    const ok = await updater.install()
-    if (ok) showNotice("更新已启动，应用将由系统安装器接管")
-  }
-
-  return (
-    <>
-      <SettingsIntro section="Updates" title="更新" description="应用更新与 Source Pack 更新相互独立。更新包必须通过签名校验，安装前不会修改本地媒体和数据库。" />
-      <SettingsGroup title="版本">
-        <SettingRow title="栖阅应用" description="当前安装版本"><span className="text-sm font-semibold text-[#1d1d1f]">{infoLoading ? "读取中…" : info?.appVersion ?? "当前版本不可用"}</span></SettingRow>
-        <SettingRow title="Source Pack" description="来源包版本与最后更新时间"><span className="text-sm font-semibold text-[#1d1d1f]">{infoLoading ? "读取中…" : info?.sourcePackVersion ?? "未配置"}</span></SettingRow>
-        <SettingRow title="更新策略" description="下载后由官方签名校验，Windows 使用被动安装模式。"><span className="text-sm font-semibold text-[#6e6e73]">启动时检查 · 安装前确认</span></SettingRow>
-      </SettingsGroup>
-      <div className="rounded-3xl border border-black/[0.07] bg-white px-5 py-[16px] shadow-sm">
-        <div className="flex items-center justify-between gap-4">
-          <div><p className="text-sm font-semibold">检查更新</p><p className="mt-1 text-xs text-[#86868b]">{statusLabel}</p></div>
-          <div className="flex items-center gap-2">
-            {updater.status === "available" && <button type="button" onClick={() => void runInstall()} className="inline-flex h-[36px] items-center justify-center gap-[8px] rounded-full bg-[#34c759] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#2eaf4f] disabled:cursor-not-allowed disabled:opacity-50">安装更新</button>}
-            <button type="button" onClick={() => void runCheck()} disabled={updater.status === "checking" || updater.status === "installing"} className="inline-flex h-[36px] items-center justify-center gap-[8px] rounded-full bg-[#007aff] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#006fe6] disabled:cursor-not-allowed disabled:opacity-50"><RefreshCw className="h-[16px] w-[16px]" />{updater.status === "error" ? "重试" : "检查更新"}</button>
-          </div>
-        </div>
-        {updater.result?.status === "available" && <div className="mt-4 rounded-2xl bg-[#f5f5f7] px-4 py-3 text-xs leading-5 text-[#6e6e73]"><p className="font-semibold text-[#1d1d1f]">{updater.result.availableVersion} 可用</p>{updater.result.releaseNotes && <p className="mt-1 whitespace-pre-wrap">{updater.result.releaseNotes}</p>}</div>}
-        {updater.error && <div role="alert" className="mt-4 flex items-center justify-between gap-3 rounded-2xl border border-[#d70015]/15 bg-[#fff1f0] px-4 py-3 text-xs text-[#d70015]"><span>{updater.error.message || "更新服务暂时不可用"}</span><button type="button" onClick={() => void runCheck()} className="shrink-0 font-semibold text-[#007aff]">重试</button></div>}
-      </div>
+      <ExternalAgentAccessSettings showNotice={showNotice} registerReloader={registerReloader} />
     </>
   )
 }
@@ -3133,107 +4933,25 @@ function PrivacySettings({ form, showNotice }: { form: SettingsFormController; s
       <div className="mb-7 flex gap-3 rounded-3xl border border-[#34a853]/20 bg-[#edf8f0] p-5"><Shield className="mt-0.5 h-5 w-5 shrink-0 text-[#248a3d]" /><div><p className="text-sm font-semibold text-[#216e32]">本地优先已启用</p><p className="mt-1 text-xs leading-5 text-[#4f7659]">栖阅不要求中心化账号。媒体历史、进度、收藏、标记和设置默认只写入本机。</p></div></div>
       <SettingsFormStatusBar form={form} onReset={() => form.resetToDefaults()} />
       <SettingsFormError form={form} />
-      <SettingsGroup title="网络" description="配置本机发出的网络请求行为，如代理与跟踪限制。">
-        <SettingRow title="代理模式" description="当前版本尚未提供独立的 Artwork/Provider 代理策略。"><SelectControl value="系统代理 · 当前版本不可用" options={["系统代理 · 当前版本不可用"]} onChange={() => undefined} ariaLabel="代理模式" disabled /></SettingRow>
-        <SettingRow title="限制网络跟踪" description="当前版本尚未接入统一出站策略消费者。"><Toggle checked={false} onChange={() => undefined} label="限制网络跟踪" disabled /></SettingRow>
-      </SettingsGroup>
-      <SettingsGroup title="本地行为">
+      <SettingsGroup title="本地行为" features={["privacy.searchHistory", "privacy.playbackHistory"]}>
         <SettingRow title="搜索历史" description="关闭后不再记录新的搜索词；已有记录不会自动删除。"><Toggle checked={value.searchHistory} onChange={(checked) => form.change({ section: "privacy", searchHistory: checked })} label="搜索历史" /></SettingRow>
         <SettingRow title="播放与阅读历史" description="关闭后不再记录新的播放或阅读打开记录；已有历史不会自动删除，清除操作仍单独生效。"><Toggle checked={value.playbackHistory} onChange={(checked) => form.change({ section: "privacy", playbackHistory: checked })} label="播放与阅读历史" /></SettingRow>
-        <SettingRow title="网络诊断信息" description="当前版本没有统一诊断数据消费者。"><Toggle checked={false} onChange={() => undefined} label="网络诊断信息" disabled /></SettingRow>
-        <SettingRow title="日志保留时间" description="当前版本没有独立的日志清理设置消费者。"><SelectControl value="当前版本不可用" options={["当前版本不可用"]} onChange={() => undefined} ariaLabel="日志保留时间" disabled /></SettingRow>
       </SettingsGroup>
       <SettingsGroup title="数据操作" description="只清理明确的技术缓存或搜索词，不会删除离线资源、原始媒体、进度、标记或收藏。">
-        <SettingRow title="清除搜索历史" danger><button type="button" disabled={action !== null} onClick={() => void runClearSearchHistory()} className="rounded-full px-3 py-[8px] text-xs font-semibold text-[#d70015] hover:bg-[#d70015]/[0.06] disabled:cursor-not-allowed disabled:opacity-50">{action === "search-history" ? "清除中…" : "清除"}</button></SettingRow>
-        <SettingRow title="清除 Artwork 缓存" description="只删除已登记的海报/Artwork 技术缓存；下次联网请求会自动重建。" danger><button type="button" disabled={action !== null} onClick={() => void runClearArtworkCache()} className="rounded-full px-3 py-[8px] text-xs font-semibold text-[#d70015] hover:bg-[#d70015]/[0.06] disabled:cursor-not-allowed disabled:opacity-50">{action === "artwork-cache" ? "清除中…" : "清除"}</button></SettingRow>
-        <SettingRow title="清除全部本地数据" description="包括设置、历史、进度和标记，不会删除用户原始媒体文件。该高风险操作尚未开放。" danger><button type="button" disabled className="rounded-full bg-[#fff1f0] px-3 py-[8px] text-xs font-semibold text-[#d70015] disabled:cursor-not-allowed disabled:opacity-50">当前版本不可用</button></SettingRow>
+        <SettingRow title="清除搜索历史" danger><button type="button" disabled={action !== null} onClick={() => void runClearSearchHistory()} className="rounded-full px-3 py-[8px] text-xs font-semibold text-[var(--haven-settings-danger)] hover:bg-[var(--haven-settings-danger-06)] disabled:cursor-not-allowed disabled:opacity-50">{action === "search-history" ? "清除中…" : "清除"}</button></SettingRow>
+        <SettingRow title="清除 Artwork 缓存" description="只删除已登记的海报/Artwork 技术缓存；下次联网请求会自动重建。" danger><button type="button" disabled={action !== null} onClick={() => void runClearArtworkCache()} className="rounded-full px-3 py-[8px] text-xs font-semibold text-[var(--haven-settings-danger)] hover:bg-[var(--haven-settings-danger-06)] disabled:cursor-not-allowed disabled:opacity-50">{action === "artwork-cache" ? "清除中…" : "清除"}</button></SettingRow>
       </SettingsGroup>
-      {actionError && <div role="alert" className="mx-2 rounded-2xl border border-[#d70015]/15 bg-[#fff1f0] px-4 py-3 text-[13px] text-[#d70015]">{actionError}</div>}
+      {actionError && <div role="alert" className="mx-2 rounded-2xl border border-[var(--haven-settings-danger-15)] bg-[var(--haven-settings-danger-surface)] px-4 py-3 text-[13px] text-[var(--haven-settings-danger)]">{actionError}</div>}
     </>
   )
 }
 
-const APP_DIRECTORY_KINDS: AppDirectoryKindDto[] = ["data", "logs", "cache"]
-
-function AboutSettings() {
-  const { info, loading, error, opening, openError, reload, openDirectory } = useAppInfo()
-  const { push } = useNotice()
-  const directoryByKind = new Map(info?.directories.map((directory) => [directory.kind, directory]))
-  const versionLabel = loading
-    ? "正在读取应用信息..."
-      : info
-        ? `${info.appVersion} · ${info.buildChannel}`
-        : "当前版本不可用"
-
-  useEffect(() => {
-    if (!openError) return
-    push({
-      kind: "error",
-      title: "无法打开目录",
-      message: openError.dto.userMessage,
-      code: openError.code,
-      retryable: openError.retryable,
-      dedupeKey: `about-directory:${openError.code}`,
-    })
-  }, [openError, push])
-
-  return (
-    <>
-      <SettingsIntro section="About" title="关于栖阅" description="版本、开源许可、数据位置和项目边界。" />
-      <div className="flex flex-col gap-5 rounded-3xl border border-black/[0.07] bg-white p-6 shadow-[0_12px_32px_rgba(0,0,0,0.05)] sm:flex-row sm:items-center">
-        <div className="flex h-[112px] w-[112px] shrink-0 items-center justify-center overflow-hidden rounded-3xl border border-black/[0.07] bg-white"><img src="/logo.png" alt="栖阅 Haven 项目 Logo" className="h-full w-full object-contain p-[8px]" /></div>
-        <div className="flex-1"><p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#007aff]">Haven</p><h3 className="mt-[8px] text-2xl font-semibold">栖阅</h3><p className="mt-[8px] text-sm leading-6 text-[#6e6e73]">让所有故事，在一个地方继续。</p><p className="mt-3 text-xs text-[#86868b]">版本 {versionLabel}</p></div>
-        <span className="inline-flex h-[32px] min-w-[112px] items-center justify-center rounded-[16px] bg-[#1d1d1f] px-[16px] text-[12px] font-semibold leading-none text-white">本机应用</span>
-      </div>
-
-      {error && (
-        <div className="flex items-center justify-between gap-4 rounded-2xl border border-[#ff3b30]/20 bg-[#ff3b30]/[0.06] px-4 py-3 text-sm text-[#b42318]">
-          <span>{error.message || "应用信息暂时不可用"}</span>
-          <button type="button" onClick={() => void reload()} className="shrink-0 font-semibold text-[#007aff]">重试</button>
-        </div>
-      )}
-
-      <SettingsGroup title="项目与许可">
-        <SettingRow title="Source Pack 版本"><span className="text-sm font-semibold">{info?.sourcePackVersion ?? (loading ? "读取中..." : "未配置")}</span></SettingRow>
-        <SettingRow title="IPC 协议版本"><span className="font-mono text-xs text-[#6e6e73]">{info?.protocolVersion ?? (loading ? "读取中..." : "不可用")}</span></SettingRow>
-        <SettingRow title="数据库版本"><span className="font-mono text-xs text-[#6e6e73]">{info?.databaseVersion ?? (loading ? "读取中..." : "不可用")}</span></SettingRow>
-        <SettingRow title="项目许可证" description="Haven 自有代码采用 MIT 协议；第三方清单中的依赖仍受各自许可证约束。"><span className="text-xs font-semibold text-[#1d1d1f]">{info?.appLicense ?? (loading ? "读取中..." : "MIT")}</span></SettingRow>
-        <SettingRow title="第三方许可" description="摘要来自构建时登记的 THIRD_PARTY_NOTICES.md，不在 IPC 中传输完整正文。">
-          <div className="max-w-[360px] text-right text-xs text-[#6e6e73]">
-            {info?.thirdPartyNotices.length ? info.thirdPartyNotices.map((notice) => <div key={`${notice.name}-${notice.license}`}>{notice.name} · {notice.license}</div>) : loading ? "读取中..." : "暂无已登记摘要"}
-          </div>
-        </SettingRow>
-      </SettingsGroup>
-
-      <SettingsGroup title="本地目录" description="目录由桌面端固定注入；页面不会接收或拼接任意路径。">
-        {APP_DIRECTORY_KINDS.map((kind) => {
-          const directory = directoryByKind.get(kind)
-          const label = directory?.displayName ?? (kind === "data" ? "应用数据目录" : kind === "logs" ? "日志目录" : "缓存目录")
-          return (
-            <SettingRow key={kind} title={label}>
-              <div className="flex max-w-[420px] items-center gap-3">
-                <span className="font-mono text-right text-xs text-[#6e6e73]">{directory?.displayPath ?? (loading ? "读取中..." : "不可用")}</span>
-                <button type="button" disabled={!directory?.canOpen || opening === kind} onClick={() => void openDirectory(kind)} className="inline-flex shrink-0 items-center gap-1 text-xs font-semibold text-[#007aff] disabled:cursor-not-allowed disabled:text-[#a1a1a6]">
-                  {opening === kind ? "打开中..." : "打开"}
-                  <Folder className="h-3.5 w-3.5" />
-                </button>
-              </div>
-            </SettingRow>
-          )
-        })}
-      </SettingsGroup>
-
-      <ErrorReportSettings />
-
-      {openError && <p className="px-2 text-xs text-[#b42318]">{openError.message || "无法打开目录，请稍后重试"}</p>}
-    </>
-  )
-}
-
-function ErrorReportSettings() {
+export function ErrorReportSettings() {
   const report = useErrorReport()
   const { push } = useNotice()
   const mode = getHavenClientMode()
+  const [confirming, setConfirming] = useState(false)
+  const busy = report.loading || report.action !== null || confirming
 
   const generate = async () => {
     const success = await report.generate()
@@ -3243,8 +4961,13 @@ function ErrorReportSettings() {
   }
 
   const confirm = async () => {
-    const success = await report.confirm()
-    if (success) push({ kind: "success", title: "已确认诊断报告", message: "现在可以导出报告或打开 GitHub Issue 预填页面。", dedupeKey: "error-report-confirmed" })
+    setConfirming(true)
+    try {
+      const success = await report.confirm()
+      if (success) push({ kind: "success", title: "已确认诊断报告", message: "现在可以导出报告或打开 GitHub Issue 预填页面。", dedupeKey: "error-report-confirmed" })
+    } finally {
+      setConfirming(false)
+    }
   }
 
   const copySummary = async () => {
@@ -3276,41 +4999,41 @@ function ErrorReportSettings() {
   }
 
   return (
-    <SettingsGroup title="错误报告" description="主动生成脱敏诊断摘要，帮助在 GitHub 报告问题。报告不会自动上传，提交前由你最终确认。">
-      <SettingRow title="报告等级" description="基础包含版本、系统和稳定错误码；标准增加协议状态；详细增加经过脱敏检查的有限诊断行。">
-        <select value={report.level} onChange={(event) => report.setLevel(event.target.value as typeof report.level)} className="rounded-xl border border-black/[0.1] bg-white px-3 py-2 text-xs font-semibold text-[#1d1d1f] outline-none focus:border-[#007aff]" aria-label="报告等级">
+    <SystemSettingsSection feature="about.diagnostics" title="诊断与反馈" description="先预览脱敏报告，确认后再导出或前往 GitHub 反馈。">
+      <SystemSettingsRow title="报告等级" description="基础包含版本与错误码；标准增加协议状态；详细增加脱敏后的诊断信息。">
+        <select value={report.level} disabled={busy} onChange={(event) => report.setLevel(event.target.value as typeof report.level)} className="system-settings__select" aria-label="报告等级">
           {(Object.keys(ERROR_REPORT_LEVEL_LABELS) as Array<typeof report.level>).map((value) => <option key={value} value={value}>{ERROR_REPORT_LEVEL_LABELS[value]}</option>)}
         </select>
-      </SettingRow>
-      <SettingRow title="生成脱敏报告" description={mode === "mock" ? "Browser Mock 只展示报告流程，不写入本地文件或打开外部页面。" : "报告 ID 会在本次流程中保持有效一段时间，过期后需重新生成。"}>
-        <button type="button" onClick={() => void generate()} disabled={report.loading} className="rounded-full bg-[#007aff] px-4 py-2 text-xs font-semibold text-white transition hover:bg-[#006fe6] disabled:cursor-not-allowed disabled:opacity-50">{report.loading ? "生成中…" : "生成预览"}</button>
-      </SettingRow>
+      </SystemSettingsRow>
+      <SystemSettingsRow title="生成脱敏报告" description={mode === "mock" ? "浏览器中可预览报告流程；文件导出与问题反馈请在桌面应用中进行。" : "报告保存在本机，生成后不会自动上传。"}>
+        <button type="button" onClick={() => void generate()} disabled={busy} className="system-settings__button system-settings__button--primary"><FileText size={15} aria-hidden="true" />{report.loading ? "生成中…" : "生成预览"}</button>
+      </SystemSettingsRow>
 
       {report.preview && (
-        <div className="mx-2 mt-2 rounded-2xl border border-[#007aff]/15 bg-[#f5f9ff] p-4">
-          <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="system-settings__report" aria-busy={busy}>
+          <div className="system-settings__report-heading">
             <div>
-              <p className="text-sm font-semibold text-[#1d1d1f]">脱敏检查：{report.preview.redaction.status === "passed" ? "通过" : "未通过"}</p>
-              <p className="mt-1 font-mono text-[11px] text-[#6e6e73]">报告 ID：{report.preview.reportId}</p>
+              <h4>脱敏检查：{report.preview.redaction.status === "passed" ? "通过" : "未通过"}</h4>
+              <p className="system-settings__description system-settings__mono">报告 ID：{report.preview.reportId}</p>
             </div>
-            <span className="rounded-full bg-[#dff3e5] px-2.5 py-1 text-[11px] font-semibold text-[#216e32]">未包含敏感数据</span>
+            <span>{report.confirmed ? "已确认报告" : "等待你检查并确认"}</span>
           </div>
-          <dl className="mt-3 grid gap-2 text-xs text-[#6e6e73] sm:grid-cols-3">
-            <div><dt>Haven 版本</dt><dd className="mt-0.5 font-semibold text-[#1d1d1f]">{report.preview.appVersion}</dd></div>
-            <div><dt>系统</dt><dd className="mt-0.5 font-semibold text-[#1d1d1f]">{report.preview.operatingSystem}</dd></div>
-            <div><dt>运行模式</dt><dd className="mt-0.5 font-semibold text-[#1d1d1f]">{report.preview.runtimeMode}</dd></div>
+          <dl className="system-settings__report-meta">
+            <div><dt>Haven 版本</dt><dd>{report.preview.appVersion}</dd></div>
+            <div><dt>系统</dt><dd>{report.preview.operatingSystem}</dd></div>
+            <div><dt>运行模式</dt><dd>{report.preview.runtimeMode}</dd></div>
           </dl>
-          <p className="mt-3 rounded-xl bg-white px-3 py-2 text-xs leading-5 text-[#3a3a3c]">{report.preview.errorSummary}</p>
-          {report.preview.details?.diagnosticLines.length ? <ul className="mt-3 space-y-1 font-mono text-[11px] text-[#6e6e73]">{report.preview.details.diagnosticLines.map((line) => <li key={line}>· {line}</li>)}</ul> : null}
-          <div className="mt-3 flex flex-wrap gap-2">
-            <button type="button" onClick={() => void copySummary()} className="inline-flex items-center gap-1.5 rounded-full border border-black/[0.1] bg-white px-3 py-2 text-xs font-semibold text-[#3a3a3c] hover:border-black/[0.2]"><Clipboard className="h-3.5 w-3.5" />复制错误摘要</button>
-            {!report.confirmed ? <button type="button" onClick={() => void confirm()} disabled={report.preview.redaction.status !== "passed"} className="inline-flex items-center gap-1.5 rounded-full bg-[#1d1d1f] px-3 py-2 text-xs font-semibold text-white hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"><Check className="h-3.5 w-3.5" />我已检查，允许使用</button> : <span className="inline-flex items-center gap-1.5 rounded-full bg-[#dff3e5] px-3 py-2 text-xs font-semibold text-[#216e32]"><Check className="h-3.5 w-3.5" />已确认</span>}
+          <p className="system-settings__report-summary">{report.preview.errorSummary}</p>
+          {report.preview.details?.diagnosticLines.length ? <ul className="system-settings__report-lines system-settings__mono">{report.preview.details.diagnosticLines.map((line) => <li key={line}>{line}</li>)}</ul> : null}
+          <div className="system-settings__button-group">
+            <button type="button" disabled={busy} onClick={() => void copySummary()} className="system-settings__button system-settings__button--secondary"><Clipboard size={14} aria-hidden="true" />复制错误摘要</button>
+            {!report.confirmed ? <button type="button" onClick={() => void confirm()} disabled={busy || report.preview.redaction.status !== "passed"} className="system-settings__button system-settings__button--primary"><Check size={14} aria-hidden="true" />{confirming ? "确认中…" : "我已检查，允许使用"}</button> : <span className="system-settings__description">已确认，可以导出或反馈</span>}
           </div>
-          {report.confirmed && <div className="mt-3 flex flex-wrap gap-2 border-t border-[#007aff]/10 pt-3"><button type="button" onClick={() => void runExport()} disabled={report.action !== null} className="rounded-full bg-[#007aff] px-3 py-2 text-xs font-semibold text-white hover:bg-[#006fe6] disabled:cursor-not-allowed disabled:opacity-50">{report.action === "export" ? "导出中…" : "导出诊断报告"}</button><button type="button" onClick={() => void runIssue()} disabled={report.action !== null} className="rounded-full border border-[#007aff]/25 bg-white px-3 py-2 text-xs font-semibold text-[#007aff] hover:bg-[#eef6ff] disabled:cursor-not-allowed disabled:opacity-50">{report.action === "issue" ? "打开中…" : "打开 GitHub Issue"}</button></div>}
-          {report.actionResult && <p className="mt-3 text-xs font-semibold text-[#216e32]">{report.actionResult.status === "exported" ? "报告导出成功，可在 Reports 文件夹中找到。" : "Issue 预填页面已打开，请在 GitHub 页面最终提交。"}</p>}
-          {report.error && <div role="alert" className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#d70015]/15 bg-[#fff1f0] px-3 py-2 text-xs text-[#b42318]"><span>{report.error.dto.userMessage}</span>{report.error.retryable && <button type="button" onClick={retry} className="font-semibold text-[#007aff]">重试</button>}</div>}
+          {report.confirmed && <div className="system-settings__report-followup system-settings__button-group"><button type="button" onClick={() => void runExport()} disabled={busy} className="system-settings__button system-settings__button--primary">{report.action === "export" ? "导出中…" : "导出诊断报告"}</button><button type="button" onClick={() => void runIssue()} disabled={busy} className="system-settings__button system-settings__button--secondary">{report.action === "issue" ? "打开中…" : "打开 GitHub Issue"}</button></div>}
+          {report.actionResult && <p role="status" className="system-settings__report-result">{report.actionResult.status === "exported" ? "报告导出成功，可在 Reports 文件夹中找到。" : "Issue 预填页面已打开，请在 GitHub 页面最终提交。"}</p>}
         </div>
       )}
-    </SettingsGroup>
+      {report.error && <div role="alert" className="system-settings__error"><TriangleAlert size={17} aria-hidden="true" /><span>{report.error.dto.userMessage}</span>{report.error.retryable && <button type="button" onClick={retry} disabled={busy} className="system-settings__button system-settings__button--secondary">重试</button>}</div>}
+    </SystemSettingsSection>
   )
 }

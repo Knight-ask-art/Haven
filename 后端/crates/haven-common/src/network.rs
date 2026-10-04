@@ -20,6 +20,14 @@ use url::Url;
 /// endpoint has to be a reviewed decision (see `docs/architecture/AI_SYSTEM.md`
 /// §7), not a side effect of adding the AI slice. Spelling the context out
 /// means that decision cannot be inherited silently by this caller.
+///
+/// One thing this policy deliberately does **not** encode: confidentiality.
+/// It accepts `http` because it is shared with callers that have no credential
+/// to protect, so the AI provider path adds its own HTTPS requirement on top
+/// (`haven_domain::ai_provider::validate_endpoint` for saving,
+/// `AiProviderProfile::require_secure_endpoint` before any outbound request).
+/// Weakening this shared policy, or relaxing that extra rule, would send
+/// `Authorization: Bearer` credentials and user content over plaintext.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpUrlPolicy {
     SourceEndpoint,

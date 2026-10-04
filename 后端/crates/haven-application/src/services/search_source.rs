@@ -910,6 +910,7 @@ mod tests {
                 enabled: true,
                 health: crate::wire::SourceHealthDto::Ok,
                 endpoint_configured: true,
+                credential_configured: false,
                 last_checked: None,
                 latency_ms: Some(200),
                 success_rate: Some(0.9),
@@ -1007,6 +1008,7 @@ mod tests {
             enabled: true,
             health: crate::wire::SourceHealthDto::Unknown,
             endpoint_configured: false,
+            credential_configured: false,
             last_checked: None,
             latency_ms: None,
             success_rate: None,
@@ -1018,6 +1020,88 @@ mod tests {
             ..metadata
         };
         assert!(source_requires_endpoint(&stream));
+    }
+
+    #[test]
+    fn endpoint_gate_covers_user_registered_feed_sources() {
+        // 用户登记的 RSS/Atom 订阅源属于 `custom_` 家族：没有端点就不能搜索。
+        let feed = crate::wire::SourceDescriptorDto {
+            source_id: "custom_feed_0123456789ab".into(),
+            display_name: "我的订阅".into(),
+            kinds: vec![
+                crate::wire::SourceKindDto::Search,
+                crate::wire::SourceKindDto::OnlineRead,
+            ],
+            categories: vec![crate::wire::SourceCategoryDto::Periodical],
+            mode: crate::wire::SourceModeDto::Single,
+            notes: "用户登记的订阅源".into(),
+            enabled: true,
+            health: crate::wire::SourceHealthDto::Unknown,
+            endpoint_configured: false,
+            credential_configured: false,
+            last_checked: None,
+            latency_ms: None,
+            success_rate: None,
+        };
+        assert!(source_requires_endpoint(&feed));
+        let custom_opds = crate::wire::SourceDescriptorDto {
+            source_id: "custom_0123456789ab".into(),
+            ..feed
+        };
+        assert!(source_requires_endpoint(&custom_opds));
+    }
+
+    /// 分发回归：`custom_feed_` 同时满足 `custom_` 与 `custom_feed_` 两个前缀。
+    /// 最长前缀路由必须把订阅源交给订阅源参与者，而不是自定义 OPDS 参与者。
+    #[test]
+    fn feed_family_dispatches_by_longest_prefix_not_to_custom_opds() {
+        struct PrefixParticipant {
+            id: &'static str,
+            prefix: &'static str,
+        }
+
+        #[async_trait::async_trait]
+        impl SearchSourceParticipant for PrefixParticipant {
+            fn source_id(&self) -> &str {
+                self.id
+            }
+
+            fn id_prefix(&self) -> Option<&str> {
+                Some(self.prefix)
+            }
+
+            async fn search(
+                &self,
+                _query: &str,
+                _limit: u32,
+                _is_cancelled: &(dyn Fn() -> bool + Send + Sync),
+            ) -> Result<Vec<WorkCardDto>, AppError> {
+                Ok(Vec::new())
+            }
+        }
+
+        let participants: Vec<Arc<dyn SearchSourceParticipant>> = vec![
+            Arc::new(PrefixParticipant {
+                id: "custom_",
+                prefix: "custom_",
+            }),
+            Arc::new(PrefixParticipant {
+                id: "custom_feed_",
+                prefix: "custom_feed_",
+            }),
+        ];
+
+        let feed = resolve_participant("custom_feed_0123456789ab", &participants)
+            .expect("订阅源必须有分发目标");
+        assert_eq!(
+            feed.id_prefix(),
+            Some("custom_feed_"),
+            "订阅源不得被自定义 OPDS 前缀截走"
+        );
+        let opds = resolve_participant("custom_0123456789ab", &participants)
+            .expect("自定义 OPDS 书源必须有分发目标");
+        assert_eq!(opds.id_prefix(), Some("custom_"));
+        assert!(resolve_participant("mangadex", &participants).is_none());
     }
 
     #[tokio::test]
@@ -1049,6 +1133,7 @@ mod tests {
                 enabled: true,
                 health: crate::wire::SourceHealthDto::Ok,
                 endpoint_configured: true,
+                credential_configured: false,
                 last_checked: None,
                 latency_ms: Some(50),
                 success_rate: Some(0.9),
@@ -1063,6 +1148,7 @@ mod tests {
                 enabled: true,
                 health: crate::wire::SourceHealthDto::Ok,
                 endpoint_configured: true,
+                credential_configured: false,
                 last_checked: None,
                 latency_ms: Some(5000),
                 success_rate: Some(0.9),

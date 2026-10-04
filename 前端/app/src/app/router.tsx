@@ -1,6 +1,7 @@
 import React from "react"
 import { createBrowserRouter, Navigate, useParams } from "react-router"
 import type { RouteObject } from "react-router"
+import { AppRoot } from "./layouts/AppRoot"
 import { AppShell } from "./layouts/AppShell"
 import { LibraryPage } from "@/features/library/pages/LibraryPage"
 import { LibraryBrowsePage } from "@/features/library/pages/LibraryBrowsePage"
@@ -48,99 +49,121 @@ if (import.meta.env.DEV || import.meta.env.VITE_SPIKE_ENABLED === "1") {
   }
 }
 
+// AI 工作台当前仅供在开发环境中评审 Figma 交互稿；没有模型接入，也不会进入生产路由。
+let aiWorkbenchPreviewRoute: RouteObject | null = null
+if (import.meta.env.DEV) {
+  const AIWorkbenchPreviewPage = React.lazy(() =>
+    import("@/features/ai/pages/AIWorkbenchPreviewPage").then(({ AIWorkbenchPreviewPage: Page }) => ({ default: Page })),
+  )
+  aiWorkbenchPreviewRoute = {
+    path: "dev/ai-workbench-preview",
+    element: <React.Suspense fallback={null}><AIWorkbenchPreviewPage /></React.Suspense>,
+  }
+}
+
 /**
  * 应用路由表（不导出）。
  *
  * 路由测试通过下面已经导出的 `router` 实例读它（`router.routes`），而不是让本文件
  * 为了可测试性再导出一个非组件常量：那会给本文件多加一条
  * react-refresh/only-export-components 警告，而 `router` 已经足够读到同一份配置。
+ *
+ * 顶层是一个**无路径的根布局**（AppRoot）：它挂在所有主要路由之上，因此外观运行时
+ * 不会因为进入 AppShell 之外的沉浸式路由（player / reader / comic / article）而被
+ * 卸载。它是无路径布局，所以这些路由的 URL 与「不套壳层」的事实都不变。
  */
 const appRoutes: RouteObject[] = [
-  ...spikeRoute ? [spikeRoute] : [],
   {
-    path: "player/:mediaItemId",
-    element: <PlayerPage />
-  },
-  {
-    path: "reader/:mediaItemId",
-    element: <BookReaderPage />
-  },
-  {
-    path: "comic/:mediaItemId",
-    element: <ComicReaderPage />
-  },
-  {
-    path: "article/:mediaItemId",
-    element: <ArticleReaderPage />
-  },
-  {
-    path: "/",
-    element: <AppShell />,
+    element: <AppRoot />,
     children: [
+      ...spikeRoute ? [spikeRoute] : [],
       {
-        index: true,
-        element: <HomePage />
+        path: "player/:mediaItemId",
+        element: <PlayerPage />
       },
       {
-        path: "library",
-        element: <LibraryPage />
+        path: "reader/:mediaItemId",
+        element: <BookReaderPage />
       },
       {
-        path: "library/movies",
-        element: <Navigate replace to="/library/browse/video" />
+        path: "comic/:mediaItemId",
+        element: <ComicReaderPage />
       },
       {
-        path: "library/browse/:category",
-        element: <LibraryBrowsePage />
+        path: "article/:mediaItemId",
+        element: <ArticleReaderPage />
       },
       {
-        path: "work/:workId",
-        element: <MediaDetailPage />
-      },
-      {
-        path: "edition/:editionId",
-        element: <EditionDetailPage />
-      },
-      {
-        // 报刊层级浏览：按 Work 身份读取真实期刊树，入口在作品详情页。
-        path: "periodical/:workId",
-        element: <PeriodicalTreePage />
-      },
-      {
-        path: "media/:id",
-        element: <LegacyMediaRedirect />
-      },
-      {
-        path: "footprints",
-        element: <FootprintsPage />
-      },
-      {
-        path: "footprints/history",
-        element: <HistoryPage />
-      },
-      {
-        path: "search",
-        element: <SearchPage />
-      },
-      {
-        path: "downloads",
-        element: <DownloadsPage />
-      },
-      {
-        path: "settings/:section?",
-        element: <SettingsPage />
-      },
-      {
-        path: "*",
-        element: (
-          <div className="p-[32px] max-w-6xl mx-auto flex flex-col items-center justify-center h-[60vh] space-y-[16px]">
-            <div className="w-[64px] h-[64px] rounded-2xl bg-muted flex items-center justify-center mb-[16px]">
-              <span className="text-2xl">🚧</span>
-            </div>
-            <h1 className="text-2xl font-bold">页面不存在 (404)</h1>
-            <p className="text-muted-foreground">您访问的页面（如旧版的收藏/标记）已被移除或重构。</p>
-          </div>
-        )
+        path: "/",
+        element: <AppShell />,
+        children: [
+          ...aiWorkbenchPreviewRoute ? [aiWorkbenchPreviewRoute] : [],
+          {
+            index: true,
+            element: <HomePage />
+          },
+          {
+            path: "library",
+            element: <LibraryPage />
+          },
+          {
+            path: "library/movies",
+            element: <Navigate replace to="/library/browse/video" />
+          },
+          {
+            path: "library/browse/:category",
+            element: <LibraryBrowsePage />
+          },
+          {
+            path: "work/:workId",
+            element: <MediaDetailPage />
+          },
+          {
+            path: "edition/:editionId",
+            element: <EditionDetailPage />
+          },
+          {
+            // 报刊层级浏览：按 Work 身份读取真实期刊树，入口在作品详情页。
+            path: "periodical/:workId",
+            element: <PeriodicalTreePage />
+          },
+          {
+            path: "media/:id",
+            element: <LegacyMediaRedirect />
+          },
+          {
+            path: "footprints",
+            element: <FootprintsPage />
+          },
+          {
+            path: "footprints/history",
+            element: <HistoryPage />
+          },
+          {
+            path: "search",
+            element: <SearchPage />
+          },
+          {
+            path: "downloads",
+            element: <DownloadsPage />
+          },
+          {
+            path: "settings/:section?",
+            element: <SettingsPage />
+          },
+          {
+            path: "*",
+            element: (
+              <div className="p-[32px] max-w-6xl mx-auto flex flex-col items-center justify-center h-[60vh] space-y-[16px]">
+                <div className="w-[64px] h-[64px] rounded-2xl bg-muted flex items-center justify-center mb-[16px]">
+                  <span className="text-2xl">🚧</span>
+                </div>
+                <h1 className="text-2xl font-bold">页面不存在 (404)</h1>
+                <p className="text-muted-foreground">您访问的页面（如旧版的收藏/标记）已被移除或重构。</p>
+              </div>
+            )
+          }
+        ]
       }
     ]
   }

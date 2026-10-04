@@ -3,11 +3,11 @@
 
 import { toHavenError } from "@/lib/ipc/errors";
 import { getHavenClient } from "@/lib/ipc/runtime";
-import type { UpdaterCheckResult, UpdaterInstallResult } from "@/lib/ipc/client";
+import type { UpdaterCheckResult, UpdaterInstallResult, UpdaterProgress } from "@/lib/ipc/client";
 
 export interface UpdaterGateway {
   check(): Promise<UpdaterCheckResult>;
-  install(): Promise<UpdaterInstallResult>;
+  install(onProgress?: (progress: UpdaterProgress) => void): Promise<UpdaterInstallResult>;
 }
 
 export const updaterGateway: UpdaterGateway = {
@@ -18,9 +18,9 @@ export const updaterGateway: UpdaterGateway = {
       throw toHavenError(error);
     }
   },
-  async install() {
+  async install(onProgress) {
     try {
-      return await getHavenClient().updateInstall();
+      return await getHavenClient().updateInstall(onProgress);
     } catch (error) {
       throw toHavenError(error);
     }

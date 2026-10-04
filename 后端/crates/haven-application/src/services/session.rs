@@ -19,13 +19,18 @@ use haven_domain::enums::{
 use haven_domain::ids::{MediaItemId, ResourceId, SourceId, StorageLocationId};
 
 use crate::mapper::progress::progress_summary;
+use crate::services::cloud_storage::service::CloudStorageService;
+use crate::services::cloud_storage::session_policy::cloud_session_binding_matches;
+use crate::services::cloud_storage::state::CloudObjectSnapshot;
 use crate::services::comic::{ComicPageService, PreparedComicPage};
 use crate::services::comic_page_identity::ComicPageIdentityService;
 use crate::services::ports::{
     RemoteByteRange, RemoteSessionBody, RemoteSessionPort, SessionOpenPorts,
 };
 use crate::services::progress::comic_progress_subject::ComicProgressSubjectService;
-use crate::services::source_import::{source_key_for_id, validate_remote_source_object};
+use crate::services::source_import::{
+    FEED_SOURCE_KEY, source_key_for_id, validate_remote_source_object,
+};
 use crate::wire::{ProgressSummaryDto, SessionEngineDto, SessionOpenRequest, SubtitleFormatDto};
 
 /// A prepared session is server-only state.  In particular, its paths and
@@ -74,6 +79,12 @@ pub enum PreparedSessionSource {
         source_key: String,
         remote_id: String,
     },
+    /// 云盘只读 PDF：携带**完整 pinned 快照**（对象绑定 / 目录绑定 / 账户代际 /
+    /// 位置状态），不是单个对象 ID。断开、重新连接或目录变更都会让快照与当前事实
+    /// 不一致，旧会话因此自动失效，而不是凭一个过期的 ID 继续读取。
+    CloudObject {
+        snapshot: Box<CloudObjectSnapshot>,
+    },
 }
 
 #[derive(Clone)]
@@ -83,6 +94,7 @@ pub struct SessionService {
     comic_page_identities: Option<ComicPageIdentityService>,
     comic_progress_subjects: Option<ComicProgressSubjectService>,
     remote: Option<Arc<dyn RemoteSessionPort>>,
+    cloud_storage: Option<Arc<CloudStorageService>>,
 }
 
 impl SessionService {
@@ -93,6 +105,7 @@ impl SessionService {
             comic_page_identities: None,
             comic_progress_subjects: None,
             remote: None,
+            cloud_storage: None,
         }
     }
 
@@ -110,7 +123,16 @@ impl SessionService {
             comic_page_identities: None,
             comic_progress_subjects: None,
             remote: Some(remote),
+            cloud_storage: None,
         }
+    }
+
+    /// Attach the controlled cloud-drive consumer. Without it, cloud-backed
+    /// objects fail closed: they are never reinterpreted as local files and
+    /// never receive an online session.
+    pub fn with_cloud_storage(mut self, cloud_storage: Arc<CloudStorageService>) -> Self {
+        self.cloud_storage = Some(cloud_storage);
+        self
     }
 
     /// Attach the production page-identity synchronizer. Keeping this as an
@@ -160,6 +182,32 @@ impl SessionService {
             .as_ref()
             .ok_or_else(remote_session_unavailable)?;
         provider.read(source_key, remote_id, range).await
+    }
+
+    /// Fetch one bounded body for a prepared cloud-drive PDF session. The
+    /// caller must already have checked the session owner in the registry;
+    /// this method only accepts the immutable pinned snapshot captured at open
+    /// and revalidates it before and after the provider read.
+    pub async fn read_cloud(
+        &self,
+        prepared: &PreparedSession,
+        range: Option<RemoteByteRange>,
+    ) -> Result<RemoteSessionBody, AppError> {
+        let PreparedSessionSource::CloudObject { snapshot } = &prepared.source else {
+            return Err(cloud_session_unavailable());
+        };
+        if prepared.engine != SessionEngineDto::Reader
+            || prepared.media_type != MediaType::Document
+            || prepared.resource_type != ResourceType::PublicationFile
+            || !is_pdf_mime(prepared.mime_type.as_deref())
+        {
+            return Err(cloud_session_unavailable());
+        }
+        let service = self
+            .cloud_storage
+            .as_ref()
+            .ok_or_else(cloud_session_unavailable)?;
+        service.read_pdf(&snapshot.object.id, snapshot, range).await
     }
 
     /// Validate the hierarchy, engine and resource policy, then return
@@ -220,7 +268,10 @@ impl SessionService {
         let mut rejected = None;
         let mut resolved = Vec::new();
         for resource in candidates {
-            match self.resolve_local_resource(&resource).await? {
+            match self
+                .resolve_local_resource(&resource, media_item.id, media_item.media_type)
+                .await?
+            {
                 CandidateResolution::Eligible {
                     storage_location_id,
                     canonical_root,
@@ -246,6 +297,10 @@ impl SessionService {
                         source_key,
                         remote_id,
                     },
+                }),
+                CandidateResolution::Cloud(snapshot) => resolved.push(ResolvedCandidate {
+                    resource,
+                    resolution: ResolvedResource::Cloud(snapshot),
                 }),
                 CandidateResolution::Skipped => {
                     // 远端流等非本地候选：静默跳过，不污染 rejected 语义。
@@ -296,6 +351,7 @@ impl SessionService {
                     ..
                 } => discover_local_subtitles(canonical_root, canonical_file),
                 ResolvedResource::Remote { .. } => Vec::new(),
+                ResolvedResource::Cloud { .. } => Vec::new(),
             }
         } else {
             Vec::new()
@@ -324,6 +380,12 @@ impl SessionService {
                     source_key,
                     remote_id,
                 },
+            ),
+            ResolvedResource::Cloud(snapshot) => (
+                None,
+                None,
+                None,
+                PreparedSessionSource::CloudObject { snapshot },
             ),
         };
         let mut prepared = PreparedSession {
@@ -378,6 +440,8 @@ impl SessionService {
     async fn resolve_local_resource(
         &self,
         resource: &Resource,
+        media_item_id: MediaItemId,
+        media_type: MediaType,
     ) -> Result<CandidateResolution, AppError> {
         // SourceObject 只能通过固定来源映射进入 Remote session；它不会被
         // 解释为路径，也不会被转换为 URL。Provider 在真正读取时再次校验
@@ -441,10 +505,43 @@ impl SessionService {
         else {
             return Ok(CandidateResolution::Rejected(resource_unavailable()));
         };
-        if storage.provider_type != StorageProviderType::Local {
-            return Ok(CandidateResolution::Rejected(security_denied(
-                "资源存储策略不允许由本地 Session 打开",
-            )));
+        match storage.provider_type {
+            StorageProviderType::Local => {}
+            StorageProviderType::GoogleDrive => {
+                // 云盘只读 PDF：只有完整绑定（位置 + 目录 + 账户代际 + 对象行）与
+                // Resource 行逐字段一致时才交给受控云盘会话；任何一处不一致都拒绝，
+                // 而不是退回本地文件语义。
+                let ResourceLocator::StorageObject { object_id, .. } = &resource.locator else {
+                    return Ok(CandidateResolution::Rejected(security_denied(
+                        "云盘绑定校验失败",
+                    )));
+                };
+                let Some(service) = &self.cloud_storage else {
+                    return Ok(CandidateResolution::Rejected(cloud_resource_unavailable()));
+                };
+                let snapshot = match service.object_snapshot(object_id).await {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => return Ok(CandidateResolution::Rejected(err)),
+                };
+                if !cloud_session_binding_matches(
+                    Some(media_item_id),
+                    media_type,
+                    resource,
+                    &storage,
+                    &snapshot,
+                ) {
+                    return Ok(CandidateResolution::Rejected(security_denied(
+                        "云盘绑定校验失败",
+                    )));
+                }
+                return Ok(CandidateResolution::Cloud(Box::new(snapshot)));
+            }
+            // 其余非本地存储（WebDAV / OneDrive）在本切片没有读取实现：保持拒绝。
+            StorageProviderType::WebDav | StorageProviderType::OneDrive => {
+                return Ok(CandidateResolution::Rejected(security_denied(
+                    "资源存储策略不允许由本地 Session 打开",
+                )));
+            }
         }
         if !matches!(
             storage.status,
@@ -639,6 +736,8 @@ enum CandidateResolution {
         source_key: String,
         remote_id: String,
     },
+    /// 已通过完整绑定校验的云盘对象快照。
+    Cloud(Box<CloudObjectSnapshot>),
     /// 非本地候选（如远端流 Http 资源）：不属于本地 Session 的管辖，
     /// 也不是策略违规；全部 Skip 时按"本地无候选"返回 RESOURCE_NOT_FOUND，
     /// 由前端回退受控流会话（stream_open，契约 §36.4）。
@@ -662,6 +761,7 @@ enum ResolvedResource {
         source_key: String,
         remote_id: String,
     },
+    Cloud(Box<CloudObjectSnapshot>),
 }
 
 pub(crate) fn engine_compatible(engine: SessionEngineDto, media_type: MediaType) -> bool {
@@ -867,6 +967,24 @@ fn remote_session_unavailable() -> AppError {
     )
 }
 
+fn cloud_session_unavailable() -> AppError {
+    AppError::new(
+        "SOURCE_UNAVAILABLE",
+        ErrorKind::Network,
+        "云盘正文当前不可用，请重试",
+        true,
+    )
+}
+
+fn cloud_resource_unavailable() -> AppError {
+    AppError::new(
+        "RESOURCE_UNAVAILABLE",
+        ErrorKind::Storage,
+        "云盘资源当前不可用",
+        false,
+    )
+}
+
 pub(crate) fn remote_session_compatible(
     resource_type: ResourceType,
     mime_type: Option<&str>,
@@ -876,8 +994,17 @@ pub(crate) fn remote_session_compatible(
         "mangadex" => {
             resource_type == ResourceType::ComicArchive && is_comic_archive_mime(mime_type)
         }
+        // 自托管漫画库（Komga/Kavita）与 MangaDex 共用同一条受控漫画页会话：
+        // 在线逐页读取由 `RemoteComicPageProvider` 提供，这里只投影「可以打开」。
+        crate::services::source_import::KOMGA_SOURCE_KEY
+        | crate::services::source_import::KAVITA_SOURCE_KEY => {
+            resource_type == ResourceType::ComicArchive && is_comic_archive_mime(mime_type)
+        }
         "arxiv" => resource_type == ResourceType::PublicationFile && is_pdf_mime(mime_type),
-        "europepmc" | "wikisource" => {
+        // 用户登记的 RSS/Atom 订阅源与固定文章来源共用同一份受控 HTML 会话
+        // （`FeedProvider` 实现 `RemoteSessionPort`）。这里的来源键必须与
+        // provider 路由器保持一致，否则已落库的订阅文章永远拿不到在线会话 URI。
+        "europepmc" | "wikisource" | FEED_SOURCE_KEY => {
             resource_type == ResourceType::ArticleSnapshot && is_html_mime(mime_type)
         }
         "opds_gutenberg" => {
@@ -1353,6 +1480,78 @@ mod tests {
         ));
     }
 
+    /// 回归（RSS/Atom Task 1）：用户登记的订阅源文章以 `SourceObject` 落库后，
+    /// `session.open(Article)` 必须解析为受控远端会话，而不是因为没有本地文件
+    /// 返回 RESOURCE_NOT_FOUND —— 那会让前端永远拿不到在线阅读入口。
+    #[tokio::test]
+    async fn feed_article_prepares_remote_session_for_online_reading() {
+        let f = fixture(None).await;
+        let mut item = MediaItemRepository::get(&*f.repos, f.item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        item.media_type = MediaType::Article;
+        f.repos.media_item.save(&item).await.unwrap();
+        for resource in f
+            .repos
+            .resource
+            .list_by_media_item(f.item_id)
+            .await
+            .unwrap()
+        {
+            f.repos.resource.delete(resource.id).await.unwrap();
+        }
+
+        let source_id = crate::services::source_import::stable_source_id(FEED_SOURCE_KEY).unwrap();
+        let remote_id = crate::services::source_import::feed_remote_id(
+            "custom_feed_0123456789ab",
+            &crate::services::source_import::feed_entry_digest("post-1"),
+        )
+        .unwrap();
+        let now = haven_common::UtcMillis(3);
+        f.repos
+            .resource
+            .save(&Resource {
+                id: ResourceId::new(),
+                media_item_id: f.item_id,
+                resource_type: ResourceType::ArticleSnapshot,
+                source_id: Some(source_id),
+                storage_location_id: None,
+                locator: ResourceLocator::SourceObject {
+                    source_id,
+                    remote_id: remote_id.clone(),
+                },
+                mime_type: Some("text/html; charset=utf-8".into()),
+                size: None,
+                hash: None,
+                availability: Availability::Available,
+                availability_source: AvailabilitySource::User,
+                modified_ms: None,
+                fingerprint_first: None,
+                fingerprint_last: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+
+        let prepared = f
+            .service
+            .prepare(SessionOpenRequest {
+                media_item_id: f.item_id.to_string(),
+                engine: SessionEngineDto::Article,
+            })
+            .await
+            .unwrap();
+        assert!(prepared.storage_location_id.is_none());
+        assert!(prepared.canonical_file.is_none());
+        assert!(matches!(
+            prepared.source,
+            PreparedSessionSource::Remote { source_key, remote_id: prepared_id, .. }
+                if source_key == FEED_SOURCE_KEY && prepared_id == remote_id
+        ));
+    }
+
     #[test]
     fn remote_session_requires_a_provider_reader_for_each_resource_kind() {
         assert!(remote_session_compatible(
@@ -1369,6 +1568,23 @@ mod tests {
             ResourceType::ArticleSnapshot,
             Some("text/html"),
             "wikisource"
+        ));
+        // 用户登记的订阅源必须与固定文章来源一样被在线会话准入，否则已导入的
+        // 订阅文章会永远停在 `can_online_read=false`。
+        assert!(remote_session_compatible(
+            ResourceType::ArticleSnapshot,
+            Some("text/html; charset=utf-8"),
+            FEED_SOURCE_KEY
+        ));
+        assert!(!remote_session_compatible(
+            ResourceType::ArticleSnapshot,
+            Some("application/pdf"),
+            FEED_SOURCE_KEY
+        ));
+        assert!(!remote_session_compatible(
+            ResourceType::PublicationFile,
+            Some("application/epub+zip"),
+            FEED_SOURCE_KEY
         ));
         assert!(remote_session_compatible(
             ResourceType::PublicationFile,

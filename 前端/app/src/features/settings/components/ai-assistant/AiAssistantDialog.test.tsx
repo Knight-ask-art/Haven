@@ -1,13 +1,14 @@
 // @vitest-environment jsdom
 //
 // 栖伴（Haven 智能体，FE-AI-ASSISTANT-001）测试：
-// - 只覆盖本次白名单内的组件，不修改既有测试。
+// - 覆盖栖伴及其设置入口，不调用真实网络或桌面能力。
 // - 用户可见名称是「栖伴」；组件名/文件名 ai-assistant / AiAssistantDialog 保持不变。
+// - 生产设置页将 AI 工作台嵌入 AI 设置导航，下面也覆盖该正式入口和设置覆盖层。
 // - 安全边界：组件不发起网络请求、不写 Settings、不写 localStorage、不调用 Tauri；
 //   只有读写回调同时提供时才走真实应用层，否则一律本地预览，
 //   本地预览草稿永远不会进入写入回调。
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { MemoryRouter, Route, Routes } from "react-router"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
@@ -17,6 +18,7 @@ import type {
   AgentSettingsProposalApproveRequest,
   AgentSettingsProposalCreateRequest,
   AgentSettingsProposalRejectRequest,
+  AiSettingsRecommendationGenerateRequest,
 } from "@/lib/ipc/generated/wire"
 import {
   AiAssistantDialog,
@@ -28,21 +30,31 @@ import {
   type AiAssistantDialogProps,
 } from "./AiAssistantDialog"
 
-// 「智能功能」分区的模型空态回归：当前没有真实的 Provider 模型发现/能力列表，
-// 默认模型与识图模型都只能显示「无可用模型」并保持禁用，不得出现示例模型名。
+// 设置分区的可用性回归：没有真实绑定/消费者的能力不再以禁用控件或路线图文案出现在
+// 生产设置页上；栖伴的模型服务尚未接入，因此它的入口在生产设置页上同样不存在。
 vi.mock("@/lib/ipc/runtime", () => ({
   getHavenClientMode: () => "mock",
-  getHavenClient: () => {
-    throw new Error("AI 分区不读取 IPC；本用例只覆盖模型选择控件的空态")
-  },
+  // 「智能功能」分区会真的读 Provider 列表与 Broker 状态：空态用例必须提供一个
+  // 真实的"没有 Provider / 默认关闭"响应，读取错误不能被伪装成空配置。
+  getHavenClient: () => ({
+    aiProviderProfileList: async () => ({ schemaVersion: 1, profiles: [] }),
+    agentBrokerStatus: async () => ({
+      schemaVersion: 1,
+      status: "disabled",
+      endpoint: null,
+      reason: null,
+    }),
+  }),
   isTauriRuntime: () => false,
 }))
-// 分区表单与模型空态无关：只保留一个空控制器，避免用例依赖各分区快照形状。
+// 分区表单与智能体逻辑无关：只保留一个空控制器，避免用例依赖各分区快照形状。
+// displayValue 给一份合法的 general 快照——分区展示层各取所需（形状不匹配时回落到
+// 该分区自己的默认值），页面因此可以正常渲染，而不需要为每个分区造假数据。
 vi.mock("@/features/settings/lib/useSettingsForm", () => ({
   useSettingsForm: () => ({
     section: "general",
     state: { status: "loading" },
-    displayValue: undefined,
+    displayValue: { section: "general", launchPage: "home", restoreSession: false, language: "zh_cn", notifications: true },
     isLoading: true,
     isSaving: false,
     isDirty: false,
@@ -56,6 +68,15 @@ vi.mock("@/features/settings/lib/useSettingsForm", () => ({
   }),
 }))
 
+/**
+ * 打开对话框。
+ *
+ * 注意本文件顶部的 `@/lib/ipc/runtime` mock 只为「智能功能分区」的空态提供一份
+ * **不含任何 Agent 命令**的响应（`aiProviderProfileList` + `agentBrokerStatus`）：
+ * 它不是一份完整的 `HavenClient`。因此凡是断言"本地预览（零写入）"语义的用例，
+ * 都必须显式传 `previewOnly`，而不是让组件把那份残缺客户端当成应用层。
+ * 需要真实应用层的用例一律显式注入 `client`。
+ */
 function renderDialog(props: Partial<AiAssistantDialogProps> = {}) {
   const onOpenChange = vi.fn()
   const view = render(
@@ -180,6 +201,13 @@ function fakeClient(overrides: Partial<AiAssistantAgentClient> = {}): AiAssistan
   } as AiAssistantAgentClient
 }
 
+/** 手动放行的 promise：用来把一次请求**卡在在途状态**，再制造并发事件。 */
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((complete) => { resolve = complete })
+  return { promise, resolve }
+}
+
 /** 快捷操作是确定性入口：点击后固定进入 proposal 状态。 */
 async function openProposal() {
   fireEvent.click(screen.getByRole("button", { name: "优化阅读" }))
@@ -269,7 +297,7 @@ describe("栖伴纯逻辑", () => {
 })
 
 describe("栖伴 Dialog 语义与分区导航", () => {
-  it("使用 portal + role=dialog，默认展示对话与预置短对话", () => {
+  it("使用 portal + role=dialog，默认只显示真实欢迎语，不预置用户对话", () => {
     renderDialog()
 
     const dialog = screen.getByRole("dialog")
@@ -278,7 +306,7 @@ describe("栖伴 Dialog 语义与分区导航", () => {
     expect(screen.getByRole("heading", { name: "栖伴" })).toBeTruthy()
 
     expect(screen.getByText(/我是栖伴，栖阅的 Haven 智能体/)).toBeTruthy()
-    expect(screen.getByText("阅读时正文偏小，排版也有点挤。")).toBeTruthy()
+    expect(screen.queryByText("阅读时正文偏小，排版也有点挤。")).toBeNull()
 
     expect(screen.getByRole("tab", { name: "对话" }).getAttribute("aria-selected")).toBe("true")
     expect(screen.getByRole("tabpanel")).toBeTruthy()
@@ -370,7 +398,7 @@ describe("栖伴 Dialog 语义与分区导航", () => {
 
 describe("栖伴提案状态机", () => {
   it("快捷操作进入 proposal 状态：三项改动、作用域、digest 与三个操作", async () => {
-    renderDialog()
+    renderDialog({ previewOnly: true })
     await openProposal()
     const region = proposalRegion()
 
@@ -388,7 +416,7 @@ describe("栖伴提案状态机", () => {
   })
 
   it("输入框可以输入并提交，提交后同样进入 proposal 状态", async () => {
-    renderDialog()
+    renderDialog({ previewOnly: true })
     fireEvent.change(screen.getByLabelText("描述你想要的设置改动"), {
       target: { value: "把阅读排版调舒服一点" },
     })
@@ -396,6 +424,16 @@ describe("栖伴提案状态机", () => {
 
     expect(screen.getByText("把阅读排版调舒服一点")).toBeTruthy()
     await waitFor(() => expect(proposalRegion()).toBeTruthy())
+  })
+
+  it("前端按后端的 2000 字符上限阻止过长请求", () => {
+    renderDialog()
+    fireEvent.change(screen.getByLabelText("描述你想要的设置改动"), {
+      target: { value: "字".repeat(2_001) },
+    })
+
+    expect(screen.getByText("最多 2000 个字符")).toBeTruthy()
+    expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(true)
   })
 
   it("非阅读意图的输入只得到能力说明，不生成提案", async () => {
@@ -409,7 +447,7 @@ describe("栖伴提案状态机", () => {
   })
 
   it("轨迹在批准前停在运行/等待态，批准后才推进到完成", async () => {
-    renderDialog({ traceStepMs: 100_000 })
+    renderDialog({ previewOnly: true, traceStepMs: 100_000 })
     fireEvent.click(screen.getByRole("button", { name: "优化阅读" }))
     fireEvent.click(screen.getByRole("tab", { name: "执行轨迹" }))
 
@@ -418,7 +456,7 @@ describe("栖伴提案状态机", () => {
     expect(screen.queryByRole("button", { name: "批准并应用" })).toBeNull()
     cleanup()
 
-    renderDialog()
+    renderDialog({ previewOnly: true })
     await openProposal()
     fireEvent.click(screen.getByRole("tab", { name: "执行轨迹" }))
     expect(screen.getByLabelText("读取设置快照：已完成")).toBeTruthy()
@@ -430,7 +468,7 @@ describe("栖伴提案状态机", () => {
 
   it("拒绝是零写入：没有回执，也没有任何存储写入", async () => {
     const setItem = vi.spyOn(Storage.prototype, "setItem")
-    renderDialog()
+    renderDialog({ previewOnly: true })
     await openProposal()
 
     fireEvent.click(within(proposalRegion()).getByRole("button", { name: "拒绝" }))
@@ -510,7 +548,7 @@ describe("栖伴提案状态机", () => {
     expect(within(region).getByText("基线版本 rev-41")).toBeTruthy()
     expect(within(region).queryByText(/本地预览/)).toBeNull()
     // 真实客户端不带 Mock 标识。
-    expect(within(region).queryByText(/Mock\/预览 · 非真实模型输出/)).toBeNull()
+    expect(within(region).getByText("固定建议 · 非模型生成")).toBeTruthy()
 
     fireEvent.click(within(region).getByRole("button", { name: "批准并应用" }))
 
@@ -767,18 +805,81 @@ describe("栖伴提案状态机", () => {
   })
 })
 
+describe("设置页 AI 工作台导航与设置入口", () => {
+  function renderSection(section: string) {
+    return render(
+      <MemoryRouter initialEntries={[`/settings/${section}`]}>
+        <Routes>
+          <Route path="/settings/:section" element={<SettingsPage />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+  }
+
+  it("导航提供 AI 工作台，但不展示 Registry 未登记的同步入口", () => {
+    renderSection("overview")
+
+    const nav = screen.getByRole("navigation", { name: "设置分类" })
+    expect(nav.textContent).toContain("AI 工作台")
+    expect(nav.textContent).toContain("智能")
+    expect(within(nav).queryByRole("button", { name: /同步与备份/ })).toBeNull()
+    expect(nav.textContent).not.toContain("规划中")
+  })
+
+  it("AI 工作台是主视图，齿轮入口打开 Provider 与 Agent 设置", async () => {
+    renderSection("ai")
+
+    expect(await screen.findByRole("button", { name: "新会话" })).toBeTruthy()
+    expect(screen.getByRole("button", { name: "提案历史" })).toBeTruthy()
+    expect(screen.getByRole("button", { name: "执行记录" })).toBeTruthy()
+    expect(screen.queryByRole("dialog")).toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: "AI 设置" }))
+    expect(await screen.findByRole("dialog", { name: "AI 设置" })).toBeTruthy()
+    expect(screen.getByText("API 连接")).toBeTruthy()
+    expect(screen.getByText("本机内置技能")).toBeTruthy()
+  })
+
+  it("停用的分区路由回落到总览，而不是渲染占位页", () => {
+    renderSection("sync")
+
+    // 总览既出现在左侧导航，也是正文标题；两条都说明这一页真的是总览。
+    expect(screen.getAllByText("总览").length).toBeGreaterThan(1)
+    expect(document.body.textContent).not.toContain("当前版本不可用")
+    expect(document.body.textContent).not.toContain("尚未接入")
+  })
+
+  it("阅读分区保留全局工作台导航，但不显示工作台工具栏或浮层", () => {
+    renderSection("reading")
+
+    const nav = screen.getByRole("navigation", { name: "设置分类" })
+    expect(nav.textContent).toContain("AI 工作台")
+    expect(screen.queryByRole("button", { name: "新会话" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "AI 设置" })).toBeNull()
+    expect(screen.queryByRole("dialog")).toBeNull()
+  })
+
+  it("总览分区同样没有栖伴入口或浮层", () => {
+    renderSection("overview")
+    expect(screen.queryByRole("button", { name: "新会话" })).toBeNull()
+    expect(screen.queryByRole("dialog")).toBeNull()
+  })
+})
+
 describe("设置页智能功能分区的模型空态", () => {
   // 这些用例保持**只读**：它们断言的是「没有任何 Provider 配置」时的诚实空态。
   // 写入路径（新建配置、单向提交 API Key）由 `pages/SettingsPage.ai-provider.test.tsx`
   // 覆盖 —— 那里有独立的模块注册表，不会与这里的 Mock 单例状态互相污染。
   function renderAiSettings() {
-    return render(
+    const view = render(
       <MemoryRouter initialEntries={["/settings/ai"]}>
         <Routes>
           <Route path="/settings/:section" element={<SettingsPage />} />
         </Routes>
       </MemoryRouter>,
     )
+    fireEvent.click(screen.getByRole("button", { name: "AI 设置" }))
+    return view
   }
 
   it("默认模型只显示「无可用模型」，对应选择控件禁用", async () => {
@@ -799,10 +900,6 @@ describe("设置页智能功能分区的模型空态", () => {
 
     fireEvent.click(trigger)
     expect(screen.queryByRole("listbox")).toBeNull()
-
-    for (const fakeModel of ["gpt-4o", "claude-compatible", "vision-compatible"]) {
-      expect(document.body.textContent).not.toContain(fakeModel)
-    }
   })
 
   it("不再预置示例 API 地址，没有配置时不提供可编辑的地址输入", async () => {
@@ -815,5 +912,314 @@ describe("设置页智能功能分区的模型空态", () => {
     // 没有 profile 就没有可写的凭据目标：API Key 行整体不渲染。
     expect(screen.queryByLabelText("API Key")).toBeNull()
     expect(screen.queryByText("已配置")).toBeNull()
+  })
+})
+
+/**
+ * 真实 Provider 路径（原生 Skill 切片）。
+ *
+ * 这一组用例的存在理由只有一个：证明「栖伴会把你输入的目标交给**你配置的**
+ * Provider」，而不是用页面侧的确定性模板冒充模型输出。
+ *
+ * 三条必须同时成立，缺一条这个切片就没有落地：
+ * 1. 用户原话、选中的 Provider 配置、设置上下文锚点逐字进入请求；
+ * 2. 没有选中配置时**如实失败**，不退回模板；
+ * 3. Mock / 纯预览路径永远不碰真实 Provider。
+ */
+describe("栖伴真实 Provider 路径", () => {
+  const PROFILE_ID = "gw-primary"
+  const MODEL_ID = "reader-chat-1"
+
+  /** 后端 `AiSettingsRecommendationDto` 的最小自洽投影。 */
+  function recommendationDto() {
+    return {
+      schemaVersion: 1 as const,
+      profileId: PROFILE_ID,
+      modelId: MODEL_ID,
+      explanation: null,
+      recommendedPatch: { fontSize: "large" as const },
+      proposal: proposalDto(),
+    }
+  }
+
+  /**
+   * 记录每一次真实 Provider 请求。
+   *
+   * 参数类型直接用生成物里的 `AiSettingsRecommendationGenerateRequest`（已含 `userIntent`）：
+   * mock 只把它原样收下来，断言时再按实际载荷取值。
+   */
+  function providerClient() {
+    const seen: Array<Record<string, unknown>> = []
+    const generate = vi.fn(async (request: AiSettingsRecommendationGenerateRequest) => {
+      seen.push(request as unknown as Record<string, unknown>)
+      return recommendationDto()
+    })
+    const client = fakeClient({
+      aiSettingsRecommendationGenerate:
+        generate as unknown as AiAssistantAgentClient["aiSettingsRecommendationGenerate"],
+    })
+    return { client, generate, seen }
+  }
+
+  it("用户原话、选中的 Provider 与上下文锚点原样进入请求，且不使用模板", async () => {
+    const { client, generate, seen } = providerClient()
+    renderDialog({ client, profileId: PROFILE_ID })
+
+    const userIntent = "把正文字号调大一级，不要改动其他项目"
+    fireEvent.change(screen.getByLabelText("描述你想要的设置改动"), { target: { value: userIntent } })
+    fireEvent.click(screen.getByRole("button", { name: "发送" }))
+    await screen.findByRole("button", { name: "批准并应用" })
+
+    expect(generate).toHaveBeenCalledTimes(1)
+    expect(seen).toHaveLength(1)
+    // 用户实际提交的那句话，而不是任何模板常量。
+    expect(seen[0].userIntent).toBe(userIntent)
+    expect(seen[0].profileId).toBe(PROFILE_ID)
+    // 锚点逐字来自最近一次上下文读取：改一个字符服务端就会 fail-closed。
+    const context = agentContext()
+    expect(seen[0].contextId).toBe(context.contextId)
+    expect(seen[0].contextHash).toBe(context.contextHash)
+    expect(seen[0].baseRevision).toBe(context.revision)
+    // 确定性模板的唯一入口是 agentSettingsProposalCreate；这里必须一次都没走。
+    expect(client.agentSettingsProposalCreate).not.toHaveBeenCalled()
+  })
+
+  it("真实路径的卡片标明实际调用的模型，digest 仍由服务端给出", async () => {
+    const { client } = providerClient()
+    renderDialog({ client, profileId: PROFILE_ID })
+
+    await openProposal()
+
+    const region = proposalRegion()
+    // 模型名是「这份建议确实来自模型」的可核对证据，不是装饰。
+    expect(within(region).getByText(`模型 ${MODEL_ID}`)).toBeTruthy()
+    expect(within(region).getByText(new RegExp(PROPOSAL_DIGEST))).toBeTruthy()
+    // 真实路径不得出现任何 Mock/预览 标识。
+    expect(within(region).queryByText(/Mock\/预览/)).toBeNull()
+    expect(within(region).queryByText(/本地预览/)).toBeNull()
+
+    // 批准只提交提案 ID 与界面显示的那份 digest。
+    fireEvent.click(within(region).getByRole("button", { name: "批准并应用" }))
+    await waitFor(() => expect(client.agentSettingsProposalApprove).toHaveBeenCalledTimes(1))
+    expect(client.agentSettingsProposalApprove).toHaveBeenCalledWith({
+      proposalId: PROPOSAL_ID,
+      expectedDigest: PROPOSAL_DIGEST,
+    })
+  })
+
+  it("没有选中 Provider 配置时如实失败，既不调用模型也不退回模板", async () => {
+    const { client, generate } = providerClient()
+    // 不传 profileId：设置页里还没有选中任何配置。
+    renderDialog({ client })
+
+    fireEvent.click(screen.getByRole("button", { name: "优化阅读" }))
+
+    const alert = await screen.findByRole("alert", { name: "提案生成失败" })
+    expect(alert.textContent).toContain("尚未选择 AI 服务配置")
+    expect(generate).not.toHaveBeenCalled()
+    expect(client.agentSettingsProposalCreate).not.toHaveBeenCalled()
+    expect(screen.queryByRole("region", { name: "设置提案" })).toBeNull()
+  })
+
+  it("畸形建议载荷 fail closed：既不生成提案，也不把它渲染成模型输出", async () => {
+    // 对话框接受的是**结构化**客户端类型（`AiAssistantAgentClient`），注入的实现、
+    // 测试替身或将来另一个 HavenClient 都可能返回畸形载荷。回归点：跨 Provider 边界的
+    // 返回值必须在**消费点**再守一次，而不是只信 TypeScript 的返回类型断言。
+    for (const [label, override] of [
+      // 少了 modelId：无法证明这份建议来自哪次模型调用。
+      ["missing-model", { modelId: undefined }],
+      // 声明是另一个配置返回的：把它当成"本次调用结果"会张冠李戴。
+      ["profile-mismatch", { profileId: "another-profile" }],
+      // 提案不是 pending：渲染出去会让人以为还有一条待批准提案。
+      ["not-pending", { proposal: { ...proposalDto(), status: "applied" as const } }],
+    ] as const) {
+      const generate = vi.fn(async () => ({ ...recommendationDto(), ...override }))
+      const client = fakeClient({
+        aiSettingsRecommendationGenerate:
+          generate as unknown as AiAssistantAgentClient["aiSettingsRecommendationGenerate"],
+      })
+      renderDialog({ client, profileId: PROFILE_ID })
+
+      fireEvent.click(screen.getByRole("button", { name: "优化阅读" }))
+
+      const alert = await screen.findByRole("alert", { name: "提案生成失败" })
+      expect(alert.textContent, label).toContain("不符合约定格式")
+      // 也不得退回确定性模板：那会让畸形载荷看起来像一次成功的生成。
+      expect(client.agentSettingsProposalCreate, label).not.toHaveBeenCalled()
+      expect(screen.queryByRole("region", { name: "设置提案" }), label).toBeNull()
+      cleanup()
+    }
+  })
+
+  it("同一轮里切换选中的 Provider 不会重复发请求，结果仍归这一轮", async () => {
+    // 回归点：请求在途时设置页把选中配置换掉（用户点了另一个 Provider），effect 的依赖
+    // （`profileId`）会变化并重跑。没有 `issuedTurnRef` 那道闸门的话，同一次用户输入会
+    // 生成两份请求——后端可能因此落下两条 pending 提案，而用户只按了一次发送。
+    const pending = deferred<ReturnType<typeof recommendationDto>>()
+    const seen: Array<Record<string, unknown>> = []
+    const generate = vi.fn(async (request: AiSettingsRecommendationGenerateRequest) => {
+      seen.push(request as unknown as Record<string, unknown>)
+      return await pending.promise
+    })
+    const client = fakeClient({
+      aiSettingsRecommendationGenerate:
+        generate as unknown as AiAssistantAgentClient["aiSettingsRecommendationGenerate"],
+    })
+    const { rerender, onOpenChange } = renderDialog({ client, profileId: PROFILE_ID })
+
+    fireEvent.click(screen.getByRole("button", { name: "优化阅读" }))
+    await waitFor(() => expect(generate).toHaveBeenCalledTimes(1))
+
+    rerender(
+      <AiAssistantDialog
+        open
+        traceStepMs={0}
+        client={client}
+        profileId="gw-other"
+        onOpenChange={onOpenChange}
+      />,
+    )
+    // 切配置本身不得触发第二次请求。
+    expect(generate).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      pending.resolve(recommendationDto())
+    })
+
+    expect(generate).toHaveBeenCalledTimes(1)
+    expect(seen).toHaveLength(1)
+    // 请求发的是**当时**选中的那个配置；结果也照旧归这一轮，而不是被丢弃。
+    expect(seen[0].profileId).toBe(PROFILE_ID)
+    expect(await screen.findByRole("button", { name: "批准并应用" })).toBeTruthy()
+    expect(client.agentSettingsProposalCreate).not.toHaveBeenCalled()
+  })
+
+  it("请求在途时关闭浮层不会重发请求，结果照旧被记录", async () => {
+    // 回归点：关闭对话框**不是**取消。浮层只是不再渲染（组件仍然挂载，钩子照常运行），
+    // 因此：
+    // - 在途命令不得因为"界面关掉了"而被再发一次（那会落下第二条 pending 提案，而用户
+    //   只按了一次发送）；
+    // - 它的结果也不能被丢弃——重新打开时这一轮必须还在，界面从不声称一条已经发出的
+    //   命令"被取消了"。
+    const pending = deferred<ReturnType<typeof recommendationDto>>()
+    const generate = vi.fn(async () => await pending.promise)
+    const client = fakeClient({
+      aiSettingsRecommendationGenerate:
+        generate as unknown as AiAssistantAgentClient["aiSettingsRecommendationGenerate"],
+    })
+    const { rerender, onOpenChange } = renderDialog({ client, profileId: PROFILE_ID })
+
+    fireEvent.click(screen.getByRole("button", { name: "优化阅读" }))
+    await waitFor(() => expect(generate).toHaveBeenCalledTimes(1))
+
+    rerender(
+      <AiAssistantDialog
+        open={false}
+        traceStepMs={0}
+        client={client}
+        profileId={PROFILE_ID}
+        onOpenChange={onOpenChange}
+      />,
+    )
+    // 关闭本身不得触发第二次请求，也不得凭空产生一条提案。
+    expect(generate).toHaveBeenCalledTimes(1)
+    expect(client.agentSettingsProposalCreate).not.toHaveBeenCalled()
+
+    await act(async () => {
+      pending.resolve(recommendationDto())
+    })
+    expect(generate).toHaveBeenCalledTimes(1)
+    expect(client.agentSettingsProposalCreate).not.toHaveBeenCalled()
+
+    // 重新打开：这一轮的结果还在（既没有被丢弃，也没有变成第二次生成）。
+    rerender(
+      <AiAssistantDialog
+        open
+        traceStepMs={0}
+        client={client}
+        profileId={PROFILE_ID}
+        onOpenChange={onOpenChange}
+      />,
+    )
+    expect(await screen.findByRole("button", { name: "批准并应用" })).toBeTruthy()
+    expect(proposalRegion()).toBeTruthy()
+  })
+
+  it("不构成阅读排版意图的输入不会触达 Provider", async () => {
+    const { client, generate } = providerClient()
+    renderDialog({ client, profileId: PROFILE_ID })
+
+    fireEvent.change(screen.getByLabelText("描述你想要的设置改动"), {
+      target: { value: "今天天气怎么样" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "发送" }))
+
+    await screen.findByText(/我只接入了阅读排版提案/)
+    expect(generate).not.toHaveBeenCalled()
+  })
+
+  it("Mock 客户端不调用真实 Provider 路径，模板结果必须带 Mock/预览 标识", async () => {
+    const { MockHavenClient } = await import("@/lib/ipc/mock-client")
+    const mock = new MockHavenClient()
+    // Mock 实现了该方法但刻意抛错（拒绝伪造 Provider）；栖伴必须绕开它。
+    const generate = vi.spyOn(mock, "aiSettingsRecommendationGenerate")
+    renderDialog({ client: mock, profileId: PROFILE_ID })
+
+    await openProposal()
+
+    expect(generate).not.toHaveBeenCalled()
+    expect(within(proposalRegion()).getByText(/Mock\/预览 · 非真实模型输出/)).toBeTruthy()
+    // 模板没有模型参与，因此不显示任何模型行。
+    expect(within(proposalRegion()).queryByText(/^模型 /)).toBeNull()
+  })
+})
+
+describe("正式嵌入式 AI 工作台", () => {
+  it("设置入口调用真实回调，历史和执行记录均可返回对话，不提供隐藏全局导航", () => {
+    const openSettings = vi.fn()
+    renderDialog({ embedded: true, previewOnly: true, onOpenSettings: openSettings })
+    expect(screen.getByRole("heading", { name: "AI 工作台" })).toBeTruthy()
+    expect(screen.getByText("本地预览", { exact: true })).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "AI 设置" }))
+    expect(openSettings).toHaveBeenCalledTimes(1)
+    fireEvent.click(screen.getByRole("button", { name: "提案历史" }))
+    expect(screen.getByRole("button", { name: "提案历史" }).getAttribute("aria-pressed")).toBe("true")
+    fireEvent.click(screen.getByRole("button", { name: "返回对话" }))
+    expect(screen.getByLabelText("描述你想要的设置改动")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "执行记录" }))
+    expect(screen.getByRole("button", { name: "返回对话" })).toBeTruthy()
+    expect(screen.queryByRole("button", { name: /收起.*导航|隐藏.*侧栏/ })).toBeNull()
+  })
+
+  it("无设置回调时不展示可点击的死入口", () => {
+    renderDialog({ embedded: true, previewOnly: true })
+    expect((screen.getByRole("button", { name: "AI 设置" }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it("Shift+Enter 与中文输入法确认不提交，Enter 发送后清空草稿", async () => {
+    renderDialog({ embedded: true, previewOnly: true })
+    const input = screen.getByLabelText("描述你想要的设置改动") as HTMLTextAreaElement
+    fireEvent.change(input, { target: { value: "优化阅读" } })
+    fireEvent.keyDown(input, { key: "Enter", shiftKey: true })
+    expect(input.value).toBe("优化阅读")
+    expect(screen.queryByRole("region", { name: "设置提案" })).toBeNull()
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true })
+    expect(input.value).toBe("优化阅读")
+    expect(screen.queryByRole("region", { name: "设置提案" })).toBeNull()
+    fireEvent.keyDown(input, { key: "Enter" })
+    expect(input.value).toBe("")
+    expect(await screen.findByRole("region", { name: "设置提案" })).toBeTruthy()
+  })
+
+  it("超长输入有可见提示，禁用发送且不丢失草稿", () => {
+    renderDialog({ embedded: true, previewOnly: true })
+    const input = screen.getByLabelText("描述你想要的设置改动") as HTMLTextAreaElement
+    const long = "阅".repeat(2001)
+    fireEvent.change(input, { target: { value: long } })
+    expect(screen.getByText("最多 2000 个字符").className).not.toContain("sr-only")
+    expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.keyDown(input, { key: "Enter" })
+    expect(input.value).toBe(long)
+    expect(screen.queryByRole("region", { name: "设置提案" })).toBeNull()
   })
 })

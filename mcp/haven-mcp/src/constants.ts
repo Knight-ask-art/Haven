@@ -105,6 +105,14 @@ export const ERROR_CODES = {
   BRIDGE_NOT_IMPLEMENTED: "HAVEN_BRIDGE_NOT_IMPLEMENTED",
   /** 桥接调用超时。 */
   BRIDGE_TIMEOUT: "HAVEN_BRIDGE_TIMEOUT",
+  /**
+   * 调用方（MCP 客户端）取消了这次调用。
+   *
+   * 与超时分开是刻意的：超时是"我们没有等到结果"，取消是"调用方不想再等了"。两者对
+   * "能不能重试"的结论相同（取决于操作有没有副作用），但对用户是两件事，混成一个码会
+   * 让诊断信息变成误导。
+   */
+  BRIDGE_CANCELLED: "HAVEN_BRIDGE_CANCELLED",
   /** 桥接返回了不符合契约的载荷。 */
   BRIDGE_PROTOCOL_ERROR: "HAVEN_BRIDGE_PROTOCOL_ERROR",
   /** 请求的 Haven 能力在本版本未实现（例如 library_summary_read）。 */

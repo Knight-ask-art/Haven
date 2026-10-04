@@ -10,6 +10,8 @@ chrono = "0.4.45"
 haven-common = { path = "../haven-common" }
 haven-domain = { path = "../haven-domain" }
 serde = { version = "1.0.229", features = ["derive"] }
+# RSS/Atom 条目标识只以固定长度单向摘要进入候选句柄与远端身份。
+sha2 = "0.11.0"
 base64 = "0.23"
 serde_json = "1.0.151"
 # tokio：ScanService + Search 并行 + Settings JSON 文件需要 rt + rt-multi-thread + sync + time + fs。

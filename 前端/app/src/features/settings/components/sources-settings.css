@@ -1,0 +1,44 @@
+.sources-settings {
+  container-type: inline-size;
+  min-width: 0;
+  color: var(--haven-settings-foreground);
+}
+
+.sources-settings :is(button, input, select):focus-visible {
+  outline: 2px solid var(--haven-settings-primary);
+  outline-offset: 3px;
+}
+.sources-settings button:disabled { cursor: not-allowed; }
+/* 来源表单与搜索共享未聚焦轮廓；排除聚焦和禁用字段，让相应状态由原控件负责。 */
+.sources-settings :is(input, select):not(:disabled):not(:focus) { border-color: var(--haven-settings-control-border); }
+.sources-settings input::placeholder { color: var(--haven-settings-muted-strong); opacity: 1; }
+.sources-settings [role="tab"][aria-selected="true"] { border-color: var(--haven-settings-primary); }
+.sources-settings .source-catalog-header,
+.sources-settings [data-source-row] {
+  display: grid;
+  grid-template-columns: minmax(150px, 2fr) minmax(88px, .8fr) minmax(110px, 1.4fr) minmax(88px, .9fr) 76px;
+  gap: 18px;
+  padding-right: 24px;
+  padding-left: 24px;
+}
+.sources-settings [data-source-row] { min-height: 82px; padding-top: 16px; padding-bottom: 16px; }
+.sources-settings [data-source-row] > div { min-width: 0; }
+.sources-settings [data-source-row] > div:nth-child(2),
+.sources-settings [data-source-row] > div:nth-child(3),
+.sources-settings [data-source-row] > div:nth-child(4) { display: block; }
+.sources-settings [data-source-row] > div:nth-child(2) > span:first-child,
+.sources-settings [data-source-row] > div:nth-child(3) > span:first-child,
+.sources-settings [data-source-row] > div:nth-child(4) > span:first-child { display: none; }
+
+@container (max-width: 740px) {
+  .sources-settings .source-catalog-header { display: none; }
+  .sources-settings [data-source-row] { grid-template-columns: minmax(0, 1fr) 76px; gap: 8px 16px; padding: 20px; }
+  .sources-settings [data-source-row] > div:nth-child(2),
+  .sources-settings [data-source-row] > div:nth-child(3),
+  .sources-settings [data-source-row] > div:nth-child(4) { grid-column: 1; display: flex; align-items: baseline; gap: 10px; padding-left: 48px; }
+  .sources-settings [data-source-row] > div:nth-child(2) > span:first-child,
+  .sources-settings [data-source-row] > div:nth-child(3) > span:first-child,
+  .sources-settings [data-source-row] > div:nth-child(4) > span:first-child { display: inline; flex: 0 0 auto; }
+  .sources-settings [data-source-row] > div:nth-child(4) { flex-wrap: wrap; }
+  .sources-settings [data-source-row] > div:nth-child(5) { grid-column: 2; grid-row: 1 / span 4; align-self: start; }
+}

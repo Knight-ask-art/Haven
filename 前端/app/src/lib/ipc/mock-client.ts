@@ -159,7 +159,23 @@ import type {
   AiProviderProfileGetRequest,
   AiProviderProfileListResultDto,
   AiProviderProfileUpsertRequest,
+  TvboxConfigPreviewDto,
+  TvboxConfigPreviewRequest,
+  TvboxConfigSaveRequest,
+  TvboxConfigSaveResult,
 } from "./generated/wire";
+import type {
+  AgentSkillActivationWire,
+  AgentSkillListResultWire,
+  AgentSkillSetEnabledRequestWire,
+  AgentSkillStateWire,
+} from "./agent-skill-wire";
+import type {
+  McpClientConfigStatusWire,
+  McpClientConfigureRequestWire,
+  McpClientTargetStatusWire,
+  McpClientTargetWire,
+} from "./mcp-client-wire";
 import type {
   SettingsChangedDto,
   SettingsSectionWire,
@@ -174,12 +190,46 @@ import type {
   PreferenceTargetWire,
   PreferenceUpdateRequest,
   PreferenceUpdateResult,
+  AppearanceAssetImportRequestWire,
+  AppearanceAssetDeleteRequestWire,
+  AppearanceAssetDeleteResultWire,
+  AppearanceAssetWire,
+  AppearanceAssetsListRequestWire,
+  AppearanceAssetsWire,
+  HomeLayoutWire,
+  HomeLayoutMutationResultWire,
+  HomeLayoutResetRequestWire,
+  HomeLayoutSaveRequestWire,
+  HomeLayoutSnapshotWire,
+  OverviewLayoutWire,
+  OverviewLayoutMutationResultWire,
+  OverviewLayoutResetRequestWire,
+  OverviewLayoutSaveRequestWire,
+  OverviewLayoutSnapshotWire,
+  ReadingOverviewGetRequestWire,
+  ReadingOverviewWire,
 } from "./settings-wire";
 import type { EditionListByWorkRequest, EditionListByWorkResultDto } from "../../features/media/ipc/edition-wire";
 import type { EditionDetailDto, EditionGetRequest } from "./generated/wire";
+import type { ErrorDto } from "./generated/wire";
+import type {
+  InterfaceFontAsset,
+  InterfaceFontFamily,
+  InterfaceFontImportResult,
+} from "./interface-font-wire";
+import {
+  guardInterfaceFontAsset,
+  isCanonicalInterfaceFontAssetId,
+} from "./interface-font-wire.js";
 import {
   applySettingsPatch,
+  defaultHomeLayout,
+  defaultOverviewLayout,
   defaultSettingsValue,
+  emptyReadingOverview,
+  guardHomeLayout,
+  guardOverviewLayout,
+  guardReadingOverviewGetRequest,
   guardSettingsSnapshot,
   guardSettingsUpdateResult,
   parseSettingsSection,
@@ -221,6 +271,20 @@ import appInfoMock from "../../../../../contracts/ipc/v1/fixtures/app-info/mock.
 import aiProviderProfilesEmpty from "../../../../../contracts/ipc/v1/fixtures/ai-provider/profile.list.empty.json" with { type: "json" };
 import aiProviderModelsReady from "../../../../../contracts/ipc/v1/fixtures/ai-provider/models.catalog.normal.json" with { type: "json" };
 import { HavenError } from "./errors.js";
+import type {
+  CloudAccountDisconnectRequestWire,
+  CloudAccountWire,
+  CloudBrowsePageWire,
+  CloudConnectAttemptWire,
+  CloudConnectBeginRequestWire,
+  CloudConnectPollWire,
+  CloudConnectStatusWire,
+  CloudFolderWire,
+  CloudImportPdfRequestWire,
+  CloudObjectWire,
+  CloudRegisterFolderRequestWire,
+  CloudStorageListWire,
+} from "./cloud-storage-client";
 
 const RESOURCE_FIXTURE_MEDIA_ITEM_ID = "0196f0d2-0000-7000-8000-000000000000";
 const MEDIA_ITEM_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -237,6 +301,98 @@ function requireLocalUuid(value: string | null, label: string): string | null {
     });
   }
   return value;
+}
+
+/** 非法布局在 Rust 侧是 `APPEARANCE_INVALID_HOME_LAYOUT`（不是 REVISION_CONFLICT）。 */
+function mockInvalidHomeLayout(): HavenError {
+  return new HavenError({
+    code: "APPEARANCE_INVALID_HOME_LAYOUT",
+    userMessage: "首页布局非法（坐标越界/模块重复/占格重叠）",
+    retryable: false,
+  });
+}
+
+/** 规范形态：模块按 `order` 升序（镜像 Rust `HomeLayout::canonicalized`，幂等比较的前提）。 */
+function canonicalHomeLayout(layout: HomeLayoutWire): HomeLayoutWire {
+  return {
+    schemaVersion: layout.schemaVersion,
+    modules: [...layout.modules]
+      .sort((left, right) => left.order - right.order)
+      .map((placement) => ({ ...placement })),
+  };
+}
+
+/** 深拷贝：Mock 内部的布局对象不得被调用方原地改写。 */
+function cloneHomeLayout(layout: HomeLayoutWire): HomeLayoutWire {
+  return {
+    schemaVersion: layout.schemaVersion,
+    modules: layout.modules.map((placement) => ({ ...placement })),
+  };
+}
+
+/** 布局比较（顺序无关：先按 order 归一，再看模块与坐标是否逐字段相等）。 */
+function homeLayoutsEqual(left: HomeLayoutWire, right: HomeLayoutWire): boolean {
+  if (left.schemaVersion !== right.schemaVersion) return false;
+  if (left.modules.length !== right.modules.length) return false;
+  const normalizedLeft = canonicalHomeLayout(left).modules;
+  const normalizedRight = canonicalHomeLayout(right).modules;
+  return normalizedLeft.every((placement, index) => {
+    const other = normalizedRight[index];
+    return placement.module === other.module
+      && placement.size === other.size
+      && placement.row === other.row
+      && placement.column === other.column
+      && placement.order === other.order;
+  });
+}
+
+// ---- 设置页总览布局（048）----
+//
+// 与首页布局同形但**完全独立**的一套状态与辅助函数：三列网格、另一组闭合模块 ID、
+// 自己的 revision 计数器。Mock 里共用一套（例如把两者当成同一个 key）会让「两份布局
+// 互不影响」这条不变量在演示环境与真实后端之间出现分歧。
+
+/** 非法总览布局在 Rust 侧是 `APPEARANCE_INVALID_OVERVIEW_LAYOUT`（不是 REVISION_CONFLICT）。 */
+function mockInvalidOverviewLayout(): HavenError {
+  return new HavenError({
+    code: "APPEARANCE_INVALID_OVERVIEW_LAYOUT",
+    userMessage: "总览布局非法（坐标越界/模块重复/占格重叠）",
+    retryable: false,
+  });
+}
+
+/** 规范形态：模块按 `order` 升序（镜像 Rust `OverviewLayout::canonicalized`）。 */
+function canonicalOverviewLayout(layout: OverviewLayoutWire): OverviewLayoutWire {
+  return {
+    schemaVersion: layout.schemaVersion,
+    modules: [...layout.modules]
+      .sort((left, right) => left.order - right.order)
+      .map((placement) => ({ ...placement })),
+  };
+}
+
+/** 深拷贝：Mock 内部的布局对象不得被调用方原地改写。 */
+function cloneOverviewLayout(layout: OverviewLayoutWire): OverviewLayoutWire {
+  return {
+    schemaVersion: layout.schemaVersion,
+    modules: layout.modules.map((placement) => ({ ...placement })),
+  };
+}
+
+/** 布局比较（顺序无关；总览与首页是两套类型，因此不能共用同一个比较函数）。 */
+function overviewLayoutsEqual(left: OverviewLayoutWire, right: OverviewLayoutWire): boolean {
+  if (left.schemaVersion !== right.schemaVersion) return false;
+  if (left.modules.length !== right.modules.length) return false;
+  const normalizedLeft = canonicalOverviewLayout(left).modules;
+  const normalizedRight = canonicalOverviewLayout(right).modules;
+  return normalizedLeft.every((placement, index) => {
+    const other = normalizedRight[index];
+    return placement.module === other.module
+      && placement.size === other.size
+      && placement.row === other.row
+      && placement.column === other.column
+      && placement.order === other.order;
+  });
 }
 
 const MOCK_COMIC_NO_SOURCE_PROGRESS_RECEIPT: ComicProgressMigrationReceiptDto = {
@@ -459,6 +615,15 @@ interface ProgressState {
 export interface MockHavenClientOptions {
   /** true（默认）：用 settings/*.saved.json 播种（镜像 favorites 播种；用于更新/冲突/事件场景）。 */
   seedSettings?: boolean;
+  /**
+   * 预置外观资产（默认空）。
+   *
+   * Mock 没有原生文件选择器，`appearanceAssetImport` 因此不会「假装选中文件」；
+   * 需要资产的 UI 场景只能通过这里注入合法资产投影（含不透明 assetId，没有路径），
+   * 列表读取与删除就作用在这份内存状态上。`byteSize` 就是 IPC 载荷里的 number
+   * （DTO 上的 u64 已按 `#[ts(type = "number")]` 对齐真实 JSON 数字）。
+   */
+  appearanceAssets?: AppearanceAssetWire[];
 }
 
 /** 共享 Fixture 驱动的 Mock Client（契约冻结前置的最小消费实现）。 */
@@ -615,6 +780,43 @@ function mockUuidFromDigest(digest: string): string {
 }
 
 /**
+ * Mock 样例数据：本机字体族。
+ *
+ * 真实枚举只在 Tauri surface 发生（Rust 侧读系统字体目录）。这里的数据只服务
+ * 浏览器 dev 与测试的可重复性，不声称任何一项是当前机器的真实字体事实。
+ */
+const MOCK_SYSTEM_FONT_FAMILIES: InterfaceFontFamily[] = [
+  { family: "Microsoft YaHei UI", localizedFamily: "微软雅黑" },
+  { family: "Source Han Serif SC", localizedFamily: "思源宋体" },
+  { family: "Inter", localizedFamily: null },
+];
+
+/** Mock 样例数据：已导入字体资产（opaque id + 展示元数据，无路径、无字节）。 */
+const MOCK_INTERFACE_FONT_ASSETS: InterfaceFontAsset[] = [
+  {
+    id: "0f8f7a2c-1b3d-4e5f-8a90-1c2d3e4f5a60",
+    familyName: "示例展示体",
+    fileName: "DemoDisplay.woff2",
+    extension: "woff2",
+    mimeType: "font/woff2",
+    byteSize: 40960,
+    createdAt: 1735689600000,
+  },
+];
+
+const interfaceFontAssetInUseError: ErrorDto = {
+  code: "FONT_ASSET_IN_USE",
+  userMessage: "该字体仍被界面字体设置引用，请先改选其他字体再删除",
+  retryable: false,
+};
+
+const interfaceFontAssetNotFoundError: ErrorDto = {
+  code: "FONT_ASSET_NOT_FOUND",
+  userMessage: "字体不存在或已被删除",
+  retryable: false,
+};
+
+/**
  * Browser Demo 的 Broker「端点」。
  *
  * 它**不是** Windows Named Pipe，也不是 Unix domain socket：浏览器里没有 Rust
@@ -623,6 +825,40 @@ function mockUuidFromDigest(digest: string): string {
  * 伪造一段真实形态的本地地址，会让页面把假端点当可用配置展示或复制给用户。
  */
 const MOCK_AGENT_BROKER_ENDPOINT = "mock://browser-preview-agent-broker"
+
+/**
+ * 浏览器预览的示例技能标识。
+ *
+ * 与上面的 mock 端点同一条理由：真实的内置技能目录是编译进二进制的构建产物，
+ * 浏览器里没有它。使用真实 id（`haven-agent-proposal`）会让预览看起来像
+ * "这项技能已经在栖阅里生效"，而预览根本没有模型请求路径可以消费它。
+ */
+const MOCK_PREVIEW_SKILL_ID = "preview-builtin-skill"
+const MOCK_PREVIEW_SKILL_DESCRIPTION = "浏览器预览项：桌面应用的内置技能目录由 Rust 侧提供"
+const MOCK_PREVIEW_SKILL_CHARS = 0
+
+/**
+ * 与后端 `MAX_CONFIG_URL_CHARS` 对齐的预览地址上限（Rust 用字符数，这里用 UTF-16
+ * 码元数——对 ASCII 地址两者一致，Mock 只做与后端同形的输入校验）。
+ */
+const MAX_TVBOX_CONFIG_URL_CHARS = 2048
+
+/** 与后端 `MAX_TVBOX_DISPLAY_NAME_CHARS` 对齐的显示名上限。 */
+const MAX_TVBOX_DISPLAY_NAME_CHARS = 100
+
+/**
+ * 浏览器预览里没有的能力：返回一句可展示的说明。
+ *
+ * 用 `HAVEN_CAPABILITY_UNAVAILABLE` 与「演示环境不支持…；请在桌面应用里…」的既有措辞，
+ * 让 UI 能把它转成提示而不是崩溃。
+ */
+function cloudUnsupported(action: string): HavenError {
+  return new HavenError({
+    code: "HAVEN_CAPABILITY_UNAVAILABLE",
+    userMessage: `演示环境不支持${action}；请在桌面应用里使用云盘。`,
+    retryable: false,
+  })
+}
 
 export class MockHavenClient implements HavenClient {
   /** 空库模式：libraryList 返回 list.empty（供空态 UI 场景）。 */
@@ -648,6 +884,9 @@ export class MockHavenClient implements HavenClient {
   /** A5：Broker 与 Rust 侧一样**默认关闭**；只有显式 enable 才是 listening。 */
   private agentBrokerListening = false;
   private searchOperationCounter = 1;
+  /** 导入字体资产的 Mock 内存态（与真实后端同一不变量，但不读真实文件）。 */
+  private readonly fontAssets: InterfaceFontAsset[] = MOCK_INTERFACE_FONT_ASSETS.map((asset) => ({ ...asset }));
+  private fontAssetCounter = 1;
   private readonly sourceEnabled = new Map<string, boolean>();
   private readonly sourceEndpoints = new Map<string, string>();
   private readonly credentialProfiles = new Set<string>();
@@ -692,10 +931,20 @@ export class MockHavenClient implements HavenClient {
   /** `settings.changed` 事件日志（仅 changed=true 时追加；镜像 P1-8，供测试断言）。 */
   readonly settingsChangedEvents: SettingsChangedDto[] = [];
 
+  /** 外观资产内存状态：只有类型化投影，没有路径/URL，也没有第二份持久化事实源。 */
+  private readonly appearanceAssets: AppearanceAssetWire[];
+  /** 首页布局内存状态；null = 从未保存过自定义（读取回落到领域默认布局）。 */
+  private homeLayoutState: { layout: HomeLayoutWire; revision: string } | null = null;
+  private homeLayoutRevisionCounter = 1;
+  /** 总览布局内存状态；与首页布局各自独立（另一张表、另一条 revision）。 */
+  private overviewLayoutState: { layout: OverviewLayoutWire; revision: string } | null = null;
+  private overviewLayoutRevisionCounter = 1;
+
   constructor(emptyLibrary = false, options: MockHavenClientOptions = {}) {
     this.emptyLibrary = emptyLibrary;
     this.favorites = new Map();
     this.settings = new Map();
+    this.appearanceAssets = [...(options.appearanceAssets ?? [])];
     // 从共享 Fixture 播种：set.success.json 的 workId 处于已收藏状态。
     const success = favoriteSuccess as FavoriteSetResult;
     this.favorites.set(success.workId, { active: success.favorite, revision: success.revision });
@@ -1397,6 +1646,52 @@ export class MockHavenClient implements HavenClient {
     return result;
   }
 
+  // ---- 界面自定义字体（BE-INTERFACE-FONT-001）----
+  //
+  // Mock 环境没有 Native 选择器、没有本机字体目录、也不读取真实文件：
+  // 这里只返回确定性的样例数据，让列表/搜索/预览/删除流程可重复。
+  // 它不声称任何一项是真实系统事实——Tauri surface 才是唯一事实源。
+
+  async interfaceFontSystemList(): Promise<InterfaceFontFamily[]> {
+    return MOCK_SYSTEM_FONT_FAMILIES.map((family) => ({ ...family }));
+  }
+
+  async interfaceFontAssetList(): Promise<InterfaceFontAsset[]> {
+    return this.fontAssets.map((asset) => ({ ...asset }));
+  }
+
+  async interfaceFontAssetImport(): Promise<InterfaceFontImportResult> {
+    const asset: InterfaceFontAsset = {
+      id: `00000000-0000-4000-8000-${String(0x1000 + this.fontAssetCounter++).padStart(12, "0")}`,
+      familyName: `导入示例字体 ${this.fontAssetCounter}`,
+      fileName: `MockDisplay${this.fontAssetCounter}.woff2`,
+      extension: "woff2",
+      mimeType: "font/woff2",
+      byteSize: 40960,
+      createdAt: Date.now(),
+    };
+    if (!guardInterfaceFontAsset(asset)) throw new Error("mock 导入字体形状非法");
+    this.fontAssets.unshift(asset);
+    return { asset: { ...asset }, deduplicated: false };
+  }
+
+  async interfaceFontAssetDelete(assetId: string): Promise<void> {
+    if (!isCanonicalInterfaceFontAssetId(assetId)) {
+      throw new HavenError(interfaceFontAssetNotFoundError);
+    }
+    // 与真实后端同一不变量：正在被界面设置引用的字体拒绝删除。
+    const appearance = this.settings.get("appearance")?.value;
+    const activeId = appearance?.section === "appearance" ? appearance.interfaceFontAssetId : undefined;
+    if (activeId === assetId) {
+      throw new HavenError(interfaceFontAssetInUseError);
+    }
+    const index = this.fontAssets.findIndex((asset) => asset.id === assetId);
+    if (index < 0) {
+      throw new HavenError(interfaceFontAssetNotFoundError);
+    }
+    this.fontAssets.splice(index, 1);
+  }
+
   async preferenceGet(request: PreferenceGetRequest): Promise<PreferenceGetResult> {
     const edition = this.preferences.get(this.preferenceKey("edition", request.mediaItemId, request.editionId));
     const media = this.preferences.get(this.preferenceKey("media_item", request.mediaItemId, request.editionId));
@@ -1480,6 +1775,146 @@ export class MockHavenClient implements HavenClient {
 
   private preferenceKey(target: PreferenceTargetWire, mediaItemId: string, editionId: string): string {
     return target + ":" + mediaItemId + ":" + editionId;
+  }
+
+  // ---- 外观（Appearance Stage 1B）：内存状态 + CAS ----
+  //
+  // 这套 Mock 只镜像后端的**事实**：CAS、幂等、显式空布局与「从未保存」的区别，
+  // 默认布局逐字段等于 `HomeLayout::default()`（三个真实模块）。它不伪造文件选择，
+  // 也不在 localStorage / 模块级变量里留第二份事实源。
+
+  async appearanceAssetsList(
+    request: AppearanceAssetsListRequestWire,
+  ): Promise<AppearanceAssetsWire> {
+    const kind = request.kind;
+    if (kind !== null && kind !== "font" && kind !== "static_wallpaper" && kind !== "dynamic_wallpaper") {
+      throw new HavenError(settingsInvalidArgument as never);
+    }
+    // 空库就是空列表：不伪造任何资产（与后端空库语义一致）。
+    const assets = kind === null
+      ? [...this.appearanceAssets]
+      : this.appearanceAssets.filter((asset) => asset.kind === kind);
+    return { schemaVersion: 1, assets };
+  }
+
+  /** 没有原生文件选择器：Mock 不假装选中文件，资产只能由 `appearanceAssets` 预置。 */
+  async appearanceAssetImport(
+    _request: AppearanceAssetImportRequestWire,
+  ): Promise<AppearanceAssetWire> {
+    throw new HavenError({
+      code: "OPERATION_CANCELLED",
+      userMessage: "演示环境没有原生文件选择器，未选择任何文件",
+      retryable: false,
+    });
+  }
+
+  /** 删除：只有规范小写 UUID 是合法 ID；未知（但合法）ID 是幂等空操作。 */
+  async appearanceAssetDelete(
+    request: AppearanceAssetDeleteRequestWire,
+  ): Promise<AppearanceAssetDeleteResultWire> {
+    if (!CANONICAL_LOCAL_ID_PATTERN.test(request.assetId)) {
+      throw new HavenError({
+        code: "INVALID_ID",
+        userMessage: "资产标识格式非法",
+        retryable: false,
+      });
+    }
+    const index = this.appearanceAssets.findIndex((asset) => asset.assetId === request.assetId);
+    if (index < 0) return { deleted: false, fileRemoved: false };
+    this.appearanceAssets.splice(index, 1);
+    return { deleted: true, fileRemoved: true };
+  }
+
+  /** 从未保存过 → 领域默认布局 + `revision=null`；保存过空布局 → 空 modules + 非空 revision。 */
+  async homeLayoutGet(): Promise<HomeLayoutSnapshotWire> {
+    if (!this.homeLayoutState) return { layout: defaultHomeLayout(), revision: null };
+    return {
+      layout: cloneHomeLayout(this.homeLayoutState.layout),
+      revision: this.homeLayoutState.revision,
+    };
+  }
+
+  /** 保存（CAS）：expected 对不上 → REVISION_CONFLICT 且零写入；同值 → changed=false。 */
+  async homeLayoutSave(request: HomeLayoutSaveRequestWire): Promise<HomeLayoutMutationResultWire> {
+    if (!guardHomeLayout(request.layout)) throw mockInvalidHomeLayout();
+    const layout = canonicalHomeLayout(request.layout);
+    const current = this.homeLayoutState;
+    if ((current?.revision ?? null) !== request.expectedRevision) {
+      throw new HavenError(settingsConflictError as never);
+    }
+    if (current && homeLayoutsEqual(current.layout, layout)) {
+      return { layout: cloneHomeLayout(layout), revision: current.revision, changed: false };
+    }
+    const revision = `appearance-mock-${this.homeLayoutRevisionCounter++}`;
+    this.homeLayoutState = { layout, revision };
+    return { layout: cloneHomeLayout(layout), revision, changed: true };
+  }
+
+  /** 重置：删除已保存的自定义；从未保存过时是幂等空操作（changed=false）。 */
+  async homeLayoutReset(request: HomeLayoutResetRequestWire): Promise<HomeLayoutMutationResultWire> {
+    const current = this.homeLayoutState;
+    if ((current?.revision ?? null) !== request.expectedRevision) {
+      throw new HavenError(settingsConflictError as never);
+    }
+    if (!current) return { layout: defaultHomeLayout(), revision: null, changed: false };
+    this.homeLayoutState = null;
+    return { layout: defaultHomeLayout(), revision: null, changed: true };
+  }
+
+  // ---- 设置页总览布局（048）：与首页布局同一套语义，但状态与 revision 各自独立 ----
+
+  /** 从未保存过 → 领域默认总览布局 + `revision=null`；保存过空布局 → 空 modules + 非空 revision。 */
+  async overviewLayoutGet(): Promise<OverviewLayoutSnapshotWire> {
+    if (!this.overviewLayoutState) return { layout: defaultOverviewLayout(), revision: null };
+    return {
+      layout: cloneOverviewLayout(this.overviewLayoutState.layout),
+      revision: this.overviewLayoutState.revision,
+    };
+  }
+
+  /** 保存（CAS）：expected 对不上 → REVISION_CONFLICT 且零写入；同值 → changed=false。 */
+  async overviewLayoutSave(request: OverviewLayoutSaveRequestWire): Promise<OverviewLayoutMutationResultWire> {
+    if (!guardOverviewLayout(request.layout)) throw mockInvalidOverviewLayout();
+    const layout = canonicalOverviewLayout(request.layout);
+    const current = this.overviewLayoutState;
+    if ((current?.revision ?? null) !== request.expectedRevision) {
+      throw new HavenError(settingsConflictError as never);
+    }
+    if (current && overviewLayoutsEqual(current.layout, layout)) {
+      return { layout: cloneOverviewLayout(layout), revision: current.revision, changed: false };
+    }
+    const revision = `overview-mock-${this.overviewLayoutRevisionCounter++}`;
+    this.overviewLayoutState = { layout, revision };
+    return { layout: cloneOverviewLayout(layout), revision, changed: true };
+  }
+
+  /** 重置：删除已保存的自定义；从未保存过时是幂等空操作（changed=false）。 */
+  async overviewLayoutReset(request: OverviewLayoutResetRequestWire): Promise<OverviewLayoutMutationResultWire> {
+    const current = this.overviewLayoutState;
+    if ((current?.revision ?? null) !== request.expectedRevision) {
+      throw new HavenError(settingsConflictError as never);
+    }
+    if (!current) return { layout: defaultOverviewLayout(), revision: null, changed: false };
+    this.overviewLayoutState = null;
+    return { layout: defaultOverviewLayout(), revision: null, changed: true };
+  }
+
+  /**
+   * 阅读总览：Mock 没有已登记的内容会话事实，所以恒定返回**显式空态**——不伪造任何
+   * 阅读分钟数。空态由 `emptyReadingOverview` 统一构造（与领域 `aggregate` 在
+   * `session_count == 0` 时的输出逐字段一致），因此页面在演示环境走的是与真实后端
+   * 同一条「无数据」分支。
+   */
+  async readingOverviewGet(request: ReadingOverviewGetRequestWire): Promise<ReadingOverviewWire> {
+    // 越界窗口后端会拒绝（READING_OVERVIEW_INVALID_RANGE）；Mock 不该给出假结果。
+    if (!guardReadingOverviewGetRequest(request)) {
+      throw new HavenError({
+        code: "READING_OVERVIEW_INVALID_RANGE",
+        userMessage: "总览统计窗口超出允许范围",
+        retryable: false,
+      });
+    }
+    return emptyReadingOverview(request, Date.now());
   }
 
   async storageLocationList(): Promise<StorageLocationDto[]> {
@@ -1617,16 +2052,26 @@ export class MockHavenClient implements HavenClient {
       enabled: this.sourceEnabled.get(source.sourceId) ?? source.enabled,
     }));
     for (const [sourceId, source] of this.customSources) {
+      const feed = source.kind === "feed";
+      const comic = source.kind === "komga" || source.kind === "kavita";
+      const comicLabel = source.kind === "kavita" ? "Kavita" : "Komga";
       const descriptor: SourceDescriptorDto = {
         sourceId,
         displayName: source.displayName,
-        kinds: ["search", "offline_download"],
-        categories: ["book"],
+        kinds: feed || comic
+          ? ["search", "online_read", "offline_download"]
+          : ["search", "offline_download"],
+        categories: feed ? ["periodical"] : comic ? ["comic"] : ["book"],
         mode: "single",
-        notes: "这是你添加的自定义 OPDS 书库；可在来源设置中编辑地址或配置访问凭据。",
+        notes: feed
+          ? "这是你添加的 RSS/Atom 订阅源；Haven 只读取该订阅源自身提供的条目内容，不会打开条目链接指向的网页。地址必须使用 HTTPS，且不能带查询串。"
+          : comic
+            ? `这是你添加的 ${comicLabel} 漫画库；搜索、章节列表、在线逐页阅读与 CBZ 下载都只访问该地址。API key 只保存在系统凭据管理器并作为请求头发送，不会出现在地址、日志或来源身份里。`
+            : "这是你添加的自定义 OPDS 书库；可在来源设置中编辑地址或配置访问凭据。",
         enabled: this.customSourceEnabled.get(sourceId) ?? false,
         health: "unknown",
         endpointConfigured: source.endpoint.length > 0,
+        credentialConfigured: this.customCredentialConfigured.has(sourceId),
         lastChecked: null,
         latencyMs: null,
         successRate: null,
@@ -1962,21 +2407,58 @@ export class MockHavenClient implements HavenClient {
     };
   }
 
-  // ---- V2-H 收尾批次：自定义 OPDS 书源（Mock：内存态，不落 localStorage）----
+  // ---- V2-H 收尾批次：自定义来源（OPDS 书库 / RSS/Atom 订阅源；Mock：内存态）----
 
-  private customSources = new Map<string, { displayName: string; endpoint: string }>();
+  private customSources = new Map<
+    string,
+    { displayName: string; endpoint: string; kind: "opds" | "feed" | "komga" | "kavita" }
+  >();
   private customSourceEnabled = new Map<string, boolean>();
   private customCredentialConfigured = new Set<string>();
+
+  /** 订阅源地址策略（与后端一致）：HTTPS、无 userinfo/fragment、无查询串。 */
+  private validateFeedEndpoint(endpoint: string): void {
+    if (!endpoint.startsWith("https://")) {
+      throw new HavenError({
+        code: "INVALID_ARGUMENT",
+        userMessage: "订阅源地址必须使用 HTTPS",
+        retryable: false,
+      });
+    }
+    if (endpoint.includes("?")) {
+      throw new HavenError({
+        code: "INVALID_ARGUMENT",
+        userMessage: "订阅源地址不能包含查询串",
+        retryable: false,
+      });
+    }
+    // 只检查 authority 里的 userinfo 与整串的 fragment 分隔符，避免误伤路径中的
+    // 合法字符。真实校验由后端 URL 策略完成。
+    const authority = endpoint.slice("https://".length).split(/[/?#]/)[0];
+    if (authority.includes("@") || endpoint.includes("#")) {
+      throw new HavenError({
+        code: "INVALID_ARGUMENT",
+        userMessage: "订阅源地址不安全",
+        retryable: false,
+      });
+    }
+  }
 
   async sourceAdd(
     request: import("./generated/wire").SourceAddRequest,
   ): Promise<import("./generated/wire").SourceAddResult> {
     const name = request.displayName.trim();
     const endpoint = request.endpoint.trim();
+    // 缺省 kind 仍是 OPDS：与新增该字段之前的请求保持向后兼容。
+    const kind = request.kind ?? "opds";
     if (!name || name.length > 100) {
       throw new HavenError({ code: "INVALID_ARGUMENT", userMessage: "显示名非法", retryable: false });
     }
-    if (!endpoint.startsWith("http://") && !endpoint.startsWith("https://")) {
+    if (kind === "feed" || kind === "komga" || kind === "kavita") {
+      // 订阅源与自托管漫画库共用同一条地址策略：HTTPS、无 userinfo/fragment、
+      // 无查询串（API key 只走请求头，不需要写进地址）。
+      this.validateFeedEndpoint(endpoint);
+    } else if (!endpoint.startsWith("http://") && !endpoint.startsWith("https://")) {
       throw new HavenError({
         code: "INVALID_ARGUMENT",
         userMessage: "端点必须是 http/https 绝对地址",
@@ -1990,8 +2472,16 @@ export class MockHavenClient implements HavenClient {
         retryable: false,
       });
     }
-    const sourceId = `custom-${Date.now().toString(16)}${this.customSources.size}`;
-    this.customSources.set(sourceId, { displayName: name, endpoint });
+    const suffix = `${Date.now().toString(16)}${this.customSources.size}`;
+    const sourceId =
+      kind === "feed"
+        ? `custom-feed-${suffix}`
+        : kind === "komga"
+          ? `custom-komga-${suffix}`
+          : kind === "kavita"
+            ? `custom-kavita-${suffix}`
+            : `custom-${suffix}`;
+    this.customSources.set(sourceId, { displayName: name, endpoint, kind });
     this.customSourceEnabled.set(sourceId, false);
     return { schemaVersion: 1, sourceId };
   }
@@ -2015,7 +2505,9 @@ export class MockHavenClient implements HavenClient {
     }
     if (request.endpoint !== null) {
       const nextEndpoint = request.endpoint.trim();
-      if (!nextEndpoint.startsWith("http://") && !nextEndpoint.startsWith("https://")) {
+      if (record.kind === "feed" || record.kind === "komga" || record.kind === "kavita") {
+        this.validateFeedEndpoint(nextEndpoint);
+      } else if (!nextEndpoint.startsWith("http://") && !nextEndpoint.startsWith("https://")) {
         throw new HavenError({
           code: "INVALID_ARGUMENT",
           userMessage: "端点必须是 http/https 绝对地址",
@@ -2040,8 +2532,18 @@ export class MockHavenClient implements HavenClient {
   }
 
   async sourceSetCredential(request: import("./generated/wire").SourceSetCredentialRequest): Promise<void> {
-    if (!this.customSources.has(request.sourceId)) {
+    const record = this.customSources.get(request.sourceId);
+    if (!record) {
       throw new HavenError({ code: "RESOURCE_NOT_FOUND", userMessage: "自定义来源不存在", retryable: false });
+    }
+    if (record.kind === "feed") {
+      // 订阅源没有受控的 HTTP 认证路径：写入一条不会被任何请求消费的凭据
+      // 只会制造假能力。
+      throw new HavenError({
+        code: "INVALID_ARGUMENT",
+        userMessage: "订阅源不使用单独的访问凭据",
+        retryable: false,
+      });
     }
     if (request.secret === null) {
       this.customCredentialConfigured.delete(request.sourceId);
@@ -2587,6 +3089,229 @@ export class MockHavenClient implements HavenClient {
   async agentBrokerDisable(): Promise<AgentBrokerStatusResultDto> {
     this.agentBrokerListening = false
     return this.agentBrokerProjection()
+  }
+
+  /**
+   * 浏览器预览的内置技能目录。
+   *
+   * **刻意不使用真实技能 id**：真实目录是编译进二进制的构建产物，浏览器里没有它。
+   * 用一个看起来像真的条目会让预览变成"技能已在栖阅里生效"的假证据——这正是
+   * AI_SYSTEM.md §6 禁止的读法。预览只证明界面与状态机接线正确。
+   */
+  private readonly mockAgentSkills = new Map<string, AgentSkillActivationWire>()
+
+  async agentSkillList(): Promise<AgentSkillListResultWire> {
+    if (this.mockAgentSkills.size === 0) {
+      this.mockAgentSkills.set(MOCK_PREVIEW_SKILL_ID, "disabled")
+    }
+    return {
+      schemaVersion: 1,
+      skills: [...this.mockAgentSkills.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([skillId, state]) => ({
+          schemaVersion: 1 as const,
+          skillId,
+          description: MOCK_PREVIEW_SKILL_DESCRIPTION,
+          instructionsChars: MOCK_PREVIEW_SKILL_CHARS,
+          state,
+        })),
+    }
+  }
+
+  async agentSkillSetEnabled(
+    request: AgentSkillSetEnabledRequestWire,
+  ): Promise<AgentSkillStateWire> {
+    if (request.skillId !== MOCK_PREVIEW_SKILL_ID) {
+      throw new HavenError({
+        code: "AGENT_SKILL_UNKNOWN",
+        userMessage: "预览环境只有一项示例技能",
+        retryable: false,
+      })
+    }
+    this.mockAgentSkills.set(request.skillId, request.enabled ? "enabled" : "disabled")
+    return {
+      schemaVersion: 1,
+      skillId: request.skillId,
+      description: MOCK_PREVIEW_SKILL_DESCRIPTION,
+      instructionsChars: MOCK_PREVIEW_SKILL_CHARS,
+      state: request.enabled ? "enabled" : "disabled",
+    }
+  }
+
+  /**
+   * 浏览器预览的客户端自动配置状态。
+   *
+   * **刻意返回"被拦下"而不是一个好看的演示状态**：预览里既没有安装包资源目录，也没有
+   * 用户真实的 `~/.codex/config.toml` / `~/.claude.json`。把这里做成"已配置"会变成
+   * "栖阅已经替你写好了客户端配置"的假证据——而那正是这条能力最不能出错的地方。
+   */
+  async mcpClientConfigStatus(): Promise<McpClientConfigStatusWire> {
+    const target = (
+      id: McpClientTargetWire,
+      label: string,
+    ): McpClientTargetStatusWire => ({
+      target: id,
+      label,
+      // 浏览器里无从得知用户的配置路径，因此不编一个出来。
+      configPath: null,
+      state: "blocked",
+      writable: false,
+      detail: "浏览器预览没有安装包资源目录，也不会去碰你机器上的客户端配置文件。",
+    })
+    return {
+      schemaVersion: 1,
+      runtimeReady: false,
+      runtimeDetail: "浏览器预览里没有随包分发的 MCP 运行时。",
+      targets: [target("codex", "Codex"), target("claude_code", "Claude Code")],
+    }
+  }
+
+  /** 预览环境**不写任何客户端配置**：连尝试都不做，直接如实失败。 */
+  async mcpClientConfigApply(
+    request: McpClientConfigureRequestWire,
+  ): Promise<McpClientConfigStatusWire> {
+    throw new HavenError({
+      code: "MCP_CLIENT_CONFIG_BLOCKED",
+      userMessage: `浏览器预览不会写入 ${request.target} 的配置文件；请在桌面版里操作。`,
+      retryable: false,
+    })
+  }
+
+  // ---- Film/TV Provider 基础切片：TVBox / FongMi 配置预览 ----
+  //
+  // 浏览器预览里没有 Rust 侧的受控 HTTP、URL 策略、逐跳 DNS 固定与响应大小上限，
+  // 因此这里**不假装取回过任何配置**：只做与后端同形的输入校验（空 / 超长），然后
+  // 如实失败。返回一份编造的解析摘要会让 UI 开发者以为预览链路已经接通了。
+  async tvboxConfigPreview(request: TvboxConfigPreviewRequest): Promise<TvboxConfigPreviewDto> {
+    const url = request.url.trim()
+    if (!url) {
+      throw new HavenError({
+        code: "INVALID_ARGUMENT",
+        userMessage: "TVBox 配置地址不能为空",
+        retryable: false,
+      })
+    }
+    if (url.length > MAX_TVBOX_CONFIG_URL_CHARS) {
+      throw new HavenError({
+        code: "INVALID_ARGUMENT",
+        userMessage: "TVBox 配置地址过长",
+        retryable: false,
+      })
+    }
+    throw new HavenError({
+      code: "HAVEN_CAPABILITY_UNAVAILABLE",
+      userMessage: "演示环境不获取远端配置；请在桌面应用里预览。",
+      retryable: false,
+    })
+  }
+
+  // ---- Film/TV Provider 基础切片：TVBox / FongMi 配置保存 ----
+  //
+  // 演示环境同样不假装导入成功：登记来源需要 Rust 侧的受控 HTTP、解析器与 SQLite
+  // 缓存，这里都没有。返回一个编造的 sourceId 会让 UI 开发者以为导入链路已经接通，
+  // 之后按那个 ID 调用只会得到"来源不存在"。
+  async tvboxConfigSave(request: TvboxConfigSaveRequest): Promise<TvboxConfigSaveResult> {
+    const displayName = request.displayName.trim()
+    if (!displayName) {
+      throw new HavenError({
+        code: "INVALID_ARGUMENT",
+        userMessage: "显示名不能为空",
+        retryable: false,
+      })
+    }
+    if (displayName.length > MAX_TVBOX_DISPLAY_NAME_CHARS) {
+      throw new HavenError({
+        code: "INVALID_ARGUMENT",
+        userMessage: "显示名不能超过 100 字符",
+        retryable: false,
+      })
+    }
+    const url = request.url.trim()
+    if (!url) {
+      throw new HavenError({
+        code: "INVALID_ARGUMENT",
+        userMessage: "TVBox 配置地址不能为空",
+        retryable: false,
+      })
+    }
+    if (url.length > MAX_TVBOX_CONFIG_URL_CHARS) {
+      throw new HavenError({
+        code: "INVALID_ARGUMENT",
+        userMessage: "TVBox 配置地址过长",
+        retryable: false,
+      })
+    }
+    throw new HavenError({
+      code: "HAVEN_CAPABILITY_UNAVAILABLE",
+      userMessage: "演示环境不导入远端配置；请在桌面应用里导入。",
+      retryable: false,
+    })
+  }
+
+  // ---- 云盘（Google Drive 只读切片；Mock/开发契约） ----
+  //
+  // 浏览器预览里没有系统浏览器授权回调、没有 Rust 侧的 Drive 适配器、租约注册表与
+  // 凭据存储，因此这里**不伪造任何"已连接"状态**：列表如实回答 `oauthAvailable: false`
+  // 与空账户表，其余动作一律显式失败。返回一个编造的账户或浏览页会让 UI 开发者以为
+  // 授权链路已经接通，而用户点下去只会得到"账户不存在"。
+  async cloudStorageList(): Promise<CloudStorageListWire> {
+    return { oauthAvailable: false, accounts: [] }
+  }
+
+  async cloudAccountConnectBegin(
+    _request: CloudConnectBeginRequestWire,
+  ): Promise<CloudConnectAttemptWire> {
+    throw cloudUnsupported("发起云盘授权")
+  }
+
+  async cloudAccountConnectPoll(_attemptId: string): Promise<CloudConnectPollWire> {
+    throw cloudUnsupported("轮询云盘授权")
+  }
+
+  async cloudAccountConnectComplete(_attemptId: string): Promise<CloudAccountWire> {
+    throw cloudUnsupported("完成云盘授权")
+  }
+
+  async cloudAccountConnectCancel(_attemptId: string): Promise<CloudConnectStatusWire> {
+    throw cloudUnsupported("取消云盘授权")
+  }
+
+  async cloudAccountDisconnect(
+    _request: CloudAccountDisconnectRequestWire,
+  ): Promise<CloudAccountWire> {
+    throw cloudUnsupported("断开云盘账户")
+  }
+
+  async cloudFolderBindingGet(_locationId: string): Promise<CloudFolderWire | null> {
+    throw cloudUnsupported("读取云盘目录绑定")
+  }
+
+  async cloudFolderRemove(_locationId: string): Promise<boolean> {
+    throw cloudUnsupported("移除云盘目录")
+  }
+
+  async cloudBrowseRoot(_accountId: string): Promise<CloudBrowsePageWire> {
+    throw cloudUnsupported("浏览云盘")
+  }
+
+  async cloudBrowseFolder(_folderHandle: string): Promise<CloudBrowsePageWire> {
+    throw cloudUnsupported("浏览云盘目录")
+  }
+
+  async cloudBrowseNextPage(_cursor: string): Promise<CloudBrowsePageWire> {
+    throw cloudUnsupported("翻页浏览云盘目录")
+  }
+
+  async cloudBrowseLocation(_locationId: string): Promise<CloudBrowsePageWire> {
+    throw cloudUnsupported("浏览已登记云盘目录")
+  }
+
+  async cloudRegisterFolder(_request: CloudRegisterFolderRequestWire): Promise<string> {
+    throw cloudUnsupported("登记云盘目录")
+  }
+
+  async cloudImportPdf(_request: CloudImportPdfRequestWire): Promise<CloudObjectWire> {
+    throw cloudUnsupported("从云盘导入 PDF")
   }
 
   private agentBrokerProjection(): AgentBrokerStatusResultDto {

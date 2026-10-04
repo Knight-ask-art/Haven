@@ -9,6 +9,15 @@
 //! - **endpoint 必须来自用户显式配置且通过共享 HTTP URL 策略**。拒绝非 http(s)、
 //!   userinfo、fragment、query、单标签主机、非公网字面地址与超范围端口；不做任何
 //!   局域网/服务发现。
+//! - **保存与使用都要求 HTTPS**。这条路径是唯一会把 `Authorization: Bearer <API key>`
+//!   连同用户设置快照 / 技能正文发出去的地方，明文 `http` 会让凭据与用户内容暴露给
+//!   路径上的任何一跳。因此：
+//!   - 保存（[`AiProviderProfile::new`]）只接受 `https`，明文地址以固定的
+//!     `AI_PROVIDER_ENDPOINT_INSECURE` 拒绝；
+//!   - 使用（[`AiProviderProfile::require_secure_endpoint`]、[`models_url_for`]、
+//!     [`chat_completions_url_for`]）对**历史遗留的明文行**同样拒绝，且零出站流量；
+//!   - 读取（[`AiProviderProfile::from_stored`]）刻意仍然接受明文行，否则升级一次就会
+//!     让设置页读不出任何配置、用户失去"改成 https"的入口。宽松只发生在读取。
 //! - **能力不猜**。`AiModelCapability` 是三态闭合集合，第三方响应缺字段即 `Unknown`；
 //!   模型名（`gpt-4o`、`*-vision`、`text-embedding-*`）不构成任何能力证据。
 
@@ -117,6 +126,12 @@ impl AiProviderProfile {
 
     /// 从持久化行恢复。脏行（非法 id / 非法 endpoint / 未知 kind）必须拒绝：
     /// 一个无法通过校验的 endpoint 不允许被当成"可请求目标"继续流通。
+    ///
+    /// 这里刻意用 [`validate_stored_endpoint`]（允许明文 `http`）而不是保存期的
+    /// [`validate_endpoint`]：早期版本允许保存明文端点，读取如果把这类行判成脏行，
+    /// 一次升级就会让设置页**读不出任何配置**，用户连把它改成 https 的入口都没有。
+    /// 机密性由使用边界（[`AiProviderProfile::require_secure_endpoint`]）负责，不靠
+    /// "读不出来"来兜底。
     #[allow(clippy::too_many_arguments)]
     pub fn from_stored(
         profile_id: String,
@@ -131,7 +146,7 @@ impl AiProviderProfile {
     ) -> Result<Self, AppError> {
         validate_profile_id(&profile_id)?;
         validate_display_name(&display_name)?;
-        let endpoint = validate_endpoint(&endpoint)?;
+        let endpoint = validate_stored_endpoint(&endpoint)?;
         if let Some(model_id) = selected_model_id.as_deref() {
             validate_model_id(model_id)?;
         }
@@ -200,6 +215,19 @@ impl AiProviderProfile {
     /// 结果仍会重新过一遍 URL 策略，因此拼接不可能把请求带出策略之外。
     pub fn models_endpoint(&self) -> Result<String, AppError> {
         models_url_for(&self.endpoint)
+    }
+
+    /// **使用边界自检**：明文端点必须在这里被拒绝。
+    ///
+    /// 读取路径刻意接受历史遗留的明文行（见 [`validate_stored_endpoint`]），因此
+    /// "行读出来了"不等于"可以拿它发请求"。任何会把 API Key 或用户内容交给这个端点的
+    /// 调用方（Application service）都必须在发起请求**之前**调用本方法；失败即固定
+    /// 的 `AI_PROVIDER_ENDPOINT_INSECURE`，且**零出站流量**。
+    ///
+    /// 复用保存期的完整校验（而不是只看 scheme）：endpoint 是从数据库读回来的字符串，
+    /// 在这里再走一遍策略比"相信它当初被校验过"更便宜也更可靠。
+    pub fn require_secure_endpoint(&self) -> Result<(), AppError> {
+        validate_endpoint(&self.endpoint).map(|_| ())
     }
 }
 
@@ -306,14 +334,35 @@ pub fn validate_model_id(value: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// 校验并规范化 endpoint。
+/// 校验并规范化 endpoint（**保存边界：只接受 HTTPS**）。
 ///
-/// 在共享 URL 策略之上再收紧两点（本切片专用）：
+/// 在共享 URL 策略之上再收紧三点（本切片专用）：
+/// - **必须是 `https`**。这条路径是唯一会把 `Authorization: Bearer <API key>` 以及用户
+///   设置快照 / 技能正文发出去的地方；明文 `http` 会把凭据与用户内容暴露给路径上的
+///   任何一跳。URL 策略本身仍然接受 `http`（那是给其它调用方用的），机密性由本切片
+///   自己负责，而不是悄悄改共享策略。
 /// - 拒绝 query：模型发现要在 endpoint 下拼路径，带 query 的 base 语义不明确，
 ///   而且 `?key=...` 是常见的"把 secret 塞进 URL"的形态。
 /// - 拒绝本地路径形状（`C:\...`、`\\server\share`、`/etc/...`）：这些根本不是 URL，
 ///   早期拒绝比让 `Url::parse` 报一个含糊的错误更可诊断。
 pub fn validate_endpoint(value: &str) -> Result<String, AppError> {
+    validate_endpoint_with_scheme(value, true)
+}
+
+/// 与 [`validate_endpoint`] 同规则，但允许 `http`——**只用于读取历史行**。
+///
+/// 早期版本允许用户保存明文 `http` 端点，因此数据库里可能已经有这样的行。读取时
+/// 沿用宽松规则，是为了让这些行仍然**可列出、可打开、可改写成 https、可删除**；
+/// 若读取也 fail closed，一次升级就会让整个设置页读取失败，用户连"改成 https"的
+/// 入口都拿不到——那是把"要求迁移"变成"锁死界面"。
+///
+/// 这不放松任何使用语义：真正发起出站请求之前仍会走
+/// [`AiProviderProfile::require_secure_endpoint`]。
+pub fn validate_stored_endpoint(value: &str) -> Result<String, AppError> {
+    validate_endpoint_with_scheme(value, false)
+}
+
+fn validate_endpoint_with_scheme(value: &str, require_https: bool) -> Result<String, AppError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(profile_error(
@@ -329,6 +378,9 @@ pub fn validate_endpoint(value: &str) -> Result<String, AppError> {
     }
     let safe =
         parse_http_url(trimmed, HttpUrlPolicy::AiProviderEndpoint).map_err(endpoint_error)?;
+    if require_https && !safe.as_url().scheme().eq_ignore_ascii_case("https") {
+        return Err(insecure_endpoint_error());
+    }
     if safe.as_url().query().is_some() {
         return Err(profile_error(
             "AI_PROVIDER_ENDPOINT_INVALID",
@@ -338,7 +390,23 @@ pub fn validate_endpoint(value: &str) -> Result<String, AppError> {
     Ok(safe.as_str().trim_end_matches('/').to_owned())
 }
 
+/// 明文端点：稳定、固定的拒绝文案。
+///
+/// **不回显**被拒绝的地址（错误消息本身也是"用户配置不出 wire"边界的一部分），也不
+/// 声称地址"非法"——它是合法的 URL，只是不能承载凭据。
+fn insecure_endpoint_error() -> AppError {
+    AppError::new(
+        "AI_PROVIDER_ENDPOINT_INSECURE",
+        ErrorKind::Validation,
+        "API 地址必须使用 HTTPS：API Key 与设置内容不得经明文连接发送。请把地址改为 https:// 后重新保存。",
+        false,
+    )
+}
+
 /// 在已规范化的 endpoint 下拼 `/models`，不重复 `/v1`、不重复 `/models`。
+///
+/// 这是**使用边界**的一部分：拼接前重新走一遍保存期规则（含 HTTPS 要求），因此历史
+/// 行里的明文端点在这里就会被拒绝——凭据与用户内容不会因为"行是旧的"而出站。
 pub fn models_url_for(endpoint: &str) -> Result<String, AppError> {
     let base = validate_endpoint(endpoint)?;
     let candidate = if base.ends_with("/models") {
@@ -352,6 +420,8 @@ pub fn models_url_for(endpoint: &str) -> Result<String, AppError> {
 }
 
 /// 在已规范化的 endpoint 下拼 `/chat/completions`，不重复、不逃逸 URL 策略。
+///
+/// 与 [`models_url_for`] 同一条使用边界：HTTPS 要求在这里同样成立。
 pub fn chat_completions_url_for(endpoint: &str) -> Result<String, AppError> {
     let base = validate_endpoint(endpoint)?;
     let candidate = if base.ends_with("/chat/completions") {
@@ -726,14 +796,83 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_accepts_http_and_https_public_hosts() {
+    fn endpoint_accepts_only_https_public_hosts() {
         for valid in [
             "https://gateway.example.invalid/v1",
-            "http://gateway.example.invalid:8080/openai",
             "https://gateway.example.invalid:8443/compatible/v1",
+            "HTTPS://GATEWAY.Example.Invalid/v1",
         ] {
             assert!(validate_endpoint(valid).is_ok(), "合法端点: {valid:?}");
         }
+        // 明文端口 8080 上的 http **也**拒绝：机密性要求与端口无关。
+        for insecure in [
+            "http://gateway.example.invalid/v1",
+            "http://gateway.example.invalid:8080/openai",
+            "http://gateway.example.invalid:443/v1",
+        ] {
+            let error = validate_endpoint(insecure).unwrap_err();
+            assert_eq!(
+                error.code().as_str(),
+                "AI_PROVIDER_ENDPOINT_INSECURE",
+                "保存边界必须拒绝明文端点: {insecure:?}"
+            );
+            assert!(!error.retryable(), "改地址才有用，重试不变好");
+            // 固定文案：既不回显地址，也不把它说成"非法 URL"。
+            assert!(!error.user_message().contains("gateway.example.invalid"));
+            assert!(error.user_message().contains("HTTPS"));
+        }
+    }
+
+    /// 明文端点在**每一个**边界上的结论，逐条钉住。
+    ///
+    /// 这是本切片的核心机密性不变量：只要有一处漏掉，API Key 与用户设置快照就会以
+    /// 明文出站，而界面上看不出任何区别。
+    #[test]
+    fn a_plaintext_endpoint_is_rejected_at_every_boundary_except_reading_history() {
+        const PLAINTEXT: &str = "http://gateway.example.invalid/v1";
+
+        // ① 保存边界：新建被拒绝。
+        assert_eq!(
+            profile(PLAINTEXT).unwrap_err().code().as_str(),
+            "AI_PROVIDER_ENDPOINT_INSECURE"
+        );
+
+        // ② 使用边界：拼接 URL 时被拒绝（凭据不会因为"行是旧的"而出站）。
+        for error in [
+            models_url_for(PLAINTEXT).unwrap_err(),
+            chat_completions_url_for(PLAINTEXT).unwrap_err(),
+        ] {
+            assert_eq!(error.code().as_str(), "AI_PROVIDER_ENDPOINT_INSECURE");
+        }
+
+        // ③ 读取边界：**允许**。历史行必须仍能被列出与编辑，否则升级一次就会把设置页锁死。
+        let legacy = AiProviderProfile::from_stored(
+            "gw".into(),
+            "旧网关".into(),
+            AiProviderKind::OpenAiCompatible,
+            PLAINTEXT.into(),
+            false,
+            None,
+            "rev-legacy".into(),
+            1,
+            1,
+        )
+        .expect("历史明文行必须仍可读取");
+        assert_eq!(legacy.endpoint(), PLAINTEXT);
+        // 但读出来不等于能用：使用边界自检必须失败。
+        assert_eq!(
+            legacy
+                .require_secure_endpoint()
+                .unwrap_err()
+                .code()
+                .as_str(),
+            "AI_PROVIDER_ENDPOINT_INSECURE"
+        );
+
+        // ④ 反向证据：https 行在使用边界通过。
+        let secure = profile("https://gateway.example.invalid/v1").unwrap();
+        assert!(secure.require_secure_endpoint().is_ok());
+        assert!(models_url_for(secure.endpoint()).is_ok());
     }
 
     #[test]

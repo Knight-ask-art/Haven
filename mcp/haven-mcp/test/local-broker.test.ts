@@ -3,6 +3,8 @@ import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
 
 import type { SettingsProposalRequest } from "../src/bridge.js";
+import { ERROR_CODES } from "../src/constants.js";
+import { toErrorPayload } from "../src/errors.js";
 import {
   LiveHavenAgentBridge,
   validateHavenEndpoint,
@@ -19,6 +21,10 @@ class FakeSocket extends EventEmitter {
   transform:
     | ((response: Record<string, unknown>, request: Record<string, unknown>) => Record<string, unknown>)
     | null = null;
+  // 连上之后对 `hello` 保持沉默：用来覆盖"握手中途被取消/超时"。
+  silentHandshake = false;
+  // 握手正常、但请求发出后连接直接断开：用来覆盖"结果未确认"的失败路径。
+  dropAfterHandshake = false;
 
   write(buffer: Buffer, callback?: () => void): boolean {
     const length = buffer.readUInt32BE(0);
@@ -26,6 +32,15 @@ class FakeSocket extends EventEmitter {
     this.writes.push(frame);
     queueMicrotask(() => {
       const type = frame.type;
+      if (type === "hello" && this.silentHandshake) {
+        callback?.();
+        return;
+      }
+      if (type !== "hello" && this.dropAfterHandshake) {
+        callback?.();
+        this.emit("close");
+        return;
+      }
       if (type === "hello") {
         this.emitData(frame, {
           type: "welcome",
@@ -295,5 +310,115 @@ describe("Haven local Broker bridge", () => {
     });
 
     await expect(bridge.getSettingsSnapshot()).rejects.toThrow("不符合协议");
+  });
+
+  it("首帧不是合法 welcome 时必须断连，而不是继续占着 Broker 的连接与配额", async () => {
+    // 回归点：首帧校验失败只按普通错误收尾的话，这条连接会留在当地——Broker 侧的连接
+    // 任务连同它占的 permit 要一直等到握手上限才释放，而 MCP 侧早已把错误回给了调用方。
+    // 三种破坏方式各命中一条不同的校验（版本、字段集合、字段长度）。
+    for (const broken of [
+      { protocol_version: 2 },
+      { unexpected_field: true },
+      { session_id: "x".repeat(200) },
+    ]) {
+      let socket: FakeSocket | undefined;
+      const bridge = new LiveHavenAgentBridge(WINDOWS_ENDPOINT, {
+        platform: "win32",
+        env: {},
+        connect: () => {
+          socket = new FakeSocket();
+          socket.transform = (response, request) =>
+            request.type === "hello" ? { ...response, ...broken } : response;
+          socket.connect();
+          return socket as never;
+        },
+      });
+
+      const payload = toErrorPayload(
+        await bridge.getSettingsSnapshot().catch((caught: unknown) => caught),
+      );
+      expect(payload.code, JSON.stringify(broken)).toBe(ERROR_CODES.BRIDGE_PROTOCOL_ERROR);
+      // 关键：连接必须被销毁，而不是"报了错但还挂着"。
+      expect(socket?.destroyed, JSON.stringify(broken)).toBe(true);
+    }
+  });
+
+  it("握手中途取消必须立刻断开连接并释放配额", async () => {
+    const sockets: FakeSocket[] = [];
+    const bridge = new LiveHavenAgentBridge(WINDOWS_ENDPOINT, {
+      platform: "win32",
+      env: {},
+      connect: () => {
+        const socket = new FakeSocket();
+        // 连上了，但对 `hello` 永远不回应：曾经的实现在 TCP connect 完成时就摘掉
+        // abort 监听器，于是这段等待既不受取消控制，也不受调用方超时控制。
+        socket.silentHandshake = true;
+        sockets.push(socket);
+        socket.connect();
+        return socket as never;
+      },
+    });
+
+    const controller = new AbortController();
+    const pending = bridge.getSettingsSnapshot({ signal: controller.signal });
+    // 让出若干微任务，确保此刻已经进入"等 welcome"的阶段，再取消。
+    await Promise.resolve();
+    await Promise.resolve();
+    controller.abort();
+
+    const payload = toErrorPayload(await pending.catch((caught: unknown) => caught));
+    expect(payload.code).toBe(ERROR_CODES.BRIDGE_CANCELLED);
+    // 握手阶段什么都还没发出去，重试是安全的。
+    expect(payload.retryable).toBe(true);
+    // 关键：取消必须落到 socket 上，而不只是"MCP 侧不再等"。
+    expect(sockets[0]?.destroyed).toBe(true);
+  });
+
+  it("提案请求发出后断连 → 非重试，并要求先回栖阅核对", async () => {
+    const bridge = new LiveHavenAgentBridge(WINDOWS_ENDPOINT, {
+      platform: "win32",
+      env: {},
+      connect: () => {
+        const socket = new FakeSocket();
+        socket.dropAfterHandshake = true;
+        socket.connect();
+        return socket as never;
+      },
+    });
+    const request: SettingsProposalRequest = {
+      section: "reading",
+      context_id: "00000000-0000-0000-0000-000000000002",
+      context_hash: "a".repeat(64),
+      base_revision: "rev-7",
+      patch: { font_size: "large" },
+    };
+
+    const payload = toErrorPayload(
+      await bridge.proposeSettingsPatch(request).catch((caught: unknown) => caught),
+    );
+    expect(payload.code).toBe(ERROR_CODES.BRIDGE_UNAVAILABLE);
+    // Broker 可能已经创建了 pending 提案：把结果报成"可重试"会诱导重复提案。
+    expect(payload.retryable).toBe(false);
+    expect(payload.message).toContain("待审批提案");
+  });
+
+  it("只读请求发出后断连仍然可重试", async () => {
+    const bridge = new LiveHavenAgentBridge(WINDOWS_ENDPOINT, {
+      platform: "win32",
+      env: {},
+      connect: () => {
+        const socket = new FakeSocket();
+        socket.dropAfterHandshake = true;
+        socket.connect();
+        return socket as never;
+      },
+    });
+
+    const payload = toErrorPayload(
+      await bridge.getSettingsSnapshot().catch((caught: unknown) => caught),
+    );
+    expect(payload.code).toBe(ERROR_CODES.BRIDGE_UNAVAILABLE);
+    // 只读读取没有副作用，重试就是重试。
+    expect(payload.retryable).toBe(true);
   });
 });

@@ -114,6 +114,7 @@ pub async fn ai_settings_recommendation_generate(
                 profile_id: request.profile_id,
                 session_id: request.session_id,
                 request_id: request.request_id,
+                user_intent: request.user_intent,
                 context_id: request.context_id,
                 context_hash: request.context_hash,
                 base_revision: request.base_revision,

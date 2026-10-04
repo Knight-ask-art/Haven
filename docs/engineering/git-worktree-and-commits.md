@@ -31,12 +31,12 @@ stash or overwrite it to make a task look tidy.
 
 Use one branch and, when isolation is useful, one worktree per independently
 reviewable task. A worktree is disposable working space, not a historical
-archive. Name it after the task, not after an agent or a vague stage:
+archive. Name it after the change rather than a tool or a vague stage:
 
 ```text
-codex/docs-system-foundation
-codex/fix-reader-progress
-codex/verify-release-candidate
+docs/publication-policy
+fix/reader-progress
+release/verify-candidate
 ```
 
 Before creating a worktree, check path ownership and overlap. If two tasks need
@@ -45,9 +45,8 @@ steps; worktrees do not remove merge conflicts.
 
 ## Commit policy
 
-The repository does not grant standing commit or push authority to an agent.
-Commit and push only when the user or the current task explicitly authorizes
-that Git operation.
+Coordinate commit, push and integration ownership before changing shared refs.
+Do not combine unrelated contributors' work into a commit without review.
 
 When authorized:
 
@@ -59,8 +58,7 @@ When authorized:
 5. Create an atomic Conventional Commit with one responsibility.
 6. Record the commit SHA, tests and remaining unverified boundaries.
 
-Do not add an AI co-author trailer or claim that a commit exists before reading
-the resulting SHA.
+Verify the resulting SHA and staged scope before reporting a commit.
 
 ## PR and merge cleanup
 

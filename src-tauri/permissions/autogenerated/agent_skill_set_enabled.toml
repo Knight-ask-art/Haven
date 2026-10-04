@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-agent-skill-set-enabled"
+description = "Enables the agent_skill_set_enabled command without any pre-configured scope."
+commands.allow = ["agent_skill_set_enabled"]
+
+[[permission]]
+identifier = "deny-agent-skill-set-enabled"
+description = "Denies the agent_skill_set_enabled command without any pre-configured scope."
+commands.deny = ["agent_skill_set_enabled"]

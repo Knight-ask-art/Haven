@@ -17,21 +17,26 @@ use haven_application::services::periodical::{
     PeriodicalIssueRecord, PeriodicalJournalRecord, PeriodicalProvider, PeriodicalVolumeRecord,
 };
 use haven_application::services::ports::{
-    FavoriteTxPorts, PeriodicalImportPlan, SourceImportPorts, SourceRegistryPorts, UnitOfWork,
+    FavoriteTxPorts, PeriodicalImportPlan, RemoteAcquisitionPort, RemoteSessionPort,
+    SourceImportPorts, SourceRegistryPorts, UnitOfWork,
 };
+use haven_application::services::search_source::{SearchEventSink, SearchSourceParticipant};
 use haven_application::services::source_import::{
-    ImportedWork, SourceCatalogEntry, SourceCatalogProvider, SourceImportService,
+    FEED_SOURCE_KEY, ImportedWork, SourceCatalogEntry, SourceCatalogProvider, SourceImportService,
+    feed_entry_digest,
 };
 use haven_application::services::source_registry::SourceRegistryService;
 use haven_common::{AppError, ErrorKind};
 use haven_domain::contracts::{
-    MediaItemRepository, PeriodicalRepository, ResourceRepository, WorkRepository,
+    EditionRepository, MediaItemRepository, PeriodicalRepository, ResourceRepository,
+    WorkRepository,
 };
 use haven_domain::entities::{Edition, MediaItem, Resource, Work};
 use haven_domain::enums::{Availability, MediaItemStatus, MediaType, ResourceType};
 use haven_domain::ids::MediaItemId;
 use haven_domain::periodical::{Doi, Issn, PageRange};
 use haven_infrastructure::Db;
+use haven_infrastructure::article_feeds::{FeedProvider, FeedSearchParticipant, FeedSource};
 use haven_infrastructure::db::repos::SqliteRepositories;
 use haven_infrastructure::db::uow::SqliteUnitOfWork;
 
@@ -1008,4 +1013,360 @@ async fn full_text_observation_requires_a_readable_content_resource() {
             "被拒绝的计划不得在 {table} 留下行"
         );
     }
+}
+
+// ---------- 用户登记的 RSS/Atom 订阅源（Task 1） ----------
+
+/// 订阅源抓取替身：进程内返回固定文档并记录被请求的地址，因此可以在没有网络的
+/// 情况下证明「只请求登记端点、绝不请求条目 link」。
+struct FakeFeedSource {
+    body: String,
+    requested: Mutex<Vec<String>>,
+}
+
+impl FakeFeedSource {
+    fn new(body: &str) -> Arc<Self> {
+        Arc::new(Self {
+            body: body.to_owned(),
+            requested: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn requested(&self) -> Vec<String> {
+        self.requested
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+}
+
+#[async_trait]
+impl FeedSource for FakeFeedSource {
+    async fn fetch(&self, url: &str) -> Result<String, AppError> {
+        self.requested
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(url.to_owned());
+        Ok(self.body.clone())
+    }
+}
+
+const FEED_ENDPOINT: &str = "https://feeds.example.invalid/rss.xml";
+const FEED_ENTRY_ONE: &str = "post-1";
+
+const FEED_RSS_FIXTURE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>我的订阅</title>
+    <link>https://feeds.example.invalid/</link>
+    <item>
+      <title>订阅第一篇</title>
+      <link>https://posts.example.invalid/one</link>
+      <guid isPermaLink="false">post-1</guid>
+      <pubDate>Wed, 01 Oct 2026 08:00:00 GMT</pubDate>
+      <description>&lt;p&gt;摘要第一段&lt;/p&gt;</description>
+      <content:encoded>&lt;p&gt;正文第一段&lt;/p&gt;&lt;img src="https://cdn.example.invalid/a.png"/&gt;&lt;script&gt;alert(1)&lt;/script&gt;&lt;p&gt;正文第二段&lt;/p&gt;</content:encoded>
+    </item>
+    <item>
+      <title>订阅第二篇</title>
+      <link>https://posts.example.invalid/two</link>
+      <guid isPermaLink="false">post-2</guid>
+      <pubDate>Thu, 02 Oct 2026 08:00:00 GMT</pubDate>
+      <description>只有摘要</description>
+    </item>
+  </channel>
+</rss>"#;
+
+fn feed_registry() -> (Arc<Db>, Arc<SqliteRepositories>, SourceRegistryService) {
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    let repos = Arc::new(SqliteRepositories::new(db.clone()));
+    let registry = SourceRegistryService::new(repos.clone());
+    (db, repos, registry)
+}
+
+/// 订阅源导入服务：与真实组合根一致，Repository、UnitOfWork、注册表与目录
+/// Provider 共享同一个内存数据库句柄。
+fn feed_import_service(
+    db: &Arc<Db>,
+    repos: &Arc<SqliteRepositories>,
+    registry: &SourceRegistryService,
+    provider: Arc<FeedProvider>,
+) -> SourceImportService {
+    let import_ports: Arc<dyn SourceImportPorts> = repos.clone();
+    SourceImportService::new(
+        import_ports,
+        Arc::new(SqliteUnitOfWork::new(db.clone())),
+        registry.clone(),
+        Arc::new(LegacyCatalogStub),
+    )
+    .with_feed_source(provider)
+}
+
+#[tokio::test]
+async fn feed_source_search_import_read_and_snapshot_stay_on_the_registered_feed() {
+    let (db, repos, registry) = feed_registry();
+    let source_id = registry
+        .add_feed_source("我的订阅", FEED_ENDPOINT)
+        .await
+        .unwrap()
+        .source_id;
+    let source = FakeFeedSource::new(FEED_RSS_FIXTURE);
+    let provider = Arc::new(FeedProvider::new(registry.clone(), source.clone()));
+    let participant = FeedSearchParticipant::new(registry.clone(), source.clone());
+    let service = feed_import_service(&db, &repos, &registry, provider.clone());
+
+    // 1) 搜索：只给出 opaque 候选，不携带端点、条目 link 或正文。
+    let not_cancelled = || false;
+    let cards = participant
+        .search_for(&source_id, "第一篇", 10, &not_cancelled)
+        .await
+        .unwrap();
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0].title, "订阅第一篇");
+    let handle = cards[0].work_id.clone();
+    assert!(handle.starts_with("content-candidate-"));
+    assert!(handle.contains(&source_id), "候选句柄只携带来源身份");
+    assert!(!handle.contains("feeds.example.invalid"));
+    assert!(!handle.contains("posts.example.invalid"));
+    assert!(!handle.contains("正文第一段"));
+
+    // 2) 导入：建立真实 Article 与受控 SourceObject，不写正文文件。
+    let temp = tempfile::tempdir().unwrap();
+    let imported = service.import_candidate(&handle).await.unwrap();
+
+    let editions = repos.list_by_work(imported.work_id).await.unwrap();
+    assert_eq!(editions.len(), 1);
+    assert_eq!(editions[0].edition_type, MediaType::Article);
+    let items = repos.list_by_edition(editions[0].id).await.unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].media_type, MediaType::Article);
+    let resources = repos
+        .list_by_media_item(imported.media_item_id)
+        .await
+        .unwrap();
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0].resource_type, ResourceType::ArticleSnapshot);
+    assert!(
+        resources[0].storage_location_id.is_none(),
+        "导入阶段不得登记本地存储位置"
+    );
+    assert!(
+        std::fs::read_dir(temp.path()).unwrap().next().is_none(),
+        "导入阶段不得写正文文件"
+    );
+    let haven_domain::entities::ResourceLocator::SourceObject { remote_id, .. } =
+        &resources[0].locator
+    else {
+        panic!("订阅导入必须写入 SourceObject");
+    };
+    let remote_id = remote_id.clone();
+
+    // 3) 在线正文：只消费订阅源自带且清洗后的内容。
+    let body = RemoteSessionPort::read(provider.as_ref(), FEED_SOURCE_KEY, &remote_id, None)
+        .await
+        .unwrap();
+    assert_eq!(body.mime_type, "text/html; charset=utf-8");
+    let html = String::from_utf8(body.bytes).unwrap();
+    assert!(html.contains("正文第一段"));
+    assert!(html.contains("正文第二段"));
+    assert!(!html.contains("<script"), "脚本必须被剥离");
+    assert!(!html.contains("alert(1)"));
+    assert!(!html.contains("<img"));
+    assert!(!html.contains("cdn.example.invalid"), "外链资源必须被剥离");
+    assert!(
+        !html.contains("posts.example.invalid"),
+        "不得请求或消费条目链接"
+    );
+
+    // 4) 离线快照：显式获取才写盘，内容与在线会话一致。
+    let snapshot = temp.path().join("snapshot.html");
+    let acquired =
+        RemoteAcquisitionPort::acquire(provider.as_ref(), FEED_SOURCE_KEY, &remote_id, &snapshot)
+            .await
+            .unwrap();
+    assert_eq!(acquired.mime, "text/html; charset=utf-8");
+    assert_eq!(
+        std::fs::read_to_string(&snapshot).unwrap(),
+        html,
+        "在线与离线必须消费同一份清洗后的正文"
+    );
+
+    // 全程只请求过登记端点；条目 link 从未被请求。
+    let requested = source.requested();
+    assert!(!requested.is_empty());
+    assert!(
+        requested.iter().all(|url| url == FEED_ENDPOINT),
+        "订阅源 Provider 只允许请求登记端点，实际请求: {requested:?}"
+    );
+}
+
+#[tokio::test]
+async fn repeated_feed_import_is_idempotent_and_malformed_feeds_fail_closed() {
+    let (db, repos, registry) = feed_registry();
+    let source_id = registry
+        .add_feed_source("我的订阅", FEED_ENDPOINT)
+        .await
+        .unwrap()
+        .source_id;
+    let source = FakeFeedSource::new(FEED_RSS_FIXTURE);
+    let provider = Arc::new(FeedProvider::new(registry.clone(), source.clone()));
+    let service = feed_import_service(&db, &repos, &registry, provider.clone());
+
+    let first = service
+        .import_feed_candidate(&source_id, &feed_entry_digest(FEED_ENTRY_ONE))
+        .await
+        .unwrap();
+    let second = service
+        .import_feed_candidate(&source_id, &feed_entry_digest(FEED_ENTRY_ONE))
+        .await
+        .unwrap();
+    assert_eq!(first, second, "重复导入必须命中同一作品身份");
+    assert_eq!(table_count(&db, "works"), 1);
+    assert_eq!(table_count(&db, "media_items"), 1);
+    assert_eq!(table_count(&db, "resources"), 1);
+
+    // 畸形文档必须明确失败，而不是返回空结果或半截条目。
+    let broken =
+        FakeFeedSource::new("<rss><channel><item><title>标签不匹配</wrong></channel></rss>");
+    let broken_provider = FeedProvider::new(registry.clone(), broken);
+    let error = broken_provider
+        .detail(&source_id, "", &feed_entry_digest(FEED_ENTRY_ONE))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code().as_str(), "SOURCE_UNAVAILABLE");
+    assert!(
+        !error.user_message().contains("feeds.example.invalid"),
+        "错误文案不得回显订阅源端点"
+    );
+
+    // 已删除或未登记的订阅源身份：这是「来源当前不可用」，不是调用方参数错误，
+    // 必须是稳定的可重试来源错误，且不发起任何请求。
+    let unknown = FakeFeedSource::new(FEED_RSS_FIXTURE);
+    let unknown_provider = FeedProvider::new(registry.clone(), unknown.clone());
+    let error = unknown_provider
+        .detail(
+            "custom_feed_ffffffffffff",
+            "",
+            &feed_entry_digest(FEED_ENTRY_ONE),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code().as_str(), "SOURCE_UNAVAILABLE");
+    assert!(error.retryable());
+    assert!(
+        unknown.requested().is_empty(),
+        "没有登记端点时不得发起任何请求"
+    );
+}
+
+// ---------- 订阅源搜索分发（Task 1） ----------
+
+struct FeedCaptureSink {
+    events: Mutex<Vec<haven_application::wire::SearchSourceEvent>>,
+}
+
+impl FeedCaptureSink {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            events: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn snapshot(&self) -> Vec<haven_application::wire::SearchSourceEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+}
+
+impl SearchEventSink for FeedCaptureSink {
+    fn emit_search_event(&self, event: haven_application::wire::SearchSourceEvent) {
+        self.events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(event);
+    }
+}
+
+/// 分发级回归：`custom_feed_*` 必须由最长前缀路由交给订阅源参与者，而不是落到
+/// 自定义 OPDS 参与者上。这里注册的是组合根同款前缀（`custom_` vs
+/// `custom_feed_`），因此断言的是真实的解析/调度语义，而不是参与者自身的搜索。
+#[tokio::test]
+async fn feed_sources_dispatch_to_the_feed_participant_not_the_custom_opds_participant() {
+    use haven_application::services::search_source::SearchSourceService;
+    use haven_application::wire::{SearchSourceEventKind, SearchSourceStartRequest};
+    use haven_infrastructure::opds::{CUSTOM_OPDS_ID_PREFIX, OpdsClient, OpdsSearchParticipant};
+
+    let (_db, _repos, registry) = feed_registry();
+    let source_id = registry
+        .add_feed_source("我的订阅", FEED_ENDPOINT)
+        .await
+        .unwrap()
+        .source_id;
+    registry
+        .set_custom_source_enabled(&source_id, true)
+        .await
+        .unwrap();
+
+    let source = FakeFeedSource::new(FEED_RSS_FIXTURE);
+    let opds_client = Arc::new(OpdsClient::new().unwrap());
+    let participants: Vec<Arc<dyn SearchSourceParticipant>> = vec![
+        Arc::new(OpdsSearchParticipant::new(
+            CUSTOM_OPDS_ID_PREFIX.to_owned(),
+            registry.clone(),
+            opds_client,
+        )),
+        Arc::new(FeedSearchParticipant::new(registry.clone(), source.clone())),
+    ];
+    let sink = FeedCaptureSink::new();
+    let service = SearchSourceService::new(registry.clone(), participants, sink.clone());
+
+    service
+        .start(SearchSourceStartRequest {
+            query: "订阅".to_owned(),
+            category: None,
+            limit_per_source: Some(10),
+        })
+        .await
+        .unwrap();
+
+    for _ in 0..200 {
+        let terminal = sink.snapshot().iter().any(|event| {
+            matches!(
+                event.kind,
+                SearchSourceEventKind::Completed
+                    | SearchSourceEventKind::Failed
+                    | SearchSourceEventKind::Cancelled
+            )
+        });
+        if terminal {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let events = sink.snapshot();
+    let result = events
+        .iter()
+        .find(|event| event.kind == SearchSourceEventKind::SourceResult)
+        .expect("订阅源参与者必须返回结果");
+    assert_eq!(result.data.source_id.as_deref(), Some(source_id.as_str()));
+    assert_eq!(result.data.works.len(), 2);
+    for card in &result.data.works {
+        assert!(card.work_id.starts_with("content-candidate-"));
+        assert!(!card.work_id.contains("feeds.example.invalid"));
+        assert!(!card.work_id.contains("posts.example.invalid"));
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == SearchSourceEventKind::Warning),
+        "订阅源不得被自定义 OPDS 参与者接管而告警"
+    );
+    assert_eq!(
+        source.requested(),
+        vec![FEED_ENDPOINT.to_owned()],
+        "只有订阅源参与者允许请求登记端点"
+    );
 }

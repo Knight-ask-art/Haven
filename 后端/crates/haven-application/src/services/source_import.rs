@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 
 use haven_common::network::{HttpUrlPolicy, parse_http_url};
 use haven_common::{AppError, ErrorKind, UtcMillis};
@@ -47,7 +48,9 @@ use crate::services::periodical::{
 use crate::services::ports::{
     ComicChapterRefreshPlan, ComicEditionWrite, PeriodicalImportPlan, SourceImportPorts, UnitOfWork,
 };
-use crate::services::source_registry::SourceRegistryService;
+use crate::services::source_registry::{
+    CUSTOM_FEED_SOURCE_PREFIX, CustomSourceKind, SourceRegistryService,
+};
 use crate::wire::ContentCategory;
 
 /// 来源目录条目（application 视角；由 infrastructure 适配器填充）。
@@ -141,6 +144,9 @@ pub trait SourceCatalogProvider: Send + Sync {
     }
 }
 
+/// 漫画候选的内部路由结果：Provider、固定来源键、分发 ID、远端作品身份。
+type ComicContentCandidateRoute = (Arc<dyn SourceCatalogProvider>, &'static str, String, String);
+
 /// 来源入库服务。
 #[derive(Clone)]
 pub struct SourceImportService {
@@ -151,6 +157,14 @@ pub struct SourceImportService {
     /// 专用报刊 Provider + 期刊 Repository。两者必须一起注入：只注入其一会让
     /// 导入路径既不能建立真实层级，也不能验证既有归属。
     periodical: Option<PeriodicalImportDeps>,
+    /// 用户登记的 RSS/Atom 订阅源目录 Provider。订阅源身份是动态 sourceId，
+    /// 不能走只按固定来源键路由的通用目录路由器，因此单独注入；未注入时
+    /// 订阅候选明确失败，不回退到其它来源。
+    feed: Option<Arc<dyn SourceCatalogProvider>>,
+    /// 用户登记的自托管漫画库（Komga/Kavita）目录 Provider。与订阅源同理，
+    /// 漫画库身份是动态 sourceId + 服务端 opaque ID，不能交给只按固定来源键
+    /// 路由的通用目录路由器；未注入时漫画库候选明确失败。
+    comic_library: Option<Arc<dyn SourceCatalogProvider>>,
 }
 
 /// 专用报刊导入依赖（Provider 负责网络，Repository 负责归属读取）。
@@ -189,6 +203,127 @@ pub const CONTENT_CANDIDATE_PREFIX: &str = "content-candidate-";
 /// is a provider-owned `(display title, stream URL)` pair and is only decoded
 /// at this application boundary.
 pub const M3U_SOURCE_ID: &str = "m3u";
+/// 用户登记的 RSS/Atom 订阅源在 `work_source_refs` / `Resource.source_id` 中
+/// 使用的固定来源键。
+///
+/// 具体订阅源身份由 `custom_feed_` 开头的 sourceId 承载，并作为 opaque
+/// `remote_id` 的前半段持久化，因此这里不需要为每个用户 Feed 生成新的来源
+/// 键（也就不需要放宽 `SourceId` 与 `source_key_for_id` 的一一映射）。
+pub const FEED_SOURCE_KEY: &str = "feed";
+/// 订阅源条目标识的最大字节数。
+///
+/// 该标识在进入候选句柄与 `remote_id` 之前会先被压成固定长度摘要，因此这里的
+/// 上限只用于拒绝明显异常的 `guid`/`link` 文本，不再影响线上身份长度。
+pub const MAX_FEED_ENTRY_KEY_BYTES: usize = 150;
+/// 订阅源条目摘要的小写十六进制长度（SHA-256 前 16 字节）。
+pub const FEED_ENTRY_DIGEST_HEX_LEN: usize = 32;
+/// 用户登记的自托管 Komga 漫画库在 `work_source_refs` / `Resource.source_id`
+/// 中使用的固定来源键。
+///
+/// 与订阅源同理：具体漫画库身份由 `custom_komga_` 开头的 sourceId 承载，并作为
+/// opaque `remote_id` 的前半段持久化，因此多个 Komga 服务器可以共用一个来源键，
+/// 而不需要为每个用户漫画库分配新的 `SourceId`。
+pub const KOMGA_SOURCE_KEY: &str = "komga";
+/// 用户登记的自托管 Kavita 漫画库固定来源键（语义同 [`KOMGA_SOURCE_KEY`]）。
+pub const KAVITA_SOURCE_KEY: &str = "kavita";
+/// 自托管漫画库 opaque 远端 ID 的长度上限（`<sourceId>:<seriesId>[:<chapterId>]`）。
+pub const MAX_COMIC_LIBRARY_REMOTE_ID_BYTES: usize = 200;
+/// 单个 opaque 漫画库标识（seriesId / bookId / chapterId）的字节上限。
+pub const MAX_COMIC_LIBRARY_ID_BYTES: usize = 64;
+
+/// 该来源键是否走「漫画章节目录 + 章节归档资源」的持久化路径。
+pub fn is_comic_catalog_source_key(source_key: &str) -> bool {
+    matches!(
+        source_key,
+        "mangadex" | KOMGA_SOURCE_KEY | KAVITA_SOURCE_KEY
+    )
+}
+
+/// 动态漫画库 sourceId → 固定来源键（`custom_komga_*` → `komga`）。
+///
+/// 非漫画库 sourceId 明确失败，避免把任意来源身份当成漫画库来源键。
+pub fn comic_library_source_key(source_id: &str) -> Result<&'static str, AppError> {
+    match SourceRegistryService::comic_library_kind(source_id) {
+        Some(CustomSourceKind::Komga) => Ok(KOMGA_SOURCE_KEY),
+        Some(CustomSourceKind::Kavita) => Ok(KAVITA_SOURCE_KEY),
+        _ => Err(invalid_remote_candidate_id()),
+    }
+}
+
+/// 单个漫画库 opaque 标识的形状。
+///
+/// 服务端返回的 series/book/chapter ID 只被当作 opaque 标识使用：这里不假定
+/// UUID 或整数，而是限制字符集与长度，避免任何标识退化成 URL、路径或查询串。
+pub fn is_comic_library_opaque_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_COMIC_LIBRARY_ID_BYTES
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
+}
+
+/// 漫画库作品身份：`<sourceId>:<seriesId>`。
+pub fn comic_library_work_ref(source_id: &str, series_id: &str) -> Result<String, AppError> {
+    if !SourceRegistryService::is_comic_library_source_id(source_id)
+        || !is_comic_library_opaque_id(series_id)
+    {
+        return Err(invalid_remote_candidate_id());
+    }
+    Ok(format!("{source_id}:{series_id}"))
+}
+
+/// 解析漫画库作品身份，返回 `(sourceId, seriesId)`。
+pub fn split_comic_library_work_ref(value: &str) -> Result<(String, String), AppError> {
+    if value.is_empty()
+        || value.len() > MAX_COMIC_LIBRARY_REMOTE_ID_BYTES
+        || has_control_character(value)
+    {
+        return Err(invalid_remote_candidate_id());
+    }
+    let (source_id, series_id) = value
+        .split_once(':')
+        .ok_or_else(invalid_remote_candidate_id)?;
+    if !SourceRegistryService::is_comic_library_source_id(source_id)
+        || !is_comic_library_opaque_id(series_id)
+    {
+        return Err(invalid_remote_candidate_id());
+    }
+    Ok((source_id.to_owned(), series_id.to_owned()))
+}
+
+/// 漫画库章节资源身份：`<sourceId>:<seriesId>:<chapterId>`。
+///
+/// 与 `comic_remote_id(work_ref, chapter_id)` 的形状一致，因此章节资源可以直接
+/// 复用既有的 `ResourceLocator::SourceObject` 持久化路径。
+pub fn split_comic_library_chapter_remote_id(
+    value: &str,
+) -> Result<(String, String, String), AppError> {
+    if value.is_empty()
+        || value.len() > MAX_COMIC_LIBRARY_REMOTE_ID_BYTES
+        || has_control_character(value)
+    {
+        return Err(invalid_remote_candidate_id());
+    }
+    let (work_ref, chapter_id) = value
+        .rsplit_once(':')
+        .ok_or_else(invalid_remote_candidate_id)?;
+    let (source_id, series_id) = split_comic_library_work_ref(work_ref)?;
+    if !is_comic_library_opaque_id(chapter_id) {
+        return Err(invalid_remote_candidate_id());
+    }
+    Ok((source_id, series_id, chapter_id.to_owned()))
+}
+
+/// 漫画库搜索候选句柄：与固定正文来源共用 `content-candidate-` 信封，句柄里只有
+/// 来源 sourceId 与经校验的 seriesId，没有漫画库地址、API key 或任意 URL。
+pub fn comic_library_candidate_handle(source_id: &str, series_id: &str) -> String {
+    format!(
+        "{CONTENT_CANDIDATE_PREFIX}{source_id}-{}",
+        encode_candidate_component(series_id)
+    )
+}
 
 /// Periodical imports may race while the first article establishes the
 /// journal's ISSN source reference.  Rebuild the plan once after observing a
@@ -210,7 +345,38 @@ impl SourceImportService {
             registry,
             catalog,
             periodical: None,
+            feed: None,
+            comic_library: None,
         }
+    }
+
+    /// 注入用户登记的 RSS/Atom 订阅源目录 Provider。
+    ///
+    /// 未注入时 `custom_feed_` 候选保持不可导入（fail closed），不会把候选交给
+    /// 通用目录或其它固定来源。
+    pub fn with_feed_source(mut self, provider: Arc<dyn SourceCatalogProvider>) -> Self {
+        self.feed = Some(provider);
+        self
+    }
+
+    /// 注入用户登记的自托管漫画库（Komga/Kavita）目录 Provider。
+    ///
+    /// 未注入时 `custom_komga_` / `custom_kavita_` 候选保持不可导入
+    /// （fail closed），不会回退到通用目录或其它固定来源。
+    pub fn with_comic_library_source(mut self, provider: Arc<dyn SourceCatalogProvider>) -> Self {
+        self.comic_library = Some(provider);
+        self
+    }
+
+    fn comic_library_provider(&self) -> Result<&Arc<dyn SourceCatalogProvider>, AppError> {
+        self.comic_library.as_ref().ok_or_else(|| {
+            AppError::new(
+                "SOURCE_IMPORT_UNSUPPORTED",
+                ErrorKind::Unsupported,
+                "自托管漫画库尚未接入当前运行实例",
+                false,
+            )
+        })
     }
 
     /// 注入专用报刊 Provider 与期刊 Repository（组合根必须同时提供）。
@@ -480,9 +646,10 @@ impl SourceImportService {
     /// Import an opaque source candidate into an existing local Work.
     ///
     /// The target form is intentionally narrower than [`Self::import_candidate`]:
-    /// only a MangaDex content candidate can add chapters to an existing comic
-    /// Work. The candidate is decoded and validated here, so a caller cannot
-    /// turn this method into an arbitrary remote-id or URL router.
+    /// only a comic content candidate (MangaDex or a registered Komga/Kavita
+    /// library) can add chapters to an existing comic Work. The candidate is
+    /// decoded and validated here, so a caller cannot turn this method into an
+    /// arbitrary remote-id or URL router.
     pub async fn import_candidate_into_work(
         &self,
         candidate_handle: &str,
@@ -515,9 +682,10 @@ impl SourceImportService {
             ));
         }
 
-        let remote_work_id = decode_mangadex_content_candidate(candidate_handle)?;
+        let (provider, source_key, dispatched_id, remote_work_id) =
+            self.route_comic_content_candidate(candidate_handle)?;
         if let Some(bound_work_id) =
-            WorkRepository::id_for_source_ref(&*self.ports, "mangadex", &remote_work_id).await?
+            WorkRepository::id_for_source_ref(&*self.ports, source_key, &remote_work_id).await?
         {
             if bound_work_id != target_work.id {
                 return Err(AppError::new(
@@ -530,10 +698,10 @@ impl SourceImportService {
             return self.existing_comic_identity(target_work.id).await;
         }
 
-        // Resolve the candidate through the allowlisted MangaDex provider
-        // before attaching it. This validates the provider-owned remote
-        // identity without exposing its URL or request channels to the caller.
-        let entry = self.catalog.detail("mangadex", "", &remote_work_id).await?;
+        // Resolve the candidate through the allowlisted provider before
+        // attaching it. This validates the provider-owned remote identity
+        // without exposing its URL or request channels to the caller.
+        let entry = provider.detail(&dispatched_id, "", &remote_work_id).await?;
         let remote = entry.remote.as_ref().ok_or_else(|| {
             AppError::new(
                 "SOURCE_UNAVAILABLE",
@@ -542,7 +710,7 @@ impl SourceImportService {
                 true,
             )
         })?;
-        if remote.source_key != "mangadex" || remote.media_type != MediaType::Comic {
+        if remote.source_key != source_key || remote.media_type != MediaType::Comic {
             return Err(AppError::new(
                 "SOURCE_UNAVAILABLE",
                 ErrorKind::Network,
@@ -553,7 +721,7 @@ impl SourceImportService {
 
         self.refresh_comic_chapter_catalog_for_work_with_catalog(
             target_work.id,
-            "mangadex",
+            source_key,
             &remote_work_id,
             entry.comic_catalog.clone(),
             false,
@@ -562,16 +730,70 @@ impl SourceImportService {
         self.existing_comic_identity(target_work.id).await
     }
 
+    /// 解析漫画正文候选句柄，返回 `(Provider, 固定来源键, Provider source_id, 作品身份)`。
+    ///
+    /// 只接受 MangaDex 与用户登记的自托管漫画库；其它来源明确拒绝，避免把任意
+    /// remote id 或 URL 交给某个 Provider。动态漫画库 sourceId 决定了 Provider 侧
+    /// 的分发身份，而固定来源键决定持久化身份——两者必须来自同一次解析。
+    fn route_comic_content_candidate(
+        &self,
+        handle: &str,
+    ) -> Result<ComicContentCandidateRoute, AppError> {
+        let handle = handle.trim();
+        let rest = handle
+            .strip_prefix(CONTENT_CANDIDATE_PREFIX)
+            .ok_or_else(comic_binding_unsupported)?;
+        let (source_id, encoded) = rest
+            .split_once('-')
+            .ok_or_else(invalid_remote_candidate_id)?;
+        if SourceRegistryService::is_comic_library_source_id(source_id) {
+            let series_id = decode_candidate_component(encoded)?;
+            let source_key = comic_library_source_key(source_id)?;
+            let remote_work_id = comic_library_work_ref(source_id, &series_id)?;
+            validate_remote_candidate_id(source_id, &remote_work_id)?;
+            return Ok((
+                self.comic_library_provider()?.clone(),
+                source_key,
+                source_id.to_owned(),
+                remote_work_id,
+            ));
+        }
+        if source_id == "mangadex" {
+            let external_id = decode_candidate_component(encoded)?;
+            validate_remote_candidate_id("mangadex", &external_id)?;
+            return Ok((
+                self.catalog.clone(),
+                "mangadex",
+                "mangadex".to_owned(),
+                external_id,
+            ));
+        }
+        Err(comic_binding_unsupported())
+    }
+
     /// 导入固定在线正文来源。
     ///
     /// 这里严格只登记元数据和 `SourceObject` 远端身份，不获取正文、不创建
     /// Offline Resource，也不写入用户下载目录。正文获取只能由显式下载任务
     /// 或受控 Remote Session 触发。
+    ///
+    /// 漫画库候选句柄携带的是服务端返回的裸 seriesId，本方法是把它转换成
+    /// 规范作品身份 `<sourceId>:<seriesId>` 的唯一入口；下游
+    /// [`Self::import_comic_library_candidate`] 只接受已校验的规范身份。
     pub async fn import_content_candidate(
         &self,
         source_id: &str,
         external_id: &str,
     ) -> Result<ImportedWork, AppError> {
+        if SourceRegistryService::is_feed_source_id(source_id) {
+            return self.import_feed_candidate(source_id, external_id).await;
+        }
+        if SourceRegistryService::is_comic_library_source_id(source_id) {
+            let work_ref = comic_library_work_ref(source_id, external_id)?;
+            return self
+                .import_comic_library_candidate(source_id, &work_ref)
+                .await;
+        }
         if !matches!(source_id, "mangadex" | "arxiv" | "europepmc" | "wikisource") {
             return Err(AppError::new(
                 "INVALID_ARGUMENT",
@@ -614,6 +836,107 @@ impl SourceImportService {
             .await
     }
 
+    /// 导入用户登记的 RSS/Atom 订阅源条目。
+    ///
+    /// 与固定正文来源一致：只登记元数据与受控 `SourceObject` 远端身份，不获取
+    /// 正文、不创建离线资源、也不打开条目 `link` 指向的网页。去重键由
+    /// `feed` 来源键 + opaque `remote_id`（`<sourceId>:<条目摘要>`）组成，
+    /// 因此不同订阅源的同名条目不会互相命中，同一 Feed 内 `guid` 缺失时也能由
+    /// 标题/发布时间派生出稳定身份。
+    ///
+    /// 入参是 [`feed_entry_digest`] 产生的固定长度摘要，而不是 Feed 原始
+    /// `guid`/`link`：Provider 会重新扫描已登记 Feed 并比对摘要，因此携带 token
+    /// 的 URL 既不进 Wire，也不进持久化身份。
+    pub async fn import_feed_candidate(
+        &self,
+        source_id: &str,
+        entry_digest: &str,
+    ) -> Result<ImportedWork, AppError> {
+        let source_id = source_id.trim();
+        let entry_digest = entry_digest.trim();
+        let remote_id = feed_remote_id(source_id, entry_digest)?;
+        if let Some(work_id) =
+            WorkRepository::id_for_source_ref(&*self.ports, FEED_SOURCE_KEY, &remote_id).await?
+        {
+            return self.existing_identity(work_id).await;
+        }
+        let feed = self.feed.as_ref().ok_or_else(|| {
+            AppError::new(
+                "SOURCE_IMPORT_UNSUPPORTED",
+                ErrorKind::Unsupported,
+                "订阅源尚未接入当前运行实例",
+                false,
+            )
+        })?;
+        let entry = feed.detail(source_id, "", entry_digest).await?;
+        let remote = entry.remote.clone().ok_or_else(|| {
+            AppError::new(
+                "SOURCE_UNAVAILABLE",
+                ErrorKind::Network,
+                "该订阅条目没有可用的正文身份",
+                true,
+            )
+        })?;
+        if remote.remote_id != remote_id {
+            return Err(AppError::new(
+                "SOURCE_UNAVAILABLE",
+                ErrorKind::Network,
+                "订阅条目标识与请求不一致",
+                true,
+            ));
+        }
+        self.import_remote_entry(FEED_SOURCE_KEY, &remote_id, entry, remote)
+            .await
+    }
+
+    /// 导入用户登记的自托管漫画库（Komga/Kavita）作品。
+    ///
+    /// 与其它远端来源一致：只登记元数据与受控 `SourceObject` 章节身份，不获取
+    /// 正文、不创建离线资源。去重键由固定来源键（`komga` / `kavita`）+
+    /// opaque `remote_id`（`<sourceId>:<seriesId>`）组成，因此不同漫画库中
+    /// 同名作品不会互相命中，同一库重复导入保持幂等。
+    ///
+    /// `work_ref` 是 [`comic_library_work_ref`] 产生的身份；其中的 seriesId 是
+    /// 服务端返回并被形状校验过的 opaque 标识，不接受前端任意 URL。
+    pub async fn import_comic_library_candidate(
+        &self,
+        source_id: &str,
+        work_ref: &str,
+    ) -> Result<ImportedWork, AppError> {
+        let source_id = source_id.trim();
+        let work_ref = work_ref.trim();
+        let (embedded, _series_id) = split_comic_library_work_ref(work_ref)?;
+        if embedded != source_id {
+            return Err(invalid_remote_candidate_id());
+        }
+        let source_key = comic_library_source_key(source_id)?;
+        if let Some(work_id) =
+            WorkRepository::id_for_source_ref(&*self.ports, source_key, work_ref).await?
+        {
+            return self.existing_identity(work_id).await;
+        }
+        let provider = self.comic_library_provider()?.clone();
+        let entry = provider.detail(source_id, "", work_ref).await?;
+        let remote = entry.remote.clone().ok_or_else(|| {
+            AppError::new(
+                "SOURCE_UNAVAILABLE",
+                ErrorKind::Network,
+                "该漫画库作品没有可用的章节身份",
+                true,
+            )
+        })?;
+        if remote.source_key != source_key || remote.media_type != MediaType::Comic {
+            return Err(AppError::new(
+                "SOURCE_UNAVAILABLE",
+                ErrorKind::Network,
+                "漫画库远端身份无效",
+                true,
+            ));
+        }
+        self.import_remote_entry(source_key, work_ref, entry, remote)
+            .await
+    }
+
     /// Read the current chapter catalog for a fixed comic source.
     ///
     /// This is deliberately a read-only provider boundary for the first
@@ -624,26 +947,35 @@ impl SourceImportService {
         source_id: &str,
         remote_work_id: &str,
     ) -> Result<ComicChapterCatalog, AppError> {
-        if source_id != "mangadex" {
-            return Err(AppError::new(
-                "SOURCE_CATALOG_UNSUPPORTED",
-                ErrorKind::Unsupported,
-                "该来源暂不支持漫画章节目录",
-                false,
-            ));
-        }
-        validate_remote_candidate_id(source_id, remote_work_id)?;
-        self.catalog
-            .comic_chapter_catalog(source_id, "", remote_work_id)
+        let (provider, dispatched_id) = self.comic_catalog_dispatch(source_id, remote_work_id)?;
+        validate_remote_candidate_id(&dispatched_id, remote_work_id)?;
+        provider
+            .comic_chapter_catalog(&dispatched_id, "", remote_work_id)
             .await?
-            .ok_or_else(|| {
-                AppError::new(
-                    "SOURCE_CATALOG_UNSUPPORTED",
-                    ErrorKind::Unsupported,
-                    "该来源暂不支持漫画章节目录",
-                    false,
-                )
-            })
+            .ok_or_else(comic_catalog_unsupported)
+    }
+
+    /// 解析漫画章节目录的 Provider 与分发用 source_id。
+    ///
+    /// MangaDex 走固定来源键路由器；用户登记的 Komga/Kavita 身份是动态 sourceId，
+    /// 必须交给注入的漫画库 Provider，并把 `remote_work_id` 里的库身份与请求的
+    /// 来源键对齐——否则一个库的身份可以被当成另一个库的请求发出去。
+    fn comic_catalog_dispatch(
+        &self,
+        source_key: &str,
+        remote_work_id: &str,
+    ) -> Result<(Arc<dyn SourceCatalogProvider>, String), AppError> {
+        if source_key == "mangadex" {
+            return Ok((self.catalog.clone(), "mangadex".to_owned()));
+        }
+        if matches!(source_key, KOMGA_SOURCE_KEY | KAVITA_SOURCE_KEY) {
+            let (custom_id, _series_id) = split_comic_library_work_ref(remote_work_id)?;
+            if comic_library_source_key(&custom_id)? != source_key {
+                return Err(comic_catalog_unsupported());
+            }
+            return Ok((self.comic_library_provider()?.clone(), custom_id));
+        }
+        Err(comic_catalog_unsupported())
     }
 
     /// Refresh and persist a MangaDex chapter catalog. Network I/O is completed
@@ -654,13 +986,8 @@ impl SourceImportService {
         source_id: &str,
         remote_work_id: &str,
     ) -> Result<ComicChapterCatalog, AppError> {
-        if source_id != "mangadex" {
-            return Err(AppError::new(
-                "SOURCE_CATALOG_UNSUPPORTED",
-                ErrorKind::Unsupported,
-                "该来源暂不支持漫画章节目录",
-                false,
-            ));
+        if !is_comic_catalog_source_key(source_id) {
+            return Err(comic_catalog_unsupported());
         }
         validate_remote_candidate_id(source_id, remote_work_id)?;
         let work_id = WorkRepository::id_for_source_ref(&*self.ports, source_id, remote_work_id)
@@ -710,15 +1037,10 @@ impl SourceImportService {
         prefetched_catalog: Option<ComicChapterCatalog>,
         record_failure: bool,
     ) -> Result<ComicChapterCatalog, AppError> {
-        if source_id != "mangadex" {
-            return Err(AppError::new(
-                "SOURCE_CATALOG_UNSUPPORTED",
-                ErrorKind::Unsupported,
-                "该来源暂不支持漫画章节目录",
-                false,
-            ));
-        }
-        validate_remote_candidate_id(source_id, remote_work_id)?;
+        // 解析分发身份既校验了「该来源是否支持目录」，也校验了远端作品身份与
+        // 请求来源键一致（动态漫画库 sourceId 不能借用另一个库的身份）。
+        let (_provider, dispatched_id) = self.comic_catalog_dispatch(source_id, remote_work_id)?;
+        validate_remote_candidate_id(&dispatched_id, remote_work_id)?;
         if let Some(bound_work_id) =
             WorkRepository::id_for_source_ref(&*self.ports, source_id, remote_work_id).await?
         {
@@ -3089,6 +3411,100 @@ fn validate_m3u_stream_url(url: &str) -> Result<(), AppError> {
 /// Candidate IDs use percent-encoding so a remote URL or title never travels
 /// as a directly callable URL through the UI.  Only the import service decodes
 /// the opaque component after the source allowlist has been checked.
+///
+/// `encode_candidate_component` 是它的编码半边：只放行 unreserved 字符，其余
+/// 字节一律 `%XX`，因此编码结果里不会出现分隔符、控制字符或可直接调用的 URL。
+pub fn encode_candidate_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// 订阅源条目标识的固定长度单向摘要。
+///
+/// 条目标识可能是携带访问令牌的 `guid`/`link` URL；这类原文绝不允许进入候选
+/// 句柄、Wire 或持久化远端身份。摘要取 SHA-256 前 16 字节的 32 位小写十六进制：
+/// 固定长度、不可逆、同一输入恒等，因此去重与幂等语义保持不变，但订阅源地址与
+/// query token 无法再从身份中还原。
+pub fn feed_entry_digest(entry_key: &str) -> String {
+    let digest = Sha256::digest(entry_key.as_bytes());
+    let mut out = String::with_capacity(FEED_ENTRY_DIGEST_HEX_LEN);
+    for byte in digest.iter().take(FEED_ENTRY_DIGEST_HEX_LEN / 2) {
+        let byte = *byte;
+        out.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
+        out.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
+    }
+    out
+}
+
+/// 订阅源摘要形状：32 位小写十六进制。摘要只能由 [`feed_entry_digest`] 产生，
+/// 因此这里可以 fail closed 地拒绝任何手写文本或 URL 片段。
+pub fn is_feed_entry_digest(value: &str) -> bool {
+    value.len() == FEED_ENTRY_DIGEST_HEX_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// 订阅源条目的 opaque 候选句柄。
+///
+/// 与固定正文来源共用 `content-candidate-` 信封，因此前端的
+/// `operationId + index` 定位语义完全一致；句柄里只有来源 sourceId 与条目身份的
+/// 单向摘要，没有订阅源地址、条目 link、query token 或任何正文。
+pub fn feed_candidate_handle(source_id: &str, entry_digest: &str) -> String {
+    format!("{CONTENT_CANDIDATE_PREFIX}{source_id}-{entry_digest}")
+}
+
+/// 订阅源 sourceId 形状：`custom_feed_` + 12 位小写十六进制。
+///
+/// 形状只由来源注册表生成，因此这里可以 fail closed 地拒绝任何手写字符串，
+/// 避免把任意文本当成订阅源身份。
+pub fn is_feed_source_id_shape(source_id: &str) -> bool {
+    let Some(rest) = source_id.strip_prefix(CUSTOM_FEED_SOURCE_PREFIX) else {
+        return false;
+    };
+    rest.len() == 12
+        && rest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// 持久化的订阅源远端身份：`<sourceId>:<条目标识摘要>`。
+///
+/// 只包含来源注册表生成的 sourceId 与 Feed 条目标识的单向摘要，不含订阅源地址、
+/// query token、条目 link 或正文。
+pub fn feed_remote_id(source_id: &str, entry_digest: &str) -> Result<String, AppError> {
+    if !is_feed_source_id_shape(source_id) || !is_feed_entry_digest(entry_digest) {
+        return Err(invalid_remote_candidate_id());
+    }
+    Ok(format!("{source_id}:{entry_digest}"))
+}
+
+/// 解析已持久化的订阅源远端身份，返回 `(sourceId, 条目摘要)`。形状不合法时返回
+/// 稳定错误，且错误文案不包含被拒绝的标识本身。
+pub fn split_feed_remote_id(remote_id: &str) -> Result<(String, String), AppError> {
+    if remote_id.is_empty() || remote_id.len() > 512 || has_control_character(remote_id) {
+        return Err(invalid_remote_candidate_id());
+    }
+    let (source_id, digest) = remote_id
+        .split_once(':')
+        .ok_or_else(invalid_remote_candidate_id)?;
+    if !is_feed_source_id_shape(source_id) || !is_feed_entry_digest(digest) {
+        return Err(invalid_remote_candidate_id());
+    }
+    Ok((source_id.to_owned(), digest.to_owned()))
+}
+
+/// Candidate IDs use percent-encoding so a remote URL or title never travels
+/// as a directly callable URL through the UI.  Only the import service decodes
+/// the opaque component after the source allowlist has been checked.
 fn decode_candidate_component(value: &str) -> Result<String, AppError> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -3145,30 +3561,14 @@ fn decode_candidate_component(value: &str) -> Result<String, AppError> {
     Ok(value)
 }
 
-fn decode_mangadex_content_candidate(handle: &str) -> Result<String, AppError> {
-    let handle = handle.trim();
-    let Some(rest) = handle.strip_prefix(CONTENT_CANDIDATE_PREFIX) else {
-        return Err(AppError::new(
-            "SOURCE_IMPORT_UNSUPPORTED",
-            ErrorKind::Unsupported,
-            "绑定导入只支持 MangaDex 漫画候选",
-            false,
-        ));
-    };
-    let Some((source_id, encoded_external_id)) = rest.split_once('-') else {
-        return Err(invalid_remote_candidate_id());
-    };
-    if source_id != "mangadex" {
-        return Err(AppError::new(
-            "SOURCE_IMPORT_UNSUPPORTED",
-            ErrorKind::Unsupported,
-            "绑定导入只支持 MangaDex 漫画候选",
-            false,
-        ));
-    }
-    let external_id = decode_candidate_component(encoded_external_id)?;
-    validate_remote_candidate_id(source_id, &external_id)?;
-    Ok(external_id)
+/// 绑定导入只接受漫画正文候选（MangaDex 与自托管漫画库）时的稳定错误。
+fn comic_binding_unsupported() -> AppError {
+    AppError::new(
+        "SOURCE_IMPORT_UNSUPPORTED",
+        ErrorKind::Unsupported,
+        "绑定导入只支持漫画候选",
+        false,
+    )
 }
 
 fn hex_value(value: u8) -> Option<u8> {
@@ -3233,6 +3633,17 @@ fn validate_remote_candidate_id(source_key: &str, value: &str) -> Result<(), App
         "wikisource" => {
             !value.contains("://") && !value.contains(['\r', '\n']) && !value.trim().is_empty()
         }
+        // 用户登记的自托管漫画库：候选身份是 `<动态 sourceId>:<seriesId>`，
+        // 两段都必须由注册表/Provider 生成，不能携带 URL、查询串或路径。
+        _ if SourceRegistryService::is_comic_library_source_id(source_key) => {
+            split_comic_library_work_ref(value).is_ok_and(|(embedded, _)| embedded == source_key)
+        }
+        // 用户登记的 RSS/Atom 订阅源：来源身份必须是注册表生成的动态 sourceId，
+        // 条目身份只能是 `feed_entry_digest` 产生的固定长度摘要（原始 guid/link
+        // 可能是携带 token 的 URL，绝不能出现在这里）。
+        _ if SourceRegistryService::is_feed_source_id(source_key) => {
+            is_feed_source_id_shape(source_key) && is_feed_entry_digest(value)
+        }
         _ => false,
     };
 
@@ -3259,9 +3670,10 @@ pub fn validate_remote_source_object(
     }
 
     let expected_type = match source_key {
-        "mangadex" => ResourceType::ComicArchive,
+        "mangadex" | KOMGA_SOURCE_KEY | KAVITA_SOURCE_KEY => ResourceType::ComicArchive,
         "arxiv" | "opds_gutenberg" => ResourceType::PublicationFile,
         "europepmc" | "wikisource" => ResourceType::ArticleSnapshot,
+        FEED_SOURCE_KEY => ResourceType::ArticleSnapshot,
         _ => return Err(invalid_remote_candidate_id()),
     };
     if resource_type != expected_type {
@@ -3291,6 +3703,17 @@ pub fn validate_remote_source_object(
                 && !remote_id.chars().any(char::is_control)
         }
         "opds_gutenberg" => validate_gutenberg_remote_id(remote_id),
+        // 自托管漫画库章节身份是 `<动态 sourceId>:<seriesId>:<chapterId>`；三段都由
+        // 注册表/Provider 生成，不含 URL、凭据或任意路径。动态 sourceId 必须映射回
+        // 本固定来源键（`custom_komga_*` → `komga`、`custom_kavita_*` → `kavita`）：
+        // 直接与固定来源键比较会恒为 false，而只按前缀放行又会接受跨库身份。
+        KOMGA_SOURCE_KEY | KAVITA_SOURCE_KEY => split_comic_library_chapter_remote_id(remote_id)
+            .is_ok_and(|(source_id, _, _)| {
+                comic_library_source_key(&source_id).is_ok_and(|key| key == source_key)
+            }),
+        // 订阅源身份是 `<动态 sourceId>:<条目标识>`；两者都由注册表/Feed 生成，
+        // 不含 URL、凭据或任意路径。
+        FEED_SOURCE_KEY => split_feed_remote_id(remote_id).is_ok(),
         _ => false,
     };
     if valid {
@@ -3317,17 +3740,23 @@ pub fn remote_source_mime_compatible(
         return false;
     };
     let expected = match source_key {
-        "mangadex" if resource_type == ResourceType::ComicArchive => [
-            "application/vnd.comicbook+zip",
-            "application/zip",
-            "application/x-cbz",
-        ]
-        .as_slice(),
+        "mangadex" | KOMGA_SOURCE_KEY | KAVITA_SOURCE_KEY
+            if resource_type == ResourceType::ComicArchive =>
+        {
+            [
+                "application/vnd.comicbook+zip",
+                "application/zip",
+                "application/x-cbz",
+            ]
+            .as_slice()
+        }
         "arxiv" if resource_type == ResourceType::PublicationFile => ["application/pdf"].as_slice(),
         "opds_gutenberg" if resource_type == ResourceType::PublicationFile => {
             ["application/epub+zip"].as_slice()
         }
-        "europepmc" | "wikisource" if resource_type == ResourceType::ArticleSnapshot => {
+        "europepmc" | "wikisource" | FEED_SOURCE_KEY
+            if resource_type == ResourceType::ArticleSnapshot =>
+        {
             ["text/html", "application/xhtml+xml"].as_slice()
         }
         _ => return false,
@@ -3421,6 +3850,16 @@ fn source_unavailable(message: &'static str) -> AppError {
     AppError::new("SOURCE_UNAVAILABLE", ErrorKind::Network, message, true)
 }
 
+/// 该来源不提供漫画章节目录时的稳定错误（MangaDex 与自托管漫画库之外）。
+fn comic_catalog_unsupported() -> AppError {
+    AppError::new(
+        "SOURCE_CATALOG_UNSUPPORTED",
+        ErrorKind::Unsupported,
+        "该来源暂不支持漫画章节目录",
+        false,
+    )
+}
+
 /// 将公开来源 key 映射为稳定的内部 SourceId。
 ///
 /// SourceId 是 UUID newtype，不能把来源注册表中的字符串直接塞进资源表，
@@ -3433,6 +3872,12 @@ pub fn stable_source_id(source_key: &str) -> Result<SourceId, AppError> {
         "europepmc" => "9fd4a7d0-0d59-4dc5-9f96-5b9bca4c1003",
         "wikisource" => "9fd4a7d0-0d59-4dc5-9f96-5b9bca4c1004",
         "opds_gutenberg" => "9fd4a7d0-0d59-4dc5-9f96-5b9bca4c1005",
+        // 用户登记的 RSS/Atom 订阅源共用一个来源键：具体订阅源身份由 opaque
+        // `remote_id` 承载，因此不需要为每个用户 Feed 分配新的 SourceId。
+        FEED_SOURCE_KEY => "9fd4a7d0-0d59-4dc5-9f96-5b9bca4c1006",
+        // 自托管漫画库同理：具体库身份在 opaque `remote_id` 里，来源键按种类固定。
+        KOMGA_SOURCE_KEY => "9fd4a7d0-0d59-4dc5-9f96-5b9bca4c1007",
+        KAVITA_SOURCE_KEY => "9fd4a7d0-0d59-4dc5-9f96-5b9bca4c1008",
         _ => {
             return Err(AppError::new(
                 "INVALID_ARGUMENT",
@@ -3462,6 +3907,9 @@ pub fn source_key_for_id(source_id: SourceId) -> Option<&'static str> {
         "europepmc",
         "wikisource",
         "opds_gutenberg",
+        FEED_SOURCE_KEY,
+        KOMGA_SOURCE_KEY,
+        KAVITA_SOURCE_KEY,
     ]
     .into_iter()
     .find(|key| stable_source_id(key).ok() == Some(source_id))
@@ -3640,6 +4088,51 @@ mod candidate_tests {
     }
 
     #[test]
+    fn remote_source_object_maps_comic_library_dynamic_ids_to_the_fixed_key() {
+        for (key, source_id, other_source_id) in [
+            (
+                KOMGA_SOURCE_KEY,
+                "custom_komga_0123456789ab",
+                "custom_kavita_0123456789ab",
+            ),
+            (
+                KAVITA_SOURCE_KEY,
+                "custom_kavita_0123456789ab",
+                "custom_komga_0123456789ab",
+            ),
+        ] {
+            let remote_id = format!("{source_id}:series-a:chapter-1");
+            assert!(
+                validate_remote_source_object(key, ResourceType::ComicArchive, &remote_id).is_ok(),
+                "{key} 必须接受映射回同一固定来源键的动态身份"
+            );
+            let cross_kind = format!("{other_source_id}:series-a:chapter-1");
+            assert!(
+                validate_remote_source_object(key, ResourceType::ComicArchive, &cross_kind)
+                    .is_err(),
+                "{key} 必须拒绝另一个漫画库种类的动态身份"
+            );
+            // 固定来源键本身不是合法的动态 sourceId：不能把它当成注册表生成的库身份。
+            let literal_key = format!("{key}:series-a:chapter-1");
+            assert!(
+                validate_remote_source_object(key, ResourceType::ComicArchive, &literal_key)
+                    .is_err(),
+                "{key} 必须拒绝未经过注册表的固定来源键字面量"
+            );
+            // 非漫画库的动态 sourceId 也不能借用漫画库章节身份。
+            assert!(
+                validate_remote_source_object(
+                    key,
+                    ResourceType::ComicArchive,
+                    "custom_feed_0123456789ab:series-a:chapter-1"
+                )
+                .is_err(),
+                "{key} 必须拒绝非漫画库的动态身份"
+            );
+        }
+    }
+
+    #[test]
     fn remote_source_object_rejects_mismatched_types_and_urls() {
         assert!(
             validate_remote_source_object("arxiv", ResourceType::PublicationFile, "2401.12345",)
@@ -3766,5 +4259,166 @@ mod candidate_tests {
             let err = validate_m3u_stream_url(url).unwrap_err();
             assert_eq!(err.code().as_str(), "INVALID_ARGUMENT");
         }
+    }
+
+    /// 锁步回归：新增一个远端来源键必须同时更新身份表与每一处门禁
+    /// （来源对象校验、正文 MIME、在线会话、离线下载投影）。漏改任一处时，
+    /// 在线读取或下载会静默变成 false，而其它测试仍然全绿。
+    ///
+    /// 这里把「同一个来源键在各门禁上的判定」钉在一起：任何一个新来源只改了
+    /// 其中一处，这条测试就会失败。
+    #[test]
+    fn remote_source_allowlists_stay_in_lockstep() {
+        for key in [
+            "mangadex",
+            "arxiv",
+            "europepmc",
+            "wikisource",
+            "opds_gutenberg",
+            FEED_SOURCE_KEY,
+            KOMGA_SOURCE_KEY,
+            KAVITA_SOURCE_KEY,
+        ] {
+            let id = stable_source_id(key).unwrap_or_else(|_| panic!("缺少来源键 {key}"));
+            assert_eq!(source_key_for_id(id), Some(key), "{key} 身份表往返失败");
+        }
+
+        // 文章快照家族：来源键必须同时通过 MIME 门禁与在线会话门禁。
+        for key in ["europepmc", "wikisource", FEED_SOURCE_KEY] {
+            assert!(
+                remote_source_mime_compatible(
+                    key,
+                    ResourceType::ArticleSnapshot,
+                    Some("text/html; charset=utf-8")
+                ),
+                "{key} 的正文 MIME 未通过门禁"
+            );
+            assert!(
+                crate::services::session::remote_session_compatible(
+                    ResourceType::ArticleSnapshot,
+                    Some("text/html; charset=utf-8"),
+                    key,
+                ),
+                "{key} 未通过在线会话门禁"
+            );
+        }
+
+        // 订阅源的远端身份必须同时满足候选形状校验与来源对象校验。
+        let digest = feed_entry_digest("post-1");
+        let feed_source_id = "custom_feed_0123456789ab";
+        assert!(validate_remote_candidate_id(feed_source_id, &digest).is_ok());
+        let remote_id = feed_remote_id(feed_source_id, &digest).unwrap();
+        assert!(
+            validate_remote_source_object(
+                FEED_SOURCE_KEY,
+                ResourceType::ArticleSnapshot,
+                &remote_id
+            )
+            .is_ok()
+        );
+        // 订阅源不是漫画来源：漫画类型必须被拒绝，避免能力投影被放大。
+        assert!(
+            validate_remote_source_object(FEED_SOURCE_KEY, ResourceType::ComicArchive, &remote_id)
+                .is_err()
+        );
+
+        // 自托管漫画库：同一个来源键必须在
+        // 身份表 / 候选形状 / 资源对象形状 / MIME 门禁 / 在线会话门禁 五处同时成立。
+        for (key, source_id) in [
+            (KOMGA_SOURCE_KEY, "custom_komga_0123456789ab"),
+            (KAVITA_SOURCE_KEY, "custom_kavita_0123456789ab"),
+        ] {
+            assert_eq!(comic_library_source_key(source_id).unwrap(), key);
+            let work_ref = comic_library_work_ref(source_id, "series-a").unwrap();
+            assert!(validate_remote_candidate_id(source_id, &work_ref).is_ok());
+            let chapter_remote_id = format!("{work_ref}:chapter-1");
+            assert!(
+                validate_remote_source_object(key, ResourceType::ComicArchive, &chapter_remote_id)
+                    .is_ok(),
+                "{key} 的章节资源身份未通过校验"
+            );
+            assert!(
+                remote_source_mime_compatible(
+                    key,
+                    ResourceType::ComicArchive,
+                    Some("application/vnd.comicbook+zip")
+                ),
+                "{key} 的 CBZ MIME 未通过门禁"
+            );
+            assert!(
+                crate::services::session::remote_session_compatible(
+                    ResourceType::ComicArchive,
+                    Some("application/vnd.comicbook+zip"),
+                    key,
+                ),
+                "{key} 未通过在线会话门禁"
+            );
+            // 漫画库不是文章来源：文章快照类型必须被拒绝。
+            assert!(
+                validate_remote_source_object(
+                    key,
+                    ResourceType::ArticleSnapshot,
+                    &chapter_remote_id
+                )
+                .is_err()
+            );
+            // 跨库身份必须被拒绝（komga 的键不能接受 kavita 的 remote_id）。
+            let other = if key == KOMGA_SOURCE_KEY {
+                "custom_kavita_0123456789ab"
+            } else {
+                "custom_komga_0123456789ab"
+            };
+            assert!(
+                validate_remote_source_object(
+                    key,
+                    ResourceType::ComicArchive,
+                    &format!("{other}:series-a:chapter-1")
+                )
+                .is_err(),
+                "{key} 接受了另一个漫画库的身份"
+            );
+        }
+    }
+
+    #[test]
+    fn comic_library_identity_shapes_reject_urls_paths_and_cross_kind_ids() {
+        assert!(is_comic_library_opaque_id("series-a"));
+        assert!(is_comic_library_opaque_id("42"));
+        for rejected in ["", ".", "..", "a/b", "a:b", "a?b", "a b"] {
+            assert!(
+                !is_comic_library_opaque_id(rejected),
+                "非法 opaque 标识被接受: {rejected}"
+            );
+        }
+        assert!(
+            !is_comic_library_opaque_id(&"x".repeat(MAX_COMIC_LIBRARY_ID_BYTES + 1)),
+            "超长 opaque 标识必须被拒绝"
+        );
+        assert!(comic_library_work_ref("mangadex", "series-a").is_err());
+        assert!(comic_library_work_ref("custom_komga_0123456789ab", "a/b").is_err());
+        for rejected in [
+            "custom_komga_0123456789ab",
+            "custom_komga_0123456789ab:",
+            "custom_komga_0123456789ab:a/b",
+            "mangadex:series-a",
+            "https://komga.example.invalid:series-a",
+        ] {
+            assert!(
+                split_comic_library_work_ref(rejected).is_err(),
+                "非法漫画库作品身份被接受: {rejected}"
+            );
+        }
+        assert!(
+            split_comic_library_chapter_remote_id("custom_komga_0123456789ab:series-a:book-1")
+                .is_ok()
+        );
+        assert!(
+            split_comic_library_chapter_remote_id("custom_komga_0123456789ab:series-a").is_err(),
+            "章节身份必须是三段式"
+        );
+        let handle = comic_library_candidate_handle("custom_komga_0123456789ab", "series-a");
+        assert!(handle.starts_with("content-candidate-"));
+        assert!(!handle.contains("https://"));
+        assert!(!handle.contains("komga.example.invalid"));
     }
 }

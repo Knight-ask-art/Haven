@@ -15,7 +15,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: haven-windows-update-channel
   cancel-in-progress: false
 
 jobs:
@@ -24,12 +24,14 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ inputs.release_tag || github.ref_name }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version-file: .node-version
           cache: npm
@@ -41,7 +43,7 @@ jobs:
           python-version: "3.x"
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: 1.94.1
 
@@ -52,6 +54,7 @@ jobs:
           npm run lint
           npm run governance:check
           npm run fixtures:check
+          npm run test
           npm run build
 
       - name: Validate film/TV acceptance contract
@@ -67,6 +70,26 @@ jobs:
           RELEASE_REF: ${{ inputs.release_tag || github.ref_name }}
         run: |
           python tools/release/bundle-version.py --ref "$env:RELEASE_REF" --github-output "$env:GITHUB_OUTPUT"
+          if ($LASTEXITCODE -ne 0) { throw 'Invalid release tag' }
+          $commit = git rev-parse HEAD
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "commit=$commit"
+
+      - name: Require signing secrets and an unpublished release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REF: ${{ steps.release-version.outputs.release_ref }}
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SIGNING_KEY)) { throw 'Updater signing key is missing' }
+          git merge-base --is-ancestor HEAD origin/main
+          if ($LASTEXITCODE -ne 0) { throw 'Release tag must be on the protected main history' }
+          $releases = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --paginate --slurp
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to verify release immutability' }
+          $existing = @($releases | ConvertFrom-Json | ForEach-Object { $_ } | Where-Object { $_.tag_name -eq $env:RELEASE_REF })
+          if ($existing.Count -gt 0 -and -not $existing[0].draft) {
+            throw 'Published releases are immutable; create a new version instead'
+          }
 
       - name: Validate first-party release version
         shell: pwsh
@@ -74,6 +97,13 @@ jobs:
           RELEASE_VERSION: ${{ steps.release-version.outputs.release_version }}
         run: |
           python tools/release/version-check.py --version "$env:RELEASE_VERSION"
+
+      - name: Verify desktop frontend provenance
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.release-version.outputs.release_version }}
+          RELEASE_COMMIT: ${{ steps.release-version.outputs.commit }}
+        run: python tools/release/desktop-assets-check.py --version "$env:RELEASE_VERSION" --commit "$env:RELEASE_COMMIT" --clean
 
       - name: Prepare Windows bundle version
         shell: pwsh
@@ -85,8 +115,33 @@ jobs:
             Set-Content -Path src-tauri/tauri.release.conf.json -Encoding utf8
           Write-Host "Prepared Windows bundle version $env:BUNDLE_VERSION"
 
+      # 自动配置写进客户端的是「安装后真实存在」的那条命令，因此安装包里必须真的有这个
+      # MCP 运行时（编译好的 server + 生产依赖 + 一个能跑的 Node）。`tauri build` 只搬运
+      # 已经存在的目录，不会替我们编译 server 或下载 Node，所以这一步必须在它之前跑。
+      - name: Assemble the bundled MCP runtime
+        shell: pwsh
+        run: pwsh tools/mcp/assemble-runtime.ps1 -Out src-tauri/resources
+
+      - name: Verify the installer carries the MCP runtime
+        shell: pwsh
+        run: |
+          $config = Get-Content -LiteralPath src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $mapped = $config.bundle.resources.'resources/haven-mcp'
+          if ($mapped -ne 'haven-mcp') {
+            throw "bundle.resources 没有把 MCP 运行时映射进安装包：$mapped"
+          }
+          foreach ($relative in @(
+            'haven-mcp/runtime/node.exe',
+            'haven-mcp/dist/index.js',
+            'haven-mcp/package.json'
+          )) {
+            if (-not (Test-Path -LiteralPath (Join-Path 'src-tauri/resources' $relative) -PathType Leaf)) {
+              throw "安装包资源不完整：$relative"
+            }
+          }
+
       - name: Build and publish Tauri release
-        uses: tauri-apps/tauri-action@v1
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # The private key is never stored in the repository. Configure these
@@ -106,6 +161,62 @@ jobs:
             See [CHANGELOG.md](https://github.com/Knight-ask-art/Haven/blob/main/CHANGELOG.md)
             for supported formats, known limitations, and upgrade behavior.
           releaseDraft: true
+          updaterJsonPreferNsis: true
           # The helper derives prerelease state from the validated public tag.
           prerelease: ${{ steps.release-version.outputs.prerelease }}
           args: --target x86_64-pc-windows-msvc --config tauri.release.conf.json
+
+      - name: Verify actual embedded frontend and native regression gates
+        working-directory: src-tauri
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.release-version.outputs.release_version }}
+          RELEASE_COMMIT: ${{ steps.release-version.outputs.commit }}
+        run: |
+          python ../tools/release/desktop-assets-check.py --version "$env:RELEASE_VERSION" --commit "$env:RELEASE_COMMIT" --clean
+          if ($LASTEXITCODE -ne 0) { throw 'Final shipped frontend provenance failed' }
+          cargo check --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Tauri check failed' }
+          cargo test --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Tauri regression tests failed' }
+          cargo test --locked --features custom-protocol --test frontend_bundle
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop embedded frontend is stale or missing' }
+
+      - name: Download and verify draft update artifacts
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REF: ${{ steps.release-version.outputs.release_ref }}
+          BUNDLE_VERSION: ${{ steps.release-version.outputs.bundle_version }}
+        run: |
+          $destination = 'src-tauri/target/release-check'
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+          gh release download "$env:RELEASE_REF" --dir $destination --pattern '*setup.exe' --pattern '*setup.exe.sig' --pattern 'latest.json' --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to retrieve draft update artifacts' }
+          python tools/release/updater-manifest-check.py --metadata "$destination/latest.json" --assets $destination --version "$env:BUNDLE_VERSION" --repository "$env:GITHUB_REPOSITORY" --tag "$env:RELEASE_REF"
+          if ($LASTEXITCODE -ne 0) { throw 'Updater manifest validation failed' }
+          $installer = @(Get-ChildItem -LiteralPath $destination -Filter '*setup.exe' -File)
+          if ($installer.Count -ne 1) { throw 'Expected exactly one Windows updater installer' }
+          cargo run --locked --manifest-path src-tauri/Cargo.toml --example verify_updater -- $installer[0].FullName "$($installer[0].FullName).sig" src-tauri/tauri.conf.json
+          if ($LASTEXITCODE -ne 0) { throw 'Signature does not match the installed application public key' }
+          $extracted = Join-Path $destination 'verified-installer'
+          7z x $installer[0].FullName "-o$extracted" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Signed installer extraction failed' }
+          $application = @(Get-ChildItem -LiteralPath $extracted -Filter 'haven-tauri.exe' -Recurse -File)
+          if ($application.Count -ne 1) { throw 'Expected exactly one application in the installer' }
+          python tools/release/desktop-executable-check.py --exe $application[0].FullName --build-info '前端/app/dist/build-info.json'
+          if ($LASTEXITCODE -ne 0) { throw 'Shipped executable contains a stale frontend' }
+          gh release upload "$env:RELEASE_REF" '前端/app/dist/build-info.json#desktop-build-info.json' --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Build provenance upload failed' }
+
+      # Stable versions alone advance releases/latest. Prereleases remain a
+      # verified draft and cannot silently alter the installed stable channel.
+      - name: Publish verified stable update
+        if: steps.release-version.outputs.prerelease == 'false'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REF: ${{ steps.release-version.outputs.release_ref }}
+        run: |
+          gh release edit "$env:RELEASE_REF" --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

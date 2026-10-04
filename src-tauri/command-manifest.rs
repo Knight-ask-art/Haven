@@ -40,6 +40,16 @@ define_commands!(
         commands::app_info::app_info_get
     ),
     (
+        "app_update_prepare",
+        "allow-app-update-prepare",
+        commands::app_update::app_update_prepare
+    ),
+    (
+        "app_update_cancel",
+        "allow-app-update-cancel",
+        commands::app_update::app_update_cancel
+    ),
+    (
         "error_report_preview_get",
         "allow-error-report-preview-get",
         commands::error_report::error_report_preview_get
@@ -178,6 +188,26 @@ define_commands!(
         "settings_import",
         "allow-settings-import",
         commands::settings::settings_import
+    ),
+    (
+        "interface_font_system_list",
+        "allow-interface-font-system-list",
+        commands::interface_font::interface_font_system_list
+    ),
+    (
+        "interface_font_asset_list",
+        "allow-interface-font-asset-list",
+        commands::interface_font::interface_font_asset_list
+    ),
+    (
+        "interface_font_asset_import",
+        "allow-interface-font-asset-import",
+        commands::interface_font::interface_font_asset_import
+    ),
+    (
+        "interface_font_asset_delete",
+        "allow-interface-font-asset-delete",
+        commands::interface_font::interface_font_asset_delete
     ),
     (
         "preference_get",
@@ -501,6 +531,61 @@ define_commands!(
         "allow-periodical-tree-get",
         commands::periodical::periodical_tree_get
     ),
+    // Appearance Stage 1B（契约 §12；045/046）：资产列表 / Native 导入 / 删除 +
+    // 首页布局 get/save/reset。六条命令的公开签名里没有任何路径参数。
+    (
+        "appearance_assets_list",
+        "allow-appearance-assets-list",
+        commands::appearance::appearance_assets_list
+    ),
+    (
+        "appearance_asset_import",
+        "allow-appearance-asset-import",
+        commands::appearance::appearance_asset_import
+    ),
+    (
+        "appearance_asset_delete",
+        "allow-appearance-asset-delete",
+        commands::appearance::appearance_asset_delete
+    ),
+    (
+        "home_layout_get",
+        "allow-home-layout-get",
+        commands::appearance::home_layout_get
+    ),
+    (
+        "home_layout_save",
+        "allow-home-layout-save",
+        commands::appearance::home_layout_save
+    ),
+    (
+        "home_layout_reset",
+        "allow-home-layout-reset",
+        commands::appearance::home_layout_reset
+    ),
+    // 设置页总览布局（048）：与首页布局平行的第二条布局通道，各自独立的 revision CAS。
+    (
+        "overview_layout_get",
+        "allow-overview-layout-get",
+        commands::appearance::overview_layout_get
+    ),
+    (
+        "overview_layout_save",
+        "allow-overview-layout-save",
+        commands::appearance::overview_layout_save
+    ),
+    (
+        "overview_layout_reset",
+        "allow-overview-layout-reset",
+        commands::appearance::overview_layout_reset
+    ),
+    // 阅读总览（契约 §12）：按请求窗口聚合已持久化的阅读会话事实。空库返回显式空态
+    // （sessionCount=0 + 可选统计量为 null），不伪造 0 分钟。
+    (
+        "reading_overview_get",
+        "allow-reading-overview-get",
+        commands::reading::reading_overview_get
+    ),
     // A2 AI Provider 基础切片（docs/architecture/AI_SYSTEM.md）。
     // 只有 profile 生命周期与只读模型目录；没有任何把提示词直通模型的自由入口。
     (
@@ -548,5 +633,62 @@ define_commands!(
         "agent_broker_disable",
         "allow-agent-broker-disable",
         commands::agent_broker::agent_broker_disable
-    )
+    ),
+    // 原生 Skill 运行时：只暴露"列出内置技能"与"逐项启停"。
+    // 没有注册/安装/按路径加载技能的命令——技能正文随应用分发，不是运行时输入。
+    (
+        "agent_skill_list",
+        "allow-agent-skill-list",
+        commands::agent_skill::agent_skill_list
+    ),
+    (
+        "agent_skill_set_enabled",
+        "allow-agent-skill-set-enabled",
+        commands::agent_skill::agent_skill_set_enabled
+    ),
+    // 外部 MCP 客户端一键配置（`MCP_EXTERNAL_AGENT_TRANSPORT.md` §9.1.1）。
+    // 授权范围被钉死在两个固定文件的一个键上：`~/.codex/config.toml` 的
+    // `[mcp_servers.haven]` 与 `~/.claude.json` 的 `mcpServers.haven`。
+    // 没有"写任意路径""写任意客户端""提交一段配置片段"的命令。
+    (
+        "mcp_client_config_status",
+        "allow-mcp-client-config-status",
+        commands::mcp_client::mcp_client_config_status
+    ),
+    (
+        "mcp_client_config_apply",
+        "allow-mcp-client-config-apply",
+        commands::mcp_client::mcp_client_config_apply
+    ),
+    // Film/TV Provider 基础切片：TVBox / FongMi 配置的**只读预览**。
+    // 只有「取回 → 解析 → 返回形态摘要」一条路径：没有保存、没有来源注册、没有缓存，
+    // 响应里也没有配置地址、正文、端点或凭据。
+    (
+        "tvbox_config_preview",
+        "allow-tvbox-config-preview",
+        commands::tvbox_config_preview::tvbox_config_preview
+    ),
+    // Film/TV Provider 基础切片：TVBox / FongMi 配置的**保存/导入**。
+    // 取回与解析成功后登记来源（默认停用）并把 last-known-good 原文写进 Rust/SQLite；
+    // 响应只有形态摘要与稳定 sourceId，没有地址、正文、端点或凭据。
+    (
+        "tvbox_config_save",
+        "allow-tvbox-config-save",
+        commands::tvbox_config_save::tvbox_config_save
+    ),
+    // 只读云盘：内部 UUID / 租约句柄；不暴露 Provider ID、凭据或远端删除。
+    ("cloud_storage_list", "allow-cloud-storage-list", commands::cloud_storage::cloud_storage_list),
+    ("cloud_account_connect_begin", "allow-cloud-account-connect-begin", commands::cloud_storage::cloud_account_connect_begin),
+    ("cloud_account_connect_poll", "allow-cloud-account-connect-poll", commands::cloud_storage::cloud_account_connect_poll),
+    ("cloud_account_connect_complete", "allow-cloud-account-connect-complete", commands::cloud_storage::cloud_account_connect_complete),
+    ("cloud_account_connect_cancel", "allow-cloud-account-connect-cancel", commands::cloud_storage::cloud_account_connect_cancel),
+    ("cloud_account_disconnect", "allow-cloud-account-disconnect", commands::cloud_storage::cloud_account_disconnect),
+    ("cloud_folder_binding_get", "allow-cloud-folder-binding-get", commands::cloud_storage::cloud_folder_binding_get),
+    ("cloud_folder_remove", "allow-cloud-folder-remove", commands::cloud_storage::cloud_folder_remove),
+    ("cloud_browse_root", "allow-cloud-browse-root", commands::cloud_storage::cloud_browse_root),
+    ("cloud_browse_folder", "allow-cloud-browse-folder", commands::cloud_storage::cloud_browse_folder),
+    ("cloud_browse_next_page", "allow-cloud-browse-next-page", commands::cloud_storage::cloud_browse_next_page),
+    ("cloud_browse_location", "allow-cloud-browse-location", commands::cloud_storage::cloud_browse_location),
+    ("cloud_register_folder", "allow-cloud-register-folder", commands::cloud_storage::cloud_register_folder),
+    ("cloud_import_pdf", "allow-cloud-import-pdf", commands::cloud_storage::cloud_import_pdf)
 );

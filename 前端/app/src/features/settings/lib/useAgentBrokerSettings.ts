@@ -6,7 +6,11 @@
 // - 组件只通过本 Hook 读状态、开关 Broker；不得直接 invoke。
 // - **默认事实来自客户端**：初始状态是「未知 + 读取中」，不预设 disabled，也绝不
 //   因为界面想显示点什么就伪造 `listening`。
-// - 竞态与卸载都不能让旧响应覆盖新状态：每次请求领一个序号，回来时不是最新的就丢弃。
+// - 竞态与卸载都不能让旧响应覆盖新状态：每次读取领一个序号，回来时不是最新的就丢弃。
+// - **读取与变更用两条独立的序号**。这是刻意的：一次读取绝不能作废一次在途的开关。
+//   共用一个序号时，用户点「启用」之后任何一次重读（分组刷新按钮、重挂载时的自动读取）
+//   都会把开关的返回值丢掉，而 `action` 还停在 `enabling` —— 界面从此永久禁用两个按钮，
+//   用户既看不到结果也点不动任何东西。
 // - enable / disable 使用命令返回值（同一个严格守卫），失败时保留上一次真实投影并
 //   给出可重试错误——失败不会把 listening 悄悄降级成 disabled。
 
@@ -78,8 +82,10 @@ function toErrorInfo(error: unknown): AgentBrokerErrorInfo {
 
 export function useAgentBrokerSettings(): AgentBrokerSettingsController {
   const [state, setState] = useState<AgentBrokerSettingsState>(EMPTY_STATE);
-  // 单调递增的请求序号：只允许最新一次请求写状态。
-  const requestId = useRef(0);
+  /** 读取的序号：只允许最新一次**读取**写状态。 */
+  const readId = useRef(0);
+  /** 变更的序号：与读取分开，因此一次读取不会作废一次在途的开关。 */
+  const mutationId = useRef(0);
   const mounted = useRef(true);
 
   useEffect(() => {
@@ -89,20 +95,38 @@ export function useAgentBrokerSettings(): AgentBrokerSettingsController {
     };
   }, []);
 
-  /** 过期响应与卸载后的响应都不得写入状态。 */
-  const isStale = useCallback((id: number): boolean => (
-    id !== requestId.current || !mounted.current
+  /**
+   * 过期读取不得写入状态。三条判据：
+   * - 已经被更新的读取取代（`readId`）；
+   * - 期间发生过开关（`mutationId` 变了）：那次读取拿到的是变更**之前**的快照；
+   * - 组件已卸载。
+   */
+  const isStale = useCallback((id: number, mutation: number): boolean => (
+    id !== readId.current || mutation !== mutationId.current || !mounted.current
   ), []);
 
   const reload = useCallback(async (): Promise<void> => {
-    const id = ++requestId.current;
+    const id = ++readId.current;
+    // 读取发起时快照当前的变更序号：期间发生过变更，这次读取的结果就已经过期了。
+    const mutation = mutationId.current;
     setState((current) => ({ ...current, loading: true, error: null }));
     try {
       const result = await readAgentBrokerStatus();
-      if (isStale(id)) return;
-      setState({ loading: false, action: "idle", result, error: null });
+      if (isStale(id, mutation)) return;
+      setState((current) => ({
+        ...current,
+        loading: false,
+        // **不把 `action` 按回 `idle`。** 一次读取回来时可能还有一条开关命令在途
+        // （设置页的「重新加载配置」正是这样触发的：它同时调用读取与开关所属分组的
+        // reload）。把 action 复位会让 `busy` 变假、按钮重新可点，用户于是能在第一条
+        // 命令还没回来时再发一条互相覆盖的开关；而界面此刻显示的仍是读取拿到的旧快照。
+        // 保留 action 让界面如实停在"正在开启 / 正在关闭"，直到那条命令自己落地。
+        action: current.action,
+        result,
+        error: null,
+      }));
     } catch (error) {
-      if (isStale(id)) return;
+      if (isStale(id, mutation)) return;
       setState((current) => ({ ...current, loading: false, error: toErrorInfo(error) }));
     }
   }, [isStale]);
@@ -110,17 +134,24 @@ export function useAgentBrokerSettings(): AgentBrokerSettingsController {
   const runAction = useCallback(async (
     action: Exclude<AgentBrokerAction, "idle">,
   ): Promise<void> => {
-    const id = ++requestId.current;
+    const id = ++mutationId.current;
     // 开关命令本身就替代了在途的状态读取：由它接管 loading，避免读取被丢弃后
-    // 页面永远停在「读取中」。
+    // 页面永远停在「读取中」。让读取失效**只**通过读取序号，变更序号此时才推进。
+    readId.current += 1;
     setState((current) => ({ ...current, loading: false, action, error: null }));
     try {
       const result = action === "enabling" ? await enableAgentBroker() : await disableAgentBroker();
-      if (isStale(id)) return;
+      if (id !== mutationId.current || !mounted.current) return;
+      // **落地时再推进一次读取序号。** 上面那次推进只能作废"开关之前发出"的读取；
+      // 一次**在开关在途期间发出**的读取（例如分组刷新按钮，或另一个调用方）拿到的是
+      // 变更**之前**的快照，它的响应完全可能落在这一行之后——两次序号的比较都会通过，
+      // 于是旧快照覆盖掉刚写入的事实，界面显示的开关状态与真实监听状态相反。
+      // 推进之后，任何"此刻之前发出"的读取都不再能写状态。
+      readId.current += 1;
       // 用命令返回值本身，不额外猜测：它已经过与 status 相同的严格守卫。
       setState({ loading: false, action: "idle", result, error: null });
     } catch (error) {
-      if (isStale(id)) return;
+      if (id !== mutationId.current || !mounted.current) return;
       // 失败保留上一次真实投影（可能仍是 listening），只补一条可重试错误。
       setState((current) => ({
         ...current,
@@ -129,7 +160,7 @@ export function useAgentBrokerSettings(): AgentBrokerSettingsController {
         error: toErrorInfo(error),
       }));
     }
-  }, [isStale]);
+  }, []);
 
   useEffect(() => {
     void reload();

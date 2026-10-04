@@ -6,9 +6,11 @@
 //! - 时间字段为 UTC RFC 3339 字符串（转换由 BE-MAPPER-001 完成）。
 //! - 类型为单一事实源：`ts-rs` 生成 TypeScript Binding（`examples/gen_wire_bindings.rs`）。
 
+pub mod cloud_storage;
 pub mod dto;
 mod generate;
 
+pub use cloud_storage::*;
 pub use dto::*;
 pub use generate::generate_wire_bindings;
 

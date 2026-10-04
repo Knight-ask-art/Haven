@@ -1,12 +1,11 @@
 import { useEffect, useState, useRef } from "react"
 import { useNavigate, useSearchParams } from "react-router"
-import { ChevronRight, Star, Check, RefreshCw, Search } from "lucide-react"
+import { ArrowDownWideNarrow, ChevronRight, Library, Star, RefreshCw, Search, SearchX } from "lucide-react"
 import { SearchBar } from "../components/SearchBar"
 import { SearchHistory } from "../components/SearchHistory"
 import { TrendingBoard } from "../components/TrendingBoard"
 import { getHavenClientMode } from "@/lib/ipc/runtime"
 import { HavenError } from "@/lib/ipc/errors"
-import { cn } from "@/lib/utils"
 import { ArtworkImage } from "@/components/ui/haven/ArtworkImage"
 import { defaultCoverCategoryForMediaType, type DefaultCoverCategory } from "@/lib/default-cover"
 import { resolveSearchRuntimeState } from "../lib/search-runtime-state"
@@ -24,6 +23,7 @@ import {
   recordSearchHistory,
   removeSearchHistory,
 } from "../ipc/search-history-gateway"
+import "./search-results.css"
 
 type ResultFilter = SearchCategory
 type SortMode = "relevance" | "year" | "rating"
@@ -59,6 +59,7 @@ export function SearchPage() {
   const categoryParam = searchParams.get("category")
   const sortParam = searchParams.get("sort")
   const submittedQuery = queryParam.trim()
+  const hasSubmittedQuery = submittedQuery.length > 0
   const [searchValue, setSearchValue] = useState(queryParam)
   const debouncedSearchValue = useDebouncedValue(searchValue, 300)
   const searchRuntimeState = resolveSearchRuntimeState(clientMode, submittedQuery)
@@ -210,9 +211,11 @@ export function SearchPage() {
   const [showSuggest, setShowSuggest] = useState(false)
 
   return (
-    <div className="w-full flex flex-col min-h-full bg-background/50 pt-[32px] pb-[120px] px-[24px] md:px-[48px] lg:px-[64px] gap-10 max-w-[1600px] mx-auto">
+    <div className={hasSubmittedQuery
+      ? "search-results-page"
+      : "w-full flex flex-col min-h-full bg-background/50 pt-[32px] pb-[120px] px-[24px] md:px-[48px] lg:px-[64px] gap-10 max-w-[1600px] mx-auto"}>
       {/* 巨型搜索框 + 联想下拉 */}
-      <div className="w-full max-w-5xl mx-auto relative">
+      <div className={hasSubmittedQuery ? "search-results__search-wrap" : "w-full max-w-5xl mx-auto relative"}>
         <SearchBar
           value={searchValue}
           onChange={(e) => setSearchValue(e.target.value)}
@@ -224,7 +227,7 @@ export function SearchPage() {
           placeholder={clientMode === "unavailable" ? "搜索服务未启用" : "搜索本地媒体库"}
         />
         {showSuggest && suggestItems.length > 0 && (
-          <div className="absolute left-0 right-0 top-full z-20 mt-2 rounded-2xl border border-black/5 bg-white p-1.5 shadow-xl dark:border-white/10 dark:bg-zinc-900">
+          <div className="search-results__suggestions absolute left-0 right-0 top-full z-20 mt-2 rounded-2xl border border-black/5 bg-white p-1.5 shadow-xl dark:border-white/10 dark:bg-zinc-900">
             {suggestItems.map((item) => (
               <button
                 key={item}
@@ -260,7 +263,7 @@ export function SearchPage() {
           />
         </div>
       )}
-      {searchRuntimeState === "ready_empty" && historyLoaded && history.length === 0 && (
+      {clientMode === "tauri" && searchRuntimeState === "ready_empty" && historyLoaded && history.length === 0 && (
         <LocalSearchEmpty />
       )}
       {searchValue.trim() === "" && (
@@ -268,18 +271,25 @@ export function SearchPage() {
       )}
 
       {searchRuntimeState === "ready_query" && (
-        <LocalSearchResults
-          query={submittedQuery}
-          items={localResults}
-          status={localStatus}
-          errorMessage={localErrorMessage}
-          filterType={filterType}
-          sortMode={sortMode}
-          onFilterTypeChange={changeFilterType}
-          onCycleSort={cycleSortMode}
-          onOpen={(id) => navigate(`/work/${id}`)}
-          onRetry={() => setRetryRevision((current) => current + 1)}
-        />
+        <>
+          <SearchResultHeader
+            query={submittedQuery}
+            preview={clientMode === "mock"}
+            filterType={filterType}
+            sortMode={sortMode}
+            onFilterTypeChange={changeFilterType}
+            onCycleSort={cycleSortMode}
+          />
+          <LocalSearchResults
+            query={submittedQuery}
+            items={localResults}
+            status={localStatus}
+            errorMessage={localErrorMessage}
+            sortMode={sortMode}
+            onOpen={(id) => navigate(`/work/${id}`)}
+            onRetry={() => setRetryRevision((current) => current + 1)}
+          />
+        </>
       )}
 
       {searchRuntimeState === "ready_query" && submittedQuery && (
@@ -385,10 +395,7 @@ function LocalSearchResults({
   items,
   status,
   errorMessage,
-  filterType,
   sortMode,
-  onFilterTypeChange,
-  onCycleSort,
   onOpen,
   onRetry,
 }: {
@@ -396,10 +403,7 @@ function LocalSearchResults({
   items: LocalSearchResult[]
   status: LocalSearchStatus
   errorMessage: string | null
-  filterType: ResultFilter
   sortMode: SortMode
-  onFilterTypeChange: (filter: ResultFilter) => void
-  onCycleSort: () => void
   onOpen: (id: string) => void
   onRetry: () => void
 }) {
@@ -414,24 +418,25 @@ function LocalSearchResults({
   }
 
   return (
-    <section className="mx-auto w-full max-w-[1200px]">
-      <SearchResultHeader
-        query={query}
-        count={status === "success" ? sortedItems.length : null}
-        filterType={filterType}
-        sortMode={sortMode}
-        onFilterTypeChange={onFilterTypeChange}
-        onCycleSort={onCycleSort}
-      />
+    <section className="search-results__section" aria-labelledby="local-results-heading" aria-busy={status === "loading"}>
+      <header className="search-results__section-header">
+        <div className="search-results__section-title">
+          <Library size={18} aria-hidden="true" />
+          <h2 id="local-results-heading">本地媒体库</h2>
+          {status === "success" && <span className="search-results__count">{sortedItems.length}</span>}
+        </div>
+        <span className="search-results__section-hint">已收录的作品</span>
+      </header>
       {status === "loading" && <SearchResultsSkeleton />}
       {status === "error" && (
-        <div className="flex min-h-[256px] flex-col items-center justify-center text-center">
+        <div className="search-results__empty" role="alert">
+          <SearchX size={24} aria-hidden="true" />
           <p className="text-sm font-semibold text-foreground">无法加载搜索结果</p>
           <p className="mt-[8px] text-xs text-muted-foreground">{errorMessage ?? "本地媒体库暂时不可用，请稍后重试。"}</p>
           <button
             type="button"
             onClick={onRetry}
-            className="mt-[16px] inline-flex items-center gap-[8px] rounded-md bg-primary px-[14px] py-[8px] text-xs font-semibold text-primary-foreground"
+            className="search-results__action"
           >
             <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
             重试
@@ -439,13 +444,14 @@ function LocalSearchResults({
         </div>
       )}
       {status === "success" && sortedItems.length === 0 && (
-        <div className="flex min-h-[256px] flex-col items-center justify-center text-center text-muted-foreground">
+        <div className="search-results__empty" role="status">
+          <SearchX size={24} aria-hidden="true" />
           <p className="text-sm font-semibold text-foreground">没有找到相关作品</p>
           <p className="mt-[8px] text-xs">可以尝试作品原名、更短的关键词或其他分类。</p>
         </div>
       )}
       {status === "success" && sortedItems.length > 0 && (
-        <div className="mt-5 grid gap-3 md:grid-cols-2">
+        <div className="search-results__grid">
           {sortedItems.map((item) => (
             <LocalSearchResultCard key={item.id} item={item} onOpen={onOpen} />
           ))}
@@ -487,14 +493,14 @@ function relevanceScore(item: LocalSearchResult, query: string): number {
 
 function SearchResultHeader({
   query,
-  count,
+  preview,
   filterType,
   sortMode,
   onFilterTypeChange,
   onCycleSort,
 }: {
   query: string
-  count: number | null
+  preview: boolean
   filterType: ResultFilter
   sortMode: SortMode
   onFilterTypeChange: (filter: ResultFilter) => void
@@ -503,54 +509,50 @@ function SearchResultHeader({
   const sortLabel = sortMode === "year" ? "年份最新" : sortMode === "rating" ? "评分最高" : "相关度"
 
   return (
-    <>
-      <div className="flex flex-col gap-[16px] border-b border-border/60 pb-5 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">Search Results</p>
-          <h2 className="mt-1 text-2xl font-bold">“{query}”</h2>
-          <p className="mt-1 text-xs text-muted-foreground">{count === null ? "正在搜索..." : `找到 ${count} 个作品结果`}</p>
+    <header className="search-results__header">
+      <div className="search-results__summary">
+        <div className="search-results__eyebrow">
+          <span>搜索结果</span>
+          {preview && <span className="search-results__preview-label">浏览器预览 · 示例数据</span>}
         </div>
-        <div className="flex items-center gap-[8px]">
-          <button
-            type="button"
-            onClick={onCycleSort}
-            className={cn(
-              "flex items-center gap-1.5 rounded-full px-3 py-[8px] text-xs font-semibold transition-colors",
-              sortMode !== "relevance" ? "bg-primary/10 text-primary" : "bg-muted/60 text-muted-foreground hover:text-foreground",
-            )}
-          >
-            {sortLabel}
-            {sortMode !== "relevance" && <Check className="h-3 w-3" aria-hidden="true" />}
-          </button>
+        <h1>“{query}”</h1>
+        <p>先查看本地媒体库，再发现已启用来源中的内容。</p>
+      </div>
+      <div className="search-results__toolbar">
+        <div className="search-results__filters" role="group" aria-label="搜索结果分类">
+          {FILTER_OPTIONS.map((option) => (
+            <button
+              key={option.id}
+              type="button"
+              aria-pressed={filterType === option.id}
+              onClick={() => onFilterTypeChange(option.id)}
+              className="search-results__filter"
+            >
+              {option.label}
+            </button>
+          ))}
         </div>
+        <button
+          type="button"
+          onClick={onCycleSort}
+          aria-label={`本地排序：${sortLabel}，点击切换`}
+          title="切换本地结果排序：相关度 / 年份最新 / 评分最高"
+          className="search-results__sort"
+        >
+          <ArrowDownWideNarrow size={16} aria-hidden="true" />
+          <span>本地排序：{sortLabel}</span>
+        </button>
       </div>
-      <div className="flex flex-wrap gap-[8px] pt-[16px]" role="tablist" aria-label="搜索结果分类">
-        {FILTER_OPTIONS.map((option) => (
-          <button
-            key={option.id}
-            type="button"
-            role="tab"
-            aria-selected={filterType === option.id}
-            onClick={() => onFilterTypeChange(option.id)}
-            className={cn(
-              "rounded-full px-3.5 py-1.5 text-xs font-semibold transition-colors",
-              filterType === option.id ? "bg-foreground text-background" : "bg-muted/60 text-muted-foreground hover:text-foreground",
-            )}
-          >
-            {option.label}
-          </button>
-        ))}
-      </div>
-    </>
+    </header>
   )
 }
 
 function SearchResultsSkeleton() {
   return (
-    <div className="mt-5 grid gap-3 md:grid-cols-2" aria-label="正在加载搜索结果">
+    <div className="search-results__grid" role="status" aria-label="正在加载搜索结果">
       {Array.from({ length: 4 }).map((_, index) => (
-        <div key={index} className="flex gap-[16px] rounded-2xl border border-border/60 p-3">
-          <div className="h-[112px] w-[80px] shrink-0 animate-pulse rounded-xl bg-muted" />
+        <div key={index} className="search-result-card search-result-card--skeleton" aria-hidden="true">
+          <div className="search-result-card__cover animate-pulse bg-muted" />
           <div className="flex min-w-0 flex-1 flex-col gap-3 py-2">
             <div className="h-4 w-3/4 animate-pulse rounded bg-muted" />
             <div className="h-3 w-1/2 animate-pulse rounded bg-muted/80" />
@@ -572,19 +574,8 @@ function LocalSearchResultCard({ item, onOpen }: { item: LocalSearchResult; onOp
         : "报刊资料"
 
   return (
-    <div
-      role="button"
-      tabIndex={0}
-      onClick={() => onOpen(item.id)}
-      onKeyDown={(event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault()
-          onOpen(item.id)
-        }
-      }}
-      className="group flex cursor-pointer gap-[16px] rounded-2xl border border-border/60 bg-background/70 p-3 text-left outline-none transition-all hover:-translate-y-0.5 hover:bg-background hover:shadow-md focus-visible:ring-2 focus-visible:ring-primary"
-    >
-      <div className="h-[112px] w-[80px] shrink-0 overflow-hidden rounded-xl bg-muted">
+    <article className="search-result-card search-result-card--local">
+      <div className="search-result-card__cover">
         <ArtworkImage
           src={item.imageUrl}
           alt={item.title}
@@ -595,20 +586,27 @@ function LocalSearchResultCard({ item, onOpen }: { item: LocalSearchResult; onOp
           loading="lazy"
         />
       </div>
-      <div className="min-w-0 flex-1 py-1">
-        <div className="flex items-start justify-between gap-[8px]">
-          <h3 className="line-clamp-2 text-sm font-bold leading-snug text-foreground">{item.title}</h3>
-          <ChevronRight className="h-[16px] w-[16px] shrink-0 text-muted-foreground transition-transform group-hover:translate-x-1" aria-hidden="true" />
-        </div>
-        {item.originalTitle && <span className="mt-1 block truncate text-xs text-muted-foreground">{item.originalTitle}</span>}
-        {item.description && <p className="mt-[10px] line-clamp-2 text-xs leading-relaxed text-muted-foreground">{item.description}</p>}
-        <div className="mt-3 flex items-center gap-3 text-xs font-semibold text-muted-foreground">
+      <div className="search-result-card__body">
+        <h3 className="search-result-card__title">
+          <button
+            type="button"
+            aria-label={`查看作品：${item.title}`}
+            onClick={() => onOpen(item.id)}
+            className="search-result-card__open"
+          >
+            {item.title}
+          </button>
+        </h3>
+        {item.originalTitle && item.originalTitle !== item.title && <span className="search-result-card__original-title">{item.originalTitle}</span>}
+        {item.description && <p className="search-result-card__description">{item.description}</p>}
+        <div className="search-result-card__metadata">
+          <span className="search-result-card__category">{categoryLabel}</span>
           {item.year ? <span>{item.year}</span> : null}
-          <span>{categoryLabel}</span>
-          {item.rating !== undefined ? <span className="flex items-center gap-1 text-amber-500"><Star className="h-3.5 w-3.5 fill-current" aria-hidden="true" />{item.rating}</span> : null}
+          {item.rating !== undefined ? <span className="search-result-card__rating"><Star size={13} aria-hidden="true" />{item.rating}</span> : null}
         </div>
       </div>
-    </div>
+      <ChevronRight className="search-result-card__chevron" size={16} aria-hidden="true" />
+    </article>
   )
 }
 

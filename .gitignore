@@ -35,6 +35,9 @@ pnpm-debug.log*
 *.bak
 *.tmp
 
+# Project-local coding-agent instructions and skills; keep out of public source.
+/.agents/
+
 # Local runtime data
 *.db
 *.db-*
@@ -69,6 +72,10 @@ plan/
 # review/planning material local; publish only their maintained index files.
 /docs/internal/
 /docs/private/
+/docs/aegis/
+# Development operating procedures are private, not product documentation.
+/docs/agents/
+/docs/architecture/CLAUDE_CODE_AGENT_WORKFLOW.md
 /docs/plans/*
 !/docs/plans/README.md
 /docs/reviews/*
@@ -108,8 +115,18 @@ plan/
 /前端/app/update_rules.py
 
 
-# Independent review Cargo target cache (EVID-SENIOR-REVIEW-2026-08-17 等)
+# Disposable Cargo target cache for isolated verification.
 .target-review-tests/
+
+# Haven MCP 运行时：由 `tools/mcp/assemble-runtime.ps1` 组装进 Tauri 的 bundle resources。
+# 只有那份占位 README 与 `tauri.conf.json` 的声明进 Git——二进制、编译产物与依赖都不进。
+# 删掉这些规则会让一次 `tauri build` 之后的 Node 运行时被提交进仓库。
+src-tauri/resources/haven-mcp/runtime/
+src-tauri/resources/haven-mcp/dist/
+src-tauri/resources/haven-mcp/node_modules/
+src-tauri/resources/haven-mcp/package.json
+src-tauri/resources/haven-mcp/haven-mcp-launcher.cmd
+src-tauri/resources/*.manifest.json
 
 # Editors and operating systems
 .idea/

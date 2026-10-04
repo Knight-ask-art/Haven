@@ -19,6 +19,7 @@ const source = (sourceId: string, mode: SourceDescriptorDto["mode"], categories:
   enabled: false,
   health: "unknown",
   endpointConfigured: false,
+  credentialConfigured: false,
   lastChecked: null,
   latencyMs: null,
   successRate: null,

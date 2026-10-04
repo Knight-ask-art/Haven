@@ -396,15 +396,21 @@ impl BrokerSession {
         let frame = match parse_client_frame(text) {
             Ok(frame) => frame,
             Err(error) => {
+                let handshaked = self.state.lock().await.handshaked;
+                if !handshaked {
+                    // 首帧就解析失败，与"首帧不是 hello"是同一种协议级失败：连接从未完成
+                    // 握手。这里**必须**回复并断连。
+                    //
+                    // 只回一条普通 `Reply` 会留下一个危险的中间态：连接没有握手，却继续
+                    // 留在主循环里占着配额，而握手超时（`HANDSHAKE_TIMEOUT`）只在握手阶段
+                    // 生效——那条上限再也管不到它。
+                    return Prepared::Immediate(self.reply_and_close_error(None, &error));
+                }
                 // 已握手的连接上，解析失败也要把顶层整数 id 回带：客户端据此把错误对回它发
-                // 出的那条请求（未知帧、多余字段、载荷不合法都会走到这里）。握手阶段一律用
-                // 0——那时还没有任何成立的请求 id，`0` 是协议里"没有请求 id"的保留值。
-                let id = if self.state.lock().await.handshaked {
-                    Self::recover_request_id(text)
-                } else {
-                    None
-                };
-                return Prepared::Immediate(self.reply_error(id, &error));
+                // 出的那条请求（未知帧、多余字段、载荷不合法都会走到这里）。
+                return Prepared::Immediate(
+                    self.reply_error(Self::recover_request_id(text), &error),
+                );
             }
         };
 
@@ -1224,6 +1230,36 @@ mod tests {
         );
     }
 
+    /// 首帧**解析失败**（非法 JSON、未知 `type`、多余字段、载荷不合法）必须与"首帧不是
+    /// hello"同样处理：回复一条协议错误并断连。
+    ///
+    /// 这条断言存在的理由：只回一条普通 `Reply` 会留下一个未握手却继续留在连接主循环里
+    /// 的连接。它占着连接配额，而 `HANDSHAKE_TIMEOUT` 只覆盖握手阶段，
+    /// 再也管不到它——一个只发一坨垃圾的客户端于是能比设计意图活得更久。
+    #[tokio::test]
+    async fn unparsable_first_frame_closes_connection() {
+        let api = Arc::new(FakeApi::default());
+        let session = session_with(api.clone(), Arc::new(ProcessQuota::default()));
+        for first in [
+            "not json at all",
+            "{}",
+            r#"{"type":"nope"}"#,
+            r#"{"type":"context","id":1,"payload":{},"unexpected":true}"#,
+            r#"{"type":"hello","protocol_version":"1","client":{"name":"x"}}"#,
+        ] {
+            let outcome = immediate(session.prepare(first).await);
+            assert!(
+                matches!(outcome, FrameOutcome::ReplyAndClose(_)),
+                "首帧 {first} 必须回复并断连，得到 {outcome:?}"
+            );
+        }
+        assert_eq!(
+            api.context_calls.load(Ordering::SeqCst),
+            0,
+            "未握手不得调用 Application"
+        );
+    }
+
     #[tokio::test]
     async fn duplicate_hello_closes_connection() {
         let api = Arc::new(FakeApi::default());
@@ -1468,14 +1504,16 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
-        // 未握手 + 解析失败（顶层 id 本可读出）：同样用 0。
+        // 未握手 + 解析失败（顶层 id 本可读出）：同样用 0，并且同样**回复后断连**——
+        // 首帧解析失败与"首帧不是 hello"是同一种协议级失败，见
+        // `unparsable_first_frame_closes_connection`。
         let session = session_with(
             Arc::new(FakeApi::default()),
             Arc::new(ProcessQuota::default()),
         );
         let value = parse(
             match immediate(session.prepare(r#"{"type":"approve","id":8}"#).await) {
-                FrameOutcome::Reply(text) => text,
+                FrameOutcome::ReplyAndClose(text) => text,
                 other => panic!("{other:?}"),
             },
         );
@@ -1834,9 +1872,11 @@ mod tests {
                 "i".repeat(65)
             ),
         ] {
+            // 载荷不合法的 `hello` 是**首帧解析失败**：连接从未握手，因此与"首帧不是
+            // hello"一样回复一条协议错误并断连，而不是留在主循环里占配额。
             let value = parse(match immediate(session.prepare(&hello).await) {
-                FrameOutcome::Reply(text) => text,
-                other => panic!("{other:?}"),
+                FrameOutcome::ReplyAndClose(text) => text,
+                other => panic!("非法的首帧 hello 必须回复并断连，得到 {other:?}"),
             });
             assert_eq!(value["error"]["code"], "INVALID_ARGUMENT", "{hello}");
         }

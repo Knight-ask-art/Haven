@@ -5,7 +5,7 @@
 // 经 toHavenError 归一（非契约形状兜底 INTERNAL_ERROR，见 errors.ts）。
 
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { check, type Update } from "@tauri-apps/plugin-updater";
+import { TauriUpdaterClient } from "./updater-client";
 
 import type { HavenClient } from "./client";
 import type {
@@ -141,9 +141,25 @@ import type {
   AiProviderProfileGetRequest,
   AiProviderProfileListResultDto,
   AiProviderProfileUpsertRequest,
+  TvboxConfigPreviewDto,
+  TvboxConfigPreviewRequest,
+  TvboxConfigSaveRequest,
+  TvboxConfigSaveResult,
 } from "./generated/wire";
-import type { UpdaterCheckResult, UpdaterInstallResult } from "./client";
-import { HavenError, toHavenError } from "./errors.js";
+import { guardAgentSkillListResult, guardAgentSkillState } from "./agent-skill-wire";
+import { guardAiSettingsRecommendation } from "./ai-recommendation-wire";
+import type {
+  AgentSkillListResultWire,
+  AgentSkillSetEnabledRequestWire,
+  AgentSkillStateWire,
+} from "./agent-skill-wire";
+import { guardMcpClientConfigStatus } from "./mcp-client-wire";
+import type {
+  McpClientConfigStatusWire,
+  McpClientConfigureRequestWire,
+} from "./mcp-client-wire";
+import type { UpdaterCheckResult, UpdaterInstallResult, UpdaterProgress } from "./client";
+import { toHavenError } from "./errors.js";
 import type {
   SettingsSectionWire,
   SettingsSnapshot,
@@ -153,17 +169,73 @@ import type {
   PreferenceGetResult,
   PreferenceUpdateRequest,
   PreferenceUpdateResult,
+  AppearanceAssetsListRequestWire,
+  AppearanceAssetImportRequestWire,
+  AppearanceAssetDeleteRequestWire,
+  AppearanceAssetWire,
+  AppearanceAssetsWire,
+  AppearanceAssetDeleteResultWire,
+  HomeLayoutSnapshotWire,
+  HomeLayoutSaveRequestWire,
+  HomeLayoutResetRequestWire,
+  HomeLayoutMutationResultWire,
+  OverviewLayoutSnapshotWire,
+  OverviewLayoutSaveRequestWire,
+  OverviewLayoutResetRequestWire,
+  OverviewLayoutMutationResultWire,
+  ReadingOverviewGetRequestWire,
+  ReadingOverviewWire,
 } from "./settings-wire";
 import {
   guardPreferenceGetResult,
   guardPreferenceUpdateResult,
   guardSettingsSnapshot,
   guardSettingsUpdateResult,
+  guardAppearanceAsset,
+  guardAppearanceAssetDeleteResult,
+  guardAppearanceAssets,
+  guardHomeLayoutMutationResult,
+  guardHomeLayoutSnapshot,
+  guardOverviewLayoutMutationResult,
+  guardOverviewLayoutSnapshot,
+  guardReadingOverview,
 } from "./settings-wire.js";
+import type {
+  InterfaceFontAsset,
+  InterfaceFontFamily,
+  InterfaceFontImportResult,
+} from "./interface-font-wire";
+import {
+  guardInterfaceFontAssetList,
+  guardInterfaceFontFamilyList,
+  guardInterfaceFontImportResult,
+} from "./interface-font-wire.js";
+import { createCloudStorageIpc } from "./cloud-storage-client.js";
 
 /** 真实 IPC Client（仅 Tauri WebView 内可用；浏览器环境由 runtime.ts 拦截回落 Mock）。 */
 export class TauriHavenClient implements HavenClient {
-  private pendingUpdate: Update | null = null;
+  private readonly updater = new TauriUpdaterClient();
+
+  // ---- 云盘（Google Drive 只读切片）----
+  //
+  // invoke、响应守卫与错误归一都在 lib/ipc/cloud-storage-client.ts 的共享实现里，
+  // 这里只是把它的方法挂到 HavenClient 上：每条命令一行委托，不复制任何命令逻辑。
+  private readonly cloudStorageIpc = createCloudStorageIpc(invoke);
+
+  readonly cloudStorageList = this.cloudStorageIpc.cloudStorageList;
+  readonly cloudAccountConnectBegin = this.cloudStorageIpc.cloudAccountConnectBegin;
+  readonly cloudAccountConnectPoll = this.cloudStorageIpc.cloudAccountConnectPoll;
+  readonly cloudAccountConnectComplete = this.cloudStorageIpc.cloudAccountConnectComplete;
+  readonly cloudAccountConnectCancel = this.cloudStorageIpc.cloudAccountConnectCancel;
+  readonly cloudAccountDisconnect = this.cloudStorageIpc.cloudAccountDisconnect;
+  readonly cloudFolderBindingGet = this.cloudStorageIpc.cloudFolderBindingGet;
+  readonly cloudFolderRemove = this.cloudStorageIpc.cloudFolderRemove;
+  readonly cloudBrowseRoot = this.cloudStorageIpc.cloudBrowseRoot;
+  readonly cloudBrowseFolder = this.cloudStorageIpc.cloudBrowseFolder;
+  readonly cloudBrowseNextPage = this.cloudStorageIpc.cloudBrowseNextPage;
+  readonly cloudBrowseLocation = this.cloudStorageIpc.cloudBrowseLocation;
+  readonly cloudRegisterFolder = this.cloudStorageIpc.cloudRegisterFolder;
+  readonly cloudImportPdf = this.cloudStorageIpc.cloudImportPdf;
 
   async libraryList(request: LibraryListRequest): Promise<PageDto<WorkCardDto>> {
     try {
@@ -564,6 +636,50 @@ export class TauriHavenClient implements HavenClient {
     }
   }
 
+  async interfaceFontSystemList(): Promise<InterfaceFontFamily[]> {
+    try {
+      const value: unknown = await invoke("interface_font_system_list");
+      if (!guardInterfaceFontFamilyList(value)) {
+        throw new Error("interface_font_system_list returned invalid data");
+      }
+      return value;
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async interfaceFontAssetList(): Promise<InterfaceFontAsset[]> {
+    try {
+      const value: unknown = await invoke("interface_font_asset_list");
+      if (!guardInterfaceFontAssetList(value)) {
+        throw new Error("interface_font_asset_list returned invalid data");
+      }
+      return value;
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async interfaceFontAssetImport(): Promise<InterfaceFontImportResult> {
+    try {
+      const value: unknown = await invoke("interface_font_asset_import");
+      if (!guardInterfaceFontImportResult(value)) {
+        throw new Error("interface_font_asset_import returned invalid data");
+      }
+      return value;
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async interfaceFontAssetDelete(assetId: string): Promise<void> {
+    try {
+      await invoke("interface_font_asset_delete", { assetId });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
   async preferenceGet(request: PreferenceGetRequest): Promise<PreferenceGetResult> {
     try {
       const value: unknown = await invoke("preference_get", { request });
@@ -573,7 +689,6 @@ export class TauriHavenClient implements HavenClient {
       throw toHavenError(error);
     }
   }
-
   async preferenceUpdate(request: PreferenceUpdateRequest): Promise<PreferenceUpdateResult> {
     try {
       const value: unknown = await invoke("preference_update", { request });
@@ -934,53 +1049,11 @@ export class TauriHavenClient implements HavenClient {
   }
 
   async updateCheck(): Promise<UpdaterCheckResult> {
-    try {
-      if (this.pendingUpdate) {
-        await this.pendingUpdate.close();
-        this.pendingUpdate = null;
-      }
-      const update = await check({ timeout: 10_000 });
-      if (!update) {
-        return {
-          status: "up_to_date",
-          currentVersion: null,
-          availableVersion: null,
-          releaseNotes: null,
-          publishedAt: null,
-        };
-      }
-      this.pendingUpdate = update;
-      return {
-        status: "available",
-        currentVersion: update.currentVersion,
-        availableVersion: update.version,
-        releaseNotes: safeUpdateText(update.body),
-        publishedAt: safeUpdateText(update.date),
-      };
-    } catch (error) {
-      throw toHavenError(error);
-    }
+    return this.updater.check();
   }
 
-  async updateInstall(): Promise<UpdaterInstallResult> {
-    const update = this.pendingUpdate;
-    if (!update) {
-      throw new HavenError({
-        code: "UPDATER_NO_UPDATE",
-        userMessage: "没有可安装的更新，请先检查更新",
-        retryable: true,
-      });
-    }
-    try {
-      // The official plugin verifies the signature before launching the Windows
-      // installer. On Windows it exits the current process so the installer can
-      // replace the application atomically.
-      await update.downloadAndInstall();
-      this.pendingUpdate = null;
-      return { status: "installed" };
-    } catch (error) {
-      throw toHavenError(error);
-    }
+  async updateInstall(onProgress?: (progress: UpdaterProgress) => void): Promise<UpdaterInstallResult> {
+    return this.updater.install(onProgress);
   }
 
   private async openDirectory(command: "open_data_directory" | "open_logs_directory" | "open_cache_directory"): Promise<void> {
@@ -1096,6 +1169,22 @@ export class TauriHavenClient implements HavenClient {
     }
   }
 
+  // ---- 外观（Appearance Stage 1B）----
+  //
+  // 每个方法都是闭合 typed 调用：参数一律是 typed request（字段 camelCase，与
+  // src-tauri/src/commands/appearance.rs 的命令签名逐字一致），没有裸路径入口。
+  // 响应先过 settings-wire 的运行时守卫，形状漂移一律 INTERNAL_ERROR，不透传。
+
+  async appearanceAssetsList(request: AppearanceAssetsListRequestWire): Promise<AppearanceAssetsWire> {
+    try {
+      const value: unknown = await invoke("appearance_assets_list", { request });
+      if (!guardAppearanceAssets(value)) throw new Error("appearance_assets_list returned invalid data");
+      return value;
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
   async agentResourcePreferenceProposalCreate(
     request: AgentResourcePreferenceProposalCreateRequest,
   ): Promise<AgentResourcePreferenceProposalDto> {
@@ -1109,6 +1198,19 @@ export class TauriHavenClient implements HavenClient {
     }
   }
 
+  async appearanceAssetImport(
+    request: AppearanceAssetImportRequestWire,
+  ): Promise<AppearanceAssetWire> {
+    try {
+      // 文件由后端 Native 选择器选定；用户取消时后端返回 OPERATION_CANCELLED。
+      const value: unknown = await invoke("appearance_asset_import", { request });
+      if (!guardAppearanceAsset(value)) throw new Error("appearance_asset_import returned invalid data");
+      return value;
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
   async agentResourcePreferenceProposalGet(
     request: AgentResourcePreferenceProposalGetRequest,
   ): Promise<AgentResourcePreferenceProposalGetResultDto> {
@@ -1117,6 +1219,20 @@ export class TauriHavenClient implements HavenClient {
         "agent_resource_preference_proposal_get",
         { request },
       );
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async appearanceAssetDelete(
+    request: AppearanceAssetDeleteRequestWire,
+  ): Promise<AppearanceAssetDeleteResultWire> {
+    try {
+      const value: unknown = await invoke("appearance_asset_delete", { request });
+      if (!guardAppearanceAssetDeleteResult(value)) {
+        throw new Error("appearance_asset_delete returned invalid data");
+      }
+      return value;
     } catch (error) {
       throw toHavenError(error);
     }
@@ -1201,9 +1317,64 @@ export class TauriHavenClient implements HavenClient {
     request: AiSettingsRecommendationGenerateRequest,
   ): Promise<AiSettingsRecommendationDto> {
     try {
-      return await invoke<AiSettingsRecommendationDto>("ai_settings_recommendation_generate", {
+      const value: unknown = await invoke<unknown>("ai_settings_recommendation_generate", {
         request,
       });
+      if (!guardAiSettingsRecommendation(value, request.profileId)) {
+        throw toHavenError({
+          code: "INTERNAL_ERROR",
+          userMessage: "AI 推荐接口返回了不完整或不匹配的数据",
+          retryable: false,
+        });
+      }
+      return value;
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async homeLayoutGet(): Promise<HomeLayoutSnapshotWire> {
+    try {
+      // 无入参命令：与 Rust `home_layout_get(state)` 签名一致。
+      const value: unknown = await invoke("home_layout_get");
+      if (!guardHomeLayoutSnapshot(value)) throw new Error("home_layout_get returned invalid data");
+      return value;
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async homeLayoutSave(request: HomeLayoutSaveRequestWire): Promise<HomeLayoutMutationResultWire> {
+    try {
+      const value: unknown = await invoke("home_layout_save", { request });
+      if (!guardHomeLayoutMutationResult(value)) throw new Error("home_layout_save returned invalid data");
+      return value;
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async homeLayoutReset(request: HomeLayoutResetRequestWire): Promise<HomeLayoutMutationResultWire> {
+    try {
+      const value: unknown = await invoke("home_layout_reset", { request });
+      if (!guardHomeLayoutMutationResult(value)) throw new Error("home_layout_reset returned invalid data");
+      return value;
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  // ---- 设置页总览布局（048）----
+  //
+  // 命令名与 src-tauri/src/commands/appearance.rs 的签名逐字一致；响应先过运行时守卫，
+  // 形状漂移（例如后端把首页布局当成总览布局返回）一律 INTERNAL_ERROR，不透传半份布局。
+
+  async overviewLayoutGet(): Promise<OverviewLayoutSnapshotWire> {
+    try {
+      // 无入参命令：与 Rust `overview_layout_get(state)` 签名一致。
+      const value: unknown = await invoke("overview_layout_get");
+      if (!guardOverviewLayoutSnapshot(value)) throw new Error("overview_layout_get returned invalid data");
+      return value;
     } catch (error) {
       throw toHavenError(error);
     }
@@ -1240,13 +1411,132 @@ export class TauriHavenClient implements HavenClient {
       throw toHavenError(error);
     }
   }
+
+  async agentSkillList(): Promise<AgentSkillListResultWire> {
+    try {
+      const value: unknown = await invoke<unknown>("agent_skill_list");
+      if (!guardAgentSkillListResult(value)) invalidAgentSkillResponse();
+      return value;
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async overviewLayoutSave(request: OverviewLayoutSaveRequestWire): Promise<OverviewLayoutMutationResultWire> {
+    try {
+      const value: unknown = await invoke("overview_layout_save", { request });
+      if (!guardOverviewLayoutMutationResult(value)) throw new Error("overview_layout_save returned invalid data");
+      return value;
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async agentSkillSetEnabled(
+    request: AgentSkillSetEnabledRequestWire,
+  ): Promise<AgentSkillStateWire> {
+    try {
+      const value: unknown = await invoke<unknown>("agent_skill_set_enabled", { request });
+      if (!guardAgentSkillState(value)) invalidAgentSkillResponse();
+      return value;
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async overviewLayoutReset(request: OverviewLayoutResetRequestWire): Promise<OverviewLayoutMutationResultWire> {
+    try {
+      const value: unknown = await invoke("overview_layout_reset", { request });
+      if (!guardOverviewLayoutMutationResult(value)) throw new Error("overview_layout_reset returned invalid data");
+      return value;
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async mcpClientConfigStatus(): Promise<McpClientConfigStatusWire> {
+    try {
+      const value: unknown = await invoke<unknown>("mcp_client_config_status");
+      if (!guardMcpClientConfigStatus(value)) invalidMcpClientConfigResponse();
+      return value;
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  // ---- 阅读总览（Reading Overview）----
+  //
+  // 无入参以外的自由字段：请求只有窗口天数与显式 UTC 偏移（字段 camelCase，与
+  // src-tauri/src/commands/reading.rs 的命令签名逐字一致）。响应先过运行时守卫，
+  // 形状漂移一律 INTERNAL_ERROR，不透传半份聚合数据给页面。
+
+  async readingOverviewGet(request: ReadingOverviewGetRequestWire): Promise<ReadingOverviewWire> {
+    try {
+      const value: unknown = await invoke("reading_overview_get", { request });
+      if (!guardReadingOverview(value)) throw new Error("reading_overview_get returned invalid data");
+      return value;
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async mcpClientConfigApply(
+    request: McpClientConfigureRequestWire,
+  ): Promise<McpClientConfigStatusWire> {
+    try {
+      const value: unknown = await invoke<unknown>("mcp_client_config_apply", { request });
+      if (!guardMcpClientConfigStatus(value)) invalidMcpClientConfigResponse();
+      return value;
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  // ---- Film/TV Provider 基础切片：TVBox / FongMi 配置预览 ----
+  //
+  // 参数以 { request } 传递（字段 camelCase，与 src-tauri 的命令签名逐字一致）。
+  // 这里只做类型化透传：响应形状守卫由 sources-gateway 统一施加，与
+  // source_registry_list 同一约定。地址只在请求方向上出现，回程里没有它。
+  async tvboxConfigPreview(request: TvboxConfigPreviewRequest): Promise<TvboxConfigPreviewDto> {
+    try {
+      return await invoke<TvboxConfigPreviewDto>("tvbox_config_preview", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  // ---- Film/TV Provider 基础切片：TVBox / FongMi 配置保存 ----
+  //
+  // 与预览同一约定：参数以 { request } 传递，响应形状守卫由 sources-gateway 施加。
+  // 地址只在请求方向上出现；回程里没有它，也没有原始配置或凭据。
+  async tvboxConfigSave(request: TvboxConfigSaveRequest): Promise<TvboxConfigSaveResult> {
+    try {
+      return await invoke<TvboxConfigSaveResult>("tvbox_config_save", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
 }
 
-function safeUpdateText(value: string | undefined): string | null {
-  if (!value) return null;
-  const normalized = Array.from(value, (character) => {
-    const codePoint = character.codePointAt(0) ?? 0;
-    return codePoint <= 0x1f || codePoint === 0x7f ? " " : character;
-  }).join("").trim();
-  return normalized ? normalized.slice(0, 2000) : null;
+/** 形状守卫失败：与其它 gateway 同一约定，不把畸形载荷当成合法状态渲染。 */
+function invalidAgentSkillResponse(): never {
+  throw toHavenError({
+    code: "INTERNAL_ERROR",
+    userMessage: "内置技能接口返回了非法数据",
+    retryable: false,
+  });
+}
+
+/**
+ * 客户端自动配置的状态守卫失败。
+ *
+ * 这份响应决定界面会不会给出一个"写入按钮"，因此畸形载荷必须 fail closed：把一份读不懂的
+ * 状态渲染成"未配置、可写"，用户按下按钮时才知道有问题，而那时我们已经在碰他的配置文件了。
+ */
+function invalidMcpClientConfigResponse(): never {
+  throw toHavenError({
+    code: "INTERNAL_ERROR",
+    userMessage: "客户端配置接口返回了非法数据",
+    retryable: false,
+  });
 }

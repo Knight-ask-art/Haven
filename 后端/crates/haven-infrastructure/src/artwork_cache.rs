@@ -768,10 +768,7 @@ fn safe_cache_path(root: &Path, relative: &str) -> Option<PathBuf> {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    crate::lower_hex(&Sha256::digest(bytes))
 }
 
 fn map_fetch_error(error: reqwest::Error) -> AppError {

@@ -37,11 +37,11 @@ permissions and generated bindings must remain aligned.
 
 | Phase | Result | Gate |
 | --- | --- | --- |
-| Foundation | Public index, metadata, authority matrix and agent entrypoint | Links and metadata check |
-| Migration map | Every existing plan/review/doc has a target, owner and status | No duplicate live ledger |
-| Canonical content | Stable product, architecture, engineering, operations and agent docs | Independent review |
+| Foundation | Public index, metadata, authority matrix and contributor guidance | Links and metadata check |
+| Migration | Revalidated durable facts move to their canonical home | No private inventory in public indexes |
+| Canonical content | Stable product, architecture, engineering and operations docs | Independent review |
 | Automation | Link, metadata, visibility, secret-marker and stale-reference checks | CI-compatible command |
-| Cutover | Status ledger and active links move to the new system | Explicit owner approval |
+| Publication | Public links and visibility match the curated tree | Privacy and tracked-tree checks |
 | Cleanup | Superseded material is archived or removed only with evidence | `git diff --check`, review and rollback path |
 
 ## Product capability workstreams
@@ -60,4 +60,4 @@ capability claim.
 - Keep generated IPC files derived from their Rust source and generator.
 - Treat persistent data, migrations, credentials, resource protocols and
   release workflows as high-risk changes.
-- Keep product Copilot contracts separate from engineering-agent permissions.
+- Keep product AI/MCP contracts separate from private development operations.

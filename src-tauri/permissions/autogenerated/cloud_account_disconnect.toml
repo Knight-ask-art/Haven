@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cloud-account-disconnect"
+description = "Enables the cloud_account_disconnect command without any pre-configured scope."
+commands.allow = ["cloud_account_disconnect"]
+
+[[permission]]
+identifier = "deny-cloud-account-disconnect"
+description = "Denies the cloud_account_disconnect command without any pre-configured scope."
+commands.deny = ["cloud_account_disconnect"]

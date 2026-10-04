@@ -92,9 +92,15 @@ export function selectBridge(
     }
 
     default:
+      // **不回显取值本身。** 这条 reason 会被 `src/index.ts` 交给 `logError` 写进 stderr，
+      // 而 MCP 客户端通常把它收进日志文件——日志比响应更容易被分享。这个变量由用户手填，
+      // 误把 token / 密码填进来是完全可能的；`redactText` 只拦得住**已知形状**的密钥，
+      // 拦不住任意字符串。因此这里根本不把它带上，而不是指望下游打码。
       return {
         ok: false,
-        reason: `未知的 ${BRIDGE_ENV_VAR} 取值：${JSON.stringify(requested)}。允许值：unavailable | fixture | live。`,
+        reason:
+          `未知的 ${BRIDGE_ENV_VAR} 取值（不在此回显，以免把误填的凭据写进日志）。` +
+          "允许值：unavailable | fixture | live。",
       };
   }
 }

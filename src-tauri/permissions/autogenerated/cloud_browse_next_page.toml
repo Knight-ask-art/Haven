@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cloud-browse-next-page"
+description = "Enables the cloud_browse_next_page command without any pre-configured scope."
+commands.allow = ["cloud_browse_next_page"]
+
+[[permission]]
+identifier = "deny-cloud-browse-next-page"
+description = "Denies the cloud_browse_next_page command without any pre-configured scope."
+commands.deny = ["cloud_browse_next_page"]

@@ -7,9 +7,11 @@ use haven_domain::entities::{Resource, ResourceLocator};
 use haven_domain::enums::{Availability, MediaType, ResourceType, StorageStatus};
 use haven_domain::ids::MediaItemId;
 
+use crate::services::cloud_storage::service::CloudStorageService;
 use crate::services::ports::ResourceListPorts;
 use crate::services::source_import::{
-    remote_source_mime_compatible, source_key_for_id, validate_remote_source_object,
+    FEED_SOURCE_KEY, KAVITA_SOURCE_KEY, KOMGA_SOURCE_KEY, remote_source_mime_compatible,
+    source_key_for_id, validate_remote_source_object,
 };
 use crate::wire::{
     AvailabilityDto, ResourceListByMediaItemRequest, ResourceListDto, ResourceSummaryDto,
@@ -21,11 +23,22 @@ const SCHEMA_VERSION: u32 = 1;
 #[derive(Clone)]
 pub struct ResourceService {
     ports: Arc<dyn ResourceListPorts>,
+    cloud_storage: Option<Arc<CloudStorageService>>,
 }
 
 impl ResourceService {
     pub fn new(ports: Arc<dyn ResourceListPorts>) -> Self {
-        Self { ports }
+        Self {
+            ports,
+            cloud_storage: None,
+        }
+    }
+
+    /// 接入云盘只读消费服务后，Google Drive PDF 绑定才会投影 `can_online_read`。
+    /// 未接入时该能力失败关闭（false），下载能力与本地判定完全不受影响。
+    pub fn with_cloud_storage(mut self, cloud_storage: Arc<CloudStorageService>) -> Self {
+        self.cloud_storage = Some(cloud_storage);
+        self
     }
 
     /// 返回指定 MediaItem 的安全资源摘要。
@@ -74,20 +87,23 @@ impl ResourceService {
         resource: Resource,
         media_type: MediaType,
     ) -> Result<ResourceSummaryDto, AppError> {
+        let storage = match resource.storage_location_id {
+            Some(id) => StorageLocationRepository::get(&*self.ports, id).await?,
+            None => None,
+        };
         // `StorageObject` is the canonical locator written by the scanner and
         // by the download worker.  Treat it as local only when its embedded
-        // provider identity agrees with the Resource row; otherwise a stale
-        // or tampered locator must not project local capabilities.
+        // provider identity agrees with the Resource row *and* the storage
+        // location is a registered local root: a cloud (Google Drive) binding
+        // must never be projected as a local file or as an existing offline
+        // copy, while the local path branch is unchanged.
         let is_local = match &resource.locator {
             ResourceLocator::LocalPath { .. } => true,
             ResourceLocator::StorageObject { provider_id, .. } => {
                 resource.storage_location_id == Some(*provider_id)
+                    && storage_is_local(storage.as_ref())
             }
             ResourceLocator::Http { .. } | ResourceLocator::SourceObject { .. } => false,
-        };
-        let storage = match resource.storage_location_id {
-            Some(id) => StorageLocationRepository::get(&*self.ports, id).await?,
-            None => None,
         };
         let requires_reauthorization = storage
             .as_ref()
@@ -116,7 +132,10 @@ impl ResourceService {
             && downloadable_locator(&resource, storage.as_ref());
         let can_online_read = is_available
             && !offline_file_missing
-            && online_readable_locator(&resource, media_type, storage.as_ref());
+            && (online_readable_locator(&resource, media_type, storage.as_ref())
+                || self
+                    .cloud_online_read(&resource, media_type, storage.as_ref())
+                    .await);
         Ok(ResourceSummaryDto {
             resource_id: resource.id.to_string(),
             resource_type: resource_type_dto(resource.resource_type),
@@ -135,6 +154,42 @@ impl ResourceService {
             stream_kind: stream_kind_dto(resource.resource_type),
         })
     }
+
+    /// 云盘在线阅读能力：只对「Google Drive 位置 + PDF 文档 + 内部身份与绑定快照完全
+    /// 一致」的资源投影为 true。这里只产出布尔值，绝不返回路径、Provider ID 或凭据；
+    /// 未接入消费服务、绑定缺失或行不自洽一律失败关闭（false），也不会打开下载能力。
+    async fn cloud_online_read(
+        &self,
+        resource: &Resource,
+        media_type: MediaType,
+        storage: Option<&haven_domain::entities::StorageLocation>,
+    ) -> bool {
+        let Some(storage) = storage else {
+            return false;
+        };
+        if storage.provider_type != haven_domain::enums::StorageProviderType::GoogleDrive {
+            return false;
+        }
+        let Some(service) = &self.cloud_storage else {
+            return false;
+        };
+        let ResourceLocator::StorageObject { object_id, .. } = &resource.locator else {
+            return false;
+        };
+        // 绑定不存在 / 行不自洽 / 仓储故障都不打断资源列表：能力失败关闭即可。
+        let Ok(snapshot) = service.object_snapshot(object_id).await else {
+            return false;
+        };
+        crate::services::cloud_storage::session_policy::cloud_session_binding_matches(
+            None, media_type, resource, storage, &snapshot,
+        )
+    }
+}
+
+fn storage_is_local(storage: Option<&haven_domain::entities::StorageLocation>) -> bool {
+    storage.is_some_and(|location| {
+        location.provider_type == haven_domain::enums::StorageProviderType::Local
+    })
 }
 
 /// 计算下载能力的唯一后端规则。只有登记过的本地存储对象或固定来源
@@ -165,10 +220,15 @@ fn downloadable_locator(
             matches!(
                 (source_key, resource.resource_type),
                 ("mangadex", ResourceType::ComicArchive)
+                    | (KOMGA_SOURCE_KEY, ResourceType::ComicArchive)
+                    | (KAVITA_SOURCE_KEY, ResourceType::ComicArchive)
                     | ("arxiv", ResourceType::PublicationFile)
                     | ("europepmc", ResourceType::ArticleSnapshot)
                     | ("wikisource", ResourceType::ArticleSnapshot)
                     | ("opds_gutenberg", ResourceType::PublicationFile)
+                    // 订阅源离线快照与在线正文共用同一个受控 provider，
+                    // `DownloadTask` 已经接受该来源；能力投影必须与执行路径一致。
+                    | (FEED_SOURCE_KEY, ResourceType::ArticleSnapshot)
             )
         }
         ResourceLocator::LocalPath { .. } | ResourceLocator::StorageObject { .. } => {
@@ -671,6 +731,156 @@ mod tests {
         let json = serde_json::to_string(summary).unwrap();
         assert!(!json.contains("mangadex"));
         assert!(!json.contains("aaaaaaaa"));
+    }
+
+    /// 回归（RSS/Atom Task 1）：用户登记的订阅文章以 `SourceObject` 落库后，
+    /// 真实 `ResourceSummaryDto` 必须同时投影 `can_download` 与 `can_online_read`，
+    /// 并保持与其它远端来源相同的类型 / 来源 / MIME 守卫。
+    #[tokio::test]
+    async fn remote_feed_article_projects_download_and_online_capabilities() {
+        let db = std::sync::Arc::new(Db::open_in_memory().unwrap());
+        let repos = std::sync::Arc::new(SqliteRepositories::new(db));
+        let now = haven_common::UtcMillis(1);
+        let work_id = WorkId::new();
+        let edition_id = EditionId::new();
+        let media_item_id = MediaItemId::new();
+        repos
+            .work
+            .save(&Work {
+                id: work_id,
+                canonical_title: "订阅文章".into(),
+                original_title: None,
+                sort_title: None,
+                description: None,
+                work_type: WorkType::Standalone,
+                release_year: None,
+                language: None,
+                director: None,
+                actor: None,
+                status: WorkStatus::Completed,
+                rating_value: None,
+                rating_scale: None,
+                artwork: Default::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        repos
+            .edition
+            .save(&Edition {
+                id: edition_id,
+                work_id,
+                title: "订阅文章".into(),
+                subtitle: None,
+                edition_type: MediaType::Article,
+                release_date: None,
+                language: None,
+                region: None,
+                publisher_or_studio: None,
+                description: None,
+                artwork: Default::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        repos
+            .media_item
+            .save(&MediaItem {
+                id: media_item_id,
+                edition_id,
+                parent_id: None,
+                media_type: MediaType::Article,
+                title: "第一篇".into(),
+                index: MediaIndex::Article { ordinal: Some(1) },
+                duration_ms: None,
+                page_count: None,
+                chapter_count: None,
+                published_at: None,
+                status: MediaItemStatus::Available,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+
+        let source_id = crate::services::source_import::stable_source_id(FEED_SOURCE_KEY).unwrap();
+        let remote_id = crate::services::source_import::feed_remote_id(
+            "custom_feed_0123456789ab",
+            &crate::services::source_import::feed_entry_digest("post-1"),
+        )
+        .unwrap();
+        let resource = Resource {
+            id: haven_domain::ids::ResourceId::new(),
+            media_item_id,
+            resource_type: ResourceType::ArticleSnapshot,
+            source_id: Some(source_id),
+            storage_location_id: None,
+            locator: ResourceLocator::SourceObject {
+                source_id,
+                remote_id,
+            },
+            mime_type: Some("text/html; charset=utf-8".into()),
+            size: None,
+            hash: None,
+            availability: Availability::Available,
+            availability_source: AvailabilitySource::User,
+            modified_ms: None,
+            fingerprint_first: None,
+            fingerprint_last: None,
+            created_at: now,
+            updated_at: now,
+        };
+        repos.resource.save(&resource).await.unwrap();
+
+        let result = ResourceService::new(repos)
+            .list_by_media_item(ResourceListByMediaItemRequest {
+                media_item_id: media_item_id.to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        let summary = &result.items[0];
+        assert!(!summary.is_local);
+        assert!(summary.can_download, "订阅文章必须可离线下载");
+        assert!(summary.can_online_read, "订阅文章必须可在线阅读");
+
+        // 类型守卫：非 ArticleSnapshot 的订阅资源不能被投影为正文能力。
+        let mut wrong_type = resource.clone();
+        wrong_type.resource_type = ResourceType::PublicationFile;
+        assert!(!downloadable_locator(&wrong_type, None));
+        assert!(!online_readable_locator(
+            &wrong_type,
+            MediaType::Article,
+            None
+        ));
+
+        // MIME 守卫：跨格式或不含 MIME 时 fail closed。
+        let mut wrong_mime = resource.clone();
+        wrong_mime.mime_type = Some("application/pdf".into());
+        assert!(!downloadable_locator(&wrong_mime, None));
+        assert!(!online_readable_locator(
+            &wrong_mime,
+            MediaType::Article,
+            None
+        ));
+
+        // 来源身份守卫：Resource.source_id 与 locator 不一致时拒绝。
+        let mut tampered = resource.clone();
+        tampered.source_id = Some(haven_domain::ids::SourceId::new());
+        assert!(!downloadable_locator(&tampered, None));
+        assert!(!online_readable_locator(
+            &tampered,
+            MediaType::Article,
+            None
+        ));
+
+        // 摘要不得回显来源键、订阅源 sourceId 或远端身份。
+        let json = serde_json::to_string(summary).unwrap();
+        assert!(!json.contains(FEED_SOURCE_KEY));
+        assert!(!json.contains("custom_feed_"));
+        assert!(!json.contains("0123456789ab"));
     }
 
     #[test]

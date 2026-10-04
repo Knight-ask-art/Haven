@@ -190,21 +190,6 @@ fn local_name(raw: &[u8]) -> String {
         .to_owned()
 }
 
-fn decode_xml_text(text: &quick_xml::events::BytesText<'_>) -> Option<String> {
-    let decoded = text.decode().ok()?;
-    quick_xml::escape::unescape(decoded.as_ref())
-        .ok()
-        .map(|value| value.into_owned())
-}
-
-fn decode_xml_reference(reference: &quick_xml::events::BytesRef<'_>) -> Option<String> {
-    let name = reference.decode().ok()?;
-    let raw = format!("&{name};");
-    quick_xml::escape::unescape(&raw)
-        .ok()
-        .map(|value| value.into_owned())
-}
-
 fn clean_text(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -284,7 +269,7 @@ pub fn parse_europe_pmc_article(
                 text_stack.push(String::new());
             }
             Ok(Event::Text(text)) => {
-                let value = decode_xml_text(&text)
+                let value = crate::unescape_xml_text(&text)
                     .ok_or_else(|| source_unavailable("Europe PMC 全文 XML 文本无效"))?;
                 if is_body_paragraph(&path) && !value.trim().is_empty() {
                     body_has_text = true;
@@ -294,7 +279,7 @@ pub fn parse_europe_pmc_article(
                 }
             }
             Ok(Event::GeneralRef(reference)) => {
-                let value = decode_xml_reference(&reference)
+                let value = crate::unescape_xml_reference(&reference)
                     .ok_or_else(|| source_unavailable("Europe PMC 全文 XML 实体引用无效"))?;
                 if is_body_paragraph(&path) && !value.trim().is_empty() {
                     body_has_text = true;

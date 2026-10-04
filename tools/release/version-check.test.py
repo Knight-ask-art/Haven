@@ -18,7 +18,7 @@ REPOSITORY_ROOT = Path(__file__).parents[2]
 
 class VersionCheckTests(unittest.TestCase):
     def test_release_manifests_use_one_first_party_version(self) -> None:
-        errors = VERSION_CHECK.validate(REPOSITORY_ROOT, "0.1.0-beta.1")
+        errors = VERSION_CHECK.validate(REPOSITORY_ROOT, "0.1.0")
 
         self.assertEqual(errors, [])
 

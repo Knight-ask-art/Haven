@@ -11,7 +11,7 @@ review_after: 2026-12-20
 
 # Haven Copilot Boundary
 
-Engineering agents and the future Haven Copilot are different systems.
+Haven's product AI does not inherit the application's general authority.
 
 Any Haven Copilot implementation must be context-bound and user-initiated. It may
 read a bounded context and propose an action, but it never receives Haven's
@@ -28,5 +28,5 @@ Locator confidence must be explicit:
 | Unresolved | Selected/pasted text or metadata only, with a visible limitation |
 
 Unresolved content must not be silently expanded to the entire work. The
-current AI plans are design/implementation inputs, not evidence that a complete
-Provider, stream, MCP or product Chat surface exists.
+capability Registry and runtime contracts determine the available surface, not
+a design proposal or a mock conversation.

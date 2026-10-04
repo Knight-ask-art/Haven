@@ -4,7 +4,7 @@
 
 import { useEffect, useRef, useState } from "react"
 import { useNavigate } from "react-router"
-import { ChevronDown, ChevronRight, Loader2, SearchX, Server } from "lucide-react"
+import { ChevronDown, ChevronRight, Download, Globe, Loader2, SearchX, Server } from "lucide-react"
 
 import type { QueryCategory, WorkCardDto } from "@/lib/ipc/generated/wire"
 import { toHavenError } from "@/lib/ipc/errors"
@@ -23,6 +23,7 @@ import {
 interface Candidate {
   index: number
   work: WorkCardDto
+  sourceId: string | null
 }
 
 function canImportCandidate(workId: string): boolean {
@@ -79,7 +80,7 @@ export function SourceCandidates({
       else if (operationIdRef.current !== event.operationId) return
       switch (event.kind) {
         case "source_result": {
-          const mapped = event.data.works.map((work) => ({ index: runningIndex++, work }))
+          const mapped = event.data.works.map((work) => ({ index: runningIndex++, work, sourceId: event.data.sourceId }))
           setCandidates((prev) => [...prev, ...mapped])
           break
         }
@@ -100,10 +101,6 @@ export function SourceCandidates({
           break
       }
     }, sourceCategory)
-      .then(() => {
-        // started 同步先发；promise 只确认登记成功。
-        if (!cancelled && status === "idle") setStatus("searching")
-      })
       .catch((error: unknown) => {
         if (cancelled) return
         setErrorCode(toHavenError(error).code)
@@ -134,54 +131,55 @@ export function SourceCandidates({
 
   if (status === "idle") return null
 
-  if (status === "failed") {
-    // 局部失败：不破坏本地结果，仅本区块呈现可重试错误。
-    return (
-      <section className="flex flex-col gap-4">
-        <h2 className="text-xl font-bold tracking-tight">来源结果</h2>
-        <div className="flex items-center justify-between rounded-3xl border border-black/[0.08] bg-white/70 px-5 py-4 text-sm">
-          <span className="text-[#d97706]">来源搜索暂时不可用（{errorCode ?? "UNKNOWN"}）</span>
-          <button type="button" onClick={() => { setStatus("idle") }} className="font-semibold text-[#007aff]">知道了</button>
-        </div>
-      </section>
-    )
-  }
-
   return (
-    <section className="flex flex-col gap-4">
-      <h2 className="text-xl font-bold tracking-tight">来源结果</h2>
-      {status === "searching" && (
-        <div className="flex items-center gap-3 rounded-3xl border border-black/[0.08] bg-white/70 px-5 py-4 text-sm text-[#86868b]">
-          <Loader2 className="h-4 w-4 animate-spin" />
-          正在向已启用来源分发查询…
+    <section className="search-results__section" aria-labelledby="source-results-heading" aria-busy={status === "searching"}>
+      <header className="search-results__section-header">
+        <div className="search-results__section-title">
+          <Globe size={18} aria-hidden="true" />
+          <h2 id="source-results-heading">来源结果</h2>
+          <span className="search-results__count">{candidates.length}</span>
+        </div>
+        <span className="search-results__section-hint" role="status">
+          {status === "searching" ? <><Loader2 size={14} className="animate-spin" aria-hidden="true" />正在查询已启用来源…</>
+            : status === "failed" ? "查询未完成"
+            : warnings.length > 0 ? "部分来源已返回"
+            : "已启用的外部来源"}
+        </span>
+      </header>
+      {status === "failed" && errorCode !== null && (
+        <div className="search-results__notice" role="alert">
+          <div className="search-results__notice-toggle">
+            <span>来源搜索暂时不可用（{errorCode ?? "UNKNOWN"}），本地结果不受影响。</span>
+            <button type="button" onClick={() => { setErrorCode(null) }} className="search-results__action">知道了</button>
+          </div>
         </div>
       )}
       {warnings.length > 0 && (
-        <div className="rounded-3xl border border-black/[0.08] bg-white/70 px-5 py-4 text-sm">
+        <div className="search-results__notice">
           <button
             type="button"
             aria-expanded={warningsOpen}
             onClick={() => { setWarningsOpen((open) => !open) }}
-            className="flex w-full items-center justify-between text-left"
+            className="search-results__notice-toggle"
           >
-            <span className="text-xs text-[#d97706]">
+            <span>
               有 {warnings.length} 个来源未返回结果，已展示其余来源。
             </span>
-            <span className="flex items-center gap-1 text-xs font-semibold text-[#007aff]">
+            <span className="search-results__notice-action">
               {warningsOpen ? "收起明细" : "查看明细"}
               {warningsOpen
-                ? <ChevronDown className="h-4 w-4" />
-                : <ChevronRight className="h-4 w-4" />}
+                ? <ChevronDown size={14} aria-hidden="true" />
+                : <ChevronRight size={14} aria-hidden="true" />}
             </span>
           </button>
           {warningsOpen && (
-            <ul className="mt-3 flex flex-col gap-2 border-t border-black/[0.06] pt-3">
+            <ul className="search-results__warning-list">
               {warnings.map((warning, i) => (
-                <li key={`${warning.sourceId}-${i}`} className="text-xs text-[#86868b]">
+                <li key={`${warning.sourceId}-${i}`}>
                   <span className="font-semibold">{sourceDisplayName(warning.sourceId)}</span>
                   {" · "}
                   {warningLineText(warning)}
-                  <span className="ml-2 rounded-full bg-black/[0.05] px-2 py-0.5 text-[10px] text-[#6e6e73]">
+                  <span className="search-results__warning-code">
                     {warning.code}
                   </span>
                 </li>
@@ -190,39 +188,47 @@ export function SourceCandidates({
           )}
         </div>
       )}
-      {candidates.length === 0 && status === "done" ? (
-        <div className="flex items-center gap-3 rounded-3xl border border-dashed border-black/[0.12] bg-white/60 px-5 py-4 text-sm text-[#86868b]">
-          <SearchX className="h-4 w-4" />
-          已启用来源没有返回匹配条目。
+      {candidates.length === 0 && status === "done" && (
+        <div className="search-results__empty search-results__empty--source" role="status">
+          <SearchX size={24} aria-hidden="true" />
+          <div>
+            <p className="font-medium text-foreground">来源中暂无匹配结果</p>
+            <p className="mt-1">已启用来源没有返回匹配条目，可尝试其他关键词。</p>
+          </div>
         </div>
-      ) : (
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-          {candidates.map(({ index, work }) => (
+      )}
+      {candidates.length > 0 && (
+        <div className="search-results__grid">
+          {candidates.map(({ index, work, sourceId }) => (
             <article
               key={`${work.workId}-${index}`}
-              className="flex items-center gap-4 rounded-3xl border border-black/[0.08] bg-white/80 px-5 py-4"
+              className="search-result-card search-result-card--source"
             >
-              <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[#f2f2f4] text-[#6e6e73]">
-                <Server className="h-5 w-5" />
+              <span className="search-result-card__source-icon">
+                <Server size={17} aria-hidden="true" />
               </span>
-              <div className="min-w-0 flex-1">
-                <p className="truncate text-sm font-semibold">{work.title}</p>
-                <p className="mt-1 truncate text-xs text-[#86868b]">
-                  来源候选{work.releaseYear !== null ? ` · ${work.releaseYear}` : ""}
-                  {work.availableMediaTypes.length > 0 ? ` · ${work.availableMediaTypes.join("/")}` : ""}
-                </p>
+              <div className="search-result-card__body">
+                <h3 className="search-result-card__title">{work.title}</h3>
+                {work.description && <p className="search-result-card__description">{work.description}</p>}
+                <div className="search-result-card__metadata">
+                  <span className="search-result-card__source-name">{sourceId ? sourceDisplayName(sourceId) : "来源候选"}</span>
+                  {work.releaseYear !== null && <span>{work.releaseYear}</span>}
+                  {work.availableMediaTypes.length > 0 && <span>{work.availableMediaTypes.join(" / ")}</span>}
+                </div>
               </div>
               {canImportCandidate(work.workId) ? (
                 <button
                   type="button"
                   disabled={importingIndex !== null}
-                  onClick={() => { void importCandidate({ index, work }) }}
-                  className="shrink-0 rounded-full bg-[#007aff] px-[16px] py-[8px] text-xs font-semibold text-white disabled:opacity-50"
+                  onClick={() => { void importCandidate({ index, work, sourceId }) }}
+                  aria-label={`${importingIndex === index ? "导入中…" : "导入媒体库"}：${work.title}`}
+                  className="search-results__action"
                 >
+                  {importingIndex === index ? <Loader2 size={13} className="animate-spin" aria-hidden="true" /> : <Download size={13} aria-hidden="true" />}
                   {importingIndex === index ? "导入中…" : "导入媒体库"}
                 </button>
               ) : (
-                <span className="shrink-0 rounded-full bg-black/[0.05] px-3 py-2 text-[11px] font-medium text-[#86868b] dark:bg-white/[0.08] dark:text-[#a1a1a6]">
+                <span className="search-result-card__read-only">
                   仅搜索
                 </span>
               )}
@@ -230,7 +236,7 @@ export function SourceCandidates({
           ))}
         </div>
       )}
-      {importError && <p className="text-sm font-semibold text-[#d97706]">{importError}</p>}
+      {importError && <p className="search-results__notice" role="alert">{importError}</p>}
     </section>
   )
 }

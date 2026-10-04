@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cloud-register-folder"
+description = "Enables the cloud_register_folder command without any pre-configured scope."
+commands.allow = ["cloud_register_folder"]
+
+[[permission]]
+identifier = "deny-cloud-register-folder"
+description = "Denies the cloud_register_folder command without any pre-configured scope."
+commands.deny = ["cloud_register_folder"]

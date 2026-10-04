@@ -13,10 +13,16 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
-import { SCHEMA_VERSION, TOOL_NAMES, type ResponseFormat, type ToolName } from "./constants.js";
+import {
+  READ_ONLY_TOOL_NAMES,
+  SCHEMA_VERSION,
+  TOOL_NAMES,
+  type ResponseFormat,
+  type ToolName,
+} from "./constants.js";
 import { capabilityUnavailable, invalidArgument, toErrorPayload } from "./errors.js";
 import { renderRecord, toolFailure, toolSuccess } from "./respond.js";
-import type { HavenAgentBridge } from "./bridge.js";
+import type { BridgeCallContext, HavenAgentBridge } from "./bridge.js";
 import { withBridgeTimeout } from "./bridge.js";
 import {
   emptyInputSchema,
@@ -485,9 +491,31 @@ const onboardingOutputSchema = z.strictObject({
 
 // ---- 注册 ----
 
-/** 未实现能力的显式拒绝。即使桥接接通，这些工具也不得编造结果。 */
+/**
+ * 未实现能力的显式拒绝。即使桥接接通，这些工具也不得编造结果。 */
 function refuseUnimplemented(name: ToolName, implementation: UnimplementedTool): never {
   throw capabilityUnavailable(`${implementation.capability}（工具 ${name}：${implementation.reason}）`);
+}
+
+/**
+ * 超时 / 客户端取消之后能不能安全重试。
+ *
+ * **只取决于这次调用有没有可能已经落库**：
+ * - 7 个只读工具没有副作用，重试就是重试；
+ * - 2 个提案工具一旦把请求发出去，Broker 可能已经创建了一条 pending 提案。此时把结果
+ *   报成"可重试"会诱导调用方再发一次，用户于是在栖阅里看到两条一模一样的待审批提案，
+ *   而调用方以为自己只成功了一次。因此非重试，并要求先回栖阅核对。
+ *
+ * 导出它只为让测试能**逐工具**钉住这条判定（`test/retryability.test.ts`），
+ * 而不是让测试自己再抄一份"哪些工具是只读的"。生产调用点仍是下面两个 handler。
+ */
+export function retryableAfterCancel(name: ToolName): boolean {
+  return (READ_ONLY_TOOL_NAMES as readonly string[]).includes(name);
+}
+
+/** MCP SDK 交给工具回调的额外上下文：我们只用到取消信号。 */
+interface ToolRequestExtra {
+  signal?: AbortSignal;
 }
 
 /**
@@ -495,12 +523,21 @@ function refuseUnimplemented(name: ToolName, implementation: UnimplementedTool):
  *
  * 注册顺序与 `TOOL_NAMES` 一致；`test/tools.test.ts` 断言注册结果**恰好等于**该集合，
  * 因此这个函数不可能悄悄多注册一个工具。
+ *
+ * **每个 handler 都必须把 `context` 传给它发起的每一次桥接调用。** 这不是风格问题：
+ * `context.signal` 是"调用方取消 / 本地超时"到达传输层的唯一路径。handler 把它丢掉，
+ * 取消就退化成"客户端不再看结果"——MCP 侧回了 `HAVEN_BRIDGE_CANCELLED`，而 Node 侧那条
+ * 连接照旧跑完，提案照旧落库。`test/tools.test.ts` 对这一点有直接断言。
  */
 export function registerHavenTools(server: McpServer, bridge: HavenAgentBridge): void {
   const readOnly = (
     name: ToolName,
     config: { inputSchema: z.ZodType; outputSchema: z.ZodType },
-    handler: (args: Record<string, unknown>, bridge: HavenAgentBridge) => Promise<Record<string, unknown>>,
+    handler: (
+      args: Record<string, unknown>,
+      bridge: HavenAgentBridge,
+      context: BridgeCallContext,
+    ) => Promise<Record<string, unknown>>,
   ): void => {
     const implementation = TOOL_IMPLEMENTATION[name];
     server.registerTool(
@@ -513,11 +550,13 @@ export function registerHavenTools(server: McpServer, bridge: HavenAgentBridge):
         annotations: READ_ONLY_ANNOTATIONS,
       },
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (async (args: any): Promise<CallToolResult> => {
+      (async (args: any, extra?: ToolRequestExtra): Promise<CallToolResult> => {
         try {
           if (!implementation.implemented) refuseUnimplemented(name, implementation);
-          const structured = await withBridgeTimeout(implementation.operation, () =>
-            handler(args, bridge),
+          const structured = await withBridgeTimeout(
+            implementation.operation,
+            (signal) => handler(args, bridge, { signal }),
+            { signal: extra?.signal, retryableOnCancel: retryableAfterCancel(name) },
           );
           return toolSuccess({
             toolName: name,
@@ -535,7 +574,11 @@ export function registerHavenTools(server: McpServer, bridge: HavenAgentBridge):
   const propose = (
     name: ToolName,
     config: { inputSchema: z.ZodType; outputSchema: z.ZodType },
-    handler: (args: Record<string, unknown>, bridge: HavenAgentBridge) => Promise<Record<string, unknown>>,
+    handler: (
+      args: Record<string, unknown>,
+      bridge: HavenAgentBridge,
+      context: BridgeCallContext,
+    ) => Promise<Record<string, unknown>>,
   ): void => {
     const implementation = TOOL_IMPLEMENTATION[name];
     server.registerTool(
@@ -548,11 +591,13 @@ export function registerHavenTools(server: McpServer, bridge: HavenAgentBridge):
         annotations: PROPOSAL_ANNOTATIONS,
       },
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (async (args: any): Promise<CallToolResult> => {
+      (async (args: any, extra?: ToolRequestExtra): Promise<CallToolResult> => {
         try {
           if (!implementation.implemented) refuseUnimplemented(name, implementation);
-          const structured = await withBridgeTimeout(implementation.operation, () =>
-            handler(args, bridge),
+          const structured = await withBridgeTimeout(
+            implementation.operation,
+            (signal) => handler(args, bridge, { signal }),
+            { signal: extra?.signal, retryableOnCancel: retryableAfterCancel(name) },
           );
           return toolSuccess({
             toolName: name,
@@ -570,14 +615,14 @@ export function registerHavenTools(server: McpServer, bridge: HavenAgentBridge):
   readOnly(
     "get_system_capabilities",
     { inputSchema: emptyInputSchema, outputSchema: systemCapabilitiesOutputSchema },
-    async (_args, activeBridge) => buildCapabilities(activeBridge),
+    async (_args, activeBridge, context) => buildCapabilities(activeBridge, context),
   );
 
   readOnly(
     "get_settings_snapshot",
     { inputSchema: sectionInputSchema, outputSchema: settingsSnapshotOutputSchema },
-    async (_args, activeBridge) => {
-      const snapshot = await activeBridge.getSettingsSnapshot();
+    async (_args, activeBridge, context) => {
+      const snapshot = await activeBridge.getSettingsSnapshot(context);
       return {
         schema_version: SCHEMA_VERSION,
         subject_scope: snapshot.subject_scope,
@@ -594,8 +639,8 @@ export function registerHavenTools(server: McpServer, bridge: HavenAgentBridge):
   readOnly(
     "get_setting_sources",
     { inputSchema: sectionInputSchema, outputSchema: settingSourcesOutputSchema },
-    async (_args, activeBridge) => {
-      const sources = await activeBridge.getSettingSources();
+    async (_args, activeBridge, context) => {
+      const sources = await activeBridge.getSettingSources(context);
       return { schema_version: SCHEMA_VERSION, ...sources };
     },
   );
@@ -603,16 +648,19 @@ export function registerHavenTools(server: McpServer, bridge: HavenAgentBridge):
   readOnly(
     "get_resource_preference_snapshot",
     { inputSchema: preferenceSnapshotInputSchema, outputSchema: resourcePreferenceSnapshotOutputSchema },
-    async (args: Record<string, unknown>, activeBridge) => {
+    async (args: Record<string, unknown>, activeBridge, context) => {
       const input = args as unknown as z.infer<typeof preferenceSnapshotInputSchema>;
       if (input.target_scope === "media_item" && input.media_item_id === null) {
         throw invalidArgument("target_scope='media_item' 时必须提供 media_item_id。");
       }
-      const snapshot = await activeBridge.getResourcePreferenceSnapshot({
-        target_scope: input.target_scope,
-        edition_id: input.edition_id,
-        media_item_id: input.media_item_id,
-      });
+      const snapshot = await activeBridge.getResourcePreferenceSnapshot(
+        {
+          target_scope: input.target_scope,
+          edition_id: input.edition_id,
+          media_item_id: input.media_item_id,
+        },
+        context,
+      );
       return { schema_version: SCHEMA_VERSION, ...snapshot };
     },
   );
@@ -620,9 +668,9 @@ export function registerHavenTools(server: McpServer, bridge: HavenAgentBridge):
   readOnly(
     "get_library_summary",
     { inputSchema: librarySummaryInputSchema, outputSchema: librarySummaryOutputSchema },
-    async (args: Record<string, unknown>, activeBridge) => {
+    async (args: Record<string, unknown>, activeBridge, context) => {
       const input = args as unknown as z.infer<typeof librarySummaryInputSchema>;
-      const summary = await activeBridge.getLibrarySummary({ limit: input.limit });
+      const summary = await activeBridge.getLibrarySummary({ limit: input.limit }, context);
       return { schema_version: SCHEMA_VERSION, ...summary };
     },
   );
@@ -630,12 +678,15 @@ export function registerHavenTools(server: McpServer, bridge: HavenAgentBridge):
   readOnly(
     "get_media_capabilities",
     { inputSchema: mediaCapabilitiesInputSchema, outputSchema: mediaCapabilitiesOutputSchema },
-    async (args: Record<string, unknown>, activeBridge) => {
+    async (args: Record<string, unknown>, activeBridge, context) => {
       const input = args as unknown as z.infer<typeof mediaCapabilitiesInputSchema>;
-      const capabilities = await activeBridge.getMediaCapabilities({
-        media_item_id: input.media_item_id,
-        limit: input.limit,
-      });
+      const capabilities = await activeBridge.getMediaCapabilities(
+        {
+          media_item_id: input.media_item_id,
+          limit: input.limit,
+        },
+        context,
+      );
       return { schema_version: SCHEMA_VERSION, ...capabilities };
     },
   );
@@ -643,8 +694,8 @@ export function registerHavenTools(server: McpServer, bridge: HavenAgentBridge):
   readOnly(
     "get_onboarding_state",
     { inputSchema: emptyInputSchema, outputSchema: onboardingOutputSchema },
-    async (_args, activeBridge) => {
-      const state = await activeBridge.getOnboardingState();
+    async (_args, activeBridge, context) => {
+      const state = await activeBridge.getOnboardingState(context);
       return { schema_version: SCHEMA_VERSION, ...state };
     },
   );
@@ -652,15 +703,18 @@ export function registerHavenTools(server: McpServer, bridge: HavenAgentBridge):
   propose(
     "propose_settings_patch",
     { inputSchema: settingsProposalInputSchema, outputSchema: proposalOutputSchema },
-    async (args: Record<string, unknown>, activeBridge) => {
+    async (args: Record<string, unknown>, activeBridge, context) => {
       const input = args as unknown as z.infer<typeof settingsProposalInputSchema>;
-      const outcome = await activeBridge.proposeSettingsPatch({
-        section: input.section,
-        context_id: input.context_id,
-        context_hash: input.context_hash,
-        base_revision: input.base_revision,
-        patch: input.patch,
-      });
+      const outcome = await activeBridge.proposeSettingsPatch(
+        {
+          section: input.section,
+          context_id: input.context_id,
+          context_hash: input.context_hash,
+          base_revision: input.base_revision,
+          patch: input.patch,
+        },
+        context,
+      );
       return { schema_version: SCHEMA_VERSION, ...outcome };
     },
   );
@@ -671,31 +725,42 @@ export function registerHavenTools(server: McpServer, bridge: HavenAgentBridge):
       inputSchema: resourcePreferenceProposalInputSchema,
       outputSchema: proposalOutputSchema,
     },
-    async (args: Record<string, unknown>, activeBridge) => {
+    async (args: Record<string, unknown>, activeBridge, context) => {
       const input = args as unknown as z.infer<typeof resourcePreferenceProposalInputSchema>;
-      const outcome = await activeBridge.proposeResourcePreferencePatch({
-        target_scope: input.target_scope,
-        edition_id: input.edition_id,
-        media_item_id: input.media_item_id,
-        context_id: input.context_id,
-        context_hash: input.context_hash,
-        base_revision: input.base_revision,
-        patch: input.patch,
-      });
+      const outcome = await activeBridge.proposeResourcePreferencePatch(
+        {
+          target_scope: input.target_scope,
+          edition_id: input.edition_id,
+          media_item_id: input.media_item_id,
+          context_id: input.context_id,
+          context_hash: input.context_hash,
+          base_revision: input.base_revision,
+          patch: input.patch,
+        },
+        context,
+      );
       return { schema_version: SCHEMA_VERSION, ...outcome };
     },
   );
 }
 
 /** 本工具永不出错：桥接不可用只体现为 `haven.available = false`。 */
-async function buildCapabilities(bridge: HavenAgentBridge): Promise<Record<string, unknown>> {
+async function buildCapabilities(
+  bridge: HavenAgentBridge,
+  context: BridgeCallContext,
+): Promise<Record<string, unknown>> {
   let havenAvailable = false;
   let agentApiVersion: number | null = null;
   let capabilities: Record<string, boolean> | null = null;
   let reason: string | null = null;
 
   try {
-    const manifest = await withBridgeTimeout("读取能力清单", () => bridge.getCapabilityManifest());
+    const manifest = await withBridgeTimeout(
+      "读取能力清单",
+      (signal) => bridge.getCapabilityManifest({ signal }),
+      // 只读：取消或超时之后重试是安全的。
+      { signal: context.signal, retryableOnCancel: true },
+    );
     havenAvailable = true;
     agentApiVersion = manifest.agent_api_version;
     capabilities = { ...manifest.capabilities };

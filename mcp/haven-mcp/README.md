@@ -101,13 +101,22 @@ MCP 客户端会把本 server 当子进程启动，而它要访问的是**另一
 
 ## 使用
 
+先分清两条入口：它们的 Node 前置条件**完全不同**，别把其中一条的要求安到另一条头上。
+
+| 入口 | 配置里的命令 | Node 从哪来 |
+| --- | --- | --- |
+| **开发 / 自建**（本节的例子、下面手敲的客户端 CLI） | 你自己 clone 出来的 `mcp/haven-mcp/dist/index.js` | **本机自装**：`package.json` 与 `package-lock.json` 的 `engines` 都是 `node >= 22.12.0` |
+| **装好的栖阅**（设置页「一键配置」实际写进客户端的那一条） | 安装目录里的 `<resource_dir>/haven-mcp/runtime/node.exe` + `dist/index.js` | **随安装包附带**，不要求用户装 Node、也不需要 clone；只有 Windows 安装包形态（见下文「可分发运行时」） |
+
+下面这段是**开发 / 自建**路径。已经用安装包装好栖阅的用户不需要执行它——那是构建机 / CI 的事。
+
 ```bash
-npm install
+npm install                 # engines: node >= 22.12.0
 npm run build
 node dist/index.js          # stdio transport
 ```
 
-MCP 客户端配置（不填 `env` 也能启动，但那样所有工具都会如实报告桥接不可用）：
+自建产物的 MCP 客户端配置（不填 `env` 也能启动，但那样所有工具都会如实报告桥接不可用）：
 
 ```json
 {
@@ -125,8 +134,180 @@ MCP 客户端配置（不填 `env` 也能启动，但那样所有工具都会如
 ```
 
 端点字符串请**从栖阅设置页「外部 Agent 接入」分组复制**（只有真实监听时才给出可复制地址，
-且需要你先在那里显式开启）；不要手写、不要猜。这就是栖阅界面为四个客户端
-（Codex / Claude Code / DSH / Pi）生成的同一份模板，四者内容完全相同。
+且需要你先在那里显式开启）；不要手写、不要猜。上面这份 JSON 就是栖阅界面为四个客户端
+（Codex / Claude Code / DSH / Pi）生成的同一份模板，四者内容完全相同；模板里同一个占位符
+写作 `<path-to-haven>`，`<repo>` 与它指的是同一件事——**你自己 clone 本仓库的路径**，
+只在自建路径下才需要替换。注意它与设置页「一键配置」写进客户端的那条命令**不是同一条**
+（那边是随包分发的 `runtime/node.exe`），这是有意的。
+
+### 配套的行为协议技能包
+
+光有连接还不够：模型还需要知道**怎么用**这 9 个工具。这项行为协议是
+`skills/haven-agent-proposal`（[`AI_SYSTEM.md`](../../docs/architecture/AI_SYSTEM.md) §6.1）。
+把它交给外部客户端的内容由仓库里的打包器产出：
+
+```bash
+python tools/skills/pack-skill.py --out <产物目录>
+# → haven-agent-proposal-<版本>.zip
+# → haven-agent-proposal-<版本>.manifest.json
+```
+
+包内文件与 `skills/haven-agent-proposal/` **逐字节相同**；manifest 里的工具清单从
+`src/constants.ts` 现读，等于冻结的 9 项。栖阅应用自己用的是同一份内容（编译期嵌入二进制），
+见 AI_SYSTEM.md §6.2/§6.3。
+
+### 接到 Codex / Claude Code 上（**未实测**，按客户端文档核对）
+
+这一段是**自建路径**：用你自己构建的产物、自己执行客户端 CLI。两个客户端**都没有实测过**
+——下面是按它们各自文档整理的最小步骤，权威说明以客户端自己的文档为准（版本差异都发生在
+那一层）。**Haven 不会替你执行这些命令**，也不会在你不知情时改写任何客户端配置；唯一会写
+客户端配置的能力是设置页里的「一键配置」，由你主动点击触发，写的是随包分发的运行时
+（见下文「一键配置 Codex / Claude Code」）。已经用安装包装好栖阅的用户可以直接走那条路，
+不需要做本节任何一步。
+
+连接。两个客户端都有自己的 CLI，可在添加 stdio MCP server 时一并传入桥接环境变量：
+
+```powershell
+# 自建路径：先在仓库的 mcp/haven-mcp 目录运行 npm install 与 npm run build
+# （本机需要 Node ≥ 22.12.0；随安装包分发的那份运行时不需要）。
+# 把 <复制的端点> 替换成 Haven 设置页「外部 Agent 接入」提供的实际端点，<repo> 替换成仓库路径。
+claude mcp add haven -s user -e HAVEN_MCP_BRIDGE=live -e "HAVEN_MCP_ENDPOINT=<复制的端点>" -- node "<repo>\mcp\haven-mcp\dist\index.js"
+codex mcp add haven --env HAVEN_MCP_BRIDGE=live --env "HAVEN_MCP_ENDPOINT=<复制的端点>" -- node "<repo>\mcp\haven-mcp\dist\index.js"
+```
+
+这两条命令会分别写入你所选客户端的 MCP 配置；Haven 本身不会执行它们。环境变量只有
+`HAVEN_MCP_BRIDGE=live` 与 `HAVEN_MCP_ENDPOINT`。端点必须从 Haven 设置页复制；不要手写或猜测。
+未启用 Haven Broker 或 Haven 未运行时，工具会如实报告桥接不可用。`<repo>` 是你自己克隆本仓库
+的路径，且需要先在 `mcp/haven-mcp` 目录运行 `npm install` 与 `npm run build` 生成 `dist/`。
+
+不想用 CLI 的话，上面那段 `mcpServers` JSON 就是等价写法：Claude Code 放在项目级
+`.mcp.json`，Codex 放在它自己的配置文件里。各客户端字段名可能不同，`command` / `args` /
+`env` 三项语义相同——差异属于各客户端的文档，不属于本仓库的契约。
+
+技能包。这一步同样是**客户端自己的机制**——栖阅不会把技能包装进任何客户端，也不写任何
+Skill 目录。它与上文那条由你主动点击触发的「一键配置」是**两件互不相干的事**：那条只写
+授权范围内的那一条 MCP 连接配置，不涉及技能包。下面分别解压到各自支持的 Skill 目录：
+
+- **Claude Code**：项目级目录为 `.claude/skills/`，个人级目录为 `~/.claude/skills/`。
+- **Codex**：项目级目录为 `.agents/skills/`，个人级目录为 `~/.agents/skills/`。
+
+压缩包内所有文件都以 `haven-agent-proposal/` 为路径前缀（不写入空目录条目）；把 zip 解压到对应的 `skills/` 父目录即可，最终应有
+`<skills目录>/haven-agent-proposal/SKILL.md`。Codex 项目级 `.agents/` 可被 Git 忽略；安装 Skill
+不需要把正文复制进 `AGENTS.md`。
+
+`SKILL.md` 里用 `<!-- haven:audience=native -->` / `<!-- haven:audience=external -->` 标出了
+两条运行时各自的段落。外部客户端拿到的是**整份文件**：属于栖阅自己那条路径的段落
+（"你没有工具，只能输出 JSON"）说的是原生运行时，不约束你。
+
+**仍未验收**：上面两条路径都没有在真实客户端上跑过，"把技能包放进技能目录之后模型确实遵守
+它"也没有实测记录。
+
+### 距「开箱即用」还差什么（**当前不是开箱即用**）
+
+逐条列清楚哪些只是**自建路径**的要求、哪些对装好的栖阅同样成立，避免把它读成
+"装好栖阅就能连上"：
+
+1. **自建产物要自己构建。** `dist/` 不随版本库分发（根 `.gitignore:3` 的 `**/dist/`），
+   自建路径必须先在 `mcp/haven-mcp` 里 `npm install && npm run build`，而这条路径要求本机
+   Node ≥ 22.12.0（`package.json` / `package-lock.json` 的 `engines`；开发门禁里的
+   `vitest` 还要更挑版本）。**装好的栖阅不走这条路径**：安装包自带已编译产物与一份 Node
+   运行时（见「可分发运行时」），用户既不需要 clone 也不需要装 Node。
+2. **包没有发布到 registry。** `package.json` 是 `"private": true`，不在任何 npm registry 上，
+   因此**自建路径**下客户端配置里的入口只能是你克隆下来的仓库路径。构建产物本身是一个标准
+   可执行入口（`bin` 里声明了 `haven-mcp-server`，`src/index.ts:1` 有 shebang），所以你也可以
+   用本地 link 把它变成一条命令；但**这条本地安装路径本仓库没有实测过**，不作为推荐步骤。
+   **自动配置也不走这条路径**：它写的是安装目录里随包分发的 `runtime/node.exe` + `dist/index.js`
+   （见「一键配置」），所以"入口必须是仓库路径"只对自建路径成立。
+3. **端点不能猜。** `HAVEN_MCP_ENDPOINT` 没有默认值，也不存在任何发现文件；必须由用户在
+   栖阅设置页显式开启 Broker 后**复制**出来（§4.2 / §4.5）。
+4. **没有真实客户端实测。** Codex / Claude Code / DSH / Pi 四者都是 `verified: false`，
+   §9 的兼容矩阵是设计目标，不是实测结果。
+
+剩下要解决的只有第 4 条：它需要真实客户端环境，本仓库无法自行提供。第 2 条里的**分发决策
+已经做完**——产物随 Windows 安装包分发，一键配置直接写那条路径，不再依赖 registry 发布。
+但"随包分发 + 一键配置"这条链路**没有在真实安装包与真实客户端上跑过一次往返**，因此本文件与
+[`MCP_EXTERNAL_AGENT_TRANSPORT.md`](../../docs/architecture/MCP_EXTERNAL_AGENT_TRANSPORT.md)
+继续是 partial 状态，不得对外描述为开箱即用、也不得描述为"已接通 MCP"。
+
+### 可分发运行时（打包器已实现，并已随安装包分发）
+
+上面第 1 条的"产物要自己构建（构建机还得自己装 Node）"已经有了一条**不需要这两件事**的产物：
+仓库里的打包器把 server 产物、生产依赖与一份 Node 运行时组装成一个自包含目录。
+
+```text
+pwsh tools/mcp/assemble-runtime.ps1 -Out src-tauri/resources
+  -> src-tauri/resources/haven-mcp/        （也就是安装后的 <resource_dir>/haven-mcp）
+       runtime/node.exe           随包分发的 Node（不再要求用户自己装）
+       dist/**.js                 已编译的 MCP server
+       node_modules/**            生产依赖（npm prune --omit=dev 之后）
+       package.json
+       haven-mcp-launcher.cmd     人工排查 / CI 用的启动器（**不是**自动配置写的命令）
+  -> src-tauri/resources/haven-mcp-runtime-<版本>.manifest.json
+```
+
+这个目录是 `src-tauri/tauri.conf.json` 的 `bundle.resources` 映射源，因此 **MSI 与 NSIS
+都会带上它**；`tauri build` 之前必须跑过组装（脚本内部会 `npm ci && npm run build &&
+npm prune --omit=dev`，再调用 `tools/mcp/package-runtime.py`）。那条 `npm ci` 正是
+`node >= 22.12.0` 的落点：这个要求属于**构建机 / CI**，不属于用户机——用户机上跑的是产物里
+那份自带的 `node.exe`，他不需要知道 Node 是什么。
+
+产物的形状由 CI 的 `mcp-launcher` 作业（Windows）真实构建并逐条断言：清单声明的每份文件
+都存在、`bundle.resources` 的映射名与产物目录同名、客户端命令是 `runtime/node.exe` 加
+`dist/index.js`（不是 `.cmd` 启动器、不是裸 `node`、不含模板占位符残留）、环境变量恰好是
+`HAVEN_MCP_BRIDGE` 与 `HAVEN_MCP_ENDPOINT`、随包的 `node.exe --version` 等于
+`.node-version`；最后把产物复制到一段**含空格的安装路径**（模拟 `C:\Program Files\…`）上，
+用清单里那条**确切的**命令与参数跑一次 JSON-RPC `initialize` 往返。
+
+启动器只用 `%~dp0`（自身所在目录）定位运行时与入口，因此整个 `haven-mcp/` 目录可以搬到任何
+位置；`tools/mcp/package-runtime.test.py` 对这条路径形状、产物内容与安装包映射逐条断言。
+
+**尚未完成的部分（不得读成"已经能用"）：**
+
+- **只有 Windows 形态。** 运行时是 `node.exe`。本仓库发布的安装包目标就是 `msi` / `nsis`，
+  因此这不构成"跨平台方案"的缺口声明——其它平台**没有实现，也没有声称**（那边自动配置
+  一律显示"当前不可写入"）。
+- **没有在真实安装包上跑过一次端到端往返**（写入客户端配置 → 重启客户端 → 连上 Haven）。
+  CI 断言的是"产物与命令形状正确、命令能起来并应答"，不等于客户端真的连上了。
+- 打包器产出的清单里 `verified.runtimeExecuted` 恒为 `false`：它只描述输入内容与版本一致性；
+  "真的跑起来了"由 CI 那一步单独断言，不由清单自称。
+
+### 「一键配置 Codex / Claude Code」：**已实现（Windows 安装包形态），尚未真机验收**
+
+授权范围被收窄到：只写两个平台固定路径（Codex `~/.codex/config.toml` 的
+`[mcp_servers.haven]`、Claude Code `~/.claude.json` 顶层 `mcpServers.haven`）、只由用户在设置页
+主动点击触发、结构化解析并只替换 `haven` 这一项、写前备份 + 同目录原子替换、**替换不得把原有
+权限放宽**（Unix 设 0600；Windows 没有等价的模式位，改为原样保留原配置的 DACL，读不到或贴不上
+就放弃写入）、不得写入任何凭据。完整边界见
+[`MCP_EXTERNAL_AGENT_TRANSPORT.md`](../../docs/architecture/MCP_EXTERNAL_AGENT_TRANSPORT.md) §9.1.1。
+
+写进客户端的 `command` / `args` 是**随包分发**的那两个文件
+（`<resource_dir>/haven-mcp/runtime/node.exe` + `dist/index.js`），所以走这条路的用户既不需要
+clone 仓库、也不需要装 Node。
+
+实现在三处：判定在 `后端/crates/haven-application/src/services/mcp_client_config.rs`，
+字节在 `后端/crates/haven-infrastructure/src/mcp_client_config.rs`（TOML 用 `toml_edit`，
+JSON 用 `serde_json`），命令与控件在 `src-tauri/src/commands/mcp_client.rs` 与设置页
+「智能功能 → 外部 Agent 接入」。`CODEX_HOME` / `CLAUDE_CONFIG_DIR` 一旦把客户端指向别处，
+状态就是"当前不可写入"，栖阅不写任何东西并说明原因。
+
+**仍然要说清楚的：** 上面那两节的手动步骤继续有效，也是**唯一经过验证**的路径；
+自动配置没有在真实安装包与真实客户端上跑过一次往返，因此登记表里
+`ai.clientAutoConfig` 的 `verifiedLive` 是 `false`。
+
+两件事现在都做完了：
+
+1. **运行时接进安装包**——`bundle.resources` + `tools/mcp/assemble-runtime.ps1`，
+   CI 与发布流程都在 `tauri build` 之前调用它。
+2. **写入通道**——结构化 TOML / JSON 合并、写前备份（同目录暂存 → 贴原访问控制 → 落字节
+   → flush → 提升）、同目录原子替换、读后写前的**逐字节**核对、链接与竞态拒绝、环境变量
+   重定向 fail closed，全部有单测（用例一律在临时目录里跑，不碰真实用户配置）。
+   Windows 一侧的访问控制保留另有 `#[cfg(windows)]` 用例：原配置的 DACL **连同
+   `SE_DACL_PROTECTED` 这一位**一起带走，替换件与备份都读回核对（同样只用临时目录，比较
+   写入前后的控制位与 ACE 集合）。这些用例**本次仍未运行**——改动所在环境无法执行
+   `cargo test`。
+
+**唯一还缺的是验收**：没有在真实安装包与真实客户端上跑过一次「写入 → 重启客户端 →
+连上 Haven」的往返。在那之前，本文件继续把手动路径写成唯一**经过验证**的路径。
 
 日志全部走 **stderr**（stdout 是 JSON-RPC 通道，一句 `console.log` 就会破坏协议流；
 有源码守卫测试盯着这条）。
@@ -165,8 +346,14 @@ npm test            # vitest（含真实 stdio 端到端）
 `npm test` 里的 stdio 端到端用例需要一个已构建的 `dist/`；缺失时会跳过并在测试名里说明。
 完整门禁因此是 **`npm run build && npm test`**。
 
-本轮（2026-09-20 工作树）结果：**88 passed / 1 skipped**。那 1 个 skipped 是 `dist/` **已**
-构建时才跳过的占位提示用例（`dist 缺失时请先运行 npm run build`），属于预期行为。
+这三条都是**开发机**上的门禁，前置条件是 Node ≥ 22.12.0（`engines`）与一个已构建的 `dist/`；
+随安装包分发的那份运行时与它们无关，用户机上不需要跑 `npm`。
+
+**这里不给出通过计数。** 改动前的记录里留过两个互相矛盾的数（88 与 95 passed），无法判定
+哪个对应本树；本轮修复也**没有重新运行** `npm test`（改动所在环境不能执行构建与测试）。
+可核对的只有门禁本身：CI 的 `mcp` 作业在 `npm ci && npm run build` 之后执行 `npm test`，
+结果以那次运行为准。`dist/` 已构建时会出现一个 skipped 的占位提示用例
+（`dist 缺失时请先运行 npm run build`），属于预期行为。
 
 覆盖范围：
 

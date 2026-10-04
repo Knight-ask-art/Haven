@@ -255,6 +255,18 @@
           "markdownDescription": "Enables the agent_settings_proposal_reject command without any pre-configured scope."
         },
         {
+          "description": "Enables the agent_skill_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-agent-skill-list",
+          "markdownDescription": "Enables the agent_skill_list command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the agent_skill_set_enabled command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-agent-skill-set-enabled",
+          "markdownDescription": "Enables the agent_skill_set_enabled command without any pre-configured scope."
+        },
+        {
           "description": "Enables the agent_trace_get command without any pre-configured scope.",
           "type": "string",
           "const": "allow-agent-trace-get",
@@ -303,6 +315,36 @@
           "markdownDescription": "Enables the app_info_get command without any pre-configured scope."
         },
         {
+          "description": "Enables the app_update_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-app-update-cancel",
+          "markdownDescription": "Enables the app_update_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the app_update_prepare command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-app-update-prepare",
+          "markdownDescription": "Enables the app_update_prepare command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the appearance_asset_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-appearance-asset-delete",
+          "markdownDescription": "Enables the appearance_asset_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the appearance_asset_import command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-appearance-asset-import",
+          "markdownDescription": "Enables the appearance_asset_import command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the appearance_assets_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-appearance-assets-list",
+          "markdownDescription": "Enables the appearance_assets_list command without any pre-configured scope."
+        },
+        {
           "description": "Enables the cache_clear command without any pre-configured scope.",
           "type": "string",
           "const": "allow-cache-clear",
@@ -331,6 +373,90 @@
           "type": "string",
           "const": "allow-cast-stop",
           "markdownDescription": "Enables the cast_stop command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cloud_account_connect_begin command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cloud-account-connect-begin",
+          "markdownDescription": "Enables the cloud_account_connect_begin command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cloud_account_connect_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cloud-account-connect-cancel",
+          "markdownDescription": "Enables the cloud_account_connect_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cloud_account_connect_complete command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cloud-account-connect-complete",
+          "markdownDescription": "Enables the cloud_account_connect_complete command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cloud_account_connect_poll command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cloud-account-connect-poll",
+          "markdownDescription": "Enables the cloud_account_connect_poll command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cloud_account_disconnect command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cloud-account-disconnect",
+          "markdownDescription": "Enables the cloud_account_disconnect command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cloud_browse_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cloud-browse-folder",
+          "markdownDescription": "Enables the cloud_browse_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cloud_browse_location command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cloud-browse-location",
+          "markdownDescription": "Enables the cloud_browse_location command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cloud_browse_next_page command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cloud-browse-next-page",
+          "markdownDescription": "Enables the cloud_browse_next_page command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cloud_browse_root command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cloud-browse-root",
+          "markdownDescription": "Enables the cloud_browse_root command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cloud_folder_binding_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cloud-folder-binding-get",
+          "markdownDescription": "Enables the cloud_folder_binding_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cloud_folder_remove command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cloud-folder-remove",
+          "markdownDescription": "Enables the cloud_folder_remove command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cloud_import_pdf command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cloud-import-pdf",
+          "markdownDescription": "Enables the cloud_import_pdf command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cloud_register_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cloud-register-folder",
+          "markdownDescription": "Enables the cloud_register_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cloud_storage_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cloud-storage-list",
+          "markdownDescription": "Enables the cloud_storage_list command without any pre-configured scope."
         },
         {
           "description": "Enables the comic_chapter_catalog_get command without any pre-configured scope.",
@@ -543,6 +669,48 @@
           "markdownDescription": "Enables the home_get command without any pre-configured scope."
         },
         {
+          "description": "Enables the home_layout_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-home-layout-get",
+          "markdownDescription": "Enables the home_layout_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the home_layout_reset command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-home-layout-reset",
+          "markdownDescription": "Enables the home_layout_reset command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the home_layout_save command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-home-layout-save",
+          "markdownDescription": "Enables the home_layout_save command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the interface_font_asset_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-interface-font-asset-delete",
+          "markdownDescription": "Enables the interface_font_asset_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the interface_font_asset_import command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-interface-font-asset-import",
+          "markdownDescription": "Enables the interface_font_asset_import command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the interface_font_asset_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-interface-font-asset-list",
+          "markdownDescription": "Enables the interface_font_asset_list command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the interface_font_system_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-interface-font-system-list",
+          "markdownDescription": "Enables the interface_font_system_list command without any pre-configured scope."
+        },
+        {
           "description": "Enables the library_list command without any pre-configured scope.",
           "type": "string",
           "const": "allow-library-list",
@@ -579,6 +747,18 @@
           "markdownDescription": "Enables the marker_list_all command without any pre-configured scope."
         },
         {
+          "description": "Enables the mcp_client_config_apply command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-mcp-client-config-apply",
+          "markdownDescription": "Enables the mcp_client_config_apply command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the mcp_client_config_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-mcp-client-config-status",
+          "markdownDescription": "Enables the mcp_client_config_status command without any pre-configured scope."
+        },
+        {
           "description": "Enables the open_cache_directory command without any pre-configured scope.",
           "type": "string",
           "const": "allow-open-cache-directory",
@@ -595,6 +775,24 @@
           "type": "string",
           "const": "allow-open-logs-directory",
           "markdownDescription": "Enables the open_logs_directory command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the overview_layout_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-overview-layout-get",
+          "markdownDescription": "Enables the overview_layout_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the overview_layout_reset command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-overview-layout-reset",
+          "markdownDescription": "Enables the overview_layout_reset command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the overview_layout_save command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-overview-layout-save",
+          "markdownDescription": "Enables the overview_layout_save command without any pre-configured scope."
         },
         {
           "description": "Enables the periodical_tree_get command without any pre-configured scope.",
@@ -661,6 +859,12 @@
           "type": "string",
           "const": "allow-reader-toc-get",
           "markdownDescription": "Enables the reader_toc_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the reading_overview_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-reading-overview-get",
+          "markdownDescription": "Enables the reading_overview_get command without any pre-configured scope."
         },
         {
           "description": "Enables the resource_list_by_media_item command without any pre-configured scope.",
@@ -849,6 +1053,18 @@
           "markdownDescription": "Enables the trending_boards_refresh command without any pre-configured scope."
         },
         {
+          "description": "Enables the tvbox_config_preview command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-tvbox-config-preview",
+          "markdownDescription": "Enables the tvbox_config_preview command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the tvbox_config_save command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-tvbox-config-save",
+          "markdownDescription": "Enables the tvbox_config_save command without any pre-configured scope."
+        },
+        {
           "description": "Enables the video_screenshot_begin command without any pre-configured scope.",
           "type": "string",
           "const": "allow-video-screenshot-begin",
@@ -957,6 +1173,18 @@
           "markdownDescription": "Denies the agent_settings_proposal_reject command without any pre-configured scope."
         },
         {
+          "description": "Denies the agent_skill_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-agent-skill-list",
+          "markdownDescription": "Denies the agent_skill_list command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the agent_skill_set_enabled command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-agent-skill-set-enabled",
+          "markdownDescription": "Denies the agent_skill_set_enabled command without any pre-configured scope."
+        },
+        {
           "description": "Denies the agent_trace_get command without any pre-configured scope.",
           "type": "string",
           "const": "deny-agent-trace-get",
@@ -1005,6 +1233,36 @@
           "markdownDescription": "Denies the app_info_get command without any pre-configured scope."
         },
         {
+          "description": "Denies the app_update_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-app-update-cancel",
+          "markdownDescription": "Denies the app_update_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the app_update_prepare command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-app-update-prepare",
+          "markdownDescription": "Denies the app_update_prepare command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the appearance_asset_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-appearance-asset-delete",
+          "markdownDescription": "Denies the appearance_asset_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the appearance_asset_import command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-appearance-asset-import",
+          "markdownDescription": "Denies the appearance_asset_import command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the appearance_assets_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-appearance-assets-list",
+          "markdownDescription": "Denies the appearance_assets_list command without any pre-configured scope."
+        },
+        {
           "description": "Denies the cache_clear command without any pre-configured scope.",
           "type": "string",
           "const": "deny-cache-clear",
@@ -1033,6 +1291,90 @@
           "type": "string",
           "const": "deny-cast-stop",
           "markdownDescription": "Denies the cast_stop command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cloud_account_connect_begin command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cloud-account-connect-begin",
+          "markdownDescription": "Denies the cloud_account_connect_begin command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cloud_account_connect_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cloud-account-connect-cancel",
+          "markdownDescription": "Denies the cloud_account_connect_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cloud_account_connect_complete command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cloud-account-connect-complete",
+          "markdownDescription": "Denies the cloud_account_connect_complete command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cloud_account_connect_poll command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cloud-account-connect-poll",
+          "markdownDescription": "Denies the cloud_account_connect_poll command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cloud_account_disconnect command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cloud-account-disconnect",
+          "markdownDescription": "Denies the cloud_account_disconnect command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cloud_browse_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cloud-browse-folder",
+          "markdownDescription": "Denies the cloud_browse_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cloud_browse_location command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cloud-browse-location",
+          "markdownDescription": "Denies the cloud_browse_location command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cloud_browse_next_page command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cloud-browse-next-page",
+          "markdownDescription": "Denies the cloud_browse_next_page command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cloud_browse_root command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cloud-browse-root",
+          "markdownDescription": "Denies the cloud_browse_root command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cloud_folder_binding_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cloud-folder-binding-get",
+          "markdownDescription": "Denies the cloud_folder_binding_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cloud_folder_remove command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cloud-folder-remove",
+          "markdownDescription": "Denies the cloud_folder_remove command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cloud_import_pdf command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cloud-import-pdf",
+          "markdownDescription": "Denies the cloud_import_pdf command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cloud_register_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cloud-register-folder",
+          "markdownDescription": "Denies the cloud_register_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cloud_storage_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cloud-storage-list",
+          "markdownDescription": "Denies the cloud_storage_list command without any pre-configured scope."
         },
         {
           "description": "Denies the comic_chapter_catalog_get command without any pre-configured scope.",
@@ -1245,6 +1587,48 @@
           "markdownDescription": "Denies the home_get command without any pre-configured scope."
         },
         {
+          "description": "Denies the home_layout_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-home-layout-get",
+          "markdownDescription": "Denies the home_layout_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the home_layout_reset command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-home-layout-reset",
+          "markdownDescription": "Denies the home_layout_reset command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the home_layout_save command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-home-layout-save",
+          "markdownDescription": "Denies the home_layout_save command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the interface_font_asset_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-interface-font-asset-delete",
+          "markdownDescription": "Denies the interface_font_asset_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the interface_font_asset_import command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-interface-font-asset-import",
+          "markdownDescription": "Denies the interface_font_asset_import command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the interface_font_asset_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-interface-font-asset-list",
+          "markdownDescription": "Denies the interface_font_asset_list command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the interface_font_system_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-interface-font-system-list",
+          "markdownDescription": "Denies the interface_font_system_list command without any pre-configured scope."
+        },
+        {
           "description": "Denies the library_list command without any pre-configured scope.",
           "type": "string",
           "const": "deny-library-list",
@@ -1281,6 +1665,18 @@
           "markdownDescription": "Denies the marker_list_all command without any pre-configured scope."
         },
         {
+          "description": "Denies the mcp_client_config_apply command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-mcp-client-config-apply",
+          "markdownDescription": "Denies the mcp_client_config_apply command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the mcp_client_config_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-mcp-client-config-status",
+          "markdownDescription": "Denies the mcp_client_config_status command without any pre-configured scope."
+        },
+        {
           "description": "Denies the open_cache_directory command without any pre-configured scope.",
           "type": "string",
           "const": "deny-open-cache-directory",
@@ -1297,6 +1693,24 @@
           "type": "string",
           "const": "deny-open-logs-directory",
           "markdownDescription": "Denies the open_logs_directory command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the overview_layout_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-overview-layout-get",
+          "markdownDescription": "Denies the overview_layout_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the overview_layout_reset command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-overview-layout-reset",
+          "markdownDescription": "Denies the overview_layout_reset command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the overview_layout_save command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-overview-layout-save",
+          "markdownDescription": "Denies the overview_layout_save command without any pre-configured scope."
         },
         {
           "description": "Denies the periodical_tree_get command without any pre-configured scope.",
@@ -1363,6 +1777,12 @@
           "type": "string",
           "const": "deny-reader-toc-get",
           "markdownDescription": "Denies the reader_toc_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the reading_overview_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-reading-overview-get",
+          "markdownDescription": "Denies the reading_overview_get command without any pre-configured scope."
         },
         {
           "description": "Denies the resource_list_by_media_item command without any pre-configured scope.",
@@ -1549,6 +1969,18 @@
           "type": "string",
           "const": "deny-trending-boards-refresh",
           "markdownDescription": "Denies the trending_boards_refresh command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the tvbox_config_preview command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-tvbox-config-preview",
+          "markdownDescription": "Denies the tvbox_config_preview command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the tvbox_config_save command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-tvbox-config-save",
+          "markdownDescription": "Denies the tvbox_config_save command without any pre-configured scope."
         },
         {
           "description": "Denies the video_screenshot_begin command without any pre-configured scope.",

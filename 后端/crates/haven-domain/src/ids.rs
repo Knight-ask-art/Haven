@@ -83,6 +83,7 @@ id_type!(PersonId, "人物 ID");
 id_type!(CollectionId, "收藏集 ID");
 id_type!(MetadataRecordId, "元数据记录 ID");
 id_type!(ProgressId, "进度 ID");
+id_type!(ReadingSessionId, "阅读会话 ID");
 id_type!(ComicProgressMigrationId, "漫画进度迁移 ID");
 id_type!(ComicProgressSubjectId, "漫画进度主体 ID");
 id_type!(ComicCatalogRefreshId, "漫画目录刷新结果 ID");

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cloud-import-pdf"
+description = "Enables the cloud_import_pdf command without any pre-configured scope."
+commands.allow = ["cloud_import_pdf"]
+
+[[permission]]
+identifier = "deny-cloud-import-pdf"
+description = "Denies the cloud_import_pdf command without any pre-configured scope."
+commands.deny = ["cloud_import_pdf"]

@@ -14,7 +14,7 @@ use haven_application::services::ports::{FavoriteTxPorts, SourceImportPorts, Uni
 use haven_application::services::source_import::{
     ImportedWork, RemoteContentRef, SourceCatalogEntry, SourceCatalogProvider, SourceImportService,
 };
-use haven_application::services::source_registry::SourceRegistryService;
+use haven_application::services::source_registry::{CustomSourceKind, SourceRegistryService};
 use haven_common::AppError;
 use haven_common::UtcMillis;
 use haven_domain::comic_catalog::{
@@ -1562,4 +1562,590 @@ async fn candidate_without_an_opaque_prefix_is_rejected() {
 
     assert_eq!(err.code().as_str(), "SOURCE_IMPORT_UNSUPPORTED");
     assert_eq!(fixture.catalog.detail_count(), 0);
+}
+
+// ---------- 用户登记的 RSS/Atom 订阅源（Task 1） ----------
+
+const FEED_ENDPOINT: &str = "https://feed.example.invalid/rss.xml";
+const FEED_ENTRY_KEY: &str = "post-1";
+
+/// 条目标识原文只在测试里出现；进入候选句柄与持久化身份的永远是单向摘要。
+fn feed_digest(entry_key: &str) -> String {
+    haven_application::services::source_import::feed_entry_digest(entry_key)
+}
+
+/// 订阅源目录替身：只接受来源注册表生成的动态 sourceId，并按同一套 opaque
+/// `remote_id` 约定给出远端身份。真实解析与清洗在 Infrastructure 层验证。
+#[derive(Default)]
+struct FakeFeedCatalog {
+    detail_calls: Mutex<usize>,
+}
+
+impl FakeFeedCatalog {
+    fn detail_count(&self) -> usize {
+        *self
+            .detail_calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[async_trait]
+impl SourceCatalogProvider for FakeFeedCatalog {
+    async fn detail(
+        &self,
+        source_id: &str,
+        _endpoint: &str,
+        external_id: &str,
+    ) -> Result<SourceCatalogEntry, AppError> {
+        if !SourceRegistryService::is_feed_source_id(source_id) {
+            return Err(AppError::new(
+                "INVALID_ARGUMENT",
+                haven_common::ErrorKind::Validation,
+                "该来源不是订阅源",
+                false,
+            ));
+        }
+        *self
+            .detail_calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+        Ok(SourceCatalogEntry {
+            external_id: external_id.to_owned(),
+            title: format!("订阅条目 {external_id}"),
+            year: Some(2026),
+            type_name: Some("订阅文章".to_owned()),
+            pic: None,
+            episodes: Vec::new(),
+            content: Some("订阅摘要".to_owned()),
+            director: None,
+            actor: None,
+            local_file: None,
+            media_type: Some(MediaType::Article),
+            remote: Some(RemoteContentRef {
+                source_key: "feed".to_owned(),
+                remote_id: haven_application::services::source_import::feed_remote_id(
+                    source_id,
+                    external_id,
+                )?,
+                media_type: MediaType::Article,
+                mime_type: Some("text/html; charset=utf-8".to_owned()),
+            }),
+            comic_catalog: None,
+        })
+    }
+}
+
+async fn feed_fixture() -> (Fixture, Arc<FakeFeedCatalog>, String) {
+    let db = Arc::new(Db::open_in_memory().expect("in-memory DB should open"));
+    let repos = Arc::new(SqliteRepositories::new(db.clone()));
+    let import_ports: Arc<dyn SourceImportPorts> = repos.clone();
+    let registry = SourceRegistryService::new(repos.clone());
+    let catalog = Arc::new(FakeCatalog::default());
+    let feed = Arc::new(FakeFeedCatalog::default());
+    let service = SourceImportService::new(
+        import_ports,
+        Arc::new(haven_infrastructure::db::uow::SqliteUnitOfWork::new(
+            db.clone(),
+        )),
+        registry.clone(),
+        catalog.clone(),
+    )
+    .with_feed_source(feed.clone());
+    let source_id = registry
+        .add_feed_source("示例订阅", FEED_ENDPOINT)
+        .await
+        .expect("feed source should register")
+        .source_id;
+    (
+        Fixture {
+            db,
+            service,
+            repos,
+            registry,
+            catalog,
+        },
+        feed,
+        source_id,
+    )
+}
+
+#[tokio::test]
+async fn feed_candidate_imports_article_with_controlled_source_object() {
+    let (fixture, feed, source_id) = feed_fixture().await;
+    let temp = tempfile::tempdir().expect("temporary directory should open");
+    let handle = haven_application::services::source_import::feed_candidate_handle(
+        &source_id,
+        &feed_digest(FEED_ENTRY_KEY),
+    );
+    assert!(handle.starts_with("content-candidate-"));
+    assert!(
+        !handle.contains("feed.example.invalid"),
+        "候选句柄不得携带订阅源地址"
+    );
+
+    let imported = fixture
+        .service
+        .import_candidate(&handle)
+        .await
+        .expect("opaque feed candidate should import");
+
+    let editions = fixture
+        .repos
+        .list_by_work(imported.work_id)
+        .await
+        .expect("subscription work should have an edition");
+    assert_eq!(editions.len(), 1);
+    assert_eq!(editions[0].edition_type, MediaType::Article);
+
+    let items = fixture
+        .repos
+        .list_by_edition(editions[0].id)
+        .await
+        .expect("subscription edition should have a media item");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].media_type, MediaType::Article);
+    assert!(matches!(items[0].index, MediaIndex::Article { .. }));
+
+    let remote_id = haven_application::services::source_import::feed_remote_id(
+        &source_id,
+        &feed_digest(FEED_ENTRY_KEY),
+    )
+    .expect("feed remote id should encode");
+    assert_remote_resource(&fixture.repos, &imported, "feed", &remote_id).await;
+
+    let resources = fixture
+        .repos
+        .list_by_media_item(imported.media_item_id)
+        .await
+        .expect("subscription media item should have a resource");
+    assert_eq!(resources[0].resource_type, ResourceType::ArticleSnapshot);
+    assert_eq!(
+        resources[0].mime_type.as_deref(),
+        Some("text/html; charset=utf-8")
+    );
+    assert_eq!(feed.detail_count(), 1);
+    assert_eq!(
+        fixture.catalog.detail_count(),
+        0,
+        "订阅源导入不得落到通用目录路由"
+    );
+    assert!(
+        fs::read_dir(temp.path())
+            .expect("temporary directory should read")
+            .next()
+            .is_none(),
+        "导入阶段不得写正文文件"
+    );
+}
+
+#[tokio::test]
+async fn repeated_feed_import_is_idempotent_and_does_not_refetch() {
+    let (fixture, feed, source_id) = feed_fixture().await;
+    let handle = haven_application::services::source_import::feed_candidate_handle(
+        &source_id,
+        &feed_digest(FEED_ENTRY_KEY),
+    );
+
+    let first = fixture.service.import_candidate(&handle).await.unwrap();
+    let calls_after_first = feed.detail_count();
+    let second = fixture.service.import_candidate(&handle).await.unwrap();
+
+    assert_eq!(first, second, "重复导入必须返回同一 Work/MediaItem 身份");
+    assert_eq!(
+        feed.detail_count(),
+        calls_after_first,
+        "重复导入应命中来源引用去重，不再请求 Provider"
+    );
+}
+
+#[tokio::test]
+async fn feed_import_separates_entries_and_feeds_by_stable_identity() {
+    let (fixture, _feed, first_source) = feed_fixture().await;
+    let second_source = fixture
+        .registry
+        .add_feed_source("另一个订阅", "https://other.example.invalid/atom.xml")
+        .await
+        .unwrap()
+        .source_id;
+    assert_ne!(first_source, second_source);
+
+    let first = fixture
+        .service
+        .import_feed_candidate(&first_source, &feed_digest(FEED_ENTRY_KEY))
+        .await
+        .unwrap();
+    let same_feed_other_entry = fixture
+        .service
+        .import_feed_candidate(&first_source, &feed_digest("post-2"))
+        .await
+        .unwrap();
+    let other_feed_same_key = fixture
+        .service
+        .import_feed_candidate(&second_source, &feed_digest(FEED_ENTRY_KEY))
+        .await
+        .unwrap();
+
+    assert_ne!(
+        first.work_id, same_feed_other_entry.work_id,
+        "同一订阅源的不同条目是不同的作品"
+    );
+    assert_ne!(
+        first.work_id, other_feed_same_key.work_id,
+        "不同订阅源的同名条目不得互相命中"
+    );
+}
+
+#[tokio::test]
+async fn feed_import_fails_closed_without_a_provider_or_a_valid_identity() {
+    let fixture = fixture();
+    let source_id = "custom_feed_0123456789ab";
+    let handle = haven_application::services::source_import::feed_candidate_handle(
+        source_id,
+        &feed_digest(FEED_ENTRY_KEY),
+    );
+    let error = fixture
+        .service
+        .import_candidate(&handle)
+        .await
+        .expect_err("未接入订阅源 Provider 时必须明确失败");
+    assert_eq!(error.code().as_str(), "SOURCE_IMPORT_UNSUPPORTED");
+    assert_eq!(
+        fixture.catalog.detail_count(),
+        0,
+        "订阅源候选不得回退到通用目录"
+    );
+
+    let digest = feed_digest(FEED_ENTRY_KEY);
+    for (source_id, entry_digest) in [
+        ("custom_feed_zzzzzzzzzzzz", digest.as_str()),
+        ("custom_feed_0123", digest.as_str()),
+        ("mangadex", digest.as_str()),
+        ("custom_0123456789ab", digest.as_str()),
+        ("custom_feed_0123456789ab", ""),
+        // 原始 guid/link 文本不再是合法的订阅条目身份。
+        ("custom_feed_0123456789ab", FEED_ENTRY_KEY),
+        (
+            "custom_feed_0123456789ab",
+            "https://feed.example.invalid/posts/1?token=secret",
+        ),
+    ] {
+        let error = fixture
+            .service
+            .import_feed_candidate(source_id, entry_digest)
+            .await
+            .expect_err("非法订阅源身份必须被拒绝");
+        assert_eq!(error.code().as_str(), "INVALID_ARGUMENT");
+        for leaked in [FEED_ENTRY_KEY, "token=secret", "https://"] {
+            assert!(
+                !error.user_message().contains(leaked),
+                "错误文案不得回显候选标识: {leaked}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn feed_import_never_persists_the_source_url_or_query_token() {
+    // 私有 Feed 常把令牌放在 guid/link 里；这些原文只能存在于后端内存，
+    // 既不能进 Wire 候选句柄，也不能进持久化的远端身份。
+    let (fixture, _feed, source_id) = feed_fixture().await;
+    let token_url = "https://reader.example.invalid/article/1?token=super-secret-token";
+    let digest = feed_digest(token_url);
+    let handle =
+        haven_application::services::source_import::feed_candidate_handle(&source_id, &digest);
+    assert!(!handle.contains("token"));
+    assert!(!handle.contains("reader.example.invalid"));
+
+    let imported = fixture.service.import_candidate(&handle).await.unwrap();
+    let resources = fixture
+        .repos
+        .list_by_media_item(imported.media_item_id)
+        .await
+        .unwrap();
+    let haven_domain::entities::ResourceLocator::SourceObject { remote_id, .. } =
+        &resources[0].locator
+    else {
+        panic!("订阅导入必须写入 SourceObject");
+    };
+    assert_eq!(
+        remote_id,
+        &format!("{source_id}:{digest}"),
+        "持久化身份只包含来源 sourceId 与条目摘要"
+    );
+    for leaked in [
+        "token",
+        "super-secret-token",
+        "reader.example.invalid",
+        "https://",
+    ] {
+        assert!(
+            !remote_id.contains(leaked),
+            "持久化远端身份不得包含 {leaked}: {remote_id}"
+        );
+    }
+}
+
+use haven_application::services::source_import::comic_library_candidate_handle;
+use haven_application::services::source_import::comic_library_source_key;
+use haven_application::services::source_import::comic_library_work_ref;
+use haven_application::services::source_import::split_comic_library_work_ref;
+
+const COMIC_LIBRARY_ENDPOINT: &str = "https://komga.example.invalid";
+const COMIC_LIBRARY_SOURCE_ID: &str = "custom_komga_0123456789ab";
+const COMIC_LIBRARY_SERIES_ID: &str = "series-a";
+const COMIC_LIBRARY_CHAPTER_ID: &str = "chapter-1";
+
+/// 漫画库目录替身：只接受来源注册表生成的动态 sourceId，并按与真实
+/// Infrastructure Provider 相同的 opaque 身份约定返回远端身份。真实的 HTTP
+/// 解析、凭据与页清单由 Infrastructure 测试单独验证。
+#[derive(Default)]
+struct FakeComicLibraryCatalog {
+    detail_calls: Mutex<Vec<(String, String)>>,
+}
+
+impl FakeComicLibraryCatalog {
+    fn detail_count(&self) -> usize {
+        self.detail_calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+}
+
+#[async_trait]
+impl SourceCatalogProvider for FakeComicLibraryCatalog {
+    async fn detail(
+        &self,
+        source_id: &str,
+        _endpoint: &str,
+        external_id: &str,
+    ) -> Result<SourceCatalogEntry, AppError> {
+        let source_key = comic_library_source_key(source_id)?;
+        let (embedded, series_id) = split_comic_library_work_ref(external_id)?;
+        if embedded != source_id {
+            return Err(AppError::new(
+                "INVALID_ARGUMENT",
+                haven_common::ErrorKind::Validation,
+                "漫画库作品身份与来源不一致",
+                false,
+            ));
+        }
+        self.detail_calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((source_id.to_owned(), external_id.to_owned()));
+
+        let catalog = ComicChapterCatalog::new(
+            source_key,
+            external_id,
+            vec![ComicChapterCatalogEntry {
+                identity: ChapterSourceIdentity::new(
+                    source_key,
+                    external_id,
+                    COMIC_LIBRARY_CHAPTER_ID,
+                )
+                .unwrap(),
+                metadata: ComicChapterMetadata {
+                    chapter_number: Some(1.0),
+                    title: Some("第一话".to_owned()),
+                    page_count: Some(2),
+                    ..Default::default()
+                },
+                availability: ComicChapterAvailability::Available,
+                published_at: None,
+                updated_at: None,
+            }],
+            UtcMillis::now(),
+        )
+        .unwrap();
+
+        Ok(SourceCatalogEntry {
+            external_id: external_id.to_owned(),
+            title: format!("漫画 {series_id}"),
+            year: Some(2026),
+            type_name: Some("漫画".to_owned()),
+            pic: None,
+            episodes: Vec::new(),
+            content: Some("漫画简介".to_owned()),
+            director: None,
+            actor: None,
+            local_file: None,
+            media_type: Some(MediaType::Comic),
+            remote: Some(RemoteContentRef {
+                source_key: source_key.to_owned(),
+                remote_id: format!("{external_id}:{COMIC_LIBRARY_CHAPTER_ID}"),
+                media_type: MediaType::Comic,
+                mime_type: Some("application/vnd.comicbook+zip".to_owned()),
+            }),
+            comic_catalog: Some(catalog),
+        })
+    }
+}
+
+async fn comic_library_fixture(
+    kind: CustomSourceKind,
+) -> (Fixture, Arc<FakeComicLibraryCatalog>, String) {
+    let db = Arc::new(Db::open_in_memory().expect("in-memory DB should open"));
+    let repos = Arc::new(SqliteRepositories::new(db.clone()));
+    let import_ports: Arc<dyn SourceImportPorts> = repos.clone();
+    let registry = SourceRegistryService::new(repos.clone());
+    let catalog = Arc::new(FakeCatalog::default());
+    let library = Arc::new(FakeComicLibraryCatalog::default());
+    let service = SourceImportService::new(
+        import_ports,
+        Arc::new(haven_infrastructure::db::uow::SqliteUnitOfWork::new(
+            db.clone(),
+        )),
+        registry.clone(),
+        catalog.clone(),
+    )
+    .with_comic_library_source(library.clone());
+    let source_id = registry
+        .add_comic_library_source("示例漫画库", COMIC_LIBRARY_ENDPOINT, kind)
+        .await
+        .expect("comic library source should register")
+        .source_id;
+    (
+        Fixture {
+            db,
+            service,
+            repos,
+            registry,
+            catalog,
+        },
+        library,
+        source_id,
+    )
+}
+
+/// Komga/Kavita 的搜索候选句柄只携带裸 seriesId，而规范作品身份是
+/// `<sourceId>:<seriesId>`。这个回归从 `import_candidate` 走真实的
+/// Application 路由，证明两个来源家族都能落库。
+#[tokio::test]
+async fn comic_library_search_candidate_imports_for_komga_and_kavita() {
+    for (kind, source_key) in [
+        (CustomSourceKind::Komga, "komga"),
+        (CustomSourceKind::Kavita, "kavita"),
+    ] {
+        let (fixture, library, source_id) = comic_library_fixture(kind).await;
+        let temp = tempfile::tempdir().expect("temporary directory should open");
+
+        // 搜索阶段生成的候选句柄：opaque，且只有裸 seriesId。
+        let handle = comic_library_candidate_handle(&source_id, COMIC_LIBRARY_SERIES_ID);
+        assert!(handle.starts_with("content-candidate-"));
+        assert!(
+            !handle.contains("komga.example.invalid"),
+            "候选句柄不得携带漫画库地址"
+        );
+
+        let imported = fixture
+            .service
+            .import_candidate(&handle)
+            .await
+            .expect("漫画库搜索候选必须能通过 import_candidate 导入");
+
+        let work_ref = comic_library_work_ref(&source_id, COMIC_LIBRARY_SERIES_ID).unwrap();
+
+        // Work 与 Comic Edition 持久化。
+        let editions = fixture
+            .repos
+            .list_by_work(imported.work_id)
+            .await
+            .expect("漫画库作品必须有版本");
+        assert_eq!(editions.len(), 1);
+        assert_eq!(editions[0].edition_type, MediaType::Comic);
+
+        // 章节 MediaItem。
+        let items = fixture
+            .repos
+            .list_by_edition(editions[0].id)
+            .await
+            .expect("漫画版本必须有章节条目");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, imported.media_item_id);
+        assert_eq!(items[0].media_type, MediaType::Comic);
+
+        // SourceObject 远端章节身份与来源引用绑定。
+        assert_remote_resource(
+            &fixture.repos,
+            &imported,
+            source_key,
+            &format!("{work_ref}:{COMIC_LIBRARY_CHAPTER_ID}"),
+        )
+        .await;
+        assert_eq!(
+            fixture
+                .repos
+                .id_for_source_ref(source_key, &work_ref)
+                .await
+                .unwrap(),
+            Some(imported.work_id)
+        );
+
+        // 漫画库候选不得落到通用目录路由，也不得写正文文件。
+        assert_eq!(library.detail_count(), 1);
+        assert_eq!(
+            fixture.catalog.detail_count(),
+            0,
+            "漫画库候选不得落到通用目录路由"
+        );
+        assert!(
+            fs::read_dir(temp.path())
+                .expect("temporary directory should read")
+                .next()
+                .is_none(),
+            "导入阶段不得写正文文件"
+        );
+
+        // 幂等：重复导入返回同一身份，且不再请求 Provider。
+        let again = fixture.service.import_candidate(&handle).await.unwrap();
+        assert_eq!(again, imported, "重复导入必须返回同一 Work/MediaItem 身份");
+        assert_eq!(
+            library.detail_count(),
+            1,
+            "重复导入应命中来源引用去重，不再请求 Provider"
+        );
+    }
+}
+
+#[tokio::test]
+async fn comic_library_candidate_fails_closed_without_a_provider_or_a_valid_series_id() {
+    // 未注入漫画库 Provider：明确失败且不回退到通用目录。
+    let fixture = fixture();
+    let handle = comic_library_candidate_handle(COMIC_LIBRARY_SOURCE_ID, COMIC_LIBRARY_SERIES_ID);
+    let error = fixture
+        .service
+        .import_candidate(&handle)
+        .await
+        .expect_err("未接入漫画库 Provider 时必须明确失败");
+    assert_eq!(error.code().as_str(), "SOURCE_IMPORT_UNSUPPORTED");
+    assert_eq!(
+        fixture.catalog.detail_count(),
+        0,
+        "漫画库候选不得回退到通用目录"
+    );
+
+    // 非法 seriesId：句柄可以由任意字符串拼出，但服务端必须在转换前 fail closed。
+    let (fixture, library, source_id) = comic_library_fixture(CustomSourceKind::Komga).await;
+    for series_id in ["", "..", "a/b", "https://komga.example.invalid/api"] {
+        let handle = comic_library_candidate_handle(&source_id, series_id);
+        let error = fixture
+            .service
+            .import_candidate(&handle)
+            .await
+            .expect_err("非法 seriesId 必须被拒绝");
+        assert_eq!(
+            error.code().as_str(),
+            "INVALID_ARGUMENT",
+            "非法 seriesId 必须被拒绝: {series_id}"
+        );
+        for leaked in ["komga.example.invalid", "https://"] {
+            assert!(
+                !error.user_message().contains(leaked),
+                "错误文案不得回显候选标识: {leaked}"
+            );
+        }
+    }
+    assert_eq!(library.detail_count(), 0, "非法候选不得触达 Provider");
 }

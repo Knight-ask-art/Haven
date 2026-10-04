@@ -81,8 +81,13 @@
     background: rgb(255 255 255 / 0.32);
   }
 
+  /* html 是通用 UI 字体栈的来源；body、.font-haven-sans 与 .settings-page 读取
+     --haven-ui-font-family（由 appearance-runtime 根据已保存的预设、本机字体或导入字体写入）。
+     html 在未投影时回落到跟随系统字体栈，body 则继承 html 的字体。
+     刻意不读该变量的：.font-haven-marker / .font-haven-salt 是装饰性手写体本身，
+     以及阅读页由 reading 设置独立接管的字体族。 */
   .font-haven-sans {
-    font-family: "Inter", "Segoe UI Variable", "Microsoft YaHei UI", system-ui, sans-serif;
+    font-family: var(--haven-ui-font-family, var(--haven-font-ui-system));
   }
 
   .font-haven-marker {
@@ -93,13 +98,73 @@
     font-family: "Rock Salt", "Segoe UI Variable", "Microsoft YaHei UI", cursive;
   }
 
-  /* 设置页专用的系统字体栈：桌面端不依赖远程字体即可保持中英文
-     字形、字重和字距一致；仅作用于设置页，不改变其他页面的视觉语言。 */
+  /* 设置页与应用界面共享字体选择；阅读正文仍由 Reader 的独立排版设置接管。 */
   .settings-page {
-    font-family: "Segoe UI Variable", "Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC", system-ui, sans-serif;
+    font-family: var(--haven-ui-font-family, var(--haven-font-ui-system));
     font-feature-settings: "kern" 1, "liga" 1, "cv01" 1, "cv02" 1;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
+  }
+}
+
+@layer components {
+  .settings-color-picker-range {
+    appearance: none;
+    width: 100%;
+    height: 24px;
+    margin: 0;
+    background: transparent;
+    cursor: pointer;
+  }
+
+  .settings-color-picker-dialog {
+    max-height: min(34rem, calc(100vh - 3rem));
+    overflow-y: auto;
+  }
+
+  .settings-color-picker-range::-webkit-slider-runnable-track {
+    height: 8px;
+    border-radius: 9999px;
+    background: var(--color-picker-track, var(--gradient-color-picker-spectrum));
+  }
+
+  .settings-color-picker-range::-moz-range-track {
+    height: 8px;
+    border-radius: 9999px;
+    background: var(--color-picker-track, var(--gradient-color-picker-spectrum));
+  }
+
+  .settings-color-picker-range::-webkit-slider-thumb {
+    appearance: none;
+    width: 18px;
+    height: 18px;
+    margin-top: -5px;
+    border: 2px solid var(--haven-settings-foreground);
+    border-radius: 50%;
+    background: var(--haven-settings-card);
+    box-shadow: 0 1px 4px rgb(0 0 0 / 0.25);
+  }
+
+  .settings-color-picker-range::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    border: 2px solid var(--haven-settings-foreground);
+    border-radius: 50%;
+    background: var(--haven-settings-card);
+    box-shadow: 0 1px 4px rgb(0 0 0 / 0.25);
+  }
+
+  .settings-color-picker-range:focus-visible {
+    outline: 2px solid var(--haven-settings-primary);
+    outline-offset: 3px;
+  }
+
+  .settings-color-picker-range--saturation {
+    --color-picker-track: var(--gradient-color-picker-saturation);
+  }
+
+  .settings-color-picker-range--lightness {
+    --color-picker-track: var(--gradient-color-picker-lightness);
   }
 }
 
@@ -109,6 +174,12 @@
        HAVEN DESIGN SYSTEM - GLOBAL TOKENS
        Mapped from DESIGN_TOKENS.md
        ========================================================================= */
+
+    --ds-font-interface-fallback: "Segoe UI Variable", "Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC", system-ui, sans-serif;
+    /* Interface font presets. Each stack falls through to fonts available on this device. */
+    --haven-font-ui-system: "Segoe UI Variable", "Segoe UI", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
+    --haven-font-ui-humanist-serif: "LXGW WenKai", "Source Han Serif SC", "Noto Serif CJK SC", "Songti SC", "SimSun", serif;
+    --haven-font-ui-modern-sans: "Inter", "Source Han Sans SC", "Noto Sans CJK SC", "Segoe UI Variable", "PingFang SC", "Microsoft YaHei UI", system-ui, sans-serif;
 
     /* 1. Neutral Palette (Light Foundation) */
     --ds-neutral-0: #ffffff;
@@ -124,6 +195,20 @@
     --ds-neutral-800: #2c2c2e;
     --ds-neutral-900: #1c1c1e;
     --ds-neutral-1000: #000000;
+
+    /* Color-picker controls only; these gradients are not application accent colors. */
+    --gradient-color-picker-spectrum: linear-gradient(90deg, #ff0000, #ffff00, #00ff00, #00ffff, #0000ff, #ff00ff, #ff0000);
+    --gradient-color-picker-saturation: linear-gradient(
+      90deg,
+      hsl(var(--color-picker-hue, 0deg) 0% 50%),
+      hsl(var(--color-picker-hue, 0deg) 100% 50%)
+    );
+    --gradient-color-picker-lightness: linear-gradient(
+      90deg,
+      hsl(var(--color-picker-hue, 0deg) 100% 0%),
+      hsl(var(--color-picker-hue, 0deg) 100% 50%),
+      hsl(var(--color-picker-hue, 0deg) 100% 100%)
+    );
 
     /* 2. Brand Colors (Light) */
     --ds-blue-500: #007aff;
@@ -310,6 +395,194 @@
     --input: var(--ds-color-border-standard);
     --ring: var(--ds-color-focus-primary);
   }
+
+  /* ==========================================================================
+     外观运行时面（Appearance Stage 1B）—— 浮动 Dock 与首页面板的**材质**。
+     ==========================================================================
+
+     为什么它们不直接用上面那 19 个 token：
+       - 浮动 Dock 是半透明材质（86% / 85% 的底 + backdrop-blur）。透明度由材质
+         token 自身携带，外观运行时可以整体替换，不依赖通用背景工具类的 alpha 解析。
+         这不表示任意色值的 /NN 工具类无效：设置强调卡的 text-[var(...)]/75 与
+         border-[var(...)]/30 已通过当前构建及浏览器 computed style 确认生效。
+       - 首页面板的底色与浮动 Dock 的底不是同一个角色（面板是页面底、Dock 是浮层
+         材质），且面板在两套主题下都刻意避开纯黑/纯白，所以也没有现成 token 可复用。
+
+     两套取值都**逐字**等于改动前组件里写死的那串颜色，因此默认外观（system /
+     light / dark）的渲染与改动前完全一致：这层 token 只是把字面量挪进样式表。
+     它们的价值在自定义主题：`appearance-runtime` 在 theme=custom 时会用用户调色板
+     重写这几个 token，浮动 Dock 与首页面板因此跟着自定义主题走（改动前它们永远
+     是写死的中性色，是整屏唯一不跟随主题的两块）。
+
+     `--haven-floating-idle` 在深色下刻意别名 `--muted-foreground`：改动前深色静止态
+     用的就是 `dark:text-muted-foreground`，改成别名之后语义不变，同时在没有自定义
+     主题时也自动跟随默认主题的弱化文字色。
+
+     `--haven-floating-idle-hover` 是静止项的悬停蒙版，取值就是改动前那两个中性蒙版
+     （`black/5` 与 `white/10`）的解析值：中性蒙版在自定义主题下同样成立，所以默认
+     外观与自定义外观都只做「压暗/提亮一层」，不会引入第二套颜色。
+
+     `--haven-home-surface` 是首页面板的底。它单独成 token 而不是复用 `--background`，
+     是因为首页的既选取值刻意与 `--background` 不同（浅色 `#f7f7f5` 而非纯白、深色
+     `#171717` 而非纯黑）。直接换成 `--background` 会把整块首页面板改成纯白/纯黑，
+     改动已确认的首页外观，因此这里保留原值、只把它变成可被自定义主题重写的一层。
+     面板的前景色两套都恰好等于 `--foreground`，所以那一侧直接复用既有 token。 */
+  :root {
+    --haven-floating-surface: rgba(255, 253, 249, 0.86);
+    --haven-floating-surface-raised: rgba(255, 255, 255, 0.9);
+    --haven-floating-border: rgba(31, 31, 31, 0.1);
+    --haven-floating-idle: rgba(95, 93, 87, 0.92);
+    --haven-floating-idle-hover: rgba(0, 0, 0, 0.05);
+    --haven-home-surface: #f7f7f5;
+  }
+
+  .dark {
+    --haven-floating-surface: rgba(9, 9, 11, 0.85);
+    --haven-floating-surface-raised: rgba(24, 24, 27, 0.9);
+    --haven-floating-border: rgba(255, 255, 255, 0.15);
+    --haven-floating-idle: var(--muted-foreground);
+    --haven-floating-idle-hover: rgba(255, 255, 255, 0.1);
+    --haven-home-surface: #171717;
+  }
+
+  /*
+     设置工作台的语义面。
+
+     设置页的暖色纸面是已确认的浅色视觉基线，不能因为把组件改成 token 就
+     退回通用的纯白 shadcn 面板。因此 light / dark 先保留当前视觉值；custom
+     再把同一组角色映射到用户的完整调色板。页面组件只消费这些角色，不再把
+     `#f0efeb`、`#fffdfb`、`#007aff` 等字面颜色当成第二份外观事实。
+  */
+  :root {
+    --haven-settings-background: #f0efeb;
+    --haven-settings-sidebar: #fbfaf7;
+    --haven-settings-card: #fffdfb;
+    --haven-settings-card-hover: #f7f5ef;
+    --haven-settings-card-foreground: #1d1d1f;
+    --haven-settings-foreground: #1d1d1f;
+    /* 辅助文本也须在暖纸页面上可读，不能靠降低文字对比度表达层级。 */
+    --haven-settings-muted: #596054;
+    --haven-settings-muted-strong: #4c5148;
+    --haven-settings-muted-subtle: #63675e;
+    --haven-settings-muted-faint: #686a64;
+    --haven-settings-border: #deddd6;
+    --haven-settings-border-subtle: rgba(0, 0, 0, 0.04);
+    /* 可交互轮廓与装饰分隔线分离；不加重卡片和列表的分隔线。 */
+    --haven-settings-control-border: #858a80;
+    --haven-settings-control: #f5f5f7;
+    --haven-settings-toggle-thumb: #ffffff;
+    --haven-settings-toggle-thumb-on: var(--haven-settings-primary-foreground);
+    --haven-settings-toggle-off: #858a80;
+    --haven-settings-toggle-off-hover: #797f75;
+    --haven-settings-warning: #925207;
+    --haven-settings-primary: #5b6b5e;
+    --haven-settings-primary-hover: #4b5b4e;
+    --haven-settings-primary-06: color-mix(in srgb, var(--haven-settings-primary) 6%, transparent);
+    --haven-settings-primary-08: color-mix(in srgb, var(--haven-settings-primary) 8%, transparent);
+    --haven-settings-primary-10: color-mix(in srgb, var(--haven-settings-primary) 10%, transparent);
+    --haven-settings-primary-12: color-mix(in srgb, var(--haven-settings-primary) 12%, transparent);
+    --haven-settings-primary-15: color-mix(in srgb, var(--haven-settings-primary) 15%, transparent);
+    --haven-settings-primary-20: color-mix(in srgb, var(--haven-settings-primary) 20%, transparent);
+    --haven-settings-primary-25: color-mix(in srgb, var(--haven-settings-primary) 25%, transparent);
+    --haven-settings-primary-30: color-mix(in srgb, var(--haven-settings-primary) 30%, transparent);
+    --haven-settings-primary-35: color-mix(in srgb, var(--haven-settings-primary) 35%, transparent);
+    --haven-settings-primary-40: color-mix(in srgb, var(--haven-settings-primary) 40%, transparent);
+    --haven-settings-primary-50: color-mix(in srgb, var(--haven-settings-primary) 50%, transparent);
+    --haven-settings-primary-foreground: #ffffff;
+    --haven-settings-danger: #d70015;
+    --haven-settings-danger-06: rgba(215, 0, 21, 0.06);
+    --haven-settings-danger-15: rgba(215, 0, 21, 0.15);
+    --haven-settings-danger-20: rgba(215, 0, 21, 0.2);
+    --haven-settings-danger-surface: #fff1f0;
+    --haven-settings-strong-surface: #1d1d1b;
+    --haven-settings-strong-foreground: #fffdf8;
+  }
+
+  .dark {
+    --haven-settings-background: #171717;
+    --haven-settings-sidebar: #1c1c1e;
+    --haven-settings-card: #242426;
+    --haven-settings-card-hover: #2c2c2e;
+    --haven-settings-card-foreground: #f5f5f7;
+    --haven-settings-foreground: #f5f5f7;
+    --haven-settings-muted: #aeaeb2;
+    --haven-settings-muted-strong: #aeaeb2;
+    --haven-settings-muted-subtle: #aeaeb2;
+    --haven-settings-muted-faint: #8e8e93;
+    --haven-settings-border: rgba(142, 142, 147, 0.58);
+    --haven-settings-border-subtle: rgba(142, 142, 147, 0.32);
+    --haven-settings-control-border: var(--haven-settings-border);
+    --haven-settings-control: #2c2c2e;
+    --haven-settings-toggle-off: var(--haven-settings-control);
+    --haven-settings-toggle-off-hover: var(--haven-settings-card-hover);
+    --haven-settings-warning: #f0b429;
+    --haven-settings-primary: #91a595;
+    --haven-settings-primary-hover: #a4b5a7;
+    --haven-settings-primary-06: color-mix(in srgb, var(--haven-settings-primary) 6%, transparent);
+    --haven-settings-primary-08: color-mix(in srgb, var(--haven-settings-primary) 8%, transparent);
+    --haven-settings-primary-10: color-mix(in srgb, var(--haven-settings-primary) 10%, transparent);
+    --haven-settings-primary-12: color-mix(in srgb, var(--haven-settings-primary) 12%, transparent);
+    --haven-settings-primary-15: color-mix(in srgb, var(--haven-settings-primary) 15%, transparent);
+    --haven-settings-primary-20: color-mix(in srgb, var(--haven-settings-primary) 20%, transparent);
+    --haven-settings-primary-25: color-mix(in srgb, var(--haven-settings-primary) 25%, transparent);
+    --haven-settings-primary-30: color-mix(in srgb, var(--haven-settings-primary) 30%, transparent);
+    --haven-settings-primary-35: color-mix(in srgb, var(--haven-settings-primary) 35%, transparent);
+    --haven-settings-primary-40: color-mix(in srgb, var(--haven-settings-primary) 40%, transparent);
+    --haven-settings-primary-50: color-mix(in srgb, var(--haven-settings-primary) 50%, transparent);
+    --haven-settings-primary-foreground: #171916;
+    --haven-settings-danger: #ff453a;
+    --haven-settings-danger-06: rgba(255, 69, 58, 0.06);
+    --haven-settings-danger-15: rgba(255, 69, 58, 0.15);
+    --haven-settings-danger-20: rgba(255, 69, 58, 0.2);
+    --haven-settings-danger-surface: #3a1c1a;
+    --haven-settings-strong-surface: #1d1d1b;
+    --haven-settings-strong-foreground: #fffdf8;
+  }
+
+  /* `data-haven-theme` is written by settings-runtime-state.ts.  The custom
+     palette is intentionally the last layer so it wins over `.dark` when the
+     custom theme follows the system dark preference. */
+  [data-haven-theme="custom"] {
+    --haven-settings-background: var(--background);
+    --haven-settings-sidebar: var(--secondary);
+    --haven-settings-card: var(--card);
+    --haven-settings-card-hover: color-mix(in srgb, var(--card) 92%, var(--foreground));
+    --haven-settings-card-foreground: var(--card-foreground);
+    --haven-settings-foreground: var(--foreground);
+    --haven-settings-muted: var(--muted-foreground);
+    --haven-settings-muted-strong: var(--muted-foreground);
+    --haven-settings-muted-subtle: var(--muted-foreground);
+    --haven-settings-muted-faint: var(--muted-foreground);
+    --haven-settings-border: var(--border);
+    --haven-settings-border-subtle: var(--border);
+    --haven-settings-control-border: color-mix(in srgb, var(--foreground) 65%, var(--card));
+    --haven-settings-control: var(--secondary);
+    --haven-settings-toggle-thumb: var(--card);
+    --haven-settings-toggle-off: color-mix(in srgb, var(--foreground) 65%, var(--card));
+    --haven-settings-toggle-off-hover: color-mix(in srgb, var(--foreground) 70%, var(--card));
+    --haven-settings-warning: var(--foreground);
+    --haven-settings-primary: var(--primary);
+    --haven-settings-primary-hover: var(--primary);
+    --haven-settings-primary-06: color-mix(in srgb, var(--primary) 6%, transparent);
+    --haven-settings-primary-08: color-mix(in srgb, var(--primary) 8%, transparent);
+    --haven-settings-primary-10: color-mix(in srgb, var(--primary) 10%, transparent);
+    --haven-settings-primary-12: color-mix(in srgb, var(--primary) 12%, transparent);
+    --haven-settings-primary-15: color-mix(in srgb, var(--primary) 15%, transparent);
+    --haven-settings-primary-20: color-mix(in srgb, var(--primary) 20%, transparent);
+    --haven-settings-primary-25: color-mix(in srgb, var(--primary) 25%, transparent);
+    --haven-settings-primary-30: color-mix(in srgb, var(--primary) 30%, transparent);
+    --haven-settings-primary-35: color-mix(in srgb, var(--primary) 35%, transparent);
+    --haven-settings-primary-40: color-mix(in srgb, var(--primary) 40%, transparent);
+    --haven-settings-primary-50: color-mix(in srgb, var(--primary) 50%, transparent);
+    --haven-settings-primary-foreground: var(--primary-foreground);
+    --haven-settings-danger: var(--destructive);
+    --haven-settings-danger-06: color-mix(in srgb, var(--destructive) 6%, transparent);
+    --haven-settings-danger-15: color-mix(in srgb, var(--destructive) 15%, transparent);
+    --haven-settings-danger-20: color-mix(in srgb, var(--destructive) 20%, transparent);
+    --haven-settings-danger-surface: color-mix(in srgb, var(--destructive) 8%, var(--background));
+    --haven-settings-strong-surface: var(--primary);
+    --haven-settings-strong-foreground: var(--primary-foreground);
+  }
 }
 
 ::highlight(haven-article-highlight) {
@@ -323,11 +596,70 @@
   * {
     @apply border-border;
   }
+  html {
+    font-family: var(--haven-ui-font-family, var(--haven-font-ui-system));
+  }
   body {
     @apply bg-background text-foreground;
+    /* 界面字体（外观 → 界面字体）：变量由 settings-runtime-state 的
+       applyInterfaceFont 写在 documentElement 上。未设置时 `inherit` 精确等于
+       Tailwind preflight 给 html 的字体栈，因此默认渲染与之前完全一致；
+       页面/组件自己声明 font-family 时（阅读器正文、漫画页等）仍然优先，
+       Reader 与 Comic 的字体行为不受影响。 */
+    /* 所有已保存的界面字体选择都由 appearance-runtime 投影到同一变量；未就绪时继承 html。 */
+    font-family: var(--haven-ui-font-family, inherit);
     font-feature-settings: "rlig" 1, "calt" 1;
     /* Apply anti-aliasing for Apple-inspired crispness */
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+/* 首页壁纸的可见性契约：AppShell 把壁纸媒体层挂在 shell 的 -z-10 上，它只从
+   「页面自身透明」的地方透出来；首页面板（根元素带 HOME_WALLPAPER_SURFACE_CLASS，
+   见 appearance-runtime.ts 与 features/home/pages/HomePage.tsx）自带一整套不透明
+   背景，不处理就永远盖住它。AppShell 只在真的渲染出壁纸层时把 shell 的壁纸属性置为
+   "true"，所以没有壁纸（或选了但字节读不出来）时这条规则不生效，首页保持原有外观。
+   刻意不放进 @layer utilities：Tailwind 会把那里的规则转成 addUtilities 注册，只有内容
+   扫描里出现过的类名才会被生成，而这个类名是 TS 常量、不出现在任何标记里；未分层样式
+   既不参与裁剪，又优先于所有分层样式，不必和 Tailwind 的 bg-* 工具类比拼优先级。 */
+[data-haven-wallpaper="true"] .haven-wallpaper-surface {
+  background-color: transparent;
+}
+
+/* 桌面首页按后端保存的 4×12 网格坐标放置模块；窄屏不套坐标，保持自然单列流。 */
+@media (min-width: 1024px) {
+  .haven-home-module-positioned {
+    grid-row-start: var(--haven-home-module-row);
+    grid-column-start: var(--haven-home-module-column);
+  }
+}
+
+/* 设置页总览的三列网格只在 Tailwind 的 `xl`（1280px）分列，因此保存下来的 3×N 网格坐标
+   也在这一档才生效：它决定模块落在第几行第几列，与「档位占几列」是两件事。窄屏是单列
+   自然流，坐标不参与。取值由渲染器写成 1 基的网格线编号（`row + 1` / `column + 1`）。 */
+@media (min-width: 1280px) {
+  .haven-overview-module-positioned {
+    grid-row-start: var(--haven-overview-module-row);
+    grid-column-start: var(--haven-overview-module-column);
+  }
+}
+
+/* 系统 prefers-reduced-motion 的 CSS 兜底，与 AppShell 那条 JS 投影是同一件事：
+   设置项 reduceMotion 由 AppShell 的 `[&_*]:transition-none …` 工具类接管；系统偏好
+   这一路除了 JS（AppShell 把合成后的值写进 class 与 data-haven-reduce-motion，并抑制
+   动态壁纸），再落一份纯媒体查询，覆盖工具类覆盖不到的两件事：JS 还来不及生效的首帧，
+   以及 portal 到 body 里的节点（通知中心、AI 助手等）——它们不在 AppShell 的类名作用
+   范围内，但 documentElement 上有同一个属性（settings-runtime-state 投影的），
+   所以这条只按属性存在匹配的兜底仍然够得着。
+   刻意只按属性「存在」匹配、不读它的取值：设置项关闭而系统要求减少动效时，属性值是
+   "false"，兜底照样要成立——这正是它独立于设置项的部分。反过来，设置项打开而系统不要
+   减少动效时，属性是 "true"，由 AppShell 的类名负责，兜底不参与，因此不会削弱设置项。
+   放在 @layer 之外：未分层样式优先于所有分层样式，不必和 Tailwind 工具类比拼优先级。 */
+@media (prefers-reduced-motion: reduce) {
+  [data-haven-reduce-motion],
+  [data-haven-reduce-motion] * {
+    transition: none;
+    animation: none;
   }
 }

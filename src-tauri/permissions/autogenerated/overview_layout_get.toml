@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-overview-layout-get"
+description = "Enables the overview_layout_get command without any pre-configured scope."
+commands.allow = ["overview_layout_get"]
+
+[[permission]]
+identifier = "deny-overview-layout-get"
+description = "Denies the overview_layout_get command without any pre-configured scope."
+commands.deny = ["overview_layout_get"]

@@ -1126,12 +1126,12 @@ fn parse_arxiv_entries(xml: &str) -> Vec<ArxivEntry> {
             }
             Ok(Event::Text(text)) if entry_depth == 1 => {
                 if let Some(target) = field {
-                    let value = decode_xml_text(&text).unwrap_or_default();
+                    let value = crate::unescape_xml_text(&text).unwrap_or_default();
                     if let Some(entry) = current.as_mut() {
                         match target {
-                            "id" => entry.id.push_str(value.trim()),
-                            "title" => entry.title.push_str(value.trim()),
-                            "summary" => entry.summary.push_str(value.trim()),
+                            "id" => entry.id.push_str(&value),
+                            "title" => entry.title.push_str(&value),
+                            "summary" => entry.summary.push_str(&value),
                             "published" => {
                                 entry.year = value.get(0..4).and_then(|v| v.parse().ok())
                             }
@@ -1141,18 +1141,13 @@ fn parse_arxiv_entries(xml: &str) -> Vec<ArxivEntry> {
                 }
             }
             Ok(Event::GeneralRef(reference)) if entry_depth == 1 => {
-                if let Some(target) = field {
-                    let value = decode_xml_reference(&reference).unwrap_or_default();
-                    if let Some(entry) = current.as_mut() {
-                        match target {
-                            "id" => entry.id.push_str(value.trim()),
-                            "title" => entry.title.push_str(value.trim()),
-                            "summary" => entry.summary.push_str(value.trim()),
-                            "published" => {
-                                entry.year = value.get(0..4).and_then(|v| v.parse().ok())
-                            }
-                            _ => {}
-                        }
+                if let (Some(target), Some(entry)) = (field, current.as_mut()) {
+                    let value = crate::unescape_xml_reference(&reference).unwrap_or_default();
+                    match target {
+                        "id" => entry.id.push_str(&value),
+                        "title" => entry.title.push_str(&value),
+                        "summary" => entry.summary.push_str(&value),
+                        _ => {}
                     }
                 }
             }
@@ -1162,6 +1157,7 @@ fn parse_arxiv_entries(xml: &str) -> Vec<ArxivEntry> {
                     entry_depth -= 1;
                     if entry_depth == 0 {
                         if let Some(mut entry) = current.take() {
+                            entry.id = entry.id.trim().to_owned();
                             entry.title = clean_text(&entry.title);
                             entry.summary = clean_text(&entry.summary);
                             if !entry.id.trim().is_empty() && !entry.title.is_empty() {
@@ -1205,18 +1201,18 @@ fn parse_atom_titles(xml: &str) -> Vec<(String, String)> {
                 }
             }
             Ok(Event::Text(text)) if depth == 1 => {
-                let value = decode_xml_text(&text).unwrap_or_default();
+                let value = crate::unescape_xml_text(&text).unwrap_or_default();
                 match field {
-                    Some("id") => id.push_str(value.trim()),
-                    Some("title") => title.push_str(value.trim()),
+                    Some("id") => id.push_str(&value),
+                    Some("title") => title.push_str(&value),
                     _ => {}
                 }
             }
             Ok(Event::GeneralRef(reference)) if depth == 1 => {
-                let value = decode_xml_reference(&reference).unwrap_or_default();
+                let value = crate::unescape_xml_reference(&reference).unwrap_or_default();
                 match field {
-                    Some("id") => id.push_str(value.trim()),
-                    Some("title") => title.push_str(value.trim()),
+                    Some("id") => id.push_str(&value),
+                    Some("title") => title.push_str(&value),
                     _ => {}
                 }
             }
@@ -1243,21 +1239,6 @@ fn local_name(raw: &[u8]) -> String {
         .next()
         .unwrap_or("")
         .to_owned()
-}
-
-fn decode_xml_text(text: &quick_xml::events::BytesText<'_>) -> Option<String> {
-    let decoded = text.decode().ok()?;
-    quick_xml::escape::unescape(decoded.as_ref())
-        .ok()
-        .map(|value| value.into_owned())
-}
-
-fn decode_xml_reference(reference: &quick_xml::events::BytesRef<'_>) -> Option<String> {
-    let name = reference.decode().ok()?;
-    let raw = format!("&{name};");
-    quick_xml::escape::unescape(&raw)
-        .ok()
-        .map(|value| value.into_owned())
 }
 
 fn localized_title(value: &Value) -> Option<String> {
@@ -1333,12 +1314,7 @@ fn clean_text(value: &str) -> String {
 fn stable_key(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
-    let digest: String = hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    digest[..24].to_owned()
+    crate::lower_hex(&hasher.finalize())[..24].to_owned()
 }
 
 fn candidate_id(source_id: &str, external_id: &str) -> String {

@@ -1,4 +1,4 @@
--- 045_ai_provider_profiles: AI Provider Profile（非敏感配置）+ 模型发现前置。
+-- 049_ai_provider_profiles: AI Provider Profile（非敏感配置）+ 模型发现前置。
 --
 -- 安全边界（docs/architecture/AI_SYSTEM.md §3、§4）：
 -- - 本表**只**存非敏感配置；API key 只存在于 CredentialStore（haven:ai:<profile_id>）。

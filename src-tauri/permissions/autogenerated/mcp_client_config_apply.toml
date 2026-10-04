@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mcp-client-config-apply"
+description = "Enables the mcp_client_config_apply command without any pre-configured scope."
+commands.allow = ["mcp_client_config_apply"]
+
+[[permission]]
+identifier = "deny-mcp-client-config-apply"
+description = "Denies the mcp_client_config_apply command without any pre-configured scope."
+commands.deny = ["mcp_client_config_apply"]

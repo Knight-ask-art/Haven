@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cloud-account-connect-cancel"
+description = "Enables the cloud_account_connect_cancel command without any pre-configured scope."
+commands.allow = ["cloud_account_connect_cancel"]
+
+[[permission]]
+identifier = "deny-cloud-account-connect-cancel"
+description = "Denies the cloud_account_connect_cancel command without any pre-configured scope."
+commands.deny = ["cloud_account_connect_cancel"]

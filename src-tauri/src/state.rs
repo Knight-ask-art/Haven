@@ -12,10 +12,12 @@ use tauri::Emitter;
 use haven_application::services::agent::{AgentProposalService, RepositoryAgentSubjectScope};
 use haven_application::services::agent_context::AgentContextQueryService;
 use haven_application::services::agent_settings_ipc::AgentSettingsIpcService;
+use haven_application::services::agent_skill::AgentSkillService;
 use haven_application::services::agent_trace::{
     AgentTraceQueryService, InMemoryAgentTraceCollector,
 };
 use haven_application::services::ai_provider::AiProviderProfileService;
+use haven_application::services::appearance::AppearanceService;
 use haven_application::services::cache::CacheService;
 use haven_application::services::cast::{CastGrantRegistry, CastService};
 use haven_application::services::comic::ComicPageService;
@@ -31,8 +33,10 @@ use haven_application::services::error_report::ErrorReportService;
 use haven_application::services::favorite::FavoriteService;
 use haven_application::services::history::HistoryService;
 use haven_application::services::home::HomeService;
+use haven_application::services::interface_fonts::InterfaceFontService;
 use haven_application::services::library::LibraryService;
 use haven_application::services::marker::MarkerService;
+use haven_application::services::mcp_client_config::McpClientConfigService;
 use haven_application::services::periodical_query::PeriodicalQueryService;
 use haven_application::services::ports::{
     ComicCatalogRefreshReceiptPort, ComicCatalogWorkPorts, SourceImportPorts, SourceRegistryPorts,
@@ -41,6 +45,7 @@ use haven_application::services::progress::comic_progress_subject::ComicProgress
 use haven_application::services::progress::ProgressService;
 use haven_application::services::reader_search::ReaderSearchService;
 use haven_application::services::reader_toc::ReaderTocService;
+use haven_application::services::reading_overview::ReadingOverviewService;
 use haven_application::services::resource::ResourceService;
 use haven_application::services::resource_preferences::ResourcePreferenceService;
 use haven_application::services::scan::ScanService;
@@ -57,15 +62,18 @@ use haven_application::services::stream::StreamService;
 use haven_application::services::trending::{
     ArtworkCachePort, TrendingCachePort, TrendingProvider, TrendingService,
 };
+use haven_application::services::tvbox_config_import::TvboxConfigSaveService;
+use haven_application::services::tvbox_config_preview::TvboxConfigPreviewService;
 use haven_application::services::work::WorkService;
 use haven_application::services::VideoScreenshotService;
 use haven_infrastructure::app_info::LocalAppInfoProvider;
+use haven_infrastructure::appearance_assets::LocalAppearanceAssetStorage;
 use haven_infrastructure::artwork_cache::ArtworkCache;
 use haven_infrastructure::cast::{AxumCastMediaServer, SoapCastControl, SsdpMdnsDiscovery};
 use haven_infrastructure::cms10::{Cms10CatalogProvider, Cms10Client, Cms10SearchParticipant};
 use haven_infrastructure::comic::LocalComicPageProvider;
 use haven_infrastructure::db::repos::{
-    SqliteRepositories, SqliteSettingProposalUow, SqliteSettingsUoW,
+    SqliteInterfaceFontUoW, SqliteRepositories, SqliteSettingProposalUow, SqliteSettingsUoW,
 };
 use haven_infrastructure::db::uow::{SqliteStorageUoW, SqliteUnitOfWork};
 use haven_infrastructure::download::{LocalDownloadRunner, LocalOfflineResourceFiles};
@@ -74,6 +82,7 @@ use haven_infrastructure::error_report::LocalErrorReportProvider;
 use haven_infrastructure::metadata_sources::{M3uSearchParticipant, MetadataClient};
 use haven_infrastructure::reader_search::LocalReaderSearchProvider;
 use haven_infrastructure::scanner::LocalLibraryScanner;
+use haven_infrastructure::system_fonts::{LocalFontFileInspector, LocalSystemFontCatalog};
 use haven_infrastructure::video_screenshot::LocalVideoScreenshotProvider;
 use haven_infrastructure::Db;
 
@@ -96,6 +105,8 @@ pub struct AppState {
     pub download_sink: Arc<TauriDownloadEventSink>,
     pub progress: ProgressService,
     pub storage_location: StorageLocationService,
+    pub cloud_storage: Arc<haven_application::services::cloud_storage::CloudStorageService>,
+    pub cloud_browse: Arc<haven_application::services::cloud_storage::browse::CloudBrowseService>,
     pub settings: SettingsService,
     pub resource_preferences: ResourcePreferenceService,
     pub search_history: SearchHistoryService,
@@ -155,6 +166,7 @@ pub struct AppState {
     pub cast_media: Arc<AxumCastMediaServer>,
     pub cast_grants: Arc<CastGrantRegistry>,
     pub(crate) session_registry: Arc<SessionRegistry>,
+    pub(crate) update_preparation: Arc<crate::commands::app_update::UpdatePreparation>,
     /// 阅读目录（契约 §19.1 `reader_toc_get`；EPUB 专用）。
     pub reader_toc: ReaderTocService,
     /// 阅读全文检索（契约 §19.1 `reader_search`）。
@@ -167,6 +179,22 @@ pub struct AppState {
     pub setting_proposals: SettingProposalService,
     /// 全局设置 Agent 的 Typed Application 入口（读取/提案/批准/回执）。
     pub agent_settings: AgentSettingsIpcService,
+    /// 界面自定义字体：本机字体枚举 + 导入字体资产（枚举/导入/删除/字节）。
+    ///
+    /// 只持有 opaque id 与族名的读写能力；字节仅经 `haven-resource://font/<id>`
+    /// 受控协议出站，WebView 永远拿不到路径。
+    pub interface_fonts: InterfaceFontService,
+    /// 外观资产与首页布局（契约 §12；045/046）。
+    ///
+    /// 只持有组合根共享的同一个 `SqliteRepositories`（appearance 登记行与布局）与
+    /// 一个受控资产存储；资产字节根目录跟随数据库所在的数据目录，不建立第二套 DB。
+    pub appearance: AppearanceService,
+    /// 阅读总览（契约 §12）：已闭合会话事实的登记与按窗口聚合。
+    ///
+    /// 端口直接由组合根共享的同一个 `SqliteRepositories` 提供（会话事实 + MediaItem
+    /// 的真实 `media_type`），不新建第二套 DB，也不引入平行读取路径。写入只发生在
+    /// 真实 Reader/Player 会话闭合处；时刻取观测值，不接受调用方传入的时长。
+    pub reading_overview: ReadingOverviewService,
     /// Agent 轨迹的有界进程内 collector；未来 UI 通过 `agent_trace_get` 读取。
     pub agent_trace: Arc<InMemoryAgentTraceCollector>,
     pub agent_trace_query: AgentTraceQueryService,
@@ -182,6 +210,28 @@ pub struct AppState {
     /// manager 内部转调的 `AgentSettingsBrokerApi` 复用上面同一个
     /// `agent_settings`，因此这里不出现第二套 DB/Repository/UoW。
     pub agent_broker: Arc<AgentBrokerManager>,
+    /// 内置 Skill 运行时：分发内容（编译期嵌入）+ 权威启用状态（SQLite）。
+    ///
+    /// 启用状态是**用户逐项决定**的持久化事实，没有内存影子副本；因此重启后
+    /// `agent_skill_list` 与请求路径看到的是同一件事。
+    pub agent_skills: AgentSkillService,
+    /// 外部 MCP 客户端（Codex / Claude Code）的 Haven 条目自动配置。
+    ///
+    /// 只服务两个**固定**文件里的一个键：`~/.codex/config.toml` 的
+    /// `[mcp_servers.haven]` 与 `~/.claude.json` 的 `mcpServers.haven`。路径由
+    /// Application 依据采集到的环境事实算出，端口不接受调用方提供的路径或内容。
+    pub mcp_client_config: McpClientConfigService,
+    /// TVBox / FongMi 配置预览（Film/TV Provider 基础切片）。
+    ///
+    /// 只持有一个无状态的端口实现：构造它不发起任何请求、不落库、不建缓存。
+    /// 每次调用都走仓库既有的受控 HTTP（URL 策略 + 逐跳 DNS 固定 + 大小上限），
+    /// 返回的也只是形态摘要。
+    pub tvbox_config_preview: TvboxConfigPreviewService,
+    /// TVBox / FongMi 配置的保存/导入（Film/TV Provider 基础切片第二步）。
+    ///
+    /// 复用组合根同一个 `SourceRegistryService`（身份与启用状态的唯一所有者）与
+    /// 组合根共享的 `SqliteRepositories`（原文缓存，迁移 051）。来源**默认停用**。
+    pub tvbox_config_save: TvboxConfigSaveService,
 }
 
 impl AppState {
@@ -195,6 +245,14 @@ impl AppState {
         let repos = Arc::new(SqliteRepositories::new(db.clone()));
         repos.download.recover_interrupted()?;
         let settings = SettingsService::new(Arc::new(SqliteSettingsUoW::new(db.clone())));
+        // 界面字体：枚举/导入/删除共用同一份 DB 与 UoW；字体目录枚举在本机只读进行，
+        // 结果在实现内记忆化（进程内一次扫描）。
+        let interface_fonts = InterfaceFontService::new(
+            Arc::new(SqliteInterfaceFontUoW::new(db.clone())),
+            Arc::new(LocalSystemFontCatalog::new()),
+            Arc::new(LocalFontFileInspector),
+            repos.clone(),
+        );
         // Agent 设置切片：提案服务与批准入口共用 AppState 的同一份 Settings /
         // SettingProposal UoW 与 Repository，不新建第二套 DB 句柄。
         let setting_proposals = SettingProposalService::new(
@@ -224,6 +282,19 @@ impl AppState {
         // A5 接线：Broker **默认关闭**。构造只建一个空 manager——不解析端点、
         // 不碰文件系统、不新建 DB 句柄；端点只在用户显式 enable 时创建。
         let agent_broker = Arc::new(AgentBrokerManager::default());
+        // 原生 Skill 运行时：技能正文在编译期嵌入二进制，启用状态在 SQLite。
+        // 构造失败（内嵌技能文档不合法）是**启动期**错误而不是运行期降级——
+        // 一个少了一项技能的目录会让用户在界面上找不到他以为存在的东西。
+        let agent_skills = AgentSkillService::new(
+            Arc::new(haven_infrastructure::agent_skill::BuiltinAgentSkillRegistry::new()?),
+            repos.clone(),
+        );
+        // 外部 MCP 客户端一键配置：构造只持有一个无状态的端口实现——不解析端点、
+        // 不读用户目录、不碰文件系统。真正的路径判定与写入都发生在命令被调用的那一刻，
+        // 且只针对 `~/.codex/config.toml` / `~/.claude.json` 里 Haven 那一条。
+        let mcp_client_config = McpClientConfigService::new(Arc::new(
+            haven_infrastructure::mcp_client_config::LocalMcpClientConfig::new(),
+        ));
         let resource_preferences = ResourcePreferenceService::new(
             repos.clone(),
             repos.clone(),
@@ -270,19 +341,17 @@ impl AppState {
                 )
             })?,
         );
-        let online_catalog = Arc::new(
-            haven_infrastructure::online_sources::OnlineCatalogProvider::new(online_client.clone()),
-        );
         // 专用报刊 Provider：与正文 Provider 共享同一条固定主机客户端，
         // 不建立第二套 HTTP 栈；期刊 Repository 与 AppState 的 SqliteRepositories 同源。
         let periodical_provider = Arc::new(
-            haven_infrastructure::periodical::EuropePmcPeriodicalProvider::new(online_client),
+            haven_infrastructure::periodical::EuropePmcPeriodicalProvider::new(
+                online_client.clone(),
+            ),
         );
         let periodical_repository: Arc<dyn haven_domain::contracts::PeriodicalRepository> =
             repos.clone();
         // 只读查询服务与导入路径共用同一个 Repository 实例（同一 DB 句柄）。
         let periodical = PeriodicalQueryService::new(periodical_repository.clone());
-        let comic_pages = comic_pages.with_remote_provider(online_catalog.clone());
         let history = HistoryService::new(repos.clone(), Arc::new(settings.clone()));
         let marker = MarkerService::new(repos.clone());
         let home = HomeService::new(repos.clone())
@@ -297,6 +366,32 @@ impl AppState {
         haven_infrastructure::metadata_sources::validate_builtin_search_coverage()?;
         let source_registry_settings: Arc<dyn SourceRegistryPorts> = repos.clone();
         let source_registry = SourceRegistryService::new(source_registry_settings);
+        // Task 1：用户登记的 RSS/Atom 订阅源。同一个 FeedProvider 实例同时被注入
+        // 目录详情/在线会话/离线获取、导入路由和搜索参与者，避免出现两条互不
+        // 一致的订阅源读取路径；未注入的候选保持 fail closed。
+        let feed_source: Arc<dyn haven_infrastructure::article_feeds::FeedSource> = Arc::new(
+            haven_infrastructure::article_feeds::FeedClient::new().map_err(|e| {
+                haven_common::AppError::new(
+                    "INTERNAL_ERROR",
+                    haven_common::ErrorKind::Internal,
+                    e.user_message(),
+                    false,
+                )
+            })?,
+        );
+        let feed_provider = Arc::new(haven_infrastructure::article_feeds::FeedProvider::new(
+            source_registry.clone(),
+            feed_source.clone(),
+        ));
+        // Remote Session 与漫画页 Provider 共享同一个受控正文来源实例；订阅源
+        // Provider 必须在这里注入，否则 feed 来源的在线会话与离线获取会明确
+        // 失败（fail closed），而不是回退到其它固定主机。
+        let online_catalog = Arc::new(
+            haven_infrastructure::online_sources::OnlineCatalogProvider::new(online_client.clone())
+                .with_feed_provider(feed_provider.clone()),
+        );
+        // 漫画页远端 Provider 在系统凭据库构造之后再接线（自托管漫画库需要按
+        // sourceId 解析 API key），因此这里不提前设置 `with_remote_provider`。
         let search_sink = Arc::new(TauriSearchEventSink::new());
         let cms10_client = Arc::new(Cms10Client::new().map_err(|e| {
             haven_common::AppError::new(
@@ -320,6 +415,27 @@ impl AppState {
         // 组合根只构造一个 CredentialStore：自定义源凭据、Provider Profile 凭据与
         // AI Provider 凭据都是同一个系统凭据库的视图，多建实例只会多出互不相干的句柄。
         let credential_store = haven_infrastructure::credential::credential_store()?;
+        let cloud_ports = haven_infrastructure::cloud_drive::GoogleDrivePorts::new(
+            option_env!("HAVEN_GOOGLE_OAUTH_CLIENT_ID").map(str::to_owned),
+            option_env!("HAVEN_GOOGLE_OAUTH_CLIENT_SECRET")
+                .map(haven_domain::credential::SecretString::new),
+            Arc::new(crate::cloud_oauth_browser::SystemGoogleOAuthBrowser),
+        );
+        let cloud_storage = Arc::new(
+            haven_application::services::cloud_storage::CloudStorageService::new(
+                Arc::new(
+                    haven_infrastructure::db::repos::SqliteCloudStorageRepository::new(db.clone()),
+                ),
+                cloud_ports.drive,
+                cloud_ports.auth,
+                credential_store.clone(),
+            ),
+        );
+        let cloud_browse = Arc::new(
+            haven_application::services::cloud_storage::browse::CloudBrowseService::new(
+                cloud_storage.clone(),
+            ),
+        );
         let opds_client = Arc::new(
             haven_infrastructure::opds::OpdsClient::new()?.with_credential_resolver(Arc::new({
                 let store = credential_store.clone();
@@ -334,6 +450,69 @@ impl AppState {
                 }
             })),
         );
+        // Task 2：用户登记的自托管漫画库（Komga/Kavita）。同一个 Provider 实例
+        // 同时承接目录详情/章节目录、在线逐页读取、章节归档下载与搜索参与者，
+        // 避免出现两条互不一致的漫画库读取路径；API key 只经系统凭据库解析，
+        // 并且只作为请求头注入（绝不进入 URL/query/wire/日志）。
+        let comic_library_gateway: Arc<
+            dyn haven_infrastructure::comic_library_sources::ComicLibraryGateway,
+        > = Arc::new(
+            haven_infrastructure::comic_library_sources::HttpComicLibraryGateway::new().map_err(
+                |e| {
+                    haven_common::AppError::new(
+                        "INTERNAL_ERROR",
+                        haven_common::ErrorKind::Internal,
+                        e.user_message(),
+                        false,
+                    )
+                },
+            )?,
+        );
+        let comic_library_api_key: Arc<
+            haven_infrastructure::comic_library_sources::ApiKeyResolver,
+        > = Arc::new({
+            let store = credential_store.clone();
+            move |source_id: &str| {
+                let store = store.clone();
+                let source_id = source_id.to_owned();
+                Box::pin(async move {
+                    let kind =
+                        haven_application::services::source_registry::SourceRegistryService::comic_library_kind(
+                            &source_id,
+                        )?;
+                    let target =
+                        haven_application::services::source_registry::SourceRegistryService::credential_target_for_kind(
+                            &source_id,
+                            kind,
+                        )
+                        .ok()?;
+                    let secret = store.get(&target).await.ok()??;
+                    Some(secret.expose().to_owned())
+                })
+            }
+        });
+        let comic_library = Arc::new(
+            haven_infrastructure::comic_library_sources::ComicLibraryProvider::new(
+                source_registry.clone(),
+                comic_library_gateway.clone(),
+                comic_library_api_key.clone(),
+            ),
+        );
+        let comic_library_catalog: Arc<dyn haven_application::services::SourceCatalogProvider> =
+            comic_library.clone();
+        let comic_library_acquisition: Arc<
+            dyn haven_application::services::ports::RemoteAcquisitionPort,
+        > = comic_library.clone();
+        let comic_library_pages: Arc<
+            dyn haven_application::services::comic::RemoteComicPageProvider,
+        > = comic_library.clone();
+        // 本地漫画、MangaDex 与自托管漫画库共用一个漫画页路由端口。
+        let comic_pages = comic_pages.with_remote_provider(Arc::new(
+            haven_infrastructure::opds::RoutingRemoteComicPageProvider::new(
+                online_catalog.clone(),
+                comic_library_pages,
+            ),
+        ));
         // V2-H1：OPDS 书源——3 个内置参与者 + 已启用自定义源动态参与者。
         let mut participants: Vec<Arc<dyn SearchSourceParticipant>> = vec![Arc::new(
             Cms10SearchParticipant::new(source_registry.clone(), cms10_client.clone()),
@@ -363,6 +542,29 @@ impl AppState {
                 opds_client.clone(),
             ),
         ));
+        // 用户登记的 RSS/Atom 订阅源：`custom_feed_` 前缀比 `custom_` 更长，
+        // 最长前缀路由会把订阅源交给本参与者，而不会落到上面的自定义 OPDS。
+        participants.push(Arc::new(
+            haven_infrastructure::article_feeds::FeedSearchParticipant::new(
+                source_registry.clone(),
+                feed_source.clone(),
+            ),
+        ));
+        // 自托管漫画库：每个家族前缀一个参与者，最长前缀路由保证 `custom_feed_`
+        // 与 `custom_komga_`/`custom_kavita_` 互不接管。
+        for prefix in [
+            haven_application::services::source_registry::CUSTOM_KOMGA_SOURCE_PREFIX,
+            haven_application::services::source_registry::CUSTOM_KAVITA_SOURCE_PREFIX,
+        ] {
+            participants.push(Arc::new(
+                haven_infrastructure::comic_library_sources::ComicLibrarySearchParticipant::new(
+                    source_registry.clone(),
+                    comic_library_gateway.clone(),
+                    comic_library_api_key.clone(),
+                    prefix,
+                ),
+            ));
+        }
         let search_source =
             SearchSourceService::new(source_registry.clone(), participants, search_sink.clone());
         let opds_catalog = Arc::new(haven_infrastructure::opds::OpdsCatalogProvider::new(
@@ -379,6 +581,7 @@ impl AppState {
                 .with_comic_progress_subjects(comic_progress_subjects.clone());
         let session =
             SessionService::new_with_remote(repos.clone(), comic_pages.clone(), remote_session)
+                .with_cloud_storage(cloud_storage.clone())
                 .with_comic_page_identity_sync(comic_page_identity.clone())
                 .with_comic_progress_subjects(comic_progress_subjects.clone());
         let work =
@@ -389,7 +592,8 @@ impl AppState {
             haven_infrastructure::opds::RoutingRemoteAcquisitionPort::new(
                 opds_catalog.clone(),
                 online_catalog.clone(),
-            ),
+            )
+            .with_comic_library(comic_library_acquisition),
         );
         let download = DownloadService::new(
             repos.clone(),
@@ -418,7 +622,9 @@ impl AppState {
             source_registry.clone(),
             catalog_router.clone(),
         )
-        .with_periodical_source(periodical_provider.clone(), periodical_repository.clone());
+        .with_periodical_source(periodical_provider.clone(), periodical_repository.clone())
+        .with_feed_source(feed_provider.clone())
+        .with_comic_library_source(comic_library_catalog.clone());
         let registered_chapters: Arc<dyn haven_domain::contracts::ChapterSourceRepository> =
             repos.clone();
         let comic_catalog_ports: Arc<dyn ComicCatalogWorkPorts> = repos.clone();
@@ -439,7 +645,9 @@ impl AppState {
                 source_registry.clone(),
                 catalog_router.clone(),
             )
-            .with_periodical_source(periodical_provider, periodical_repository),
+            .with_periodical_source(periodical_provider, periodical_repository)
+            .with_feed_source(feed_provider)
+            .with_comic_library_source(comic_library_catalog),
         );
         {
             let enrichment = enrichment.clone();
@@ -503,6 +711,10 @@ impl AppState {
             haven_infrastructure::ai_provider::OpenAiCompatibleSettingsRecommender::new(),
         ))
         .with_agent_settings(agent_settings.clone())
+        // 原生 Skill 运行时接进**真实**的模型请求路径：每次设置建议都会先解析
+        // 当前生效的内置技能，并把它们的说明性正文拼进 Provider 请求的 system 消息。
+        // 这一步不改变权限——Proposal 仍停在 pending，批准仍只在 Haven UI 里完成。
+        .with_agent_skills(agent_skills.clone())
         .with_trace(agent_trace.clone());
         let agent_context = AgentContextQueryService::new(
             repos.clone(),
@@ -524,6 +736,14 @@ impl AppState {
             db.clone(),
             ArtworkCache::default_root(db.as_ref()),
         )?);
+        // 外观（契约 §12）：登记行与首页布局走组合根共享的 SqliteRepositories，
+        // 资产字节放进跟随数据库数据目录的受控存储——两半共用同一个 DB 事实源。
+        let appearance = AppearanceService::new(
+            repos.clone(),
+            Arc::new(LocalAppearanceAssetStorage::new(
+                LocalAppearanceAssetStorage::default_root(db.as_ref()),
+            )),
+        );
         let data_dir = db
             .path()
             .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
@@ -566,6 +786,24 @@ impl AppState {
             stream.clone(),
             cast_grants.clone(),
         );
+        // 阅读总览（契约 §12）：端口由组合根共享的同一个 SqliteRepositories 直接实现
+        // （会话事实表 + MediaItem 真实 media_type），因此登记与读取同源，不需要在
+        // src-tauri 里再包一层转发 shim。
+        let reading_overview = ReadingOverviewService::new(repos.clone());
+        // TVBox / FongMi 配置预览：端口由 Infrastructure 的受控 HTTP 适配器实现
+        // （infra→app 方向，ADR-003 §6）。构造不触网。
+        let tvbox_config_preview = TvboxConfigPreviewService::new(Arc::new(
+            haven_infrastructure::tvbox_config_fetch::HttpTvboxConfigPreview,
+        ));
+        // TVBox / FongMi 配置保存：同一个受控 HTTP 适配器家族（这里回原文），
+        // 身份仍由上面那一个 source_registry 决定，原文落在组合根共享的 SQLite 仓储上。
+        let source_config_cache: Arc<dyn haven_application::services::SourceConfigCache> =
+            repos.clone();
+        let tvbox_config_save = TvboxConfigSaveService::new(
+            Arc::new(haven_infrastructure::tvbox_config_fetch::HttpTvboxConfigImport),
+            source_registry.clone(),
+            source_config_cache,
+        );
         Ok(Self {
             db,
             repos: repos.clone(),
@@ -575,6 +813,8 @@ impl AppState {
             download_sink,
             progress,
             storage_location,
+            cloud_storage: cloud_storage.clone(),
+            cloud_browse,
             settings,
             resource_preferences,
             search_history,
@@ -582,7 +822,7 @@ impl AppState {
             scan,
             scan_sink,
             work,
-            resource: ResourceService::new(repos),
+            resource: ResourceService::new(repos).with_cloud_storage(cloud_storage.clone()),
             comic_pages,
             comic_catalog,
             comic_progress_migration,
@@ -610,16 +850,24 @@ impl AppState {
             cast_media,
             cast_grants,
             session_registry: Arc::new(SessionRegistry::new()),
+            update_preparation: Arc::new(crate::commands::app_update::UpdatePreparation::default()),
             reader_toc,
             reader_search,
             reader_search_sink,
             video_screenshot,
             setting_proposals,
             agent_settings,
+            interface_fonts,
+            appearance,
+            reading_overview,
             agent_trace,
             agent_trace_query,
             agent_context,
             agent_broker,
+            agent_skills,
+            mcp_client_config,
+            tvbox_config_preview,
+            tvbox_config_save,
         })
     }
 }

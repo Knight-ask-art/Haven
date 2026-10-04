@@ -13,6 +13,7 @@
 use std::sync::{Arc, Mutex};
 
 use haven_common::AppError;
+use haven_domain::appearance::{AppearanceAssetId, AppearanceAssetKind, WallpaperSelection};
 use haven_domain::contracts::SettingsRow;
 use haven_domain::settings::{SettingsPatch, SettingsSection, SettingsValue};
 
@@ -44,6 +45,34 @@ pub trait SettingsTxPorts {
         expected_revision: Option<&str>,
         row: &SettingsRow,
     ) -> Result<bool, AppError>;
+
+    /// **事务内跨表引用校验**：待写入的值里若引用了别的表的事实（当前只有
+    /// `appearance.interfaceFontAssetId` → `interface_font_assets.id`），
+    /// 必须在**同一个事务**里确认它存在，否则「设置引用了已删除的字体」这类
+    /// 失效状态可以绕过删除保护写进设置。
+    ///
+    /// 默认实现不做校验（测试替身与不涉及跨表引用的实现无需关心）；
+    /// SQLite 实现在同一连接上查询。返回 `Err` 时整个更新回滚，不写库、不发事件。
+    fn validate_references(&self, _value: &SettingsValue) -> Result<(), AppError> {
+        Ok(())
+    }
+    /// 读取可引用外观资产的**种类**（同一事务内）。`Ok(None)` 表示没有可引用的登记行
+    /// （ID 不存在、状态尚未验证/已拒绝，或登记行的种类不是闭合集合里的任何一种）。
+    ///
+    /// `appearance.customFontAssetId` 与 `appearance.wallpaper.assetId` 是设置 JSON 里
+    /// **仅有的**两处资产引用，而设置行与资产登记行之间没有外键：删除资产时判定的
+    /// 「有没有人在用」与本方法判定的「引用的东西还在不在」必须是同一条事务边界上的
+    /// 两次查询，否则两条路径都只看得到自己提交前的那一瞬间——一边删掉了资产，另一边
+    /// 刚好把它的 ID 写进设置，留下的引用谁都不认识。
+    ///
+    /// 只查询、不写入：被拒绝的更新必须零写入（由 `SettingsUoW::run` 的事务回滚兜住）。
+    fn validated_appearance_asset_kind(
+        &self,
+        id: AppearanceAssetId,
+    ) -> Result<Option<AppearanceAssetKind>, AppError> {
+        let _ = id;
+        Ok(None)
+    }
 }
 
 /// Settings Unit of Work：闭包在**单一事务**内执行（读→校验→比较→写原子）；
@@ -97,6 +126,9 @@ impl SettingsService {
     /// - 校验通过 + 相同值 → 幂等（`changed=false`，不写库不发 Event），
     ///   revision 为事务内读到的 authoritative 当前版本。
     /// - 校验通过 + 实际变化 → 新 revision 持久化，`changed=true`。
+    /// - appearance 分区新写入的非空资产引用在**同一事务**里再确认一次存在且种类匹配
+    ///   （见 [`appearance_reference_requirements`]）：不匹配则稳定
+    ///   `APPEARANCE_ASSET_UNAVAILABLE`，零写入。
     pub async fn update(
         &self,
         section: SettingsSection,
@@ -140,6 +172,23 @@ impl SettingsService {
                     revision: current_revision,
                     changed: false,
                 }));
+                return Ok(());
+            }
+
+            // 跨表引用校验：与本次写入同一事务，避免「设置引用了已删除的字体」
+            // 这类失效状态被写进 authoritative 行。
+            tx.validate_references(&next_value)?;
+            // 外观资产引用必须先落回真实的登记行，再允许写进设置：设置 JSON 与资产登记行
+            // 之间没有外键，删除侧也只在**自己的**事务里判定占用，所以「删除刚提交、
+            // 引用随即写入」这条缝隙只能在这里堵——查库与写入同属一个事务，查不到的引用
+            // 一行都不写。
+            for (id, required) in appearance_reference_requirements(&current_value, &next_value) {
+                let actual = tx.validated_appearance_asset_kind(id)?;
+                if actual == Some(required) {
+                    continue;
+                }
+                let error = asset_reference_unavailable(required, actual);
+                *cell.lock().unwrap() = Some(Err(error));
                 return Ok(());
             }
 
@@ -202,6 +251,66 @@ fn deserialize_value(section: SettingsSection, data_json: &str) -> Result<Settin
         ));
     }
     Ok(value)
+}
+
+/// 本次更新**新写入的非空**外观资产引用 → 它必须匹配的资产种类。
+///
+/// 只比较新旧值，不做全量校验，这条边界因此是「改了什么就查什么」：
+/// - 引用没变的字段（包括历史遗留的悬空 ID）不查库，旧数据不会阻塞无关字段的修改；
+/// - 清空引用（`customFontAssetId: null` / `wallpaper: {"kind":"none"}`）不需要任何资产；
+/// - 壁纸按**整个选择**比较：`static A` → `dynamic A` 的 ID 没变，语义却变了，
+///   必须按新种类重新校验（同一个 ID 不可能既是静态又是动态壁纸）。
+fn appearance_reference_requirements(
+    previous: &SettingsValue,
+    next: &SettingsValue,
+) -> Vec<(AppearanceAssetId, AppearanceAssetKind)> {
+    let (SettingsValue::Appearance(previous), SettingsValue::Appearance(next)) = (previous, next)
+    else {
+        return Vec::new();
+    };
+
+    let mut requirements = Vec::new();
+    if next.custom_font_asset_id != previous.custom_font_asset_id {
+        if let Some(id) = next.custom_font_asset_id {
+            requirements.push((id, AppearanceAssetKind::Font));
+        }
+    }
+    if next.wallpaper != previous.wallpaper {
+        match next.wallpaper {
+            WallpaperSelection::None => {}
+            WallpaperSelection::Static(id) => {
+                requirements.push((id, AppearanceAssetKind::StaticWallpaper));
+            }
+            WallpaperSelection::Dynamic(id) => {
+                requirements.push((id, AppearanceAssetKind::DynamicWallpaper));
+            }
+        }
+    }
+    requirements
+}
+
+/// 新写入的外观资产引用对不上真实登记行。
+///
+/// 状态本身不非法（用户选的 ID 曾经真实存在），只是当前引用不上：可重试的是「换一个
+/// 资产再存」，不是「原样重试」。因此是 `NotFound` + 不可重试，与读路径的
+/// `APPEARANCE_ASSET_UNAVAILABLE` 共用同一个错误码——同一件事（这个资产用不了）
+/// 在前端只该有一个分支。
+///
+/// 文案只说位置与种类（都是界面上已有的说法），不含任何路径、行号或内部字段名。
+fn asset_reference_unavailable(
+    required: AppearanceAssetKind,
+    actual: Option<AppearanceAssetKind>,
+) -> AppError {
+    let message = match actual {
+        Some(_) => format!("所选资产不是{}，请重新选择", required.label()),
+        None => format!("所选{}资产不可用，请重新选择", required.label()),
+    };
+    AppError::new(
+        "APPEARANCE_ASSET_UNAVAILABLE",
+        haven_common::ErrorKind::NotFound,
+        message,
+        false,
+    )
 }
 
 /// 状态版本 token（opaque；唯一性由时间戳 + 纳秒后缀保证）。

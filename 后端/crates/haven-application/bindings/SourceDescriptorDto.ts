@@ -33,6 +33,11 @@ notes: string, enabled: boolean, health: SourceHealthDto,
  */
 endpointConfigured: boolean, 
 /**
+ * 该来源是否已写入系统凭据（OPDS 密码 / Komga、Kavita API key）。
+ * 只投影“有/无”，secret 与 target 永远不出 IPC。
+ */
+credentialConfigured: boolean, 
+/**
  * 健康探测：最后检测时间（RFC3339），无探测为 null。
  */
 lastChecked: string | null, 

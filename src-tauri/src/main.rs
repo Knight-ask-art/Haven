@@ -4,5 +4,13 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 fn main() {
+    if std::env::args().any(|argument| argument == "--verify-bundle") {
+        if let Some(info) = haven_tauri_lib::embedded_frontend_build_info() {
+            println!("{info}");
+            return;
+        }
+        eprintln!("This executable does not embed a desktop frontend build manifest.");
+        std::process::exit(1);
+    }
     haven_tauri_lib::run()
 }

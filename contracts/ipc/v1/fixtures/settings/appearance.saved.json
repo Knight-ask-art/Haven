@@ -4,7 +4,8 @@
     "theme": "dark",
     "density": "compact",
     "sidebar": "expanded",
-    "reduceMotion": true
+    "reduceMotion": true,
+    "interfaceFontMode": "serif"
   },
   "revision": "set-0000000000000002-00000001"
 }

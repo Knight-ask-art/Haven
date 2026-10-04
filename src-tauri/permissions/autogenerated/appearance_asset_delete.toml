@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-appearance-asset-delete"
+description = "Enables the appearance_asset_delete command without any pre-configured scope."
+commands.allow = ["appearance_asset_delete"]
+
+[[permission]]
+identifier = "deny-appearance-asset-delete"
+description = "Denies the appearance_asset_delete command without any pre-configured scope."
+commands.deny = ["appearance_asset_delete"]

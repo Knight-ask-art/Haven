@@ -30,6 +30,7 @@ use crate::ids::{
 use crate::locator::Locator;
 use crate::setting_proposal::{
     SettingProposalChange, SettingTarget, canonical_digest, canonical_json_of, is_canonical_digest,
+    lower_hex,
 };
 use crate::settings::{
     PreferenceData, ReadingPatch, ReadingSettings, SettingsPatch, SettingsSection,
@@ -1096,11 +1097,7 @@ impl AgentApprovalToken {
         hasher.update(proposal_digest.as_bytes());
         hasher.update(b"\n");
         hasher.update(self.raw.as_bytes());
-        let digest: String = hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+        let digest = lower_hex(&hasher.finalize());
         AgentApprovalTokenHash::parse(digest)
     }
 }

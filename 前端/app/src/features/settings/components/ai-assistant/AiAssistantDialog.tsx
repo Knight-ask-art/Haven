@@ -2,17 +2,21 @@ import { useCallback, useEffect, useId, useMemo, useReducer, useRef, useState } 
 import type { FormEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react"
 import { createPortal } from "react-dom"
 import {
+  Activity,
   ArrowRight,
   Check,
   ChevronRight,
+  Clock3,
   CircleAlert,
   CircleX,
   FileClock,
   ListTree,
   Loader2,
   MessageSquare,
+  Plus,
   Receipt,
   Send,
+  Settings2,
   ShieldCheck,
   Sparkles,
   TriangleAlert,
@@ -22,7 +26,12 @@ import { cn } from "@/lib/utils"
 import { HavenError, isErrorDto } from "@/lib/ipc/errors"
 import { getHavenClient } from "@/lib/ipc/runtime"
 import { MockHavenClient } from "@/lib/ipc/mock-client"
-import type { PreferenceReadingPatchDto } from "@/lib/ipc/generated/wire"
+import type {
+  AiSettingsRecommendationGenerateRequest,
+  PreferenceReadingPatchDto,
+} from "@/lib/ipc/generated/wire"
+import { guardAiSettingsRecommendation } from "@/lib/ipc/ai-recommendation-wire"
+import "./ai-assistant.css"
 
 /**
  * 栖伴（Haven 智能体，前端第一阶段）。
@@ -30,8 +39,15 @@ import type { PreferenceReadingPatchDto } from "@/lib/ipc/generated/wire"
  * 用户可见名称统一为「栖伴」；组件名、文件名与目录沿用 ai-assistant / AiAssistantDialog，
  * 不改动既有导入路径与内部标识。
  *
- * 边界说明：本阶段**没有**接入 Provider / MCP / 模型服务，因此组件从不发起网络请求，
- * 也不推断或显示任何模型名；没有可用模型时它明确显示这一点。
+ * 两条输入路径，界面必须让用户分得清是哪一条：
+ * - **真实 Provider**：客户端提供 `aiSettingsRecommendationGenerate`、当前不是 Mock、
+ *   且设置页给了选中的 Provider 配置 id 时，栖伴把你**原话**（`userIntent`）连同
+ *   设置上下文锚点交给后端；模型与凭据都由后端按该配置解析，前端既不选模型也不碰密钥。
+ *   模型返回的结构化建议由 Rust 转成一条**待批准**提案。
+ * - **确定性模板 / 本地预览**：显式 Mock、测试替身或纯预览时使用。它不是模型输出，
+ *   因此整条记录必须带 Mock/预览 标识；Tauri 生产里不会走到这条路径。
+ *
+ * 两条路径都不改变写入边界：提案一律停在 `pending`，批准只能由用户在栖阅界面完成。
  *
  * 写入路径只有一条：`agent_settings_*` Typed IPC。提案的 canonical digest 一律来自
  * Rust（Mock 场景来自 MockHavenClient 的确定性摘要），UI 只负责展示并把它原样回传；
@@ -70,6 +86,13 @@ export interface AiAssistantProposalDraft {
    * （64 位小写十六进制）；本地预览值是仅用于本机核对的短摘要，不得当作领域 digest 使用。
    */
   digest: string
+  /**
+   * 生成这份提案时实际调用的模型 id（来自 Provider 目录）。
+   *
+   * 只有真实 Provider 路径才有值；确定性模板与本地预览恒为 null——界面据此
+   * 区分"模型给出的建议"与"页面自己拼的模板"，而不是靠文案措辞。
+   */
+  modelId: string | null
   changes: AiAssistantProposalChange[]
 }
 
@@ -78,23 +101,43 @@ export interface AiAssistantProposalDraft {
  *
  * 只声明用到的命令，避免组件依赖整个客户端；真实实现是 `TauriHavenClient`，
  * 显式 Mock/开发契约场景是 `MockHavenClient`。
+ *
+ * `aiSettingsRecommendationGenerate` 是**真实 Provider 路径**的唯一入口，因此是可选的：
+ * 只有提供了它、且当前客户端不是 Mock 时，栖伴才会把你的原话交给已配置的 Provider。
+ * 缺少它（显式 Mock、测试替身、纯预览）时退回到确定性模板，并且调用方必须显示
+ * Mock/预览 标识——模板永远不会被当成模型输出。
  */
 export type AiAssistantAgentClient = {
   agentSettingsContextGet: HavenClientShape["agentSettingsContextGet"]
   agentSettingsProposalCreate: HavenClientShape["agentSettingsProposalCreate"]
   agentSettingsProposalApprove: HavenClientShape["agentSettingsProposalApprove"]
   agentSettingsProposalReject: HavenClientShape["agentSettingsProposalReject"]
+  aiSettingsRecommendationGenerate?: HavenClientShape["aiSettingsRecommendationGenerate"]
 }
 type HavenClientShape = import("@/lib/ipc/client").HavenClient
+
+const MAX_USER_INTENT_CHARS = 2_000
 
 export interface AiAssistantDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
+  /** 以工作台主视图内嵌显示；默认仍是可复用的对话框形态。 */
+  embedded?: boolean
+  /** 打开工作台设置视图，不在助手中另建设置事实源。 */
+  onOpenSettings?: () => void
   /**
    * Typed IPC 客户端。缺省时按运行时自动选择（Tauri → 真实客户端；浏览器 dev →
    * Mock）。显式传入 Mock 实例时，整条链路都会显示「Mock/预览」标识。
    */
   client?: AiAssistantAgentClient
+  /**
+   * 用户在「智能功能」里选中的 Provider 配置 id。
+   *
+   * 由设置页在打开栖伴时传入：**模型不在前端推断**，而是后端按该配置的
+   * `selectedModelId` 解析。为 null 且客户端支持真实路径时，栖伴会如实失败
+   * （"尚未选择 AI 服务配置"），而不是退回模板冒充模型输出。
+   */
+  profileId?: string | null
   /**
    * 纯预览模式：不获取任何客户端，批准只产生「本地预览」回执。
    * 保留它是为了让"尚未接线"这条路径可被测试钉住。
@@ -162,6 +205,8 @@ interface AiAssistantProposalRecord extends AiAssistantProposalDraft {
    * 不得让用户误以为它来自真实模型。
    */
   mock: boolean
+  /** 此提案由页面/测试替身的固定模板生成，而不是由模型输出。 */
+  template: boolean
   /**
    * 只作用于**这一张卡片**的拦截说明（当前只有"拒绝失败"）。
    *
@@ -206,10 +251,11 @@ interface AiAssistantTraceStep {
 }
 
 type AiAssistantAction =
+  | { type: "reset" }
   | { type: "submit"; prompt: string }
   | { type: "answer"; prompt: string; text: string }
   | { type: "advance-trace" }
-  | { type: "proposal-ready"; draft: AiAssistantProposalDraft; digestPreview: boolean; mock: boolean }
+  | { type: "proposal-ready"; draft: AiAssistantProposalDraft; digestPreview: boolean; mock: boolean; template: boolean }
   | { type: "proposal-failed"; message: string }
   // 提案动作一律带上被点击卡片的 proposalId：连续生成多份 pending 提案时，
   // 批准/拒绝只作用于用户点中的那一条。
@@ -232,6 +278,9 @@ export const READING_OPTIMIZE_PATCH: PreferenceReadingPatchDto = {
 
 /** 设置项 key → 中文标签；未知 key 回落到 key 原文（不隐藏上游改动）。 */
 const SETTING_KEY_LABELS: Record<string, string> = {
+  "appearance.interfaceFontMode": "界面字体",
+  "appearance.interfaceFontFamily": "界面字体（本机）",
+  "appearance.interfaceFontAssetId": "界面字体（导入）",
   "reading.fontFamily": "字体",
   "reading.customFontFamily": "自定义字体",
   "reading.fontSize": "正文字号",
@@ -312,13 +361,23 @@ function settingValueLabel(value: string): string {
 }
 
 /**
- * 走 Typed IPC 生成提案：读取上下文 → 创建提案（携带 context id/hash + base revision）。
+ * 走 Typed IPC 生成提案：读取上下文 → 生成提案（携带 context id/hash + base revision）。
  *
- * canonical digest 完全来自 Rust（或 Mock 的确定性摘要），UI 不计算领域摘要。
- * 没有可用模型/设置读取能力时抛错，让调用方显示"无可用模型"，而不是退回草稿。
+ * 两条输入路径的选择规则是**闭合**的，且只有一条会调用真实 Provider：
+ *
+ * | 条件 | 路径 |
+ * | --- | --- |
+ * | 显式 Mock 客户端 | 确定性模板（界面必须带 Mock/预览 标识） |
+ * | 无 `aiSettingsRecommendationGenerate`（测试替身 / 纯预览） | 确定性模板 |
+ * | 有该方法但设置页没给 Provider 配置 | **如实失败**，不生成任何提案 |
+ * | 有该方法且有 Provider 配置 | 真实 Provider 请求，携带用户原话 |
+ *
+ * 第三行是刻意的：退回模板会让"没有可用模型"看起来像"模型给了建议"，而那正是
+ * 本切片要消灭的失败模式。模板也**不会**被送进任何请求——它只是页面侧的固定改动。
  */
 async function buildAgentProposal(
   client: AiAssistantAgentClient,
+  input: { profileId: string | null; userIntent: string; mock: boolean },
 ): Promise<AiAssistantProposalDraft> {
   const context = await client.agentSettingsContextGet()
   if (!context.capabilities.capabilities.settingsRead) {
@@ -328,8 +387,74 @@ async function buildAgentProposal(
       retryable: false,
     })
   }
-  // 本阶段没有可用模型：提案内容是**确定性意图模板**，不是模型输出。
-  // 页面必须始终把这一点显示给用户（文案与 Mock/预览标识分别承担）。
+
+  // Mock 客户端也实现了 `aiSettingsRecommendationGenerate`（它刻意抛错，拒绝伪造
+  // Provider），因此判据里必须显式排除 Mock——否则浏览器开发环境会整片变成错误页。
+  // 调用一律**通过客户端对象**（`client.…?.(…)`），不把方法取出来单独调用：这些是
+  // 类方法，提取后调用会让将来任何用到 `this` 的实现静默失效。
+  const usesProvider = !input.mock
+    && typeof client.aiSettingsRecommendationGenerate === "function"
+  if (usesProvider) {
+    if (!input.profileId) {
+      throw new HavenError({
+        code: "AI_PROVIDER_PROFILE_NOT_FOUND",
+        userMessage: "尚未选择 AI 服务配置。请先在「智能功能 → API 连接」里配置并选中一个 Provider，再让栖伴生成提案。",
+        retryable: false,
+      })
+    }
+    // 只提交你的原话与上下文锚点：模型、凭据、endpoint 都由后端按 profileId 解析。
+    const request: AiSettingsRecommendationGenerateRequest = {
+      profileId: input.profileId,
+      sessionId: cryptoRandomUuid(),
+      requestId: cryptoRandomUuid(),
+      userIntent: input.userIntent,
+      contextId: context.contextId,
+      contextHash: context.contextHash,
+      baseRevision: context.revision,
+    }
+    const recommendation = await client.aiSettingsRecommendationGenerate?.(request)
+    if (!recommendation) {
+      // 上面的判据已经确认它存在；这里只是给类型收窄，顺带给出诚实的失败文案。
+      throw new HavenError({
+        code: "AI_PROVIDER_RECOMMENDATION_UNAVAILABLE",
+        userMessage: "栖伴无法调用已配置的 AI 服务，未生成提案。",
+        retryable: false,
+      })
+    }
+    // **消费点也要守一次**：这条响应跨越模型 Provider 边界，TypeScript 的返回类型只是
+    // 断言。TauriClient 已经在 IPC 层守过一次，但对话框接受的是**结构化**客户端类型，
+    // 注入的实现、测试替身或将来另一个 HavenClient 都可能绕过那一层。这里复用同一份
+    // `guardAiSettingsRecommendation`（不另写一套规则，避免两道守卫漂移），畸形载荷
+    // 一律 fail closed——绝不把"字段缺失的载荷"渲染成"模型给了建议"。
+    if (!guardAiSettingsRecommendation(recommendation, input.profileId)) {
+      throw new HavenError({
+        code: "AI_PROVIDER_RECOMMENDATION_INVALID",
+        userMessage: "AI 服务返回的建议不符合约定格式，栖伴没有生成任何提案。请重试，或检查该 Provider 的兼容性。",
+        retryable: true,
+      })
+    }
+    const proposal = recommendation.proposal
+    return {
+      id: proposal.proposalId,
+      title: "阅读排版优化",
+      summary: recommendation.explanation
+        ?? `已由 ${recommendation.modelId} 基于本机设置快照整理 ${proposal.changes.length} 项阅读排版改动。请在下方提案中逐项审查后决定是否批准。`,
+      target: "global",
+      targetLabel: proposal.targetLabel,
+      expectedRevision: proposal.baseRevision,
+      digest: proposal.digest,
+      modelId: recommendation.modelId,
+      changes: proposal.changes.map((change) => ({
+        key: change.key,
+        label: settingKeyLabel(change.key),
+        from: settingValueLabel(change.before),
+        to: settingValueLabel(change.after),
+      })),
+    }
+  }
+
+  // 确定性意图模板：**不是模型输出**。真正生效的 proposal、canonical digest、Diff
+  // 与回执仍由 Rust Application/Domain 生成并校验；这里只是页面侧的固定改动。
   const proposal = await client.agentSettingsProposalCreate({
     sessionId: cryptoRandomUuid(),
     requestId: cryptoRandomUuid(),
@@ -346,6 +471,7 @@ async function buildAgentProposal(
     targetLabel: proposal.targetLabel,
     expectedRevision: proposal.baseRevision,
     digest: proposal.digest,
+    modelId: null,
     changes: proposal.changes.map((change) => ({
       key: change.key,
       label: settingKeyLabel(change.key),
@@ -360,13 +486,19 @@ function cryptoRandomUuid(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID()
   }
-  // 仅在缺少 WebCrypto 的测试环境兜底；格式仍是 UUID v4 形状。
-  const hex = "0123456789abcdef"
-  let out = ""
-  for (let index = 0; index < 32; index += 1) {
-    out += hex[Math.floor(Math.random() * 16)]
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    const bytes = new Uint8Array(16)
+    crypto.getRandomValues(bytes)
+    // UUID v4: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+    // version (4)
+    bytes[6] = (bytes[6] & 0x0f) | 0x40
+    // variant (10xx)
+    bytes[8] = (bytes[8] & 0x3f) | 0x80
+
+    const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`
   }
-  return `${out.slice(0, 8)}-${out.slice(8, 12)}-4${out.slice(13, 16)}-8${out.slice(17, 20)}-${out.slice(20, 32)}`
+  throw new Error("Secure random UUID generation is unavailable: Web Crypto API is required.")
 }
 
 const VIEW_TABS: Array<{ id: AiAssistantView; label: string; icon: ReactNode }> = [
@@ -504,6 +636,8 @@ export function createPreviewProposal(turn: number): AiAssistantProposalDraft {
     targetLabel: "全局默认",
     expectedRevision: null,
     digest: proposalDigest({ target: "global", changes }),
+    // 本地预览没有模型参与，因此不显示任何模型名。
+    modelId: null,
     changes,
   }
 }
@@ -521,13 +655,7 @@ function createInitialState(): AiAssistantState {
       {
         id: "seed-greeting",
         role: "assistant",
-        text: "我是栖伴，栖阅的 Haven 智能体。我会先读取本机设备能力、设置快照和阅读偏好，再给出可以逐项审查的设置提案。",
-      },
-      { id: "seed-request", role: "user", text: "阅读时正文偏小，排版也有点挤。" },
-      {
-        id: "seed-offer",
-        role: "assistant",
-        text: "可以。我会生成一份只改排版三项的提案，批准之前不会写入任何设置。需要现在生成吗？",
+        text: "我是栖伴，栖阅的 Haven 智能体。目前已接入阅读排版设置提案。描述你想调整的阅读体验后，我会读取本机设置并生成待审查提案；未经你批准不会写入。",
       },
     ],
   }
@@ -549,6 +677,20 @@ function pendingProposalOf(state: AiAssistantState, proposalId: string): AiAssis
 
 function reducer(state: AiAssistantState, action: AiAssistantAction): AiAssistantState {
   switch (action.type) {
+    case "reset":
+      // 新会话只清空当前对话内容；提案记录和最近一条成功执行轨迹仍可从历史中查看。
+      // turn 保持单调递增，避免新会话复用上一轮请求的归属编号。
+      {
+        const keepTrace = state.status !== "idle" && state.status !== "failed" && state.traceRevealed > 0
+        return {
+          ...createInitialState(),
+          turn: state.turn,
+          proposals: state.proposals,
+          status: keepTrace ? state.status : "idle",
+          traceRevealed: keepTrace ? state.traceRevealed : 0,
+          latestProposalId: keepTrace ? state.latestProposalId : null,
+        }
+      }
     case "submit": {
       const turn = state.turn + 1
       return {
@@ -585,6 +727,7 @@ function reducer(state: AiAssistantState, action: AiAssistantAction): AiAssistan
         receipt: null,
         digestPreview: action.digestPreview,
         mock: action.mock,
+        template: action.template,
         notice: null,
       }
       return {
@@ -912,26 +1055,26 @@ const WARN_NODE_TONE = {
 }
 
 const MUTED_NODE_TONE = {
-  node: "border-black/[0.08] bg-black/[0.03] text-[#86868b] dark:border-white/[0.1] dark:bg-white/[0.04] dark:text-[#98989d]",
-  connector: "bg-black/[0.08] dark:bg-white/[0.1]",
-  title: "text-[#6e6e73] dark:text-[#98989d]",
+  node: "border-[var(--haven-settings-border)] bg-black/[0.03] text-[var(--haven-settings-muted-strong)] dark:border-[var(--haven-settings-border)] dark:bg-[var(--haven-settings-control)] dark:text-[var(--haven-settings-muted-strong)]",
+  connector: "bg-black/[0.08] dark:bg-[var(--haven-settings-control)]",
+  title: "text-[var(--haven-settings-muted-strong)] dark:text-[var(--haven-settings-muted-strong)]",
 }
 
 const NODE_TONE: Record<AiAssistantTraceNodeStatus, { node: string; connector: string; title: string }> = {
   complete: {
     node: "border-[#34c759]/40 bg-[#34c759]/[0.14] text-[#248a3d] dark:text-[#30d158]",
     connector: "bg-[#34c759]/30",
-    title: "text-[#1d1d1f] dark:text-[#f5f5f5]",
+    title: "text-[var(--haven-settings-foreground)] dark:text-[var(--haven-settings-foreground)]",
   },
   active: {
-    node: "border-[#007aff]/45 bg-[#007aff]/[0.14] text-[#007aff]",
-    connector: "bg-[#007aff]/25",
-    title: "text-[#007aff]",
+    node: "border-[var(--haven-settings-primary)]/45 bg-[var(--haven-settings-primary)]/[0.14] text-[var(--haven-settings-primary)]",
+    connector: "bg-[var(--haven-settings-primary)]/25",
+    title: "text-[var(--haven-settings-primary)]",
   },
   pending: {
-    node: "border-black/[0.08] bg-black/[0.03] text-[#c7c7cc] dark:border-white/[0.1] dark:bg-white/[0.04] dark:text-[#636366]",
-    connector: "bg-black/[0.08] dark:bg-white/[0.1]",
-    title: "text-[#86868b] dark:text-[#98989d]",
+    node: "border-[var(--haven-settings-border)] bg-black/[0.03] text-[#c7c7cc] dark:border-[var(--haven-settings-border)] dark:bg-[var(--haven-settings-control)] dark:text-[#636366]",
+    connector: "bg-black/[0.08] dark:bg-[var(--haven-settings-control)]",
+    title: "text-[var(--haven-settings-muted-strong)] dark:text-[var(--haven-settings-muted-strong)]",
   },
   // 需要用户处理的零写入阻断（版本冲突 / 过期 / 校验失败）共用琥珀色。
   conflict: WARN_NODE_TONE,
@@ -950,13 +1093,19 @@ const NODE_TONE: Record<AiAssistantTraceNodeStatus, { node: string; connector: s
 export function AiAssistantDialog({
   open,
   onOpenChange,
+  embedded = false,
+  onOpenSettings,
   client,
+  profileId = null,
   previewOnly = false,
   traceStepMs = 420,
 }: AiAssistantDialogProps) {
   const [state, dispatch] = useReducer(reducer, undefined, createInitialState)
   const [view, setView] = useState<AiAssistantView>("conversation")
+  const [selectedProposalId, setSelectedProposalId] = useState<string | null>(null)
   const [input, setInput] = useState("")
+  const inputLength = Array.from(input).length
+  const inputTooLong = inputLength > MAX_USER_INTENT_CHARS
   const [busy, setBusy] = useState(false)
   const titleId = useId()
   const inputId = useId()
@@ -983,11 +1132,12 @@ export function AiAssistantDialog({
   }, [open])
 
   useEffect(() => {
+    if (embedded) return
     panelRef.current?.focus()
-  }, [open])
+  }, [open, embedded])
 
   useEffect(() => {
-    if (!open) return
+    if (!open || embedded) return
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return
       event.stopPropagation()
@@ -995,7 +1145,34 @@ export function AiAssistantDialog({
     }
     document.addEventListener("keydown", handleKeyDown)
     return () => document.removeEventListener("keydown", handleKeyDown)
-  }, [open, onOpenChange])
+  }, [open, onOpenChange, embedded])
+
+  /**
+   * 本轮异步结果的归属（按 `state.turn`）。
+   *
+   * 用**轮次**而不是 `cancelled` 标志，是因为 `cancelled` 会在 effect 重跑时被置真，而
+   * effect 重跑的原因可能只是 `profileId` 或客户端身份变了。那样一来，**已经发给 Tauri
+   * 的那条命令**的结果会被丢掉：后端可能已经落了一条 pending 提案，界面却停在「正在生成」
+   * 且永远不会再推进。反过来，为了修这个而在重跑时再发一次请求，又会为同一次用户输入
+   * 生成两份提案。
+   *
+   * 因此这里钉两条：
+   * - 每一轮至多**发一次**请求（`issuedTurnRef`）；
+   * - 这一轮的结果**永远**归这一轮，只有"被更新的一轮取代"或"组件卸载"才会丢弃它。
+   *
+   * 关闭对话框不会走到这里：对话框只是不再渲染，在途命令的结果照常被记录——界面因此
+   * 从不会声称一条已经发出的命令"被取消了"。
+   */
+  const issuedTurnRef = useRef<number | null>(null)
+  const settledTurnRef = useRef<number | null>(null)
+  const unmountedRef = useRef(false)
+
+  useEffect(() => {
+    unmountedRef.current = false
+    return () => {
+      unmountedRef.current = true
+    }
+  }, [])
 
   // 轨迹推进：推进到提案节点后等待用户批准。有客户端时走 Typed IPC，
   // 否则退回本地预览草稿（digest 会标注「本地预览」，不会进入任何写入路径）。
@@ -1007,42 +1184,51 @@ export function AiAssistantDialog({
       return () => window.clearTimeout(timer)
     }
 
-    let cancelled = false
-    const fallback = () => {
-      if (!cancelled) {
-        dispatch({
-          type: "proposal-ready",
-          draft: createPreviewProposal(state.turn),
-          digestPreview: true,
-          mock: false,
-        })
-      }
-    }
-    if (!resolvedClient) {
-      fallback()
-      return () => {
-        cancelled = true
-      }
+    const turn = state.turn
+    // 同一轮只发一次：依赖项变化（选中配置 / 客户端身份）不得再发第二份同样的请求。
+    if (issuedTurnRef.current === turn || settledTurnRef.current === turn) return
+    issuedTurnRef.current = turn
+    const settle = (action: AiAssistantAction) => {
+      if (unmountedRef.current || issuedTurnRef.current !== turn) return
+      settledTurnRef.current = turn
+      dispatch(action)
     }
 
-    const request = buildAgentProposal(resolvedClient).then(
+    if (!resolvedClient) {
+      settle({
+        type: "proposal-ready",
+        draft: createPreviewProposal(turn),
+        digestPreview: true,
+        mock: false,
+        template: true,
+      })
+      return
+    }
+
+    // 用户原话经 ref 传入：它是提交那一刻的输入，不是渲染期的状态，
+    // 因此不参与依赖数组，也不会被后续输入改写。
+    void buildAgentProposal(resolvedClient, {
+      profileId,
+      userIntent: lastPromptRef.current,
+      mock: mockMode,
+    }).then(
       (draft) => {
-        if (!cancelled) {
-          dispatch({ type: "proposal-ready", draft, digestPreview: false, mock: mockMode })
-        }
+        settle({
+          type: "proposal-ready",
+          draft,
+          digestPreview: false,
+          mock: mockMode,
+          // 只有后端明确返回非空模型 id 才能声称结果来自模型；undefined 等畸形值必须 fail closed。
+          template: !draft.modelId,
+        })
       },
       (error: unknown) => {
-        if (cancelled) return
-        // 没有可用模型/设置读取失败：明确说明，不生成伪造 AI 结果，也不退回预览草稿。
+        // 没有可用模型 / Provider 请求失败：明确说明，不生成伪造 AI 结果，也不退回预览草稿。
         const message = describeIpcError(error, "读取本机设置失败，未生成提案。")
-        dispatch({ type: "proposal-failed", message })
+        settle({ type: "proposal-failed", message })
       },
     )
-    void request
-    return () => {
-      cancelled = true
-    }
-  }, [state.status, state.traceRevealed, state.turn, traceStepMs, resolvedClient, mockMode])
+  }, [state.status, state.traceRevealed, state.turn, traceStepMs, resolvedClient, mockMode, profileId])
 
   const isDrafting = state.status === "drafting"
   const issue = buildIssue(state)
@@ -1051,7 +1237,7 @@ export function AiAssistantDialog({
 
   const submitPrompt = useCallback((raw: string) => {
     const prompt = raw.trim()
-    if (!prompt || state.status === "drafting") return
+    if (!prompt || Array.from(prompt).length > MAX_USER_INTENT_CHARS || state.status === "drafting") return
     setInput("")
     if (!wantsReadingProposal(prompt)) {
       dispatch({
@@ -1069,7 +1255,9 @@ export function AiAssistantDialog({
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
+    if (isDrafting || inputTooLong || !input.trim()) return
     submitPrompt(input)
+    setInput("")
   }
 
   /**
@@ -1209,18 +1397,18 @@ export function AiAssistantDialog({
   }
 
   const messagesPane = (
-    <div className="settings-scrollbar-hidden min-h-0 flex-1 space-y-3 overflow-y-auto px-5 py-5 sm:px-6">
+    <div className={cn("settings-scrollbar-hidden min-h-0 flex-1 space-y-3 overflow-y-auto px-5 py-5 sm:px-6", embedded && "haven-ai-workbench__messages")}>
       {state.messages.map((message) => (
         <div key={message.id} className={cn("flex", message.role === "user" ? "justify-end" : "justify-start")}>
-          <div className={cn("max-w-[86%] space-y-2", message.role === "user" && "flex flex-col items-end")}>
+          <div className={cn("max-w-[86%] space-y-[8px]", message.role === "user" && "flex flex-col items-end")}>
             <p
               className={cn(
-                "rounded-2xl px-4 py-2.5 text-[13px] leading-6",
+                "rounded-2xl px-[16px] py-2.5 text-[13px] leading-6",
                 message.role === "user"
-                  ? "bg-[#007aff] text-white"
+                  ? "bg-[var(--haven-settings-primary)] text-[var(--haven-settings-primary-foreground)]"
                   : message.tone === "warning"
                     ? "border border-[#f0b429]/35 bg-[#fff8e5] text-[#7a5a1a] dark:bg-[#3a2f12] dark:text-[#f0b429]"
-                    : "border border-black/[0.06] bg-white text-[#1d1d1f] dark:border-white/[0.08] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]",
+                    : "border border-[var(--haven-settings-border)] bg-[var(--haven-settings-card)] text-[var(--haven-settings-foreground)] dark:border-[var(--haven-settings-border)] dark:bg-[var(--haven-settings-card)] dark:text-[var(--haven-settings-foreground)]",
               )}
             >
               {message.text}
@@ -1230,10 +1418,15 @@ export function AiAssistantDialog({
         </div>
       ))}
       {isDrafting && (
-        <p className="flex items-center gap-2 text-[12px] text-[#86868b] dark:text-[#98989d]" role="status">
+        <p className="flex items-center gap-[8px] text-[12px] text-[var(--haven-settings-muted-strong)] dark:text-[var(--haven-settings-muted-strong)]" role="status">
           <Loader2 className="h-[14px] w-[14px] animate-spin" strokeWidth={2.2} />
           正在读取本机设置并生成提案…
         </p>
+      )}
+      {embedded && state.messages.length === 1 && (
+        <div className="haven-ai-workbench__suggestions" aria-label="对话快捷操作">
+          {QUICK_ACTIONS.map((action) => <button key={action.id} type="button" onClick={() => submitPrompt(action.prompt)} disabled={isDrafting}>{action.label}<ArrowRight size={13} aria-hidden="true" /></button>)}
+        </div>
       )}
     </div>
   )
@@ -1241,45 +1434,58 @@ export function AiAssistantDialog({
   const composer = (
     <form
       onSubmit={handleSubmit}
-      className="shrink-0 border-t border-black/[0.06] bg-white/70 px-5 py-4 dark:border-white/[0.06] dark:bg-[#1c1c1e]/80 sm:px-6"
+      className={cn("shrink-0 border-t border-[var(--haven-settings-border)] bg-[var(--haven-settings-card)] px-5 py-[16px] sm:px-6", embedded && "haven-ai-workbench__composer")}
     >
-      <div className="flex flex-wrap gap-2 pb-3">
+      {!embedded && <div className="flex flex-wrap gap-[8px] pb-3">
         {QUICK_ACTIONS.map((action) => (
           <button
             key={action.id}
             type="button"
             disabled={isDrafting}
             onClick={() => submitPrompt(action.prompt)}
-            className="rounded-full border border-black/[0.08] bg-white px-3 py-1.5 text-[12px] font-medium text-[#1d1d1f] transition-colors hover:border-[#007aff]/40 hover:text-[#007aff] disabled:cursor-not-allowed disabled:opacity-50 dark:border-white/[0.1] dark:bg-[#2c2c2e] dark:text-[#f5f5f5]"
+            className="rounded-full border border-[var(--haven-settings-border)] bg-[var(--haven-settings-card)] px-3 py-1.5 text-[12px] font-medium text-[var(--haven-settings-foreground)] transition-colors hover:border-[var(--haven-settings-primary)]/40 hover:text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50 dark:border-[var(--haven-settings-border)] dark:bg-[var(--haven-settings-card)] dark:text-[var(--haven-settings-foreground)]"
           >
             {action.label}
           </button>
         ))}
-      </div>
-      <div className="flex items-center gap-2 rounded-2xl border border-black/[0.08] bg-white px-3 py-2 focus-within:border-[#007aff]/45 focus-within:ring-4 focus-within:ring-[#007aff]/10 dark:border-white/[0.1] dark:bg-[#2c2c2e]">
+      </div>}
+      <div className={cn("flex items-center gap-[8px] rounded-2xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-card)] px-3 py-[8px] focus-within:border-[var(--haven-settings-primary)]/45 focus-within:ring-4 focus-within:ring-[var(--haven-settings-primary)]/10 dark:border-[var(--haven-settings-border)] dark:bg-[var(--haven-settings-card)]", embedded && "min-h-[58px] rounded-[16px] bg-transparent px-5 dark:bg-transparent")}>
         <label htmlFor={inputId} className="sr-only">
           描述你想要的设置改动
         </label>
-        <input
+        <textarea
           id={inputId}
           value={input}
           onChange={(event) => setInput(event.target.value)}
           placeholder="描述你想要的设置改动，例如：优化阅读"
           disabled={isDrafting}
+          rows={embedded ? 2 : 1}
+          maxLength={MAX_USER_INTENT_CHARS * 2}
           autoComplete="off"
-          className="min-w-0 flex-1 bg-transparent text-[13px] text-[#1d1d1f] outline-none placeholder:text-[#a1a1a6] disabled:cursor-not-allowed dark:text-[#f5f5f5] dark:placeholder:text-[#8e8e93]"
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+              event.preventDefault()
+              event.currentTarget.form?.requestSubmit()
+            }
+          }}
+          className="min-w-0 flex-1 resize-none bg-transparent text-[13px] leading-6 text-[var(--haven-settings-foreground)] outline-none placeholder:text-[var(--haven-settings-muted-strong)] disabled:cursor-not-allowed"
         />
         <button
           type="submit"
           aria-label="发送"
-          disabled={isDrafting || input.trim().length === 0}
-          className="flex h-[32px] w-[32px] shrink-0 items-center justify-center rounded-full bg-[#007aff] text-white transition-colors hover:bg-[#006fe6] disabled:cursor-not-allowed disabled:opacity-40"
+          disabled={isDrafting || input.trim().length === 0 || inputTooLong}
+          className={cn("flex h-[32px] w-[32px] shrink-0 items-center justify-center rounded-full bg-[var(--haven-settings-primary)] text-[var(--haven-settings-primary-foreground)] transition-colors hover:bg-[var(--haven-settings-primary-hover)] disabled:cursor-not-allowed disabled:opacity-40", embedded && "h-[40px] w-[128px] rounded-full bg-[var(--haven-settings-primary)] text-[12px] font-semibold hover:bg-[var(--haven-settings-primary-hover)]")}
         >
-          <Send className="h-[15px] w-[15px]" strokeWidth={2} />
+          {embedded ? <><Send className="mr-[8px] h-[14px] w-[14px]" strokeWidth={2} />生成提案</> : <Send className="h-[15px] w-[15px]" strokeWidth={2} />}
         </button>
       </div>
-      <p className="mt-2 text-[11px] leading-5 text-[#86868b] dark:text-[#8e8e93]">
-        {previewMode
+      <p aria-live="polite" className={cn("mt-1 text-right text-[11px]", inputTooLong ? "text-[var(--haven-settings-danger)]" : "text-[var(--haven-settings-muted-strong)]")}>
+        {inputTooLong ? `最多 ${MAX_USER_INTENT_CHARS} 个字符` : `${inputLength} / ${MAX_USER_INTENT_CHARS}`}
+      </p>
+      <p className="mt-[8px] text-[11px] leading-5 text-[var(--haven-settings-muted-strong)] dark:text-[var(--haven-settings-muted-strong)]">
+        {mockMode
+          ? "交互预览 · 使用演示数据，不调用真实模型，也不写入本机设置。"
+          : previewMode
           ? "本地预览 · 提交只在本机推进界面状态，不发起网络请求，也不写入设置。"
           : "批准后会通过设置应用层写入，写入前仍需要你逐项确认。"}
       </p>
@@ -1289,6 +1495,131 @@ export function AiAssistantDialog({
   const traceInspector = (
     <TraceInspector steps={buildTraceSteps(state)} statuses={traceNodeStatuses(state)} running={isDrafting} />
   )
+
+  const activeConversationTitle = [...state.messages]
+    .reverse()
+    .find((message) => message.role === "user")
+    ?.text.trim()
+    .slice(0, 42) || "新会话"
+  const selectedProposal = selectedProposalId === null
+    ? null
+    : state.proposals.find((proposal) => proposal.id === selectedProposalId) ?? null
+
+  if (embedded) {
+    return (
+      <section
+        aria-labelledby={titleId}
+        className="haven-ai-workbench"
+      >
+        <header className="haven-ai-workbench__toolbar">
+          <div className="haven-ai-workbench__title">
+            <h2 id={titleId}>AI 工作台</h2>
+            <p>{view === "trace" ? "执行记录" : view === "proposals" ? "提案历史" : activeConversationTitle}</p>
+          </div>
+          <div className="haven-ai-workbench__actions">
+            <button
+              type="button"
+              aria-label="新会话"
+              title={isDrafting || busy ? "当前操作完成后才能新建会话" : "新会话"}
+              disabled={isDrafting || busy}
+              onClick={() => {
+                dispatch({ type: "reset" })
+                setInput("")
+                setSelectedProposalId(null)
+                setView("conversation")
+              }}
+              className="flex h-[36px] w-[36px] items-center justify-center rounded-[10px] border border-[var(--haven-settings-border)] bg-[var(--haven-settings-card)] text-[var(--haven-settings-muted-strong)] transition-colors hover:bg-[var(--haven-settings-card)] disabled:cursor-not-allowed disabled:opacity-45"
+            >
+              <Plus size={16} strokeWidth={1.8} /><span>新会话</span>
+            </button>
+            <button
+              type="button"
+              aria-label="提案历史"
+              aria-pressed={view === "proposals"}
+              onClick={() => setView((current) => current === "proposals" ? "conversation" : "proposals")}
+              className={cn(
+                "flex h-[36px] w-[36px] items-center justify-center rounded-[10px] border border-[var(--haven-settings-border)] transition-colors hover:bg-[var(--haven-settings-card)]",
+                view === "proposals" ? "bg-[var(--haven-settings-primary-12)] text-[var(--haven-settings-primary)]" : "bg-[var(--haven-settings-card)] text-[var(--haven-settings-muted-strong)]",
+              )}
+            >
+              <Clock3 size={16} strokeWidth={1.8} /><span>提案</span>
+            </button>
+            <button
+              type="button"
+              aria-label="执行记录"
+              aria-pressed={view === "trace"}
+              onClick={() => setView((current) => current === "trace" ? "conversation" : "trace")}
+              className={cn(
+                "flex h-[36px] w-[36px] items-center justify-center rounded-[10px] border border-[var(--haven-settings-border)] transition-colors hover:bg-[var(--haven-settings-card)]",
+                view === "trace" ? "bg-[var(--haven-settings-primary-12)] text-[var(--haven-settings-primary)]" : "bg-[var(--haven-settings-card)] text-[var(--haven-settings-muted-strong)]",
+              )}
+            >
+              <Activity size={16} strokeWidth={1.8} /><span>执行记录</span>
+            </button>
+            <button
+              type="button"
+              aria-label="AI 设置"
+              disabled={!onOpenSettings}
+              onClick={() => onOpenSettings?.()}
+              className="flex h-[36px] w-[36px] items-center justify-center rounded-[10px] border border-[var(--haven-settings-border)] bg-[var(--haven-settings-card)] text-[var(--haven-settings-muted-strong)] transition-colors hover:bg-[var(--haven-settings-card)]"
+            >
+              <Settings2 size={16} strokeWidth={1.8} /><span>AI 设置</span>
+            </button>
+          </div>
+        </header>
+        <div className="haven-ai-workbench__context">
+          <span>{mockMode ? "交互预览" : previewMode ? "本地预览" : profileId ? "已选择 AI 服务" : "未选择 AI 服务"}</span>
+          {view !== "conversation" ? <button type="button" onClick={() => setView("conversation")}>返回对话<ArrowRight size={13} aria-hidden="true" /></button> : <span>设置改动需经你批准</span>}
+        </div>
+
+        {issue && (
+          <div role="alert" aria-label={issue.title} className={cn(
+            "flex shrink-0 items-start gap-2.5 border-b px-6 py-3 text-[12px] leading-5",
+            issue.tone === "danger" ? "border-[#ff3b30]/25 bg-[#fdecea] text-[#a3231a]" : "border-[#f0b429]/30 bg-[#fff8e5] text-[#7a5a1a]",
+          )}>
+            {issue.tone === "danger"
+              ? <CircleX className="mt-0.5 h-[15px] w-[15px] shrink-0" strokeWidth={2.2} />
+              : <TriangleAlert className="mt-0.5 h-[15px] w-[15px] shrink-0" strokeWidth={2.2} />}
+            <p className="min-w-0">
+              <span className="font-semibold">{issue.title}</span>
+              <span className="mt-0.5 block">{issue.message}</span>
+              <span className="mt-0.5 block">{issue.detail}</span>
+            </p>
+          </div>
+        )}
+
+        {view === "conversation" && (
+          <div className="flex min-h-0 flex-1 flex-col">
+            {messagesPane}
+            {composer}
+          </div>
+        )}
+
+        {view === "trace" && (
+          <div role="tabpanel" aria-label="执行记录" className="settings-scrollbar-hidden min-h-0 flex-1 overflow-y-auto px-[32px] py-7 sm:px-12">
+            <div className="mx-auto w-full max-w-[720px]">{traceInspector}</div>
+          </div>
+        )}
+
+        {view === "proposals" && (
+          <div role="tabpanel" aria-label="提案历史" className="settings-scrollbar-hidden min-h-0 flex-1 overflow-y-auto px-6 py-6 sm:px-10">
+            <div className="mx-auto w-full max-w-[760px]">
+              <ProposalHistory
+                proposals={state.proposals}
+                selectedProposalId={selectedProposalId}
+                onSelect={setSelectedProposalId}
+              />
+              {selectedProposal && (
+                <div className="mt-[16px]" aria-label="提案详情">
+                  {renderProposalAttachment(selectedProposal.id)}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </section>
+    )
+  }
 
   return createPortal(
     <div
@@ -1303,17 +1634,17 @@ export function AiAssistantDialog({
         aria-modal="true"
         aria-labelledby={titleId}
         tabIndex={-1}
-        className="flex h-full w-full max-w-[1040px] flex-col overflow-hidden border border-black/[0.06] bg-[#f5f5f7] text-[#1d1d1f] shadow-[0_30px_80px_rgba(0,0,0,0.28)] outline-none dark:border-white/[0.08] dark:bg-[#1c1c1e] dark:text-[#f5f5f5] sm:h-[min(780px,calc(100dvh-48px))] sm:rounded-[24px]"
+        className="flex h-full w-full max-w-[1040px] flex-col overflow-hidden border border-[var(--haven-settings-border)] bg-[#f5f5f7] text-[var(--haven-settings-foreground)] shadow-[0_30px_80px_rgba(0,0,0,0.28)] outline-none dark:border-[var(--haven-settings-border)] dark:bg-[#1c1c1e] dark:text-[var(--haven-settings-foreground)] sm:h-[min(780px,calc(100dvh-48px))] sm:rounded-[24px]"
       >
-        <header className="flex shrink-0 items-start gap-3 border-b border-black/[0.06] px-5 py-4 dark:border-white/[0.06] sm:px-6">
-          <span className="flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-xl bg-[#007aff]/[0.12] text-[#007aff]">
+        <header className="flex shrink-0 items-start gap-3 border-b border-[var(--haven-settings-border)] px-5 py-[16px] dark:border-[var(--haven-settings-border)] sm:px-6">
+          <span className="flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-xl bg-[var(--haven-settings-primary-12)] text-[var(--haven-settings-primary)]">
             <Sparkles className="h-[18px] w-[18px]" strokeWidth={1.9} />
           </span>
           <div className="min-w-0 flex-1">
             <h2 id={titleId} className="text-[16px] font-semibold tracking-[-0.02em]">
               栖伴
             </h2>
-            <p className="mt-0.5 text-[12px] leading-5 text-[#6e6e73] dark:text-[#98989d]">
+            <p className="mt-0.5 text-[12px] leading-5 text-[var(--haven-settings-muted-strong)] dark:text-[var(--haven-settings-muted-strong)]">
               {previewMode
                 ? "Haven 智能体 · 本地预览：尚未接入完整应用层，批准只会生成预览回执，不会写入任何设置。"
                 : "Haven 智能体 · 读取本机设置快照后给出提案，写入前需要你逐项批准。"}
@@ -1323,7 +1654,7 @@ export function AiAssistantDialog({
             type="button"
             aria-label="关闭栖伴"
             onClick={() => onOpenChange(false)}
-            className="flex h-[32px] w-[32px] shrink-0 items-center justify-center rounded-full text-[#6e6e73] transition-colors hover:bg-black/[0.05] hover:text-[#1d1d1f] dark:text-[#98989d] dark:hover:bg-white/[0.08] dark:hover:text-[#f5f5f5]"
+            className="flex h-[32px] w-[32px] shrink-0 items-center justify-center rounded-full text-[var(--haven-settings-muted-strong)] transition-colors hover:bg-black/[0.05] hover:text-[var(--haven-settings-foreground)] dark:text-[var(--haven-settings-muted-strong)] dark:hover:bg-[var(--haven-settings-card)]/[0.08] dark:hover:text-[var(--haven-settings-foreground)]"
           >
             <X className="h-[17px] w-[17px]" strokeWidth={2} />
           </button>
@@ -1358,7 +1689,7 @@ export function AiAssistantDialog({
             aria-label="栖伴分区"
             aria-orientation="vertical"
             onKeyDown={handleTabKeyDown}
-            className="settings-scrollbar-hidden flex shrink-0 items-center gap-1 overflow-x-auto border-b border-black/[0.06] px-4 py-2 dark:border-white/[0.06] sm:w-[172px] sm:flex-col sm:items-stretch sm:overflow-visible sm:border-b-0 sm:border-r sm:px-3 sm:py-4"
+            className="settings-scrollbar-hidden flex shrink-0 items-center gap-1 overflow-x-auto border-b border-[var(--haven-settings-border)] px-[16px] py-[8px] dark:border-[var(--haven-settings-border)] sm:w-[172px] sm:flex-col sm:items-stretch sm:overflow-visible sm:border-b-0 sm:border-r sm:px-3 sm:py-[16px]"
           >
             {VIEW_TABS.map((tab) => {
               const isActive = tab.id === view
@@ -1378,8 +1709,8 @@ export function AiAssistantDialog({
                   className={cn(
                     "flex h-[34px] shrink-0 items-center gap-2.5 rounded-xl px-3 text-[13px] font-medium transition-colors sm:w-full",
                     isActive
-                      ? "bg-[#007aff]/[0.12] text-[#007aff]"
-                      : "text-[#6e6e73] hover:bg-black/[0.04] hover:text-[#1d1d1f] dark:text-[#98989d] dark:hover:bg-white/[0.06] dark:hover:text-[#f5f5f5]",
+                      ? "bg-[var(--haven-settings-primary-12)] text-[var(--haven-settings-primary)]"
+                      : "text-[var(--haven-settings-muted-strong)] hover:bg-black/[0.04] hover:text-[var(--haven-settings-foreground)] dark:text-[var(--haven-settings-muted-strong)] dark:hover:bg-[var(--haven-settings-card)]/[0.06] dark:hover:text-[var(--haven-settings-foreground)]",
                   )}
                 >
                   {tab.icon}
@@ -1413,7 +1744,7 @@ export function AiAssistantDialog({
                   {messagesPane}
                   {composer}
                 </div>
-                <aside className="settings-scrollbar-hidden max-h-[46%] shrink-0 overflow-y-auto border-t border-black/[0.06] px-5 py-4 dark:border-white/[0.06] lg:max-h-none lg:w-[330px] lg:border-l lg:border-t-0 lg:px-5 lg:py-5">
+                <aside className="settings-scrollbar-hidden max-h-[46%] shrink-0 overflow-y-auto border-t border-[var(--haven-settings-border)] px-5 py-[16px] dark:border-[var(--haven-settings-border)] lg:max-h-none lg:w-[330px] lg:border-l lg:border-t-0 lg:px-5 lg:py-5">
                   {traceInspector}
                 </aside>
               </div>
@@ -1428,8 +1759,14 @@ export function AiAssistantDialog({
               >
                 <ProposalHistory
                   proposals={state.proposals}
-                  onSelect={() => setView("conversation")}
+                  selectedProposalId={selectedProposalId}
+                  onSelect={setSelectedProposalId}
                 />
+                {selectedProposal && (
+                  <div className="mt-[16px]" aria-label="提案详情">
+                    {renderProposalAttachment(selectedProposal.id)}
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -1461,35 +1798,48 @@ function ProposalAttachment({
   return (
     <section
       aria-label="设置提案"
-      className="w-full rounded-2xl border border-black/[0.06] bg-white p-4 text-left dark:border-white/[0.08] dark:bg-[#2c2c2e]"
+      className="w-full rounded-2xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-card)] p-[16px] text-left dark:border-[var(--haven-settings-border)] dark:bg-[var(--haven-settings-card)]"
     >
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <p className="text-[13px] font-semibold">{record.title}</p>
-          {record.mock && (
+          {(record.mock || record.template || record.digestPreview) && (
             <p
               role="note"
               className="mt-1 inline-flex items-center gap-1.5 rounded-full bg-[#f0b429]/[0.18] px-2.5 py-0.5 text-[11px] font-semibold text-[#b7791f] dark:text-[#f0b429]"
             >
-              Mock/预览 · 非真实模型输出
+              {record.digestPreview
+                ? "本地预览 · 非真实模型输出"
+                : record.mock
+                  ? "Mock/预览 · 非真实模型输出"
+                  : "固定建议 · 非模型生成"}
             </p>
           )}
-          <p className="mt-1 text-[11px] text-[#86868b] dark:text-[#98989d]">
+          <p className="mt-1 text-[11px] text-[var(--haven-settings-muted-strong)] dark:text-[var(--haven-settings-muted-strong)]">
             {`作用域 ${record.targetLabel} · digest ${digestDisplay(record)}`}
           </p>
-          <p className="mt-0.5 text-[11px] text-[#86868b] dark:text-[#98989d]">
+          <p className="mt-0.5 text-[11px] text-[var(--haven-settings-muted-strong)] dark:text-[var(--haven-settings-muted-strong)]">
             基线版本 {record.expectedRevision ?? "未提供（本地预览）"}
           </p>
+          {/*
+            模型来源只在真实 Provider 路径上出现。模板与本地预览恒为 null，
+            因此这一行本身就是"这份建议到底是不是模型给的"的可核对证据。
+          */}
+          {record.modelId && (
+            <p className="mt-0.5 text-[11px] text-[var(--haven-settings-muted-strong)] dark:text-[var(--haven-settings-muted-strong)]">
+              {`模型 ${record.modelId}`}
+            </p>
+          )}
         </div>
         <span
           className={cn(
             "shrink-0 rounded-full px-2.5 py-1 text-[11px] font-semibold",
             record.status === "pending"
-              ? "bg-[#007aff]/[0.12] text-[#007aff]"
+              ? "bg-[var(--haven-settings-primary-12)] text-[var(--haven-settings-primary)]"
               : record.status === "applied"
                 ? "bg-[#34c759]/[0.16] text-[#248a3d] dark:text-[#30d158]"
                 : record.status === "rejected"
-                  ? "bg-black/[0.05] text-[#6e6e73] dark:bg-white/[0.08] dark:text-[#98989d]"
+                  ? "bg-black/[0.05] text-[var(--haven-settings-muted-strong)] dark:bg-[var(--haven-settings-control)] dark:text-[var(--haven-settings-muted-strong)]"
                   : "bg-[#f0b429]/[0.18] text-[#b7791f] dark:text-[#f0b429]",
           )}
         >
@@ -1501,22 +1851,22 @@ function ProposalAttachment({
         {record.changes.map((change) => (
           <li
             key={change.key}
-            className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-black/[0.025] px-3 py-2 dark:bg-white/[0.04]"
+            className="flex flex-wrap items-center justify-between gap-[8px] rounded-xl bg-black/[0.025] px-3 py-[8px] dark:bg-[var(--haven-settings-control)]"
           >
             <span className="text-[13px] font-medium">{change.label}</span>
-            <span className="flex items-center gap-2 text-[12px]">
-              <span className="rounded-md bg-black/[0.05] px-2 py-0.5 text-[#6e6e73] dark:bg-white/[0.08] dark:text-[#98989d]">
+            <span className="flex items-center gap-[8px] text-[12px]">
+              <span className="rounded-md bg-black/[0.05] px-[8px] py-0.5 text-[var(--haven-settings-muted-strong)] dark:bg-[var(--haven-settings-control)] dark:text-[var(--haven-settings-muted-strong)]">
                 {change.from}
               </span>
-              <ArrowRight className="h-3.5 w-3.5 text-[#86868b]" strokeWidth={2} />
-              <span className="rounded-md bg-[#007aff]/[0.12] px-2 py-0.5 font-semibold text-[#007aff]">{change.to}</span>
+              <ArrowRight className="h-3.5 w-3.5 text-[var(--haven-settings-muted-strong)]" strokeWidth={2} />
+              <span className="rounded-md bg-[var(--haven-settings-primary-12)] px-[8px] py-0.5 font-semibold text-[var(--haven-settings-primary)]">{change.to}</span>
             </span>
           </li>
         ))}
       </ul>
 
       {record.status === "rejected" && (
-        <p className="mt-3 flex items-center gap-2 rounded-xl bg-black/[0.03] px-3 py-2 text-[12px] text-[#6e6e73] dark:bg-white/[0.05] dark:text-[#98989d]">
+        <p className="mt-3 flex items-center gap-[8px] rounded-xl bg-black/[0.03] px-3 py-[8px] text-[12px] text-[var(--haven-settings-muted-strong)] dark:bg-[var(--haven-settings-control)] dark:text-[var(--haven-settings-muted-strong)]">
           <ShieldCheck className="h-[14px] w-[14px] shrink-0" strokeWidth={2} />
           本次没有写入任何设置。
         </p>
@@ -1525,7 +1875,7 @@ function ProposalAttachment({
       {statusNote && (
         <p
           role="alert"
-          className="mt-3 flex items-start gap-2 rounded-xl border border-[#f0b429]/40 bg-[#fff8e5] px-3 py-2 text-[12px] leading-5 text-[#7a5a1a] dark:bg-[#3a2f12] dark:text-[#f0b429]"
+          className="mt-3 flex items-start gap-[8px] rounded-xl border border-[#f0b429]/40 bg-[#fff8e5] px-3 py-[8px] text-[12px] leading-5 text-[#7a5a1a] dark:bg-[#3a2f12] dark:text-[#f0b429]"
         >
           <TriangleAlert className="mt-0.5 h-[14px] w-[14px] shrink-0" strokeWidth={2} />
           <span>{statusNote}</span>
@@ -1540,7 +1890,7 @@ function ProposalAttachment({
         <div
           role="alert"
           className={cn(
-            "mt-3 flex items-start gap-2 rounded-xl border px-3 py-2 text-[12px] leading-5",
+            "mt-3 flex items-start gap-[8px] rounded-xl border px-3 py-[8px] text-[12px] leading-5",
             record.notice.tone === "danger"
               ? "border-[#ff3b30]/30 bg-[#fdecea] text-[#a3231a] dark:border-[#ff453a]/30 dark:bg-[#3a1a18] dark:text-[#ff8a80]"
               : "border-[#f0b429]/40 bg-[#fff8e5] text-[#7a5a1a] dark:bg-[#3a2f12] dark:text-[#f0b429]",
@@ -1559,11 +1909,11 @@ function ProposalAttachment({
 
       {record.receipt && <ProposalReceipt receipt={record.receipt} record={record} />}
 
-      <div className="mt-3 flex flex-wrap items-center gap-2">
+      <div className="mt-3 flex flex-wrap items-center gap-[8px]">
         <button
           type="button"
           onClick={onViewTrace}
-          className="rounded-full border border-black/[0.08] px-3 py-1.5 text-[12px] font-medium text-[#6e6e73] transition-colors hover:text-[#007aff] dark:border-white/[0.1] dark:text-[#98989d]"
+          className="rounded-full border border-[var(--haven-settings-border)] px-3 py-1.5 text-[12px] font-medium text-[var(--haven-settings-muted-strong)] transition-colors hover:text-[var(--haven-settings-primary)] dark:border-[var(--haven-settings-border)] dark:text-[var(--haven-settings-muted-strong)]"
         >
           查看执行轨迹
         </button>
@@ -1573,7 +1923,7 @@ function ProposalAttachment({
               type="button"
               disabled={busy}
               onClick={() => { void onReject(record.id) }}
-              className="rounded-full border border-black/[0.08] px-3 py-1.5 text-[12px] font-semibold text-[#d70015] transition-colors hover:bg-[#d70015]/[0.06] disabled:cursor-not-allowed disabled:opacity-50 dark:border-white/[0.1]"
+              className="rounded-full border border-[var(--haven-settings-border)] px-3 py-1.5 text-[12px] font-semibold text-[#d70015] transition-colors hover:bg-[#d70015]/[0.06] disabled:cursor-not-allowed disabled:opacity-50 dark:border-[var(--haven-settings-border)]"
             >
               拒绝
             </button>
@@ -1581,7 +1931,7 @@ function ProposalAttachment({
               type="button"
               disabled={busy}
               onClick={() => { void onApprove(record.id) }}
-              className="rounded-full bg-[#007aff] px-4 py-1.5 text-[12px] font-semibold text-white transition-colors hover:bg-[#006fe6] disabled:cursor-not-allowed disabled:opacity-50"
+              className="rounded-full bg-[var(--haven-settings-primary)] px-[16px] py-1.5 text-[12px] font-semibold text-[var(--haven-settings-primary-foreground)] transition-colors hover:bg-[var(--haven-settings-primary-hover)] disabled:cursor-not-allowed disabled:opacity-50"
             >
               批准并应用
             </button>
@@ -1595,11 +1945,11 @@ function ProposalAttachment({
 function ProposalReceipt({ receipt, record }: { receipt: AiAssistantReceipt; record: AiAssistantProposalRecord }) {
   return (
     <div className="mt-3 rounded-xl border border-[#34c759]/25 bg-[#edf8f0] px-3 py-3 dark:border-[#34c759]/25 dark:bg-[#16281c]">
-      <p className="flex items-center gap-2 text-[12px] font-semibold text-[#216e32] dark:text-[#30d158]">
+      <p className="flex items-center gap-[8px] text-[12px] font-semibold text-[#216e32] dark:text-[#30d158]">
         <Receipt className="h-[14px] w-[14px]" strokeWidth={2} />
         Setting Change Receipt
       </p>
-      <dl className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]">
+      <dl className="mt-[8px] grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]">
         <div className="flex items-center gap-1">
           <dt className="text-[#4f7659] dark:text-[#7ec79a]">状态</dt>
           <dd className="font-semibold text-[#216e32] dark:text-[#30d158]">
@@ -1620,12 +1970,12 @@ function ProposalReceipt({ receipt, record }: { receipt: AiAssistantReceipt; rec
         </div>
       </dl>
       {receipt.receiptId && (
-        <p className="mt-2 break-all text-[11px] leading-5 text-[#4f7659] dark:text-[#7ec79a]">
+        <p className="mt-[8px] break-all text-[11px] leading-5 text-[#4f7659] dark:text-[#7ec79a]">
           {`回执 ${receipt.receiptId}`}
           {receipt.digest ? ` · digest ${receipt.digest}` : ""}
         </p>
       )}
-      <p className="mt-2 text-[11px] leading-5 text-[#4f7659] dark:text-[#7ec79a]">
+      <p className="mt-[8px] text-[11px] leading-5 text-[#4f7659] dark:text-[#7ec79a]">
         {receipt.preview
           ? `Mock/预览回执 · 本阶段没有可用的模型供应商，${receipt.appliedAt} 的这次批准没有写入本机设置。`
           : `写入时间 ${receipt.appliedAt}`}
@@ -1636,36 +1986,42 @@ function ProposalReceipt({ receipt, record }: { receipt: AiAssistantReceipt; rec
 
 function ProposalHistory({
   proposals,
+  selectedProposalId,
   onSelect,
 }: {
   proposals: AiAssistantProposalRecord[]
-  onSelect: () => void
+  selectedProposalId: string | null
+  onSelect: (proposalId: string) => void
 }) {
   if (proposals.length === 0) {
     return (
-      <p className="rounded-2xl border border-dashed border-black/[0.1] px-4 py-6 text-center text-[13px] text-[#86868b] dark:border-white/[0.12] dark:text-[#98989d]">
+      <p className="rounded-2xl border border-dashed border-[var(--haven-settings-border)] px-[16px] py-6 text-center text-[13px] text-[var(--haven-settings-muted-strong)] dark:border-[var(--haven-settings-border)] dark:text-[var(--haven-settings-muted-strong)]">
         还没有设置提案。回到对话，让栖伴先生成一份提案。
       </p>
     )
   }
   return (
-    <ul aria-label="提案记录" className="space-y-2">
+    <ul aria-label="提案记录" className="space-y-[8px]">
       {proposals.map((proposal) => (
         <li key={proposal.id}>
           <button
             type="button"
-            onClick={onSelect}
-            className="flex w-full items-center gap-3 rounded-xl border border-black/[0.06] bg-white px-4 py-3 text-left transition-colors hover:border-[#007aff]/35 dark:border-white/[0.08] dark:bg-[#2c2c2e]"
+            aria-pressed={selectedProposalId === proposal.id}
+            onClick={() => onSelect(proposal.id)}
+            className={cn(
+              "flex w-full items-center gap-3 rounded-xl border px-[16px] py-3 text-left transition-colors hover:border-[var(--haven-settings-primary)]/35 dark:border-[var(--haven-settings-border)] dark:bg-[var(--haven-settings-card)]",
+              selectedProposalId === proposal.id ? "border-[var(--haven-settings-primary-40)] bg-[var(--haven-settings-primary-12)] dark:bg-[var(--haven-settings-primary-12)]" : "border-[var(--haven-settings-border)] bg-[var(--haven-settings-card)]",
+            )}
           >
             <span
               className={cn(
                 "shrink-0 rounded-full px-2.5 py-1 text-[11px] font-semibold",
                 proposal.status === "pending"
-                  ? "bg-[#007aff]/[0.12] text-[#007aff]"
+                  ? "bg-[var(--haven-settings-primary-12)] text-[var(--haven-settings-primary)]"
                   : proposal.status === "applied"
                     ? "bg-[#34c759]/[0.16] text-[#248a3d] dark:text-[#30d158]"
                     : proposal.status === "rejected"
-                      ? "bg-black/[0.05] text-[#6e6e73] dark:bg-white/[0.08] dark:text-[#98989d]"
+                      ? "bg-black/[0.05] text-[var(--haven-settings-muted-strong)] dark:bg-[var(--haven-settings-control)] dark:text-[var(--haven-settings-muted-strong)]"
                       : "bg-[#f0b429]/[0.18] text-[#b7791f] dark:text-[#f0b429]",
               )}
             >
@@ -1673,7 +2029,7 @@ function ProposalHistory({
             </span>
             <span className="min-w-0 flex-1">
               <span className="block truncate text-[13px] font-medium">{proposal.title}</span>
-              <span className="mt-0.5 block truncate text-[11px] text-[#86868b] dark:text-[#98989d]">
+              <span className="mt-0.5 block truncate text-[11px] text-[var(--haven-settings-muted-strong)] dark:text-[var(--haven-settings-muted-strong)]">
                 {`${proposal.targetLabel} · ${proposal.changes.length} 项改动 · digest ${digestDisplay(proposal)}`}
               </span>
             </span>
@@ -1696,11 +2052,11 @@ function TraceInspector({
 }) {
   return (
     <div className="min-w-0">
-      <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-[#86868b] dark:text-[#98989d]">执行轨迹</p>
-      <p className="mt-1 text-[11px] leading-5 text-[#86868b] dark:text-[#8e8e93]">
+      <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-[var(--haven-settings-muted-strong)] dark:text-[var(--haven-settings-muted-strong)]">执行轨迹</p>
+      <p className="mt-1 text-[11px] leading-5 text-[var(--haven-settings-muted-strong)] dark:text-[var(--haven-settings-muted-strong)]">
         只读步骤记录，不含查询语句、本机路径或凭据。
       </p>
-      <ol aria-label="执行轨迹节点" className="mt-4">
+      <ol aria-label="执行轨迹节点" className="mt-[16px]">
         {steps.map((step, index) => (
           <TraceNode
             key={step.id}
@@ -1712,7 +2068,7 @@ function TraceInspector({
         ))}
       </ol>
       {statuses.every((status) => status === "pending") && (
-        <p className="mt-3 flex items-center gap-2 text-[11px] text-[#86868b] dark:text-[#8e8e93]">
+        <p className="mt-3 flex items-center gap-[8px] text-[11px] text-[var(--haven-settings-muted-strong)] dark:text-[var(--haven-settings-muted-strong)]">
           <CircleAlert className="h-[13px] w-[13px] shrink-0" strokeWidth={2} />
           还没有执行记录。在对话中提交需求后，这里会逐步显示读取与提案节点。
         </p>
@@ -1734,7 +2090,7 @@ function TraceNode({
 }) {
   const tone = NODE_TONE[status]
   return (
-    <li aria-label={`${step.title}：${TRACE_NODE_STATUS_LABEL[status]}`} className="relative flex gap-3 pb-4 last:pb-0">
+    <li aria-label={`${step.title}：${TRACE_NODE_STATUS_LABEL[status]}`} className="relative flex gap-3 pb-[16px] last:pb-0">
       {!isLast && (
         <span aria-hidden="true" className={cn("absolute left-[13px] top-[28px] h-[calc(100%-28px)] w-[2px] rounded-full", tone.connector)} />
       )}
@@ -1756,13 +2112,13 @@ function TraceNode({
           {step.title}
           <span className="sr-only">（{TRACE_NODE_STATUS_LABEL[status]}）</span>
         </p>
-        <p className="mt-0.5 text-[11px] leading-5 text-[#6e6e73] dark:text-[#98989d]">{step.description}</p>
+        <p className="mt-0.5 text-[11px] leading-5 text-[var(--haven-settings-muted-strong)] dark:text-[var(--haven-settings-muted-strong)]">{step.description}</p>
         {step.meta.length > 0 && (
           <dl className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1">
             {step.meta.map((entry) => (
               <div key={entry.label} className="flex items-center gap-1 text-[10px]">
-                <dt className="text-[#86868b] dark:text-[#8e8e93]">{entry.label}</dt>
-                <dd className="font-medium text-[#6e6e73] dark:text-[#98989d]">{entry.value}</dd>
+                <dt className="text-[var(--haven-settings-muted-strong)] dark:text-[var(--haven-settings-muted-strong)]">{entry.label}</dt>
+                <dd className="font-medium text-[var(--haven-settings-muted-strong)] dark:text-[var(--haven-settings-muted-strong)]">{entry.value}</dd>
               </div>
             ))}
           </dl>

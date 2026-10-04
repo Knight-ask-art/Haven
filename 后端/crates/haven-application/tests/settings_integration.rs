@@ -1,7 +1,8 @@
 //! SettingsService 集成测试（BE-SETTINGS-001 验收 + R-MAIN-01 复审回归）。
 //!
 //! 真实 SQLite + file-backed：默认值 / 更新持久化 / 重启恢复 / 幂等 / revision 冲突 /
-//! 非法枚举与未知字段拒绝 / 未知 Section / 迁移升级 / **stale-idempotent 与双连接并发**。
+//! 非法枚举与未知字段拒绝 / 未知 Section / 迁移升级 / **stale-idempotent 与双连接并发** /
+//! **外观资产引用的同一事务校验**。
 //!
 //! 并发控制契约（R-MAIN-01）：
 //! - expected 校验**先于**一切（含幂等短路）：过期 revision 即使提交相同值也冲突；
@@ -14,6 +15,11 @@ use haven_application::services::resource_preferences::{
     PreferenceTarget, ResourcePreferenceService,
 };
 use haven_application::services::settings::{SettingsService, SettingsUpdateResult};
+use haven_domain::appearance::{
+    AppearanceAssetId, AppearanceAssetKind, AppearanceAssetMetadata, AssetValidationState,
+    WallpaperSelection,
+};
+use haven_domain::contracts::{AppearanceRepository, SettingsRepository, SettingsRow};
 use haven_domain::settings::{
     AppearancePatch, ComicDirection, ComicPageGap, ComicPatch, ComicPreloadPages, ComicViewMode,
     Density, DownloadConcurrency, DownloadPatch, DownloadSpeedLimit, GeneralPatch, LaunchPage,
@@ -43,6 +49,14 @@ fn appearance_patch(theme: Option<Theme>) -> SettingsPatch {
         density: None,
         sidebar: None,
         reduce_motion: None,
+        interface_font_mode: None,
+        interface_font_family: None,
+        interface_font_asset_id: None,
+        custom_theme: None,
+        wallpaper: None,
+        custom_font_asset_id: None,
+        ui_font_preset: None,
+        ui_font_family: None,
     })
 }
 
@@ -827,6 +841,14 @@ async fn invalid_inputs_are_rejected_at_boundary() {
                 density: None,
                 sidebar: None,
                 reduce_motion: None,
+                interface_font_mode: None,
+                interface_font_family: None,
+                interface_font_asset_id: None,
+                custom_theme: None,
+                wallpaper: None,
+                custom_font_asset_id: None,
+                ui_font_preset: None,
+                ui_font_family: None,
             }),
         )
         .await
@@ -860,6 +882,14 @@ async fn sections_are_isolated() {
                 density: Some(Density::Compact),
                 sidebar: None,
                 reduce_motion: None,
+                interface_font_mode: None,
+                interface_font_family: None,
+                interface_font_asset_id: None,
+                custom_theme: None,
+                wallpaper: None,
+                custom_font_asset_id: None,
+                ui_font_preset: None,
+                ui_font_family: None,
             }),
         )
         .await
@@ -1266,4 +1296,330 @@ async fn two_connections_concurrent_first_write_exactly_one_wins() {
     };
     assert_eq!(actual, winner_page, "首次并发最终值必须来自成功请求");
     drop(db_check);
+}
+
+// ---------- appearance 资产引用的同一事务校验（045 登记行 + settings 行） ----------
+
+/// 三条真实资产 ID。`AppearanceAssetId::parse` 只认规范小写 UUID 文本（与 045 的
+/// `appearance_assets.id` 约束同一形状），所以测试里也只用这种写法。
+const FONT_ASSET: &str = "0196f0d2-0000-7000-8000-0000000000f1";
+const STATIC_ASSET: &str = "0196f0d2-0000-7000-8000-0000000000f2";
+const DYNAMIC_ASSET: &str = "0196f0d2-0000-7000-8000-0000000000f3";
+/// 从未登记过的资产 ID：「引用的东西不存在」那一侧。
+const ABSENT_ASSET: &str = "0196f0d2-0000-7000-8000-0000000000ff";
+
+/// 三种资产种类的短名（调用点因此不必把 `AppearanceAssetKind::…` 写满一行）。
+const FONT_KIND: AppearanceAssetKind = AppearanceAssetKind::Font;
+const STATIC_KIND: AppearanceAssetKind = AppearanceAssetKind::StaticWallpaper;
+const DYNAMIC_KIND: AppearanceAssetKind = AppearanceAssetKind::DynamicWallpaper;
+
+fn asset_id(value: &str) -> AppearanceAssetId {
+    AppearanceAssetId::parse(value).expect("测试常量非法")
+}
+
+/// 登记一条外观资产（真实 045 表）。
+async fn register_asset_with_state(
+    db: &Arc<Db>,
+    id: &str,
+    kind: AppearanceAssetKind,
+    state: AssetValidationState,
+) {
+    let asset = AppearanceAssetMetadata::new(asset_id(id), kind, state, 16, None).unwrap();
+    let repos = SqliteRepositories::new(db.clone());
+    repos.create_asset(&asset).await.unwrap();
+}
+
+async fn register_asset(db: &Arc<Db>, id: &str, kind: AppearanceAssetKind) {
+    register_asset_with_state(db, id, kind, AssetValidationState::Validated).await;
+}
+
+/// 直接写一行外观设置（绕过服务层），模拟历史遗留 / 已经损坏的落库形态。
+async fn write_appearance_row(db: &Arc<Db>, revision: &str, value: SettingsValue) {
+    let row = SettingsRow {
+        section: "appearance".into(),
+        schema_version: 1,
+        revision: revision.into(),
+        data_json: serde_json::to_string(&value).unwrap(),
+        updated_at: haven_common::UtcMillis(1),
+    };
+    let repos = SqliteRepositories::new(db.clone());
+    repos.upsert(&row).await.unwrap();
+}
+
+/// 领域合并语义下的外观设置值（与真实写入路径同一份 patch 语义）。
+fn appearance_value_with(patch: AppearancePatch) -> SettingsValue {
+    SettingsPatch::Appearance(patch)
+        .apply_to(&SettingsValue::default_for(SettingsSection::Appearance))
+}
+
+/// 指向那个**从未登记过**的资产的 patch。
+fn absent_patch() -> SettingsPatch {
+    SettingsPatch::Appearance(AppearancePatch {
+        custom_font_asset_id: Some(Some(asset_id(ABSENT_ASSET))),
+        ..AppearancePatch::default()
+    })
+}
+
+/// 种类匹配的引用照常保存：字体槽要字体资产，壁纸槽要**同档**的壁纸资产。
+#[tokio::test]
+async fn matching_appearance_asset_references_are_persisted() {
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    let svc = service(&db);
+    register_asset(&db, FONT_ASSET, FONT_KIND).await;
+    register_asset(&db, STATIC_ASSET, STATIC_KIND).await;
+    register_asset(&db, DYNAMIC_ASSET, DYNAMIC_KIND).await;
+
+    let font = asset_id(FONT_ASSET);
+    let saved = svc
+        .update(
+            SettingsSection::Appearance,
+            None,
+            SettingsPatch::Appearance(AppearancePatch {
+                custom_font_asset_id: Some(Some(font)),
+                wallpaper: Some(Some(WallpaperSelection::Static(asset_id(STATIC_ASSET)))),
+                ..AppearancePatch::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(saved.changed);
+    let revision = saved.revision.clone().expect("变化必须带 revision");
+
+    // 换成动态壁纸（种类仍然匹配）同样照常保存。
+    let dynamic = svc
+        .update(
+            SettingsSection::Appearance,
+            Some(&revision),
+            SettingsPatch::Appearance(AppearancePatch {
+                wallpaper: Some(Some(WallpaperSelection::Dynamic(asset_id(DYNAMIC_ASSET)))),
+                ..AppearancePatch::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(dynamic.changed);
+
+    let snapshot = svc.get(SettingsSection::Appearance).await.unwrap();
+    let SettingsValue::Appearance(value) = snapshot.value else {
+        panic!("appearance 分区必须返回 appearance 设置");
+    };
+    assert_eq!(value.custom_font_asset_id, Some(font));
+    assert_eq!(
+        value.wallpaper,
+        WallpaperSelection::Dynamic(asset_id(DYNAMIC_ASSET))
+    );
+}
+
+/// 引用一个从未登记过的资产：稳定 `APPEARANCE_ASSET_UNAVAILABLE` + 零写入。
+///
+/// 「零写入」在这里是**可观测**的：同一次保存随后补上登记行再提交一次，仍然带着
+/// `expected_revision = None` 成功——上一次失败没有留下任何 revision，也没有写坏值。
+#[tokio::test]
+async fn appearance_reference_to_a_missing_asset_is_rejected_without_writing() {
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    let svc = service(&db);
+
+    let error = svc
+        .update(SettingsSection::Appearance, None, absent_patch())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code().as_str(), "APPEARANCE_ASSET_UNAVAILABLE");
+    // 出路是换一个资产再存，不是原样重试。
+    assert!(!error.retryable());
+    assert!(
+        !error.user_message().contains(ABSENT_ASSET),
+        "错误文案不得回显资产 ID 或任何内部细节"
+    );
+
+    // 零写入：从未保存过的分区不得因为一次被拒绝的更新而留下 revision。
+    let snapshot = svc.get(SettingsSection::Appearance).await.unwrap();
+    assert!(snapshot.revision.is_none());
+    assert_eq!(
+        snapshot.value,
+        SettingsValue::default_for(SettingsSection::Appearance)
+    );
+
+    register_asset(&db, ABSENT_ASSET, FONT_KIND).await;
+    let saved = svc
+        .update(SettingsSection::Appearance, None, absent_patch())
+        .await
+        .unwrap();
+    // expected=None 仍然可用 → 上一次失败确实一行都没写。
+    assert!(saved.changed);
+}
+
+/// ID 存在但种类对不上：字体槽里的静态壁纸、壁纸槽里的字体、静态资产当动态壁纸，
+/// 三种都要被拒绝，且都不留下任何写入。
+#[tokio::test]
+async fn appearance_reference_with_a_mismatched_kind_is_rejected_without_writing() {
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    let svc = service(&db);
+    register_asset(&db, FONT_ASSET, FONT_KIND).await;
+    register_asset(&db, STATIC_ASSET, STATIC_KIND).await;
+
+    let font_as_wallpaper = SettingsPatch::Appearance(AppearancePatch {
+        wallpaper: Some(Some(WallpaperSelection::Static(asset_id(FONT_ASSET)))),
+        ..AppearancePatch::default()
+    });
+    let wallpaper_as_font = SettingsPatch::Appearance(AppearancePatch {
+        custom_font_asset_id: Some(Some(asset_id(STATIC_ASSET))),
+        ..AppearancePatch::default()
+    });
+    let static_as_dynamic = SettingsPatch::Appearance(AppearancePatch {
+        wallpaper: Some(Some(WallpaperSelection::Dynamic(asset_id(STATIC_ASSET)))),
+        ..AppearancePatch::default()
+    });
+
+    for (patch, required_kind) in [
+        (font_as_wallpaper, "静态壁纸"),
+        (wallpaper_as_font, "字体"),
+        (static_as_dynamic, "动态壁纸"),
+    ] {
+        let error = svc
+            .update(SettingsSection::Appearance, None, patch)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code().as_str(),
+            "APPEARANCE_ASSET_UNAVAILABLE",
+            "种类对不上必须与「不存在」共用同一个稳定错误码"
+        );
+        assert!(!error.retryable());
+        assert!(
+            error.user_message().contains(required_kind),
+            "错误文案要说明槽位需要的类型"
+        );
+        let snapshot = svc.get(SettingsSection::Appearance).await.unwrap();
+        // 被拒绝的更新不得留下 revision。
+        assert!(snapshot.revision.is_none());
+    }
+    assert_eq!(
+        svc.get(SettingsSection::Appearance).await.unwrap().value,
+        SettingsValue::default_for(SettingsSection::Appearance)
+    );
+}
+
+/// Pending 与 Rejected 资产即使登记行存在，也不能被绑定到生产设置。
+#[tokio::test]
+async fn unvalidated_appearance_assets_cannot_be_referenced() {
+    for state in [
+        AssetValidationState::Pending,
+        AssetValidationState::Rejected,
+    ] {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let svc = service(&db);
+        register_asset_with_state(&db, FONT_ASSET, FONT_KIND, state).await;
+
+        let error = svc
+            .update(
+                SettingsSection::Appearance,
+                None,
+                SettingsPatch::Appearance(AppearancePatch {
+                    custom_font_asset_id: Some(Some(asset_id(FONT_ASSET))),
+                    ..AppearancePatch::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), "APPEARANCE_ASSET_UNAVAILABLE");
+        assert!(error.user_message().contains("不可用"));
+        assert!(
+            svc.get(SettingsSection::Appearance)
+                .await
+                .unwrap()
+                .revision
+                .is_none()
+        );
+    }
+}
+
+/// 清除引用不需要任何资产：`null` 与 `kind: none` 都不查库。
+///
+/// 被清掉的那个 ID 刻意**没有**登记行（历史遗留的悬空引用）：如果清空也要「先查资产
+/// 再放行」，这个本来就该被修好的状态反而会被卡住——用户明明是在把它清掉。
+#[tokio::test]
+async fn clearing_an_appearance_reference_needs_no_asset_row() {
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    let svc = service(&db);
+    let dangling = asset_id(ABSENT_ASSET);
+    let legacy = appearance_value_with(AppearancePatch {
+        custom_font_asset_id: Some(Some(dangling)),
+        wallpaper: Some(Some(WallpaperSelection::Static(dangling))),
+        ..AppearancePatch::default()
+    });
+    write_appearance_row(&db, "legacy-1", legacy).await;
+
+    let cleared = svc
+        .update(
+            SettingsSection::Appearance,
+            Some("legacy-1"),
+            SettingsPatch::Appearance(AppearancePatch {
+                custom_font_asset_id: Some(None),
+                wallpaper: Some(None),
+                ..AppearancePatch::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(cleared.changed);
+    let SettingsValue::Appearance(value) = cleared.value else {
+        panic!("appearance 分区必须返回 appearance 设置");
+    };
+    assert_eq!(value.custom_font_asset_id, None);
+    assert_eq!(value.wallpaper, WallpaperSelection::None);
+}
+
+/// 悬空引用没被改动时不得阻塞无关字段：这条边界是「改了什么就查什么」，不是全量校验。
+///
+/// 反过来，真的把引用改到另一个不存在的资产上仍然要被拒绝，且已有行与 revision
+/// 都不动——「不阻塞旧值」不等于「允许写坏新值」。
+#[tokio::test]
+async fn an_unchanged_dangling_reference_does_not_block_an_unrelated_patch() {
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    let svc = service(&db);
+    let dangling = asset_id(ABSENT_ASSET);
+    let legacy = appearance_value_with(AppearancePatch {
+        custom_font_asset_id: Some(Some(dangling)),
+        ..AppearancePatch::default()
+    });
+    write_appearance_row(&db, "legacy-1", legacy).await;
+
+    // 只改主题：悬空引用原样留在设置里，更新照常成功。
+    let updated = svc
+        .update(
+            SettingsSection::Appearance,
+            Some("legacy-1"),
+            appearance_patch(Some(Theme::Dark)),
+        )
+        .await
+        .unwrap();
+    let revision = updated.revision.clone();
+    assert!(updated.changed);
+    assert_ne!(revision.as_deref(), Some("legacy-1"));
+    let SettingsValue::Appearance(value) = updated.value else {
+        panic!("appearance 分区必须返回 appearance 设置");
+    };
+    assert_eq!(value.theme, Theme::Dark);
+    assert_eq!(
+        value.custom_font_asset_id,
+        Some(dangling),
+        "没被碰到的旧引用必须原样保留，而不是被顺手清掉"
+    );
+
+    // 把引用改到另一个不存在的资产上：拒绝，且已有行一步都不动。
+    let error = svc
+        .update(
+            SettingsSection::Appearance,
+            revision.as_deref(),
+            SettingsPatch::Appearance(AppearancePatch {
+                custom_font_asset_id: Some(Some(AppearanceAssetId::new())),
+                ..AppearancePatch::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code().as_str(), "APPEARANCE_ASSET_UNAVAILABLE");
+    let snapshot = svc.get(SettingsSection::Appearance).await.unwrap();
+    // 被拒绝的更新不得推进 revision。
+    assert_eq!(snapshot.revision, revision);
 }
