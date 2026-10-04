@@ -22,7 +22,7 @@ uuid = { version = "1.24.0", features = ["v4"] }
 walkdir = "2.5.0"
 axum = { version = "0.8", features = ["json"] }
 mdns-sd = "0.21"
-quick-xml = { version = "0.41", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 rfd = "0.17"
 if-addrs = "0.15"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
