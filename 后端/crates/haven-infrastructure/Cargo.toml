@@ -33,13 +33,13 @@ sha2 = "0.11.0"
 # 版本刻意定在 0.20.2：它**已经**在 workspace 的 Cargo.lock 里（由其它依赖间接引入），
 # 因此提升为直接依赖只是在本 crate 的依赖列表里加一条边，不会新增任何包——`--offline`
 # 与 `--locked` 的构建流程都不需要联网或重新解析版本。
-toml_edit = "0.20.2"
+toml_edit = "0.25.15"
 tokio = { version = "1.53.1", features = ["rt", "fs", "io-util", "sync", "net", "time", "macros"] }
 uuid = { version = "1.24.0", features = ["v4"] }
 walkdir = "2.5.0"
 axum = { version = "0.8", features = ["json"] }
 mdns-sd = "0.21"
-quick-xml = { version = "0.41", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 rfd = "0.17"
 if-addrs = "0.15"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
