@@ -4643,7 +4643,7 @@ function AiSettings({ showNotice, registerReloader, aiSelection }: { showNotice:
             <SettingRow title="配置名称">
               <input value={draftDisplayName} onChange={(event) => updateDraft({ displayName: event.target.value })} className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)]" aria-label="配置名称" />
             </SettingRow>
-            <SettingRow title="API 地址" description="必须是 https 的公网服务地址；栖阅不会通过明文连接发送 API Key 或设置内容。">
+            <SettingRow title="API 地址" description="远程服务使用 HTTPS；本机网关可使用 http://127.0.0.1 或 http://[::1] 及端口。不支持局域网或服务发现。">
               <input value={draftEndpoint} onChange={(event) => updateDraft({ endpoint: event.target.value })} className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)]" aria-label="API 地址" />
             </SettingRow>
             <SettingRow title="保存配置" description="新服务默认启用；API Key 将单独配置。">
@@ -4663,7 +4663,7 @@ function AiSettings({ showNotice, registerReloader, aiSelection }: { showNotice:
                 aria-label="配置名称"
               />
             </SettingRow>
-            <SettingRow title="启用智能功能" description={ai.selectedEndpointInsecure ? "该配置使用 http 明文地址，不能启用：启停会重写同一条配置，而明文地址不允许保存。请先把地址改成 https。" : "停用后不会向该 Provider 发起任何请求。"}>
+            <SettingRow title="启用智能功能" description={ai.selectedEndpointInsecure ? "该配置使用远程 HTTP 明文地址，不能启用。请先把地址改成 HTTPS 并保存。" : "停用后不会向该 Provider 发起任何请求。"}>
               <Toggle
                 checked={selected.enabled}
                 onChange={(value) => void ai.saveProfile({
@@ -4680,7 +4680,7 @@ function AiSettings({ showNotice, registerReloader, aiSelection }: { showNotice:
             <SettingRow title="API 协议" description="决定请求与响应的编排协议，而不是具体服务商。">
               <span className="text-[13px] font-semibold text-[var(--haven-settings-foreground)]">OpenAI Compatible</span>
             </SettingRow>
-            <SettingRow title="API 地址" description="协议服务根地址（https，公网主机）。已带 /v1 时不会重复拼接；http 明文地址不能保存，也不能用于发起请求。">
+            <SettingRow title="API 地址" description="远程服务使用 HTTPS；本机网关可使用 http://127.0.0.1 或 http://[::1] 及端口。已带 /v1 时不会重复拼接，不支持局域网或服务发现。">
               <input
                 value={draftEndpoint}
                 onChange={(event) => updateDraft({ endpoint: event.target.value })}
@@ -4690,7 +4690,7 @@ function AiSettings({ showNotice, registerReloader, aiSelection }: { showNotice:
             </SettingRow>
             {ai.selectedEndpointInsecure && (
               <div role="alert" className="mx-5 mb-3 rounded-2xl border border-[#ff9500]/25 bg-[#fff8e5] px-4 py-3 text-xs leading-5 text-[#7a5a1a] dark:border-[#ff9500]/30 dark:bg-[#3a2f12] dark:text-[#f0b429]">
-                {`该配置保存的是 http 明文地址，因此栖阅不会向它发起任何请求（模型列表与设置建议都会以 ${INSECURE_ENDPOINT_CODE} 失败）。把地址改成 https 并保存后即可恢复；本次没有发送任何密钥或设置内容。`}
+                {`该配置保存的是远程 HTTP 明文地址，栖阅不会向它发起请求（${INSECURE_ENDPOINT_CODE}）。改成 HTTPS 并保存后即可恢复；本机 127.0.0.1 / [::1] 网关可使用 HTTP。`}
               </div>
             )}
             {isDirty && (
@@ -4739,7 +4739,7 @@ function AiSettings({ showNotice, registerReloader, aiSelection }: { showNotice:
         {!isCreating && !ai.state.loadError && <SettingRow title="默认模型" description={ai.hasAvailableModel
           ? (mockMode
             ? "Mock/预览：这份模型列表来自契约 fixture，不是真实 Provider 的 /models 响应。"
-            : "模型与能力都来自 Provider 的模型列表。")
+            : "模型来自 Provider。对话能力未声明时，选定后可尝试生成建议；明确不支持的模型不可调用。")
           : `${ai.unavailableModelLabel}：${ai.unavailableModelHint}`}>
           <div className="flex items-center gap-4">
             <SelectControl
@@ -4771,10 +4771,10 @@ function AiSettings({ showNotice, registerReloader, aiSelection }: { showNotice:
               : <span className="text-[13px] text-[var(--haven-settings-muted-strong)]">请检查 API 地址与 API Key</span>}
           </SettingRow>
         )}
-        {!isCreating && !ai.state.loadError && <SettingRow title="识图模型" description="能力只在 Provider 显式声明时才标注；未声明的模型显示「未声明」，不会按模型名推断。">
+        {!isCreating && !ai.state.loadError && <SettingRow title="模型能力" description="能力只在 Provider 显式声明时才标注；未声明的模型显示「未声明」，不会按模型名推断。">
           <div className="flex max-w-[420px] flex-col items-end gap-1">
             {ai.hasAvailableModel ? ai.modelOptions.map((option) => (
-              <span key={option.modelId} className="text-[11px] text-[var(--haven-settings-muted-strong)]">{`${option.modelId} · 识图：${option.visionLabel} · 向量：${option.embeddingLabel}`}</span>
+              <span key={option.modelId} className="text-[11px] text-[var(--haven-settings-muted-strong)]">{`${option.modelId} · 对话：${option.chatLabel} · 识图：${option.visionLabel} · 向量：${option.embeddingLabel}`}</span>
             )) : <span className="text-[13px] font-semibold text-[var(--haven-settings-muted-strong)]">{ai.unavailableModelLabel}</span>}
           </div>
         </SettingRow>}

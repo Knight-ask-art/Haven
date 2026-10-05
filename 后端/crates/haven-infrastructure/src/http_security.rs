@@ -9,7 +9,8 @@
 use std::net::{IpAddr, SocketAddr};
 
 use haven_common::network::{
-    HttpUrlPolicy, fixture_loopback_allowed, is_publicly_routable, parse_http_url,
+    HttpUrlPolicy, ai_provider_loopback_allowed, fixture_loopback_allowed, is_publicly_routable,
+    parse_http_url,
 };
 use reqwest::{ClientBuilder, Url};
 
@@ -55,7 +56,12 @@ pub(crate) async fn resolve_public_http_target(
         return Err(HttpTargetError::ResolveFailed);
     }
     if addresses.iter().any(|address| {
-        !is_publicly_routable(address.ip()) && !fixture_loopback_allowed(&host, address.ip())
+        let local_ai = policy == HttpUrlPolicy::AiProviderEndpoint
+            && dns_name.is_none()
+            && ai_provider_loopback_allowed(&host, address.ip());
+        !(is_publicly_routable(address.ip())
+            || fixture_loopback_allowed(&host, address.ip())
+            || local_ai)
     }) {
         return Err(HttpTargetError::UnsafeAddress);
     }
@@ -108,6 +114,44 @@ pub(crate) fn pin_client_builder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ai_literal_loopback_is_resolved_without_dns_or_proxy_bypass() {
+        for (raw, expected) in [
+            ("http://127.0.0.1:3123/v1", "127.0.0.1:3123"),
+            ("http://[::1]:11434/v1", "[::1]:11434"),
+        ] {
+            let target = resolve_public_http_target(raw, HttpUrlPolicy::AiProviderEndpoint)
+                .await
+                .unwrap();
+            assert_eq!(target.dns_name, None);
+            assert_eq!(
+                target.addresses,
+                vec![expected.parse::<SocketAddr>().unwrap()]
+            );
+            assert!(
+                pin_client_builder(reqwest::Client::builder(), &target)
+                    .build()
+                    .is_ok()
+            );
+        }
+        for raw in [
+            "http://localhost:3123/v1",
+            "http://127.0.0.2:3123/v1",
+            "http://192.168.1.10:3123/v1",
+        ] {
+            assert!(
+                resolve_public_http_target(raw, HttpUrlPolicy::AiProviderEndpoint)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            resolve_public_http_target("http://[::1]:3123/v1", HttpUrlPolicy::MediaResource)
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn loopback_resolution_is_rejected_even_when_the_host_resolves() {

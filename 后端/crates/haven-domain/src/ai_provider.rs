@@ -7,12 +7,12 @@
 //!   enabled / selectedModelId 与审计时间；API key 只存在于 CredentialStore
 //!   （`haven:ai:<profile-id>`）。因此本类型可以安全地进 SQLite、进 wire、进日志。
 //! - **endpoint 必须来自用户显式配置且通过共享 HTTP URL 策略**。拒绝非 http(s)、
-//!   userinfo、fragment、query、单标签主机、非公网字面地址与超范围端口；不做任何
-//!   局域网/服务发现。
-//! - **保存与使用都要求 HTTPS**。这条路径是唯一会把 `Authorization: Bearer <API key>`
+//!   userinfo、fragment、query、单标签主机与非公网地址。唯一例外是显式配置的
+//!   127.0.0.1 / ::1 本机端点及其非零端口；不做局域网/服务发现。
+//! - **远程保存与使用都要求 HTTPS**。这条路径会把 `Authorization: Bearer <API key>`
 //!   连同用户设置快照 / 技能正文发出去的地方，明文 `http` 会让凭据与用户内容暴露给
 //!   路径上的任何一跳。因此：
-//!   - 保存（[`AiProviderProfile::new`]）只接受 `https`，明文地址以固定的
+//!   - 保存（[`AiProviderProfile::new`]）只接受 `https` 或上述本机 `http`，远程明文地址以固定的
 //!     `AI_PROVIDER_ENDPOINT_INSECURE` 拒绝；
 //!   - 使用（[`AiProviderProfile::require_secure_endpoint`]、[`models_url_for`]、
 //!     [`chat_completions_url_for`]）对**历史遗留的明文行**同样拒绝，且零出站流量；
@@ -21,7 +21,9 @@
 //! - **能力不猜**。`AiModelCapability` 是三态闭合集合，第三方响应缺字段即 `Unknown`；
 //!   模型名（`gpt-4o`、`*-vision`、`text-embedding-*`）不构成任何能力证据。
 
-use haven_common::network::{HttpUrlError, HttpUrlPolicy, parse_http_url};
+use haven_common::network::{
+    HttpUrlError, HttpUrlPolicy, ai_provider_loopback_allowed, parse_http_url,
+};
 use haven_common::{AppError, ErrorKind};
 
 use crate::agent::contains_sensitive_text;
@@ -217,7 +219,7 @@ impl AiProviderProfile {
         models_url_for(&self.endpoint)
     }
 
-    /// **使用边界自检**：明文端点必须在这里被拒绝。
+    /// **使用边界自检**：远程明文端点必须在这里被拒绝。
     ///
     /// 读取路径刻意接受历史遗留的明文行（见 [`validate_stored_endpoint`]），因此
     /// "行读出来了"不等于"可以拿它发请求"。任何会把 API Key 或用户内容交给这个端点的
@@ -308,7 +310,8 @@ pub fn validate_display_name(value: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// 校验模型 id：来自 Provider，是外部输入，必须限长且不得带控制字符。
+/// 模型 id 是 JSON 请求体里的不透明值，允许 namespace/model；不用于 URL、路径或 Header。
+/// 来自 Provider 的外部输入仍必须限长且不得带控制字符、空白或反斜杠。
 pub fn validate_model_id(value: &str) -> Result<(), AppError> {
     if value.trim().is_empty() {
         return Err(profile_error(
@@ -324,23 +327,23 @@ pub fn validate_model_id(value: &str) -> Result<(), AppError> {
     }
     if value
         .chars()
-        .any(|c| c.is_control() || c == '/' || c == '\\' || c.is_whitespace())
+        .any(|c| c.is_control() || c == '\\' || c.is_whitespace())
     {
         return Err(profile_error(
             "AI_PROVIDER_MODEL_ID_INVALID",
-            "模型 id 不得包含控制字符、空白或路径分隔符",
+            "模型 id 不得包含控制字符、空白或反斜杠",
         ));
     }
     Ok(())
 }
 
-/// 校验并规范化 endpoint（**保存边界：只接受 HTTPS**）。
+/// 校验并规范化 endpoint（远程 HTTPS；显式本机 loopback 可用 HTTP）。
 ///
 /// 在共享 URL 策略之上再收紧三点（本切片专用）：
-/// - **必须是 `https`**。这条路径是唯一会把 `Authorization: Bearer <API key>` 以及用户
+/// - **远程必须是 `https`**。这条路径会把 `Authorization: Bearer <API key>` 以及用户
 ///   设置快照 / 技能正文发出去的地方；明文 `http` 会把凭据与用户内容暴露给路径上的
 ///   任何一跳。URL 策略本身仍然接受 `http`（那是给其它调用方用的），机密性由本切片
-///   自己负责，而不是悄悄改共享策略。
+///   自己负责。只有共享策略确认的 127.0.0.1 / ::1 本机端点可使用 HTTP。
 /// - 拒绝 query：模型发现要在 endpoint 下拼路径，带 query 的 base 语义不明确，
 ///   而且 `?key=...` 是常见的"把 secret 塞进 URL"的形态。
 /// - 拒绝本地路径形状（`C:\...`、`\\server\share`、`/etc/...`）：这些根本不是 URL，
@@ -378,7 +381,11 @@ fn validate_endpoint_with_scheme(value: &str, require_https: bool) -> Result<Str
     }
     let safe =
         parse_http_url(trimmed, HttpUrlPolicy::AiProviderEndpoint).map_err(endpoint_error)?;
-    if require_https && !safe.as_url().scheme().eq_ignore_ascii_case("https") {
+    let local = safe
+        .host()
+        .parse()
+        .is_ok_and(|ip| ai_provider_loopback_allowed(safe.host(), ip));
+    if require_https && !safe.as_url().scheme().eq_ignore_ascii_case("https") && !local {
         return Err(insecure_endpoint_error());
     }
     if safe.as_url().query().is_some() {
@@ -390,7 +397,7 @@ fn validate_endpoint_with_scheme(value: &str, require_https: bool) -> Result<Str
     Ok(safe.as_str().trim_end_matches('/').to_owned())
 }
 
-/// 明文端点：稳定、固定的拒绝文案。
+/// 远程明文端点：稳定、固定的拒绝文案。
 ///
 /// **不回显**被拒绝的地址（错误消息本身也是"用户配置不出 wire"边界的一部分），也不
 /// 声称地址"非法"——它是合法的 URL，只是不能承载凭据。
@@ -398,15 +405,15 @@ fn insecure_endpoint_error() -> AppError {
     AppError::new(
         "AI_PROVIDER_ENDPOINT_INSECURE",
         ErrorKind::Validation,
-        "API 地址必须使用 HTTPS：API Key 与设置内容不得经明文连接发送。请把地址改为 https:// 后重新保存。",
+        "远程 API 地址必须使用 HTTPS；仅显式配置的本机 127.0.0.1 或 [::1] 地址可使用 HTTP。请修改地址后重新保存。",
         false,
     )
 }
 
 /// 在已规范化的 endpoint 下拼 `/models`，不重复 `/v1`、不重复 `/models`。
 ///
-/// 这是**使用边界**的一部分：拼接前重新走一遍保存期规则（含 HTTPS 要求），因此历史
-/// 行里的明文端点在这里就会被拒绝——凭据与用户内容不会因为"行是旧的"而出站。
+/// 这是**使用边界**的一部分：拼接前重新走一遍保存期规则（远程 HTTPS / 显式本机例外），
+/// 因此历史行里的远程明文端点在这里就会被拒绝。
 pub fn models_url_for(endpoint: &str) -> Result<String, AppError> {
     let base = validate_endpoint(endpoint)?;
     let candidate = if base.ends_with("/models") {
@@ -421,7 +428,7 @@ pub fn models_url_for(endpoint: &str) -> Result<String, AppError> {
 
 /// 在已规范化的 endpoint 下拼 `/chat/completions`，不重复、不逃逸 URL 策略。
 ///
-/// 与 [`models_url_for`] 同一条使用边界：HTTPS 要求在这里同样成立。
+/// 与 [`models_url_for`] 同一条使用边界：远程 HTTPS / 显式本机例外在这里同样成立。
 pub fn chat_completions_url_for(endpoint: &str) -> Result<String, AppError> {
     let base = validate_endpoint(endpoint)?;
     let candidate = if base.ends_with("/chat/completions") {
@@ -455,8 +462,10 @@ fn endpoint_error(error: HttpUrlError) -> AppError {
         HttpUrlError::MissingHost => "API 地址缺少主机名",
         HttpUrlError::UserInfo => "API 地址不得内嵌用户名或密码",
         HttpUrlError::Fragment => "API 地址不得包含片段",
-        HttpUrlError::UnsafeHost => "API 地址的地址段不被允许（仅接受公网主机）",
-        HttpUrlError::DisallowedPort => "API 地址的端口不被允许（仅 80/443/8080/8443）",
+        HttpUrlError::UnsafeHost => "API 地址的地址段不被允许（仅接受公网或规范本机回环主机）",
+        HttpUrlError::DisallowedPort => {
+            "API 地址端口不被允许：公网仅 80/443/8080/8443，本机端口须为 1-65535"
+        }
     };
     profile_error("AI_PROVIDER_ENDPOINT_INVALID", detail)
 }
@@ -486,12 +495,6 @@ impl AiModelCapability {
             Some(false) => Self::Unsupported,
             None => Self::Unknown,
         }
-    }
-
-    /// 只有 Provider **显式声明** `supported` 才允许发起需要该能力的请求。
-    /// `unsupported` 与 `unknown` 都拒绝：缺字段不等于支持，能力不猜。
-    pub const fn is_explicitly_supported(self) -> bool {
-        matches!(self, Self::Supported)
     }
 }
 
@@ -750,14 +753,16 @@ mod tests {
     }
 
     #[test]
-    fn model_id_rejects_control_chars_and_paths() {
-        for invalid in ["", " ", "a b", "a/b", "a\\b", "a\u{7}b"] {
+    fn model_id_accepts_namespaces_but_rejects_control_chars_and_backslashes() {
+        for invalid in ["", " ", "a b", "a\\b", "a\u{7}b"] {
             assert!(
                 validate_model_id(invalid).is_err(),
                 "非法模型 id 必须拒绝: {invalid:?}"
             );
         }
         assert!(validate_model_id("gpt-4o-mini").is_ok());
+        assert!(validate_model_id("provider/reader-model").is_ok());
+        assert!(validate_model_id(&"a".repeat(AI_PROVIDER_MODEL_ID_MAX_LEN + 1)).is_err());
     }
 
     #[test]
@@ -777,7 +782,10 @@ mod tests {
             "https://gateway.example.invalid/v1#frag",
             "https://localhost/v1",
             "https://gateway/v1",
-            "https://127.0.0.1:11434/v1",
+            "https://127.0.0.2:11434/v1",
+            "http://127.0.0.1:3123/v1?key=secret",
+            "http://[::1]:3123/v1#fragment",
+            "http://127.0.0.1:3123\\evil/v1",
             "https://192.168.1.10/v1",
             "https://gateway.example.invalid:12345/v1",
         ] {
@@ -796,11 +804,14 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_accepts_only_https_public_hosts() {
+    fn endpoint_accepts_public_https_or_explicit_local_http() {
         for valid in [
             "https://gateway.example.invalid/v1",
             "https://gateway.example.invalid:8443/compatible/v1",
             "HTTPS://GATEWAY.Example.Invalid/v1",
+            "http://127.0.0.1:3123/v1",
+            "http://[::1]:11434/v1",
+            "https://127.0.0.1:65535/v1",
         ] {
             assert!(validate_endpoint(valid).is_ok(), "合法端点: {valid:?}");
         }
@@ -820,6 +831,45 @@ mod tests {
             // 固定文案：既不回显地址，也不把它说成"非法 URL"。
             assert!(!error.user_message().contains("gateway.example.invalid"));
             assert!(error.user_message().contains("HTTPS"));
+        }
+    }
+
+    #[test]
+    fn local_endpoint_and_namespaced_model_survive_save_read_and_request_boundaries() {
+        for endpoint in ["http://127.0.0.1:3123/v1", "http://[::1]:3123/v1"] {
+            let local = AiProviderProfile::new(
+                "local-gateway",
+                "本机网关",
+                AiProviderKind::OpenAiCompatible,
+                endpoint,
+                true,
+                Some("provider/reader-model".into()),
+                1,
+            )
+            .unwrap();
+            assert!(local.require_secure_endpoint().is_ok());
+            assert_eq!(
+                models_url_for(endpoint).unwrap(),
+                format!("{endpoint}/models")
+            );
+            assert_eq!(
+                chat_completions_url_for(endpoint).unwrap(),
+                format!("{endpoint}/chat/completions")
+            );
+            let stored = AiProviderProfile::from_stored(
+                local.profile_id().into(),
+                local.display_name().into(),
+                local.kind(),
+                local.endpoint().into(),
+                true,
+                local.selected_model_id().map(str::to_owned),
+                "rev-local".into(),
+                1,
+                1,
+            )
+            .unwrap();
+            assert_eq!(stored.selected_model_id(), Some("provider/reader-model"));
+            assert_eq!(stored.endpoint(), endpoint);
         }
     }
 
@@ -882,7 +932,7 @@ mod tests {
                 "gw".into(),
                 "网关".into(),
                 AiProviderKind::OpenAiCompatible,
-                "https://127.0.0.1/v1".into(),
+                "https://127.0.0.2/v1".into(),
                 true,
                 None,
                 "rev-1".into(),
@@ -938,9 +988,6 @@ mod tests {
         assert_eq!(descriptor.vision, AiModelCapability::Unknown);
         assert_eq!(descriptor.embedding, AiModelCapability::Unknown);
         assert_eq!(descriptor.chat, AiModelCapability::Unknown);
-        assert!(!AiModelCapability::Unknown.is_explicitly_supported());
-        assert!(!AiModelCapability::Unsupported.is_explicitly_supported());
-        assert!(AiModelCapability::Supported.is_explicitly_supported());
     }
 
     #[test]

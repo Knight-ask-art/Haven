@@ -11,23 +11,17 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use url::Url;
 
-/// Context-specific policy name. The current contexts share the same safe
-/// default port set; keeping the context explicit prevents a future relaxed
-/// rule from being accidentally reused by the media proxy.
-///
-/// `AiProviderEndpoint` is the user-configured AI provider root. Its rules are
-/// today identical to `SourceEndpoint` on purpose: allowing a loopback or LAN
-/// endpoint has to be a reviewed decision (see `docs/architecture/AI_SYSTEM.md`
-/// §7), not a side effect of adding the AI slice. Spelling the context out
-/// means that decision cannot be inherited silently by this caller.
+/// Context-specific policy name. Only `AiProviderEndpoint` accepts explicitly
+/// configured literal 127.0.0.1 / ::1 endpoints on nonzero ports. This does not
+/// authorize LAN discovery, DNS loopback targets, or media/source access.
 ///
 /// One thing this policy deliberately does **not** encode: confidentiality.
 /// It accepts `http` because it is shared with callers that have no credential
 /// to protect, so the AI provider path adds its own HTTPS requirement on top
+/// except for those local-only AI endpoints
 /// (`haven_domain::ai_provider::validate_endpoint` for saving,
 /// `AiProviderProfile::require_secure_endpoint` before any outbound request).
-/// Weakening this shared policy, or relaxing that extra rule, would send
-/// `Authorization: Bearer` credentials and user content over plaintext.
+/// Public AI endpoints still require HTTPS for credentials and user content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpUrlPolicy {
     SourceEndpoint,
@@ -114,7 +108,33 @@ pub fn parse_http_url(raw: &str, policy: HttpUrlPolicy) -> Result<SafeHttpUrl, H
         return Err(HttpUrlError::DisallowedPort);
     }
     let host = url.host_str().ok_or(HttpUrlError::MissingHost)?;
-    let host = validate_host(host)?;
+    let literal = host.trim_start_matches('[').trim_end_matches(']');
+    let ai_loopback = policy == HttpUrlPolicy::AiProviderEndpoint
+        && literal
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ai_provider_loopback_allowed(literal, ip));
+    let host = if ai_loopback {
+        if raw.contains('\\') {
+            return Err(HttpUrlError::InvalidUrl);
+        }
+        // WHATWG URL parsing normalizes aliases such as 127.1 and 2130706433.
+        // A local credential destination must be spelled as an explicit literal.
+        let authority = raw
+            .split_once("://")
+            .map(|(_, tail)| tail.split(['/', '?', '#']).next().unwrap_or_default())
+            .ok_or(HttpUrlError::UnsafeHost)?;
+        let raw_host = if authority.starts_with('[') {
+            authority.split_once(']').map(|(host, _)| &host[1..])
+        } else {
+            Some(authority.split(':').next().unwrap_or_default())
+        };
+        if raw_host != Some(literal) {
+            return Err(HttpUrlError::UnsafeHost);
+        }
+        literal.to_owned()
+    } else {
+        validate_host(host)?
+    };
     let port = url
         .port_or_known_default()
         .ok_or(HttpUrlError::DisallowedPort)?;
@@ -222,7 +242,21 @@ pub fn is_publicly_routable(ip: IpAddr) -> bool {
     }
 }
 
-fn allowed_port(_policy: HttpUrlPolicy, port: u16, host: &str) -> bool {
+/// Only canonical literal loopback AI targets qualify; DNS answers do not.
+/// Callers must also check the policy and parse the URL through this module.
+pub fn ai_provider_loopback_allowed(host: &str, ip: IpAddr) -> bool {
+    (host == "127.0.0.1" && ip == IpAddr::V4(Ipv4Addr::LOCALHOST))
+        || (host == "::1" && ip == IpAddr::V6(Ipv6Addr::LOCALHOST))
+}
+
+fn allowed_port(policy: HttpUrlPolicy, port: u16, host: &str) -> bool {
+    if policy == HttpUrlPolicy::AiProviderEndpoint
+        && host
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ai_provider_loopback_allowed(host, ip))
+    {
+        return port != 0;
+    }
     // Keep the set deliberately small.  8080/8443 retain common self-hosted
     // media endpoints without allowing arbitrary service ports.
     if matches!(port, 80 | 443 | 8080 | 8443) {
@@ -311,6 +345,67 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ai_loopback_is_explicit_scoped_and_accepts_nonzero_ports() {
+        for raw in [
+            "http://127.0.0.1:3123/v1",
+            "http://127.0.0.1/v1",
+            "https://127.0.0.1:11434/v1",
+            "http://[::1]:3123/v1",
+            "https://[::1]:65535/v1",
+        ] {
+            assert!(
+                parse_http_url(raw, HttpUrlPolicy::AiProviderEndpoint).is_ok(),
+                "{raw}"
+            );
+            for policy in [HttpUrlPolicy::SourceEndpoint, HttpUrlPolicy::MediaResource] {
+                // The unrelated opt-in Film/TV fixture remains its own authority.
+                #[cfg(not(feature = "film-tv-fixture"))]
+                assert!(parse_http_url(raw, policy).is_err(), "{policy:?}: {raw}");
+                #[cfg(feature = "film-tv-fixture")]
+                if !raw.contains("127.0.0.1") {
+                    assert!(parse_http_url(raw, policy).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ai_loopback_does_not_authorize_aliases_dns_lan_or_invalid_authorities() {
+        for raw in [
+            "http://127.0.0.1:0/v1",
+            "http://[::1]:0/v1",
+            "http://127.0.0.1:/v1",
+            "http://127.0.0.1:65536/v1",
+            "http://127.1:3123/v1",
+            "http://2130706433:3123/v1",
+            "http://0x7f000001:3123/v1",
+            "http://127.0.0.1:3123\\evil/v1",
+            "http://[::1]:3123\\evil/v1",
+            "http://[0:0:0:0:0:0:0:1]:3123/v1",
+            "http://127.0.0.1.:3123/v1",
+            "http://127.0.0.2:3123/v1",
+            "http://[::ffff:127.0.0.1]:3123/v1",
+            "http://localhost:3123/v1",
+            "http://gateway.local:3123/v1",
+            "http://0.0.0.0:3123/v1",
+            "http://[::]:3123/v1",
+            "http://192.168.1.10/v1",
+            "http://10.0.0.1/v1",
+            "http://169.254.169.254/v1",
+            "http://user:secret@127.0.0.1:3123/v1",
+            "file:///v1",
+            "http://127.0.0.1:3123/v1#fragment",
+        ] {
+            assert!(
+                parse_http_url(raw, HttpUrlPolicy::AiProviderEndpoint).is_err(),
+                "{raw}"
+            );
+        }
+        assert!(!is_publicly_routable(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!is_publicly_routable(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
 
     #[test]
     fn accepts_public_domains_and_common_media_ports() {
