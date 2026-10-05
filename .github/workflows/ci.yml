@@ -62,7 +62,10 @@ jobs:
             exit 0
           fi
 
-          mapfile -t changed < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          changed_paths="$(mktemp)"
+          trap 'rm -f -- "$changed_paths"' EXIT
+          git diff --name-only -z "$BASE_SHA" "$HEAD_SHA" > "$changed_paths"
+          mapfile -d '' -t changed < "$changed_paths"
           frontend=false
           backend=false
           tauri=false
@@ -213,6 +216,9 @@ jobs:
 
       - name: Test release version policy
         run: python tools/release/version-check.test.py
+
+      - name: Test Unicode changed-path classification
+        run: python tools/release/changed-scope.test.py
 
       - name: Test desktop provenance and signed updater manifest policy
         shell: pwsh

@@ -17,15 +17,12 @@ import {
   reportHomeWallpaperUnavailable,
   requestWallpaperRetry,
 } from "@/features/settings/lib/appearance-runtime"
-import { defaultHomeModuleSettings } from "../lib/home-layout"
 import { defaultOverviewModuleSettings, overviewModuleSettingsToLayout } from "../lib/overview-layout"
-import type { HomeLayoutController, HomeLayoutEditorStatus } from "../lib/useHomeLayout"
 import type { OverviewLayoutController, OverviewLayoutEditorStatus } from "../lib/useOverviewLayout"
 import type { AppearanceAssetLists, AppearanceAssetActionResult } from "../lib/useAppearanceAssets"
 import {
   AppearanceFontPicker,
   AppearanceWallpaperGroup,
-  HomeLayoutEditor,
   OverviewLayoutEditor,
   SettingsPage,
   SettingsSectionUnavailable,
@@ -862,105 +859,6 @@ describe("settings section renderer fallback", () => {  it("shows an unregistere
     // 通用设置的标题与第一项都不该出现：那正是「静默落到 General」的样子。
     expect(screen.queryByText("通用")).toBeNull()
     expect(screen.queryByText("默认启动页")).toBeNull()
-  })
-})
-
-describe("home layout reset availability", () => {
-  function controllerIn(status: HomeLayoutEditorStatus): HomeLayoutController {
-    const modules = defaultHomeModuleSettings()
-    return {
-      state: { status, modules, savedModules: modules, revision: null, message: null, retryable: false },
-      isDirty: false,
-      isSaving: status === "saving",
-      move: () => undefined,
-      reorder: () => undefined,
-      setSize: () => undefined,
-      setVisible: () => undefined,
-      save: () => undefined,
-      reset: vi.fn(),
-      reload: () => undefined,
-    }
-  }
-
-  function resetButton(): HTMLButtonElement {
-    const button = screen.getByText("恢复默认").closest("button")
-    if (!(button instanceof HTMLButtonElement)) throw new Error("恢复默认必须是一个按钮")
-    return button
-  }
-
-  it("offers the reset only once the current revision is actually known", () => {
-    // 还没读到布局：手上的 revision 是 null，而后端的 null 等于「从未保存过」，
-    // 这时点「恢复默认」只可能得到一条用户无法理解的 REVISION_CONFLICT。
-    for (const unknown of ["loading", "error"] as const) {
-      render(<HomeLayoutEditor controller={controllerIn(unknown)} />)
-      expect(resetButton().disabled, `${unknown} 时不该提供恢复默认`).toBe(true)
-      cleanup()
-    }
-
-    // 读到事实之后（无论是否已有保存过的布局）才提供这个动作。
-    render(<HomeLayoutEditor controller={controllerIn("ready")} />)
-    expect(resetButton().disabled).toBe(false)
-  })
-
-  it("explains home layout changes by their visible result", () => {
-    const { container } = render(<HomeLayoutEditor controller={controllerIn("ready")} />)
-
-    expect(screen.getByText("拖动模块手柄调整顺序，选择紧凑、标准或通栏宽度；窄屏下会自动排成单列。")).toBeTruthy()
-    expect(screen.getByText("隐藏全部模块后，首页仍会显示欢迎区。")).toBeTruthy()
-    const preview = screen.getByRole("img", { name: "首页布局实时预览" })
-    expect(preview.className).toContain("gap-2")
-    expect(preview.className).toContain("p-3")
-    expect(preview.querySelector("[data-layout-preview-module]")?.className).toContain("rounded-[4px]")
-    expect(container.textContent).not.toMatch(/空布局|从未保存过|确定性|后端/)
-  })
-
-  it("draws each width option as its actual horizontal grid proportion", () => {
-    render(<HomeLayoutEditor controller={controllerIn("ready")} />)
-
-    const homeWidthGroup = screen.getByRole("group", { name: "继续显示宽度" })
-    const homeFillPercent = (name: string) => {
-      const button = [...homeWidthGroup.querySelectorAll("button")].find((entry) => entry.getAttribute("aria-label") === name)
-      const fill = button?.querySelector<HTMLElement>("[data-layout-width-fill]")
-      if (!fill) throw new Error("首页宽度选项必须有比例示意")
-      return Number.parseFloat(fill.style.width)
-    }
-    expect(homeFillPercent("继续：紧凑")).toBe(25)
-    expect(homeFillPercent("继续：标准")).toBe(50)
-    expect(homeFillPercent("继续：通栏")).toBe(100)
-  })
-
-  it("dims and disables hidden home module controls while leaving its visibility switch operable", () => {
-    const controller = controllerIn("ready")
-    controller.state = {
-      ...controller.state,
-      modules: controller.state.modules.map((entry) => entry.module === "continue" ? { ...entry, visible: false } : entry),
-    }
-    controller.setVisible = vi.fn()
-    controller.reorder = vi.fn()
-    const { container } = render(<HomeLayoutEditor controller={controller} />)
-
-    const row = container.querySelector('[data-layout-module-row="continue"]')
-    if (!row) throw new Error("隐藏的首页模块行必须存在")
-    const staticControls = row.querySelector("[data-layout-static-controls]")
-    expect(staticControls?.className).toContain("opacity-40")
-    expect(staticControls?.className).toContain("pointer-events-none")
-
-    const handle = screen.getByRole("button", { name: "拖动或用方向键调整继续顺序" })
-    expect(handle.getAttribute("aria-disabled")).toBe("true")
-    expect(handle.tabIndex).toBe(-1)
-    fireEvent.keyDown(handle, { key: "ArrowDown" })
-    expect(controller.reorder).not.toHaveBeenCalled()
-
-    const widthGroup = screen.getByRole("group", { name: "继续显示宽度" })
-    expect([...widthGroup.querySelectorAll("button")].every((button) => (button as HTMLButtonElement).disabled)).toBe(true)
-
-    const visibilitySwitch = screen.getByRole("switch", { name: "显示继续" }) as HTMLButtonElement
-    expect(visibilitySwitch.disabled).toBe(false)
-    fireEvent.click(visibilitySwitch)
-    expect(controller.setVisible).toHaveBeenCalledWith("continue", true)
-
-    const preview = screen.getByRole("img", { name: "首页布局实时预览" })
-    expect(preview.textContent).not.toContain("继续")
   })
 })
 

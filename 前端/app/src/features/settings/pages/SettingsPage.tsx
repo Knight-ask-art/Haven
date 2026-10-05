@@ -191,8 +191,6 @@ import {
   type AppearanceAssetSelection,
   type AppearanceAssetsController,
 } from "@/features/settings/lib/useAppearanceAssets"
-import { HOME_MODULES, HOME_MODULE_SIZES, homeModuleLabel, homeModuleSettingsToLayout, type HomeModuleId, type HomeModuleSize } from "@/features/settings/lib/home-layout"
-import { useHomeLayout, type HomeLayoutController } from "@/features/settings/lib/useHomeLayout"
 import {
   OVERVIEW_MODULES,
   OVERVIEW_MODULE_SIZES,
@@ -202,7 +200,7 @@ import {
   type OverviewModulePlacement,
   type OverviewModuleSize,
 } from "@/features/settings/lib/overview-layout"
-import { homeModuleColumnSpan, overviewModuleColumnSpan } from "@/lib/ipc/settings-wire"
+import { overviewModuleColumnSpan } from "@/lib/ipc/settings-wire"
 import {
   useOverviewLayout,
   type OverviewLayoutController,
@@ -400,14 +398,9 @@ function SettingsContent() {
   // 总览布局只读一次、只持有一个 revision：总览渲染器与外观分区里的布局编辑器共用同一份
   // 状态，因此「编辑器保存后总览立刻按新排列渲染」是同一次读取的结果，而不是两个各自
   // 缓存的副本。两个独立 hook 实例会让编辑器拿着过期 revision 去保存。
-  //
-  // 首页布局是**另一份**布局（另一个 hook、另一条 revision），两者互不影响。
   const overviewLayout = useOverviewLayout(appearanceGateway, showNotice)
   const overviewLayoutState = overviewLayout.state
-  // 首页布局编辑器与外观资产列表同样是**页面级**状态，而不是外观分区的局部状态：切换分区
-  // 不该把它们连同「正在飞的导入 / 删除 / 还没保存的布局草稿」一起卸载。放在这里之后，
-  // 分区之间来回切只会换渲染器，不会重读一遍列表、也不会丢掉上一次操作的结果。
-  const homeLayout = useHomeLayout(appearanceGateway, showNotice)
+  // 外观资产列表保持页面级状态，分区切换不会丢掉导入 / 删除的异步结果。
   const appearanceAssets = useAppearanceAssets(
     appearanceAssetSelection(appearanceForm),
     appearanceGateway,
@@ -465,7 +458,6 @@ function SettingsContent() {
                       showNotice,
                       resourceContext,
                       overviewLayout,
-                      homeLayout,
                       appearanceAssets,
                     )}
                 {activeSection === "ai" && aiSettingsOpen && (
@@ -661,8 +653,7 @@ const OVERVIEW_MODULE_SPAN_CLASS: Record<OverviewModuleSize, string> = {
  * 摆放坐标以 CSS 自定义属性交给 index.css 里的 `xl` 媒体查询（`.haven-overview-module-positioned`）。
  *
  * 为什么不是内联的 `gridRow` / `gridColumn`：三列网格只在 `xl` 生效，窄屏是自然单列流，
- * 而内联样式没有断点。同一个「坐标交给自定义属性、断点交给 CSS」的做法，首页模块区
- * （`haven-home-module-positioned`）已经在用。
+ * 而内联样式没有断点，因此坐标交给自定义属性，断点由 CSS 控制。
  *
  * 取值是 **1 基**的网格线编号：存储里的 `row` / `column` 是 0 基的起始格。
  */
@@ -949,7 +940,6 @@ function renderSettingsSection(
   showNotice: (message: string) => void,
   resourceContext: ResourcePreferenceContext | null,
   overviewLayout: OverviewLayoutController,
-  homeLayout: HomeLayoutController,
   appearanceAssets: AppearanceAssetsController,
 ) {
   switch (section) {
@@ -959,7 +949,6 @@ function renderSettingsSection(
           form={forms.appearance}
           showNotice={showNotice}
           overviewLayout={overviewLayout}
-          homeLayout={homeLayout}
           assets={appearanceAssets}
         />
       )
@@ -1382,15 +1371,14 @@ function SettingsFormError({ form }: { form: SettingsFormController }) {
  *   - 主题 / 密度 / 侧栏留白 / 减少动效 → settingsGateway（appearance 分区）；
  *   - 自定义调色板与强调色 → 同一个分区里的 customTheme（运行时投影成 CSS token）；
  *   - 字体与壁纸资产 → appearanceGateway（列表 / 导入 / 删除，只有不透明 assetId）；
- *   - 首页布局 → appearanceGateway 的 homeLayoutGet/Save/Reset（expectedRevision CAS）；
  *   - 总览布局 → appearanceGateway 的 overviewLayoutGet/Save/Reset（**另一份**布局、
  *     另一条 revision、三列网格）。
  *
  * 没有任何一项是本地假状态：控件改的是表单草稿，草稿经 SettingsFormController 提交；
- * 资产与两份布局各自的异步结果由对应 Hook 呈现（loading / empty / ready / conflict /
+ * 资产与总览布局各自的异步结果由对应 Hook 呈现（loading / empty / ready / conflict /
  * error）。
  *
- * 两份布局与资产列表的控制器都由 `SettingsContent` 持有并传入（不是在这里 `use*`）：
+ * 总览布局与资产列表的控制器都由 `SettingsContent` 持有并传入（不是在这里 `use*`）：
  * 总览页渲染的就是同一份已保存状态，所以保存成功后切回总览立刻按新排列渲染；而外观分区
  * 只是它们的编辑器——切到别分区再切回来不会重读列表，也不会丢掉还没保存的布局草稿或
  * 上一次导入/删除的结果。
@@ -1438,7 +1426,7 @@ function ThemePalettePreview({
   )
 }
 
-function AppearanceSettings({ form, showNotice, overviewLayout, homeLayout, assets }: { form: SettingsFormController; showNotice: (message: string) => void; overviewLayout: OverviewLayoutController; homeLayout: HomeLayoutController; assets: AppearanceAssetsController }) {
+function AppearanceSettings({ form, showNotice, overviewLayout, assets }: { form: SettingsFormController; showNotice: (message: string) => void; overviewLayout: OverviewLayoutController; assets: AppearanceAssetsController }) {
   const value = appearanceDisplayValue(form)
   const selection = appearanceAssetSelection(form)
   // 预览的减少动效结论与 AppShell 的壁纸投影同源：设置项（appearance.reduceMotion）与
@@ -1646,7 +1634,6 @@ function AppearanceSettings({ form, showNotice, overviewLayout, homeLayout, asse
         action={assets.action}
       />
 
-      <HomeLayoutEditor controller={homeLayout} />
       <OverviewLayoutEditor controller={overviewLayout} />
     </>
   )
@@ -3109,85 +3096,6 @@ function layoutStatusLabel(
   if (message) return message
   if (isDirty) return "有未保存的布局修改"
   return revision === null ? "当前使用默认布局" : "布局已保存"
-}
-
-/** 首页布局编辑器：真实可用的模块显隐、拖放排序与宽度档位。 */
-export function HomeLayoutEditor({ controller }: { controller: HomeLayoutController }) {
-  const { state, isDirty, isSaving } = controller
-  const canEdit = state.status === "ready" || state.status === "save-error"
-  const layoutRevisionKnown = canEdit || state.status === "saving"
-  const [draggedModule, setDraggedModule] = useState<HomeModuleId | null>(null)
-  const [dropTarget, setDropTarget] = useState<HomeModuleId | null>(null)
-  const visibleModules = state.modules.filter((entry) => entry.visible)
-  const preview = homeModuleSettingsToLayout(state.modules)
-  const onDrop = (event: DragEvent<HTMLDivElement>, targetModule: HomeModuleId) => {
-    const sourceValue = event.dataTransfer.getData("text/plain") || draggedModule
-    const source = state.modules.find((entry) => entry.module === sourceValue && entry.visible)
-    if (!source) return
-    const rect = event.currentTarget.getBoundingClientRect()
-    const targetIndex = layoutDropIndex(
-      state.modules,
-      source.module,
-      targetModule,
-      event.clientY >= rect.top + rect.height / 2,
-    )
-    if (targetIndex !== null) controller.reorder(source.module, targetIndex)
-    setDraggedModule(null)
-    setDropTarget(null)
-  }
-
-  return (
-    <SettingsGroup title="首页布局" features={["appearance.homeLayout"]} description="拖动模块手柄调整顺序，选择紧凑、标准或通栏宽度；窄屏下会自动排成单列。">
-      <LayoutEditorActions
-        sectionName="首页"
-        label={layoutStatusLabel("首页", state.status, state.message, isDirty, state.revision)}
-        status={state.status}
-        isDirty={isDirty}
-        isSaving={isSaving}
-        canEdit={canEdit}
-        layoutRevisionKnown={layoutRevisionKnown}
-        onSave={controller.save}
-        onReset={controller.reset}
-        onReload={controller.reload}
-      />
-      <LayoutWireframePreview
-        ariaLabel="首页布局实时预览"
-        columns={homeModuleColumnSpan("large")}
-        placements={preview.modules}
-        labelFor={(module) => homeModuleLabel(module as HomeModuleId)}
-        spanFor={(size) => homeModuleColumnSpan(size as HomeModuleSize)}
-      />
-      {state.modules.map((entry) => {
-        const visibleIndex = visibleModules.findIndex((item) => item.module === entry.module)
-        return (
-          <LayoutEditorRow
-            key={entry.module}
-            module={entry.module}
-            label={homeModuleLabel(entry.module)}
-            description={HOME_MODULES.find((module) => module.id === entry.module)?.description ?? ""}
-            visible={entry.visible}
-            size={entry.size}
-            sizeOptions={HOME_MODULE_SIZES}
-            columns={homeModuleColumnSpan("large")}
-            spanFor={homeModuleColumnSpan}
-            visibleIndex={visibleIndex}
-            canEdit={canEdit}
-            isSaving={isSaving}
-            isDragging={draggedModule !== null}
-            isDropTarget={dropTarget === entry.module}
-            onResize={(size) => controller.setSize(entry.module, size)}
-            onVisibilityChange={(visible) => controller.setVisible(entry.module, visible)}
-            onReorder={(targetIndex) => controller.reorder(entry.module, targetIndex)}
-            onDragStart={setDraggedModule}
-            onDragEnd={() => { setDraggedModule(null); setDropTarget(null) }}
-            onDragEnter={setDropTarget}
-            onDrop={(event) => onDrop(event, entry.module)}
-          />
-        )
-      })}
-      <p className="px-6 py-3 text-[11px] leading-5 text-[var(--haven-settings-muted)]">隐藏全部模块后，首页仍会显示欢迎区。</p>
-    </SettingsGroup>
-  )
 }
 
 /** 总览布局编辑器：使用同一套拖放与可视宽度控件，但依据总览自己的三列栅格。 */
