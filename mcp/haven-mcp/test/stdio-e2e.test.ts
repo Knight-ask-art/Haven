@@ -8,7 +8,7 @@
 // 并在测试名里说明——完整门禁是 `npm run build && npm test`。
 
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -16,6 +16,9 @@ import { describe, expect, it } from "vitest";
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ENTRY = path.join(PACKAGE_ROOT, "dist", "index.js");
+const PACKAGE_IDENTITY = JSON.parse(
+  readFileSync(path.join(PACKAGE_ROOT, "package.json"), "utf8"),
+) as { name: string; version: string };
 const BUILT = existsSync(ENTRY);
 const maybe = BUILT ? it : it.skip;
 
@@ -81,6 +84,15 @@ describe("stdio 端到端", () => {
     });
     expect(messages.every((message) => message.jsonrpc === "2.0")).toBe(true);
 
+    // 在真正的编译入口检查身份，不能用源码常量作期望而漏掉随包版本漂移。
+    const initialized = messages.find((message) => message.id === 1) as {
+      result?: { serverInfo?: { name: string; version: string } };
+    };
+    expect(initialized.result?.serverInfo).toEqual({
+      name: PACKAGE_IDENTITY.name,
+      version: PACKAGE_IDENTITY.version,
+    });
+
     const toolsList = messages.find((message) => message.id === 2) as {
       result?: { tools?: { name: string }[] };
     };
@@ -89,10 +101,20 @@ describe("stdio 端到端", () => {
 
     // 桥接不可用是**如实报告**，不是启动失败。
     const call = messages.find((message) => message.id === 3) as {
-      result?: { isError?: boolean; structuredContent?: { haven?: { available?: boolean } } };
+      result?: {
+        isError?: boolean;
+        structuredContent?: {
+          haven?: { available?: boolean };
+          mcp_server?: { name: string; version: string };
+        };
+      };
     };
     expect(call.result?.isError).toBeFalsy();
     expect(call.result?.structuredContent?.haven?.available).toBe(false);
+    expect(call.result?.structuredContent?.mcp_server).toMatchObject({
+      name: PACKAGE_IDENTITY.name,
+      version: PACKAGE_IDENTITY.version,
+    });
 
     // 日志确实走了 stderr。
     expect(result.stderr).toContain("HAVEN_BRIDGE_UNAVAILABLE");
