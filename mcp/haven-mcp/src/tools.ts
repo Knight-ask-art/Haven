@@ -16,6 +16,8 @@ import { z } from "zod";
 import {
   READ_ONLY_TOOL_NAMES,
   SCHEMA_VERSION,
+  SERVER_NAME,
+  SERVER_VERSION,
   TOOL_NAMES,
   type ResponseFormat,
   type ToolName,
@@ -780,8 +782,8 @@ async function buildCapabilities(
   return {
     schema_version: SCHEMA_VERSION,
     mcp_server: {
-      name: "haven-mcp-server",
-      version: "0.1.0-beta.1",
+      name: SERVER_NAME,
+      version: SERVER_VERSION,
       tool_count: TOOL_NAMES.length,
       tools: [...TOOL_NAMES],
     },

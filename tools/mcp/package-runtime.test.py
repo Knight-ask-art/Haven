@@ -80,6 +80,9 @@ def _make_minimal_repository(root: Path, version: str = "0.1.0-beta.1") -> Path:
             mcp_root / "node_modules" / package / "package.json",
             {"name": package, "version": "1.0.0"},
         )
+    readme = root / "src-tauri/resources/haven-mcp/README.md"
+    readme.parent.mkdir(parents=True)
+    readme.write_bytes("# Haven MCP 运行时\r\n".encode("utf-8"))
     return mcp_root
 
 
@@ -175,6 +178,7 @@ class PackageRuntimeTests(unittest.TestCase):
             PACK.package_runtime(root, base / "out", node)
 
             bundle = base / "out" / PACK.BUNDLE_DIR_NAME
+            self.assertTrue((bundle / "README.md").is_file())
             self.assertTrue((bundle / PACK.LAUNCHER_NAME).is_file())
             self.assertTrue((bundle / PACK.RUNTIME_DIR_NAME / PACK.RUNTIME_NAME).is_file())
             self.assertTrue((bundle / PACK.ENTRY_RELATIVE).is_file())
@@ -346,6 +350,125 @@ class PackageRuntimeTests(unittest.TestCase):
                 (base / "one/haven-mcp-runtime-0.1.0-beta.1.manifest.json").read_bytes(),
                 (base / "two/haven-mcp-runtime-0.1.0-beta.1.manifest.json").read_bytes(),
             )
+
+    def test_in_tree_rebuild_preserves_tracked_inputs_and_removes_stale_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base = Path(temporary_directory)
+            root = base / "repo"
+            _make_minimal_repository(root)
+            (root / ".gitignore").write_bytes((REPOSITORY_ROOT / ".gitignore").read_bytes())
+            readme = root / "src-tauri/resources/haven-mcp/README.md"
+            original = readme.read_bytes()
+
+            def git(*arguments: str) -> str:
+                result = subprocess.run(
+                    ["git", "-C", str(root), *arguments],
+                    capture_output=True,
+                    check=True,
+                    timeout=30,
+                )
+                return result.stdout.decode("utf-8")
+
+            git("init", "--quiet")
+            git(
+                "add", "--", ".gitignore", ".node-version", "前端/app/package.json",
+                "mcp/haven-mcp/package.json", "src-tauri/resources/haven-mcp/README.md",
+            )
+            before = git("status", "--porcelain", "--untracked-files=all")
+            node = _stub_node(base)
+            out = root / "src-tauri/resources"
+            first = PACK.package_runtime(root, out, node)
+            self.assertEqual(readme.read_bytes(), original)
+            self.assertEqual(git("status", "--porcelain", "--untracked-files=all"), before)
+
+            stale = out / "haven-mcp/dist/retired.js"
+            stale.write_text("export const retired = true;\n", encoding="utf-8")
+            second = PACK.package_runtime(root, out, node)
+            self.assertFalse(stale.exists())
+            self.assertEqual(readme.read_bytes(), original)
+            self.assertEqual(first, second)
+            self.assertEqual(git("status", "--porcelain", "--untracked-files=all"), before)
+
+    def test_rebuild_uses_only_the_canonical_readme_not_arbitrary_old_output_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base = Path(temporary_directory)
+            root = base / "repo"
+            _make_minimal_repository(root)
+            bundle = base / "out/haven-mcp"
+            bundle.mkdir(parents=True)
+            (bundle / "README.md").write_text("UNTRUSTED-OLD-OUTPUT", encoding="utf-8")
+            (bundle / ".env").write_text("SENTINEL=private\n", encoding="utf-8")
+            (bundle / "obsolete.js").write_text("export {};\n", encoding="utf-8")
+
+            manifest = PACK.package_runtime(root, base / "out", _stub_node(base))
+            self.assertEqual(
+                (bundle / "README.md").read_bytes(),
+                (root / "src-tauri/resources/haven-mcp/README.md").read_bytes(),
+            )
+            self.assertFalse((bundle / ".env").exists())
+            self.assertFalse((bundle / "obsolete.js").exists())
+            self.assertIn("README.md", {entry["path"] for entry in manifest["files"]})
+
+    def test_missing_canonical_readme_is_rejected_without_replacing_the_old_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base = Path(temporary_directory)
+            root = base / "repo"
+            _make_minimal_repository(root)
+            (root / "src-tauri/resources/haven-mcp/README.md").unlink()
+            bundle = base / "out/haven-mcp"
+            bundle.mkdir(parents=True)
+            marker = bundle / "old.js"
+            marker.write_bytes(b"unchanged")
+
+            with self.assertRaises(PACK.PackageError):
+                PACK.package_runtime(root, base / "out", _stub_node(base))
+            self.assertEqual(marker.read_bytes(), b"unchanged")
+
+    def test_linked_canonical_resource_directory_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base = Path(temporary_directory)
+            root = base / "repo"
+            _make_minimal_repository(root)
+            resources = root / "src-tauri/resources"
+            outside = base / "outside-resources"
+            resources.rename(outside)
+            if not _make_directory_link(resources, outside):
+                self.skipTest("当前平台不允许创建目录联接或符号链接")
+
+            with self.assertRaises(PACK.PackageError):
+                PACK.package_runtime(root, base / "out", _stub_node(base))
+            self.assertFalse((base / "out").exists())
+
+    def test_linked_canonical_readme_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base = Path(temporary_directory)
+            root = base / "repo"
+            _make_minimal_repository(root)
+            readme = root / "src-tauri/resources/haven-mcp/README.md"
+            outside = base / "outside-readme.md"
+            readme.rename(outside)
+            try:
+                readme.symlink_to(outside)
+            except (OSError, NotImplementedError):
+                self.skipTest("当前平台不允许创建符号链接")
+
+            with self.assertRaises(PACK.PackageError):
+                PACK.package_runtime(root, base / "out", _stub_node(base))
+            self.assertFalse((base / "out").exists())
+
+    def test_release_checks_source_state_after_assembly_before_native_build(self) -> None:
+        workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        assembly = workflow.index("      - name: Assemble the bundled MCP runtime")
+        check = workflow.index("      - name: Verify release assembly leaves source clean")
+        build = workflow.index("      - name: Build and publish Tauri release")
+        final = workflow.index("      - name: Verify actual embedded frontend and native regression gates")
+        self.assertLess(assembly, check)
+        self.assertLess(check, build)
+        self.assertLess(build, final)
+        self.assertIn("git status --porcelain --untracked-files=all", workflow[check:build])
+        self.assertIn("if ($LASTEXITCODE -ne 0)", workflow[check:build])
+        self.assertIn("if ($changes.Count -gt 0)", workflow[check:build])
+        self.assertIn("--clean", workflow[final:])
 
     def test_a_version_mismatch_between_product_and_server_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

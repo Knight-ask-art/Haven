@@ -5,8 +5,13 @@
 // `test/tools.test.ts` 断言注册结果与 `TOOL_NAMES` 完全一致，因此"顺手多注册一个
 // write 工具"会在测试里立刻失败。
 
+import { createRequire } from "node:module";
+
 export const SERVER_NAME = "haven-mcp-server";
-export const SERVER_VERSION = "0.1.0-beta.1";
+// 源码与 dist 的上级目录都是包根；发布身份只取随包清单，不复制版本字面量。
+export const SERVER_VERSION = (
+  createRequire(import.meta.url)("../package.json") as { version: string }
+).version;
 
 /** 所有 MCP 响应载荷共用的 schema 版本（与 Haven Wire 的 schemaVersion 语义一致）。 */
 export const SCHEMA_VERSION = 1 as const;
