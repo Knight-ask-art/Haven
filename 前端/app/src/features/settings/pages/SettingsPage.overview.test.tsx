@@ -433,6 +433,7 @@ describe("overview coordinates are applied at the three-column breakpoint", () =
     expect(xl).toContain(".haven-overview-module-positioned")
     expect(xl).toContain("grid-row-start: var(--haven-overview-module-row)")
     expect(xl).toContain("grid-column-start: var(--haven-overview-module-column)")
-    expect(mediaBlock(1024)).not.toContain("haven-overview-module-positioned")
+    // 首页布局已经移除其 1024px 查询；总览坐标规则仍只能出现在上面验证的 xl 块中。
+    expect(indexCss.match(/\.haven-overview-module-positioned\s*\{/g)).toHaveLength(1)
   })
 })
