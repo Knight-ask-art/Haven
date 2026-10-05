@@ -140,6 +140,13 @@ jobs:
             }
           }
 
+      - name: Verify release assembly leaves source clean
+        shell: pwsh
+        run: |
+          $changes = @(git status --porcelain --untracked-files=all)
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to verify release source state' }
+          if ($changes.Count -gt 0) { throw 'Release assembly modified source inputs' }
+
       - name: Build and publish Tauri release
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:

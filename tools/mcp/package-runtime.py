@@ -11,6 +11,7 @@
 
 ```text
 <out>/haven-mcp/
+  README.md                  ← 仓库跟踪的资源目录说明，重建时保留原始字节
   runtime/node.exe           ← 随包分发的 Node 运行时（自动配置写进客户端的 command）
   dist/**.js                 ← 已编译的 MCP server（自动配置写进客户端的 args）
   node_modules/**            ← 生产依赖
@@ -399,6 +400,17 @@ def package_runtime(
     version = resolve_version(root)
     declared_node = node_version(root, node_version_override)
     entries = collect_bundle(mcp_root)
+
+    # 资源目录的 README 是源码输入，不是旧产物。始终从固定仓库位置读取，
+    # 不能把旧输出目录中的任意文件带入安装包；也不能在整目录替换时删掉源码。
+    resource_root = _resolve_inside(
+        root, f"src-tauri/resources/{BUNDLE_DIR_NAME}", label="MCP 资源目录"
+    )
+    readme = resource_root / "README.md"
+    if _is_link_like(readme) or not readme.is_file():
+        raise PackageError(f"{readme}: 资源目录说明必须是普通文件，不能是链接或重解析点")
+    entries.append(("README.md", readme))
+    entries.sort(key=lambda entry: entry[0])
 
     bundle_root = out_dir / BUNDLE_DIR_NAME
     manifest = build_manifest(version, declared_node, entries, node_path)
