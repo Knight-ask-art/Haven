@@ -145,7 +145,10 @@ jobs:
         run: |
           $changes = @(git status --porcelain --untracked-files=all)
           if ($LASTEXITCODE -ne 0) { throw 'Unable to verify release source state' }
-          if ($changes.Count -gt 0) { throw 'Release assembly modified source inputs' }
+          if ($changes.Count -gt 0) {
+            $changes | ForEach-Object { Write-Host $_ }
+            throw 'Release assembly modified source inputs'
+          }
 
       - name: Build and publish Tauri release
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
@@ -168,6 +171,8 @@ jobs:
             See [CHANGELOG.md](https://github.com/Knight-ask-art/Haven/blob/main/CHANGELOG.md)
             for supported formats, known limitations, and upgrade behavior.
           releaseDraft: true
+          # Haven publishes its own immutable public-download manifest below.
+          uploadUpdaterJson: false
           updaterJsonPreferNsis: true
           # The helper derives prerelease state from the validated public tag.
           prerelease: ${{ steps.release-version.outputs.prerelease }}
@@ -188,6 +193,27 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Tauri regression tests failed' }
           cargo test --locked --features custom-protocol --test frontend_bundle
           if ($LASTEXITCODE -ne 0) { throw 'Desktop embedded frontend is stale or missing' }
+
+      - name: Produce the public Windows updater manifest
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REF: ${{ steps.release-version.outputs.release_ref }}
+          BUNDLE_VERSION: ${{ steps.release-version.outputs.bundle_version }}
+        run: |
+          # GitHub normalizes uploaded filenames; use the actual draft assets,
+          # not a guessed transformation of the local (possibly Chinese) name.
+          $destination = 'src-tauri/target/update-manifest'
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+          gh release download "$env:RELEASE_REF" --dir $destination --pattern '*setup.exe' --pattern '*setup.exe.sig' --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to retrieve generated updater assets' }
+          $installer = @(Get-ChildItem -LiteralPath $destination -Filter '*setup.exe' -File)
+          if ($installer.Count -ne 1) { throw 'Expected exactly one uploaded Windows updater installer' }
+          $signature = "$($installer[0].FullName).sig"
+          python tools/release/make-updater-manifest.py --installer $installer[0].FullName --signature $signature --version "$env:BUNDLE_VERSION" --repository "$env:GITHUB_REPOSITORY" --tag "$env:RELEASE_REF" --output "$destination/latest.json" --notes 'See CHANGELOG.md for supported formats and upgrade behavior.'
+          if ($LASTEXITCODE -ne 0) { throw 'Public updater manifest generation failed' }
+          gh release upload "$env:RELEASE_REF" "$destination/latest.json" --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Public updater manifest upload failed' }
 
       - name: Download and verify draft update artifacts
         shell: pwsh

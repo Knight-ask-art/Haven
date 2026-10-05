@@ -470,6 +470,10 @@ class PackageRuntimeTests(unittest.TestCase):
         self.assertIn("if ($changes.Count -gt 0)", workflow[check:build])
         self.assertIn("--clean", workflow[final:])
 
+    def test_assembly_prunes_installed_dependencies_without_rewriting_the_lockfile(self) -> None:
+        assembly = (REPOSITORY_ROOT / "tools/mcp/assemble-runtime.ps1").read_text(encoding="utf-8")
+        self.assertIn("npm prune --omit=dev --no-save", assembly)
+
     def test_a_version_mismatch_between_product_and_server_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             base = Path(temporary_directory)

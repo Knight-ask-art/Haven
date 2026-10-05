@@ -57,7 +57,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "npm ci 失败" }
     npm run build
     if ($LASTEXITCODE -ne 0) { throw "npm run build 失败" }
-    npm prune --omit=dev
+    # 裁剪安装树，不让 npm 的锁文件序列化版本改写受跟踪的依赖输入。
+    npm prune --omit=dev --no-save
     if ($LASTEXITCODE -ne 0) { throw "npm prune 失败" }
 }
 finally {
