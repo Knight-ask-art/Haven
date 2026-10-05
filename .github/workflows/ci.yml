@@ -385,6 +385,16 @@ jobs:
         shell: pwsh
         run: pwsh tools/mcp/assemble-runtime.ps1 -Out src-tauri/resources
 
+      - name: Verify MCP assembly preserves source inputs
+        shell: pwsh
+        run: |
+          $changes = @(git status --porcelain --untracked-files=all)
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to verify MCP source state' }
+          if ($changes.Count -gt 0) {
+            $changes | ForEach-Object { Write-Host $_ }
+            throw 'MCP assembly modified source inputs'
+          }
+
       - name: Assert the bundle contents, the installer mapping and the declared command
         shell: pwsh
         run: |
