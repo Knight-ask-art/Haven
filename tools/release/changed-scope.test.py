@@ -36,7 +36,9 @@ def bash_executable() -> str:
 
 
 class ChangedScopeTests(unittest.TestCase):
-    def classify(self, workflow: str, path: str) -> dict[str, str]:
+    def classify(
+        self, workflow: str, paths: str | list[str], *, missing_base: bool = False
+    ) -> dict[str, str]:
         with tempfile.TemporaryDirectory(prefix="haven-scope-test-") as temporary:
             repository = Path(temporary)
 
@@ -54,17 +56,18 @@ class ChangedScopeTests(unittest.TestCase):
             git("config", "core.quotepath", "true")
             git("commit", "--quiet", "--allow-empty", "-m", "base")
             base = git("rev-parse", "HEAD")
-            changed = repository / path
-            changed.parent.mkdir(parents=True, exist_ok=True)
-            changed.write_text("fixture\n", encoding="utf-8")
-            git("add", "--", path)
+            for path in [paths] if isinstance(paths, str) else paths:
+                changed = repository / path
+                changed.parent.mkdir(parents=True, exist_ok=True)
+                changed.write_text("fixture\n", encoding="utf-8")
+                git("add", "--", path)
             git("commit", "--quiet", "-m", "change")
             head = git("rev-parse", "HEAD")
             output = repository / "scope-output.txt"
             environment = {
                 **os.environ,
                 "EVENT_NAME": "pull_request",
-                "BASE_SHA": base,
+                "BASE_SHA": "missing-commit" if missing_base else base,
                 "HEAD_SHA": head,
                 "GITHUB_OUTPUT": output.as_posix(),
             }
@@ -75,6 +78,10 @@ class ChangedScopeTests(unittest.TestCase):
                 capture_output=True,
                 encoding="utf-8",
             )
+            if missing_base:
+                self.assertNotEqual(result.returncode, 0, "Invalid Git input must fail closed")
+                self.assertFalse(output.exists(), "Failed classification must not emit false scope flags")
+                return {}
             self.assertEqual(result.returncode, 0, result.stderr)
             return dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
 
@@ -89,6 +96,20 @@ class ChangedScopeTests(unittest.TestCase):
     def test_spaces_do_not_split_a_chinese_path(self) -> None:
         self.assertEqual(self.classify("ci.yml", "前端/app/space name.tsx")["frontend"], "true")
         self.assertEqual(self.classify("codeql.yml", "前端/app/space name.tsx")["javascript"], "true")
+
+    def test_multiple_paths_select_both_frontend_and_backend(self) -> None:
+        paths = ["前端/app/example.tsx", "后端/crates/example.rs"]
+        ci = self.classify("ci.yml", paths)
+        self.assertEqual(ci["frontend"], "true")
+        self.assertEqual(ci["backend"], "true")
+        codeql = self.classify("codeql.yml", paths)
+        self.assertEqual(codeql["javascript"], "true")
+        self.assertEqual(codeql["rust"], "true")
+
+    def test_invalid_base_commit_fails_instead_of_skipping_checks(self) -> None:
+        for workflow in ("ci.yml", "codeql.yml"):
+            with self.subTest(workflow=workflow):
+                self.classify(workflow, "前端/app/example.tsx", missing_base=True)
 
     def test_documentation_does_not_select_unrelated_components(self) -> None:
         self.assertTrue(all(value == "false" for value in self.classify("ci.yml", "docs/example.md").values()))
