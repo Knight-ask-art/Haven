@@ -46,7 +46,7 @@ const FEATURE_SEARCH_TERMS: Partial<Record<FeatureId, readonly string[]>> = {
   "downloads.speedLimit": ["下载速度限制", "限速"],
   "ai.providerProfile": ["AI 服务", "提供商", "API 地址", "OpenAI Compatible"],
   "ai.providerCredential": ["API Key", "apikey", "密钥"],
-  "ai.providerModel": ["默认模型", "模型列表", "识图模型"],
+  "ai.providerModel": ["默认模型", "模型列表", "模型能力", "对话", "识图", "识图模型", "向量"],
   "ai.agentBroker": ["MCP", "外部 Agent", "接入"],
   "ai.clientAutoConfig": ["MCP", "Codex", "Claude Code", "自动配置"],
   "skills.builtinRuntime": ["Skills", "内置技能"],

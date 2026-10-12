@@ -19,11 +19,11 @@ const gateway = vi.hoisted(() => ({
   catalogStateHint: vi.fn(() => "暂无模型"),
 }))
 
-// 用 `importOriginal` 保留真实的常量与纯函数（`isHttpsAiEndpoint`、
+// 用 `importOriginal` 保留真实的常量与纯函数（`isAiEndpointTransportAllowed`、
 // `INSECURE_ENDPOINT_CODE` …），只替换真正需要打桩的 IO。
 //
 // 为什么不再手写整个模块：手写替身必须逐项复制模块的导出面，漏掉一个（这里曾经漏掉
-// `isHttpsAiEndpoint`）就会让 Hook 在运行时拿到 `undefined is not a function`，
+// `isAiEndpointTransportAllowed`）就会让 Hook 在运行时拿到 `undefined is not a function`，
 // 而失败现象是"未处理的异常"，与真正的断言失败混在一起，读起来完全不像 Jest 的报错。
 vi.mock("../ipc/ai-provider-gateway", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../ipc/ai-provider-gateway")>()
@@ -81,6 +81,42 @@ beforeEach(() => {
 })
 
 describe("useAiProviderSettings 并发与读取失败", () => {
+  it("本机 HTTP 配置可以保存并回读，不被错误标记为明文远程地址", async () => {
+    const local = { ...PROFILE, endpoint: "http://127.0.0.1:3123/v1", selectedModelId: "provider/reader-model" }
+    gateway.listAiProviderProfiles.mockResolvedValue([local])
+    gateway.upsertAiProviderProfile.mockResolvedValue(local)
+    const { result } = renderHook(() => useAiProviderSettings())
+    await waitFor(() => expect(result.current.selectedProfile?.profileId).toBe(local.profileId))
+    expect(result.current.selectedEndpointInsecure).toBe(false)
+    await act(async () => {
+      await expect(result.current.saveProfile({
+        profileId: local.profileId, displayName: local.displayName, endpoint: local.endpoint,
+        enabled: true, selectedModelId: local.selectedModelId,
+      })).resolves.toBe(true)
+    })
+    expect(gateway.upsertAiProviderProfile).toHaveBeenCalledWith(expect.objectContaining({
+      endpoint: local.endpoint, selectedModelId: local.selectedModelId,
+    }))
+    expect(result.current.selectedProfile?.endpoint).toBe(local.endpoint)
+  })
+
+  it("远程 HTTP 配置保存前快速拒绝，不发送密钥或发起保存请求", async () => {
+    const remote = { ...PROFILE, endpoint: "http://gateway.example.invalid/v1" }
+    gateway.listAiProviderProfiles.mockResolvedValue([remote])
+    const { result } = renderHook(() => useAiProviderSettings())
+    await waitFor(() => expect(result.current.selectedProfile?.profileId).toBe(remote.profileId))
+    expect(result.current.selectedEndpointInsecure).toBe(true)
+    await act(async () => {
+      await expect(result.current.saveProfile({
+        profileId: remote.profileId, displayName: remote.displayName, endpoint: remote.endpoint,
+        enabled: true, selectedModelId: null,
+      })).resolves.toBe(false)
+    })
+    expect(result.current.state.saveError?.code).toBe("AI_PROVIDER_ENDPOINT_INSECURE")
+    expect(gateway.upsertAiProviderProfile).not.toHaveBeenCalled()
+    expect(gateway.setAiProviderApiKey).not.toHaveBeenCalled()
+  })
+
   it("模型刷新不会使同时进行的 Provider 列表读取失效", async () => {
     const { result } = renderHook(() => useAiProviderSettings())
     await waitFor(() => expect(result.current.state.loading).toBe(false))

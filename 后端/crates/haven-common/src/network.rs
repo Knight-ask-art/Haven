@@ -13,16 +13,18 @@ use url::Url;
 
 /// Context-specific URL policy. Fixed source/media policies retain their
 /// existing boundaries. `UserProvidedSource` is the explicit exception for
-/// destinations entered by the user in source settings.
+/// destinations entered by the user in source settings. `AiProviderEndpoint`
+/// accepts only explicitly configured canonical 127.0.0.1 / ::1 literals on
+/// nonzero ports; it does not authorize LAN discovery or DNS loopback targets.
 ///
 /// One thing this policy deliberately does **not** encode: confidentiality.
 /// It accepts `http` because it is shared with callers that have no credential
 /// to protect, so the AI provider path adds its own HTTPS requirement on top
+/// except for those local-only AI endpoints
 /// (`haven_domain::ai_provider::validate_endpoint` for saving,
 /// `AiProviderProfile::require_secure_endpoint` before any outbound request).
-/// Weakening this shared policy or relaxing credential-specific rules would
-/// send credentials and user content over plaintext. User-provided source
-/// requests carrying credentials also require HTTPS.
+/// Public AI endpoints and user-provided source requests carrying credentials
+/// still require HTTPS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpUrlPolicy {
     SourceEndpoint,
@@ -122,7 +124,31 @@ pub fn parse_http_url(raw: &str, policy: HttpUrlPolicy) -> Result<SafeHttpUrl, H
         return Err(HttpUrlError::DisallowedPort);
     }
     let host = url.host_str().ok_or(HttpUrlError::MissingHost)?;
-    let host = if policy == HttpUrlPolicy::UserProvidedSource {
+    let literal = host.trim_start_matches('[').trim_end_matches(']');
+    let ai_loopback = policy == HttpUrlPolicy::AiProviderEndpoint
+        && literal
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ai_provider_loopback_allowed(literal, ip));
+    let host = if ai_loopback {
+        if raw.contains('\\') {
+            return Err(HttpUrlError::InvalidUrl);
+        }
+        // WHATWG URL parsing normalizes aliases such as 127.1 and 2130706433.
+        // A local credential destination must be spelled as an explicit literal.
+        let authority = raw
+            .split_once("://")
+            .map(|(_, tail)| tail.split(['/', '?', '#']).next().unwrap_or_default())
+            .ok_or(HttpUrlError::UnsafeHost)?;
+        let raw_host = if authority.starts_with('[') {
+            authority.split_once(']').map(|(host, _)| &host[1..])
+        } else {
+            Some(authority.split(':').next().unwrap_or_default())
+        };
+        if raw_host != Some(literal) {
+            return Err(HttpUrlError::UnsafeHost);
+        }
+        literal.to_owned()
+    } else if policy == HttpUrlPolicy::UserProvidedSource {
         validate_user_provided_source_host(host)?
     } else {
         validate_host(host)?
@@ -295,6 +321,9 @@ pub fn is_publicly_routable(ip: IpAddr) -> bool {
 /// source endpoint. Link-local, unspecified, multicast and reserved ranges are
 /// intentionally excluded; 100.64.0.0/10 is included for common personal VPNs.
 pub fn is_user_source_local_ip_allowed(ip: IpAddr) -> bool {
+    if is_local_proxy_fake_ip(ip) {
+        return false;
+    }
     match ip {
         IpAddr::V4(address) => {
             address.is_private() || address.is_loopback() || is_shared_ipv4(address)
@@ -303,11 +332,38 @@ pub fn is_user_source_local_ip_allowed(ip: IpAddr) -> bool {
     }
 }
 
-/// 当前识别的本机 DNS 代理精确 Fake-IP 前缀。
+/// Only canonical literal loopback AI targets qualify; DNS answers do not.
+/// Callers must also check the policy and parse the URL through this module.
+pub fn ai_provider_loopback_allowed(host: &str, ip: IpAddr) -> bool {
+    (host == "127.0.0.1" && ip == IpAddr::V4(Ipv4Addr::LOCALHOST))
+        || (host == "::1" && ip == IpAddr::V6(Ipv6Addr::LOCALHOST))
+}
+
+fn allowed_port(policy: HttpUrlPolicy, port: u16, host: &str) -> bool {
+    if policy == HttpUrlPolicy::UserProvidedSource {
+        return port != 0;
+    }
+    if policy == HttpUrlPolicy::AiProviderEndpoint
+        && host
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ai_provider_loopback_allowed(host, ip))
+    {
+        return port != 0;
+    }
+    if host
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| fixture_loopback_allowed(host, ip))
+    {
+        return matches!(port, 80 | 443 | 8080 | 8443) || (49152..=65535).contains(&port);
+    }
+    matches!(port, 80 | 443 | 8080 | 8443)
+}
+
+/// Recognized local DNS proxy Fake-IP prefixes.
 ///
-/// 只用于识别域名解析结果，本身不授权任何请求。固定来源策略仍由
-/// `parse_http_url` 拒绝这些保留地址；用户明确配置的 `UserProvidedSource` 则接受
-/// ULA 字面地址以支持本机服务，因此也接受落在此 IPv6 前缀内的用户端点。
+/// This classifies addresses but does not grant request access. The transport
+/// may accept these addresses as DNS answers for hostnames; URL literals stay
+/// rejected, including when entered as a user-configured source.
 pub fn is_local_proxy_fake_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(address) => {
@@ -321,20 +377,6 @@ pub fn is_local_proxy_fake_ip(ip: IpAddr) -> bool {
 fn is_shared_ipv4(ip: Ipv4Addr) -> bool {
     let [first, second, _, _] = ip.octets();
     first == 100 && (64..=127).contains(&second)
-}
-
-fn allowed_port(policy: HttpUrlPolicy, port: u16, host: &str) -> bool {
-    // A source endpoint explicitly entered by the user can use its chosen service port.
-    if policy == HttpUrlPolicy::UserProvidedSource {
-        return port != 0;
-    }
-    if host
-        .parse::<IpAddr>()
-        .is_ok_and(|ip| fixture_loopback_allowed(host, ip))
-    {
-        return matches!(port, 80 | 443 | 8080 | 8443) || (49152..=65535).contains(&port);
-    }
-    matches!(port, 80 | 443 | 8080 | 8443)
 }
 
 /// Candidate-only network escape hatch for the deterministic local fixture.
@@ -418,6 +460,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ai_loopback_is_explicit_scoped_and_accepts_nonzero_ports() {
+        for raw in [
+            "http://127.0.0.1:3123/v1",
+            "http://127.0.0.1/v1",
+            "https://127.0.0.1:11434/v1",
+            "http://[::1]:3123/v1",
+            "https://[::1]:65535/v1",
+        ] {
+            assert!(
+                parse_http_url(raw, HttpUrlPolicy::AiProviderEndpoint).is_ok(),
+                "{raw}"
+            );
+            for policy in [HttpUrlPolicy::SourceEndpoint, HttpUrlPolicy::MediaResource] {
+                // The unrelated opt-in Film/TV fixture remains its own authority.
+                #[cfg(not(feature = "film-tv-fixture"))]
+                assert!(parse_http_url(raw, policy).is_err(), "{policy:?}: {raw}");
+                #[cfg(feature = "film-tv-fixture")]
+                if !raw.contains("127.0.0.1") {
+                    assert!(parse_http_url(raw, policy).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ai_loopback_does_not_authorize_aliases_dns_lan_or_invalid_authorities() {
+        for raw in [
+            "http://127.0.0.1:0/v1",
+            "http://[::1]:0/v1",
+            "http://127.0.0.1:/v1",
+            "http://127.0.0.1:65536/v1",
+            "http://127.1:3123/v1",
+            "http://2130706433:3123/v1",
+            "http://0x7f000001:3123/v1",
+            "http://127.0.0.1:3123\\evil/v1",
+            "http://[::1]:3123\\evil/v1",
+            "http://[0:0:0:0:0:0:0:1]:3123/v1",
+            "http://127.0.0.1.:3123/v1",
+            "http://127.0.0.2:3123/v1",
+            "http://[::ffff:127.0.0.1]:3123/v1",
+            "http://localhost:3123/v1",
+            "http://gateway.local:3123/v1",
+            "http://0.0.0.0:3123/v1",
+            "http://[::]:3123/v1",
+            "http://192.168.1.10/v1",
+            "http://10.0.0.1/v1",
+            "http://169.254.169.254/v1",
+            "http://user:secret@127.0.0.1:3123/v1",
+            "file:///v1",
+            "http://127.0.0.1:3123/v1#fragment",
+        ] {
+            assert!(
+                parse_http_url(raw, HttpUrlPolicy::AiProviderEndpoint).is_err(),
+                "{raw}"
+            );
+        }
+        assert!(!is_publicly_routable(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!is_publicly_routable(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
     fn accepts_public_domains_and_common_media_ports() {
         for raw in [
             "https://cdn.example.invalid/video/index.m3u8",
@@ -477,30 +580,14 @@ mod tests {
             for raw in [
                 "http://198.18.0.1:443/video.mp4",
                 "https://198.19.255.254:443/opds",
+                "https://[fdfe:dcba:9876::1]:443/opds",
             ] {
                 assert!(
                     parse_http_url(raw, policy).is_err(),
-                    "IPv4 fake-IP must remain blocked as a literal for {policy:?}: {raw}"
+                    "Fake-IP must remain blocked as a literal for {policy:?}: {raw}"
                 );
             }
         }
-        for policy in [
-            HttpUrlPolicy::MediaResource,
-            HttpUrlPolicy::SourceEndpoint,
-            HttpUrlPolicy::AiProviderEndpoint,
-        ] {
-            assert!(
-                parse_http_url("https://[fdfe:dcba:9876::1]:443/opds", policy).is_err(),
-                "fixed policies must reject private IPv6 fake-IP literals: {policy:?}"
-            );
-        }
-        assert!(
-            parse_http_url(
-                "https://[fdfe:dcba:9876::1]:443/opds",
-                HttpUrlPolicy::UserProvidedSource
-            )
-            .is_ok()
-        );
     }
 
     #[test]
@@ -644,7 +731,6 @@ mod tests {
             "http://172.16.3.4:9973/api.php",
             "https://[::1]:8080/opds",
             "https://[fd12::10]:8096/api",
-            "https://[fdfe:dcba:9876::1]:8096/opds",
             "http://nas:5001/opds",
             "http://komga.local:8096/api",
             "https://reader.home.internal:5001/opds",

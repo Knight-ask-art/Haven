@@ -32,22 +32,36 @@ export const NO_AVAILABLE_MODEL = "无可用模型";
  *
  * 与 Rust 侧 `AI_PROVIDER_ENDPOINT_INSECURE` **逐字对应**：这条路径是唯一会把
  * `Authorization: Bearer <API Key>` 以及用户设置快照 / 技能正文发出去的地方，
- * 明文 `http` 会让它们暴露给链路上的任何一跳。
+ * 远程明文 `http` 会让它们暴露给链路上的任何一跳；显式本机端点是唯一例外。
  *
  * 前端只做**快速失败**（省一次往返），权威结论仍然来自后端；两侧码值不一致时以后端为准。
  */
 export const INSECURE_ENDPOINT_CODE = "AI_PROVIDER_ENDPOINT_INSECURE";
 export const INSECURE_ENDPOINT_MESSAGE =
-  "API 地址必须使用 HTTPS：API Key 与设置内容不得经明文连接发送。请把地址改为 https:// 后重新保存。";
+  "远程 API 地址必须使用 HTTPS；仅显式配置的本机 127.0.0.1 或 [::1] 地址可使用 HTTP。请修改地址后重新保存。";
 
 /**
- * 端点是不是 https。
+ * 快速判断 HTTPS 或显式本机 HTTP；后端仍负责完整 URL / DNS / 端口策略。
  *
- * 只做前缀判断，**不**在 TS 里重建 Rust 的主机 / 端口 / DNS 策略——那会制造两套会漂移
- * 的真相。这里回答的是唯一一个前端必须知道的机密性问题：明文还是加密。
+ * 不解析 DNS、不授予 LAN 权限，也不认可 WHATWG 归一化的 loopback 别名。
  */
-export function isHttpsAiEndpoint(endpoint: string): boolean {
-  return endpoint.trim().toLowerCase().startsWith("https://");
+export function isAiEndpointTransportAllowed(endpoint: string): boolean {
+  const value = endpoint.trim();
+  if (value.toLowerCase().startsWith("https://")) return true;
+  if (/[\s\\]/u.test(value)) return false;
+  for (const character of value) {
+    const code = character.charCodeAt(0);
+    if (code <= 0x1f || code === 0x7f) return false;
+  }
+  const authority = value.split("://")[1]?.split(/[/?#]/u)[0];
+  if (!authority || !/^(127\.0\.0\.1|\[::1\])(?::[0-9]+)?$/u.test(authority)) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" && url.port !== "0"
+      && url.username === "" && url.password === "" && url.search === "" && url.hash === "";
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -140,7 +154,7 @@ function isOptionalText(value: unknown): value is string | null {
  *
  * `endpoint` **允许** `http://`：升级前保存的明文行仍然存在，设置页必须能列出它们、
  * 打开它们、把它们改成 https 或删掉——把这类行判成非法载荷会让整份列表守卫失败，
- * 用户连修复入口都拿不到。机密性由保存边界（[`isHttpsAiEndpoint`] + 后端）与使用边界
+ * 用户连修复入口都拿不到。机密性由保存边界（[`isAiEndpointTransportAllowed`] + 后端）与使用边界
  * （后端 `require_secure_endpoint`）负责，不由"读不出来"兜底。
  */
 export function guardAiProviderProfile(value: unknown): value is AiProviderProfileDto {
@@ -398,6 +412,7 @@ export function catalogStateHint(state: AiProviderModelsCatalogStateDto | null):
 export type AiProviderModelOption = {
   modelId: string;
   label: string;
+  chatLabel: string;
   visionLabel: string;
   embeddingLabel: string;
 };
@@ -409,6 +424,7 @@ export function toModelOptions(
   return catalog.models.map((model) => ({
     modelId: model.modelId,
     label: model.displayName ?? model.modelId,
+    chatLabel: capabilityLabel(model.chat),
     visionLabel: capabilityLabel(model.vision),
     embeddingLabel: capabilityLabel(model.embedding),
   }));
