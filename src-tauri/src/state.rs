@@ -130,6 +130,8 @@ pub struct AppState {
     pub home: HomeService,
     /// 来源注册表（契约 §36.2；V2-A 冻结批次）。
     pub source_registry: SourceRegistryService,
+    /// 来源凭据与清理任务共享的系统凭据存储视图；秘密不出 Rust 边界。
+    pub(crate) source_credential_store: Arc<dyn haven_domain::credential::CredentialStore>,
     /// 渐进式来源搜索（契约 §36.3；V2-B 起接入 CMS10 参与者）。
     pub search_source: SearchSourceService,
     /// 搜索事件出口（每次 search_source_start 绑定 Channel）。
@@ -365,7 +367,22 @@ impl AppState {
         // sourceId 若未同时接入真实搜索参与者，直接 fail closed，不能静默显示。
         haven_infrastructure::metadata_sources::validate_builtin_search_coverage()?;
         let source_registry_settings: Arc<dyn SourceRegistryPorts> = repos.clone();
-        let source_registry = SourceRegistryService::new(source_registry_settings);
+        // 文件库使用同目录的跨进程租约；只有明确的内存库装配才使用进程内租约。
+        // 不给文件锁失败提供内存回退，否则两个实例会各自成为“唯一”凭据写者。
+        let source_credential_lease: Arc<
+            dyn haven_application::services::source_registry::SourceCredentialLease,
+        > = if db.path().is_some_and(|path| !path.as_os_str().is_empty()) {
+            Arc::new(haven_infrastructure::FileSourceCredentialLease::from_db(
+                db.as_ref(),
+            )?)
+        } else {
+            Arc::new(
+                haven_application::services::source_registry::InMemorySourceCredentialLease::new(),
+            )
+        };
+        let source_registry = SourceRegistryService::new(source_registry_settings)
+            .with_settings_uow(Arc::new(SqliteSettingsUoW::new(db.clone())))
+            .with_credential_lease(source_credential_lease);
         // Task 1：用户登记的 RSS/Atom 订阅源。同一个 FeedProvider 实例同时被注入
         // 目录详情/在线会话/离线获取、导入路由和搜索参与者，避免出现两条互不
         // 一致的订阅源读取路径；未注入的候选保持 fail closed。
@@ -401,14 +418,16 @@ impl AppState {
                 false,
             )
         })?);
-        let metadata_client = Arc::new(MetadataClient::new().map_err(|e| {
-            haven_common::AppError::new(
-                "INTERNAL_ERROR",
-                haven_common::ErrorKind::Internal,
-                e.user_message(),
-                false,
-            )
-        })?);
+        let metadata_client = Arc::new(MetadataClient::with_image_proxy(repos.clone()).map_err(
+            |e| {
+                haven_common::AppError::new(
+                    "INTERNAL_ERROR",
+                    haven_common::ErrorKind::Internal,
+                    e.user_message(),
+                    false,
+                )
+            },
+        )?);
         // V2-H 收尾批次：自定义源凭据解析器——搜索/导入请求前从系统 keyring 取
         // Basic Auth secret（内存即取即用，禁止落盘/日志）。
         //
@@ -437,18 +456,28 @@ impl AppState {
             ),
         );
         let opds_client = Arc::new(
-            haven_infrastructure::opds::OpdsClient::new()?.with_credential_resolver(Arc::new({
-                let store = credential_store.clone();
-                move |source_id: &str| {
-                    let store = store.clone();
-                    let source_id = source_id.to_owned();
-                    Box::pin(async move {
-                        let target = haven_application::services::source_registry::SourceRegistryService::custom_credential_target(&source_id).ok()?;
-                        let secret = store.get(&target).await.ok()??;
-                        Some(secret.expose().to_owned())
-                    })
-                }
-            })),
+            haven_infrastructure::opds::OpdsClient::new()?
+                .with_source_registry(source_registry.clone())
+                .with_credential_resolver(Arc::new({
+                    let store = credential_store.clone();
+                    let registry = source_registry.clone();
+                    move |source_id: &str| {
+                        let store = store.clone();
+                        let registry = registry.clone();
+                        let source_id = source_id.to_owned();
+                        Box::pin(async move {
+                            let target =
+                                registry.custom_credential_ref(&source_id).await.ok()??;
+                            let secret = store.get(&target).await.ok()??;
+                            if registry.custom_credential_ref(&source_id).await.ok()?
+                                != Some(target)
+                            {
+                                return None;
+                            }
+                            Some(secret.expose().to_owned())
+                        })
+                    }
+                })),
         );
         // Task 2：用户登记的自托管漫画库（Komga/Kavita）。同一个 Provider 实例
         // 同时承接目录详情/章节目录、在线逐页读取、章节归档下载与搜索参与者，
@@ -472,21 +501,17 @@ impl AppState {
             haven_infrastructure::comic_library_sources::ApiKeyResolver,
         > = Arc::new({
             let store = credential_store.clone();
+            let registry = source_registry.clone();
             move |source_id: &str| {
                 let store = store.clone();
+                let registry = registry.clone();
                 let source_id = source_id.to_owned();
                 Box::pin(async move {
-                    let kind =
-                        haven_application::services::source_registry::SourceRegistryService::comic_library_kind(
-                            &source_id,
-                        )?;
-                    let target =
-                        haven_application::services::source_registry::SourceRegistryService::credential_target_for_kind(
-                            &source_id,
-                            kind,
-                        )
-                        .ok()?;
+                    let target = registry.custom_credential_ref(&source_id).await.ok()??;
                     let secret = store.get(&target).await.ok()??;
+                    if registry.custom_credential_ref(&source_id).await.ok()? != Some(target) {
+                        return None;
+                    }
                     Some(secret.expose().to_owned())
                 })
             }
@@ -513,9 +538,10 @@ impl AppState {
                 comic_library_pages,
             ),
         ));
-        // V2-H1：OPDS 书源——3 个内置参与者 + 已启用自定义源动态参与者。
+        // V2-H1：OPDS 书源——内置 Gutenberg 参与者 + 已启用自定义源动态参与者。
         let mut participants: Vec<Arc<dyn SearchSourceParticipant>> = vec![Arc::new(
-            Cms10SearchParticipant::new(source_registry.clone(), cms10_client.clone()),
+            Cms10SearchParticipant::new(source_registry.clone(), cms10_client.clone())
+                .with_image_proxy(repos.clone()),
         )];
         participants.extend(
             haven_infrastructure::metadata_sources::metadata_participants(metadata_client.clone()),
@@ -530,7 +556,8 @@ impl AppState {
                     sid,
                     source_registry.clone(),
                     opds_client.clone(),
-                ),
+                )
+                .with_image_proxy(repos.clone()),
             ));
         }
         // 自定义源：单个前缀路由参与者承接全部 `custom_` 源
@@ -540,7 +567,8 @@ impl AppState {
                 haven_infrastructure::opds::CUSTOM_OPDS_ID_PREFIX.to_owned(),
                 source_registry.clone(),
                 opds_client.clone(),
-            ),
+            )
+            .with_image_proxy(repos.clone()),
         ));
         // 用户登记的 RSS/Atom 订阅源：`custom_feed_` 前缀比 `custom_` 更长，
         // 最长前缀路由会把订阅源交给本参与者，而不会落到上面的自定义 OPDS。
@@ -704,7 +732,7 @@ impl AppState {
             repos.clone();
         let ai_provider = AiProviderProfileService::new(
             ai_provider_profiles,
-            credential_store,
+            credential_store.clone(),
             Arc::new(haven_infrastructure::ai_provider::OpenAiCompatibleModelCatalog::new()),
         )
         .with_settings_recommendation(Arc::new(
@@ -832,6 +860,7 @@ impl AppState {
             marker,
             home,
             source_registry,
+            source_credential_store: credential_store,
             search_source,
             search_sink,
             source_import,

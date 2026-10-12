@@ -13,6 +13,9 @@
 //! - 取回与解析**先于任何写入**。失败时不会注册来源，也不会覆盖已有的 last-known-good。
 //! - 注册先于缓存。缓存写入失败时回滚刚完成的注册，而不是留下一个「已登记但没有配置」
 //!   的来源——那种状态会让用户重试时撞上「该端点已存在」，永久卡住。
+//! - 注册与缓存写入在注册表**同一份**外部 I/O 租约内完成（取回之后取得、函数返回前一直
+//!   持有）。于是一次合规的来源移除无法插进「已注册、原始配置还没落缓存」之间，留下一个
+//!   既没有身份指向、也不在任何清理队列里的原始配置孤儿。
 //!
 //! 边界（本切片不越界）：
 //! - 没有刷新、ETag、定时重取，也没有任何自动重新获取路径。
@@ -91,7 +94,14 @@ impl TvboxConfigSaveService {
         }
     }
 
-    /// 校验 → 取回并解析 → 注册来源（默认停用）→ 写入 last-known-good 原文。
+    /// 校验 → 取回并解析 → **[取得注册表同一份外部 I/O 租约]** → 注册来源（默认停用）→
+    /// 写入 last-known-good 原文。
+    ///
+    /// 租约在**取回之后、注册之前**取得，并一直持有到本函数返回（成功或失败）：注册与缓存
+    /// 写入必须落在同一个独占区间里，否则一次合规的 `remove_custom_source` 可以在「来源已
+    /// 注册、原始配置还没落缓存」之间把来源删掉——记录与缓存清理队列都已出队，而这次迟到的
+    /// `put` 之后才把原始配置写进去，留下一个没有任何身份指向、也不在任何清理队列里的孤儿。
+    /// 远端取回**不**持租约：租约仲裁的是外部凭据 I/O 的写者，不该被一次网络获取长时间占住。
     ///
     /// 回滚走 [`SourceRegistryService::discard_fresh_registration`]：刚登记的来源没有
     /// 任何凭据（`credential_ref` 为 `None`），因此这条路径不接触系统凭据库，也不会
@@ -103,13 +113,18 @@ impl TvboxConfigSaveService {
         let name = validate_display_name(&request.display_name)?;
         let url = validate_config_url(&request.url)?;
 
-        // 1. 取回 + 解析。任何失败都在写入之前返回。
+        // 1. 取回 + 解析。任何失败都在写入之前返回，也不占租约。
         let fetched = self.importer.fetch_config(url).await?;
 
-        // 2. 注册来源。身份、前缀与 enabled 语义由注册表唯一决定（默认停用）。
+        // 2. 借注册表**同一份**外部 I/O 租约：注册 + 缓存写入在同一个独占区间里完成，
+        //    一次合规的移除因此只能拿到 `SOURCE_CREDENTIAL_BUSY`，插不进这两步之间。
+        //    守卫是命名绑定（不是 `let _`），随本函数栈帧存活到所有返回路径之后。
+        let _save_lease = self.registry.acquire_credential_lease().await?;
+
+        // 3. 注册来源。身份、前缀与 enabled 语义由注册表唯一决定（默认停用）。
         let added = self.registry.add_tvbox_source(name, url).await?;
 
-        // 3. 落 last-known-good。失败则回滚注册，避免留下无法重试的半成品来源。
+        // 4. 落 last-known-good。失败则回滚注册，避免留下无法重试的半成品来源。
         if let Err(error) = self
             .cache
             .put(&added.source_id, fetched.body(), UtcMillis::now())
@@ -183,7 +198,9 @@ mod tests {
 
     use super::*;
     use crate::services::source_config_cache::InMemorySourceConfigCache;
-    use crate::services::source_registry::CustomSourceKind;
+    use crate::services::source_registry::{
+        CustomSourceKind, InMemorySourceCredentialLease, SourceCredentialLease,
+    };
 
     const CONFIG_BODY: &str =
         r#"{"sites":[{"name":"示例站点","api":"https://api.example.invalid/vod"}]}"#;
@@ -280,6 +297,104 @@ mod tests {
         }
     }
 
+    /// `put` 会挂起直到测试放行的缓存：确定性地把保存停在「来源已注册、原始配置还没落
+    /// 缓存」之间，用来验证这段时间里一次合规移除只能拿到 `SOURCE_CREDENTIAL_BUSY`。
+    struct BlockingPutCache {
+        inner: InMemorySourceConfigCache,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl BlockingPutCache {
+        fn new() -> Self {
+            Self {
+                inner: InMemorySourceConfigCache::new(),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+
+        /// 等保存真的进入了缓存写入。
+        async fn entered(&self) {
+            self.entered.notified().await;
+        }
+
+        /// 放行缓存写入，让保存完成注册之后的剩余区间。
+        fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    #[async_trait]
+    impl SourceConfigCache for BlockingPutCache {
+        async fn put(
+            &self,
+            source_id: &str,
+            body: &[u8],
+            fetched_at: UtcMillis,
+        ) -> Result<(), AppError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.inner.put(source_id, body, fetched_at).await
+        }
+
+        async fn get(
+            &self,
+            source_id: &str,
+        ) -> Result<Option<crate::services::source_config_cache::CachedSourceConfig>, AppError>
+        {
+            self.inner.get(source_id).await
+        }
+
+        async fn delete(&self, source_id: &str) -> Result<bool, AppError> {
+            self.inner.delete(source_id).await
+        }
+    }
+
+    /// 记录 `put` 次数的缓存（其余委托内存实现）：钉住 fail closed 路径没有写缓存。
+    struct RecordingPutCache {
+        inner: InMemorySourceConfigCache,
+        puts: AtomicUsize,
+    }
+
+    impl RecordingPutCache {
+        fn new() -> Self {
+            Self {
+                inner: InMemorySourceConfigCache::new(),
+                puts: AtomicUsize::new(0),
+            }
+        }
+
+        fn puts(&self) -> usize {
+            self.puts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl SourceConfigCache for RecordingPutCache {
+        async fn put(
+            &self,
+            source_id: &str,
+            body: &[u8],
+            fetched_at: UtcMillis,
+        ) -> Result<(), AppError> {
+            self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.put(source_id, body, fetched_at).await
+        }
+
+        async fn get(
+            &self,
+            source_id: &str,
+        ) -> Result<Option<crate::services::source_config_cache::CachedSourceConfig>, AppError>
+        {
+            self.inner.get(source_id).await
+        }
+
+        async fn delete(&self, source_id: &str) -> Result<bool, AppError> {
+            self.inner.delete(source_id).await
+        }
+    }
+
     /// 第二次 settings 写入失败，用来验证来源注册的补偿失败不会被吞掉。
     struct FailRollbackSettings {
         inner: Arc<SqliteRepositories>,
@@ -330,7 +445,10 @@ mod tests {
 
     fn registry() -> SourceRegistryService {
         let db = Arc::new(Db::open_in_memory().expect("内存库必须可迁移"));
+        // 外部凭据 I/O 的独占租约显式注入：内存库不与任何其它进程共享事实，进程内租约
+        // 就是它正确的独占范围；没有它，凭据写入/清除、来源移除与清理扫描会 fail closed。
         SourceRegistryService::new(Arc::new(SqliteRepositories::new(db)))
+            .with_credential_lease(Arc::new(InMemorySourceCredentialLease::new()))
     }
 
     fn service(
@@ -531,7 +649,8 @@ mod tests {
             inner,
             writes: AtomicUsize::new(0),
         });
-        let registry = SourceRegistryService::new(settings);
+        let registry = SourceRegistryService::new(settings)
+            .with_credential_lease(Arc::new(InMemorySourceCredentialLease::new()));
         let cache = Arc::new(FailingPutCache(InMemorySourceConfigCache::new()));
         let importer = Arc::new(FakeImporter::returning(CONFIG_BODY));
         let service = TvboxConfigSaveService::new(importer, registry.clone(), cache.clone());
@@ -641,6 +760,154 @@ mod tests {
                 .iter()
                 .any(|source| source.source_id == saved.source_id)
         );
+    }
+
+    /// 保存持有注册表**同一份**外部 I/O 租约，覆盖「注册来源 → 写 last-known-good 缓存」
+    /// 整个区间：把保存停在缓存写入中间，一次合规的移除只能拿到 `SOURCE_CREDENTIAL_BUSY`，
+    /// 来源记录与缓存都不会被破坏；保存完成后移除照常成功并清掉缓存。
+    #[tokio::test]
+    async fn a_compliant_removal_cannot_interleave_with_the_registration_and_cache_write() {
+        let db = Arc::new(Db::open_in_memory().expect("内存库必须可迁移"));
+        let repos = Arc::new(SqliteRepositories::new(db));
+        let lease: Arc<dyn SourceCredentialLease> = Arc::new(InMemorySourceCredentialLease::new());
+        // 保存用的装配面与「另一个合规写者」是**两个独立构造**的服务实例，共享同一份租约：
+        // 因此这次移除真的会与保存争夺租约，而不是同一条调用栈上的自我竞争。
+        let registry =
+            SourceRegistryService::new(repos.clone()).with_credential_lease(lease.clone());
+        let second = SourceRegistryService::new(repos).with_credential_lease(lease);
+        let cache = Arc::new(BlockingPutCache::new());
+        let importer = Arc::new(FakeImporter::returning(CONFIG_BODY));
+        let service = TvboxConfigSaveService::new(importer, registry.clone(), cache.clone());
+
+        let writer = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .save(&request(
+                        "电视源",
+                        "https://config.example.invalid/tvbox.json",
+                    ))
+                    .await
+            })
+        };
+
+        // 保存已经注册了来源、正停在缓存写入中间。
+        cache.entered().await;
+        let registered = registry
+            .list()
+            .await
+            .unwrap()
+            .sources
+            .into_iter()
+            .find(|source| source.source_id.starts_with("custom_tvbox_"))
+            .expect("缓存写入挂起时来源必须已经注册")
+            .source_id;
+
+        // 另一个独立装配面的合规移除必须被租约挡下，且不产生任何副作用。
+        let error = second
+            .remove_custom_source(&registered, &MemoryStore, &InMemorySourceConfigCache::new())
+            .await
+            .expect_err("缓存写入挂起时合规移除必须被租约挡下");
+        assert_eq!(error.code().as_str(), "SOURCE_CREDENTIAL_BUSY");
+        assert!(error.retryable(), "占用是可以直接重试的状态");
+        assert!(
+            second
+                .list()
+                .await
+                .unwrap()
+                .sources
+                .iter()
+                .any(|source| source.source_id == registered),
+            "被挡下的移除不得删掉来源记录"
+        );
+
+        // 放行：缓存写入完成，保存成功返回，租约随函数栈帧释放。
+        cache.release();
+        let saved = writer
+            .await
+            .expect("保存任务必须正常结束")
+            .expect("保存必须成功");
+        assert_eq!(saved.source_id, registered);
+        assert_eq!(
+            cache.get(&registered).await.unwrap().unwrap().body(),
+            CONFIG_BODY.as_bytes()
+        );
+
+        // 租约已经释放：这次移除照常成功，并把刚写进去的缓存清干净。
+        second
+            .remove_custom_source(&registered, &MemoryStore, cache.as_ref())
+            .await
+            .expect("保存结束后移除必须成功");
+        assert!(
+            cache.get(&registered).await.unwrap().is_none(),
+            "来源删除后不得留下原始配置"
+        );
+        assert!(
+            !second
+                .list()
+                .await
+                .unwrap()
+                .sources
+                .iter()
+                .any(|source| source.source_id == registered)
+        );
+    }
+
+    /// 没有注入租约的装配面：保存必须在**注册来源与写缓存之前** fail closed，一个字节
+    /// 都不写；注入非重入的内存租约之后同一次保存成功，证明整条路径只取了一次租约。
+    #[tokio::test]
+    async fn a_save_without_a_lease_fails_closed_before_registration_or_cache_write() {
+        let db = Arc::new(Db::open_in_memory().expect("内存库必须可迁移"));
+        let registry = SourceRegistryService::new(Arc::new(SqliteRepositories::new(db)));
+        let cache = Arc::new(RecordingPutCache::new());
+        let importer = Arc::new(FakeImporter::returning(CONFIG_BODY));
+        let service =
+            TvboxConfigSaveService::new(importer.clone(), registry.clone(), cache.clone());
+
+        let error = service
+            .save(&request(
+                "电视源",
+                "https://config.example.invalid/tvbox.json",
+            ))
+            .await
+            .expect_err("没有注入租约时保存必须 fail closed");
+        assert_eq!(error.code().as_str(), "SOURCE_CREDENTIAL_LEASE_UNAVAILABLE");
+        assert!(!error.retryable(), "装配错误不是「稍后重试就好」");
+
+        // 取回发生在取得租约之前（租约只仲裁外部 I/O 写者，不该挡住远端获取），但 fail
+        // closed 之后没有任何写入。
+        assert_eq!(importer.calls().len(), 1, "取回先于租约");
+        assert_eq!(cache.puts(), 0, "fail closed 路径一个字节都不得写缓存");
+        assert!(
+            registry
+                .list()
+                .await
+                .unwrap()
+                .sources
+                .iter()
+                .all(|source| !source.source_id.starts_with("custom_tvbox_")),
+            "fail closed 不得注册来源"
+        );
+
+        // 注入租约之后同一次保存成功：内存租约是**非重入**的，若保存路径在注册或补偿
+        // 内部再取一次租约，这里会立刻拿到 BUSY——成功即证明整条路径只取了一次。
+        let leased_cache = Arc::new(InMemorySourceConfigCache::new());
+        let (leased_service, _, leased_registry) =
+            self::service(FakeImporter::returning(CONFIG_BODY), leased_cache.clone());
+        let saved = leased_service
+            .save(&request(
+                "电视源",
+                "https://config.example.invalid/tvbox.json",
+            ))
+            .await
+            .expect("非重入租约下保存必须成功（证明只取了一次）");
+        assert!(leased_cache.get(&saved.source_id).await.unwrap().is_some());
+        // 保存返回即代表守卫已经释放：同一次移除照常成功。
+        leased_registry
+            .remove_custom_source(&saved.source_id, &MemoryStore, leased_cache.as_ref())
+            .await
+            .expect("保存结束后租约必须已经释放");
+        assert!(leased_cache.get(&saved.source_id).await.unwrap().is_none());
     }
 
     #[test]

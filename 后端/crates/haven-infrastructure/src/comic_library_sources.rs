@@ -6,8 +6,8 @@
 //!   文件路径或页面地址**从不**被当成下一次请求的目标。
 //! - API key 只经系统凭据库解析，并且**只作为请求头**注入（Komga `X-API-Key`、
 //!   Kavita `x-api-key`）。它绝不进入 URL、query、path、wire、日志或错误文案。
-//! - 出站请求沿用仓库现有的 HTTPS/Host/DNS/端口/重定向/响应大小策略，不新增
-//!   内网、回环或单标签主机例外（自托管 NAS 属于后续单独的 ADR）。
+//! - 出站请求只使用用户明确登记的基地址和固定 API 路径；用户来源策略支持自托管
+//!   本机/局域网地址与任意非零端口。配置 API key 时仍要求 HTTPS，避免明文发送凭据。
 //!
 //! 网络访问收在 [`ComicLibraryGateway`] 端口后面：生产实现是
 //! [`HttpComicLibraryGateway`]，测试注入进程内 fake，因此端点映射、分页、
@@ -87,7 +87,8 @@ pub enum LibraryMethod {
 
 /// 一次有界的漫画库请求描述。
 ///
-/// `endpoint` 是用户登记且已通过 `HttpUrlPolicy::SourceEndpoint` 校验的基地址；
+/// `endpoint` 是用户登记且已通过 `HttpUrlPolicy::UserProvidedSource` 校验的基地址
+/// （HTTPS、无 query，可为公网或明确配置的本机/局域网主机，使用任意非零端口）；
 /// `path` 只由本模块按固定 API 路径构造（可含本模块编码的查询串）。
 #[derive(Clone)]
 pub struct LibraryRequest {
@@ -135,8 +136,9 @@ impl ComicLibraryGateway for HttpComicLibraryGateway {
         max_bytes: usize,
     ) -> Result<LibraryResponse, AppError> {
         // endpoint 已在登记时校验；这里仍然重新走一次策略，避免持久化数据被
-        // 手工改写后绕过策略。
-        haven_common::network::parse_http_url(&request.endpoint, HttpUrlPolicy::SourceEndpoint)
+        // 手工改写后绕过策略。端口按用户提供来源策略（自建 Komga/Kavita 常监听
+        // 非 80/443/8080/8443 的端口），保存与逐跳出站是同一个策略。
+        haven_common::network::parse_http_url(&request.endpoint, HttpUrlPolicy::UserProvidedSource)
             .map_err(|_| security_denied("漫画库地址不安全"))?;
         let mut current = reqwest::Url::parse(&format!(
             "{}{}",
@@ -159,7 +161,7 @@ impl ComicLibraryGateway for HttpComicLibraryGateway {
                 return Err(security_denied("漫画库重定向目标与登记地址不一致"));
             }
             let target =
-                resolve_public_http_target(current.as_str(), HttpUrlPolicy::SourceEndpoint)
+                resolve_public_http_target(current.as_str(), HttpUrlPolicy::UserProvidedSource)
                     .await
                     .map_err(|_| security_denied("漫画库地址解析不安全"))?;
             let builder = reqwest::Client::builder()

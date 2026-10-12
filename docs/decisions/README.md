@@ -11,6 +11,9 @@ review_after: 2026-12-20
 
 # Architecture Decisions
 
+- [Controlled source artwork](ADR-0001-controlled-source-artwork.md)
+- [Versioned source credentials and durable cleanup](ADR-0002-versioned-source-credentials.md)
+
 Use an ADR for a decision that changes a long-lived invariant, boundary,
 persistent format, security rule, release policy or public contract.
 

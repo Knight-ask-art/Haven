@@ -349,19 +349,6 @@
   gap: 12px;
 }
 
-.search-result-card__source-icon {
-  display: inline-flex;
-  width: 36px;
-  height: 36px;
-  flex-shrink: 0;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  background: var(--muted);
-  color: var(--muted-foreground);
-}
-
 .search-result-card--source .search-result-card__body {
   flex-basis: 150px;
 }

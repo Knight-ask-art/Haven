@@ -156,7 +156,10 @@ pub use source_import::{
     CMS10_CANDIDATE_PREFIX, FEED_SOURCE_KEY, ImportedWork, OPDS_CANDIDATE_PREFIX,
     SourceCatalogEntry, SourceCatalogProvider, SourceImportService,
 };
-pub use source_registry::{CUSTOM_FEED_SOURCE_PREFIX, CustomSourceKind, SourceRegistryService};
+pub use source_registry::{
+    CUSTOM_FEED_SOURCE_PREFIX, CustomSourceKind, InMemorySourceCredentialLease,
+    SourceCredentialLease, SourceCredentialLeaseGuard, SourceRegistryService,
+};
 pub use storage_location::{
     DefaultRootProbe, ProbeOutcome, RootProbe, ScanTarget, ScanTargetToken, StorageLocationService,
     StorageLocationUoW, StorageTxPorts,

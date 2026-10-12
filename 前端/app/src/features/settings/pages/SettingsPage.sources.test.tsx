@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { MemoryRouter, Route, Routes } from "react-router"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
@@ -92,6 +92,23 @@ describe("来源页的设计骨架", () => {
     expect(screen.getByRole("button", { name: "添加来源" })).toBeTruthy()
     expect(document.body.textContent).not.toContain("示例数据")
   })
+
+  it("启用选择不冒充连通性，也不因健康状态自动改写", async () => {
+    const unknown = { ...tvboxDescriptor(), sourceId: "tvmaze", displayName: "TVmaze", enabled: true }
+    const failed: SourceDescriptorDto = { ...tvboxDescriptor(), sourceId: "bangumi", displayName: "Bangumi", enabled: false, health: "down", lastChecked: "2026-10-08T00:00:00Z", latencyMs: 200 }
+    vi.spyOn(getHavenClient(), "sourceRegistryList").mockResolvedValue(registryWith([unknown, failed]))
+    const update = vi.spyOn(getHavenClient(), "sourceRegistrySet")
+    renderSourcesSettings()
+    await screen.findByText("TVmaze")
+    const first = within(document.querySelector('[data-source-id="tvmaze"]') as HTMLElement)
+    expect(first.getByText("已启用")).toBeTruthy()
+    expect(first.getByText("暂无查询状态")).toBeTruthy()
+    const second = within(document.querySelector('[data-source-id="bangumi"]') as HTMLElement)
+    expect(second.getByText("已停用")).toBeTruthy()
+    expect(second.getByText("最近查询 · 不可用")).toBeTruthy()
+    expect(update).not.toHaveBeenCalled()
+  })
+
 })
 
 describe("来源设置中的 RSS/Atom 添加流程", () => {
@@ -119,7 +136,7 @@ describe("来源设置中的 RSS/Atom 添加流程", () => {
         kind: "feed",
       })
     })
-    expect(await screen.findByText("来源已准备好")).toBeTruthy()
+    expect(await screen.findByText("来源已添加")).toBeTruthy()
     expect(screen.getByText(/RSS\/Atom 订阅源（不使用访问凭据）/)).toBeTruthy()
     expect(screen.queryByLabelText("访问凭据（可选）")).toBeNull()
   })
@@ -324,7 +341,7 @@ describe("来源管理异步交互回归", () => {
     expect(screen.getByLabelText("访问凭据（可选）")).toBe(password)
     expect(password.value).toBe("mock-only-not-a-credential")
     fireEvent.click(screen.getByRole("button", { name: "稍后配置" }))
-    expect(screen.getByText("来源已准备好")).toBeTruthy()
+    expect(screen.getByText("来源已添加")).toBeTruthy()
     fireEvent.click(screen.getByRole("button", { name: "返回来源列表" }))
     expect(screen.queryByRole("dialog")).toBeNull()
   })
@@ -334,7 +351,9 @@ describe("来源管理异步交互回归", () => {
       ...tvboxDescriptor(), sourceId: "custom_opds_0123456789ab", displayName: "已认证书库",
       categories: ["book"], kinds: ["search", "online_read"], credentialConfigured: true,
     }
-    vi.spyOn(getHavenClient(), "sourceRegistryList").mockResolvedValue(registryWith([source]))
+    vi.spyOn(getHavenClient(), "sourceRegistryList")
+      .mockResolvedValueOnce(registryWith([source]))
+      .mockResolvedValue(registryWith([{ ...source, credentialConfigured: false }]))
     const write = vi.spyOn(getHavenClient(), "sourceSetCredential").mockResolvedValue(undefined)
     renderSourcesSettings()
     fireEvent.click(await screen.findByRole("button", { name: "已认证书库 更多操作" }))
@@ -359,15 +378,39 @@ describe("来源管理异步交互回归", () => {
     expect(document.activeElement).toBe(trigger)
   })
 
-  it("清除凭据失败显示就地错误，不把已有凭据误标为已清除", async () => {
-    const source: SourceDescriptorDto = { ...tvboxDescriptor(), sourceId: "custom_opds_0123456789ab", displayName: "凭据书库", categories: ["book"], credentialConfigured: true }
-    vi.spyOn(getHavenClient(), "sourceRegistryList").mockResolvedValue(registryWith([source]))
-    vi.spyOn(getHavenClient(), "sourceSetCredential").mockRejectedValue(new HavenError({ code: "KEYRING_UNAVAILABLE", userMessage: "系统凭据服务暂不可用", retryable: true }))
+  it("保存凭据失败时保留就地错误，重新读取仍投影为已配置（外部写入未被采纳）", async () => {
+    const source: SourceDescriptorDto = { ...tvboxDescriptor(), sourceId: "custom_opds_0123456789ab", displayName: "写入书库", categories: ["book"], credentialConfigured: true }
+    const listing = vi.spyOn(getHavenClient(), "sourceRegistryList").mockResolvedValue(registryWith([source]))
+    vi.spyOn(getHavenClient(), "sourceSetCredential").mockRejectedValue(new HavenError({ code: "CREDENTIAL_ACCESS_FAILED", userMessage: "系统凭据管理器写入失败", retryable: true }))
     renderSourcesSettings()
-    fireEvent.click(await screen.findByRole("button", { name: "凭据书库 更多操作" }))
+    fireEvent.click(await screen.findByRole("button", { name: "写入书库 更多操作" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: /配置访问凭据/ }))
+    fireEvent.change(screen.getByLabelText(/访问密码（仅写入/), { target: { value: "mock-only-not-a-credential" } })
+    fireEvent.click(screen.getByRole("button", { name: "保存凭据" }))
+    expect((await screen.findByRole("alert")).textContent).toBe("系统凭据管理器写入失败")
+    await waitFor(() => { expect(listing).toHaveBeenCalledTimes(2) })
+    // 写入路径先分配新槽位再采纳：外部写入失败时旧引用没有被撤销，权威投影仍是「已配置」。
+    expect(screen.getByRole("button", { name: "清除凭据" })).toBeTruthy()
+    expect(screen.getByText("暂无查询状态")).toBeTruthy()
+    expect(screen.queryByText("暂无查询状态 · 可选凭据未配置")).toBeNull()
+  })
+
+  it("清除凭据失败后重新读取的是已撤销引用的投影：保留就地错误，不再显示清除入口或旧凭据配置", async () => {
+    const source: SourceDescriptorDto = { ...tvboxDescriptor(), sourceId: "custom_opds_abcdef012345", displayName: "撤销书库", categories: ["book"], credentialConfigured: true }
+    const listing = vi.spyOn(getHavenClient(), "sourceRegistryList")
+      .mockResolvedValueOnce(registryWith([source]))
+      .mockResolvedValue(registryWith([{ ...source, credentialConfigured: false }]))
+    vi.spyOn(getHavenClient(), "sourceSetCredential").mockRejectedValue(new HavenError({ code: "CREDENTIAL_ACCESS_FAILED", userMessage: "凭据清理暂时失败，可重试", retryable: true }))
+    renderSourcesSettings()
+    fireEvent.click(await screen.findByRole("button", { name: "撤销书库 更多操作" }))
     fireEvent.click(screen.getByRole("menuitem", { name: /配置访问凭据/ }))
     fireEvent.click(screen.getByRole("button", { name: "清除凭据" }))
-    expect((await screen.findByRole("alert")).textContent).toBe("系统凭据服务暂不可用")
-    expect(screen.getByRole("button", { name: "清除凭据" })).toBeTruthy()
+    expect((await screen.findByRole("alert")).textContent).toBe("凭据清理暂时失败，可重试")
+    await waitFor(() => { expect(listing).toHaveBeenCalledTimes(2) })
+    // 清除路径先在同一事务里撤销引用并登记清理义务，之后才做外部删除：外部删除失败时
+    // 失败的是物理清理，引用已经撤销，因此清除入口随投影消失，列表也不再显示旧凭据配置。
+    await waitFor(() => { expect(screen.queryByRole("button", { name: "清除凭据" })).toBeNull() })
+    expect(screen.getByText("暂无查询状态 · 可选凭据未配置")).toBeTruthy()
+    expect(screen.queryByText("暂无查询状态")).toBeNull()
   })
 })

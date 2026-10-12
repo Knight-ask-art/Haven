@@ -5,8 +5,8 @@ status: active
 owner: architecture
 visibility: public
 source_of_truth: accepted-decisions-and-runtime-contracts
-last_reviewed: 2026-10-04
-review_after: 2027-01-04
+last_reviewed: 2026-10-08
+review_after: 2027-01-08
 ---
 
 # Haven Source of Truth
@@ -23,6 +23,30 @@ controlled source access without creating a central Haven account.
 
 Metadata candidates are not consumable content. A provider result becomes
 readable or playable only through the controlled resource path.
+
+Search artwork follows the same resource boundary: adapters register validated
+images in the backend and cards carry opaque artwork identities. The
+[artwork decision](decisions/ADR-0001-controlled-source-artwork.md) records the
+distinction between fixed-provider images and signed user-source images. Image
+content requests use checked per-hop addresses and bypass environment HTTP proxies;
+local TUN mapping remains a separate trusted routing boundary.
+
+Source credentials have versioned, source-scoped identities and durable cleanup
+owned by `SourceRegistryService`. The [source credential decision](decisions/ADR-0002-versioned-source-credentials.md)
+defines the source-only revocation and recovery boundary; it does not change AI
+or cloud credential-family semantics. OPDS consumers use one coherent source
+snapshot, bind credentials to the registered HTTPS origin and recheck that
+snapshot after credential resolution before sending.
+
+User-configured source endpoints retain their configured scheme and may target
+private IPv4, loopback, IPv6 ULA, shared VPN addresses, and local DNS names on
+any nonzero service port. Link-local, unspecified, multicast, cloud metadata,
+and other reserved destinations remain denied; literal Fake-IP addresses also
+remain denied. Recognized local DNS Fake-IP answers are accepted for hostnames
+and the resolved addresses stay pinned for that request. Fixed metadata, AI,
+and media-resource requests keep their own policies and do not inherit the
+private-address exception. Type-specific HTTPS requirements remain, and source
+credentials stay HTTPS-only and bound to the registered origin.
 
 ## Authority matrix
 

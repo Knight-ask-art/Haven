@@ -5,8 +5,8 @@
 //! - `source_set_credential`：secret 只写系统 keyring（ADR-001）；持久化仅存 credential_ref；
 //!   secret 与 target 禁止出 IPC、日志。RSS/Atom 订阅源不使用该路径；
 //!   Komga/Kavita 的 API key 走该路径（只作为请求头注入，绝不进 URL）。
-//! - `source_remove` 走 ADR-001 删除顺序：先删系统凭据，再清持久化引用，最后清掉该
-//!   来源缓存的原始配置（TVBox 配置来源会用到；没有缓存的来源删到 0 行不是错误）。
+//! - `source_remove` 在来源事务中先撤销引用并登记凭据／配置缓存的清理义务，再清理外部
+//!   存储；失败的义务保留供重试。此顺序仅适用于来源，不改变其他凭据家族的契约。
 //!
 //! Command 只做不可信输入校验、Application 调用与错误映射。
 
@@ -103,7 +103,7 @@ pub async fn source_update(
     run_blocking(move || async move { run_source_update(&state, request).await }).await
 }
 
-/// `source_remove` 命令核心（ADR-001 删除顺序：先 keyring 后持久化引用）。
+/// `source_remove` 命令核心：先原子撤销来源引用，再执行可重试的外部清理。
 pub async fn run_source_remove(
     state: &AppState,
     request: SourceRemoveRequest,
@@ -111,14 +111,12 @@ pub async fn run_source_remove(
     if request.source_id.trim().is_empty() || request.source_id.len() > 64 {
         return Err(invalid_argument("sourceId 非法"));
     }
-    let store =
-        haven_infrastructure::credential::credential_store().map_err(|e| to_error_dto(&e))?;
     // 删除路径同时清掉该来源的 last-known-good 原始配置（TVBox 配置来源会用到）。
     state
         .source_registry
         .remove_custom_source(
             &request.source_id,
-            store.as_ref(),
+            state.source_credential_store.as_ref(),
             &state.repos.source_config_cache,
         )
         .await
@@ -150,11 +148,9 @@ pub async fn run_source_set_credential(
             return Err(invalid_argument("凭据内容超长"));
         }
     }
-    let store =
-        haven_infrastructure::credential::credential_store().map_err(|e| to_error_dto(&e))?;
     state
         .source_registry
-        .set_custom_source_credential(&request, store.as_ref())
+        .set_custom_source_credential(&request, state.source_credential_store.as_ref())
         .await
         .map_err(|e| to_error_dto(&e))
 }

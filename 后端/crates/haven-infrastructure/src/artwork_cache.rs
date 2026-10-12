@@ -355,19 +355,18 @@ impl ArtworkCache {
             .map_err(|_| artwork_security("图片来源地址无效"))?;
 
         for redirect_count in 0..=MAX_REDIRECTS {
-            self.network
-                .validate_remote_url(
+            // 校验的结果就是这一跳唯一可发请求的目标：URL 形状、来源主机与
+            // DNS 解析都在这里重新判定，请求客户端也由该目标固定地址后才建立。
+            let target = self
+                .network
+                .resolve_remote_target(
                     &current,
                     record.source_id.as_deref(),
                     record.normalized_host.as_deref(),
                 )
                 .await?;
-            let response = self
-                .network
-                .request(&current, record.source_id.as_deref())
-                .send()
-                .await
-                .map_err(map_fetch_error)?;
+            let request = target.build_request()?;
+            let response = request.send().await.map_err(map_fetch_error)?;
 
             if response.status().is_redirection() {
                 if redirect_count == MAX_REDIRECTS {
@@ -378,7 +377,10 @@ impl ArtworkCache {
                     .get(LOCATION)
                     .and_then(|value| value.to_str().ok())
                     .ok_or_else(|| artwork_security("图片跳转地址无效"))?;
-                current = current
+                // 下一跳从已校验目标自己的 URL 派生，保证重定向只能从已检查的
+                // 地址继续；新地址会在下一轮循环里重新做完整校验与解析。
+                current = target
+                    .url()
                     .join(location)
                     .map_err(|_| artwork_security("图片跳转地址无效"))?;
                 continue;
@@ -940,30 +942,31 @@ mod tests {
     #[tokio::test]
     async fn remote_policy_rejects_private_literal_ip_and_signed_query() {
         let network = ArtworkNetwork::new().unwrap();
-        let private = "http://127.0.0.1/a.jpg".parse().unwrap();
+        // 这些都是公网字面地址之外的形状，因此不触发 DNS，断言是确定性的。
+        let private: reqwest::Url = "http://127.0.0.1/a.jpg".parse().unwrap();
         assert!(
             network
-                .validate_remote_url(&private, Some("cms10"), Some("127.0.0.1"))
+                .resolve_remote_target(&private, Some("cms10"), Some("127.0.0.1"))
                 .await
                 .is_err()
         );
-        let literal_fake = "http://198.18.0.1/a.jpg".parse().unwrap();
+        let literal_fake: reqwest::Url = "http://198.18.0.1/a.jpg".parse().unwrap();
         let error = network
-            .validate_remote_url(&literal_fake, Some("cms10"), Some("198.18.0.1"))
+            .resolve_remote_target(&literal_fake, Some("cms10"), Some("198.18.0.1"))
             .await
             .unwrap_err();
         assert_eq!(error.code().as_str(), "SECURITY_POLICY_DENIED");
-        let unknown_host = "https://img.example.com/a.jpg".parse().unwrap();
+        let unknown_host: reqwest::Url = "https://img.example.com/a.jpg".parse().unwrap();
         assert!(
             network
-                .validate_remote_url(&unknown_host, Some("cms10"), None)
+                .resolve_remote_target(&unknown_host, Some("cms10"), None)
                 .await
                 .is_err()
         );
-        let signed = "https://img.doubanio.com/a.jpg?sig=abc".parse().unwrap();
+        let signed: reqwest::Url = "https://img.doubanio.com/a.jpg?sig=abc".parse().unwrap();
         assert!(
             network
-                .validate_remote_url(&signed, Some("douban"), Some("img.doubanio.com"))
+                .resolve_remote_target(&signed, Some("douban"), Some("img.doubanio.com"))
                 .await
                 .is_err()
         );

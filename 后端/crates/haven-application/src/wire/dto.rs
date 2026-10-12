@@ -1682,6 +1682,73 @@ mod tests {
             Some("work-1")
         );
     }
+
+    #[test]
+    fn source_set_credential_request_debug_redacts_secret() {
+        // 哨兵只在本测试内存在：Debug 文本里出现它就说明秘密漏了。
+        let sentinel = "sentinel-secret-must-not-appear";
+        let request = SourceSetCredentialRequest {
+            source_id: "custom_opds_0123456789ab".into(),
+            secret: Some(sentinel.into()),
+        };
+
+        let rendered = format!("{request:?}");
+        assert!(
+            !rendered.contains(sentinel),
+            "Debug 不得输出 secret 原文: {rendered}"
+        );
+        assert!(rendered.contains("custom_opds_0123456789ab"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+
+        let cleared = SourceSetCredentialRequest {
+            source_id: "custom_opds_0123456789ab".into(),
+            secret: None,
+        };
+        let cleared_rendered = format!("{cleared:?}");
+        assert!(
+            cleared_rendered.contains("secret: None"),
+            "{cleared_rendered}"
+        );
+        assert!(
+            !cleared_rendered.contains("<redacted>"),
+            "{cleared_rendered}"
+        );
+
+        // 脱敏只发生在 Debug：请求方向上的序列化契约不变。
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["secret"], sentinel);
+    }
+
+    #[test]
+    fn source_endpoint_requests_redact_query_tokens_from_debug() {
+        let sentinel = "query-token-sentinel";
+        let add = SourceAddRequest {
+            display_name: "自托管书库".into(),
+            endpoint: format!("https://catalog.example.invalid/opds?token={sentinel}"),
+            kind: SourceAddKindDto::Opds,
+        };
+        let add_debug = format!("{add:?}");
+        assert!(!add_debug.contains(sentinel), "{add_debug}");
+        assert!(add_debug.contains("<redacted>"), "{add_debug}");
+
+        let update = SourceUpdateRequest {
+            source_id: "custom_opds_0123456789ab".into(),
+            display_name: None,
+            endpoint: Some(format!(
+                "https://catalog.example.invalid/opds?token={sentinel}"
+            )),
+        };
+        let update_debug = format!("{update:?}");
+        assert!(!update_debug.contains(sentinel), "{update_debug}");
+        assert!(
+            !update_debug.contains("catalog.example.invalid"),
+            "{update_debug}"
+        );
+        assert!(
+            update_debug.contains("endpoint_configured: true"),
+            "{update_debug}"
+        );
+    }
 }
 
 /// Continue 条目（首页 `home_get`；NOTE-7 契约定义）。
@@ -2845,7 +2912,7 @@ pub enum SourceAddKindDto {
 /// （secret 单独走 keyring）。
 /// RSS/Atom 订阅源不接受凭据，端点必须使用 HTTPS 且不能带查询串；
 /// Komga/Kavita 端点同样必须使用 HTTPS 且不能带查询串，API key 只经请求头注入。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, rename_all = "camelCase")]
 pub struct SourceAddRequest {
@@ -2857,6 +2924,16 @@ pub struct SourceAddRequest {
     #[serde(default)]
     #[ts(optional, type = "\"opds\" | \"feed\" | \"komga\" | \"kavita\"")]
     pub kind: SourceAddKindDto,
+}
+
+impl std::fmt::Debug for SourceAddRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceAddRequest")
+            .field("display_name", &self.display_name)
+            .field("endpoint", &"<redacted>")
+            .field("kind", &self.kind)
+            .finish()
+    }
 }
 
 /// `source_add` 结果：返回稳定 sourceId（OPDS 为 `custom_`、RSS/Atom 为
@@ -2872,7 +2949,7 @@ pub struct SourceAddResult {
 }
 
 /// `source_update`：修改自定义源显示名与/或端点。null = 不变。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, rename_all = "camelCase")]
 pub struct SourceUpdateRequest {
@@ -2880,6 +2957,16 @@ pub struct SourceUpdateRequest {
     pub display_name: Option<String>,
     /// null = 不变；空串非法（用 `source_registry_set_endpoint` 语义清空不适用，此处必须给出有效端点）。
     pub endpoint: Option<String>,
+}
+
+impl std::fmt::Debug for SourceUpdateRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceUpdateRequest")
+            .field("source_id", &self.source_id)
+            .field("display_name", &self.display_name)
+            .field("endpoint_configured", &self.endpoint.is_some())
+            .finish()
+    }
 }
 
 /// `source_update` 幂等结果。
@@ -2914,13 +3001,26 @@ pub struct SourceRemoveResult {
 
 /// `source_set_credential`：写入/清除自定义源凭据。secret 只进系统 keyring；
 /// 持久化仅存 credential_ref；secret 与 target 禁止出 IPC、日志。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, rename_all = "camelCase")]
 pub struct SourceSetCredentialRequest {
     pub source_id: String,
     /// null = 清除凭据；Some(空串) 非法 → INVALID_ARGUMENT。
     pub secret: Option<String>,
+}
+
+// Rust 侧说明（不进 wire 契约）：该类型刻意不 derive `Debug`，而是手工实现。secret 是
+// 明文秘密，任何日志、panic 或错误包装都不得打印出原文；Debug 只投影「这一次请求有没有
+// 携带秘密」这一位事实，长度、前缀等同样不进 Debug。序列化契约不变：请求方向上 secret
+// 仍然是真实字段。
+impl std::fmt::Debug for SourceSetCredentialRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceSetCredentialRequest")
+            .field("source_id", &self.source_id)
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// `source_work_import` 请求：导入搜索候选（operationId + 序号定位服务端缓存）。

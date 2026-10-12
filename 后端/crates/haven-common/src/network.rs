@@ -11,28 +11,36 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use url::Url;
 
-/// Context-specific policy name. The current contexts share the same safe
-/// default port set; keeping the context explicit prevents a future relaxed
-/// rule from being accidentally reused by the media proxy.
-///
-/// `AiProviderEndpoint` is the user-configured AI provider root. Its rules are
-/// today identical to `SourceEndpoint` on purpose: allowing a loopback or LAN
-/// endpoint has to be a reviewed decision (see `docs/architecture/AI_SYSTEM.md`
-/// §7), not a side effect of adding the AI slice. Spelling the context out
-/// means that decision cannot be inherited silently by this caller.
+/// Context-specific URL policy. Fixed source/media policies retain their
+/// existing boundaries. `UserProvidedSource` is the explicit exception for
+/// destinations entered by the user in source settings.
 ///
 /// One thing this policy deliberately does **not** encode: confidentiality.
 /// It accepts `http` because it is shared with callers that have no credential
 /// to protect, so the AI provider path adds its own HTTPS requirement on top
 /// (`haven_domain::ai_provider::validate_endpoint` for saving,
 /// `AiProviderProfile::require_secure_endpoint` before any outbound request).
-/// Weakening this shared policy, or relaxing that extra rule, would send
-/// `Authorization: Bearer` credentials and user content over plaintext.
+/// Weakening this shared policy or relaxing credential-specific rules would
+/// send credentials and user content over plaintext. User-provided source
+/// requests carrying credentials also require HTTPS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpUrlPolicy {
     SourceEndpoint,
     MediaResource,
     AiProviderEndpoint,
+    /// A self-hosted or public endpoint the user typed into the source settings
+    /// (custom OPDS / RSS-Atom feed / Komga / Kavita / TVBox config / CMS10 / M3U).
+    ///
+    /// The user has explicitly chosen this destination, so private LAN, loopback,
+    /// unique-local IPv6, shared overlay-network addresses, and local DNS names
+    /// are supported for personal/self-hosted servers. Public source requests
+    /// retain the same behavior. Link-local, unspecified, multicast, cloud
+    /// metadata and other reserved addresses remain rejected. HTTP(S), a
+    /// non-empty authority, nonzero port, no user-info/fragment/control
+    /// characters/whitespace are still required. This policy is only used for
+    /// user-configured sources; fixed metadata and media-resource requests keep
+    /// their stricter policies.
+    UserProvidedSource,
 }
 
 /// Errors are intentionally coarse so callers can map them to a safe user
@@ -114,7 +122,11 @@ pub fn parse_http_url(raw: &str, policy: HttpUrlPolicy) -> Result<SafeHttpUrl, H
         return Err(HttpUrlError::DisallowedPort);
     }
     let host = url.host_str().ok_or(HttpUrlError::MissingHost)?;
-    let host = validate_host(host)?;
+    let host = if policy == HttpUrlPolicy::UserProvidedSource {
+        validate_user_provided_source_host(host)?
+    } else {
+        validate_host(host)?
+    };
     let port = url
         .port_or_known_default()
         .ok_or(HttpUrlError::DisallowedPort)?;
@@ -166,6 +178,48 @@ fn has_explicit_empty_port(raw: &str) -> bool {
 
 /// Validate an already extracted host before adding it to a grant allowlist.
 pub fn validate_host(raw: &str) -> Result<String, HttpUrlError> {
+    let host = normalize_host(raw)?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_publicly_routable(ip) || fixture_loopback_allowed(&host, ip) {
+            return Ok(host);
+        }
+        return Err(HttpUrlError::UnsafeHost);
+    }
+
+    validate_dns_name(&host)?;
+    if host.split('.').count() < 2
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host == "metadata.google.internal"
+        || host.ends_with(".internal")
+    {
+        return Err(HttpUrlError::UnsafeHost);
+    }
+    Ok(host)
+}
+
+/// Host validation for an endpoint the user explicitly configured as a source.
+/// Unlike fixed-source/media policies, this accepts common local server names
+/// and addresses while still rejecting link-local and reserved IP ranges.
+fn validate_user_provided_source_host(raw: &str) -> Result<String, HttpUrlError> {
+    let host = normalize_host(raw)?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_publicly_routable(ip) || is_user_source_local_ip_allowed(ip) {
+            return Ok(host);
+        }
+        return Err(HttpUrlError::UnsafeHost);
+    }
+    validate_dns_name(&host)?;
+    // Keep the well-known cloud metadata hostname blocked even when explicitly
+    // entered; its link-local target is not a personal catalog endpoint.
+    if host == "metadata.google.internal" {
+        return Err(HttpUrlError::UnsafeHost);
+    }
+    Ok(host)
+}
+
+fn normalize_host(raw: &str) -> Result<String, HttpUrlError> {
     if raw.is_empty() || raw.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
         return Err(HttpUrlError::UnsafeHost);
     }
@@ -178,19 +232,12 @@ pub fn validate_host(raw: &str) -> Result<String, HttpUrlError> {
     if host.is_empty() {
         return Err(HttpUrlError::MissingHost);
     }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_publicly_routable(ip) || fixture_loopback_allowed(&host, ip) {
-            return Ok(host);
-        }
-        return Err(HttpUrlError::UnsafeHost);
-    }
+    Ok(host)
+}
 
-    // A single-label name is commonly a workstation/container/LAN alias. It
-    // cannot be distinguished from an internal resolver target here, so it
-    // is rejected until an explicit trusted-source policy exists.
+fn validate_dns_name(host: &str) -> Result<(), HttpUrlError> {
     let labels: Vec<&str> = host.split('.').collect();
-    if labels.len() < 2
-        || host.len() > 253
+    if host.len() > 253
         || labels.iter().any(|label| {
             label.is_empty()
                 || label.len() > 63
@@ -203,15 +250,37 @@ pub fn validate_host(raw: &str) -> Result<String, HttpUrlError> {
     {
         return Err(HttpUrlError::UnsafeHost);
     }
-    if host == "localhost"
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-        || host == "metadata.google.internal"
-        || host.ends_with(".internal")
-    {
-        return Err(HttpUrlError::UnsafeHost);
+    Ok(())
+}
+
+/// Normalized `scheme://host[:port]` origin used by credential-binding checks.
+///
+/// This is pure syntax normalization (lowercase host, terminal dot removed, the
+/// scheme's default port dropped). It performs **no** security decision: callers
+/// must still parse every URL through [`parse_http_url`] before acting on it.
+/// Two URLs compared through this helper are normalized identically, so a caller
+/// that only injects a credential when the request origin equals the registered
+/// catalog origin cannot be confused by host case, a trailing dot or an
+/// explicitly written default port.
+pub fn url_origin(url: &Url) -> Option<String> {
+    let scheme = url.scheme().to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
     }
-    Ok(host)
+    let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    Some(match url.port() {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    })
+}
+
+/// Raw endpoint text → normalized origin ([`url_origin`]). `None` for anything
+/// that is not a parseable absolute http(s) URL.
+pub fn origin_of(raw: &str) -> Option<String> {
+    Url::parse(raw).ok().and_then(|url| url_origin(&url))
 }
 
 /// Literal IP policy shared by URL parsing and DNS-pinning callers.
@@ -222,14 +291,50 @@ pub fn is_publicly_routable(ip: IpAddr) -> bool {
     }
 }
 
-fn allowed_port(_policy: HttpUrlPolicy, port: u16, host: &str) -> bool {
-    // Keep the set deliberately small.  8080/8443 retain common self-hosted
-    // media endpoints without allowing arbitrary service ports.
-    if matches!(port, 80 | 443 | 8080 | 8443) {
-        return true;
+/// Private destinations are accepted only for an explicitly user-configured
+/// source endpoint. Link-local, unspecified, multicast and reserved ranges are
+/// intentionally excluded; 100.64.0.0/10 is included for common personal VPNs.
+pub fn is_user_source_local_ip_allowed(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(address) => {
+            address.is_private() || address.is_loopback() || is_shared_ipv4(address)
+        }
+        IpAddr::V6(address) => address.is_loopback() || address.is_unique_local(),
     }
-    host.parse::<IpAddr>()
-        .is_ok_and(|ip| fixture_loopback_allowed(host, ip) && (49152..=65535).contains(&port))
+}
+
+/// 当前识别的本机 DNS 代理精确 Fake-IP 前缀。
+///
+/// 只用于识别域名解析结果，本身不授权任何请求。固定来源策略仍由
+/// `parse_http_url` 拒绝这些保留地址；用户明确配置的 `UserProvidedSource` 则接受
+/// ULA 字面地址以支持本机服务，因此也接受落在此 IPv6 前缀内的用户端点。
+pub fn is_local_proxy_fake_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(address) => {
+            let [first, second, _, _] = address.octets();
+            first == 198 && matches!(second, 18 | 19)
+        }
+        IpAddr::V6(address) => address.segments()[..4] == [0xfdfe, 0xdcba, 0x9876, 0],
+    }
+}
+
+fn is_shared_ipv4(ip: Ipv4Addr) -> bool {
+    let [first, second, _, _] = ip.octets();
+    first == 100 && (64..=127).contains(&second)
+}
+
+fn allowed_port(policy: HttpUrlPolicy, port: u16, host: &str) -> bool {
+    // A source endpoint explicitly entered by the user can use its chosen service port.
+    if policy == HttpUrlPolicy::UserProvidedSource {
+        return port != 0;
+    }
+    if host
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| fixture_loopback_allowed(host, ip))
+    {
+        return matches!(port, 80 | 443 | 8080 | 8443) || (49152..=65535).contains(&port);
+    }
+    matches!(port, 80 | 443 | 8080 | 8443)
 }
 
 /// Candidate-only network escape hatch for the deterministic local fixture.
@@ -345,6 +450,9 @@ mod tests {
             "http://192.168.1.1/video.mp4",
             "http://169.254.169.254/latest/meta-data",
             "http://100.100.100.200/video.mp4",
+            "http://198.18.0.1/video.mp4",
+            "http://198.19.255.254/video.mp4",
+            "https://[fdfe:dcba:9876::1]/video.mp4",
             "https://[::1]/video.mp4",
             "https://[fc00::1]/video.mp4",
             "https://[fe80::1]/video.mp4",
@@ -355,6 +463,59 @@ mod tests {
                 Err(HttpUrlError::UnsafeHost),
                 "unsafe URL accepted: {raw}"
             );
+        }
+    }
+
+    #[test]
+    fn fake_ip_range_is_rejected_as_a_literal_for_every_http_policy() {
+        for policy in [
+            HttpUrlPolicy::MediaResource,
+            HttpUrlPolicy::SourceEndpoint,
+            HttpUrlPolicy::AiProviderEndpoint,
+            HttpUrlPolicy::UserProvidedSource,
+        ] {
+            for raw in [
+                "http://198.18.0.1:443/video.mp4",
+                "https://198.19.255.254:443/opds",
+            ] {
+                assert!(
+                    parse_http_url(raw, policy).is_err(),
+                    "IPv4 fake-IP must remain blocked as a literal for {policy:?}: {raw}"
+                );
+            }
+        }
+        for policy in [
+            HttpUrlPolicy::MediaResource,
+            HttpUrlPolicy::SourceEndpoint,
+            HttpUrlPolicy::AiProviderEndpoint,
+        ] {
+            assert!(
+                parse_http_url("https://[fdfe:dcba:9876::1]:443/opds", policy).is_err(),
+                "fixed policies must reject private IPv6 fake-IP literals: {policy:?}"
+            );
+        }
+        assert!(
+            parse_http_url(
+                "https://[fdfe:dcba:9876::1]:443/opds",
+                HttpUrlPolicy::UserProvidedSource
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn local_proxy_fake_ip_classification_is_exact() {
+        for raw in ["198.18.0.1", "198.19.255.254", "fdfe:dcba:9876::1"] {
+            assert!(is_local_proxy_fake_ip(raw.parse().unwrap()), "{raw}");
+        }
+        for raw in [
+            "198.20.0.1",
+            "198.17.255.255",
+            "fdfe:dcba:9877::1",
+            "fc00::1",
+            "10.0.0.1",
+        ] {
+            assert!(!is_local_proxy_fake_ip(raw.parse().unwrap()), "{raw}");
         }
     }
 
@@ -432,5 +593,194 @@ mod tests {
         ] {
             assert!(parse_http_url(raw, HttpUrlPolicy::SourceEndpoint).is_err());
         }
+    }
+
+    #[test]
+    fn user_provided_source_accepts_public_hosts_on_arbitrary_nonzero_ports() {
+        for raw in [
+            "https://media.example.invalid:8096/api",
+            "https://media.example.invalid:32400/library",
+            "https://catalog.example.invalid:5001/opds",
+            "https://catalog.example.invalid:9117/feed.xml",
+            "http://catalog.example.invalid:9973/api.php",
+            "https://media.example.invalid:1/api",
+            "https://media.example.invalid:65535/api",
+            "https://1.1.1.1:8096/api",
+        ] {
+            let parsed = parse_http_url(raw, HttpUrlPolicy::UserProvidedSource)
+                .unwrap_or_else(|error| panic!("{raw}: {error:?}"));
+            assert!(!parsed.host().is_empty());
+        }
+        // The fixed policies keep their exact previous port set: a self-hosted
+        // port is not silently granted to media/source/AI requests.
+        for policy in [
+            HttpUrlPolicy::SourceEndpoint,
+            HttpUrlPolicy::MediaResource,
+            HttpUrlPolicy::AiProviderEndpoint,
+        ] {
+            for raw in [
+                "https://media.example.invalid:8096/api",
+                "https://media.example.invalid:32400/library",
+                "https://catalog.example.invalid:5001/opds",
+            ] {
+                assert_eq!(
+                    parse_http_url(raw, policy),
+                    Err(HttpUrlError::DisallowedPort),
+                    "{policy:?}: {raw}"
+                );
+            }
+            assert!(parse_http_url("https://media.example.invalid:8080/api", policy).is_ok());
+            assert!(parse_http_url("https://media.example.invalid/api", policy).is_ok());
+        }
+    }
+
+    #[test]
+    fn user_provided_source_accepts_local_self_hosted_endpoints() {
+        for raw in [
+            "http://127.0.0.1:8096/api",
+            "http://localhost:32400/library",
+            "https://192.168.1.10:5001/opds",
+            "http://10.0.0.5:8088/feed.xml",
+            "http://172.16.3.4:9973/api.php",
+            "https://[::1]:8080/opds",
+            "https://[fd12::10]:8096/api",
+            "https://[fdfe:dcba:9876::1]:8096/opds",
+            "http://nas:5001/opds",
+            "http://komga.local:8096/api",
+            "https://reader.home.internal:5001/opds",
+            "http://100.100.100.200:8096/api",
+        ] {
+            assert!(
+                parse_http_url(raw, HttpUrlPolicy::UserProvidedSource).is_ok(),
+                "explicitly configured self-hosted endpoint should be accepted: {raw}"
+            );
+        }
+
+        // The local endpoint exception is only for destinations the user added
+        // as a source; fixed media and metadata requests keep their old boundary.
+        for raw in [
+            "http://127.0.0.1/api",
+            "http://localhost/api",
+            "http://192.168.1.10/api",
+            "http://nas.local/api",
+        ] {
+            for policy in [HttpUrlPolicy::SourceEndpoint, HttpUrlPolicy::MediaResource] {
+                assert_eq!(
+                    parse_http_url(raw, policy),
+                    Err(HttpUrlError::UnsafeHost),
+                    "local source exception leaked into {policy:?}: {raw}"
+                );
+            }
+        }
+        for raw in [
+            "http://localhost/api",
+            "http://192.168.1.10/api",
+            "http://nas.local/api",
+        ] {
+            assert_eq!(
+                parse_http_url(raw, HttpUrlPolicy::AiProviderEndpoint),
+                Err(HttpUrlError::UnsafeHost),
+                "local source exception leaked into the AI provider policy: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_provided_source_still_denies_link_local_reserved_and_malformed_targets() {
+        for raw in [
+            // Port 0 is not a service and an explicitly empty port is ambiguous.
+            "https://catalog.example.invalid:0/opds",
+            "https://catalog.example.invalid:/opds",
+            "https://catalog.example.invalid:65536/opds",
+            // Link-local / metadata / reserved ranges.
+            "http://169.254.169.254:8096/latest/meta-data",
+            "http://198.18.0.1:8096/api",
+            "http://192.0.0.9:8096/api",
+            "https://[fe80::1]:8096/api",
+            "https://[2001:db8::1]:8096/api",
+            "https://metadata.google.internal:8096/api",
+            // Ambiguous authorities and non-http schemes stay rejected.
+            "https://user:secret@catalog.example.invalid:8096/opds",
+            "https://catalog.example.invalid:8096/opds#fragment",
+            "https://catalog.example.invalid:8096/a b",
+            "https:///opds",
+            "ftp://catalog.example.invalid:8096/opds",
+        ] {
+            assert!(
+                parse_http_url(raw, HttpUrlPolicy::UserProvidedSource).is_err(),
+                "unsafe URL accepted by the user-provided source policy: {raw}"
+            );
+        }
+    }
+
+    #[cfg(feature = "film-tv-fixture")]
+    #[test]
+    fn user_provided_source_allows_local_service_ports_without_widening_media_fixture() {
+        for raw in [
+            "http://127.0.0.1:49152/hls/master.m3u8",
+            "http://127.0.0.1:80/hls/x",
+            "http://127.0.0.1:9200/api",
+            "http://127.0.0.1:8096/api",
+            "http://127.0.0.1:32400/api",
+            "http://10.0.0.1:49152/api",
+        ] {
+            assert!(
+                parse_http_url(raw, HttpUrlPolicy::UserProvidedSource).is_ok(),
+                "configured source endpoint should allow its nonzero service port: {raw}"
+            );
+        }
+        for raw in [
+            "http://127.0.0.1:9200/api",
+            "http://127.0.0.1:8096/api",
+            "http://127.0.0.1:32400/api",
+            "http://127.0.0.2:49152/api",
+            "http://10.0.0.1:49152/api",
+        ] {
+            assert!(
+                parse_http_url(raw, HttpUrlPolicy::MediaResource).is_err(),
+                "fixture mode leaked a local-service port: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_normalization_is_scheme_port_and_case_exact() {
+        let origin = |raw: &str| url_origin(&Url::parse(raw).unwrap());
+        assert_eq!(
+            origin("https://Catalog.Example.Invalid./opds"),
+            Some("https://catalog.example.invalid".to_owned())
+        );
+        assert_eq!(
+            origin("https://catalog.example.invalid:443/opds"),
+            Some("https://catalog.example.invalid".to_owned())
+        );
+        assert_eq!(
+            origin("http://catalog.example.invalid:80/opds"),
+            Some("http://catalog.example.invalid".to_owned())
+        );
+        assert_eq!(
+            origin("http://catalog.example.invalid:8096/opds"),
+            Some("http://catalog.example.invalid:8096".to_owned())
+        );
+        assert_eq!(
+            origin("https://catalog.example.invalid:8096/opds"),
+            Some("https://catalog.example.invalid:8096".to_owned())
+        );
+        assert_eq!(
+            origin("https://[2001:4860:4860::8888]:8443/a"),
+            Some("https://[2001:4860:4860::8888]:8443".to_owned())
+        );
+        // Scheme and port are part of the identity: a plaintext downgrade or a
+        // different service port is a different origin, never "the same host".
+        assert_ne!(
+            origin("https://catalog.example.invalid/opds"),
+            origin("http://catalog.example.invalid/opds")
+        );
+        assert_ne!(
+            origin("http://catalog.example.invalid:8096/opds"),
+            origin("http://catalog.example.invalid:8097/opds")
+        );
+        assert_eq!(origin_of("ftp://catalog.example.invalid/a"), None);
+        assert_eq!(origin_of("not a url"), None);
     }
 }

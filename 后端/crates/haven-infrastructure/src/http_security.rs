@@ -2,14 +2,16 @@
 //!
 //! URL syntax and literal-address policy live in `haven-common`.  This module
 //! owns the I/O half of that boundary: resolve a hostname once for one
-//! request, reject any non-public answer, and pin the resulting addresses in
-//! reqwest.  Callers must repeat the operation after every manually followed
-//! redirect.
+//! request, reject unsafe answers, and pin the resulting addresses in reqwest.
+//! Public addresses and the reserved fake-IP range used by local DNS proxies are
+//! accepted for hostnames; callers must repeat the operation after every
+//! manually followed redirect.
 
 use std::net::{IpAddr, SocketAddr};
 
 use haven_common::network::{
-    HttpUrlPolicy, fixture_loopback_allowed, is_publicly_routable, parse_http_url,
+    HttpUrlPolicy, fixture_loopback_allowed, is_local_proxy_fake_ip, is_publicly_routable,
+    is_user_source_local_ip_allowed, parse_http_url,
 };
 use reqwest::{ClientBuilder, Url};
 
@@ -49,14 +51,15 @@ pub(crate) async fn resolve_public_http_target(
     let addresses = if let Ok(ip) = host.parse::<IpAddr>() {
         vec![SocketAddr::new(ip, port)]
     } else {
-        resolve_public_addresses(&host, port).await?
+        resolve_public_addresses(&host, port, policy).await?
     };
     if addresses.is_empty() {
         return Err(HttpTargetError::ResolveFailed);
     }
-    if addresses.iter().any(|address| {
-        !is_publicly_routable(address.ip()) && !fixture_loopback_allowed(&host, address.ip())
-    }) {
+    if addresses
+        .iter()
+        .any(|address| !is_allowed_dns_address(&host, address.ip(), policy))
+    {
         return Err(HttpTargetError::UnsafeAddress);
     }
     Ok(ResolvedHttpTarget {
@@ -66,29 +69,56 @@ pub(crate) async fn resolve_public_http_target(
     })
 }
 
-/// Resolve via the platform resolver in async I/O, then fail closed if any
-/// returned address is not publicly routable.  Rejecting the whole answer set
-/// is intentional: using only the first public answer would make resolver
-/// ordering part of the security decision.
+/// Resolve via the platform resolver in async I/O, then validate every returned
+/// address under the request policy. Rejecting a mixed safe/unsafe answer set is
+/// intentional: using only the first public answer would make resolver ordering
+/// part of the security decision.
 pub(crate) async fn resolve_public_addresses(
     host: &str,
     port: u16,
+    policy: HttpUrlPolicy,
 ) -> Result<Vec<SocketAddr>, HttpTargetError> {
-    let mut addresses = tokio::net::lookup_host((host, port))
+    let addresses = tokio::net::lookup_host((host, port))
         .await
         .map_err(|_| HttpTargetError::ResolveFailed)?
         .collect::<Vec<_>>();
+    validate_resolved_addresses(host, port, policy, addresses)
+}
+
+/// Sort and validate resolver output. Kept separate from the platform lookup so
+/// empty-answer behavior can be tested without depending on local DNS/proxy rules.
+fn validate_resolved_addresses(
+    host: &str,
+    _port: u16,
+    policy: HttpUrlPolicy,
+    mut addresses: Vec<SocketAddr>,
+) -> Result<Vec<SocketAddr>, HttpTargetError> {
     addresses.sort_unstable();
     addresses.dedup();
     if addresses.is_empty() {
         return Err(HttpTargetError::ResolveFailed);
     }
-    if addresses.iter().any(|address| {
-        !is_publicly_routable(address.ip()) && !fixture_loopback_allowed(host, address.ip())
-    }) {
+    if addresses
+        .iter()
+        .any(|address| !is_allowed_dns_address(host, address.ip(), policy))
+    {
         return Err(HttpTargetError::UnsafeAddress);
     }
     Ok(addresses)
+}
+
+/// Allow the recognized IPv4/IPv6 local-proxy Fake-IP prefixes only when they
+/// were returned for a hostname. Local DNS proxies map public domains into
+/// these ranges and route those connections through the user's configured
+/// network stack. Literal URLs using the same addresses remain rejected by
+/// `parse_http_url` and by this check. Other private LAN/loopback answers are
+/// accepted only for the explicitly user-configured source policy; fixed
+/// metadata/media requests continue to reject them.
+fn is_allowed_dns_address(host: &str, ip: IpAddr, policy: HttpUrlPolicy) -> bool {
+    is_publicly_routable(ip)
+        || fixture_loopback_allowed(host, ip)
+        || (host.parse::<IpAddr>().is_err() && is_local_proxy_fake_ip(ip))
+        || (policy == HttpUrlPolicy::UserProvidedSource && is_user_source_local_ip_allowed(ip))
 }
 
 /// Apply the transport controls that make `target.addresses` authoritative.
@@ -112,20 +142,88 @@ mod tests {
     #[tokio::test]
     async fn loopback_resolution_is_rejected_even_when_the_host_resolves() {
         assert_eq!(
-            resolve_public_addresses("localhost", 80).await,
+            resolve_public_addresses("localhost", 80, HttpUrlPolicy::SourceEndpoint).await,
             Err(HttpTargetError::UnsafeAddress)
         );
     }
 
-    #[tokio::test]
-    async fn missing_domain_resolution_is_not_treated_as_public() {
-        assert!(
-            resolve_public_http_target(
-                "https://does-not-exist.invalid/video.m3u8",
+    #[test]
+    fn empty_resolution_is_not_treated_as_public() {
+        assert_eq!(
+            validate_resolved_addresses(
+                "does-not-exist.invalid",
+                443,
                 HttpUrlPolicy::MediaResource,
-            )
-            .await
-            .is_err()
+                Vec::new(),
+            ),
+            Err(HttpTargetError::ResolveFailed)
         );
+    }
+
+    #[test]
+    fn fake_ip_answers_are_allowed_for_hostnames_without_widening_fixed_policies() {
+        let fake_ip: IpAddr = "198.18.2.168".parse().unwrap();
+        let upper_fake_ip: IpAddr = "198.19.255.254".parse().unwrap();
+        let fake_ipv6: IpAddr = "fdfe:dcba:9876::ee".parse().unwrap();
+        let private_ip: IpAddr = "192.168.1.10".parse().unwrap();
+
+        for policy in [
+            HttpUrlPolicy::MediaResource,
+            HttpUrlPolicy::SourceEndpoint,
+            HttpUrlPolicy::AiProviderEndpoint,
+            HttpUrlPolicy::UserProvidedSource,
+        ] {
+            assert!(
+                is_allowed_dns_address("api.example.com", fake_ip, policy),
+                "hostname fake-IP answer should be allowed for {policy:?}"
+            );
+            assert!(
+                is_allowed_dns_address("api.example.com", upper_fake_ip, policy),
+                "the upper RFC 2544 range should be allowed for {policy:?}"
+            );
+            assert!(
+                is_allowed_dns_address("api.example.com", fake_ipv6, policy),
+                "the configured local-proxy IPv6 prefix should be allowed for {policy:?}"
+            );
+            assert!(
+                !is_allowed_dns_address("198.18.2.168", fake_ip, policy),
+                "literal fake-IP address must stay rejected for {policy:?}"
+            );
+            assert!(
+                !is_allowed_dns_address("198.19.255.254", upper_fake_ip, policy),
+                "upper-range literal fake-IP must stay rejected for {policy:?}"
+            );
+            if policy != HttpUrlPolicy::UserProvidedSource {
+                assert!(
+                    !is_allowed_dns_address("fdfe:dcba:9876::ee", fake_ipv6, policy),
+                    "fixed policies must reject private IPv6 fake-IP literals: {policy:?}"
+                );
+            }
+        }
+        assert!(is_allowed_dns_address(
+            "fdfe:dcba:9876::ee",
+            fake_ipv6,
+            HttpUrlPolicy::UserProvidedSource
+        ));
+        assert!(!is_allowed_dns_address(
+            "api.example.com",
+            private_ip,
+            HttpUrlPolicy::SourceEndpoint
+        ));
+        assert!(is_allowed_dns_address(
+            "nas.local",
+            private_ip,
+            HttpUrlPolicy::UserProvidedSource
+        ));
+        assert!(!is_allowed_dns_address(
+            "nas.local",
+            private_ip,
+            HttpUrlPolicy::SourceEndpoint
+        ));
+        assert!(!is_allowed_dns_address(
+            "nas.local",
+            "169.254.1.1".parse().unwrap(),
+            HttpUrlPolicy::UserProvidedSource
+        ));
     }
 }

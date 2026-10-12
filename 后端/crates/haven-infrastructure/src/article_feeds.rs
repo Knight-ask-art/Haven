@@ -9,8 +9,8 @@
 //! - 私有订阅源地址可能携带 query token：这类地址在登记时就被拒绝（当前没有
 //!   受控的 typed credential 路径可以承载 Feed query 凭据），因此订阅源地址
 //!   不会因为凭据而变成敏感值；错误信息一律使用固定安全文案。
-//! - 出站请求遵守仓库现有的 HTTPS、Host、DNS、端口、重定向与响应大小策略，
-//!   不新增内网/回环/单标签主机例外。
+//! - 由用户明确登记的 Feed 可使用本机/局域网主机与任意非零端口；仍要求 HTTPS、
+//!   不带 query token，并逐跳校验 Host、DNS、重定向与响应大小。
 //!
 //! 网络访问收在 [`FeedSource`] 端口后面：生产实现是 [`FeedClient`]，测试可以
 //! 注入进程内 fake，因此解析、候选与消费语义无需真实网络即可验证。
@@ -89,7 +89,7 @@ impl FeedSource for FeedClient {
         let mut current = validate_feed_request_url(url)?.into_url();
         for _ in 0..=MAX_REDIRECTS {
             let target =
-                resolve_public_http_target(current.as_str(), HttpUrlPolicy::SourceEndpoint)
+                resolve_public_http_target(current.as_str(), HttpUrlPolicy::UserProvidedSource)
                     .await
                     .map_err(|_| security_denied("订阅源地址解析不安全"))?;
             let builder = reqwest::Client::builder()
@@ -149,15 +149,15 @@ impl FeedSource for FeedClient {
     }
 }
 
-/// 订阅源地址策略：在共享的 `SourceEndpoint` 策略之上强制 HTTPS，并**拒绝
-/// query 串**。
+/// 订阅源地址策略：在共享的**用户提供来源**策略之上强制 HTTPS，并**拒绝 query 串**。
 ///
-/// 共享策略已经拒绝 userinfo、fragment、私网/回环/单标签主机与非白名单端口。
+/// 共享策略允许用户主动配置的本机/局域网 Feed 与任意非零端口，同时拒绝 userinfo、
+/// fragment、链路本地和保留地址；保存与逐跳出站是同一个策略。
 /// 这里额外做的两条都来自同一个现实：私有 Feed 常把访问令牌放在 URL query 里，
 /// 而当前没有受控的 typed credential 路径可以安全承载它。与其把凭据以 URL 形式
 /// 留在设置里、再让它渗进日志/错误/身份，不如 fail closed 地拒绝这类端点。
 fn validate_feed_request_url(raw: &str) -> Result<haven_common::network::SafeHttpUrl, AppError> {
-    let parsed = parse_http_url(raw, HttpUrlPolicy::SourceEndpoint)
+    let parsed = parse_http_url(raw, HttpUrlPolicy::UserProvidedSource)
         .map_err(|_| security_denied("订阅源地址不安全"))?;
     if !parsed.as_url().scheme().eq_ignore_ascii_case("https") {
         return Err(security_denied("订阅源地址必须使用 HTTPS"));
@@ -1270,19 +1270,13 @@ mod tests {
     }
 
     #[test]
-    fn feed_url_policy_rejects_credentials_fragments_plaintext_private_hosts_and_queries() {
+    fn feed_url_policy_allows_private_hosts_but_rejects_reserved_targets_and_queries() {
         for rejected in [
             "https://user:secret@feed.example.invalid/rss",
             "https://feed.example.invalid/rss#fragment",
             "http://feed.example.invalid/rss",
-            "https://127.0.0.1/rss",
-            "https://10.0.0.5/rss",
-            "https://192.168.1.10/rss",
-            "https://[::1]/rss",
-            "https://localhost/rss",
-            "https://feed/rss",
-            "https://feed.internal/rss",
-            "https://feed.example.invalid:12345/rss",
+            "https://169.254.169.254/rss",
+            "https://metadata.google.internal/rss",
             // 当前没有受控的 typed credential 路径可以承载 Feed query 凭据，
             // 因此所有 query 串一律 fail closed。
             "https://feed.example.invalid/rss?a=b",
@@ -1296,6 +1290,24 @@ mod tests {
         }
         assert!(validate_feed_request_url("https://feed.example.invalid/rss").is_ok());
         assert!(validate_feed_request_url("https://feed.example.invalid/nested/rss.xml").is_ok());
+        for local in [
+            "https://127.0.0.1:8443/rss",
+            "https://192.168.1.10:5001/rss",
+            "https://feeds.local:8088/rss",
+            "https://feed:8088/rss",
+        ] {
+            assert!(
+                validate_feed_request_url(local).is_ok(),
+                "用户明确配置的本地订阅源应可用: {local}"
+            );
+        }
+        // 自建订阅服务监听用户自己选的端口：保存与逐跳出站都按用户提供来源策略接受
+        // 任意非零端口（这里同时证明 http 明文仍被 HTTPS 约束挡在外面）。
+        assert!(
+            validate_feed_request_url("https://feed.example.invalid:12345/rss").is_ok(),
+            "用户提供的订阅源端口必须可用"
+        );
+        assert!(validate_feed_request_url("http://feed.example.invalid:12345/rss").is_err());
     }
 
     #[test]

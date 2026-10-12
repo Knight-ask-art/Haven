@@ -3,8 +3,13 @@
 //! 安全边界（SECURITY_PRIVACY_COMPLIANCE S8：防 SSRF / 出站最小化）：
 //! - 仅访问用户显式配置的单个端点；搜索与详情都是同一端点上的查询参数变体
 //!   （`ac=videolist&wd=` / `ac=videolist&ids=`），不跟随任何响应体中的跳转地址。
+//! - 端点是**用户提供**的：保存（`source_registry`）与逐跳出站都使用
+//!   `HttpUrlPolicy::UserProvidedSource`，支持用户明确配置的本机/局域网地址和任意非零端口；
+//!   链路本地/元数据/保留地址、userinfo 与 fragment 仍然逐条 fail closed。
 //! - 响应体上限 8 MiB；超时 15s；UA 标识应用版本。
 //! - 日志只允许 host，不允许完整 URL/查询串/播放地址。
+//! - 搜索卡片里的海报只经 `ImageProxyRepository` 登记并投影成
+//!   `haven://artwork/<opaque>`；不在搜索阶段逐条抓图。
 //!
 //! 协议事实（SOURCES_INVENTORY §22 实测）：`ac=videolist` 返回
 //！ `{ code, list: [{ vod_id, vod_name, type_name, vod_year, vod_pic, vod_play_url }] }`；
@@ -21,9 +26,10 @@ use haven_application::services::search_source::SearchSourceParticipant;
 use haven_application::wire::WorkCardDto;
 use haven_common::network::{HttpUrlPolicy, parse_http_url};
 use haven_common::{AppError, ErrorKind};
+use haven_domain::contracts::ImageProxyRepository;
 use serde::Deserialize;
 
-use crate::http_security::{pin_client_builder, resolve_public_http_target};
+use crate::http_security::{ResolvedHttpTarget, pin_client_builder, resolve_public_http_target};
 
 pub const CMS10_SOURCE_ID: &str = "cms10";
 
@@ -242,7 +248,48 @@ pub struct Cms10Client;
 
 impl Cms10Client {
     pub fn new() -> Result<Self, AppError> {
-        Ok(Self)
+        Ok(Self::default())
+    }
+
+    /// 解析一个采集站地址。默认走**用户提供来源**策略：用户可选本机/局域网主机和
+    /// 任意非零端口；链路本地/保留地址、userinfo 与 fragment 仍然 fail closed。
+    fn parse_endpoint(&self, raw: &str) -> Result<reqwest::Url, AppError> {
+        parse_http_url(raw, HttpUrlPolicy::UserProvidedSource)
+            .map_err(|_| endpoint_invalid())
+            .map(|safe| safe.into_url())
+    }
+
+    /// 出站目标：逐次解析并把结果钉进客户端；用户配置的回环/局域网地址会按来源策略
+    /// 原样连接，不经过系统代理。
+    async fn resolve_target(&self, url: &reqwest::Url) -> Result<ResolvedHttpTarget, AppError> {
+        resolve_public_http_target(url.as_str(), HttpUrlPolicy::UserProvidedSource)
+            .await
+            .map_err(|_| source_unavailable("采集站地址解析不安全"))
+    }
+
+    /// 查询参数始终通过 URL API 写入，避免 endpoint 中已有 query 时生成第二个 `?`，
+    /// 也避免把用户输入拼进路径或解释成额外参数。
+    fn endpoint_url(
+        &self,
+        endpoint: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<reqwest::Url, AppError> {
+        if !matches!(key, "wd" | "ids") {
+            return Err(AppError::new(
+                "INVALID_ARGUMENT",
+                ErrorKind::Validation,
+                "CMS10 查询参数非法",
+                false,
+            ));
+        }
+        let mut url = self.parse_endpoint(endpoint)?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("ac", "videolist");
+            query.append_pair(key, value);
+        }
+        Ok(url)
     }
 
     async fn fetch_limited(
@@ -251,14 +298,11 @@ impl Cms10Client {
         url: &str,
         payload: Option<&serde_json::Value>,
     ) -> Result<Vec<Cms10Entry>, AppError> {
-        let mut current = parse_http_url(url, HttpUrlPolicy::SourceEndpoint)
-            .map_err(|_| source_unavailable("采集站地址不安全"))?
-            .into_url();
+        // CMS10 端点由用户提供：保存与出站都使用同一用户来源策略，支持自建服务的
+        // 本机/局域网地址与非零端口。链路本地、云元数据和保留目标仍会被拒绝。
+        let mut current = self.parse_endpoint(url)?;
         for _ in 0..=MAX_REDIRECTS {
-            let target =
-                resolve_public_http_target(current.as_str(), HttpUrlPolicy::SourceEndpoint)
-                    .await
-                    .map_err(|_| source_unavailable("采集站地址解析不安全"))?;
+            let target = self.resolve_target(&current).await?;
             let builder = reqwest::Client::builder()
                 .connect_timeout(CONNECT_TIMEOUT)
                 .timeout(REQUEST_TIMEOUT)
@@ -321,7 +365,7 @@ impl Cms10Client {
         query: &str,
         limit: u32,
     ) -> Result<Vec<Cms10Entry>, AppError> {
-        let url = build_cms10_url(endpoint, "wd", query)?;
+        let url = self.endpoint_url(endpoint, "wd", query)?;
         let mut entries = self
             .fetch_limited(reqwest::Method::GET, url.as_str(), None)
             .await?;
@@ -331,7 +375,7 @@ impl Cms10Client {
 
     /// 按 vod_id 取详情（含播放组）。
     pub async fn detail(&self, endpoint: &str, vod_id: &str) -> Result<Cms10Entry, AppError> {
-        let url = build_cms10_url(endpoint, "ids", vod_id)?;
+        let url = self.endpoint_url(endpoint, "ids", vod_id)?;
         let mut entries = self
             .fetch_limited(reqwest::Method::GET, url.as_str(), None)
             .await?;
@@ -353,33 +397,14 @@ fn map_network_err(err: reqwest::Error) -> AppError {
     source_unavailable(kind)
 }
 
-/// CMS10 查询参数始终通过 URL API 写入，避免 endpoint 中已有 query 时
-/// 生成第二个 `?`，也避免把用户输入拼进路径或解释成额外参数。
-fn build_cms10_url(endpoint: &str, key: &str, value: &str) -> Result<reqwest::Url, AppError> {
-    if !matches!(key, "wd" | "ids") {
-        return Err(AppError::new(
-            "INVALID_ARGUMENT",
-            ErrorKind::Validation,
-            "CMS10 查询参数非法",
-            false,
-        ));
-    }
-    let mut url = parse_http_url(endpoint, HttpUrlPolicy::SourceEndpoint)
-        .map_err(|_| {
-            AppError::new(
-                "INVALID_ARGUMENT",
-                ErrorKind::Validation,
-                "采集站端点非法",
-                false,
-            )
-        })?
-        .into_url();
-    {
-        let mut query = url.query_pairs_mut();
-        query.append_pair("ac", "videolist");
-        query.append_pair(key, value);
-    }
-    Ok(url)
+/// 非法的采集站端点/查询参数（与保存路径同一口径）。
+fn endpoint_invalid() -> AppError {
+    AppError::new(
+        "INVALID_ARGUMENT",
+        ErrorKind::Validation,
+        "采集站端点非法",
+        false,
+    )
 }
 
 /// CMS10 目录适配器：把 Cms10Client 适配为 application 的 SourceCatalogProvider。
@@ -469,11 +494,23 @@ impl haven_application::services::SourceCatalogProvider for Cms10CatalogProvider
 pub struct Cms10SearchParticipant {
     registry: SourceRegistryService,
     client: Arc<Cms10Client>,
+    /// 受控图片登记端口。未注入时搜索照常工作，只是没有海报。
+    image_proxy: Option<Arc<dyn ImageProxyRepository>>,
 }
 
 impl Cms10SearchParticipant {
     pub fn new(registry: SourceRegistryService, client: Arc<Cms10Client>) -> Self {
-        Self { registry, client }
+        Self {
+            registry,
+            client,
+            image_proxy: None,
+        }
+    }
+
+    /// 注入受控 Artwork 登记端口（`image_proxy` migration 015 的 ImageProxyRepository）。
+    pub fn with_image_proxy(mut self, proxy: Arc<dyn ImageProxyRepository>) -> Self {
+        self.image_proxy = Some(proxy);
+        self
     }
 }
 
@@ -504,33 +541,229 @@ impl SearchSourceParticipant for Cms10SearchParticipant {
             return Ok(Vec::new());
         }
         let entries = self.client.search(&endpoint, query, limit).await?;
-        Ok(entries
-            .into_iter()
-            .map(|entry| WorkCardDto {
-                // 候选句柄：非 UUID 前缀形状明确标识"未入库候选"。
-                work_id: format!("{CMS10_CANDIDATE_PREFIX}{}", entry.vod_id),
-                title: entry.name,
-                original_title: None,
-                description: None,
-                categories: vec![haven_application::wire::ContentCategory::Video],
-                available_media_types: vec![haven_application::wire::MediaTypeDto::Series],
-                poster_uri: None,
-                backdrop_uri: None,
-                release_year: entry.year,
-                rating_value: None,
-                rating_scale: None,
-                favorite: false,
-                progress: None,
-                primary_action: None,
-                external_ids: Vec::new(),
-            })
-            .collect())
+        let mut cards: Vec<WorkCardDto> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            // 海报地址来自采集站响应本身；登记交给受控 ImageProxyRepository，卡片只拿
+            // opaque `haven://artwork/<id>`。登记失败/被拒/缺失/取消时卡片保持原样。
+            let poster_uri = crate::opds::projected_poster(
+                self.image_proxy.as_deref(),
+                CMS10_SOURCE_ID,
+                entry.pic.as_deref(),
+                is_cancelled,
+            )
+            .await;
+            cards.push(cms10_card(entry, poster_uri));
+        }
+        Ok(cards)
+    }
+}
+
+/// 单条 CMS10 条目 → 搜索卡片：候选句柄是"未入库候选"形状，海报只接收已经登记过的
+/// 受控 URI（`None` = 没有海报）。
+fn cms10_card(entry: Cms10Entry, poster_uri: Option<String>) -> WorkCardDto {
+    WorkCardDto {
+        // 候选句柄：非 UUID 前缀形状明确标识"未入库候选"。
+        work_id: format!("{CMS10_CANDIDATE_PREFIX}{}", entry.vod_id),
+        title: entry.name,
+        original_title: None,
+        description: None,
+        categories: vec![haven_application::wire::ContentCategory::Video],
+        available_media_types: vec![haven_application::wire::MediaTypeDto::Series],
+        poster_uri,
+        backdrop_uri: None,
+        release_year: entry.year,
+        rating_value: None,
+        rating_scale: None,
+        favorite: false,
+        progress: None,
+        primary_action: None,
+        external_ids: Vec::new(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::opds::fixture::{
+        ArtworkOutcome, FixtureResponse, FixtureServer, RecordingImageProxy, seeded_cms10_registry,
+    };
+
+    /// 采集条目里的 `vod_pic` 必须成为受控海报：登记使用固定的 CMS10 来源身份，卡片只拿
+    /// opaque `haven://artwork/<id>`；被拒 / 缺失 / 取消一律保持无海报并保留元数据。
+    #[tokio::test]
+    async fn cms10_search_card_projects_only_registered_controlled_artwork() {
+        let entry = || {
+            Cms10Entry::try_from(
+                serde_json::from_str::<Cms10RawItem>(
+                    r#"{"vod_id": 42, "vod_name": "庆余年", "vod_year": "2024", "vod_pic": "https://img.picbf.com/42.jpg"}"#,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let pic = "https://img.picbf.com/42.jpg";
+        let not_cancelled = || false;
+
+        let proxy = RecordingImageProxy::new(ArtworkOutcome::Registered);
+        let poster = crate::opds::projected_poster(
+            Some(proxy.as_ref()),
+            CMS10_SOURCE_ID,
+            entry().pic.as_deref(),
+            &not_cancelled,
+        )
+        .await;
+        assert_eq!(poster.as_deref(), Some("haven://artwork/artwork-1"));
+        assert_eq!(
+            proxy.calls(),
+            vec![(CMS10_SOURCE_ID.to_owned(), pic.to_owned())],
+            "登记必须使用固定的 CMS10 来源身份与上游解析出来的地址"
+        );
+
+        let card = cms10_card(entry(), poster);
+        assert_eq!(
+            card.poster_uri.as_deref(),
+            Some("haven://artwork/artwork-1")
+        );
+        assert_eq!(card.title, "庆余年");
+        assert_eq!(card.work_id, format!("{CMS10_CANDIDATE_PREFIX}42"));
+        let wire = serde_json::to_string(&card).unwrap();
+        assert!(wire.contains("haven://artwork/artwork-1"));
+        assert!(
+            !wire.contains("img.picbf.com"),
+            "远端图片地址不得进入 Wire: {wire}"
+        );
+
+        // 被策略拒绝 / id 形状非法：元数据保留，海报为 None。
+        for outcome in [
+            ArtworkOutcome::Rejected,
+            ArtworkOutcome::RegisteredInvalidId,
+        ] {
+            let rejected = RecordingImageProxy::new(outcome);
+            let poster = crate::opds::projected_poster(
+                Some(rejected.as_ref()),
+                CMS10_SOURCE_ID,
+                entry().pic.as_deref(),
+                &not_cancelled,
+            )
+            .await;
+            assert_eq!(poster, None);
+            assert_eq!(
+                rejected.calls(),
+                vec![(CMS10_SOURCE_ID.to_owned(), pic.to_owned())],
+                "带图片的条目必须经过登记，才能按拒绝结果回退"
+            );
+            let card = cms10_card(entry(), poster);
+            assert_eq!(card.poster_uri, None);
+            assert_eq!(card.title, "庆余年");
+        }
+
+        // 没有 pic 字段的条目 / 取消之后的条目：根本不进入登记路径。
+        let rejected = RecordingImageProxy::new(ArtworkOutcome::Rejected);
+        let no_pic: Cms10RawItem =
+            serde_json::from_str(r#"{"vod_id": 43, "vod_name": "无封面"}"#).unwrap();
+        let no_pic = Cms10Entry::try_from(no_pic).unwrap();
+        assert_eq!(
+            crate::opds::projected_poster(
+                Some(rejected.as_ref()),
+                CMS10_SOURCE_ID,
+                no_pic.pic.as_deref(),
+                &not_cancelled,
+            )
+            .await,
+            None
+        );
+        let cancelled = || true;
+        assert_eq!(
+            crate::opds::projected_poster(
+                Some(rejected.as_ref()),
+                CMS10_SOURCE_ID,
+                Some(pic),
+                &cancelled
+            )
+            .await,
+            None
+        );
+        assert!(rejected.calls().is_empty(), "缺失/取消的海报不得登记");
+    }
+
+    /// 真实链路：`Cms10SearchParticipant::search` → 用户配置的本机采集站 JSON 响应 → 解析出的
+    /// `vod_pic` → 受控图片登记 → 卡片。这里使用真实的用户来源 URL/DNS 策略，不借助回环夹具缝隙。
+    #[tokio::test]
+    async fn cms10_search_registers_catalog_artwork_through_the_real_search_path() {
+        let server = FixtureServer::start(|origin| {
+            vec![(
+                "/api.php".to_owned(),
+                FixtureResponse::json(format!(
+                    r#"{{"code":1,"list":[{{"vod_id":42,"vod_name":"庆余年","vod_year":"2024","vod_pic":"{origin}/img/42.jpg","vod_play_url":"第01集${origin}/1.m3u8"}}]}}"#
+                )),
+            )]
+        });
+        let endpoint = format!("{}/api.php", server.origin());
+        // 回环地址属于用户明确配置的本机采集站；设置行由 fixture helper 初始化。
+        let registry = seeded_cms10_registry(&endpoint).await;
+        let proxy = RecordingImageProxy::new(ArtworkOutcome::Registered);
+        let client = Arc::new(Cms10Client::new().unwrap());
+        let participant =
+            Cms10SearchParticipant::new(registry, client).with_image_proxy(proxy.clone());
+
+        let not_cancelled = || false;
+        let cards = participant
+            .search("庆余年", 10, &not_cancelled)
+            .await
+            .expect("夹具采集站必须可搜索");
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].title, "庆余年");
+        assert_eq!(cards[0].work_id, format!("{CMS10_CANDIDATE_PREFIX}42"));
+        assert_eq!(
+            cards[0].poster_uri.as_deref(),
+            Some("haven://artwork/artwork-1")
+        );
+        assert_eq!(
+            proxy.calls(),
+            vec![(
+                CMS10_SOURCE_ID.to_owned(),
+                format!("{}/img/42.jpg", server.origin())
+            )],
+            "登记使用固定的 CMS10 来源身份与响应里的原始地址"
+        );
+
+        // 只有一次采集请求，且没有为海报额外抓图。
+        assert_eq!(server.connections(), 1);
+        assert_eq!(server.paths(), vec!["/api.php"]);
+        let target = server.requests()[0].target().to_owned();
+        assert!(target.contains("ac=videolist"), "目标: {target}");
+        assert!(
+            target.contains("wd=%E5%BA%86%E4%BD%99%E5%B9%B4"),
+            "目标: {target}"
+        );
+        assert!(
+            !target.contains("img/42.jpg"),
+            "搜索阶段不得为结果发起图片请求"
+        );
+
+        let wire = serde_json::to_string(&cards).unwrap();
+        assert!(wire.contains("haven://artwork/artwork-1"));
+        assert!(!wire.contains("img/42.jpg"));
+    }
+
+    /// 用户明确配置的本机采集站可以直接使用，不需要测试专用的回环绕过。
+    #[tokio::test]
+    async fn production_client_accepts_an_explicitly_configured_loopback_catalog() {
+        let server = FixtureServer::start(|_| {
+            vec![(
+                "/api.php".to_owned(),
+                FixtureResponse::json(r#"{"code":1,"list":[]}"#.to_owned()),
+            )]
+        });
+        let endpoint = format!("{}/api.php", server.origin());
+        let production = Cms10Client::new().unwrap();
+        let cards = production
+            .search(&endpoint, "任意", 10)
+            .await
+            .expect("用户明确配置的本机采集站应可访问");
+        assert!(cards.is_empty());
+        assert_eq!(server.connections(), 1, "配置的本机端点应收到一次请求");
+    }
 
     #[test]
     fn parses_first_play_group_and_filters_non_http() {
@@ -563,12 +796,13 @@ mod tests {
 
     #[test]
     fn cms10_query_is_encoded_without_path_concatenation() {
-        let url = build_cms10_url(
-            "https://media.example.invalid/api.php?token=opaque",
-            "wd",
-            "庆余年",
-        )
-        .unwrap();
+        let url = Cms10Client::default()
+            .endpoint_url(
+                "https://media.example.invalid/api.php?token=opaque",
+                "wd",
+                "庆余年",
+            )
+            .unwrap();
         assert_eq!(url.path(), "/api.php");
         let query = url.query().unwrap();
         assert!(query.contains("ac=videolist"));

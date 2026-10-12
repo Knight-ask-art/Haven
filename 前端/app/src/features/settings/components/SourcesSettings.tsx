@@ -94,7 +94,7 @@ function M3uEndpointRow({
   return (
     <div className="flex flex-col gap-[8px] border-t border-[var(--haven-settings-border-subtle)] px-5 py-[16px]">
       <p className="text-xs font-semibold text-[var(--haven-settings-foreground)]">M3U 播放列表地址</p>
-      <p className="text-[11px] leading-5 text-[var(--haven-settings-muted)]">填入以 http:// 或 https:// 开头的播放列表地址。保存后可按频道名称搜索；播放地址不会显示在搜索结果中。</p>
+      <p className="text-[11px] leading-5 text-[var(--haven-settings-muted)]">填入以 http:// 或 https:// 开头的播放列表地址，本机和局域网地址也可以使用；地址带访问参数时请使用 HTTPS。保存后可按频道名称搜索，播放地址不会显示在搜索结果中。</p>
       <div className="flex flex-col gap-[8px] sm:flex-row sm:items-center">
         <input
           value={endpoint}
@@ -456,7 +456,7 @@ function BuiltinSourceRow({
         source={source}
         origin={`内置 · ${source.displayName}`}
         statusLabel={source.enabled ? "已启用" : "已停用"}
-        statusHint={supportsEndpoint && !source.endpointConfigured ? "待配置接口" : source.health === "unknown" ? "未检测" : healthLabel}
+        statusHint={supportsEndpoint && !source.endpointConfigured ? "待配置接口" : source.health === "unknown" ? "暂无查询状态" : `最近查询 · ${healthLabel}`}
         controls={(
           <>
             <SourceEnableSwitch source={source} busy={toggling} onToggle={onToggle} />
@@ -616,6 +616,13 @@ function CustomSourceManager({
   const [customTogglingId, setCustomTogglingId] = useState<string | null>(null)
 
   useEffect(() => {
+    if (credentialFor === null || registry === null) return
+    const source = registry.sources.find((item) => item.sourceId === credentialFor)
+    if (source) setCredentialConfigured(source.credentialConfigured)
+    else setCredentialFor(null)
+  }, [credentialFor, registry])
+
+  useEffect(() => {
     if (requestedAddKind === null) return
     setAddKind(requestedAddKind)
     setAddStep("details")
@@ -724,9 +731,11 @@ function CustomSourceManager({
     try {
       await removeSource({ sourceId })
       showNotice("来源已删除")
-      onChanged()
     } catch (error) {
       showNotice(toHavenError(error).dto.userMessage)
+    } finally {
+      // 外部清理失败前，来源记录可能已原子撤销；回源读取，不从异常推断旧状态。
+      onChanged()
     }
   }
 
@@ -756,13 +765,14 @@ function CustomSourceManager({
       setCredentialValue("")
       showNotice(secret.length > 0 ? "凭据已保存到系统凭据管理器" : "凭据已清除")
       if (adding) setAddStep("done")
-      onChanged()
     } catch (error) {
       const message = toHavenError(error).dto.userMessage
       setCredentialError(message)
       showNotice(message)
     } finally {
       setSubmitting(false)
+      // 逻辑撤销与物理清理分离；成功与失败都由权威注册表重新投影配置状态。
+      onChanged()
     }
   }
 
@@ -847,7 +857,7 @@ function CustomSourceManager({
         {addStep === "done" && (
           <div className="mt-5 flex flex-col gap-[16px]">
             <div className="rounded-2xl border border-[#34a853]/20 bg-[var(--haven-settings-card)] p-[16px]">
-              <p className="text-sm font-semibold text-[var(--haven-settings-primary)]">来源已准备好</p>
+              <p className="text-sm font-semibold text-[var(--haven-settings-primary)]">来源已添加</p>
               <p className="mt-1 text-xs leading-5 text-[var(--haven-settings-primary)]">{displayName} · 单一来源 · {addKind === "feed" ? "RSS/Atom 订阅源（不使用访问凭据）" : comicLibraryKind ? `${comicLibraryLabel} 漫画库${credentialConfigured ? " · API key 已配置" : " · API key 稍后配置"}` : `OPDS 目录${credentialConfigured ? " · 凭据已配置" : " · 凭据稍后配置"}`}</p>
             </div>
             <div className="flex justify-end"><button type="button" onClick={resetAddForm} className="rounded-full bg-[var(--haven-settings-primary)] px-[16px] py-[8px] text-xs font-semibold text-[var(--haven-settings-primary-foreground)]">返回来源列表</button></div>
@@ -879,8 +889,8 @@ function CustomSourceManager({
         const statusHint = source.health === "unknown"
           ? comic
             ? `API key ${source.credentialConfigured ? "已配置" : "未配置"}`
-            : !feed && !source.credentialConfigured ? "访问凭据未配置" : "未检测"
-          : SOURCE_HEALTH_LABELS[source.health] ?? "未检测"
+            : !feed && !source.credentialConfigured ? "暂无查询状态 · 可选凭据未配置" : "暂无查询状态"
+          : `最近查询 · ${SOURCE_HEALTH_LABELS[source.health] ?? "未知"}`
         return (
           <div key={source.sourceId} className="border-b border-[var(--haven-settings-border-subtle)] last:border-b-0">
             <SourceCatalogRow

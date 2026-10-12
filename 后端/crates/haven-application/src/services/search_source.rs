@@ -11,11 +11,14 @@
 //!   未知 operationId → `RESOURCE_NOT_FOUND`。
 //! - 已启用来源无注册参与者时跳过该来源（组合缺口，不是来源失败）；固定公开
 //!   metadata Provider 不需要用户端点，CMS10/M3U/OPDS 等资源来源仍需端点。
+//! - 每个**真实**搜索观测（成功或失败）都写入来源注册表的健康事实：被跳过的来源
+//!   （无参与者、分类不匹配、未配置端点）与取消的查询都不是探测，不写健康；
+//!   更早开始的检查即使更晚完成，也不会回退更晚开始的结果（见 `source_registry::health`）。
 //!
 //! 依赖方向：application 层只依赖 domain 契约 + wire DTO；
 //! `SearchSourceParticipant` / `SearchEventSink` 端口由后续批次与 src-tauri 实现。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,7 +28,9 @@ use tokio::task::JoinSet;
 use haven_common::{AppError, ErrorKind, UtcMillis};
 
 use crate::mapper::utc_millis_to_rfc3339;
-use crate::services::source_registry::SourceRegistryService;
+use crate::services::source_registry::{
+    SourceHealthRecorder, SourceRegistryService, SourceSearchObservation,
+};
 use crate::wire::{
     SearchSourceEvent, SearchSourceEventData, SearchSourceEventKind, SearchSourceStartRequest,
     SearchStartResultDto, WorkCardDto,
@@ -299,6 +304,8 @@ pub struct SearchSourceService {
     participants: Vec<Arc<dyn SearchSourceParticipant>>,
     sink: Arc<dyn SearchEventSink>,
     supervisor: Arc<Supervisor>,
+    /// 真实搜索观测的健康落地端口（无写入通道时注册表侧是无操作）。
+    health: Option<Arc<dyn SourceHealthRecorder>>,
 }
 
 impl SearchSourceService {
@@ -307,11 +314,13 @@ impl SearchSourceService {
         participants: Vec<Arc<dyn SearchSourceParticipant>>,
         sink: Arc<dyn SearchEventSink>,
     ) -> Self {
+        let health: Arc<dyn SourceHealthRecorder> = Arc::new(registry.clone());
         Self {
             registry,
             participants,
             sink,
             supervisor: Arc::new(Supervisor::new()),
+            health: Some(health),
         }
     }
 
@@ -373,9 +382,9 @@ impl SearchSourceService {
         let cancel = cancel.expect("新登记必须返回取消标志");
         let candidates = candidates.expect("新登记必须返回候选缓存");
 
-        // 启用时点的启用来源快照（含健康/端点，供并行优先级排序；搜索期间变更不并入本次任务）。
+        // 启用时点的分发快照（含健康/端点/配置版本，供并行优先级排序；搜索期间变更不并入本次任务）。
         // 注册表读取失败 → 清理登记并以稳定错误响应（不产生 Channel 会话）。
-        let enabled_sources = match self.enabled_sources().await {
+        let snapshot = match self.registry.enabled_sources_snapshot().await {
             Ok(v) => v,
             Err(err) => {
                 self.supervisor.abort(&query_key, &operation_id);
@@ -395,27 +404,34 @@ impl SearchSourceService {
 
         let participants = self.participants.clone();
         let supervisor = self.supervisor.clone();
-        let query_owned = query.to_owned();
-        let category = request.category;
-        let limit = request.limit_per_source.unwrap_or(DEFAULT_LIMIT_PER_SOURCE);
+        let dispatch_query = DispatchQuery {
+            // 合并键、事件与参与者都使用同一个 trim 过的搜索词。
+            text: query.to_owned(),
+            category: request.category,
+            limit: request.limit_per_source.unwrap_or(DEFAULT_LIMIT_PER_SOURCE),
+        };
         let op_for_spawn = operation_id.clone();
+        let enabled_sources = snapshot.sources;
+        let health = HealthContext {
+            revisions: snapshot.revisions,
+            recorder: self.health.clone(),
+        };
 
         // 双层 spawn（与 ScanService 同模式）：内层 panic 由 JoinHandle 捕获，
         // 外层保证终态事件 + 终态登记统一执行。
         let supervisor_query_key = query_key.clone();
         tokio::spawn(async move {
             let inner_emitter = emitter.clone();
-            let inner_query = query_owned.clone();
             let inner_candidates = candidates.clone();
+            let inner_health = health.clone();
             let inner = tokio::spawn(async move {
                 run_dispatch(
                     participants,
-                    inner_query,
-                    category,
-                    limit,
+                    dispatch_query,
                     enabled_sources,
                     inner_emitter,
                     inner_candidates,
+                    inner_health,
                 )
                 .await
             });
@@ -460,23 +476,6 @@ impl SearchSourceService {
         }
     }
 
-    /// 启用时点的启用来源快照（按内置目录顺序，含健康与端点状态供调度排序）。
-    async fn enabled_sources(&self) -> Result<Vec<crate::wire::SourceDescriptorDto>, AppError> {
-        let registry = self.registry.list().await?;
-        Ok(registry.sources.into_iter().filter(|s| s.enabled).collect())
-    }
-
-    /// 兼容旧名（测试用），返回仅 ID；新调度用 `enabled_sources`。
-    #[allow(dead_code)]
-    async fn enabled_source_ids(&self) -> Result<Vec<String>, AppError> {
-        Ok(self
-            .enabled_sources()
-            .await?
-            .into_iter()
-            .map(|s| s.source_id)
-            .collect())
-    }
-
     /// 按操作 + 序号取候选外部 ID（导入定位；未知返回 None）。
     pub fn candidate_external_id(&self, operation_id: &str, index: u32) -> Option<String> {
         self.supervisor.candidate_external_id(operation_id, index)
@@ -497,19 +496,76 @@ struct ScheduledSource {
     descriptor: crate::wire::SourceDescriptorDto,
 }
 
-#[allow(dead_code)]
-enum SourceOutcome {
+/// 一次来源调用的探测事实：开始时间、真实耗时，以及它是否真的发出了请求。
+struct SourceProbe {
+    /// 分发时刻即「检查开始」时刻：观测按它排序，迟到的旧检查不得回退新结果。
+    started_at: UtcMillis,
+    latency_ms: u64,
+    /// 分发时是否已经取消：取消后参与者返回的空结果不是一次真实探测，不能记成成功。
+    probed: bool,
+}
+
+enum SourceOutcomeKind {
     Result {
         source_id: String,
         works: Vec<WorkCardDto>,
-        elapsed_ms: u64,
     },
     Warning {
         source_id: String,
         code: String,
         message: String,
-        elapsed_ms: u64,
     },
+}
+
+struct SourceOutcome {
+    kind: SourceOutcomeKind,
+    probe: SourceProbe,
+}
+
+/// 分发期的健康观测上下文：分发时读到的来源配置版本 + 观测落地端口。
+///
+/// 版本号随观测进入健康写入事务：分发之后发生的端点/凭据变更（含 A→B→A）会让这次
+/// 观测作废，而不是把新端点标成健康。
+#[derive(Clone)]
+struct HealthContext {
+    revisions: BTreeMap<String, String>,
+    recorder: Option<Arc<dyn SourceHealthRecorder>>,
+}
+
+impl HealthContext {
+    /// 构造一次真实搜索观测。
+    ///
+    /// 取消的查询与分发时已取消的调用都不是探测：既不记成功也不记失败。
+    fn observation(
+        &self,
+        source_id: &str,
+        probe: &SourceProbe,
+        succeeded: bool,
+        emitter: &TaskEmitter,
+    ) -> Option<SourceSearchObservation> {
+        if !probe.probed || emitter.is_cancelled() {
+            return None;
+        }
+        Some(SourceSearchObservation {
+            source_id: source_id.to_owned(),
+            source_revision: self.revisions.get(source_id).cloned(),
+            started_at: probe.started_at,
+            succeeded,
+            latency_ms: probe.latency_ms,
+        })
+    }
+
+    /// 一轮搜索只发起一次健康写入，避免每个来源分别排队争用数据库写锁。
+    async fn record_all(&self, observations: Vec<SourceSearchObservation>, emitter: &TaskEmitter) {
+        if observations.is_empty() || emitter.is_cancelled() {
+            return;
+        }
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        // 健康是诊断事实：写入失败不得把一次已经完成的搜索变成失败。
+        let _ = recorder.record_search_observations(observations).await;
+    }
 }
 
 fn resolve_participant(
@@ -555,15 +611,27 @@ fn priority_of(source: &crate::wire::SourceDescriptorDto) -> u64 {
         / success_bp.max(500)
 }
 
+/// 一次分发的查询输入。
+///
+/// 分发循环里的每个参与者调用都只依赖这三个值；把它们收成一份值对象，让
+/// `run_dispatch` 的参数表不再随调度选项增长。字段语义与之前的位置参数完全一致：
+/// `text` 是已 trim 的搜索词（合并键、事件与参与者共用同一个字符串），`category` 是分类
+/// 门控用的原始请求值（`None` 表示不限制），`limit` 是已经取过 [`DEFAULT_LIMIT_PER_SOURCE`]
+/// 默认值的上限。
+struct DispatchQuery {
+    text: String,
+    category: Option<crate::wire::QueryCategory>,
+    limit: u32,
+}
+
 /// 分发循环（并行均衡版）。返回值语义同前：`Some(kind)` 为取消/失败提前收束，`None` 为全部完成。
 async fn run_dispatch(
     participants: Vec<Arc<dyn SearchSourceParticipant>>,
-    query: String,
-    category: Option<crate::wire::QueryCategory>,
-    limit: u32,
+    query: DispatchQuery,
     enabled_sources: Vec<crate::wire::SourceDescriptorDto>,
     emitter: Arc<TaskEmitter>,
     candidates: Arc<Mutex<Vec<String>>>,
+    health: HealthContext,
 ) -> Option<SearchSourceEventKind> {
     // 1. 组装调度队列：解析 participant、分类门控、端点门控
     let mut jobs: Vec<ScheduledSource> = Vec::new();
@@ -572,7 +640,7 @@ async fn run_dispatch(
             // 组合缺口：启用但无参与者，跳过不告警
             continue;
         };
-        if !participant.supports_category(category) {
+        if !participant.supports_category(query.category) {
             continue;
         }
         if source_requires_endpoint(&source) && !source.endpoint_configured {
@@ -581,7 +649,7 @@ async fn run_dispatch(
                 Some(source.source_id.clone()),
                 Vec::new(),
                 Some("SOURCE_NOT_CONFIGURED".to_owned()),
-                Some("该搜索源尚未完成配置。".to_owned()),
+                Some(source_not_configured_message(&source.source_id).to_owned()),
             );
             continue;
         }
@@ -602,41 +670,58 @@ async fn run_dispatch(
 
     let mut pending: VecDeque<ScheduledSource> = jobs.into();
     let mut running: JoinSet<SourceOutcome> = JoinSet::new();
+    let mut health_observations = Vec::new();
 
     let spawn_next = |running: &mut JoinSet<SourceOutcome>,
                       pending: &mut VecDeque<ScheduledSource>,
-                      query: &str,
-                      limit: u32,
+                      query: &DispatchQuery,
                       cancel: &Arc<AtomicBool>| {
         while running.len() < MAX_CONCURRENCY {
             let Some(job) = pending.pop_front() else {
                 break;
             };
-            let query = query.to_owned();
+            let limit = query.limit;
+            let query = query.text.clone();
             let cancel = Arc::clone(cancel);
             let participant = job.participant.clone();
             let source_id = job.source_id.clone();
             running.spawn(async move {
-                let started = std::time::Instant::now();
                 let is_cancelled = || cancel.load(Ordering::Acquire);
+                let probe_started_at = UtcMillis::now();
+                let probed = !is_cancelled();
+                let started = std::time::Instant::now();
                 let call = participant.search_for(&source_id, &query, limit, &is_cancelled);
-                match tokio::time::timeout(SOURCE_TIMEOUT, call).await {
-                    Ok(Ok(works)) => SourceOutcome::Result {
-                        source_id,
-                        works,
-                        elapsed_ms: started.elapsed().as_millis() as u64,
-                    },
-                    Ok(Err(err)) => SourceOutcome::Warning {
-                        source_id,
-                        code: err.code().as_str().to_owned(),
-                        message: err.user_message().to_owned(),
-                        elapsed_ms: started.elapsed().as_millis() as u64,
-                    },
-                    Err(_) => SourceOutcome::Warning {
-                        source_id,
-                        code: "SOURCE_UNAVAILABLE".to_owned(),
-                        message: "该搜索源响应超时。".to_owned(),
-                        elapsed_ms: SOURCE_TIMEOUT.as_millis() as u64,
+                let (kind, latency_ms) = match tokio::time::timeout(SOURCE_TIMEOUT, call).await {
+                    Ok(Ok(works)) => (
+                        SourceOutcomeKind::Result {
+                            source_id: source_id.clone(),
+                            works,
+                        },
+                        started.elapsed().as_millis() as u64,
+                    ),
+                    Ok(Err(err)) => (
+                        SourceOutcomeKind::Warning {
+                            source_id: source_id.clone(),
+                            code: err.code().as_str().to_owned(),
+                            message: err.user_message().to_owned(),
+                        },
+                        started.elapsed().as_millis() as u64,
+                    ),
+                    Err(_) => (
+                        SourceOutcomeKind::Warning {
+                            source_id: source_id.clone(),
+                            code: "SOURCE_UNAVAILABLE".to_owned(),
+                            message: "该搜索源响应超时。".to_owned(),
+                        },
+                        SOURCE_TIMEOUT.as_millis() as u64,
+                    ),
+                };
+                SourceOutcome {
+                    kind,
+                    probe: SourceProbe {
+                        started_at: probe_started_at,
+                        latency_ms,
+                        probed,
                     },
                 }
             });
@@ -646,7 +731,7 @@ async fn run_dispatch(
     // 初始填充
     {
         let cancel = emitter.cancel.clone();
-        spawn_next(&mut running, &mut pending, &query, limit, &cancel);
+        spawn_next(&mut running, &mut pending, &query, &cancel);
     }
 
     enum End {
@@ -666,7 +751,7 @@ async fn run_dispatch(
                 break End::Completed;
             }
             let cancel = emitter.cancel.clone();
-            spawn_next(&mut running, &mut pending, &query, limit, &cancel);
+            spawn_next(&mut running, &mut pending, &query, &cancel);
             continue;
         }
 
@@ -679,7 +764,7 @@ async fn run_dispatch(
                 break End::Completed;
             }
             let cancel = emitter.cancel.clone();
-            spawn_next(&mut running, &mut pending, &query, limit, &cancel);
+            spawn_next(&mut running, &mut pending, &query, &cancel);
             continue;
         };
 
@@ -690,18 +775,14 @@ async fn run_dispatch(
         }
 
         match joined {
-            Ok(outcome) => {
+            Ok(SourceOutcome { kind, probe }) => {
                 // 先补位，避免 sink 慢时浪费并发
                 {
                     let cancel = emitter.cancel.clone();
-                    spawn_next(&mut running, &mut pending, &query, limit, &cancel);
+                    spawn_next(&mut running, &mut pending, &query, &cancel);
                 }
-                match outcome {
-                    SourceOutcome::Result {
-                        source_id,
-                        works,
-                        elapsed_ms: _,
-                    } => {
+                match kind {
+                    SourceOutcomeKind::Result { source_id, works } => {
                         {
                             // `SearchSourceEventData.works` 与此缓存共享同一批次、同一
                             // 到达顺序。缓存所有展示句柄，确保前端使用的 index 不会因
@@ -711,25 +792,35 @@ async fn run_dispatch(
                         }
                         emitter.emit(
                             SearchSourceEventKind::SourceResult,
-                            Some(source_id),
+                            Some(source_id.clone()),
                             works,
                             None,
                             None,
                         );
+                        // 空成功响应也是一次真实成功的探测。
+                        if let Some(observation) =
+                            health.observation(&source_id, &probe, true, &emitter)
+                        {
+                            health_observations.push(observation);
+                        }
                     }
-                    SourceOutcome::Warning {
+                    SourceOutcomeKind::Warning {
                         source_id,
                         code,
                         message,
-                        elapsed_ms: _,
                     } => {
                         emitter.emit(
                             SearchSourceEventKind::Warning,
-                            Some(source_id),
+                            Some(source_id.clone()),
                             Vec::new(),
                             Some(code),
                             Some(message),
                         );
+                        if let Some(observation) =
+                            health.observation(&source_id, &probe, false, &emitter)
+                        {
+                            health_observations.push(observation);
+                        }
                     }
                 }
             }
@@ -741,7 +832,10 @@ async fn run_dispatch(
     };
 
     match end {
-        End::Completed => None,
+        End::Completed => {
+            health.record_all(health_observations, &emitter).await;
+            None
+        }
         End::Cancelled => Some(SearchSourceEventKind::Cancelled),
     }
 }
@@ -764,6 +858,14 @@ fn cache_displayed_candidates(candidates: &Arc<Mutex<Vec<String>>>, works: &[Wor
 /// 但它们的地址由后端拥有，不应因为 Wire 中没有端点而被跳过。
 fn source_requires_endpoint(source: &crate::wire::SourceDescriptorDto) -> bool {
     matches!(source.source_id.as_str(), "cms10" | "m3u") || source.source_id.starts_with("custom_")
+}
+
+fn source_not_configured_message(source_id: &str) -> &'static str {
+    match source_id {
+        "cms10" => "CMS10 需要先到“设置 → 来源”配置采集接口地址。",
+        "m3u" => "M3U 需要先到“设置 → 来源”配置播放列表地址。",
+        _ => "该搜索源尚未完成配置。",
+    }
 }
 
 /// 生成 opaque id（时间戳 + 纳秒后缀，保证唯一性）。
@@ -831,8 +933,9 @@ mod tests {
         }
     }
 
-    struct CaptureSink {
-        events: Mutex<Vec<SearchSourceEvent>>,
+    /// 事件捕获下沉。健康用例（`health_tests`）复用同一份实现，避免两套事件断言分叉。
+    pub(super) struct CaptureSink {
+        pub(super) events: Mutex<Vec<SearchSourceEvent>>,
     }
 
     impl SearchEventSink for CaptureSink {
@@ -841,7 +944,7 @@ mod tests {
         }
     }
 
-    fn card(work_id: &str, title: &str) -> WorkCardDto {
+    pub(super) fn card(work_id: &str, title: &str) -> WorkCardDto {
         WorkCardDto {
             work_id: work_id.to_owned(),
             title: title.to_owned(),
@@ -930,12 +1033,15 @@ mod tests {
         let started = std::time::Instant::now();
         let result = run_dispatch(
             participants,
-            "q".to_owned(),
-            None,
-            5,
+            DispatchQuery {
+                text: "q".to_owned(),
+                category: None,
+                limit: 5,
+            },
             enabled,
             emitter.clone(),
             candidates,
+            no_health(),
         )
         .await;
         let elapsed = started.elapsed();
@@ -1020,6 +1126,22 @@ mod tests {
             ..metadata
         };
         assert!(source_requires_endpoint(&stream));
+    }
+
+    #[test]
+    fn missing_builtin_endpoints_explain_how_to_configure_them() {
+        assert_eq!(
+            source_not_configured_message("cms10"),
+            "CMS10 需要先到“设置 → 来源”配置采集接口地址。"
+        );
+        assert_eq!(
+            source_not_configured_message("m3u"),
+            "M3U 需要先到“设置 → 来源”配置播放列表地址。"
+        );
+        assert_eq!(
+            source_not_configured_message("custom_0123456789ab"),
+            "该搜索源尚未完成配置。"
+        );
     }
 
     #[test]
@@ -1172,12 +1294,15 @@ mod tests {
         let handle = tokio::spawn(async move {
             run_dispatch(
                 participants_clone,
-                "q".to_owned(),
-                None,
-                5,
+                DispatchQuery {
+                    text: "q".to_owned(),
+                    category: None,
+                    limit: 5,
+                },
                 enabled_clone,
                 emitter_clone,
                 candidates_clone,
+                no_health(),
             )
             .await
         });
@@ -1197,9 +1322,10 @@ mod tests {
         }
     }
 
-    struct ImmediateParticipant {
-        id: String,
-        calls: Arc<AtomicUsize>,
+    /// 立即返回空结果的参与者：健康用例用它证明「空成功响应也是一次真实成功」。
+    pub(super) struct ImmediateParticipant {
+        pub(super) id: String,
+        pub(super) calls: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
@@ -1216,6 +1342,15 @@ mod tests {
         ) -> Result<Vec<WorkCardDto>, AppError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Vec::new())
+        }
+    }
+
+    /// 不写健康事实的分发上下文（只验证调度与事件行为的用例使用）。
+    /// 真实搜索观测 → 健康事实的用例在 `health_tests` 里自带完整夹具。
+    pub(super) fn no_health() -> HealthContext {
+        HealthContext {
+            revisions: BTreeMap::new(),
+            recorder: None,
         }
     }
 }
