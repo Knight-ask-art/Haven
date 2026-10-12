@@ -4,11 +4,17 @@
 //! - `resolve` 只放行 http(s) 目标；库内脏数据一律拒绝。真正出站前由
 //!   `ArtworkCache` 再执行来源 Host、DNS/IP、Redirect 和 signed-query 策略，
 //!   因此登记本身不被当作 SSRF 防护。
+//! - 显式登记的映射可以携带 CDN 签名查询串（见 [`allows_signed_query`]）；
+//!   旧记录补齐与豆瓣自动来源策略仍然拒绝，签名串只存在于映射表与出站请求。
+//! - 登记侧的 URL 形状与主机判定与共享出站策略同源（`haven_common::network`）：
+//!   畸形 authority 与不可路由的字面地址在写入映射表之前就拒绝。端口策略不在
+//!   这里收窄，公共非零端口保持既有行为。
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use haven_common::AppError;
+use haven_common::network::{is_publicly_routable, validate_host};
 use haven_domain::contracts::ImageProxyRepository;
 use rusqlite::OptionalExtension;
 
@@ -21,6 +27,10 @@ pub struct ImageProxyRecord {
     pub target_url: String,
     pub normalized_host: Option<String>,
 }
+
+/// Artwork 目标地址的硬上限。签名 CDN 地址必然带查询串，但仍然只允许落进
+/// 受控的后端登记映射；长度上限防止任意长字符串进入映射表与缓存索引。
+pub const MAX_ARTWORK_TARGET_URL_LEN: usize = 2_048;
 
 use crate::db::Db;
 use crate::db::repos::map_db_error;
@@ -155,7 +165,9 @@ impl SqliteImageProxyRepository {
         source_id: &str,
         target_url: &str,
     ) -> Result<(), AppError> {
-        let normalized_host = validate_registration(source_id, target_url)?;
+        // 旧记录补齐是按主机推断来源的兼容路径，不是显式登记：签名查询串在这
+        // 里必须继续 fail closed，不能因为换了一个调用方就放宽。
+        let normalized_host = validate_artwork_target(source_id, target_url, false)?;
         let conn = self.db.lock();
         conn.execute(
             "UPDATE image_proxy
@@ -170,9 +182,53 @@ impl SqliteImageProxyRepository {
 
 /// 注册阶段只做不依赖 DNS 的 URL 形状和来源域校验；实际连接前还必须
 /// 重新解析 DNS 并检查 IP，避免把“已登记”误当作 SSRF 防护。
+///
+/// 允许签名类查询参数：后端显式登记的映射（来源 + 主机双重作用域，写入
+/// `source_id`/`normalized_host`）可以携带 CDN 签名串，登记表本身不外泄。
 pub fn validate_registration(source_id: &str, target_url: &str) -> Result<String, AppError> {
+    validate_artwork_target(source_id, target_url, allows_signed_query(source_id))
+}
+
+/// 显式登记的来源是否接受签名类查询参数。
+///
+/// 仅用户配置的 CMS/OPDS/Feed 图片路径接受签名串。固定元数据来源、未知来源
+/// 与未来新增来源默认拒绝，不能仅因为调用了 `register` 就获得此能力。
+/// 旧记录补齐（[`SqliteImageProxyRepository::backfill_known_source_if_missing`]）
+/// 同样不放行；真正出站仍须验证已登记主机及公共 DNS 地址。
+pub fn allows_signed_query(source_id: &str) -> bool {
+    if matches!(source_id, "cms10" | "opds") {
+        return true;
+    }
+    // 只接受注册表生成的 OPDS/Feed 身份形状；其它 custom 家族（例如 TVBox）
+    // 不继承图片权限。它不替代调用方的来源归属校验或请求时的网络检查。
+    ["custom_feed_", "custom_"].iter().any(|prefix| {
+        source_id.strip_prefix(prefix).is_some_and(|id| {
+            id.len() == 12
+                && id
+                    .bytes()
+                    .all(|ch| ch.is_ascii_digit() || (b'a'..=b'f').contains(&ch))
+        })
+    })
+}
+
+fn validate_artwork_target(
+    source_id: &str,
+    target_url: &str,
+    allow_signed_query: bool,
+) -> Result<String, AppError> {
     if source_id.trim().is_empty() || source_id.len() > 64 {
         return Err(haven_common::validation("图片来源标识无效"));
+    }
+    if target_url.len() > MAX_ARTWORK_TARGET_URL_LEN {
+        return Err(haven_common::validation("图片地址超出长度上限"));
+    }
+    // 归一化之前的原始形状：WHATWG 解析会把反斜杠当成路径分隔符，也会把
+    // `https:///path` 的空 authority 重新解释成主机。授权边界必须看调用方
+    // 真正写下（以及将写进映射表）的文本，而不是“解析之后的样子”。
+    if !has_safe_authority_shape(target_url) {
+        return Err(haven_common::validation(
+            "图片代理只接受合法 http/https 地址",
+        ));
     }
     let url = target_url
         .parse::<reqwest::Url>()
@@ -184,22 +240,59 @@ pub fn validate_registration(source_id: &str, target_url: &str) -> Result<String
     {
         return Err(haven_common::validation("图片地址包含不允许的 URL 组件"));
     }
-    if has_sensitive_query(&url) {
+    if !allow_signed_query && has_sensitive_query(&url) {
         return Err(haven_common::validation(
             "图片地址不能包含签名或 Secret 查询参数",
         ));
     }
-    let host = url
+    let raw_host = url
         .host_str()
-        .ok_or_else(|| haven_common::validation("图片地址缺少主机"))?
-        .to_ascii_lowercase();
+        .ok_or_else(|| haven_common::validation("图片地址缺少主机"))?;
+    // 主机判定与共享出站策略同一份：localhost、单标签主机、`.local`/`.internal`
+    // 后缀都在这里 fail closed。端口策略刻意不在这里收窄——登记侧继续接受
+    // 此前已允许的公共非零端口，端口兼容策略是另一项独立任务。
+    let host = validate_host(raw_host)
+        .map_err(|_| haven_common::validation("图片地址主机不在公共网络范围"))?;
+    // 字面地址是连接目标本身，必须直接按公共路由判定；不能依赖来源登记，
+    // 也不能靠 Fake-IP 分类器获得豁免。
+    if let Ok(ip) = host.parse::<std::net::IpAddr>()
+        && !is_publicly_routable(ip)
+    {
+        return Err(haven_common::validation("图片地址主机不在公共网络范围"));
+    }
     if source_id == "douban" && host != "doubanio.com" && !host.ends_with(".doubanio.com") {
         return Err(haven_common::validation("豆瓣图片主机不在允许列表"));
     }
-    if host == "localhost" || is_private_literal_host(&host) {
-        return Err(haven_common::validation("图片地址主机不在公共网络范围"));
-    }
     Ok(host)
+}
+
+/// 原始文本层面的 authority 形状检查。
+///
+/// `url::Url` 会规范化若干畸形写法（空端口等同于没有端口、反斜杠等同于 `/`、
+/// 空 authority 会被当成主机），这些形式一旦写进映射表，就会与调用方看到的
+/// 文本含义不一致。这里只拒绝明确畸形的写法，不引入任何新的端口或主机策略。
+fn has_safe_authority_shape(raw: &str) -> bool {
+    if raw.chars().any(char::is_control) || raw.chars().any(char::is_whitespace) {
+        return false;
+    }
+    if raw.contains('\\') {
+        return false;
+    }
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    // `://` 之后必须紧跟非空的 authority；`https:///path` 这类写法在解析后
+    // 会变成另一种目标。
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() {
+        return false;
+    }
+    // `https://host:/path` 的显式空端口在解析后会被当成“没有端口”。
+    !authority.ends_with(':')
 }
 
 /// 返回 021 之前能够从精确 Host 推断出的来源策略。
@@ -224,6 +317,10 @@ pub fn legacy_source_for_url(target_url: &str) -> Option<&'static str> {
     }
 }
 
+/// 地址是否带签名/凭据类查询参数。
+///
+/// 这是拒绝判定，不是分类器：显式登记的后端映射允许签名 CDN 地址（见
+/// [`allows_signed_query`]），只有旧记录推断与自动授权来源用它 fail closed。
 pub fn has_sensitive_query(url: &reqwest::Url) -> bool {
     const SENSITIVE: &[&str] = &[
         "token",
@@ -241,36 +338,6 @@ pub fn has_sensitive_query(url: &reqwest::Url) -> bool {
             .iter()
             .any(|item| key == *item || key.contains(item))
     })
-}
-
-fn is_private_literal_host(host: &str) -> bool {
-    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
-        return false;
-    };
-    is_private_ip(ip)
-}
-
-pub fn is_private_ip(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(ip) => {
-            ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_unspecified()
-                || ip.is_broadcast()
-                || ip.octets() == [169, 254, 169, 254]
-                || ip.octets()[0] == 0
-        }
-        std::net::IpAddr::V6(ip) => {
-            if let Some(ipv4) = ip.to_ipv4() {
-                return is_private_ip(std::net::IpAddr::V4(ipv4));
-            }
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || (ip.segments()[0] & 0xfe00) == 0xfc00
-                || (ip.segments()[0] & 0xffc0) == 0xfe80
-        }
-    }
 }
 
 #[cfg(test)]
@@ -378,14 +445,113 @@ mod tests {
     }
 
     #[test]
-    fn registration_rejects_signed_and_cross_source_urls() {
+    fn registration_rejects_cross_source_and_private_targets() {
         assert!(validate_registration("douban", "https://evil.example/p.jpg").is_err());
-        assert!(
-            validate_registration("douban", "https://img.doubanio.com/p.jpg?signature=secret")
-                .is_err()
-        );
         assert!(validate_registration("douban", "https://img.doubanio.com/p.jpg").is_ok());
         assert!(validate_registration("cms10", "http://127.0.0.1/p.jpg").is_err());
+        assert!(validate_registration("cms10", "file:///etc/passwd").is_err());
+        assert!(validate_registration("cms10", "https://user:pass@img.example.com/p.jpg").is_err());
+        assert!(validate_registration("cms10", "https://img.example.com/p.jpg#frag").is_err());
+        assert!(validate_registration("", "https://img.example.com/p.jpg").is_err());
+    }
+
+    #[test]
+    fn signed_query_is_accepted_only_for_explicitly_registered_sources() {
+        // 后端显式登记的映射可以携带 CDN 签名串：来源 + 主机作用域仍然成立。
+        assert!(
+            validate_registration(
+                "custom_0123456789ab",
+                "https://img.example.com/p.jpg?token=opaque&expires=1&sig=opaque"
+            )
+            .is_ok()
+        );
+        assert!(validate_registration("cms10", "https://img.picbf.com/p.jpg?key=opaque").is_ok());
+        assert!(
+            validate_registration(
+                "custom_feed_0123456789ab",
+                "https://img.example.com/p.jpg?sig=opaque"
+            )
+            .is_ok()
+        );
+        // 固定来源、未知来源和其它 custom 家族不因登记而获得签名图片权限。
+        for source in [
+            "douban",
+            "tvmaze",
+            "anilist",
+            "bangumi",
+            "itunes",
+            "gutenberg",
+            "mangadex",
+            "future",
+            "custom_tvbox_0123456789ab",
+            "custom_not-an-id",
+        ] {
+            assert!(!allows_signed_query(source));
+            assert!(
+                validate_registration(source, "https://img.example.com/p.jpg?signature=opaque")
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn registration_bounds_the_target_url_length() {
+        let oversized = format!(
+            "https://img.example.com/p.jpg?token={}",
+            "a".repeat(MAX_ARTWORK_TARGET_URL_LEN)
+        );
+        assert!(validate_registration("cms10", &oversized).is_err());
+        let allowed = format!("https://img.example.com/p.jpg?token={}", "a".repeat(1_024));
+        assert!(validate_registration("cms10", &allowed).is_ok());
+    }
+
+    #[test]
+    fn registration_errors_never_echo_the_rejected_target() {
+        // 被拒绝的签名地址只留下稳定错误，不得把 fixture 查询串或主机带进
+        // 错误文案（错误会出现在日志与 IPC 结果里）。
+        let secret = "fixture-signature-opaque";
+        let error = validate_registration(
+            "douban",
+            &format!("https://img.doubanio.com/p.jpg?signature={secret}"),
+        )
+        .unwrap_err();
+        let rendered = format!(
+            "{} {} {error} {error:?}",
+            error.code().as_str(),
+            error.user_message()
+        );
+        assert!(!rendered.contains(secret), "错误文案不得包含查询串");
+        assert!(
+            !rendered.contains("doubanio.com"),
+            "错误文案不得包含目标主机"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_backfill_never_accepts_signed_query() {
+        let (repo, db) = setup();
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO image_proxy (id, target_url, created_at)
+                 VALUES ('legacy-signed', ?1, 0)",
+                rusqlite::params!["https://img.picbf.com/poster.jpg?token=opaque"],
+            )
+            .unwrap();
+        }
+
+        assert!(
+            repo.backfill_known_source_if_missing(
+                "legacy-signed",
+                "cms10",
+                "https://img.picbf.com/poster.jpg?token=opaque"
+            )
+            .is_err(),
+            "旧记录补齐不得为签名地址补出来源策略"
+        );
+        let record = repo.resolve_record("legacy-signed").unwrap().unwrap();
+        assert_eq!(record.source_id, None, "补齐失败必须保持 fail closed");
+        assert_eq!(record.normalized_host, None);
     }
 
     #[test]
@@ -413,11 +579,60 @@ mod tests {
     }
 
     #[test]
-    fn private_ip_policy_covers_metadata_and_ipv6_ranges() {
-        assert!(is_private_ip("169.254.169.254".parse().unwrap()));
-        assert!(is_private_ip("10.0.0.1".parse().unwrap()));
-        assert!(is_private_ip("::1".parse().unwrap()));
-        assert!(is_private_ip("::ffff:127.0.0.1".parse().unwrap()));
-        assert!(!is_private_ip("1.1.1.1".parse().unwrap()));
+    fn registration_rejects_addresses_outside_the_public_ranges() {
+        // 与共享出站策略同一份判定：云元数据、CGNAT、基准测试/文档网段、
+        // 保留段与 IPv6 ULA/link-local 都不能靠“登记”获得网络授权。
+        for raw in [
+            "http://169.254.169.254/latest/meta-data",
+            "http://10.0.0.1/p.jpg",
+            "http://127.0.0.1/p.jpg",
+            "http://100.100.100.200/p.jpg",
+            "http://198.18.0.1/p.jpg",
+            "http://192.0.0.9/p.jpg",
+            "http://[::1]/p.jpg",
+            "http://[fc00::1]/p.jpg",
+            "http://[fe80::1]/p.jpg",
+            "http://[2001:db8::1]/p.jpg",
+        ] {
+            assert!(
+                validate_registration("cms10", raw).is_err(),
+                "不得登记非公网地址: {raw}"
+            );
+        }
+        assert!(validate_registration("cms10", "https://img.example.com/p.jpg").is_ok());
+        assert!(validate_registration("cms10", "https://1.1.1.1/p.jpg").is_ok());
+        assert!(is_publicly_routable("1.1.1.1".parse().unwrap()));
+        assert!(!is_publicly_routable("100.100.100.200".parse().unwrap()));
+    }
+
+    #[test]
+    fn registration_rejects_malformed_authority_before_normalization() {
+        // 反斜杠、控制字符与空白会在 WHATWG 归一化里改变 authority 的含义；
+        // 空 authority 与显式空端口也会被解析成另一种目标。全部在解析前拒绝。
+        for raw in [
+            "https://img.example.com\\evil/p.jpg",
+            "https://img.example.com/p.jpg\n",
+            "https://img.example.com/p .jpg",
+            "https://img.example.com\r\nX-Injected: 1/p.jpg",
+            "https:///p.jpg",
+            "https://img.example.com:/p.jpg",
+        ] {
+            assert!(
+                validate_registration("cms10", raw).is_err(),
+                "不得登记畸形地址: {raw:?}"
+            );
+        }
+        // 端口兼容：登记侧继续接受此前已允许的公网非零端口。
+        for raw in [
+            "https://img.example.com/p.jpg",
+            "https://img.example.com:8443/p.jpg",
+            "https://img.example.com:9200/p.jpg",
+            "http://img.example.com:8080/p.jpg?token=opaque",
+        ] {
+            assert!(
+                validate_registration("cms10", raw).is_ok(),
+                "不得回归已允许的公网端口: {raw}"
+            );
+        }
     }
 }

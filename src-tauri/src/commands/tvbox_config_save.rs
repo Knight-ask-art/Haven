@@ -139,7 +139,9 @@ mod tests {
         let repos = Arc::new(SqliteRepositories::new(db));
         TvboxConfigSaveService::new(
             importer,
-            SourceRegistryService::new(repos),
+            SourceRegistryService::new(repos).with_credential_lease(Arc::new(
+                haven_application::services::source_registry::InMemorySourceCredentialLease::new(),
+            )),
             Arc::new(InMemorySourceConfigCache::new()),
         )
     }

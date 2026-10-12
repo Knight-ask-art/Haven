@@ -60,4 +60,13 @@ describe("settings navigation search", () => {
     expect(settingsSectionSearchKeywords("reading")).toContain("字号")
     expect(settingsSectionSearchKeywords("sync")).toEqual([])
   })
+
+  it("finds the AI model capability control by its current title and capability labels", () => {
+    for (const query of ["模型能力", "对话", "识图", "向量", "识图模型"]) {
+      expect(findSettingsFeatureMatches(query)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ section: "ai", featureId: "ai.providerModel" }),
+      ]))
+      expect(settingsSectionSearchKeywords("ai")).toContain(query)
+    }
+  })
 })

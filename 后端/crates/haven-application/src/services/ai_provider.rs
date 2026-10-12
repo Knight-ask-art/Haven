@@ -315,7 +315,7 @@ impl AiProviderProfileService {
     ///
     /// 只有真正的失败（不可达 / 非 2xx / 非法 JSON）才返回 `Err`；不吞错、不伪造模型。
     ///
-    /// **机密性前置检查**：历史行里可能存着明文 `http` 端点（旧版本允许保存）。这种行
+    /// **机密性前置检查**：历史行里可能存着远程明文 `http` 端点（旧版本允许保存）。这种行
     /// 会以固定的 `AI_PROVIDER_ENDPOINT_INSECURE` 失败，且**不读取凭据、不发起任何请求**
     /// ——"行读得出来"不等于"可以用它把 API Key 发出去"。检查放在凭据读取之前，是因为
     /// "地址必须改成 https"才是用户此刻真正要做的动作；报成"尚未配置密钥"会把可执行的
@@ -387,7 +387,7 @@ impl AiProviderProfileService {
             return Err(recommendation_disabled());
         }
         // 与 `models_catalog` 同一条机密性前置检查：这一次出站的不只是 API Key，
-        // 还有用户的建议原文与启用技能的原生投影，明文连接一律不允许。
+        // 还有用户的建议原文与启用技能的原生投影，远程明文连接一律不允许。
         profile.require_secure_endpoint()?;
         let target = credential_target(profile.profile_id())?;
         let Some(secret) = self.credentials.get(&target).await? else {
@@ -401,7 +401,10 @@ impl AiProviderProfileService {
             .list_models(profile.kind(), profile.endpoint(), &secret)
             .await?;
         let Some(model) = models.iter().find(|model| {
-            model.model_id == selected_model_id && model.chat == AiModelCapability::Supported
+            // Standard OpenAI catalogs often omit capability declarations. An
+            // explicit selection may attempt the bounded request without changing
+            // Unknown into Supported. An explicit denial still fails closed.
+            model.model_id == selected_model_id && model.chat != AiModelCapability::Unsupported
         }) else {
             return Err(recommendation_model_unavailable());
         };
@@ -989,7 +992,7 @@ mod tests {
             ),
             (
                 AiProviderProfileUpsertRequest {
-                    endpoint: "http://127.0.0.1:11434/v1".into(),
+                    endpoint: "http://192.168.1.10:11434/v1".into(),
                     ..upsert_request("gw", None)
                 },
                 "AI_PROVIDER_ENDPOINT_INVALID",
@@ -1618,103 +1621,117 @@ mod tests {
 
     #[tokio::test]
     async fn valid_structured_recommendation_creates_pending_proposal_without_writing_settings() {
-        let fixture = fixture();
-        let created = fixture
-            .service
-            .upsert(AiProviderProfileUpsertRequest {
-                selected_model_id: Some("reader-model".into()),
-                ..upsert_request("gw", None)
-            })
-            .await
-            .unwrap();
-        let target = credential_target(&created.profile_id).unwrap();
-        fixture
-            .credentials
-            .set(&target, &SecretString::new("sk-test-only"))
-            .await
-            .unwrap();
-        *fixture.catalog.models.lock().unwrap() = vec![
-            AiModelDescriptor::new(
-                "reader-model".into(),
-                Some("Reader Model".into()),
-                None,
-                Some("fixture".into()),
+        for (endpoint, chat) in [
+            (
+                "https://gateway.example.invalid/v1",
                 AiModelCapability::Supported,
-                AiModelCapability::Unknown,
-                AiModelCapability::Unknown,
-            )
-            .unwrap(),
-        ];
+            ),
+            ("http://127.0.0.1:3123/v1", AiModelCapability::Unknown),
+            ("http://[::1]:3123/v1", AiModelCapability::Unknown),
+        ] {
+            let fixture = fixture();
+            let created = fixture
+                .service
+                .upsert(AiProviderProfileUpsertRequest {
+                    endpoint: endpoint.into(),
+                    selected_model_id: Some("provider/reader-model".into()),
+                    ..upsert_request("gw", None)
+                })
+                .await
+                .unwrap();
+            let target = credential_target(&created.profile_id).unwrap();
+            fixture
+                .credentials
+                .set(&target, &SecretString::new("sk-test-only"))
+                .await
+                .unwrap();
+            *fixture.catalog.models.lock().unwrap() = vec![
+                AiModelDescriptor::new(
+                    "provider/reader-model".into(),
+                    Some("Reader Model".into()),
+                    None,
+                    Some("fixture".into()),
+                    chat,
+                    AiModelCapability::Unknown,
+                    AiModelCapability::Unknown,
+                )
+                .unwrap(),
+            ];
 
-        let agent_store = crate::services::agent_settings_ipc::tests::FakeStore::new();
-        crate::services::agent_settings_ipc::tests::seed_reading(&agent_store, Some("rev-0001"));
-        let agent_settings = crate::services::agent_settings_ipc::tests::service(&agent_store);
-        let recommender = Arc::new(RecordingRecommender::default());
-        let service = AiProviderProfileService::new(
-            fixture.profiles.clone(),
-            fixture.credentials.clone(),
-            fixture.catalog.clone(),
-        )
-        .with_settings_recommendation(recommender.clone())
-        .with_agent_settings(agent_settings.clone());
-
-        let context = agent_settings.context().await.unwrap();
-        let result = service
-            .generate_settings_recommendation(AiSettingsRecommendationRequest {
-                profile_id: "gw".into(),
-                session_id: AgentSessionId::new().to_string(),
-                request_id: AgentRequestId::new().to_string(),
-                user_intent: "把字体调大一点".into(),
-                context_id: context.context_id().to_string(),
-                context_hash: context.context_hash().to_owned(),
-                base_revision: context.revision().map(str::to_owned),
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(result.profile_id, "gw");
-        assert_eq!(result.model_id, "reader-model");
-        assert_eq!(
-            result.explanation.as_deref(),
-            Some("根据当前阅读设置生成建议")
-        );
-        assert_eq!(
-            result.recommended_patch.font_size,
-            Some(crate::wire::PreferenceReadingFontSizeDto::Large)
-        );
-        assert_eq!(
-            result.proposal.status,
-            crate::wire::AgentSettingsProposalStatusDto::Pending
-        );
-        assert_eq!(result.proposal.changes.len(), 1);
-        assert_eq!(result.proposal.changes[0].key, "reading.fontSize");
-        assert_eq!(result.proposal.changes[0].after, "large");
-        assert_eq!(
-            agent_store.target_writes(),
-            0,
-            "Provider 建议不得直接写设置"
-        );
-        assert_eq!(agent_store.revision().as_deref(), Some("rev-0001"));
-        assert_eq!(
-            agent_store.proposal_count(),
-            1,
-            "必须进入既有 Proposal store"
-        );
-        assert_eq!(
-            recommender.calls.lock().unwrap().as_slice(),
-            ["reader-model"]
-        );
-        assert_eq!(
-            recommender.seen_intents.lock().unwrap().as_slice(),
-            ["把字体调大一点"]
-        );
-
-        let encoded = serde_json::to_string(&result).unwrap();
-        for forbidden in ["sk-test-only", "haven:ai:", "credentialRef", "secret"] {
-            assert!(
-                !encoded.contains(forbidden),
-                "建议结果不得携带敏感材料：{forbidden}"
+            let agent_store = crate::services::agent_settings_ipc::tests::FakeStore::new();
+            crate::services::agent_settings_ipc::tests::seed_reading(
+                &agent_store,
+                Some("rev-0001"),
             );
+            let agent_settings = crate::services::agent_settings_ipc::tests::service(&agent_store);
+            let recommender = Arc::new(RecordingRecommender::default());
+            let service = AiProviderProfileService::new(
+                fixture.profiles.clone(),
+                fixture.credentials.clone(),
+                fixture.catalog.clone(),
+            )
+            .with_settings_recommendation(recommender.clone())
+            .with_agent_settings(agent_settings.clone());
+
+            let context = agent_settings.context().await.unwrap();
+            let result = service
+                .generate_settings_recommendation(AiSettingsRecommendationRequest {
+                    profile_id: "gw".into(),
+                    session_id: AgentSessionId::new().to_string(),
+                    request_id: AgentRequestId::new().to_string(),
+                    user_intent: "把字体调大一点".into(),
+                    context_id: context.context_id().to_string(),
+                    context_hash: context.context_hash().to_owned(),
+                    base_revision: context.revision().map(str::to_owned),
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(result.profile_id, "gw");
+            assert_eq!(result.model_id, "provider/reader-model");
+            assert_eq!(fixture.catalog.models.lock().unwrap()[0].chat, chat);
+            assert_eq!(
+                result.explanation.as_deref(),
+                Some("根据当前阅读设置生成建议")
+            );
+            assert_eq!(
+                result.recommended_patch.font_size,
+                Some(crate::wire::PreferenceReadingFontSizeDto::Large)
+            );
+            assert_eq!(
+                result.proposal.status,
+                crate::wire::AgentSettingsProposalStatusDto::Pending
+            );
+            assert_eq!(result.proposal.changes.len(), 1);
+            assert_eq!(result.proposal.changes[0].key, "reading.fontSize");
+            assert_eq!(result.proposal.changes[0].after, "large");
+            assert_eq!(
+                agent_store.target_writes(),
+                0,
+                "Provider 建议不得直接写设置"
+            );
+            assert_eq!(agent_store.revision().as_deref(), Some("rev-0001"));
+            assert_eq!(
+                agent_store.proposal_count(),
+                1,
+                "必须进入既有 Proposal store"
+            );
+            assert_eq!(
+                recommender.calls.lock().unwrap().as_slice(),
+                ["provider/reader-model"]
+            );
+            assert_eq!(
+                recommender.seen_intents.lock().unwrap().as_slice(),
+                ["把字体调大一点"]
+            );
+
+            let encoded = serde_json::to_string(&result).unwrap();
+            for forbidden in ["sk-test-only", "haven:ai:", "credentialRef", "secret"] {
+                assert!(
+                    !encoded.contains(forbidden),
+                    "建议结果不得携带敏感材料：{forbidden}"
+                );
+            }
         }
     }
 
@@ -1950,8 +1967,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_or_unsupported_chat_capability_never_reaches_recommender() {
-        for chat in [AiModelCapability::Unknown, AiModelCapability::Unsupported] {
+    async fn explicitly_unsupported_or_absent_selected_model_never_reaches_recommender() {
+        for chat in [Some(AiModelCapability::Unsupported), None] {
             let fixture = fixture();
             fixture
                 .service
@@ -1967,18 +1984,21 @@ mod tests {
                 .set(&target, &SecretString::new("sk-test-only"))
                 .await
                 .unwrap();
-            *fixture.catalog.models.lock().unwrap() = vec![
-                AiModelDescriptor::new(
-                    "reader-model".into(),
-                    None,
-                    None,
-                    None,
-                    chat,
-                    AiModelCapability::Unknown,
-                    AiModelCapability::Unknown,
-                )
-                .unwrap(),
-            ];
+            *fixture.catalog.models.lock().unwrap() = chat
+                .into_iter()
+                .map(|chat| {
+                    AiModelDescriptor::new(
+                        "reader-model".into(),
+                        None,
+                        None,
+                        None,
+                        chat,
+                        AiModelCapability::Unknown,
+                        AiModelCapability::Unknown,
+                    )
+                    .unwrap()
+                })
+                .collect();
             let agent_store = crate::services::agent_settings_ipc::tests::FakeStore::new();
             crate::services::agent_settings_ipc::tests::seed_reading(
                 &agent_store,

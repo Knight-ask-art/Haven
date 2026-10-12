@@ -128,6 +128,16 @@ beforeEach(() => {
 afterEach(cleanup)
 
 describe("DownloadsPage asynchronous refreshes", () => {
+  it("uses clear storage and file-import copy", async () => {
+    listDownloads.mockResolvedValueOnce([])
+
+    renderPage()
+
+    expect(await screen.findByText(/空间不足时，下载任务会等待可用空间释放/)).toBeTruthy()
+    expect(screen.getByText("当前版本暂不支持拖拽导入本地文件")).toBeTruthy()
+    expect(screen.queryByText(/WaitingForSpace|P1 预览|拖拽文件到此处可导入/)).toBeNull()
+  })
+
   it("merges a progress event into an in-flight list and releases the refresh control", async () => {
     const initial = task()
     const lateRefresh = deferred<DownloadTaskDto[]>()

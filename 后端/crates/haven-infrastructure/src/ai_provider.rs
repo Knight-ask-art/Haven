@@ -4,13 +4,13 @@
 //!
 //! 这是本切片里**唯一**由用户配置目标地址的出站请求。它复用项目既有的出站约束：
 //! - 端点先过 `HttpUrlPolicy::AiProviderEndpoint`（http/https、无 userinfo / fragment、
-//!   多标签主机、公网字面地址、允许端口集合）；
-//! - **HTTPS 是硬要求**：两个适配器都在拼 URL 的那一步走 `models_url_for` /
-//!   `chat_completions_url_for`，它们复用保存期的规则（含 HTTPS）。因此历史遗留的明文
+//!   公网主机/端口或显式本机 loopback）；
+//! - **远程 HTTPS 是硬要求**：两个适配器都在拼 URL 的那一步走 `models_url_for` /
+//!   `chat_completions_url_for`，它们复用保存期的规则。因此历史遗留的远程明文
 //!   行在这里就被拒绝——凭据与用户内容不会因为"地址是旧版本存下的"而出站，且这一类
 //!   失败发生在 DNS 解析之前，零网络副作用；
 //! - 每次请求重新解析 DNS，任一结果非公网即整体拒绝，并把地址固定到连接上
-//!   （`resolve_public_http_target` + `pin_client_builder`）；
+//!   （`resolve_public_http_target` + `pin_client_builder`）；本机目标不走 DNS，所有请求禁用代理；
 //! - **不跟随重定向**：3xx 一律当作配置错误返回，而不是"再解析一个新主机"；
 //! - 有界的连接/请求超时与响应体大小。
 //!
@@ -297,7 +297,7 @@ fn target_error(error: crate::http_security::HttpTargetError) -> AppError {
         Error::Invalid | Error::UnsafeAddress => AppError::new(
             "AI_PROVIDER_ENDPOINT_INVALID",
             ErrorKind::Validation,
-            "API 地址不被允许（仅接受公网 http/https 主机）",
+            "API 地址不被允许（仅接受公网 HTTPS 或显式本机端点）",
             false,
         ),
         Error::ResolveFailed => AppError::new(
@@ -704,25 +704,171 @@ fn recommendation_target_error(error: crate::http_security::HttpTargetError) -> 
         Error::Invalid | Error::UnsafeAddress => AppError::new(
             "AI_PROVIDER_ENDPOINT_INVALID",
             ErrorKind::Validation,
-            "API 地址不被允许（仅接受公网 http/https 主机）",
+            "API 地址不被允许（仅接受公网 HTTPS 或显式本机端点）",
             false,
         ),
         Error::ResolveFailed => recommendation_unreachable(),
     }
 }
 
-/// 供组装层做启动期自检：策略必须拒绝非公网端点。
+/// 策略自检：本机例外不得扩展为 LAN / DNS loopback 权限。
 pub fn assert_endpoint_policy_is_fail_closed() -> bool {
-    parse_http_url(
-        "http://127.0.0.1:11434/v1",
-        HttpUrlPolicy::AiProviderEndpoint,
-    )
-    .is_err()
+    [
+        "http://192.168.1.10/v1",
+        "https://localhost/v1",
+        "http://169.254.169.254/v1",
+    ]
+    .iter()
+    .all(|raw| parse_http_url(raw, HttpUrlPolicy::AiProviderEndpoint).is_err())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn local_http_response(
+        status: u16,
+        body: Vec<u8>,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0u8; 4096];
+                let length = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    length > 0 && request.len() + length <= 32 * 1024,
+                    "bounded test request"
+                );
+                request.extend_from_slice(&chunk[..length]);
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            // A redirect must be surfaced, never followed to an unsafe target.
+            let headers = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nLocation: http://169.254.169.254/blocked\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (endpoint, task)
+    }
+
+    #[tokio::test]
+    async fn local_gateway_transport_preserves_namespaced_ids_and_strict_request() {
+        let secret = SecretString::new("test-only-local-credential");
+        let (endpoint, server) = local_http_response(
+            200,
+            models_body(serde_json::json!({
+                "data": [{"id": "provider/reader-model"}]
+            })),
+        )
+        .await;
+        let models = OpenAiCompatibleModelCatalog::new()
+            .list_models(AiProviderKind::OpenAiCompatible, &endpoint, &secret)
+            .await
+            .unwrap();
+        assert_eq!(models[0].model_id, "provider/reader-model");
+        assert_eq!(models[0].chat, AiModelCapability::Unknown);
+        let request = server.await.unwrap();
+        assert!(request.starts_with("GET /v1/models HTTP/1.1\r\n"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer test-only-local-credential\r\n")
+        );
+
+        let body = models_body(serde_json::json!({"choices": [{"message": {
+            "content": complete_recommendation_content("\"large\"", "\"增大字号\"")
+        }}]}));
+        let (endpoint, server) = local_http_response(200, body).await;
+        let recommendation = OpenAiCompatibleSettingsRecommender::new()
+            .recommend_settings(
+                AiProviderKind::OpenAiCompatible,
+                &endpoint,
+                &secret,
+                &AiSettingsRecommendationInput {
+                    model_id: "provider/reader-model".into(),
+                    user_intent: "调大字号".into(),
+                    reading: sample_reading(),
+                    skills: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            recommendation.patch().font_size,
+            Some(haven_domain::settings::ReadingFontSize::Large)
+        );
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
+        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["model"], "provider/reader-model");
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert!(!body.to_string().contains(secret.expose()));
+    }
+
+    #[tokio::test]
+    async fn local_gateway_redirects_never_forward_credentials() {
+        let secret = SecretString::new("test-only-local-credential");
+        let (endpoint, server) = local_http_response(302, Vec::new()).await;
+        let error = OpenAiCompatibleModelCatalog::new()
+            .list_models(AiProviderKind::OpenAiCompatible, &endpoint, &secret)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code().as_str(),
+            "AI_PROVIDER_MODELS_UNEXPECTED_REDIRECT"
+        );
+        server.await.unwrap();
+        let (endpoint, server) = local_http_response(302, Vec::new()).await;
+        let error = OpenAiCompatibleSettingsRecommender::new()
+            .recommend_settings(
+                AiProviderKind::OpenAiCompatible,
+                &endpoint,
+                &secret,
+                &AiSettingsRecommendationInput {
+                    model_id: "provider/reader-model".into(),
+                    user_intent: "调大字号".into(),
+                    reading: sample_reading(),
+                    skills: Vec::new(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code().as_str(),
+            "AI_PROVIDER_RECOMMENDATION_UNEXPECTED_REDIRECT"
+        );
+        server.await.unwrap();
+    }
 
     fn models_body(payload: Value) -> Vec<u8> {
         serde_json::to_vec(&payload).unwrap()
@@ -788,6 +934,29 @@ mod tests {
             );
             assert_eq!(model.chat, AiModelCapability::Unknown, "{}", model.model_id);
         }
+    }
+
+    #[test]
+    fn namespaced_model_ids_are_preserved_without_claiming_capabilities() {
+        let models = interpret_models_response(
+            200,
+            &models_body(serde_json::json!({
+                "data": [{ "id": "provider/reader-a" }, { "id": "provider/reader-b" }]
+            })),
+        )
+        .unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.model_id.as_str())
+                .collect::<Vec<_>>(),
+            ["provider/reader-a", "provider/reader-b"]
+        );
+        assert!(
+            models
+                .iter()
+                .all(|model| model.chat == AiModelCapability::Unknown)
+        );
     }
 
     #[test]
@@ -868,7 +1037,7 @@ mod tests {
                 { "id": "good-model" },
                 { "id": "" },
                 { "id": "bad model with space" },
-                { "id": "bad/id" },
+                { "id": "bad\\id" },
                 { "object": "model" },
                 "not-an-object",
                 { "id": "another-good-model" }
@@ -944,7 +1113,7 @@ mod tests {
     fn endpoint_policy_is_fail_closed_for_private_targets() {
         assert!(assert_endpoint_policy_is_fail_closed());
         for raw in [
-            "http://127.0.0.1:11434/v1/models",
+            "http://127.0.0.2:11434/v1/models",
             "http://192.168.1.10/v1/models",
             "http://10.0.0.5/v1/models",
             "https://localhost/v1/models",
@@ -952,7 +1121,7 @@ mod tests {
         ] {
             assert!(
                 parse_http_url(raw, HttpUrlPolicy::AiProviderEndpoint).is_err(),
-                "私网/回环端点必须被拒绝: {raw}"
+                "未授权的私网/回环端点必须被拒绝: {raw}"
             );
         }
     }

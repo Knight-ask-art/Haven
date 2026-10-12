@@ -10,9 +10,9 @@
 //!   Cookie / Authorization 既不会被发送，也不会跨重定向被携带；每一跳都用全新的
 //!   client 与全新的 request，重定向前后的请求之间没有共享的 header 状态。
 //! - URL 语法与字面地址策略完全复用 `haven_common::network`：每一跳都会重新执行
-//!   [`parse_http_url`]（`HttpUrlPolicy::SourceEndpoint`），拒绝非 http(s) scheme、
-//!   userinfo、fragment、回环/私网/单标签/`.local`/`.internal` 主机、非白名单端口
-//!   （80/443/8080/8443）。本模块不新增加宽或更严的例外。
+//!   [`parse_http_url`]（`HttpUrlPolicy::UserProvidedSource`），允许用户明确配置的本机/
+//!   局域网地址与任意非零端口，仍拒绝非 http(s) scheme、userinfo、fragment、链路本地、
+//!   云元数据与其它保留目标。本模块不新增加宽或更严的例外。
 //! - 每一跳都重新做 DNS 解析与地址固定（[`resolve_public_http_target`] +
 //!   [`pin_client_builder`]），因此重定向不会绕过 DNS rebinding 防护；重定向手动
 //!   跟随，上限固定且很小，自动重定向与代理都被显式关闭。
@@ -179,9 +179,13 @@ async fn read_bounded_body(body: &mut dyn TvboxBodyStream) -> Result<Vec<u8>, Ap
     Ok(buffer)
 }
 
-/// 施加 `HttpUrlPolicy::SourceEndpoint` 的语法与字面地址策略，并规范化成可 join 的 URL。
+/// 施加 `HttpUrlPolicy::UserProvidedSource` 的语法与字面地址策略，并规范化成可 join 的 URL。
+///
+/// TVBox / FongMi 配置地址是**用户导入**的：自建配置服务可以在本机或局域网，端口也由
+/// 用户决定。仍拒绝非 http(s) scheme、userinfo、fragment、链路本地、云元数据与其它
+/// 保留目标；保存路径（`source_registry`）用的是同一个策略。
 fn validate_request_url(raw: &str) -> Result<Url, AppError> {
-    parse_http_url(raw, HttpUrlPolicy::SourceEndpoint)
+    parse_http_url(raw, HttpUrlPolicy::UserProvidedSource)
         .map(|safe| safe.into_url())
         .map_err(|_| security_denied("TVBox 配置地址不安全"))
 }
@@ -201,7 +205,7 @@ struct HttpTvboxConfigTransport;
 #[async_trait]
 impl TvboxConfigTransport for HttpTvboxConfigTransport {
     async fn get(&self, url: &str) -> Result<TvboxHopResponse, AppError> {
-        let target = resolve_public_http_target(url, HttpUrlPolicy::SourceEndpoint)
+        let target = resolve_public_http_target(url, HttpUrlPolicy::UserProvidedSource)
             .await
             .map_err(|_| security_denied("TVBox 配置地址解析不安全"))?;
         let builder = reqwest::Client::builder()
@@ -630,15 +634,8 @@ mod tests {
             "file:///etc/hosts",
             "https://user:secret@config.example.invalid/tvbox.json",
             "https://config.example.invalid/tvbox.json#frag",
-            "http://127.0.0.1/tvbox.json",
-            "http://10.0.0.1/tvbox.json",
-            "http://192.168.1.1/tvbox.json",
             "http://169.254.169.254/latest/meta-data",
-            "https://localhost/tvbox.json",
-            "https://config.local/tvbox.json",
-            "https://config.internal/tvbox.json",
-            "https://tvbox/tvbox.json",
-            "https://config.example.invalid:12345/tvbox.json",
+            "https://metadata.google.internal/tvbox.json",
         ] {
             let error = fetch_config_preview_with(&transport, url)
                 .await
@@ -650,6 +647,29 @@ mod tests {
         assert!(
             transport.requests().is_empty(),
             "被拒绝的地址不应触发任何网络请求"
+        );
+
+        // 公网配置地址可以使用自建端口；HTTP scheme 仍按预览策略拒绝。
+        let transport = FakeTransport::new(vec![FakeHop::ok(SAMPLE_CONFIG.as_bytes())]);
+        fetch_config_preview_with(
+            &transport,
+            "https://config.example.invalid:12345/tvbox.json",
+        )
+        .await
+        .expect("用户提供的配置端口必须被接受");
+        assert_eq!(
+            transport.requests(),
+            vec!["https://config.example.invalid:12345/tvbox.json".to_owned()]
+        );
+
+        // 用户明确导入的本机配置服务也可使用非标准端口。
+        let transport = FakeTransport::new(vec![FakeHop::ok(SAMPLE_CONFIG.as_bytes())]);
+        fetch_config_preview_with(&transport, "http://127.0.0.1:38080/tvbox.json")
+            .await
+            .expect("本机配置服务应可访问");
+        assert_eq!(
+            transport.requests(),
+            vec!["http://127.0.0.1:38080/tvbox.json".to_owned()]
         );
     }
 

@@ -79,7 +79,7 @@ Provider 可以返回有界解释和闭合的设置 patch，不能批准、Apply
 
 ```text
 启用的 profile + CredentialStore + selectedModelId
-  → 模型目录中的同一 id，且显式 chat=Supported
+  → 模型目录中的同一 id，用户明确选定，且 chat 不是 Unsupported
   → authoritative 设置上下文
   → AiSettingsRecommendationPort
   → strict json_schema structured output
@@ -91,8 +91,9 @@ Provider 可以返回有界解释和闭合的设置 patch，不能批准、Apply
 创建提案；领域 digest 仍由 Haven 生成。Structured Output 要求闭合键集合、
 合法枚举、长度和控制字符约束；缺失或未知键都拒绝，不从自由文本中猜测 JSON。
 
-没有可用 profile、凭据、选中模型或显式 chat 能力时，不发模型请求，也不拿模板
-冒充模型响应。错误只返回稳定、脱敏的 code/message/retryable。
+没有可用 profile、凭据、选中模型，或目录缺少同一 id / 明确声明不支持 chat 时，不发模型
+请求，也不拿模板冒充模型响应。标准兼容目录未声明 chat 时保持 Unknown，但用户选定后
+可以尝试上述有界请求；输出仍须严格校验。错误只返回稳定、脱敏的 code/message/retryable。
 
 ## 4. 凭据与隐私
 
@@ -110,6 +111,11 @@ profile 必须呈现可恢复的“未配置凭据”状态。
 DNS 重绑定或无界响应。每次请求校验目的地址并固定已验证解析结果；
 重定向不能绕过地址策略。AI endpoint 采用自己的策略类别，不能继承其它来源的
 测试例外或局域网授权。
+
+远程 AI 端点的保存与使用必须采用 HTTPS。本机网关允许用户显式配置规范字面地址
+`127.0.0.1` 或 `[::1]`，支持 HTTP/HTTPS 与非零端口。该例外只属于 AI Provider；
+不授权 LAN、DNS 回环、地址别名、服务发现或其他来源。每次请求关闭代理和重定向，
+域名仍须解析为公网地址并固定连接目标，响应大小和超时保持有界。
 
 ## 5. MCP 边界
 
@@ -216,6 +222,8 @@ system 消息。前端只提交 profileId、用户目标和上下文锚点，不
 能力为 supported/unsupported/unknown；缺字段即 unknown，不从模型名猜
 chat、vision 或 embedding。空目录、未配置和禁用各有明确状态；
 网络或非法响应返回稳定错误，不伪造目录。
+模型 id 是不透明 JSON 值，支持 `namespace/model`，不会用作路径或请求 Header。
+允许尝试 Unknown chat 不会把能力声明改成 Supported，也不授予工具或 Apply 权限。
 
 Settings Registry、Wire、Binding、持久化和运行时消费者必须指向同一份能力。
 页面视觉完整与编译成功都不能单独建立产品兼容性承诺。

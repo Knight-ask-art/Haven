@@ -76,7 +76,6 @@ export function DownloadsPage() {
   const [subscriptionErrorMessage, setSubscriptionErrorMessage] = useState<string | null>(null)
   const [subscriptionRevision, setSubscriptionRevision] = useState(0)
   const [pendingTaskIds, setPendingTaskIds] = useState<Set<string>>(() => new Set())
-  const [isDragOver, setIsDragOver] = useState(false)
   const eventStateRef = useRef(createDownloadEventState())
   const tasksRef = useRef<DownloadTaskDto[]>([])
   const listRequestRef = useRef(0)
@@ -336,15 +335,12 @@ export function DownloadsPage() {
       className="flex h-full w-full flex-col overflow-hidden bg-background"
       onDragOver={(e) => {
         e.preventDefault()
-        setIsDragOver(true)
       }}
-      onDragLeave={() => setIsDragOver(false)}
       onDrop={(e) => {
         e.preventDefault()
-        setIsDragOver(false)
         const files = Array.from(e.dataTransfer.files)
         if (files.length > 0) {
-          setErrorMessage(`检测到 ${files.length} 个文件，拖拽导入将在下一版本支持（已记录 ${files[0].name}）`)
+          setErrorMessage(`当前版本暂不支持拖拽导入文件（检测到 ${files.length} 个文件）。`)
         }
       }}
     >
@@ -427,18 +423,9 @@ export function DownloadsPage() {
 
       {/* 存储配额 Banner（P1） */}
       <div className="mx-[24px] mt-[16px] flex items-center justify-between rounded-lg border border-border/60 bg-muted/30 px-[16px] py-[10px] text-xs md:mx-[48px] lg:mx-[72px]">
-        <span className="text-muted-foreground">存储配额：本地离线内容由下载任务管理，超出可用空间时进入 <span className="font-semibold text-foreground">WaitingForSpace</span></span>
-        <span className="hidden text-muted-foreground sm:block">拖拽文件到此处可导入（P1 预览）</span>
+        <span className="text-muted-foreground">存储配额：本地离线内容由下载任务管理；空间不足时，下载任务会等待可用空间释放。</span>
+        <span className="hidden text-muted-foreground sm:block">当前版本暂不支持拖拽导入本地文件</span>
       </div>
-
-      {isDragOver && (
-        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-background/80 backdrop-blur-sm">
-          <div className="rounded-2xl border-2 border-dashed border-primary bg-background px-8 py-6 text-center shadow-xl">
-            <p className="text-sm font-semibold">释放以导入文件</p>
-            <p className="mt-1 text-xs text-muted-foreground">支持 EPUB / PDF / CBZ（下一版本落地指纹去重）</p>
-          </div>
-        </div>
-      )}
 
       {visibleErrorMessage && (
         <div className="mx-[24px] mt-[16px] flex items-center justify-between gap-[16px] rounded-lg border border-destructive/30 bg-destructive/5 px-[16px] py-[12px] text-sm text-destructive md:mx-[48px] lg:mx-[72px]">

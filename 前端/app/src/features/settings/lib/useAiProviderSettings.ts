@@ -25,7 +25,7 @@ import {
   catalogStateHint,
   clearAiProviderApiKey,
   deleteAiProviderProfile,
-  isHttpsAiEndpoint,
+  isAiEndpointTransportAllowed,
   listAiProviderModels,
   listAiProviderProfiles,
   setAiProviderApiKey,
@@ -337,7 +337,7 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
     }
     // 保存边界：明文端点在这里就被拒绝，省掉一次注定失败的往返。
     // 后端仍会独立地再判一次——前端这条只是快速失败，不是权威结论。
-    if (!isHttpsAiEndpoint(draft.endpoint)) {
+    if (!isAiEndpointTransportAllowed(draft.endpoint)) {
       setState((current) => ({
         ...current,
         saveError: {
@@ -538,7 +538,7 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
     // 历史遗留的明文行：仍然可列出、可编辑，但用它发请求会被后端拒绝。
     // 界面据此给出"必须改成 https"的可执行结论，而不是让用户去猜为什么拉不到模型。
     selectedEndpointInsecure:
-      selectedProfile !== null && !isHttpsAiEndpoint(selectedProfile.endpoint),
+      selectedProfile !== null && !isAiEndpointTransportAllowed(selectedProfile.endpoint),
     // 只有"重试真的会重做那件事"时才提供重试——凭据写入的密钥原文按设计不留存。
     canRetrySaveError:
       state.saveError !== null

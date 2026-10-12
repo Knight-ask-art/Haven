@@ -4,8 +4,10 @@
 
 import { useEffect, useRef, useState } from "react"
 import { useNavigate } from "react-router"
-import { ChevronDown, ChevronRight, Download, Globe, Loader2, SearchX, Server } from "lucide-react"
+import { ChevronDown, ChevronRight, Download, Globe, Loader2, SearchX } from "lucide-react"
 
+import { ArtworkImage } from "@/components/ui/haven/ArtworkImage"
+import { defaultCoverCategoryForMediaType } from "@/lib/default-cover"
 import type { QueryCategory, WorkCardDto } from "@/lib/ipc/generated/wire"
 import { toHavenError } from "@/lib/ipc/errors"
 import {
@@ -142,7 +144,7 @@ export function SourceCandidates({
         <span className="search-results__section-hint" role="status">
           {status === "searching" ? <><Loader2 size={14} className="animate-spin" aria-hidden="true" />正在查询已启用来源…</>
             : status === "failed" ? "查询未完成"
-            : warnings.length > 0 ? "部分来源已返回"
+            : warnings.length > 0 ? candidates.length > 0 ? "部分来源已返回" : "来源未返回结果"
             : "已启用的外部来源"}
         </span>
       </header>
@@ -163,7 +165,11 @@ export function SourceCandidates({
             className="search-results__notice-toggle"
           >
             <span>
-              有 {warnings.length} 个来源未返回结果，已展示其余来源。
+              {status === "searching"
+                ? `有 ${warnings.length} 个来源暂未返回结果，仍在查询其他来源。`
+                : candidates.length > 0
+                  ? `有 ${warnings.length} 个来源未返回结果，已展示其余来源。`
+                  : `有 ${warnings.length} 个来源未返回结果，当前没有可展示的来源结果。`}
             </span>
             <span className="search-results__notice-action">
               {warningsOpen ? "收起明细" : "查看明细"}
@@ -192,8 +198,14 @@ export function SourceCandidates({
         <div className="search-results__empty search-results__empty--source" role="status">
           <SearchX size={24} aria-hidden="true" />
           <div>
-            <p className="font-medium text-foreground">来源中暂无匹配结果</p>
-            <p className="mt-1">已启用来源没有返回匹配条目，可尝试其他关键词。</p>
+            <p className="font-medium text-foreground">
+              {warnings.length > 0 ? "当前没有可展示的来源条目" : "来源中暂无匹配结果"}
+            </p>
+            <p className="mt-1">
+              {warnings.length > 0
+                ? "请展开上方明细查看未返回来源的原因。"
+                : "已启用来源没有返回匹配条目，可尝试其他关键词。"}
+            </p>
           </div>
         </div>
       )}
@@ -204,9 +216,15 @@ export function SourceCandidates({
               key={`${work.workId}-${index}`}
               className="search-result-card search-result-card--source"
             >
-              <span className="search-result-card__source-icon">
-                <Server size={17} aria-hidden="true" />
-              </span>
+              <div className="search-result-card__cover">
+                <ArtworkImage
+                  src={work.posterUri ?? work.backdropUri}
+                  alt={work.title}
+                  fallbackCategory={defaultCoverCategoryForMediaType(work.categories[0] ?? work.availableMediaTypes[0])}
+                  fallbackSeed={work.workId}
+                  loading="lazy"
+                />
+              </div>
               <div className="search-result-card__body">
                 <h3 className="search-result-card__title">{work.title}</h3>
                 {work.description && <p className="search-result-card__description">{work.description}</p>}

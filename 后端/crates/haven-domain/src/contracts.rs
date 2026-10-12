@@ -708,6 +708,11 @@ pub trait AgentActionBindingRepository: Send + Sync {
 
 /// 受控图片代理映射（契约 §36 C1：外部海报 URL 不进 IPC）。
 /// `register` 幂等：同一来源与 URL 返回同一稳定 id（UUID 字符串）。
+/// 调用方必须先在真实 Provider 或用户配置来源边界校验来源归属与图片地址；
+/// 不接受前端或远程配置直接提供的任意登记请求。签名查询串仅对实现明确支持的
+/// 用户配置图片来源开放，不能从任意 `source_id` 推导授权。登记不授予内网访问，
+/// 不替代实际抓取前的 DNS/地址固定、主机作用域与重定向检查。
+/// 原始 URL（含签名串）只留在后端映射与出站层，不进入 Wire、日志或错误文案。
 #[async_trait]
 pub trait ImageProxyRepository: Send + Sync {
     async fn register(&self, source_id: &str, target_url: &str) -> Result<String, AppError>;

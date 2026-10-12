@@ -24,6 +24,7 @@ pub mod opds;
 pub mod periodical;
 pub mod reader_search;
 pub mod scanner;
+pub mod source_credential_lease;
 pub mod system_fonts;
 pub mod trending;
 pub mod tvbox_config;
@@ -32,6 +33,7 @@ pub mod video_screenshot;
 
 pub use credential::credential_store;
 pub use db::Db;
+pub use source_credential_lease::FileSourceCredentialLease;
 
 pub(crate) fn lower_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";

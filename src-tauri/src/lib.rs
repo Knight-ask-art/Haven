@@ -14,6 +14,7 @@ mod resource_protocol;
 pub mod scan_sink;
 pub mod search_sink;
 pub(crate) mod session_registry;
+mod source_background;
 pub mod state;
 pub mod stream_registry;
 
@@ -202,6 +203,11 @@ pub fn run() {
         // metadata.changed 广播出口绑定 AppHandle（契约 §36.8）。
         state.metadata_sink.bind(app.handle().clone());
         cloud_background::start_credential_cleanup(state.cloud_storage.clone());
+        source_background::start_credential_cleanup(
+            state.source_registry.clone(),
+            state.source_credential_store.clone(),
+            state.repos.clone(),
+        );
         let download = state.download.clone();
         app.manage(state);
         tauri::async_runtime::spawn(async move {

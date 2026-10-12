@@ -25,6 +25,7 @@ import {
   guardAiProviderProfile,
   guardAiProviderProfileList,
   guardCredentialStatus,
+  isAiEndpointTransportAllowed,
   toModelOptions,
   upsertAiProviderProfile,
 } from "./ai-provider-gateway"
@@ -33,6 +34,31 @@ describe("AI Provider wire runtime guards", () => {
   // 目录守卫要求响应与**请求的那个 profile** 绑定；夹具里的 id 就是请求时用的那个。
   const PROFILE_ID = modelsReady.profileId
   const OTHER_PROFILE_ID = "another-provider"
+
+  it("allows remote HTTPS or explicit loopback HTTP without allowing LAN or aliases", () => {
+    for (const endpoint of [
+      "https://gateway.example.invalid/v1", "http://127.0.0.1:3123/v1",
+      "http://[::1]:11434/v1", "http://127.0.0.1/v1",
+    ]) expect(isAiEndpointTransportAllowed(endpoint), endpoint).toBe(true)
+    for (const endpoint of [
+      "http://gateway.example.invalid/v1", "http://192.168.1.10/v1",
+      "http://localhost:3123/v1", "http://127.0.0.2:3123/v1", "http://127.1:3123/v1",
+      "http://2130706433:3123/v1", "http://[::ffff:127.0.0.1]:3123/v1",
+      "http://127.0.0.1:0/v1", "http://127.0.0.1:65536/v1",
+      "http://user:pass@127.0.0.1:3123/v1", "http://127.0.0.1:3123/v1?key=x",
+      "http://127.0.0.1:3123/v1#frag", "http://127.0.0.1:3123\\evil/v1",
+      "http://127.0.0.1:3123/v1\u0001", "http://127.0.0.1:3123/v1\u007f",
+      "http://127.0.0.1:3123/v\t1", "http://127.0.0.1:3123/v1 extra",
+      "file:///v1", "http://0.0.0.0:3123/v1",
+    ]) expect(isAiEndpointTransportAllowed(endpoint), endpoint).toBe(false)
+  })
+
+  it("preserves namespaced model IDs and exposes undeclared chat capability", () => {
+    const model = { ...modelsReady.models[0], modelId: "provider/reader-model", chat: "unknown" }
+    expect(guardAiProviderModel(model)).toBe(true)
+    expect(toModelOptions({ ...modelsReady, models: [model] } as never)[0])
+      .toMatchObject({ modelId: "provider/reader-model", chatLabel: "未声明" })
+  })
 
   it("accepts the shared fixtures", () => {
     expect(guardAiProviderProfileList(profileListNormal)).toBe(true)

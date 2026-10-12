@@ -12,9 +12,8 @@
 //! - stale revision 冲突且不覆盖；
 //! - ACL 只授权 main 窗口。
 //!
-//! 本测试**不会**调用 `credential_set`：真实运行环境下那会写进用户的 Windows
-//! 凭据管理器。凭据读写路径由 `CredentialAccessService` 与 `AiProviderProfileService`
-//! 的内存替身单测覆盖。
+//! 默认测试不会调用 `credential_set`。单独 opt-in 的 ignored live test 使用随机隔离
+//! profile、内存数据库与真实 Windows 凭据管理器；结束/展开栈时删除测试凭据。
 //!
 //! **平台差异**：非 Windows 平台按 ADR-001 装配 `UnsupportedCredentialStore`，
 //! profile 行写入后读取凭据存在性必然失败。因此 `profile_lifecycle_*` 在非 Windows
@@ -35,6 +34,9 @@ use tauri::utils::acl::resolved::Resolved;
 use tauri::utils::platform::Target;
 use tauri::webview::InvokeRequest;
 use tauri::{Context, Url};
+
+#[cfg(windows)]
+use tauri::Manager;
 
 use haven_infrastructure::Db;
 use haven_tauri_lib::state::AppState;
@@ -80,6 +82,270 @@ fn app() -> tauri::App<MockRuntime> {
         .manage(AppState::new(db))
         .build(real_acl_context())
         .unwrap()
+}
+
+/// Live verification is deliberately not a CI dependency or a provider fixture.
+/// Input credentials come only from the test process, never source or arguments.
+#[cfg(windows)]
+#[test]
+#[ignore = "requires explicit local provider configuration and transient credentials"]
+fn live_local_provider_recommendation_approval_and_receipt() {
+    use haven_domain::credential::SecretString;
+    use haven_domain::ids::{AgentRequestId, AgentSessionId};
+
+    fn checked_ipc(
+        webview: &tauri::WebviewWindow<MockRuntime>,
+        command: &str,
+        body: serde_json::Value,
+        secret: &SecretString,
+    ) -> serde_json::Value {
+        let response =
+            get_ipc_response(webview, invoke_request(command, body)).unwrap_or_else(|error| {
+                // Do not print arbitrary error payloads or echo server content.
+                let code = error
+                    .get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|code| {
+                        code.len() <= 100
+                            && code
+                                .bytes()
+                                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+                    })
+                    .unwrap_or("LIVE_IPC_ERROR");
+                panic!("live stage {command} failed: {code}");
+            });
+        let value: serde_json::Value = response.deserialize().expect("typed JSON response");
+        if value.to_string().contains(secret.expose()) {
+            panic!("live IPC response leaked credential material");
+        }
+        value
+    }
+
+    struct CredentialCleanup<'a> {
+        webview: &'a tauri::WebviewWindow<MockRuntime>,
+        profile_id: String,
+    }
+    impl Drop for CredentialCleanup<'_> {
+        fn drop(&mut self) {
+            let deleted = get_ipc_response(
+                self.webview,
+                invoke_request(
+                    "credential_delete",
+                    serde_json::json!({"request": {"provider": "ai", "profileId": self.profile_id}}),
+                ),
+            );
+            if deleted.is_err() {
+                eprintln!("LIVE_TEST_CREDENTIAL_CLEANUP_FAILED");
+            }
+        }
+    }
+
+    let endpoint = std::env::var("HAVEN_AGENT_LIVE_ENDPOINT").expect("explicit endpoint required");
+    let safe = haven_common::network::parse_http_url(
+        &endpoint,
+        haven_common::network::HttpUrlPolicy::AiProviderEndpoint,
+    )
+    .expect("valid local endpoint required");
+    assert!(
+        safe.host()
+            .parse()
+            .is_ok_and(|ip| haven_common::network::ai_provider_loopback_allowed(safe.host(), ip)),
+        "this opt-in test only permits local literal endpoints"
+    );
+    let models: Vec<String> = serde_json::from_str(
+        &std::env::var("HAVEN_AGENT_LIVE_MODELS").expect("explicit models required"),
+    )
+    .expect("model array required");
+    assert!(
+        !models.is_empty() && models.len() <= 2,
+        "bounded live verification"
+    );
+    let secret = SecretString::new(
+        std::env::var("HAVEN_AGENT_LIVE_KEY").expect("transient credential required"),
+    );
+    assert!(!secret.expose().is_empty(), "nonempty credential required");
+
+    for model_id in models {
+        haven_domain::ai_provider::validate_model_id(&model_id).expect("valid opaque model id");
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let app = haven_tauri_lib::register_invoke_handler(mock_builder())
+            .manage(AppState::new(db.clone()))
+            .build(real_acl_context())
+            .unwrap();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let profile_id = format!("live-agent-{}", uuid::Uuid::new_v4());
+        let mut body = upsert_body(&profile_id, &endpoint, true, None);
+        body["request"]["selectedModelId"] = serde_json::json!(model_id);
+        checked_ipc(&webview, "ai_provider_profile_upsert", body, &secret);
+        let cleanup = CredentialCleanup {
+            webview: &webview,
+            profile_id: profile_id.clone(),
+        };
+        checked_ipc(
+            &webview,
+            "credential_set",
+            serde_json::json!({"request": {
+                "provider": "ai", "profileId": profile_id, "secret": secret.expose(),
+            }}),
+            &secret,
+        );
+
+        let catalog = checked_ipc(
+            &webview,
+            "ai_provider_models_list",
+            serde_json::json!({"request": {"profileId": profile_id}}),
+            &secret,
+        );
+        assert_eq!(catalog["state"], "ready");
+        let model = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["modelId"] == model_id)
+            .expect("explicit model must remain in catalog");
+        assert_ne!(model["chat"], "unsupported");
+
+        let skill = checked_ipc(
+            &webview,
+            "agent_skill_set_enabled",
+            serde_json::json!({"request": {
+                "skillId": "haven-agent-proposal", "enabled": true,
+            }}),
+            &secret,
+        );
+        assert_eq!(skill["state"], "enabled");
+        let context = checked_ipc(
+            &webview,
+            "agent_settings_context_get",
+            serde_json::json!({}),
+            &secret,
+        );
+        let session_id = AgentSessionId::new();
+        let started = std::time::Instant::now();
+        let result = checked_ipc(
+            &webview,
+            "ai_settings_recommendation_generate",
+            serde_json::json!({"request": {
+                "profileId": profile_id, "sessionId": session_id.to_string(), "requestId": AgentRequestId::new().to_string(),
+                "userIntent": "将全局阅读字号设置为 large、行高设置为 airy。只修改这两个字段，其余字段保持 null。",
+                "contextId": context["contextId"], "contextHash": context["contextHash"], "baseRevision": context["revision"],
+            }}),
+            &secret,
+        );
+        let latency_ms = started.elapsed().as_millis();
+        assert_eq!(result["modelId"], model_id);
+        assert_eq!(result["proposal"]["status"], "pending");
+        assert_eq!(result["recommendedPatch"]["fontSize"], "large");
+        assert_eq!(result["recommendedPatch"]["lineHeight"], "airy");
+        let after_pending = checked_ipc(
+            &webview,
+            "agent_settings_context_get",
+            serde_json::json!({}),
+            &secret,
+        );
+        assert_eq!(
+            after_pending["revision"], context["revision"],
+            "generating must not write settings"
+        );
+        assert_eq!(after_pending["reading"], context["reading"]);
+
+        let approve_body = serde_json::json!({"request": {
+            "proposalId": result["proposal"]["proposalId"], "expectedDigest": result["proposal"]["digest"],
+        }});
+        let approved = checked_ipc(
+            &webview,
+            "agent_settings_proposal_approve",
+            approve_body.clone(),
+            &secret,
+        );
+        assert_eq!(approved["proposal"]["status"], "applied");
+        assert_eq!(approved["receipt"]["status"], "applied");
+        assert_eq!(approved["receipt"]["changed"], true);
+        let after_approve = checked_ipc(
+            &webview,
+            "agent_settings_context_get",
+            serde_json::json!({}),
+            &secret,
+        );
+        assert_eq!(
+            after_approve["revision"],
+            approved["receipt"]["appliedRevision"]
+        );
+        assert_eq!(after_approve["reading"]["fontSize"], "large");
+        assert_eq!(after_approve["reading"]["lineHeight"], "airy");
+        let stored: serde_json::Value = db
+            .with_tx(|tx| {
+                let raw: String = tx
+                    .query_row(
+                        "SELECT data_json FROM settings WHERE section = 'reading'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| {
+                        haven_common::AppError::new(
+                            "LIVE_DB_ERROR",
+                            haven_common::ErrorKind::Database,
+                            "live test read failed",
+                            false,
+                        )
+                    })?;
+                Ok(serde_json::from_str(&raw).unwrap())
+            })
+            .unwrap();
+        assert_eq!(stored["fontSize"], "large");
+        assert_eq!(stored["lineHeight"], "airy");
+        let receipt = checked_ipc(
+            &webview,
+            "agent_setting_change_receipt_get",
+            serde_json::json!({"request": {
+                "proposalId": result["proposal"]["proposalId"],
+            }}),
+            &secret,
+        );
+        assert_eq!(receipt, approved["receipt"]);
+        assert!(get_ipc_response(
+            &webview,
+            invoke_request("agent_settings_proposal_approve", approve_body)
+        )
+        .is_err());
+        let after_replay = checked_ipc(
+            &webview,
+            "agent_settings_context_get",
+            serde_json::json!({}),
+            &secret,
+        );
+        assert_eq!(after_replay["revision"], after_approve["revision"]);
+        let trace = app.state::<AppState>().agent_trace.snapshot(session_id);
+        assert!(
+            trace.len() >= 8,
+            "real request and approval must produce trace events"
+        );
+
+        checked_ipc(
+            &webview,
+            "ai_provider_profile_delete",
+            serde_json::json!({"request": {"profileId": profile_id, "expectedRevision": null}}),
+            &secret,
+        );
+        let credential = checked_ipc(
+            &webview,
+            "credential_status",
+            serde_json::json!({"request": {"provider": "ai", "profileId": profile_id}}),
+            &secret,
+        );
+        assert_eq!(credential["configured"], false);
+        drop(cleanup);
+        println!(
+            "{}",
+            serde_json::json!({
+                "model": model_id, "chatDeclaration": model["chat"], "latencyMs": latency_ms,
+                "nativeSkillEnabled": true, "pendingOnly": true, "approvalApplied": true,
+                "sqliteReadback": true, "receiptReadback": true, "replayDenied": true, "credentialCleaned": true,
+            })
+        );
+    }
 }
 
 fn upsert_body(
@@ -183,7 +449,8 @@ fn invalid_endpoints_are_rejected_with_zero_writes() {
         .unwrap();
 
     for endpoint in [
-        "http://127.0.0.1:11434/v1",
+        "http://127.0.0.2:11434/v1",
+        "http://127.1:3123/v1",
         "http://192.168.1.10/v1",
         "https://localhost/v1",
         "C:\\gateway",
@@ -224,6 +491,39 @@ fn invalid_endpoints_are_rejected_with_zero_writes() {
         0,
         "全部非法输入必须零写入"
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn local_endpoint_and_namespaced_model_round_trip_through_real_dispatch_and_sqlite() {
+    let app = app();
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .unwrap();
+    let profile_id = format!("test-local-{}", uuid::Uuid::new_v4());
+    for endpoint in ["http://127.0.0.1:3123/v1", "http://[::1]:11434/v1"] {
+        let mut body = upsert_body(&profile_id, endpoint, true, None);
+        body["request"]["selectedModelId"] = serde_json::json!("provider/reader-model");
+        let response =
+            get_ipc_response(&webview, invoke_request("ai_provider_profile_upsert", body)).unwrap();
+        let created: serde_json::Value = response.deserialize().unwrap();
+        assert_eq!(created["endpoint"], endpoint);
+        assert_eq!(created["selectedModelId"], "provider/reader-model");
+        assert_eq!(created["credentialConfigured"], false);
+        let response = get_ipc_response(
+            &webview,
+            invoke_request(
+                "ai_provider_profile_get",
+                serde_json::json!({"request": {"profileId": profile_id}}),
+            ),
+        )
+        .unwrap();
+        let fetched: serde_json::Value = response.deserialize().unwrap();
+        assert_eq!(created, fetched);
+        assert_no_credential_material(&fetched);
+        get_ipc_response(&webview, invoke_request("ai_provider_profile_delete",
+            serde_json::json!({"request": {"profileId": profile_id, "expectedRevision": created["revision"]}}))).unwrap();
+    }
 }
 
 /// 非 Windows 专属契约：仓库在该平台装配 `UnsupportedCredentialStore`（ADR-001

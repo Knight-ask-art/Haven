@@ -3,14 +3,26 @@
 //! 安全边界（对齐 cms10.rs S8：防 SSRF / 出站最小化）：
 //! - 仅访问注册表配置端点、其 OpenSearch 模板解析结果与条目页/获取链接；
 //!   全部限定 http(s)，下载阶段拒绝重定向到非 http(s)。
+//! - 请求策略按**正向确认的来源身份**选择：内置 Gutenberg 只允许固定的公开 HTTPS
+//!   主机白名单且不允许任何显式端口；只有注册表里确实登记为自定义 OPDS 书源的
+//!   `sourceId` 才使用用户来源端口策略（任意非零端口）。其它 `custom_` 家族
+//!   （订阅源 / 漫画库 / TVBox 配置）、未登记与家族外 ID 一律 fail closed。
+//! - 每个手工跟随的重定向都重新过一遍策略与 DNS；自定义书源还必须逐跳留在登记端点
+//!   origin 上。
+//! - 相对引用按 RFC 3986 与目录地址做标准 join，并**保留目录自己的 scheme 与端口**
+//!   （`url` 子模块）：匿名 HTTP 目录能保存、能取根目录，也必须能解析搜索地址与条目
+//!   链接。只有 Gutenberg 官方镜像保留「明文结果按 https 取」那条窄行为。
+//! - Basic Auth 只在**登记端点 origin** 上注入，明文 HTTP 上一律 fail closed；异步凭据
+//!   解析前后各取一次权威上下文，解析期间发生的端点/版本变化会让本次请求作废。
 //! - Feed 响应 ≤ 8 MiB；EPUB 获取 ≤ 64 MiB（Content-Length 预检 + 流式计数双保险）。
-//! - 日志只允许 host，不落完整 URL / 查询串 / 书目内容。
+//! - 日志只允许 host，不落完整 URL / 查询串 / 书目内容；请求上下文与注册表快照的
+//!   `Debug` 也只打印形状。
 //! - 落盘文件只写入已登记的本地存储位置（受控资源，禁止任意路径拼接）。
+//! - 搜索结果里的图片只**登记**（`ImageProxyRepository`）并投影成
+//!   `haven://artwork/<opaque>`；搜索阶段不为每条结果发图片请求，登记失败只让卡片没有海报。
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
-#[cfg(test)]
-use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -25,9 +37,11 @@ use haven_application::services::search_source::SearchSourceParticipant;
 use haven_application::services::source_import::{
     RemoteContentRef, SourceCatalogEntry, SourceCatalogProvider,
 };
-use haven_common::network::{HttpUrlPolicy, parse_http_url};
+use haven_application::services::source_registry::CustomSourceKind;
+use haven_common::network::parse_http_url;
 use haven_common::{AppError, ErrorKind};
 use haven_domain::comic_catalog::ComicChapterCatalog;
+use haven_domain::contracts::ImageProxyRepository;
 
 use tokio::io::AsyncWriteExt;
 
@@ -35,6 +49,30 @@ use zip::ZipArchive;
 
 use crate::cms10::{CMS10_SOURCE_ID, Cms10CatalogProvider};
 use crate::http_security::{ResolvedHttpTarget, pin_client_builder, resolve_public_http_target};
+
+/// 地址构造（`url`）与请求权威上下文（`request`）各有自己的所有者模块；离线夹具与
+/// 目录级测试只在 `cfg(test)` 下存在。
+mod request;
+mod url;
+
+#[cfg(test)]
+mod catalog_tests;
+#[cfg(test)]
+pub(crate) mod fixture;
+#[cfg(test)]
+mod request_tests;
+
+#[cfg(test)]
+use self::fixture::{is_loopback_http_url, loopback_fixture_target, parse_loopback_fixture_url};
+
+use self::request::{
+    HopCredential, OpdsRequestContext, OpdsSourceIdentity, hop_credential,
+    opds_request_context_changed, opds_source_denied,
+};
+use self::url::{
+    absolutize, gutenberg_search_mirrors, has_explicit_authority_port, is_gutenberg_endpoint,
+    urlencode, with_gutenberg_host_fallbacks,
+};
 
 /// OPDS 书源内置 ID（必须与 source_registry 内置目录一致）。
 pub const OPDS_SOURCE_GUTENBERG: &str = "opds_gutenberg";
@@ -81,27 +119,6 @@ fn storage_failure(detail: &'static str) -> AppError {
 }
 
 // ---------- Atom 最小解析 ----------
-
-/// 相对引用绝对化 + http→https 升级（Gutenberg 的 OpenSearch 模板与条目链接均为
-/// http/相对路径，纯 http 在该站会断连）。仅接受同源相对路径，拒绝其它形态。
-fn absolutize(base: &str, href: &str) -> Option<String> {
-    let h = href.trim();
-    if let Some(rest) = h.strip_prefix("https://") {
-        return Some(format!("https://{rest}"));
-    }
-    if let Some(rest) = h.strip_prefix("http://") {
-        return Some(format!("https://{rest}"));
-    }
-    if let Some(rest) = h.strip_prefix("//") {
-        return Some(format!("https://{rest}"));
-    }
-    if !h.starts_with('/') {
-        return None;
-    }
-    let (scheme, rest) = base.split_once("://")?;
-    let host = rest.split('/').next()?;
-    Some(format!("{scheme}://{host}{h}"))
-}
 
 #[derive(Default)]
 struct EntryBuilder {
@@ -305,6 +322,12 @@ pub struct OpdsClient {
     search_templates: Arc<Mutex<HashMap<String, String>>>,
     /// 私有源凭据提供方。
     credential_resolver: Option<Arc<CredentialResolver>>,
+    /// 注册表：用来**正向确认**某个 `sourceId` 确实是已登记的自定义 OPDS 书源，并给出它
+    /// 当前的登记端点 origin 与配置版本。
+    ///
+    /// 未注入时自定义 OPDS 请求一律 fail closed（既不解析凭据，也不继承用户来源策略）；
+    /// 内置 Gutenberg 与匿名请求照常可用。
+    source_registry: Option<SourceRegistryService>,
     #[cfg(test)]
     allow_loopback_fixture: bool,
 }
@@ -314,6 +337,7 @@ impl OpdsClient {
         Ok(Self {
             search_templates: Arc::new(Mutex::new(HashMap::new())),
             credential_resolver: None,
+            source_registry: None,
             #[cfg(test)]
             allow_loopback_fixture: false,
         })
@@ -325,26 +349,74 @@ impl OpdsClient {
         self
     }
 
+    /// 注入来源注册表。生产组合根**必须**注入：没有它时任何 `custom_` 来源都拿不到用户
+    /// 来源策略与凭据，请求会以 `INVALID_ARGUMENT` fail closed。
+    pub fn with_source_registry(mut self, registry: SourceRegistryService) -> Self {
+        self.source_registry = Some(registry);
+        self
+    }
+
     #[cfg(test)]
     fn with_loopback_fixture(mut self) -> Self {
         self.allow_loopback_fixture = true;
         self
     }
 
+    /// 解析一次请求的权威上下文。
+    ///
+    /// `None` = 匿名请求（没有来源身份）；内置 Gutenberg 走固定白名单；其余一律要求
+    /// **注册表里确实登记为自定义 OPDS 书源**——订阅源 / 漫画库 / TVBox 配置家族、其它
+    /// `custom_` 家族、未登记 ID 与家族外 ID 都 fail closed，绝不解析凭据，也绝不继承
+    /// 用户来源网络策略。
+    async fn request_context(
+        &self,
+        source_id: Option<&str>,
+    ) -> Result<OpdsRequestContext, AppError> {
+        let Some(source_id) = source_id else {
+            return Ok(OpdsRequestContext::anonymous());
+        };
+        if is_builtin_opds(source_id) {
+            return Ok(OpdsRequestContext::builtin_gutenberg(source_id));
+        }
+        let Some(registry) = self.source_registry.as_ref() else {
+            return Err(opds_source_denied());
+        };
+        if !matches!(
+            SourceRegistryService::custom_kind_from_source_id(source_id),
+            Some(CustomSourceKind::Opds)
+        ) {
+            return Err(opds_source_denied());
+        }
+        let Some(snapshot) = registry
+            .registered_source_request_snapshot(source_id)
+            .await?
+        else {
+            return Err(opds_source_denied());
+        };
+        // 记录里的种类必须与来源身份形状一致；被伪造/手工改写的记录 fail closed。
+        if snapshot.kind() != CustomSourceKind::Opds {
+            return Err(opds_source_denied());
+        }
+        Ok(OpdsRequestContext::registered_custom_opds(
+            source_id, snapshot,
+        ))
+    }
+
     fn validate_request_url(
         &self,
         raw: &str,
-        source_id: Option<&str>,
+        context: &OpdsRequestContext,
     ) -> Result<reqwest::Url, AppError> {
         #[cfg(test)]
         if self.allow_loopback_fixture && is_loopback_http_url(raw) {
             return parse_loopback_fixture_url(raw);
         }
-        validate_opds_url(raw, source_id)
+        validate_opds_url(raw, context)
     }
 
     async fn resolve_request_target(
         &self,
+        context: &OpdsRequestContext,
         current: &reqwest::Url,
     ) -> Result<ResolvedHttpTarget, AppError> {
         #[cfg(test)]
@@ -353,37 +425,72 @@ impl OpdsClient {
                 return target;
             }
         }
-        resolve_public_http_target(current.as_str(), HttpUrlPolicy::SourceEndpoint)
+        resolve_public_http_target(current.as_str(), context.policy())
             .await
             .map_err(|_| invalid_feed("目录地址解析不安全"))
     }
 
+    /// 解析凭据并复核上下文。
+    ///
+    /// 解析器在异步区间之前读到的来源身份/端点/版本，与解析之后重读的那一份必须完全一致；
+    /// 任何变化（端点 A→B、A→B→A、凭据轮换、来源被删除）都让本次请求 fail closed，绝不把
+    /// 新解析出来的 secret 发往旧上下文选定的端点。**解析结果为空也必须复核**：解析器返回
+    /// `None` 只说明本次拿不到 secret，不说明来源上下文没变；漏掉这一步会让一个已经失效的
+    /// 上下文照常发请求。凭据格式与本切片之前完全一致（Basic `sourceId:password`），来源
+    /// 作用域由解析器自己保证。
+    async fn resolve_credential(
+        &self,
+        context: &OpdsRequestContext,
+        target: &reqwest::Url,
+    ) -> Result<Option<String>, AppError> {
+        let (Some(source_id), Some(resolver)) =
+            (context.source_id(), self.credential_resolver.as_ref())
+        else {
+            return Ok(None);
+        };
+        // 权威 origin 的一跳才允许解析 secret；跨 origin 的一跳连解析都不做。
+        if hop_credential(context, target)? != HopCredential::Authorized {
+            return Ok(None);
+        }
+        let secret = resolver(source_id).await;
+        let current = self.request_context(Some(source_id)).await?;
+        if !context.is_current_with(&current) {
+            return Err(opds_request_context_changed());
+        }
+        Ok(secret)
+    }
+
     async fn get_limited(
         &self,
-        source_id: Option<&str>,
+        context: &OpdsRequestContext,
         url: &str,
         cap: usize,
     ) -> Result<Vec<u8>, AppError> {
         // 网络对部分书目站存在间歇性 TLS 重置：传输层错误单次重试（响应上限不变）。
-        match self.get_limited_once(source_id, url, cap).await {
-            Err(e) if e.retryable() => self.get_limited_once(source_id, url, cap).await,
+        match self.get_limited_once(context, url, cap).await {
+            Err(e) if e.retryable() => self.get_limited_once(context, url, cap).await,
             other => other,
         }
     }
 
     async fn get_limited_once(
         &self,
-        source_id: Option<&str>,
+        context: &OpdsRequestContext,
         url: &str,
         cap: usize,
     ) -> Result<Vec<u8>, AppError> {
-        let origin = self.validate_request_url(url, source_id)?;
+        let origin = self.validate_request_url(url, context)?;
         let mut current = origin.clone();
         for _ in 0..=MAX_REDIRECTS {
-            let target = self.resolve_request_target(&current).await?;
-            if source_id.is_some_and(|id| !is_builtin_opds(id))
-                && !same_opds_authority(&origin, &target.url, source_id)
-            {
+            // 凭据判定（含「已配置凭据的来源不得走明文 HTTP」）在任何 DNS 或网络动作
+            // 之前完成：fail closed 不依赖解析是否成功。
+            let credential = hop_credential(context, &current)?;
+            let target = self.resolve_request_target(context, &current).await?;
+            // 已登记的自定义书源必须逐跳留在**登记端点 origin** 上（重定向到别的
+            // origin 一律拒绝）。内置 Gutenberg 与匿名请求的主机判定已经由
+            // `validate_request_url`（含 `has_explicit_authority_port`）逐跳施加，
+            // 这里不再重复一遍。
+            if context.is_registered_custom_opds() && !context.authorizes_url(&target.url) {
                 return Err(invalid_feed("目录重定向来源不一致"));
             }
             let builder = reqwest::Client::builder()
@@ -396,14 +503,11 @@ impl OpdsClient {
                 .build()
                 .map_err(|_| invalid_feed("HTTP 客户端初始化失败"))?;
             let mut builder = client.get(target.url.clone());
-            if let (Some(sid), Some(resolver)) = (source_id, &self.credential_resolver) {
-                // Built-in sources are always anonymous.  We still pass the
-                // source key here so redirect policy can be enforced.
-                if !is_builtin_opds(sid) && same_opds_authority(&origin, &target.url, source_id) {
-                    if let Some(secret) = resolver(sid).await {
-                        // secret 即取即用；reqwest 内部按 header 编码，不落日志。
-                        builder = builder.basic_auth::<&str, String>(sid, Some(secret));
-                    }
+            if credential == HopCredential::Authorized {
+                let secret = self.resolve_credential(context, &current).await?;
+                if let (Some(sid), Some(secret)) = (context.source_id(), secret) {
+                    // secret 即取即用；reqwest 内部按 header 编码，不落日志。
+                    builder = builder.basic_auth::<&str, String>(sid, Some(secret));
                 }
             }
             let resp = builder
@@ -420,7 +524,7 @@ impl OpdsClient {
                     .url
                     .join(location)
                     .map_err(|_| invalid_feed("目录重定向地址无效"))?;
-                self.validate_request_url(current.as_str(), source_id)?;
+                self.validate_request_url(current.as_str(), context)?;
                 continue;
             }
             if !resp.status().is_success() {
@@ -448,18 +552,18 @@ impl OpdsClient {
         Err(invalid_feed("目录重定向次数过多"))
     }
 
-    async fn get_feed(&self, source_id: Option<&str>, url: &str) -> Result<Vec<u8>, AppError> {
-        self.get_limited(source_id, url, FEED_CAP_BYTES).await
+    async fn get_feed(&self, context: &OpdsRequestContext, url: &str) -> Result<Vec<u8>, AppError> {
+        self.get_limited(context, url, FEED_CAP_BYTES).await
     }
 
     async fn get_feed_with_host_fallback(
         &self,
-        source_id: Option<&str>,
+        context: &OpdsRequestContext,
         url: &str,
     ) -> Result<(String, Vec<u8>), AppError> {
         let mut last = None;
         for candidate in with_gutenberg_host_fallbacks(url) {
-            match self.get_feed(source_id, &candidate).await {
+            match self.get_feed(context, &candidate).await {
                 Ok(body) => return Ok((candidate, body)),
                 Err(err) => last = Some(err),
             }
@@ -469,13 +573,13 @@ impl OpdsClient {
 
     async fn get_limited_with_host_fallback(
         &self,
-        source_id: Option<&str>,
+        context: &OpdsRequestContext,
         url: &str,
         cap: usize,
     ) -> Result<Vec<u8>, AppError> {
         let mut last = None;
         for candidate in with_gutenberg_host_fallbacks(url) {
-            match self.get_limited(source_id, &candidate, cap).await {
+            match self.get_limited(context, &candidate, cap).await {
                 Ok(body) => return Ok(body),
                 Err(err) => last = Some(err),
             }
@@ -501,16 +605,27 @@ impl OpdsClient {
     }
 
     /// 搜索地址解析：优先缓存模板 → OpenSearch atom 模板 → Gutenberg search.opds → `?query=`。
-    /// 模板结果统一过 absolutize（含 http→https 升级，规避纯 http 断连站）。
+    /// 模板结果统一过 `absolutize`：保留目录自己的 scheme 与端口，只有 Gutenberg 官方
+    /// 镜像保留那条「明文结果按 https 取」的窄行为。
     pub async fn search_url(
         &self,
         source_id: Option<&str>,
         endpoint: &str,
         query: &str,
     ) -> Result<String, AppError> {
+        let context = self.request_context(source_id).await?;
+        self.search_url_with(&context, endpoint, query).await
+    }
+
+    async fn search_url_with(
+        &self,
+        context: &OpdsRequestContext,
+        endpoint: &str,
+        query: &str,
+    ) -> Result<String, AppError> {
         if let Some(tpl) = self.cached_template(endpoint) {
             if let Some(url) = Self::apply_template(&tpl, query, endpoint) {
-                if is_source_url_allowed(source_id, endpoint, &url) {
+                if self.is_source_url_allowed(context, endpoint, &url) {
                     return Ok(url);
                 }
             }
@@ -519,27 +634,21 @@ impl OpdsClient {
         // 也必须走同一组受控镜像回退，否则仅因根目录一次 TLS/504 波动就
         // 会把一个已经有真实搜索实现的内置来源误判为不可搜索。
         let (resolved_endpoint, root) = if is_gutenberg_endpoint(endpoint) {
-            self.get_feed_with_host_fallback(source_id, endpoint)
-                .await?
+            self.get_feed_with_host_fallback(context, endpoint).await?
         } else {
-            (
-                endpoint.to_owned(),
-                self.get_feed(source_id, endpoint).await?,
-            )
+            (endpoint.to_owned(), self.get_feed(context, endpoint).await?)
         };
         let xml = std::str::from_utf8(&root).map_err(|_| invalid_feed("目录编码异常"))?;
         let (_, feed_links) = parse_atom(xml, &resolved_endpoint);
         if let Some((_, search_desc)) = feed_links.iter().find(|(rel, _)| rel == "search") {
             let absolute_desc = absolutize(&resolved_endpoint, search_desc)
                 .ok_or_else(|| invalid_feed("搜索描述地址非法"))?;
-            if is_source_url_allowed(source_id, endpoint, &absolute_desc)
-                && let Ok(desc) = self
-                    .get_limited(source_id, &absolute_desc, 256 * 1024)
-                    .await
+            if self.is_source_url_allowed(context, endpoint, &absolute_desc)
+                && let Ok(desc) = self.get_limited(context, &absolute_desc, 256 * 1024).await
             {
                 if let Some(tpl) = extract_atom_template(&String::from_utf8_lossy(&desc)) {
                     if let Some(url) = Self::apply_template(&tpl, query, &absolute_desc) {
-                        if is_source_url_allowed(source_id, endpoint, &url) {
+                        if self.is_source_url_allowed(context, endpoint, &url) {
                             self.remember_template(endpoint, tpl);
                             return Ok(url);
                         }
@@ -552,7 +661,7 @@ impl OpdsClient {
             .next()
             .filter(|_| is_gutenberg_endpoint(endpoint))
         {
-            if is_source_url_allowed(source_id, endpoint, &url) {
+            if self.is_source_url_allowed(context, endpoint, &url) {
                 return Ok(url);
             }
         }
@@ -561,7 +670,7 @@ impl OpdsClient {
             endpoint,
             &format!("{endpoint}{sep}query={}", urlencode(query)),
         )
-        .filter(|url| is_source_url_allowed(source_id, endpoint, url))
+        .filter(|url| self.is_source_url_allowed(context, endpoint, url))
         .ok_or_else(|| invalid_feed("搜索地址解析失败"))?;
         Ok(url)
     }
@@ -573,28 +682,31 @@ impl OpdsClient {
         query: &str,
         limit: u32,
     ) -> Result<Vec<OpdsEntry>, AppError> {
+        // 一次搜索只解析一次权威上下文：整轮请求（含模板/描述文件/条目页）使用同一份
+        // 来源身份、端口策略与权威 origin。
+        let context = self.request_context(source_id).await?;
         let mut urls: Vec<String> = Vec::new();
         // Gutenberg：www 镜像优先（m. 对 search.opds 常 504），成功则跳过 OpenSearch。
         if is_gutenberg_endpoint(endpoint) {
             urls.extend(gutenberg_search_mirrors(query));
-        } else if let Ok(url) = self.search_url(source_id, endpoint, query).await {
+        } else if let Ok(url) = self.search_url_with(&context, endpoint, query).await {
             urls.push(url);
         }
         let mut last_err: Option<AppError> = None;
         if let Some(entries) = self
-            .try_search_urls(source_id, endpoint, &urls, limit, &mut last_err)
+            .try_search_urls(&context, endpoint, &urls, limit, &mut last_err)
             .await
         {
             return Ok(entries);
         }
         if is_gutenberg_endpoint(endpoint) {
-            if let Ok(url) = self.search_url(source_id, endpoint, query).await {
+            if let Ok(url) = self.search_url_with(&context, endpoint, query).await {
                 let extras: Vec<String> = with_gutenberg_host_fallbacks(&url)
                     .into_iter()
                     .filter(|u| !urls.contains(u))
                     .collect();
                 if let Some(entries) = self
-                    .try_search_urls(source_id, endpoint, &extras, limit, &mut last_err)
+                    .try_search_urls(&context, endpoint, &extras, limit, &mut last_err)
                     .await
                 {
                     return Ok(entries);
@@ -606,20 +718,20 @@ impl OpdsClient {
 
     async fn try_search_urls(
         &self,
-        source_id: Option<&str>,
+        context: &OpdsRequestContext,
         source_endpoint: &str,
         urls: &[String],
         limit: u32,
         last_err: &mut Option<AppError>,
     ) -> Option<Vec<OpdsEntry>> {
         for url in urls {
-            match self.get_feed(source_id, url).await {
+            match self.get_feed(context, url).await {
                 Ok(body) => {
                     let xml = String::from_utf8_lossy(&body);
                     let mut entries: Vec<OpdsEntry> = book_candidates(parse_atom(&xml, url).0)
                         .into_iter()
                         .filter(|entry| {
-                            is_source_url_allowed(source_id, source_endpoint, &entry.entry_id)
+                            self.is_source_url_allowed(context, source_endpoint, &entry.entry_id)
                         })
                         .collect();
                     if entries.is_empty() {
@@ -640,8 +752,18 @@ impl OpdsClient {
         source_id: Option<&str>,
         entry_page_url: &str,
     ) -> Result<OpdsEntry, AppError> {
+        let context = self.request_context(source_id).await?;
+        self.fetch_entry_metadata_with(&context, entry_page_url)
+            .await
+    }
+
+    async fn fetch_entry_metadata_with(
+        &self,
+        context: &OpdsRequestContext,
+        entry_page_url: &str,
+    ) -> Result<OpdsEntry, AppError> {
         let (page_url, body) = self
-            .get_feed_with_host_fallback(source_id, entry_page_url)
+            .get_feed_with_host_fallback(context, entry_page_url)
             .await?;
         let xml = String::from_utf8_lossy(&body);
         let entries = parse_atom(&xml, &page_url).0;
@@ -659,13 +781,16 @@ impl OpdsClient {
         source_id: Option<&str>,
         entry_page_url: &str,
     ) -> Result<(OpdsEntry, Vec<u8>), AppError> {
-        let entry = self.fetch_entry_metadata(source_id, entry_page_url).await?;
+        let context = self.request_context(source_id).await?;
+        let entry = self
+            .fetch_entry_metadata_with(&context, entry_page_url)
+            .await?;
         let href = entry
             .epub_href
             .clone()
             .ok_or_else(|| invalid_feed("该条目没有 EPUB 获取链接"))?;
         let data = self
-            .get_limited_with_host_fallback(source_id, &href, BOOK_CAP_BYTES as usize)
+            .get_limited_with_host_fallback(&context, &href, BOOK_CAP_BYTES as usize)
             .await?;
         Ok((entry, data.to_vec()))
     }
@@ -694,22 +819,18 @@ fn extract_atom_template(desc: &str) -> Option<String> {
     }
 }
 
-fn is_gutenberg_endpoint(endpoint: &str) -> bool {
-    reqwest::Url::parse(endpoint)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-        .is_some_and(|host| matches!(host.as_str(), "www.gutenberg.org" | "m.gutenberg.org"))
-}
-
-/// 校验 OPDS 请求地址。自定义目录可以访问其已登记的 http(s) 端点；内置
-/// Gutenberg 只允许公开站点的 HTTPS 主机，并且每个手工跟随的重定向都会再次
-/// 进入本函数。请求凭据、端口和片段不会从候选句柄进入网络层。
-fn validate_opds_url(raw: &str, source_id: Option<&str>) -> Result<reqwest::Url, AppError> {
-    let safe = parse_http_url(raw, HttpUrlPolicy::SourceEndpoint)
-        .map_err(|_| invalid_feed("目录地址不安全"))?;
+/// 校验 OPDS 请求地址。
+///
+/// 策略由**请求上下文**决定，而不是由调用方随手传进来的字符串：已登记的自定义 OPDS
+/// 书源可以使用用户来源端口策略（任意非零端口），内置 Gutenberg 只允许公开站点的
+/// HTTPS 主机且**不允许任何显式端口（含 `:443`）**，匿名请求使用固定严格策略。
+/// 每个手工跟随的重定向都会再次进入本函数，因此端口与主机的判定逐跳成立。userinfo、
+/// fragment 与畸形 authority 由共享策略统一拒绝。
+fn validate_opds_url(raw: &str, context: &OpdsRequestContext) -> Result<reqwest::Url, AppError> {
+    let safe = parse_http_url(raw, context.policy()).map_err(|_| invalid_feed("目录地址不安全"))?;
     let host = safe.host().to_owned();
     let url = safe.into_url();
-    if source_id.is_some_and(is_builtin_opds)
+    if context.identity() == OpdsSourceIdentity::BuiltinGutenberg
         && (url.scheme() != "https"
             // `url::Url::port()` normalizes an explicitly written default
             // port (`:443`) to `None`.  Inspect the authority as well so the
@@ -723,10 +844,13 @@ fn validate_opds_url(raw: &str, source_id: Option<&str>) -> Result<reqwest::Url,
     Ok(url)
 }
 
+/// Feed-discovered URLs remain inside the authority that owns the configured
+/// OPDS source. Gutenberg is the one deliberate two-host exception because
+/// its official mobile and desktop mirrors are interchangeable and anonymous.
 fn same_opds_authority(
     origin: &reqwest::Url,
     target: &reqwest::Url,
-    source_id: Option<&str>,
+    context: &OpdsRequestContext,
 ) -> bool {
     let Some(origin_host) = origin.host_str() else {
         return false;
@@ -740,7 +864,7 @@ fn same_opds_authority(
     if !same_port || origin.scheme() != target.scheme() {
         return false;
     }
-    if source_id.is_some_and(is_builtin_opds) {
+    if context.identity() == OpdsSourceIdentity::BuiltinGutenberg {
         matches!(
             origin_host.as_str(),
             "www.gutenberg.org" | "m.gutenberg.org"
@@ -753,86 +877,34 @@ fn same_opds_authority(
     }
 }
 
-/// Feed-discovered URLs remain inside the authority that owns the configured
-/// OPDS source. Gutenberg is the one deliberate two-host exception because
-/// its official mobile and desktop mirrors are interchangeable and anonymous.
-fn is_source_url_allowed(source_id: Option<&str>, origin: &str, candidate: &str) -> bool {
-    let Ok(origin) = validate_opds_url(origin, source_id) else {
-        return false;
-    };
-    let Ok(candidate) = validate_opds_url(candidate, source_id) else {
-        return false;
-    };
-    same_opds_authority(&origin, &candidate, source_id)
-}
-
-/// Return whether the raw URL authority contains an explicit port.  This is
-/// intentionally only used after URL parsing and user-info rejection; it
-/// exists because the URL parser erases the default HTTPS port when exposing
-/// `Url::port()`.  Gutenberg only needs the bare public HTTPS hosts.
-fn has_explicit_authority_port(raw: &str) -> bool {
-    let Some((_, after_scheme)) = raw.split_once("://") else {
-        return false;
-    };
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    if host.starts_with('[') {
-        return host.find(']').is_some_and(|end| {
-            host.get(end + 1..)
-                .is_some_and(|tail| tail.starts_with(':'))
-        });
+/// Feed-discovered URL checks need the request's own policy (and its test fixture), so they
+/// live on the client rather than on a free function.
+impl OpdsClient {
+    /// 模板 / 描述文件 / 条目身份发现的地址是否仍属于本次请求的来源权威。
+    ///
+    /// 两侧都先过**本次请求的策略**（与真正发请求时同一个函数，因此测试 fixture
+    /// 的行为与其它跳完全一致），再比较 authority。
+    fn is_source_url_allowed(
+        &self,
+        context: &OpdsRequestContext,
+        origin: &str,
+        candidate: &str,
+    ) -> bool {
+        let Ok(origin) = self.validate_request_url(origin, context) else {
+            return false;
+        };
+        let Ok(candidate) = self.validate_request_url(candidate, context) else {
+            return false;
+        };
+        same_opds_authority(&origin, &candidate, context)
     }
-    host.contains(':')
-}
-
-#[cfg(test)]
-fn is_loopback_http_url(raw: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(raw) else {
-        return false;
-    };
-    matches!(url.scheme(), "http" | "https")
-        && url
-            .host_str()
-            .and_then(|host| host.parse::<IpAddr>().ok())
-            .is_some_and(|ip| ip.is_loopback())
-}
-
-#[cfg(test)]
-fn parse_loopback_fixture_url(raw: &str) -> Result<reqwest::Url, AppError> {
-    let url = reqwest::Url::parse(raw).map_err(|_| invalid_feed("测试目录地址无效"))?;
-    if !is_loopback_http_url(raw)
-        || url.username() != ""
-        || url.password().is_some()
-        || url.fragment().is_some()
-        || url.port_or_known_default().is_none()
-    {
-        return Err(invalid_feed("测试目录地址不安全"));
-    }
-    Ok(url)
-}
-
-#[cfg(test)]
-fn loopback_fixture_target(url: &reqwest::Url) -> Option<Result<ResolvedHttpTarget, AppError>> {
-    let host = url.host_str()?;
-    let ip = host.parse::<IpAddr>().ok()?;
-    if !ip.is_loopback() {
-        return None;
-    }
-    let port = url.port_or_known_default()?;
-    Some(Ok(ResolvedHttpTarget {
-        url: url.clone(),
-        dns_name: None,
-        addresses: vec![SocketAddr::new(ip, port)],
-    }))
 }
 
 fn validate_builtin_gutenberg_url(raw: &str) -> Result<reqwest::Url, AppError> {
-    validate_opds_url(raw, Some(OPDS_SOURCE_GUTENBERG))
+    validate_opds_url(
+        raw,
+        &OpdsRequestContext::builtin_gutenberg(OPDS_SOURCE_GUTENBERG),
+    )
 }
 
 fn is_epub_payload(bytes: &[u8]) -> bool {
@@ -918,41 +990,14 @@ fn bounded_epub_session_body(
     })
 }
 
-/// 内置三预设（匿名访问）；仅自定义 `custom_` 前缀源注入凭据。
+/// 内置 OPDS 来源判定：当前**只有一个**内置预设（Gutenberg），按 ID 常量精确匹配，
+/// 匿名访问、固定公开 HTTPS 主机白名单。
+///
+/// 自定义身份不在这里判定，也不由名字或前缀长相推断：它来自注册表正向确认的记录
+/// （种类 + 登记端点 origin 快照，见 `request_context`），因此订阅源 / 漫画库 / TVBox
+/// 配置等其它 `custom_` 家族与未登记 ID 都拿不到用户来源策略与凭据。
 fn is_builtin_opds(source_id: &str) -> bool {
     OPDS_SOURCE_IDS.contains(&source_id)
-}
-
-/// Gutenberg 搜索镜像：www 优先（m. 在部分网络对 search.opds 返回 504）。
-fn gutenberg_search_mirrors(query: &str) -> Vec<String> {
-    let q = urlencode(query);
-    vec![
-        format!("https://www.gutenberg.org/ebooks/search.opds/?query={q}"),
-        format!("https://m.gutenberg.org/ebooks/search.opds/?query={q}"),
-    ]
-}
-
-fn with_gutenberg_host_fallbacks(url: &str) -> Vec<String> {
-    let mut out = vec![url.to_owned()];
-    if url.contains("://m.gutenberg.org") {
-        out.push(url.replacen("://m.gutenberg.org", "://www.gutenberg.org", 1));
-    } else if url.contains("://www.gutenberg.org") {
-        out.push(url.replacen("://www.gutenberg.org", "://m.gutenberg.org", 1));
-    }
-    out
-}
-
-fn urlencode(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for b in input.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 // ---------- 目录提供方（元数据 + 远端身份） ----------
@@ -986,24 +1031,27 @@ impl SourceCatalogProvider for OpdsCatalogProvider {
                 false,
             ));
         }
+        // 权威上下文来自**注册表**：只有确实登记为自定义 OPDS 书源的 `sourceId` 才拿到
+        // 用户来源策略与凭据，未知/其它 `custom_` 家族会在这里 fail closed。
+        //
+        // 凭据引用不是由 `sourceId` 拼出来的 profile：解析器读的是注册表当前选中的
+        // **版本化引用**（`CustomSourceRecord.credential_ref` → 系统凭据库），而 Basic 的
+        // 用户名段仍是 `sourceId`，形状与本切片之前一致。引用只在本文件的
+        // `resolve_credential` 里、且只在登记端点 origin 上、复核过配置版本之后才被使用。
+        let context = self.client.request_context(Some(source_id)).await?;
         // A candidate handle may only refer to an entry on the configured
         // source authority.  Do not let a caller replace the registered
-        // endpoint with an arbitrary public URL; this also keeps custom-source
-        // credentials scoped to their original host.
-        let source_endpoint = validate_opds_url(endpoint, Some(source_id))?;
-        let entry_url = validate_opds_url(external_id, Some(source_id))?;
-        if !same_opds_authority(&source_endpoint, &entry_url, Some(source_id)) {
+        // endpoint with an arbitrary public URL; credential injection is bound
+        // to the registered endpoint origin inside the client, not to whatever
+        // endpoint the caller passed here.
+        let source_endpoint = validate_opds_url(endpoint, &context)?;
+        let entry_url = validate_opds_url(external_id, &context)?;
+        if !same_opds_authority(&source_endpoint, &entry_url, &context) {
             return Err(invalid_feed("目录条目不属于已配置来源"));
         }
-        // 私有源凭据：sourceId 即 profile（`haven:opds:<sourceId>`），detail 走同源 Basic Auth。
-        // Built-in source key is passed to the HTTP layer for strict host and
-        // redirect validation; `get_limited_once` deliberately skips auth for
-        // built-in IDs. Custom OPDS IDs retain their credential lookup path.
-        let source_for_auth =
-            (is_opds_source_id(source_id) || is_custom).then(|| source_id.to_owned());
         let entry = self
             .client
-            .fetch_entry_metadata(source_for_auth.as_deref(), entry_url.as_str())
+            .fetch_entry_metadata_with(&context, entry_url.as_str())
             .await?;
 
         Ok(SourceCatalogEntry {
@@ -1053,9 +1101,10 @@ impl RemoteAcquisitionPort for OpdsCatalogProvider {
             return Err(storage_failure("书籍临时文件路径无效"));
         }
         let remote_url = validate_builtin_gutenberg_url(remote_id)?;
+        let context = OpdsRequestContext::builtin_gutenberg(source_key);
         let entry = self
             .client
-            .fetch_entry_metadata(Some(source_key), remote_url.as_str())
+            .fetch_entry_metadata_with(&context, remote_url.as_str())
             .await?;
         let href = entry
             .epub_href
@@ -1064,11 +1113,7 @@ impl RemoteAcquisitionPort for OpdsCatalogProvider {
         let href = validate_builtin_gutenberg_url(href)?;
         let bytes = self
             .client
-            .get_limited_with_host_fallback(
-                Some(source_key),
-                href.as_str(),
-                BOOK_CAP_BYTES as usize,
-            )
+            .get_limited_with_host_fallback(&context, href.as_str(), BOOK_CAP_BYTES as usize)
             .await?;
         validate_epub_payload(&bytes)?;
         let size_bytes = write_epub_atomic(destination, &bytes).await?;
@@ -1106,9 +1151,10 @@ impl RemoteSessionPort for OpdsCatalogProvider {
         // a caller-supplied download URL.  Re-validate it before every read,
         // then resolve the EPUB link from the current entry metadata.
         let entry_url = validate_builtin_gutenberg_url(remote_id)?;
+        let context = OpdsRequestContext::builtin_gutenberg(source_key);
         let entry = self
             .client
-            .fetch_entry_metadata(Some(source_key), entry_url.as_str())
+            .fetch_entry_metadata_with(&context, entry_url.as_str())
             .await?;
         let epub_href = entry
             .epub_href
@@ -1117,11 +1163,7 @@ impl RemoteSessionPort for OpdsCatalogProvider {
         let epub_url = validate_builtin_gutenberg_url(epub_href)?;
         let bytes = self
             .client
-            .get_limited_with_host_fallback(
-                Some(source_key),
-                epub_url.as_str(),
-                ONLINE_EPUB_CAP_BYTES,
-            )
+            .get_limited_with_host_fallback(&context, epub_url.as_str(), ONLINE_EPUB_CAP_BYTES)
             .await?;
         validate_epub_payload(&bytes)?;
         bounded_epub_session_body(bytes, range)
@@ -1316,11 +1358,72 @@ async fn write_epub_atomic(destination: &Path, bytes: &[u8]) -> Result<u64, AppE
 
 // ---------- 搜索参与者 ----------
 
+/// 用户登记目录（OPDS/CMS10）共用的受控 Artwork 投影。
+///
+/// 搜索阶段只做两件事：把上游响应里**已经存在**的图片字段交给既有的
+/// `ImageProxyRepository::register`（URL 形状、主机与长度策略都在那里），并把返回的
+/// opaque id 投影成 `haven://artwork/<id>`。搜索**不会**为每条结果额外抓一张图——抓取由
+/// 渲染时的受控 Artwork 缓存负责，登记本身不发起任何图片请求。
+///
+/// 这里刻意不携带目录凭据：要求 Cookie / API key 才能取到的图片在下游抓取时会诚实地失败
+/// 并回退到无海报，而不是把目录 secret 交给图片路径。缺失、被策略拒绝或登记失败都只让
+/// 卡片少一张海报，元数据照常保留。
+pub(crate) async fn register_catalog_artwork(
+    proxy: Option<&dyn ImageProxyRepository>,
+    source_id: &str,
+    poster: Option<&str>,
+) -> Option<String> {
+    let (Some(proxy), Some(poster)) = (proxy, poster) else {
+        return None;
+    };
+    let poster = poster.trim();
+    if poster.is_empty() {
+        return None;
+    }
+    let id = proxy.register(source_id, poster).await.ok()?;
+    controlled_artwork_uri(&id)
+}
+
+/// 搜索卡片的海报投影（OPDS 与 CMS10 共用的唯一口径）。
+///
+/// 取消之后不再新增登记：已登记过的 opaque 身份不会被删除（已保存的库记录可能引用
+/// 它们），但取消之后的条目不再产生新的映射。缺地址 / 被策略拒绝 / 登记失败都只是
+/// 「这张卡片没有海报」，元数据保持原样。
+pub(crate) async fn projected_poster(
+    proxy: Option<&dyn ImageProxyRepository>,
+    source_id: &str,
+    pic: Option<&str>,
+    is_cancelled: &(dyn Fn() -> bool + Send + Sync),
+) -> Option<String> {
+    if is_cancelled() {
+        return None;
+    }
+    register_catalog_artwork(proxy, source_id, pic).await
+}
+
+/// 受控 Artwork URI：`haven://artwork/<opaque>`。字符集与 `mapper::work_card` 的
+/// `controlled_artwork_uri` 以及前端的 `artworkRequestUri` 保持一致；形状不合法的 id
+/// 一律不进入 Wire。
+pub(crate) fn controlled_artwork_uri(id: &str) -> Option<String> {
+    let id = id.trim();
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+    Some(format!("haven://artwork/{id}"))
+}
+
 /// 每个 OPDS 来源一个参与者实例；分类声明为 Book。
 pub struct OpdsSearchParticipant {
     source_id: String,
     registry: SourceRegistryService,
     client: Arc<OpdsClient>,
+    /// 受控图片登记端口。未注入时搜索照常工作，只是没有海报。
+    image_proxy: Option<Arc<dyn ImageProxyRepository>>,
 }
 
 impl OpdsSearchParticipant {
@@ -1333,7 +1436,14 @@ impl OpdsSearchParticipant {
             source_id: source_id.into(),
             registry,
             client,
+            image_proxy: None,
         }
+    }
+
+    /// 注入受控 Artwork 登记端口（`image_proxy` migration 015 的 ImageProxyRepository）。
+    pub fn with_image_proxy(mut self, proxy: Arc<dyn ImageProxyRepository>) -> Self {
+        self.image_proxy = Some(proxy);
+        self
     }
 }
 
@@ -1379,50 +1489,75 @@ impl SearchSourceParticipant for OpdsSearchParticipant {
         limit: u32,
         is_cancelled: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<Vec<haven_application::wire::WorkCardDto>, AppError> {
+        // 只有内置 OPDS ID，以及**确实登记为自定义 OPDS 书源**的 ID 才参与：订阅源 /
+        // 漫画库 / TVBox 配置家族与未登记 ID 安静跳过，一次请求都不发（组合缺口，不是告警）。
+        if !is_opds_source_id(dispatched_id)
+            && !matches!(
+                SourceRegistryService::custom_kind_from_source_id(dispatched_id),
+                Some(CustomSourceKind::Opds)
+            )
+        {
+            return Ok(Vec::new());
+        }
         let Some(endpoint) = self.registry.endpoint(dispatched_id).await? else {
             return Ok(Vec::new());
         };
         if is_cancelled() {
             return Ok(Vec::new());
         }
-        // Keep the built-in key visible to the HTTP policy while still making
-        // its requests anonymous (the client skips credential injection for
-        // built-in IDs).
-        let source_for_auth: Option<&str> = Some(dispatched_id);
         let entries = self
             .client
-            .search_entries(source_for_auth, &endpoint, query, limit)
+            .search_entries(Some(dispatched_id), &endpoint, query, limit)
             .await?;
-        Ok(entries
-            .into_iter()
-            .map(|entry| haven_application::wire::WorkCardDto {
-                // The operation cache must never expose a directly callable remote
-                // URL as a candidate handle. Keep the source key visible only for
-                // server-side routing and percent-encode the entry identity; the
-                // import service is the sole component that decodes it after the
-                // source policy has been checked.
-                work_id: format!(
-                    "{}{}\u{1}{}",
-                    haven_application::services::OPDS_CANDIDATE_PREFIX,
-                    dispatched_id,
-                    urlencode(&entry.entry_id)
-                ),
-                title: entry.title,
-                original_title: entry.author,
-                description: None,
-                categories: vec![haven_application::wire::ContentCategory::Book],
-                available_media_types: vec![haven_application::wire::MediaTypeDto::Book],
-                poster_uri: None,
-                backdrop_uri: None,
-                release_year: None,
-                rating_value: None,
-                rating_scale: None,
-                favorite: false,
-                progress: None,
-                primary_action: None,
-                external_ids: Vec::new(),
-            })
-            .collect())
+        let mut cards: Vec<haven_application::wire::WorkCardDto> =
+            Vec::with_capacity(entries.len());
+        for entry in entries {
+            // 图片来源身份用**分发到的来源 ID**（后端生成的自定义身份或内置 ID），
+            // 与卡片/候选句柄的来源一致。
+            let poster_uri = projected_poster(
+                self.image_proxy.as_deref(),
+                dispatched_id,
+                entry.pic.as_deref(),
+                is_cancelled,
+            )
+            .await;
+            cards.push(opds_card(dispatched_id, entry, poster_uri));
+        }
+        Ok(cards)
+    }
+}
+
+/// 单条 OPDS 条目 → 搜索卡片。
+///
+/// 候选句柄里绝不出现可直接调用的远端地址：来源键只用于后端路由，条目身份先做百分号
+/// 编码，只有导入服务在来源策略校验之后才会解码。海报只接收已经登记过的受控 URI
+/// （`None` = 没有海报）。
+fn opds_card(
+    dispatched_id: &str,
+    entry: OpdsEntry,
+    poster_uri: Option<String>,
+) -> haven_application::wire::WorkCardDto {
+    haven_application::wire::WorkCardDto {
+        work_id: format!(
+            "{}{}\u{1}{}",
+            haven_application::services::OPDS_CANDIDATE_PREFIX,
+            dispatched_id,
+            urlencode(&entry.entry_id)
+        ),
+        title: entry.title,
+        original_title: entry.author,
+        description: None,
+        categories: vec![haven_application::wire::ContentCategory::Book],
+        available_media_types: vec![haven_application::wire::MediaTypeDto::Book],
+        poster_uri,
+        backdrop_uri: None,
+        release_year: None,
+        rating_value: None,
+        rating_scale: None,
+        favorite: false,
+        progress: None,
+        primary_action: None,
+        external_ids: Vec::new(),
     }
 }
 
@@ -1481,6 +1616,17 @@ impl RoutingSourceCatalogProvider {
         // sourceId 处理（`SourceImportService` 显式注入），这里 fail closed，避免把
         // 漫画库身份当成 OPDS 条目地址去请求。
         if SourceRegistryService::is_comic_library_source_id(source_id) {
+            return Err(AppError::new(
+                "INVALID_ARGUMENT",
+                ErrorKind::Validation,
+                "未知来源目录",
+                false,
+            ));
+        }
+        // 用户导入的 TVBox / FongMi 配置来源同样属于 `custom_` 家族，但它既不是 OPDS 书源、
+        // 也没有任何已实现的搜索/播放路径。它必须在**路由层**就被排除，而不是让 OPDS 兜底
+        // 去请求一个配置文件地址（客户端也会按登记种类 fail closed，这里是第二道闸门）。
+        if SourceRegistryService::is_tvbox_source_id(source_id) {
             return Err(AppError::new(
                 "INVALID_ARGUMENT",
                 ErrorKind::Validation,
@@ -1549,75 +1695,15 @@ impl SourceCatalogProvider for RoutingSourceCatalogProvider {
 
 #[cfg(test)]
 mod tests {
+    use super::fixture::{
+        ArtworkOutcome, FixtureResponse, FixtureServer, RecordingImageProxy,
+        closed_loopback_origin, counting_resolver, opds_entry_with_poster, provider_endpoint,
+        seeded_opds_registry,
+    };
     use super::*;
     use std::io::{Cursor, Write as _};
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
-
-    #[test]
-    fn absolutize_upgrades_http_and_resolves_relative() {
-        let base = "https://m.gutenberg.org/ebooks/search.opds/?query=frankenstein";
-        assert_eq!(
-            absolutize(base, "/cache/epub/84/pg84.epub").unwrap(),
-            "https://m.gutenberg.org/cache/epub/84/pg84.epub"
-        );
-        assert_eq!(
-            absolutize(base, "http://m.gutenberg.org/ebooks/search.opds/?query=x").unwrap(),
-            "https://m.gutenberg.org/ebooks/search.opds/?query=x"
-        );
-        assert_eq!(
-            absolutize(base, "//cdn.example.org/a.epub").unwrap(),
-            "https://cdn.example.org/a.epub"
-        );
-        assert_eq!(
-            absolutize(base, "https://other.org/b.epub").unwrap(),
-            "https://other.org/b.epub"
-        );
-        assert!(absolutize(base, "plain.tex").is_none());
-    }
-
-    #[test]
-    fn gutenberg_mirrors_prefer_www_then_mobile() {
-        let urls = gutenberg_search_mirrors("frankenstein");
-        assert_eq!(
-            urls[0],
-            "https://www.gutenberg.org/ebooks/search.opds/?query=frankenstein"
-        );
-        assert_eq!(
-            urls[1],
-            "https://m.gutenberg.org/ebooks/search.opds/?query=frankenstein"
-        );
-        assert_eq!(
-            with_gutenberg_host_fallbacks("https://m.gutenberg.org/ebooks/84.opds"),
-            vec![
-                "https://m.gutenberg.org/ebooks/84.opds".to_owned(),
-                "https://www.gutenberg.org/ebooks/84.opds".to_owned(),
-            ]
-        );
-        assert!(!is_gutenberg_endpoint(
-            "https://standardebooks.org/feeds/opds"
-        ));
-    }
-
-    #[test]
-    fn opensearch_picks_atom_template_and_upgrades_https() {
-        let desc = r#"<?xml version="1.0"?>
-<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
-  <ShortName>Gutenberg</ShortName>
-  <Url type="text/html" template="http://www.gutenberg.org/ebooks/search/?query={searchTerms}"/>
-  <Url type="application/atom+xml" template="http://m.gutenberg.org/ebooks/search.opds/?query={searchTerms}"/>
-</OpenSearchDescription>"#;
-        let tpl = extract_atom_template(desc).unwrap();
-        let url = absolutize(
-            "https://www.gutenberg.org/catalog/osd-books.xml",
-            &tpl.replace("{searchTerms}", &urlencode("frankenstein")),
-        )
-        .unwrap();
-        assert_eq!(
-            url,
-            "https://m.gutenberg.org/ebooks/search.opds/?query=frankenstein"
-        );
-    }
 
     #[test]
     fn builtin_gutenberg_policy_rejects_untrusted_urls() {
@@ -1637,33 +1723,59 @@ mod tests {
         );
     }
 
-    #[test]
-    fn custom_opds_candidates_stay_on_the_registered_authority() {
-        let source = "custom_catalog123456";
-        assert!(is_source_url_allowed(
-            Some(source),
+    #[tokio::test]
+    async fn custom_opds_candidates_stay_on_the_registered_authority() {
+        let (registry, source) =
+            seeded_opds_registry("https://catalog.example.invalid/opds", false).await;
+        let client = OpdsClient::new().unwrap().with_source_registry(registry);
+        let context = client.request_context(Some(&source)).await.unwrap();
+        assert!(client.is_source_url_allowed(
+            &context,
             "https://catalog.example.invalid/opds",
             "https://catalog.example.invalid/books/84.opds"
         ));
-        assert!(!is_source_url_allowed(
-            Some(source),
+        assert!(!client.is_source_url_allowed(
+            &context,
             "https://catalog.example.invalid/opds",
             "https://other.example.invalid/books/84.opds"
         ));
-        assert!(!is_source_url_allowed(
-            Some(source),
+        assert!(!client.is_source_url_allowed(
+            &context,
             "https://catalog.example.invalid/opds",
             "https://user:secret@catalog.example.invalid/books/84.opds"
         ));
-        assert!(is_source_url_allowed(
-            Some(OPDS_SOURCE_GUTENBERG),
+        // 内置 Gutenberg 继续使用它自己的两主机例外。
+        let gutenberg = OpdsRequestContext::builtin_gutenberg(OPDS_SOURCE_GUTENBERG);
+        assert!(client.is_source_url_allowed(
+            &gutenberg,
             "https://www.gutenberg.org/ebooks/search.opds",
             "https://m.gutenberg.org/ebooks/84.opds"
         ));
-        assert!(!is_source_url_allowed(
-            Some(OPDS_SOURCE_GUTENBERG),
+        assert!(!client.is_source_url_allowed(
+            &gutenberg,
             "https://www.gutenberg.org/ebooks/search.opds",
             "https://evil.example.invalid/ebooks/84.opds"
+        ));
+        // 已登记的自定义书源可以使用任意非零端口：端口是用户自己的选择，
+        // 但**别的**端口仍然不是同一个权威。
+        let (port_registry, port_source) =
+            seeded_opds_registry("https://catalog.example.invalid:8096/opds", false).await;
+        let port_client = OpdsClient::new()
+            .unwrap()
+            .with_source_registry(port_registry);
+        let port_context = port_client
+            .request_context(Some(&port_source))
+            .await
+            .unwrap();
+        assert!(port_client.is_source_url_allowed(
+            &port_context,
+            "https://catalog.example.invalid:8096/opds",
+            "https://catalog.example.invalid:8096/books/84.opds"
+        ));
+        assert!(!port_client.is_source_url_allowed(
+            &port_context,
+            "https://catalog.example.invalid:8096/opds",
+            "https://catalog.example.invalid:8097/books/84.opds"
         ));
     }
 
@@ -1800,79 +1912,477 @@ mod tests {
         assert_eq!(books[1].author.as_deref(), Some("Anon & Co"));
     }
 
-    // ---- 自定义源凭据（V2-H 收尾批次） ----
-
-    /// 本地 HTTP 服务器：回显 Authorization 头（仅测试内使用）。
-    fn spawn_auth_echo_server() -> (String, tokio::sync::oneshot::Receiver<String>) {
-        use std::io::{BufRead, BufReader, Read};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            if let Ok((stream, _)) = listener.accept() {
-                let mut reader = BufReader::new(stream);
-                let mut request_line = String::new();
-                if reader.read_line(&mut request_line).is_err() {
-                    return;
-                }
-                let mut auth = String::new();
-                loop {
-                    let mut line = String::new();
-                    match reader.read_line(&mut line) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {
-                            if line.to_ascii_lowercase().starts_with("authorization:") {
-                                auth = line.trim().to_owned();
-                            }
-                            if line == "\r\n" || line == "\n" {
-                                break;
-                            }
-                        }
-                    }
-                }
-                let _ = reader.read(&mut [0u8; 16]);
-                let _ = tx.send(auth);
-            }
-        });
-        (format!("http://{addr}/feed"), rx)
-    }
+    // ---- 自定义源凭据与用户来源请求上下文 ----
+    //
+    // 回环夹具、来源登记夹具与凭据解析器替身都在 `super::fixture`（`cfg(test)`），
+    // 与 CMS10 适配器的测试共用同一份；这里只保留请求上下文本身的用例。
 
     #[tokio::test]
-    async fn basic_auth_injected_for_custom_source() {
-        use base64::Engine as _;
-        let (url, rx) = spawn_auth_echo_server();
+    async fn credentials_are_bound_to_the_registered_origin_and_never_look_up_foreign_hops() {
+        // 登记端点是 HTTPS（配了凭据的来源只允许 HTTPS）：这里只需要 origin 判定，
+        // 不做任何真实连接。
+        let secure_origin = closed_loopback_origin().replacen("http://", "https://", 1);
+        let (registry, source_id) =
+            seeded_opds_registry(&provider_endpoint(&secure_origin), true).await;
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = OpdsClient::new()
+            .unwrap()
+            .with_source_registry(registry)
+            .with_credential_resolver(counting_resolver(calls.clone()));
+
+        let authoritative = reqwest::Url::parse(&format!("{secure_origin}/feed")).unwrap();
+        let context = client
+            .request_context(Some(&source_id))
+            .await
+            .expect("已登记的自定义 OPDS 书源必须得到上下文");
+        assert_eq!(
+            hop_credential(&context, &authoritative).unwrap(),
+            HopCredential::Authorized,
+            "权威登记 origin 上的一跳允许带凭据"
+        );
+        assert_eq!(
+            client
+                .resolve_credential(&context, &authoritative)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("p@ss:word")
+        );
+        // Basic 的用户名段是 sourceId：凭据格式与本切片之前完全一致
+        // （解析器被请求的来源 ID 就是将被编码进 `basic_auth(source_id, secret)` 的那一个）。
+        assert_eq!(calls.lock().unwrap().clone(), vec![source_id.clone()]);
+
+        // 另一个 origin（被篡改的目录链接/模板/重定向）不许继承凭据：连解析都不做。
+        let foreign = reqwest::Url::parse(&format!("{}/feed", closed_loopback_origin())).unwrap();
+        assert_eq!(
+            hop_credential(&context, &foreign).unwrap(),
+            HopCredential::Anonymous
+        );
+        assert!(
+            client
+                .resolve_credential(&context, &foreign)
+                .await
+                .unwrap()
+                .is_none(),
+            "跨 origin 的一跳不得解析 secret"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "跨 origin 的一跳不得再次调用凭据解析器"
+        );
+
+        // 明文 HTTP 上的权威 origin：在发出请求之前就以固定错误 fail closed，
+        // 而且连 secret 都不会去解析。
+        let plaintext = closed_loopback_origin();
+        let (plain_registry, plain_source) =
+            seeded_opds_registry(&provider_endpoint(&plaintext), true).await;
+        let plain_client = OpdsClient::new()
+            .unwrap()
+            .with_loopback_fixture()
+            .with_source_registry(plain_registry)
+            .with_credential_resolver(counting_resolver(calls.clone()));
+        let plain_context = plain_client
+            .request_context(Some(&plain_source))
+            .await
+            .unwrap();
+        let error = plain_client
+            .get_feed(&plain_context, &format!("{plaintext}/feed"))
+            .await
+            .expect_err("配了凭据的来源不得在明文 HTTP 上发请求");
+        assert_eq!(error.code().as_str(), "SECURITY_POLICY_DENIED");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "明文拒绝发生在解析 secret 之前"
+        );
+    }
+
+    /// 越界的一跳：请求地址不属于**登记端点 origin**，必须在建立任何连接之前 fail closed。
+    /// 夹具服务器记录被接受的 TCP 连接数，因此「有没有真的发出请求」是一个可断言的事实，
+    /// 而不是靠时序猜测。
+    #[tokio::test]
+    async fn foreign_origin_requests_never_carry_catalog_credentials() {
+        let server = FixtureServer::start(|_| {
+            vec![(
+                "/feed".to_owned(),
+                FixtureResponse::atom(r#"<feed xmlns="http://www.w3.org/2005/Atom"/>"#),
+            )]
+        });
+        let url = format!("{}/feed", server.origin());
+        // 登记端点在**另一个**回环 origin 上：本次请求不是权威 origin，必须 fail closed，
+        // 绝不能把目录凭据发给一个不属于该来源的地址。
+        let (registry, source_id) =
+            seeded_opds_registry(&provider_endpoint(&closed_loopback_origin()), true).await;
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let client = OpdsClient::new()
             .unwrap()
             .with_loopback_fixture()
-            .with_credential_resolver(Arc::new(|source_id: &str| {
-                let matched = source_id == "custom_test123456";
-                Box::pin(async move { matched.then(|| "p@ss:word".to_owned()) })
-            }));
-        // 响应非 feed 会报错，但请求已发出；Authorization 头由服务端捕获。
-        let _ = client.get_feed(Some("custom_test123456"), &url).await;
-        let received = rx.await.unwrap();
-        let expected =
-            base64::engine::general_purpose::STANDARD.encode("custom_test123456:p@ss:word");
+            .with_source_registry(registry)
+            .with_credential_resolver(counting_resolver(calls.clone()));
+
+        let context = client.request_context(Some(&source_id)).await.unwrap();
+        let error = client
+            .get_feed(&context, &url)
+            .await
+            .expect_err("越界的一跳必须 fail closed");
+        assert_eq!(error.code().as_str(), "SOURCE_UNAVAILABLE");
         assert!(
-            received
-                .to_ascii_lowercase()
-                .ends_with(&format!("basic {expected}").to_ascii_lowercase()),
-            "应注入 Basic Auth 头，实际: {received}"
+            calls.lock().unwrap().is_empty(),
+            "越界的一跳不得解析 secret"
+        );
+        assert_eq!(server.connections(), 0, "越界的一跳不得建立任何 socket");
+    }
+
+    #[tokio::test]
+    async fn anonymous_and_builtin_requests_stay_anonymous() {
+        let server = FixtureServer::start(|_| {
+            vec![(
+                "/feed".to_owned(),
+                FixtureResponse::atom(r#"<feed xmlns="http://www.w3.org/2005/Atom"/>"#),
+            )]
+        });
+        let url = format!("{}/feed", server.origin());
+        let (registry, _source_id) =
+            seeded_opds_registry(&provider_endpoint(server.origin()), true).await;
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = OpdsClient::new()
+            .unwrap()
+            .with_loopback_fixture()
+            .with_source_registry(registry)
+            .with_credential_resolver(counting_resolver(calls.clone()));
+
+        // 匿名请求（没有来源身份）：即使注入了注册表与解析器，也不解析凭据。
+        let anonymous = OpdsRequestContext::anonymous();
+        client
+            .get_feed(&anonymous, &url)
+            .await
+            .expect("匿名请求照常可用");
+
+        // 内置 Gutenberg：身份固定为内置，凭据解析永远不参与。
+        let builtin = OpdsRequestContext::builtin_gutenberg(OPDS_SOURCE_GUTENBERG);
+        client
+            .get_feed(&builtin, &url)
+            .await
+            .expect("内置来源照常可用");
+
+        assert_eq!(server.connections(), 2, "两次请求各建立一次连接");
+        assert_eq!(server.requests().len(), 2);
+        for request in server.requests() {
+            assert_eq!(
+                request.header("authorization"),
+                None,
+                "匿名/内置请求必须不带凭据"
+            );
+        }
+        assert!(calls.lock().unwrap().is_empty(), "内置/匿名不得解析凭据");
+    }
+
+    #[tokio::test]
+    async fn wrong_family_and_unknown_ids_never_reach_the_credential_resolver() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (registry, _opds_source) =
+            seeded_opds_registry(&provider_endpoint(&closed_loopback_origin()), true).await;
+        let client = OpdsClient::new()
+            .unwrap()
+            .with_loopback_fixture()
+            .with_source_registry(registry)
+            .with_credential_resolver(counting_resolver(calls.clone()));
+
+        // 其它 `custom_` 家族与未登记/家族外 ID：fail closed，绝不解析凭据，也绝不因为
+        // 名字看起来像就拿到用户来源策略或登记端点。
+        for source_id in [
+            "custom_feed_0123456789ab",
+            "custom_komga_0123456789ab",
+            "custom_kavita_0123456789ab",
+            "custom_tvbox_0123456789ab",
+            "custom_unknown000000",
+            "mangadex",
+            "custom_",
+        ] {
+            let denied = client.request_context(Some(source_id)).await;
+            assert!(denied.is_err(), "{source_id} 不得得到用户来源上下文");
+            assert_eq!(
+                denied.unwrap_err().code().as_str(),
+                "INVALID_ARGUMENT",
+                "{source_id} 必须以未知来源 fail closed"
+            );
+        }
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "错误家族/未知身份一次都不许调用凭据解析器"
+        );
+        // 同一个客户端对**已登记**的 OPDS 来源仍然工作：上面的拒绝不是「客户端整体失效」。
+        let (ok_registry, ok_source) =
+            seeded_opds_registry(&provider_endpoint(&closed_loopback_origin()), true).await;
+        let ok_client = OpdsClient::new()
+            .unwrap()
+            .with_source_registry(ok_registry)
+            .with_credential_resolver(counting_resolver(calls.clone()));
+        assert!(ok_client.request_context(Some(&ok_source)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn context_change_during_credential_resolution_fails_closed() {
+        // 登记端点是 HTTPS：这一跳本来会注入凭据，因此必须走到解析 + 复核那一步。
+        let secure_origin = closed_loopback_origin().replacen("http://", "https://", 1);
+        let (registry, source_id) =
+            seeded_opds_registry(&provider_endpoint(&secure_origin), true).await;
+        // 解析器在 await 期间被暂停；测试借这段时间把来源端点改掉。
+        let (resolver, entered, release) = super::fixture::paused_resolver(Some("p@ss:word"));
+        let client = Arc::new(
+            OpdsClient::new()
+                .unwrap()
+                .with_loopback_fixture()
+                .with_source_registry(registry.clone())
+                .with_credential_resolver(resolver),
+        );
+        let context = client
+            .request_context(Some(&source_id))
+            .await
+            .expect("已登记的自定义 OPDS 书源必须得到上下文");
+        let url = format!("{secure_origin}/feed");
+
+        let task = tokio::spawn({
+            let client = client.clone();
+            let context = context.clone();
+            let url = url.clone();
+            async move { client.get_feed(&context, &url).await }
+        });
+        entered.await.expect("解析器必须被调用并暂停");
+
+        // 解析期间来源被改到另一个端点（配置版本随之作废）。
+        registry
+            .update_custom_source(haven_application::wire::SourceUpdateRequest {
+                source_id: source_id.clone(),
+                display_name: None,
+                endpoint: Some("https://other.example.invalid/opds".to_owned()),
+            })
+            .await
+            .unwrap();
+        let _ = release.send(());
+
+        let error = task
+            .await
+            .unwrap()
+            .expect_err("上下文在解析期间变化时必须 fail closed");
+        assert_eq!(error.code().as_str(), "SOURCE_UNAVAILABLE");
+        assert!(
+            error.user_message().contains("变更"),
+            "必须是可识别的上下文失效错误，实际: {}",
+            error.user_message()
+        );
+        // 旧上下文不再权威：解析出来的 secret 没有被用于任何请求。
+        let refreshed = client
+            .request_context(Some(&source_id))
+            .await
+            .expect("来源仍登记为自定义 OPDS 书源");
+        assert!(!context.is_current_with(&refreshed));
+    }
+
+    // ---- 用户登记目录的受控 Artwork 投影 ----
+    //
+    // 登记结果替身与 OPDS 条目构造器在 `super::fixture`；整条搜索链路的用例在
+    // `super::catalog_tests`（它们需要一个真实的离线目录服务器，而不仅是 helper）。
+
+    #[tokio::test]
+    async fn opds_search_cards_project_only_registered_controlled_artwork() {
+        let proxy = RecordingImageProxy::new(ArtworkOutcome::Registered);
+        let not_cancelled = || false;
+        let source_id = "custom_0123456789ab";
+        let pic = "https://catalog.example.invalid/covers/9.png";
+
+        let poster =
+            projected_poster(Some(proxy.as_ref()), source_id, Some(pic), &not_cancelled).await;
+        assert_eq!(poster.as_deref(), Some("haven://artwork/artwork-1"));
+        // 登记用的是**分发到的来源身份**与上游解析出来的绝对图片地址。
+        assert_eq!(proxy.calls(), vec![(source_id.to_owned(), pic.to_owned())]);
+
+        let card = opds_card(
+            source_id,
+            opds_entry_with_poster("https://catalog.example.invalid/books/9.opds", Some(pic)),
+            poster,
+        );
+        assert_eq!(
+            card.poster_uri.as_deref(),
+            Some("haven://artwork/artwork-1")
+        );
+        assert!(
+            card.work_id
+                .starts_with(haven_application::services::OPDS_CANDIDATE_PREFIX)
+        );
+        // Wire 上只有 opaque 地址：远端图片地址不出现。
+        let wire = serde_json::to_string(&card).unwrap();
+        assert!(wire.contains("haven://artwork/artwork-1"));
+        assert!(!wire.contains("covers/9.png"));
+
+        // 没有图片字段的条目根本不进入登记路径，卡片保持无海报。
+        assert_eq!(
+            projected_poster(Some(proxy.as_ref()), source_id, None, &not_cancelled).await,
+            None
+        );
+        assert_eq!(proxy.calls().len(), 1, "缺失的海报不得进入登记路径");
+        assert_eq!(
+            opds_card(
+                source_id,
+                opds_entry_with_poster("https://catalog.example.invalid/books/10.opds", None),
+                None,
+            )
+            .poster_uri,
+            None
         );
     }
 
     #[tokio::test]
-    async fn builtin_source_requests_stay_anonymous() {
-        let (url, rx) = spawn_auth_echo_server();
-        let client = OpdsClient::new()
-            .unwrap()
-            .with_loopback_fixture()
-            .with_credential_resolver(Arc::new(|_source_id: &str| {
-                Box::pin(async { Some("unused".to_owned()) })
-            }));
-        // 内置源路径不传 source_id → 不注入凭据。
-        let _ = client.get_feed(None, &url).await;
-        assert_eq!(rx.await.unwrap(), "", "内置源必须匿名访问");
+    async fn opds_search_cancellation_stops_further_artwork_registration() {
+        let proxy = RecordingImageProxy::new(ArtworkOutcome::Registered);
+        let not_cancelled = || false;
+        let cancelled = || true;
+        let source_id = "custom_0123456789ab";
+
+        // 取消之前正常登记。
+        assert_eq!(
+            projected_poster(
+                Some(proxy.as_ref()),
+                source_id,
+                Some("https://catalog.example.invalid/1.png"),
+                &not_cancelled,
+            )
+            .await
+            .as_deref(),
+            Some("haven://artwork/artwork-1")
+        );
+        // 取消之后不再登记新的映射，但条目本身仍然可以投影成卡片（元数据保留）。
+        assert_eq!(
+            projected_poster(
+                Some(proxy.as_ref()),
+                source_id,
+                Some("https://catalog.example.invalid/2.png"),
+                &cancelled,
+            )
+            .await,
+            None
+        );
+        assert_eq!(proxy.calls().len(), 1, "取消之后不得继续登记图片");
+        let card = opds_card(
+            source_id,
+            opds_entry_with_poster(
+                "https://catalog.example.invalid/books/2.opds",
+                Some("https://catalog.example.invalid/2.png"),
+            ),
+            None,
+        );
+        assert_eq!(card.poster_uri, None);
+        assert_eq!(card.title, "有封面的书");
+    }
+
+    #[tokio::test]
+    async fn artwork_projection_is_optional_and_never_echoes_the_upstream_url() {
+        // 没有注入端口 / 没有图片字段：不登记、不报错、卡片保持原样。
+        let not_cancelled = || false;
+        assert_eq!(
+            projected_poster(
+                None,
+                "cms10",
+                Some("https://img.example.invalid/p.jpg"),
+                &not_cancelled
+            )
+            .await,
+            None
+        );
+        let proxy = RecordingImageProxy::new(ArtworkOutcome::Registered);
+        assert_eq!(
+            projected_poster(Some(proxy.as_ref()), "cms10", None, &not_cancelled).await,
+            None
+        );
+        assert_eq!(
+            projected_poster(Some(proxy.as_ref()), "cms10", Some("   "), &not_cancelled).await,
+            None
+        );
+        assert!(proxy.calls().is_empty(), "缺失的海报地址不得进入登记路径");
+
+        // 被策略拒绝 / 登记失败：返回 None，错误事实里没有目标地址。
+        for outcome in [ArtworkOutcome::Rejected, ArtworkOutcome::Failed] {
+            let proxy = RecordingImageProxy::new(outcome);
+            let secret = "https://img.example.invalid/p.jpg?token=fixture-secret";
+            assert_eq!(
+                projected_poster(Some(proxy.as_ref()), "cms10", Some(secret), &not_cancelled).await,
+                None,
+                "登记失败时海报必须是 None"
+            );
+            assert_eq!(
+                proxy.calls(),
+                vec![("cms10".to_owned(), secret.to_owned())],
+                "上游地址只进入登记端口，不进 Wire"
+            );
+        }
+
+        // opaque id 的形状判定：畸形 id 不进入 Wire。
+        assert_eq!(
+            controlled_artwork_uri("0f7a4a1e-0f2f-4a4f-9c4f-3c1b0f0a4b6c").as_deref(),
+            Some("haven://artwork/0f7a4a1e-0f2f-4a4f-9c4f-3c1b0f0a4b6c")
+        );
+        for rejected in [
+            "",
+            "../etc",
+            "a b",
+            "https://evil.example/x.jpg",
+            &"a".repeat(65),
+        ] {
+            assert_eq!(
+                controlled_artwork_uri(rejected),
+                None,
+                "非法 id: {rejected}"
+            );
+        }
+    }
+
+    /// 家族之外 / 未登记的自定义身份：参与者安静跳过，既不登记也不发请求。
+    #[tokio::test]
+    async fn artwork_is_only_registered_for_the_dispatched_source_identity() {
+        let (registry, source_id) =
+            seeded_opds_registry("https://catalog.example.invalid/opds", false).await;
+        let proxy = RecordingImageProxy::new(ArtworkOutcome::Registered);
+        let client = Arc::new(
+            OpdsClient::new()
+                .unwrap()
+                .with_source_registry(registry.clone()),
+        );
+        let participant =
+            OpdsSearchParticipant::new(CUSTOM_OPDS_ID_PREFIX.to_owned(), registry.clone(), client)
+                .with_image_proxy(proxy.clone());
+
+        let not_cancelled = || false;
+        for foreign in [
+            "custom_feed_0123456789ab",
+            "custom_komga_0123456789ab",
+            "custom_kavita_0123456789ab",
+            "custom_tvbox_0123456789ab",
+            "custom_unknown000000",
+            "mangadex",
+        ] {
+            assert!(
+                participant
+                    .search_for(foreign, "任意", 10, &not_cancelled)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{foreign} 不得被 OPDS 参与者接管"
+            );
+        }
+        assert!(
+            proxy.calls().is_empty(),
+            "错误家族/未登记身份不得登记任何图片"
+        );
+        assert!(
+            registry
+                .endpoint("custom_unknown000000")
+                .await
+                .unwrap()
+                .is_none(),
+            "未登记身份没有端点可用"
+        );
+        assert!(registry.endpoint(&source_id).await.unwrap().is_some());
     }
 
     /// 回归（RSS/Atom Task 1）：`custom_feed_` 属于 `custom_` 家族，但订阅源绝不是

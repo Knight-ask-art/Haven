@@ -3,6 +3,10 @@
 //! 这些 Provider 只访问源码中固定的公开 API（或用户在来源设置中明确配置的
 //! M3U 地址），返回 `WorkCardDto` 搜索投影。它们不把远端海报 URL 写进 Wire，
 //! 也不接受前端传入任意 URL、Header、Cookie 或凭据。
+//!
+//! 响应里带回的海报地址由 `artwork` 子模块在 Provider 边界校验，并交给注入的
+//! `ImageProxyRepository` 登记成 `haven://artwork/<opaque>`；没有注入 Repository、
+//! Provider 没给图片或地址被策略拒绝时，卡片保持无海报，搜索本身不受影响。
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -15,13 +19,16 @@ use haven_application::services::source_registry::SourceRegistryService;
 use haven_application::wire::{
     ContentCategory, ExternalIdDto, ExternalIdProviderDto, MediaTypeDto, QueryCategory, WorkCardDto,
 };
-use haven_common::network::{HttpUrlPolicy, parse_http_url};
+use haven_common::network::{HttpUrlPolicy, parse_http_url, url_origin};
 use haven_common::{AppError, ErrorKind};
-use quick_xml::events::Event;
+use haven_domain::contracts::ImageProxyRepository;
+use quick_xml::events::{BytesStart, Event};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::http_security::{pin_client_builder, resolve_public_http_target};
+use crate::http_security::{HttpTargetError, pin_client_builder, resolve_public_http_target};
+
+mod artwork;
 
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
@@ -41,6 +48,21 @@ const EUROPE_PMC_URL: &str = "https://www.ebi.ac.uk/europepmc/webservices/rest/s
 const WIKISOURCE_URL: &str = "https://zh.wikisource.org/w/api.php";
 const CROSSREF_URL: &str = "https://api.crossref.org/works";
 const OPENALEX_URL: &str = "https://api.openalex.org/works";
+
+/// AniList GraphQL 搜索查询。`coverImage` 必须保留：海报地址由同一次响应带回，
+/// 搜索阶段只做登记，不再为卡片额外请求图片。
+const ANILIST_SEARCH_QUERY: &str = r#"
+  query($search: String!, $type: MediaType!, $perPage: Int!) {
+    Page(perPage: $perPage) {
+      media(search: $search, type: $type) {
+        id type seasonYear
+        title { romaji english native }
+        description(asHtml: false)
+        coverImage { extraLarge large medium }
+      }
+    }
+  }
+"#;
 
 /// 固定公开 metadata Provider 的 sourceId 快照。保留该公开常量供诊断/测试使用；
 /// 运行时覆盖校验使用下面的 `METADATA_SOURCE_KINDS`，并由同一数组驱动参与者工厂，
@@ -160,8 +182,8 @@ impl MetadataSourceKind {
 
     /// The fixed authority for this built-in metadata provider. The source
     /// constants are the provider trust boundary, so a redirect must remain
-    /// on this exact HTTPS host. User-configured M3U uses the separate generic
-    /// public-URL path.
+    /// on this exact HTTPS host. User-configured M3U uses the explicit
+    /// `UserProvidedSource` policy and stays on its registered origin.
     fn fixed_host(self) -> &'static str {
         match self {
             Self::Tvmaze => "api.tvmaze.com",
@@ -240,12 +262,37 @@ fn provider_supports_category(source_id: &str, category: &str) -> bool {
 }
 
 /// 固定 API 的共享客户端。每个来源仍使用自己的固定 URL；共享仅限传输层配置。
-#[derive(Clone, Copy, Debug, Default)]
-pub struct MetadataClient;
+///
+/// 可选的 `ImageProxyRepository` 只用于登记 Provider 返回的海报地址，使它变成
+/// opaque artwork id。它不抓取图片：响应已经带回地址时不再为每张卡片发网络
+/// 请求，抓取留给渲染时的受控 Artwork 缓存。
+#[derive(Clone, Default)]
+pub struct MetadataClient {
+    image_proxy: Option<Arc<dyn ImageProxyRepository>>,
+}
+
+impl std::fmt::Debug for MetadataClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 不打印 Repository 内部实现，避免把受控映射的细节带进日志。
+        formatter
+            .debug_struct("MetadataClient")
+            .field("artwork_registration", &self.image_proxy.is_some())
+            .finish()
+    }
+}
 
 impl MetadataClient {
+    /// 不登记 Artwork 的客户端（M3U 播放列表等只需要固定传输层）。
     pub fn new() -> Result<Self, AppError> {
-        Ok(Self)
+        Ok(Self::default())
+    }
+
+    /// 组合根注入受控图片代理仓库：带图的搜索结果会登记成
+    /// `haven://artwork/<opaque>`。未注入时搜索仍然可用，只是没有海报。
+    pub fn with_image_proxy(proxy: Arc<dyn ImageProxyRepository>) -> Result<Self, AppError> {
+        Ok(Self {
+            image_proxy: Some(proxy),
+        })
     }
 
     async fn get_json(&self, url: &str, source: MetadataSourceKind) -> Result<Value, AppError> {
@@ -300,11 +347,21 @@ impl MetadataClient {
         accept: &str,
         fixed_source: Option<MetadataSourceKind>,
     ) -> Result<Vec<u8>, AppError> {
+        let policy = if fixed_source.is_some() {
+            HttpUrlPolicy::SourceEndpoint
+        } else {
+            // The only non-fixed caller is M3U, whose playlist endpoint is
+            // explicitly supplied by the user and may live on the local LAN.
+            HttpUrlPolicy::UserProvidedSource
+        };
         let mut current = match fixed_source {
             Some(source) => validate_fixed_metadata_url(url, source)?,
-            None => parse_http_url(url, HttpUrlPolicy::SourceEndpoint)
-                .map_err(|_| source_unavailable("来源地址不安全"))?
-                .into_url(),
+            None => validate_user_m3u_url(url)?,
+        };
+        let user_source_origin = if fixed_source.is_none() {
+            Some(url_origin(&current).ok_or_else(|| source_unavailable("M3U 地址无效"))?)
+        } else {
+            None
         };
         for _ in 0..=MAX_REDIRECTS {
             if let Some(source) = fixed_source {
@@ -313,15 +370,20 @@ impl MetadataClient {
                 // otherwise valid public HTTP(S) URL.
                 validate_fixed_metadata_url(current.as_str(), source)?;
             }
-            let target =
-                resolve_public_http_target(current.as_str(), HttpUrlPolicy::SourceEndpoint)
-                    .await
-                    .map_err(|_| source_unavailable("来源地址解析不安全"))?;
+            let target = resolve_public_http_target(current.as_str(), policy)
+                .await
+                .map_err(|error| {
+                    source_unavailable(match error {
+                        HttpTargetError::Invalid => "来源地址格式无效",
+                        HttpTargetError::ResolveFailed => "来源域名暂时无法解析",
+                        HttpTargetError::UnsafeAddress => "来源域名解析到了不允许的地址",
+                    })
+                })?;
             let builder = reqwest::Client::builder()
                 .connect_timeout(CONNECT_TIMEOUT)
                 .timeout(REQUEST_TIMEOUT)
-                // Keep the fixed-source client predictable on Windows while
-                // preserving HTTPS certificate validation.
+                // Keep the source client predictable on Windows while
+                // preserving HTTPS certificate validation where used.
                 .http1_only()
                 .redirect(reqwest::redirect::Policy::none())
                 .user_agent(SOURCE_USER_AGENT);
@@ -356,6 +418,11 @@ impl MetadataClient {
                     .map_err(|_| source_unavailable("来源重定向地址无效"))?;
                 if let Some(source) = fixed_source {
                     validate_fixed_metadata_url(current.as_str(), source)?;
+                } else {
+                    validate_user_m3u_url(current.as_str())?;
+                    if url_origin(&current).as_deref() != user_source_origin.as_deref() {
+                        return Err(source_unavailable("M3U 重定向来源与登记地址不一致"));
+                    }
                 }
                 continue;
             }
@@ -390,8 +457,9 @@ impl MetadataClient {
         source: MetadataSourceKind,
         query: &str,
         limit: u32,
+        is_cancelled: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<Vec<WorkCardDto>, AppError> {
-        match source {
+        let drafts = match source {
             MetadataSourceKind::Tvmaze => self.search_tvmaze(query, limit).await,
             MetadataSourceKind::Bangumi => self.search_bangumi(query, limit).await,
             MetadataSourceKind::Anilist => self.search_anilist(query, limit).await,
@@ -404,16 +472,22 @@ impl MetadataClient {
             MetadataSourceKind::Wikisource => self.search_wikisource(query, limit).await,
             MetadataSourceKind::Crossref => self.search_crossref(query, limit).await,
             MetadataSourceKind::Openalex => self.search_openalex(query, limit).await,
-        }
+        }?;
+        // Artwork 只登记同一次响应中的字段；取消后不再创建无消费者的映射。
+        Ok(artwork::register_cards(self.image_proxy.as_deref(), drafts, is_cancelled).await)
     }
 
-    async fn search_tvmaze(&self, query: &str, limit: u32) -> Result<Vec<WorkCardDto>, AppError> {
+    async fn search_tvmaze(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<artwork::CardDraft>, AppError> {
         let url = format!("{TVMAZE_URL}?q={}", urlencode(query));
         let value = self.get_json(&url, MetadataSourceKind::Tvmaze).await?;
         let items = value
             .as_array()
             .ok_or_else(|| source_unavailable("TVMaze 返回结构异常"))?;
-        let mut cards = Vec::new();
+        let mut drafts = Vec::new();
         for item in items.iter().take(limit as usize) {
             let show = item.get("show").unwrap_or(item);
             let Some(title) = string_field(show, "name") else {
@@ -424,20 +498,27 @@ impl MetadataClient {
                 .and_then(Value::as_i64)
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| stable_key(&title));
-            cards.push(card(
-                "tvmaze",
-                &id,
-                title,
-                string_field(show, "summary").map(|v| clean_text(&v)),
-                year_from_value(show.get("premiered")),
-                (ContentCategory::Video, MediaTypeDto::Series),
-                Some(ExternalIdProviderDto::Tvmaze),
-            ));
+            drafts.push(
+                artwork::CardDraft::new(card(
+                    "tvmaze",
+                    &id,
+                    title,
+                    string_field(show, "summary").map(|v| clean_text(&v)),
+                    year_from_value(show.get("premiered")),
+                    (ContentCategory::Video, MediaTypeDto::Series),
+                    Some(ExternalIdProviderDto::Tvmaze),
+                ))
+                .with_poster(artwork::tvmaze_poster(show)),
+            );
         }
-        Ok(cards)
+        Ok(drafts)
     }
 
-    async fn search_bangumi(&self, query: &str, limit: u32) -> Result<Vec<WorkCardDto>, AppError> {
+    async fn search_bangumi(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<artwork::CardDraft>, AppError> {
         let payload = serde_json::json!({
             "keyword": query,
             "sort": "match",
@@ -450,7 +531,7 @@ impl MetadataClient {
             .get("data")
             .and_then(Value::as_array)
             .ok_or_else(|| source_unavailable("Bangumi 返回结构异常"))?;
-        let mut cards = Vec::new();
+        let mut drafts = Vec::new();
         for item in items.iter().take(limit as usize) {
             let Some(id) = item.get("id").and_then(Value::as_i64) else {
                 continue;
@@ -465,36 +546,32 @@ impl MetadataClient {
             } else {
                 (ContentCategory::Video, MediaTypeDto::Series)
             };
-            cards.push(card(
-                "bangumi",
-                &id.to_string(),
-                title,
-                string_field(item, "summary").map(|v| clean_text(&v)),
-                year_from_value(item.get("date")),
-                (category, media_type),
-                Some(ExternalIdProviderDto::Bangumi),
-            ));
+            drafts.push(
+                artwork::CardDraft::new(card(
+                    "bangumi",
+                    &id.to_string(),
+                    title,
+                    string_field(item, "summary").map(|v| clean_text(&v)),
+                    year_from_value(item.get("date")),
+                    (category, media_type),
+                    Some(ExternalIdProviderDto::Bangumi),
+                ))
+                .with_poster(artwork::bangumi_poster(item)),
+            );
         }
-        Ok(cards)
+        Ok(drafts)
     }
 
-    async fn search_anilist(&self, query: &str, limit: u32) -> Result<Vec<WorkCardDto>, AppError> {
-        const QUERY: &str = r#"
-          query($search: String!, $type: MediaType!, $perPage: Int!) {
-            Page(perPage: $perPage) {
-              media(search: $search, type: $type) {
-                id type seasonYear
-                title { romaji english native }
-                description(asHtml: false)
-              }
-            }
-          }
-        "#;
-        let mut cards = Vec::new();
+    async fn search_anilist(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<artwork::CardDraft>, AppError> {
+        let mut drafts = Vec::new();
         let mut succeeded = false;
         for media_type in ["ANIME", "MANGA"] {
             let payload = serde_json::json!({
-                "query": QUERY,
+                "query": ANILIST_SEARCH_QUERY,
                 "variables": { "search": query, "type": media_type, "perPage": limit }
             });
             let value = match self
@@ -538,35 +615,42 @@ impl MetadataClient {
                     continue;
                 }
                 let is_manga = media_type == "MANGA";
-                cards.push(card(
-                    "anilist",
-                    &id.to_string(),
-                    title.to_owned(),
-                    string_field(item, "description").map(|v| clean_text(&v)),
-                    year_from_value(item.get("seasonYear")),
-                    (
-                        if is_manga {
-                            ContentCategory::Comic
-                        } else {
-                            ContentCategory::Video
-                        },
-                        if is_manga {
-                            MediaTypeDto::Comic
-                        } else {
-                            MediaTypeDto::Series
-                        },
-                    ),
-                    Some(ExternalIdProviderDto::Anilist),
-                ));
+                drafts.push(
+                    artwork::CardDraft::new(card(
+                        "anilist",
+                        &id.to_string(),
+                        title.to_owned(),
+                        string_field(item, "description").map(|v| clean_text(&v)),
+                        year_from_value(item.get("seasonYear")),
+                        (
+                            if is_manga {
+                                ContentCategory::Comic
+                            } else {
+                                ContentCategory::Video
+                            },
+                            if is_manga {
+                                MediaTypeDto::Comic
+                            } else {
+                                MediaTypeDto::Series
+                            },
+                        ),
+                        Some(ExternalIdProviderDto::Anilist),
+                    ))
+                    .with_poster(artwork::anilist_poster(item)),
+                );
             }
         }
         if !succeeded {
             return Err(source_unavailable("AniList 暂时不可用"));
         }
-        Ok(cards)
+        Ok(drafts)
     }
 
-    async fn search_itunes(&self, query: &str, limit: u32) -> Result<Vec<WorkCardDto>, AppError> {
+    async fn search_itunes(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<artwork::CardDraft>, AppError> {
         // Apple 已将 movie entity 从 Search API 的可检索集合中移除；tvSeason
         // 仍返回真实剧集条目。固定限定 entity，避免把音乐/播客误投影成影视作品。
         let url = format!(
@@ -590,17 +674,20 @@ impl MetadataClient {
                     .and_then(Value::as_i64)
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| stable_key(&title));
-                Some(card(
-                    "itunes",
-                    &id,
-                    title,
-                    string_field(item, "longDescription")
-                        .or_else(|| string_field(item, "shortDescription"))
-                        .map(|v| clean_text(&v)),
-                    year_from_value(item.get("releaseDate")),
-                    (ContentCategory::Video, MediaTypeDto::Series),
-                    None,
-                ))
+                Some(
+                    artwork::CardDraft::new(card(
+                        "itunes",
+                        &id,
+                        title,
+                        string_field(item, "longDescription")
+                            .or_else(|| string_field(item, "shortDescription"))
+                            .map(|v| clean_text(&v)),
+                        year_from_value(item.get("releaseDate")),
+                        (ContentCategory::Video, MediaTypeDto::Series),
+                        None,
+                    ))
+                    .with_poster(artwork::itunes_poster(item)),
+                )
             })
             .collect())
     }
@@ -609,26 +696,30 @@ impl MetadataClient {
         &self,
         query: &str,
         limit: u32,
-    ) -> Result<Vec<WorkCardDto>, AppError> {
+    ) -> Result<Vec<artwork::CardDraft>, AppError> {
         let url = format!("{GUTENBERG_OPDS_URL}/?query={}", urlencode(query));
         let xml = self.get_text(&url, MetadataSourceKind::Gutenberg).await?;
-        Ok(parse_atom_titles(&xml)
+        Ok(parse_atom_entries(&xml)
             .iter()
-            .filter_map(|(id, title)| {
-                let id = id
+            .filter_map(|entry| {
+                let id = entry
+                    .id
                     .split("/ebooks/")
                     .nth(1)
                     .and_then(|value| value.split(|ch: char| !ch.is_ascii_digit()).next())
                     .filter(|value| !value.is_empty())?;
-                Some(card(
-                    "gutenberg",
-                    id,
-                    title.clone(),
-                    None,
-                    None,
-                    (ContentCategory::Book, MediaTypeDto::Book),
-                    Some(ExternalIdProviderDto::Gutenberg),
-                ))
+                Some(
+                    artwork::CardDraft::new(card(
+                        "gutenberg",
+                        id,
+                        entry.title.clone(),
+                        None,
+                        None,
+                        (ContentCategory::Book, MediaTypeDto::Book),
+                        Some(ExternalIdProviderDto::Gutenberg),
+                    ))
+                    .with_poster(entry.image.as_deref().and_then(artwork::gutenberg_poster)),
+                )
             })
             .take(limit as usize)
             .collect())
@@ -638,9 +729,13 @@ impl MetadataClient {
         &self,
         query: &str,
         limit: u32,
-    ) -> Result<Vec<WorkCardDto>, AppError> {
+    ) -> Result<Vec<artwork::CardDraft>, AppError> {
         // Advanced Search 是 Internet Archive 的公开 JSON API。限定 mediatype:texts，
         // 避免把视频、音频和软件条目投影成图书；该端点不需要 API Key。
+        //
+        // 该响应不携带任何图片字段，因此这里保持空海报：IA 的派生封面端点会
+        // 跳到另一个主机，受控出站策略按已登记主机作用域会拒绝该跳转，登记它
+        // 只会得到一张永远加载不出来的海报。
         let archive_query = format!("title:({}) AND mediatype:texts", query.trim());
         let url = format!(
             "{INTERNET_ARCHIVE_URL}?q={}&fl%5B%5D=identifier&fl%5B%5D=title&fl%5B%5D=description&fl%5B%5D=year&rows={limit}&page=1&output=json",
@@ -660,7 +755,7 @@ impl MetadataClient {
             .filter_map(|item| {
                 let title = stringish_field(item, "title")?;
                 let external_id = stringish_field(item, "identifier")?;
-                Some(card(
+                Some(artwork::CardDraft::new(card(
                     "archive",
                     &external_id,
                     title,
@@ -668,12 +763,16 @@ impl MetadataClient {
                     year_from_value(item.get("year")),
                     (ContentCategory::Book, MediaTypeDto::Book),
                     None,
-                ))
+                )))
             })
             .collect())
     }
 
-    async fn search_mangadex(&self, query: &str, limit: u32) -> Result<Vec<WorkCardDto>, AppError> {
+    async fn search_mangadex(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<artwork::CardDraft>, AppError> {
         let url = format!(
             "{MANGADEX_URL}?title={}&limit={limit}&includes[]=cover_art",
             urlencode(query)
@@ -686,27 +785,15 @@ impl MetadataClient {
         Ok(items
             .iter()
             .take(limit as usize)
-            .filter_map(|item| {
-                let id = string_field(item, "id")?;
-                let attrs = item.get("attributes")?;
-                let title = localized_title(attrs.get("title")?)?;
-                Some(card(
-                    "mangadex",
-                    &id,
-                    title,
-                    attrs
-                        .get("description")
-                        .and_then(localized_title)
-                        .map(|v| clean_text(&v)),
-                    year_from_value(attrs.get("year")),
-                    (ContentCategory::Comic, MediaTypeDto::Comic),
-                    None,
-                ))
-            })
+            .filter_map(mangadex_draft)
             .collect())
     }
 
-    async fn search_arxiv(&self, query: &str, limit: u32) -> Result<Vec<WorkCardDto>, AppError> {
+    async fn search_arxiv(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<artwork::CardDraft>, AppError> {
         let url = format!(
             "{ARXIV_URL}?search_query=all:{}&start=0&max_results={limit}",
             urlencode(query)
@@ -718,7 +805,7 @@ impl MetadataClient {
             .take(limit as usize)
             .map(|entry| {
                 let external_id = normalize_arxiv_id(&entry.id).unwrap_or(entry.id);
-                card(
+                artwork::CardDraft::new(card(
                     "arxiv",
                     &external_id,
                     entry.title,
@@ -726,7 +813,7 @@ impl MetadataClient {
                     entry.year,
                     (ContentCategory::Periodical, MediaTypeDto::Article),
                     None,
-                )
+                ))
             })
             .collect())
     }
@@ -735,9 +822,9 @@ impl MetadataClient {
         &self,
         query: &str,
         limit: u32,
-    ) -> Result<Vec<WorkCardDto>, AppError> {
+    ) -> Result<Vec<artwork::CardDraft>, AppError> {
         // 只选择开放获取文章，并要求返回 PMCID；没有 PMCID 的记录无法在本地
-        // 获取全文，因此不把它们投影为可导入候选。
+        // 获取全文，因此不把它们投影为可导入候选。该来源没有海报字段。
         let url = format!(
             "{EUROPE_PMC_URL}?query={}%20AND%20OPEN_ACCESS:Y&format=json&resultType=core&pageSize={limit}",
             urlencode(query)
@@ -763,7 +850,7 @@ impl MetadataClient {
                             .and_then(Value::as_i64)
                             .and_then(|value| i32::try_from(value).ok())
                     });
-                Some(card(
+                Some(artwork::CardDraft::new(card(
                     "europepmc",
                     &pmcid,
                     title,
@@ -771,7 +858,7 @@ impl MetadataClient {
                     year,
                     (ContentCategory::Periodical, MediaTypeDto::Article),
                     None,
-                ))
+                )))
             })
             .collect())
     }
@@ -780,7 +867,7 @@ impl MetadataClient {
         &self,
         query: &str,
         limit: u32,
-    ) -> Result<Vec<WorkCardDto>, AppError> {
+    ) -> Result<Vec<artwork::CardDraft>, AppError> {
         let url = format!(
             "{WIKISOURCE_URL}?action=query&list=search&srsearch={}&srlimit={limit}&format=json&formatversion=2",
             urlencode(query)
@@ -798,7 +885,7 @@ impl MetadataClient {
                 let title = string_field(item, "title")?;
                 // 标题会在 content-candidate 中进行 UTF-8 百分号编码；这里仍
                 // 只把页面标题放到候选外部 ID，不把页面 URL暴露给前端。
-                Some(card(
+                Some(artwork::CardDraft::new(card(
                     "wikisource",
                     &title,
                     title.clone(),
@@ -806,12 +893,16 @@ impl MetadataClient {
                     None,
                     (ContentCategory::Periodical, MediaTypeDto::Article),
                     None,
-                ))
+                )))
             })
             .collect())
     }
 
-    async fn search_crossref(&self, query: &str, limit: u32) -> Result<Vec<WorkCardDto>, AppError> {
+    async fn search_crossref(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<artwork::CardDraft>, AppError> {
         let url = format!("{CROSSREF_URL}?query={}&rows={limit}", urlencode(query));
         let value = self.get_json(&url, MetadataSourceKind::Crossref).await?;
         let items = value
@@ -834,7 +925,7 @@ impl MetadataClient {
                 let id = string_field(item, "DOI")
                     .or_else(|| string_field(item, "URL"))
                     .unwrap_or_else(|| stable_key(&title));
-                Some(card(
+                Some(artwork::CardDraft::new(card(
                     "crossref",
                     &id,
                     title,
@@ -842,12 +933,16 @@ impl MetadataClient {
                     year_from_crossref(item),
                     (ContentCategory::Periodical, MediaTypeDto::Article),
                     None,
-                ))
+                )))
             })
             .collect())
     }
 
-    async fn search_openalex(&self, query: &str, limit: u32) -> Result<Vec<WorkCardDto>, AppError> {
+    async fn search_openalex(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<artwork::CardDraft>, AppError> {
         let url = format!(
             "{OPENALEX_URL}?search={}&per-page={limit}",
             urlencode(query)
@@ -863,7 +958,7 @@ impl MetadataClient {
             .filter_map(|item| {
                 let title = string_field(item, "title")?;
                 let id = string_field(item, "id").unwrap_or_else(|| stable_key(&title));
-                Some(card(
+                Some(artwork::CardDraft::new(card(
                     "openalex",
                     &id,
                     title,
@@ -873,7 +968,7 @@ impl MetadataClient {
                         .and_then(|v| i32::try_from(v).ok()),
                     (ContentCategory::Periodical, MediaTypeDto::Article),
                     None,
-                ))
+                )))
             })
             .collect())
     }
@@ -888,6 +983,17 @@ impl MetadataClient {
         )
         .await
     }
+}
+
+/// M3U endpoints are user supplied, so local/private hosts and service ports
+/// are valid. Query parameters may contain a token and therefore require HTTPS.
+fn validate_user_m3u_url(raw: &str) -> Result<reqwest::Url, AppError> {
+    let parsed = parse_http_url(raw, HttpUrlPolicy::UserProvidedSource)
+        .map_err(|_| source_unavailable("M3U 地址不安全"))?;
+    if parsed.as_url().query().is_some() && parsed.as_url().scheme() != "https" {
+        return Err(source_unavailable("带查询参数的 M3U 地址必须使用 HTTPS"));
+    }
+    Ok(parsed.into_url())
 }
 
 /// Validate a built-in Provider URL before resolving or sending it. The
@@ -972,11 +1078,9 @@ impl SearchSourceParticipant for MetadataSearchParticipant {
         if is_cancelled() {
             return Ok(Vec::new());
         }
-        let mut cards = self.client.search(self.source, query, limit).await?;
-        if is_cancelled() {
-            cards.clear();
-        }
-        Ok(cards)
+        self.client
+            .search(self.source, query, limit, is_cancelled)
+            .await
     }
 }
 
@@ -1175,12 +1279,32 @@ fn parse_arxiv_entries(xml: &str) -> Vec<ArxivEntry> {
     entries
 }
 
-fn parse_atom_titles(xml: &str) -> Vec<(String, String)> {
+/// OPDS/Atom 条目。`image` 是 Provider 响应里真实带回的封面 `link`（相对或
+/// 绝对地址），是否可用由 Provider 图片主机白名单裁决。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AtomEntry {
+    id: String,
+    title: String,
+    image: Option<String>,
+    image_rank: u8,
+}
+
+impl AtomEntry {
+    fn new() -> Self {
+        Self {
+            id: String::new(),
+            title: String::new(),
+            image: None,
+            image_rank: 0,
+        }
+    }
+}
+
+fn parse_atom_entries(xml: &str) -> Vec<AtomEntry> {
     let mut reader = quick_xml::Reader::from_str(xml);
     let mut entries = Vec::new();
     let mut depth = 0usize;
-    let mut id = String::new();
-    let mut title = String::new();
+    let mut current: Option<AtomEntry> = None;
     let mut field: Option<&'static str> = None;
     loop {
         match reader.read_event() {
@@ -1189,10 +1313,12 @@ fn parse_atom_titles(xml: &str) -> Vec<(String, String)> {
                 if name == "entry" {
                     depth += 1;
                     if depth == 1 {
-                        id.clear();
-                        title.clear();
+                        current = Some(AtomEntry::new());
                     }
                 } else if depth == 1 {
+                    if name == "link" {
+                        record_atom_image(current.as_mut(), &event);
+                    }
                     field = match name.as_str() {
                         "id" => Some("id"),
                         "title" => Some("title"),
@@ -1200,28 +1326,44 @@ fn parse_atom_titles(xml: &str) -> Vec<(String, String)> {
                     };
                 }
             }
+            // OPDS 的封面 link 通常是自闭合元素。
+            Ok(Event::Empty(event)) if depth == 1 => {
+                if local_name(event.name().as_ref()) == "link" {
+                    record_atom_image(current.as_mut(), &event);
+                }
+            }
             Ok(Event::Text(text)) if depth == 1 => {
                 let value = crate::unescape_xml_text(&text).unwrap_or_default();
-                match field {
-                    Some("id") => id.push_str(&value),
-                    Some("title") => title.push_str(&value),
-                    _ => {}
+                if let Some(entry) = current.as_mut() {
+                    match field {
+                        Some("id") => entry.id.push_str(&value),
+                        Some("title") => entry.title.push_str(&value),
+                        _ => {}
+                    }
                 }
             }
             Ok(Event::GeneralRef(reference)) if depth == 1 => {
                 let value = crate::unescape_xml_reference(&reference).unwrap_or_default();
-                match field {
-                    Some("id") => id.push_str(&value),
-                    Some("title") => title.push_str(&value),
-                    _ => {}
+                if let Some(entry) = current.as_mut() {
+                    match field {
+                        Some("id") => entry.id.push_str(&value),
+                        Some("title") => entry.title.push_str(&value),
+                        _ => {}
+                    }
                 }
             }
             Ok(Event::End(event)) => {
                 let name = local_name(event.name().as_ref());
                 if name == "entry" && depth > 0 {
                     depth -= 1;
-                    if depth == 0 && !id.trim().is_empty() && !title.trim().is_empty() {
-                        entries.push((id.clone(), clean_text(&title)));
+                    if depth == 0 {
+                        if let Some(mut entry) = current.take() {
+                            entry.id = entry.id.trim().to_owned();
+                            entry.title = clean_text(&entry.title);
+                            if !entry.id.is_empty() && !entry.title.is_empty() {
+                                entries.push(entry);
+                            }
+                        }
                     }
                 }
                 field = None;
@@ -1233,12 +1375,69 @@ fn parse_atom_titles(xml: &str) -> Vec<(String, String)> {
     entries
 }
 
+/// 记录 OPDS 封面 `link`：原图优先于缩略图，其余关系（如 `alternate`）忽略。
+/// href 是否真的可用由 `artwork::gutenberg_poster` 的主机白名单裁决。
+fn record_atom_image(entry: Option<&mut AtomEntry>, event: &BytesStart<'_>) {
+    let Some(entry) = entry else { return };
+    let Some(href) = atom_link_attribute(event, "href") else {
+        return;
+    };
+    let rel = atom_link_attribute(event, "rel").unwrap_or_default();
+    let rank = match rel.as_str() {
+        "http://opds-spec.org/image" | "http://opds-spec.org/cover" => 2,
+        "http://opds-spec.org/image/thumbnail" | "http://opds-spec.org/thumbnail" => 1,
+        _ => return,
+    };
+    if rank > entry.image_rank {
+        entry.image_rank = rank;
+        entry.image = Some(href);
+    }
+}
+
+fn atom_link_attribute(event: &BytesStart<'_>, key: &str) -> Option<String> {
+    event
+        .attributes()
+        .flatten()
+        .find(|attribute| attribute.key.as_ref() == key.as_bytes())
+        .and_then(|attribute| {
+            attribute
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .ok()
+                .map(|value| value.into_owned())
+        })
+}
+
 fn local_name(raw: &[u8]) -> String {
     String::from_utf8_lossy(raw)
         .rsplit(':')
         .next()
         .unwrap_or("")
         .to_owned()
+}
+
+/// MangaDex 条目 → 卡片草稿。
+///
+/// `includes[]=cover_art` 带回的 relationship 里含封面 `fileName`；卡片映射、
+/// ID 形状与文件名边界在这里收口，便于用固定 fixture 验证整条路径。
+fn mangadex_draft(item: &Value) -> Option<artwork::CardDraft> {
+    let id = string_field(item, "id")?;
+    let attrs = item.get("attributes")?;
+    let title = localized_title(attrs.get("title")?)?;
+    Some(
+        artwork::CardDraft::new(card(
+            "mangadex",
+            &id,
+            title,
+            attrs
+                .get("description")
+                .and_then(localized_title)
+                .map(|v| clean_text(&v)),
+            year_from_value(attrs.get("year")),
+            (ContentCategory::Comic, MediaTypeDto::Comic),
+            None,
+        ))
+        .with_poster(artwork::mangadex_poster(&id, item)),
+    )
 }
 
 fn localized_title(value: &Value) -> Option<String> {
@@ -1435,6 +1634,7 @@ fn internal_error(message: &'static str) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn all_fixed_sources_have_real_participants() {
@@ -1504,6 +1704,32 @@ mod tests {
     }
 
     #[test]
+    fn user_m3u_playlist_accepts_local_http_but_requires_https_for_query_tokens() {
+        for raw in [
+            "http://127.0.0.1:9978/list.m3u",
+            "http://playlist:8096/list.m3u",
+            "https://192.168.1.10:5001/list.m3u",
+            "https://public.example.invalid:12345/list.m3u?token=opaque",
+        ] {
+            assert!(
+                validate_user_m3u_url(raw).is_ok(),
+                "explicitly configured M3U playlist should be accepted: {raw}"
+            );
+        }
+        for raw in [
+            "http://public.example.invalid:12345/list.m3u?token=opaque",
+            "http://169.254.169.254:9978/latest/meta-data",
+            "http://198.18.0.1:9978/list.m3u",
+            "ftp://public.example.invalid/list.m3u",
+        ] {
+            assert!(
+                validate_user_m3u_url(raw).is_err(),
+                "unsafe M3U endpoint should be rejected: {raw}"
+            );
+        }
+    }
+
+    #[test]
     fn m3u_candidate_id_keeps_encoded_title_and_stream_payload() {
         let external_id = "新闻\u{1}https://cdn.example/live.m3u8?token=opaque";
         let candidate = candidate_id(M3U_SOURCE_ID, external_id);
@@ -1528,14 +1754,20 @@ mod tests {
     }
 
     #[test]
-    fn parses_gutenberg_atom_entries_and_numeric_ids() {
-        let xml = r#"<feed xmlns="http://www.w3.org/2005/Atom"><entry><id>https://www.gutenberg.org/ebooks/84</id><title> Frankenstein </title></entry><entry><id>https://www.gutenberg.org/ebooks/authors/1</id><title>Author</title></entry></feed>"#;
-        let entries = parse_atom_titles(xml);
+    fn parses_gutenberg_opds_entries_with_cover_links() {
+        let xml = r#"<feed xmlns="http://www.w3.org/2005/Atom"><entry><id>https://www.gutenberg.org/ebooks/84</id><title> Frankenstein </title><link rel="http://opds-spec.org/image/thumbnail" type="image/jpeg" href="https://www.gutenberg.org/cache/epub/84/pg84.cover.small.jpg"/><link rel="http://opds-spec.org/image" type="image/jpeg" href="https://www.gutenberg.org/cache/epub/84/pg84.cover.medium.jpg"/><link rel="alternate" type="text/html" href="https://www.gutenberg.org/ebooks/84"/></entry><entry><id>https://www.gutenberg.org/ebooks/authors/1</id><title>Author</title></entry></feed>"#;
+        let entries = parse_atom_entries(xml);
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].1, "Frankenstein");
+        assert_eq!(entries[0].title, "Frankenstein");
+        assert_eq!(
+            entries[0].image.as_deref(),
+            Some("https://www.gutenberg.org/cache/epub/84/pg84.cover.medium.jpg"),
+            "封面原图必须优先于缩略图"
+        );
+        assert_eq!(entries[1].image, None, "没有封面 link 的条目保持空海报");
         assert_eq!(
             entries[0]
-                .0
+                .id
                 .split("/ebooks/")
                 .nth(1)
                 .unwrap()
@@ -1543,6 +1775,57 @@ mod tests {
                 .next(),
             Some("84")
         );
+    }
+
+    #[test]
+    fn anilist_search_query_requests_the_cover_image_field() {
+        assert!(ANILIST_SEARCH_QUERY.contains("coverImage"));
+        for field in ["extraLarge", "large", "medium"] {
+            assert!(
+                ANILIST_SEARCH_QUERY.contains(field),
+                "AniList 查询必须请求封面字段 {field}，否则搜索响应不会带回海报地址"
+            );
+        }
+    }
+
+    #[test]
+    fn mangadex_fixture_maps_cover_relationship_to_a_bounded_address() {
+        let id = "0f7a4a1e-0f2f-4a4f-9c4f-3c1b0f0a4b6c";
+        let item = serde_json::json!({
+            "id": id,
+            "type": "manga",
+            "attributes": {
+                "title": { "en": "Synthetic Comic" },
+                "description": { "en": "synthetic" },
+                "year": 2024
+            },
+            "relationships": [
+                { "id": "author-1", "type": "author", "attributes": {} },
+                {
+                    "id": "cover-1",
+                    "type": "cover_art",
+                    "attributes": { "fileName": "synthetic-cover.jpg", "volume": "1" }
+                }
+            ]
+        });
+        let draft = mangadex_draft(&item).expect("固定 fixture 必须映射成卡片");
+        assert_eq!(draft.card.title, "Synthetic Comic");
+        assert_eq!(draft.card.release_year, Some(2024));
+        let poster = draft.poster.expect("cover_art 关系必须被提取");
+        assert_eq!(poster.source_id(), "mangadex");
+        assert_eq!(
+            poster.url(),
+            format!("https://uploads.mangadex.org/covers/{id}/synthetic-cover.jpg")
+        );
+
+        // 没有 cover_art 关系时仍返回卡片，只是没有海报。
+        let without_cover = serde_json::json!({
+            "id": id,
+            "attributes": { "title": { "en": "Synthetic Comic" } },
+            "relationships": []
+        });
+        let draft = mangadex_draft(&without_cover).expect("无封面条目仍必须可用");
+        assert!(draft.poster.is_none());
     }
 
     #[test]
@@ -1580,5 +1863,168 @@ mod tests {
         assert!(provider_supports_category("cms10", "video"));
         assert!(!provider_supports_category("cms10", "book"));
         assert!(!provider_supports_category("unknown", "video"));
+    }
+
+    /// 记录调用参数的受控图片代理仓库替身：断言登记确实经过
+    /// `ImageProxyRepository`，并且拿到的是 Provider 边界校验后的地址。
+    #[derive(Default)]
+    struct RecordingImageProxy {
+        calls: Mutex<Vec<(String, String)>>,
+        reject: bool,
+    }
+
+    impl RecordingImageProxy {
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ImageProxyRepository for RecordingImageProxy {
+        async fn register(&self, source_id: &str, target_url: &str) -> Result<String, AppError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((source_id.to_owned(), target_url.to_owned()));
+            if self.reject {
+                return Err(source_unavailable("测试用登记拒绝"));
+            }
+            Ok("0f7a4a1e-0f2f-4a4f-9c4f-3c1b0f0a4b6c".to_owned())
+        }
+
+        async fn resolve(&self, _id: &str) -> Result<Option<String>, AppError> {
+            Ok(None)
+        }
+    }
+
+    /// TVMaze fixture：上游字段 → 投影 → 登记的唯一合成数据源。
+    fn synthetic_show() -> Value {
+        serde_json::json!({
+            "name": "Synthetic Show",
+            "summary": "synthetic summary",
+            "premiered": "2024-01-01",
+            "image": {
+                "medium": "https://static.tvmaze.com/uploads/images/medium_portrait/synthetic.jpg"
+            }
+        })
+    }
+
+    fn synthetic_draft() -> artwork::CardDraft {
+        let show = synthetic_show();
+        artwork::CardDraft::new(card(
+            "tvmaze",
+            "1",
+            "Synthetic Show".to_owned(),
+            Some("synthetic summary".to_owned()),
+            Some(2024),
+            (ContentCategory::Video, MediaTypeDto::Series),
+            Some(ExternalIdProviderDto::Tvmaze),
+        ))
+        .with_poster(artwork::tvmaze_poster(&show))
+    }
+
+    #[tokio::test]
+    async fn provider_artwork_is_registered_as_an_opaque_uri() {
+        let proxy = Arc::new(RecordingImageProxy::default());
+        let client = MetadataClient::with_image_proxy(proxy.clone()).expect("注入必须成功");
+
+        let dto = artwork::register_card(client.image_proxy.as_deref(), synthetic_draft()).await;
+
+        assert_eq!(
+            dto.poster_uri.as_deref(),
+            Some("haven://artwork/0f7a4a1e-0f2f-4a4f-9c4f-3c1b0f0a4b6c")
+        );
+        assert_eq!(dto.backdrop_uri, None);
+        assert_eq!(dto.title, "Synthetic Show");
+        let calls = proxy.calls();
+        assert_eq!(calls.len(), 1, "每张卡片只登记一次，不额外发图片请求");
+        assert_eq!(calls[0].0, "tvmaze");
+        assert_eq!(
+            calls[0].1,
+            "https://static.tvmaze.com/uploads/images/medium_portrait/synthetic.jpg"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_metadata_does_not_register_unused_artwork() {
+        let proxy = RecordingImageProxy::default();
+        let cards = artwork::register_cards(Some(&proxy), vec![synthetic_draft()], &|| true).await;
+        assert!(cards.is_empty());
+        assert!(proxy.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_between_cards_stops_artwork_registration() {
+        let proxy = RecordingImageProxy::default();
+        let cards = artwork::register_cards(
+            Some(&proxy),
+            vec![synthetic_draft(), synthetic_draft()],
+            &|| !proxy.calls().is_empty(),
+        )
+        .await;
+        assert!(cards.is_empty());
+        assert_eq!(proxy.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn wire_projection_never_carries_the_remote_artwork_url() {
+        let proxy = Arc::new(RecordingImageProxy::default());
+        let client = MetadataClient::with_image_proxy(proxy).expect("注入必须成功");
+        let dto = artwork::register_card(client.image_proxy.as_deref(), synthetic_draft()).await;
+
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(json.contains("haven://artwork/"));
+        assert!(!json.contains("tvmaze.com"), "远端地址不得进入 Wire");
+        assert!(!json.contains("https://"));
+    }
+
+    #[tokio::test]
+    async fn metadata_stays_usable_when_artwork_is_absent_or_rejected() {
+        // 未注入 Repository：不登记，也不失败。
+        let client = MetadataClient::new().expect("无 Artwork 的客户端必须可构造");
+        let dto = artwork::register_card(client.image_proxy.as_deref(), synthetic_draft()).await;
+        assert_eq!(dto.poster_uri, None);
+
+        // Provider 没给图片：完全不登记。
+        let recording = Arc::new(RecordingImageProxy::default());
+        let client = MetadataClient::with_image_proxy(recording.clone()).expect("注入必须成功");
+        let mut draft = synthetic_draft();
+        draft.poster = None;
+        let dto = artwork::register_card(client.image_proxy.as_deref(), draft).await;
+        assert_eq!(dto.poster_uri, None);
+        assert!(recording.calls().is_empty());
+
+        // 登记被策略/存储拒绝：元数据仍然可用，只是没有海报。
+        let rejecting = Arc::new(RecordingImageProxy {
+            reject: true,
+            ..Default::default()
+        });
+        let client = MetadataClient::with_image_proxy(rejecting.clone()).expect("注入必须成功");
+        let dto = artwork::register_card(client.image_proxy.as_deref(), synthetic_draft()).await;
+        assert_eq!(dto.poster_uri, None);
+        assert_eq!(dto.title, "Synthetic Show");
+        assert_eq!(dto.release_year, Some(2024));
+        assert_eq!(rejecting.calls().len(), 1);
+
+        // 上游地址不在 Provider 图片主机白名单：不会进入登记路径。
+        let recording = Arc::new(RecordingImageProxy::default());
+        let client = MetadataClient::with_image_proxy(recording.clone()).expect("注入必须成功");
+        let hostile = serde_json::json!({
+            "name": "Synthetic Show",
+            "image": { "medium": "https://evil.example/synthetic.jpg" }
+        });
+        let draft = artwork::CardDraft::new(card(
+            "tvmaze",
+            "1",
+            "Synthetic Show".to_owned(),
+            None,
+            None,
+            (ContentCategory::Video, MediaTypeDto::Series),
+            None,
+        ))
+        .with_poster(artwork::tvmaze_poster(&hostile));
+        let dto = artwork::register_card(client.image_proxy.as_deref(), draft).await;
+        assert_eq!(dto.poster_uri, None);
+        assert!(recording.calls().is_empty());
     }
 }
