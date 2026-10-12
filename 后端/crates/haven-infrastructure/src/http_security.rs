@@ -10,9 +10,8 @@
 use std::net::{IpAddr, SocketAddr};
 
 use haven_common::network::{
-    HttpUrlPolicy, fixture_loopback_allowed, is_local_proxy_fake_ip, is_publicly_routable,
-    is_user_source_local_ip_allowed, parse_http_url,
-    ai_provider_loopback_allowed,
+    HttpUrlPolicy, ai_provider_loopback_allowed, fixture_loopback_allowed, is_local_proxy_fake_ip,
+    is_publicly_routable, is_user_source_local_ip_allowed, parse_http_url,
 };
 use reqwest::{ClientBuilder, Url};
 

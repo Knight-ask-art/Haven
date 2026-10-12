@@ -1,7 +1,7 @@
 ---
 doc_id: decisions.versioned-source-credentials
 type: decision
-status: accepted
+status: active
 owner: architecture
 visibility: public
 source_of_truth: source-credential-lifecycle

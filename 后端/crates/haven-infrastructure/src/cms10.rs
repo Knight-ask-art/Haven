@@ -248,7 +248,7 @@ pub struct Cms10Client;
 
 impl Cms10Client {
     pub fn new() -> Result<Self, AppError> {
-        Ok(Self::default())
+        Ok(Self)
     }
 
     /// 解析一个采集站地址。默认走**用户提供来源**策略：用户可选本机/局域网主机和
@@ -796,7 +796,7 @@ mod tests {
 
     #[test]
     fn cms10_query_is_encoded_without_path_concatenation() {
-        let url = Cms10Client::default()
+        let url = Cms10Client
             .endpoint_url(
                 "https://media.example.invalid/api.php?token=opaque",
                 "wd",

@@ -1,7 +1,7 @@
 ---
 doc_id: decisions.controlled-source-artwork
 type: decision
-status: accepted
+status: active
 owner: architecture
 visibility: public
 source_of_truth: artwork-registration-and-outbound-policy
