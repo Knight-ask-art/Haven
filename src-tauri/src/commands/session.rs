@@ -238,6 +238,7 @@ mod tests {
                     is_hls: true,
                     progress: None,
                     upstream_url: upstream.to_owned(),
+                    scope: haven_common::network::StreamUrlScope::Media,
                 },
                 upstream,
                 "main",

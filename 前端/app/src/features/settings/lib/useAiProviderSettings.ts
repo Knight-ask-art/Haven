@@ -80,6 +80,8 @@ export interface AiProviderSettingsOptions {
   initialProfileId?: string | null;
   /** 选择变化（含读取后的收敛结果）时回调，供调用方在分区切换之间记住它。 */
   onSelectedProfileChange?: (profileId: string | null) => void;
+  /** 活跃时自动读取配置；默认 true。工作台与设置面板共享读取结果。 */
+  enabled?: boolean;
 }
 
 export interface AiProviderProfileDraft {
@@ -140,9 +142,14 @@ function toErrorInfo(error: unknown): AiProviderErrorInfo {
 }
 
 export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): AiProviderSettingsController {
-  const [state, setState] = useState<AiProviderSettingsState>(EMPTY_STATE);
+  // 不活跃的控制器没有"正在读取"这回事：`loading: true` 会让工作台显示一个永远不会
+  // 结束的读取中状态（因为它按设计就没打算读）。
+  const [state, setState] = useState<AiProviderSettingsState>(() => (
+    (options.enabled ?? true) ? EMPTY_STATE : { ...EMPTY_STATE, loading: false }
+  ));
   // Profile 列表与模型目录是两个独立的异步资源；刷新模型不能让列表请求失效，反之亦然。
   const profileLoadId = useRef(0);
+  const profilesInitialized = useRef(false);
   const catalogRequestId = useRef(0);
   const selectedRef = useRef<string | null>(null);
   selectedRef.current = state.selectedProfileId;
@@ -182,11 +189,16 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
    */
   const lastDeleteTarget = useRef<{ profileId: string; revision: string } | null>(null);
 
+  /** 跟随 AI 分区的活跃状态，避免其他分区触发模型读取。 */
+  const enabledRef = useRef(options.enabled ?? true);
+  enabledRef.current = options.enabled ?? true;
+
   /**
    * 读取 Profile 列表，并在必要时顺带读取模型目录。
    * `preferredProfileId` 让删除/新建后仍能停留在用户刚才看的那个 profile 上。
    */
   const load = useCallback(async (preferredProfileId?: string | null): Promise<void> => {
+    profilesInitialized.current = false;
     const id = ++profileLoadId.current;
     // 刷新列表期间不再展示旧的模型加载状态；如果选中项变了，后续 effect 会重新读取。
     catalogRequestId.current += 1;
@@ -199,6 +211,7 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
     try {
       const profiles = await listAiProviderProfiles();
       if (id !== profileLoadId.current) return;
+      profilesInitialized.current = true;
       // 组件内选择 → 调用方记住的选择 → 列表第一项。
       //
       // 中间那一项专门用来跨"分区切换导致的重新挂载"存活：少了它，重新挂载会直接落到
@@ -221,6 +234,7 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
       }));
     } catch (error) {
       if (id !== profileLoadId.current) return;
+      profilesInitialized.current = true;
       setState((current) => ({
         ...current,
         loading: false,
@@ -232,12 +246,20 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
     }
   }, [notifySelection]);
 
+  /** 进入 AI 分区时读取配置；退出时失效尚未完成的请求。 */
+  const enabled = options.enabled ?? true;
   useEffect(() => {
-    void load();
-  }, [load]);
+    if (enabled) void load();
+    else setState((current) => ({ ...current, loading: false, catalogLoading: false }));
+    return () => {
+      profileLoadId.current += 1;
+      catalogRequestId.current += 1;
+      profilesInitialized.current = false;
+    };
+  }, [enabled, load]);
 
   const refreshModels = useCallback(async (): Promise<void> => {
-    if (state.loading || state.loadError !== null) {
+    if (!profilesInitialized.current || state.loading || state.loadError !== null) {
       catalogRequestId.current += 1;
       return;
     }
@@ -250,6 +272,11 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
         catalogLoading: false,
         catalogError: null,
       }));
+      return;
+    }
+    // 退出 AI 分区后不自动请求模型目录。
+    if (!enabledRef.current) {
+      catalogRequestId.current += 1;
       return;
     }
     const id = ++catalogRequestId.current;
@@ -301,9 +328,11 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
 
   useEffect(() => {
     if (state.loading || catalogIdentity === null) return;
+    // 显式 reload 可在非活跃时读取配置；自动模型读取只跟随活跃分区。
+    if (!enabled) return;
     void refreshModels();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [catalogIdentity, state.loading]);
+  }, [catalogIdentity, state.loading, enabled]);
 
   const selectProfile = useCallback((profileId: string | null) => {
     catalogRequestId.current += 1;
@@ -528,7 +557,7 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
     : catalogStateHint(state.catalog?.state ?? null);
 
   return {
-    state,
+    state: { ...state, loading: state.loading || (enabled && !profilesInitialized.current) },
     selectedProfile,
     modelOptions,
     hasAvailableModel,

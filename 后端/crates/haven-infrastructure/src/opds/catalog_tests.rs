@@ -95,6 +95,114 @@ fn catalog_server() -> FixtureServer {
     })
 }
 
+#[tokio::test]
+async fn search_accepts_empty_feed_and_urn_book_with_external_cover() {
+    for (xml, count) in [
+        (r#"<feed xmlns="http://www.w3.org/2005/Atom"/>"#, 0),
+        (
+            r#"<feed xmlns="http://www.w3.org/2005/Atom"><entry><id>urn:uuid:book-1</id><title>URN Book</title><link rel="http://opds-spec.org/acquisition" type="application/epub+zip" href="/book.epub"/><link rel="http://opds-spec.org/image" type="image/png" href="https://cdn.example.invalid/cover.png"/></entry></feed>"#,
+            1,
+        ),
+    ] {
+        let server = FixtureServer::start(move |origin| {
+            vec![
+                ("/opds".to_owned(), FixtureResponse::atom(root_feed())),
+                (
+                    "/opensearch.xml".to_owned(),
+                    FixtureResponse::opensearch(opensearch_description(origin)),
+                ),
+                (
+                    "/search.opds".to_owned(),
+                    FixtureResponse::atom(xml.to_owned()),
+                ),
+            ]
+        });
+        let (registry, source_id) =
+            seeded_opds_registry(&format!("{}/opds", server.origin()), false).await;
+        let client = Arc::new(
+            OpdsClient::new()
+                .unwrap()
+                .with_loopback_fixture()
+                .with_source_registry(registry.clone()),
+        );
+        let participant = OpdsSearchParticipant::new(source_id.clone(), registry, client);
+        let cards = participant
+            .search_for(&source_id, "book", 10, &|| false)
+            .await
+            .unwrap();
+        assert_eq!(cards.len(), count);
+        if count == 1 {
+            assert_eq!(cards[0].title, "URN Book");
+        }
+    }
+}
+
+#[tokio::test]
+async fn search_preserves_the_root_directory_error() {
+    let server = FixtureServer::start(|_| Vec::new());
+    let endpoint = format!("{}/missing", server.origin());
+    let (registry, source_id) = seeded_opds_registry(&endpoint, false).await;
+    let client = OpdsClient::new()
+        .unwrap()
+        .with_loopback_fixture()
+        .with_source_registry(registry);
+    let expected = client
+        .search_url(Some(&source_id), &endpoint, "book")
+        .await
+        .unwrap_err();
+    let actual = client
+        .search_entries(Some(&source_id), &endpoint, "book", 10)
+        .await
+        .unwrap_err();
+    assert_eq!(actual.code(), expected.code());
+    assert_eq!(actual.user_message(), expected.user_message());
+}
+
+#[test]
+fn search_feed_validation_rejects_broken_xml_and_html() {
+    for xml in [
+        "<html><body>login</body></html>",
+        "<feed><entry></feed>",
+        "<feed>",
+        "<feed/><feed/>",
+    ] {
+        assert!(!super::valid_search_feed(xml), "{xml}");
+    }
+    assert!(super::valid_search_feed("<?xml version=\"1.0\"?><feed/>"));
+}
+
+#[test]
+fn basic_auth_uses_saved_username_and_legacy_secret_requires_reconfiguration() {
+    let client = reqwest::Client::new();
+    let request = super::apply_opds_auth(
+        client.get("https://catalog.example.invalid/opds"),
+        "haven-opds-basic-v1\nreader\nsynthetic:password",
+    )
+    .unwrap()
+    .build()
+    .unwrap();
+    use base64::Engine;
+    let encoded = request.headers()[reqwest::header::AUTHORIZATION]
+        .to_str()
+        .unwrap()
+        .strip_prefix("Basic ")
+        .unwrap();
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap(),
+        b"reader:synthetic:password"
+    );
+    let result = super::apply_opds_auth(
+        client.get("https://catalog.example.invalid/opds"),
+        "old-password",
+    );
+    assert_eq!(
+        result.err().unwrap().code().as_str(),
+        "CREDENTIAL_RECONFIGURATION_REQUIRED"
+    );
+}
+
 struct CatalogFixture {
     server: FixtureServer,
     client: Arc<OpdsClient>,

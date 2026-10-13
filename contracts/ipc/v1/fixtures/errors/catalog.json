@@ -29,6 +29,7 @@
     { "code": "DOWNLOAD_DISK_FULL", "retryable": false },
     { "code": "DOWNLOAD_INTEGRITY_FAILED", "retryable": true },
     { "code": "CREDENTIAL_ACCESS_FAILED", "retryable": "by-classification" },
+    { "code": "CREDENTIAL_RECONFIGURATION_REQUIRED", "retryable": false },
     { "code": "SECURITY_POLICY_DENIED", "retryable": false },
     { "code": "DATABASE_ERROR", "retryable": true },
     { "code": "INTERNAL_ERROR", "retryable": false }

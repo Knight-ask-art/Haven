@@ -1354,6 +1354,54 @@ async fn m3u_import_persists_a_playable_chain_and_is_idempotent() {
 }
 
 #[tokio::test]
+async fn personal_m3u_import_preserves_scope_through_capability_and_stream_open() {
+    use haven_application::services::resource::ResourceService;
+    use haven_application::services::source_import::{encode_candidate_component, m3u_source_id};
+    use haven_application::services::stream::StreamService;
+    use haven_application::wire::{
+        ResourceListByMediaItemRequest, SessionEngineDto, SessionOpenRequest,
+    };
+    use haven_common::network::StreamUrlScope;
+
+    let fixture = fixture();
+    for url in [
+        "http://127.0.0.1:8096/live.m3u8",
+        "http://192.168.1.10:9973/live.m3u8",
+    ] {
+        let payload = encode_candidate_component(&format!("Home\u{1}{url}"));
+        let handle = format!("content-candidate-m3u-{payload}");
+        let imported = fixture.service.import_candidate(&handle).await.unwrap();
+        let resources = fixture
+            .repos
+            .list_by_media_item(imported.media_item_id)
+            .await
+            .unwrap();
+        assert_eq!(resources[0].source_id, Some(m3u_source_id().unwrap()));
+        let summaries = ResourceService::new(fixture.repos.clone())
+            .list_by_media_item(ResourceListByMediaItemRequest {
+                media_item_id: imported.media_item_id.to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(summaries.items[0].can_online_read);
+        let facts = StreamService::new(fixture.repos.clone())
+            .prepare(SessionOpenRequest {
+                media_item_id: imported.media_item_id.to_string(),
+                engine: SessionEngineDto::Playback,
+            })
+            .await
+            .unwrap();
+        assert_eq!(facts.scope, StreamUrlScope::UserProvidedSource);
+        assert_eq!(facts.upstream_url, url);
+        assert!(facts.is_hls);
+        assert_eq!(
+            fixture.service.import_candidate(&handle).await.unwrap(),
+            imported
+        );
+    }
+}
+
+#[tokio::test]
 async fn m3u_resource_failure_rolls_back_the_entire_import_chain() {
     let fixture = fixture();
     fixture

@@ -21,7 +21,7 @@ use haven_application::services::{ComicPageBody, PreparedSession, PreparedSessio
 use haven_application::wire::SessionEngineDto;
 #[cfg(test)]
 use haven_common::network::validate_host;
-use haven_common::network::{is_publicly_routable, parse_http_url, HttpUrlPolicy};
+use haven_common::network::{parse_http_url, StreamUrlScope};
 use haven_common::{AppError, ErrorKind};
 use haven_domain::contracts::{ResourceRepository, StorageLocationRepository};
 use haven_domain::entities::{Resource, ResourceLocator, StorageLocation};
@@ -1596,12 +1596,10 @@ fn percent_encode(value: &str) -> String {
 
 /// 相对地址 → 绝对地址。只允许 HTTP(S)，并使用 URL 解析器处理
 /// `../`、查询和 IPv6 authority，避免手工拼接产生跨主机或路径歧义。
-fn absolutize(base_url: &str, target: &str) -> Option<String> {
-    let base = parse_http_url(base_url, HttpUrlPolicy::MediaResource)
-        .ok()?
-        .into_url();
+fn absolutize(base_url: &str, target: &str, scope: StreamUrlScope) -> Option<String> {
+    let base = parse_http_url(base_url, scope.policy()).ok()?.into_url();
     let joined = base.join(target).ok()?;
-    parse_http_url(joined.as_str(), HttpUrlPolicy::MediaResource)
+    parse_http_url(joined.as_str(), scope.policy())
         .ok()
         .map(|safe| safe.as_str().to_owned())
 }
@@ -1628,6 +1626,7 @@ fn rewrite_hls_manifest(
     manifest_base: &str,
     grant_id: &str,
     manifest_version: &str,
+    scope: StreamUrlScope,
     register_target: &mut dyn FnMut(&str) -> String,
 ) -> Option<String> {
     let mut proxy_for = |raw: &str| -> Option<String> {
@@ -1635,7 +1634,7 @@ fn rewrite_hls_manifest(
         if raw.is_empty() {
             return None;
         }
-        let absolute = absolutize(manifest_base, raw)?;
+        let absolute = absolutize(manifest_base, raw, scope)?;
         let token = register_target(&absolute);
         Some(format!(
             "http://haven-resource.stream/{grant_id}?u={}&v={manifest_version}",
@@ -1779,6 +1778,7 @@ async fn serve_stream_with_resolution(
             &upstream,
             grant_id,
             &manifest_version,
+            inner.facts.scope,
             &mut register_target,
         ) else {
             return Err(resource_unavailable());
@@ -2067,7 +2067,7 @@ async fn fetch_stream_response(
     resolution: StreamResolution,
 ) -> Result<(reqwest::Response, String), AppError> {
     for redirect_count in 0..=MAX_STREAM_REDIRECTS {
-        let target = resolve_stream_target(&upstream, resolution).await?;
+        let target = resolve_stream_target(&upstream, resolution, inner.facts.scope).await?;
         if !inner.host_allowed(&target.host) {
             return Err(policy_denied("流目标主机未被授权"));
         }
@@ -2107,7 +2107,7 @@ async fn fetch_stream_response(
                 ));
             };
             let Some(next) = (match resolution {
-                StreamResolution::System => absolutize(&target.url, location),
+                StreamResolution::System => absolutize(&target.url, location, inner.facts.scope),
                 #[cfg(test)]
                 StreamResolution::Fixture(_) => absolutize_fixture(&target.url, location),
             }) else {
@@ -2141,10 +2141,11 @@ async fn fetch_stream_response(
 async fn resolve_stream_target(
     raw_url: &str,
     resolution: StreamResolution,
+    scope: StreamUrlScope,
 ) -> Result<ResolvedStreamTarget, AppError> {
     let (url, host, dns_name, port) = match resolution {
         StreamResolution::System => {
-            let safe = parse_http_url(raw_url, HttpUrlPolicy::MediaResource)
+            let safe = parse_http_url(raw_url, scope.policy())
                 .map_err(|_| policy_denied("流目标地址不受安全策略允许"))?;
             let url = safe.as_str().to_owned();
             let host = safe.host().to_owned();
@@ -2194,7 +2195,8 @@ async fn resolve_stream_target(
         StreamResolution::System => match host.parse::<IpAddr>() {
             Ok(ip) => vec![SocketAddr::new(ip, port)],
             Err(_) => {
-                resolve_public_addresses(dns_name.as_deref().unwrap_or(host.as_str()), port).await?
+                resolve_public_addresses(dns_name.as_deref().unwrap_or(host.as_str()), port, scope)
+                    .await?
             }
         },
         #[cfg(test)]
@@ -2211,10 +2213,14 @@ async fn resolve_stream_target(
 /// Resolve synchronously in a blocking worker, then fail closed if DNS
 /// returns even one non-public address. The resulting list is pinned with
 /// `resolve_to_addrs` before the HTTP request is sent.
-async fn resolve_public_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, AppError> {
-    let host = host.to_owned();
+async fn resolve_public_addresses(
+    host: &str,
+    port: u16,
+    scope: StreamUrlScope,
+) -> Result<Vec<SocketAddr>, AppError> {
+    let lookup_host = host.to_owned();
     let addresses = tauri::async_runtime::spawn_blocking(move || {
-        (host.as_str(), port)
+        (lookup_host.as_str(), port)
             .to_socket_addrs()
             .map(|items| items.collect::<Vec<_>>())
     })
@@ -2238,7 +2244,7 @@ async fn resolve_public_addresses(host: &str, port: u16) -> Result<Vec<SocketAdd
     if addresses.is_empty()
         || addresses
             .iter()
-            .any(|address| !is_publicly_routable(address.ip()))
+            .any(|address| !scope.allows_address(host, address.ip()))
     {
         return Err(policy_denied("流源解析到不受支持的地址"));
     }
@@ -2305,6 +2311,7 @@ mod tests {
             "https://cdn.example.com/a/index.m3u8",
             "00000000-0000-0000-0000-000000000001",
             &manifest_version,
+            StreamUrlScope::Media,
             &mut register_target,
         )
         .expect("fixture manifest must fit target budget");
@@ -2916,6 +2923,7 @@ mod tests {
             is_hls: true,
             progress: None,
             upstream_url: url.to_owned(),
+            scope: StreamUrlScope::Media,
         }
     }
 
@@ -2928,7 +2936,49 @@ mod tests {
             is_hls: false,
             progress: None,
             upstream_url: url.to_owned(),
+            scope: StreamUrlScope::Media,
         }
+    }
+
+    #[tokio::test]
+    async fn user_source_stream_fetches_loopback_with_the_production_resolver() {
+        let (_, address) = spawn_stream_fixture("200 OK", "Content-Type: video/mp4\r\n", b"abc");
+        let url = format!("http://{address}/video.mp4");
+        assert!(
+            resolve_stream_target(&url, StreamResolution::System, StreamUrlScope::Media)
+                .await
+                .is_err()
+        );
+        let mut facts = direct_stream_facts(&url);
+        facts.scope = StreamUrlScope::UserProvidedSource;
+        let registry = crate::stream_registry::StreamRegistry::new();
+        let grant = registry.register(facts, &url, "main").unwrap();
+        let inner = registry.lookup(&grant.to_string(), "main").unwrap();
+        let (response, final_url) =
+            fetch_stream_response(&inner, url.clone(), None, StreamResolution::System)
+                .await
+                .unwrap();
+        assert_eq!(final_url, url);
+        assert_eq!(
+            read_stream_body_bounded(response, 16).await.unwrap(),
+            b"abc"
+        );
+        let mut targets = Vec::new();
+        let mut register = |target: &str| {
+            targets.push(target.to_owned());
+            "token".to_owned()
+        };
+        let manifest = rewrite_hls_manifest(
+            "#EXTM3U\nsegment.ts\n",
+            &format!("http://{address}/live/index.m3u8"),
+            "grant",
+            "v1",
+            inner.facts.scope,
+            &mut register,
+        )
+        .unwrap();
+        assert!(manifest.contains("?u=token&v=v1"));
+        assert_eq!(targets, vec![format!("http://{address}/live/segment.ts")]);
     }
 
     #[tokio::test]

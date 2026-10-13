@@ -14,14 +14,12 @@ import { getHavenClient } from "@/lib/ipc/runtime";
 import { toHavenError } from "@/lib/ipc/errors";
 import type {
   AiModelCapabilityDto,
-  AiProviderKindDto,
   AiProviderModelDto,
   AiProviderModelsCatalogDto,
   AiProviderModelsCatalogStateDto,
   AiProviderProfileDto,
   AiProviderProfileListResultDto,
   AiProviderProfileUpsertRequest,
-  CredentialStatusDto,
 } from "@/lib/ipc/generated/wire";
 
 /** 「无可用模型」的显示文案：唯一的空态标签，禁止用示例模型名占位。 */
@@ -107,20 +105,6 @@ const MODEL_FIELDS = [
 
 const CATALOG_FIELDS = ["schemaVersion", "profileId", "state", "models"] as const;
 
-/** 任何 secret 形状的键都不允许出现在 AI Provider 响应里。 */
-const FORBIDDEN_FIELDS = [
-  "secret",
-  "apiKey",
-  "api_key",
-  "key",
-  "token",
-  "password",
-  "authorization",
-  "credentialRef",
-  "credential_ref",
-  "target",
-  "bearer",
-];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -138,11 +122,6 @@ function hasExactFields(value: Record<string, unknown>, allowed: readonly string
   return true;
 }
 
-function hasForbiddenField(value: Record<string, unknown>): boolean {
-  return Reflect.ownKeys(value).some(
-    (field) => typeof field === "string" && FORBIDDEN_FIELDS.includes(field),
-  );
-}
 
 /** 可选文本字段：null 或非空字符串。**不**做 trim 之外的任何解释。 */
 function isOptionalText(value: unknown): value is string | null {
@@ -158,7 +137,7 @@ function isOptionalText(value: unknown): value is string | null {
  * （后端 `require_secure_endpoint`）负责，不由"读不出来"兜底。
  */
 export function guardAiProviderProfile(value: unknown): value is AiProviderProfileDto {
-  if (!isRecord(value) || hasForbiddenField(value)) return false;
+  if (!isRecord(value)) return false;
   if (!hasExactFields(value, PROFILE_FIELDS)) return false;
   return value.schemaVersion === 1
     && typeof value.profileId === "string"
@@ -189,7 +168,7 @@ export function guardAiProviderProfileList(
 }
 
 export function guardAiProviderModel(value: unknown): value is AiProviderModelDto {
-  if (!isRecord(value) || hasForbiddenField(value)) return false;
+  if (!isRecord(value)) return false;
   if (!hasExactFields(value, MODEL_FIELDS)) return false;
   return typeof value.modelId === "string"
     && value.modelId.length > 0
@@ -215,7 +194,7 @@ export function guardAiProviderModelsCatalog(
   value: unknown,
   expectedProfileId: string,
 ): value is AiProviderModelsCatalogDto {
-  if (!isRecord(value) || hasForbiddenField(value)) return false;
+  if (!isRecord(value)) return false;
   if (!hasExactFields(value, CATALOG_FIELDS)) return false;
   if (value.schemaVersion !== 1) return false;
   if (typeof value.profileId !== "string" || value.profileId.length === 0) return false;
@@ -228,12 +207,6 @@ export function guardAiProviderModelsCatalog(
   return true;
 }
 
-export function guardCredentialStatus(value: unknown): value is CredentialStatusDto {
-  if (!isRecord(value) || hasForbiddenField(value)) return false;
-  if (!hasExactFields(value, ["configured", "updatedAt"])) return false;
-  return typeof value.configured === "boolean"
-    && (value.updatedAt === null || typeof value.updatedAt === "string");
-}
 
 const INVALID_RESPONSE = "AI Provider 接口返回了非法数据";
 
@@ -252,26 +225,6 @@ export async function listAiProviderProfiles(): Promise<AiProviderProfileDto[]> 
   }
 }
 
-/**
- * 读取单个 Provider Profile。
- *
- * **形状守卫不够，还要比对身份。** 只检查"这是一份合法的 profile"的话，一次错配的响应
- * （迟到的旧请求、重复派发、服务端 id 混用）会被当成刚请求的那一份交出去，调用方随即
- * 拿着**另一个配置**的 endpoint / 模型继续操作，而界面上没有任何区别。
- *
- * 比对是逐字节的，且不会误伤合法流程：`validate_profile_id` 只接受 ASCII 字母数字、
- * `-` 与 `_`，且后端不对 id 做任何 trim / 大小写归一——能通过校验的 id 就是原样存回来的
- * 那个（见 `haven-domain` 的 `validate_profile_id`）。
- */
-export async function getAiProviderProfile(profileId: string): Promise<AiProviderProfileDto> {
-  try {
-    const value: unknown = await getHavenClient().aiProviderProfileGet({ profileId });
-    if (!guardAiProviderProfile(value) || value.profileId !== profileId) invalidResponse();
-    return value;
-  } catch (error) {
-    throw toHavenError(error);
-  }
-}
 
 /**
  * 写入 Provider Profile（非敏感字段）；CAS 冲突由后端返回。
@@ -329,19 +282,6 @@ export async function listAiProviderModels(
   }
 }
 
-/** 该 profile 的密钥是否已配置。只读事实，不返回密钥本身。 */
-export async function aiProviderCredentialConfigured(profileId: string): Promise<boolean> {
-  try {
-    const value: unknown = await getHavenClient().credentialStatus({
-      provider: "ai",
-      profileId,
-    });
-    if (!guardCredentialStatus(value)) invalidResponse();
-    return value.configured;
-  } catch (error) {
-    throw toHavenError(error);
-  }
-}
 
 /**
  * 单向写入 API Key（`haven:ai:<profileId>`）。
@@ -429,6 +369,3 @@ export function toModelOptions(
     embeddingLabel: capabilityLabel(model.embedding),
   }));
 }
-
-/** 供测试与调用方复用的种类常量（与生成物同值）。 */
-export const AI_PROVIDER_KIND_OPENAI_COMPATIBLE: AiProviderKindDto = "openai_compatible";

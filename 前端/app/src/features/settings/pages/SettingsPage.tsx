@@ -37,7 +37,7 @@ import { getHavenClientMode } from "@/lib/ipc/runtime"
 import type { AppearanceAssetKindWire, AppearanceAssetWire, ComicSettingsValue, GeneralSettingsValue, AppearanceSettingsValue, PlaybackSettingsValue, PreferenceComicPatchWire, PreferenceGetResult, PreferenceReadingPatchWire, PreferenceTargetWire, PrivacySettingsValue, ReadingFontFamilyWire, ReadingPatchWire, ReadingSettingsValue, SettingsValue, ThemeWire, UiFontPresetWire, WallpaperSelection } from "@/lib/ipc/settings-wire"
 import type { SettingsFormController } from "@/features/settings/lib/useSettingsForm"
 import { useSettingsForm } from "@/features/settings/lib/useSettingsForm"
-import { useAiProviderSettings } from "@/features/settings/lib/useAiProviderSettings"
+import { useAiProviderSettings, type AiProviderSettingsController } from "@/features/settings/lib/useAiProviderSettings"
 import { INSECURE_ENDPOINT_CODE, NO_MODEL_SELECTED } from "@/features/settings/ipc/ai-provider-gateway"
 import { useAgentBrokerSettings } from "@/features/settings/lib/useAgentBrokerSettings"
 import { useAgentSkills } from "@/features/settings/lib/useAgentSkills"
@@ -328,17 +328,15 @@ function SettingsContent() {
   const activeSection = activeNavId === "overview" ? null : activeNavId
   const [aiSettingsOpen, setAiSettingsOpen] = useState(isLegacySkillsRoute)
   const aiSettingsTitleId = useId()
-  /**
-   * 用户在「智能功能」里选中的 AI Provider 配置 id。
-   *
-   * 它必须活在**分区切换之上**：每个分区各自挂载自己的设置组件，切到别的分区再切回来，
-   * `AiSettings` 会连同 `useAiProviderSettings` 一起重新挂载。选择只留在那个组件里，
-   * 重挂载就会静默回落到列表第一项——用户选的是 B，回来变成 A，而「打开栖伴」取的正是
-   * 这个值，于是外部模型请求被发给了另一个 Provider。
-   *
-   * 它只是本次 WebView 会话内的记忆：不持久化、不进 settings wire，刷新页面即失效。
-   */
-  const [aiProfileId, setAiProfileId] = useState<string | null>(null)
+  // AI 工作台与设置面板共享控制器；进入 AI 分区就读取保存的配置。
+  const ai = useAiProviderSettings({ enabled: activeSection === "ai" })
+  const aiSelection = useMemo<AiProviderSelection>(() => ({
+    controller: ai,
+    onOpenSettings: () => { setSearchDestination(null); setAiSettingsOpen(true) },
+  }), [ai])
+
+  const aiProfileId = aiSelection.controller.selectedProfile?.profileId ?? null
+
   // 没有表单控制器的分区（「智能功能」/「内置技能」）把自己的重读入口登记在这里，
   // 「重新加载配置」按当前分区转调，页面不需要知道具体 hook。
   const sectionReloaders = useRef(new Map<SettingsSectionId, Set<() => void>>())
@@ -445,13 +443,20 @@ function SettingsContent() {
                       onRetryLayout={overviewLayout.reload}
                     />
                   : activeSection === "ai"
-                    ? <AiAssistantDialog
+                    ? <>
+                      {ai.state.loadError && <div role="alert" className="rounded-2xl border border-[var(--haven-settings-border)] px-4 py-3 text-sm">
+                        <span>{ai.state.loadError.message}</span>
+                        <button type="button" onClick={() => { void ai.reload() }} className="ml-3 font-semibold text-[var(--haven-settings-primary)]">重新读取</button>
+                      </div>}
+                      <AiAssistantDialog
                         open
                         embedded
                         onOpenChange={() => undefined}
-                        onOpenSettings={() => { setSearchDestination(null); setAiSettingsOpen(true) }}
-                        profileId={aiProfileId}
+                        onOpenSettings={aiSelection.onOpenSettings}
+                        profileId={ai.state.loadError ? null : aiProfileId}
+                        providerLoading={ai.state.loading || ai.state.loadError !== null}
                       />
+                    </>
                     : activeSection && renderSettingsSection(
                       activeSection,
                       forms,
@@ -470,11 +475,7 @@ function SettingsContent() {
                     onClose={() => { setAiSettingsOpen(false); setSearchDestination(null) }}
                   >
                       <div className="space-y-7">
-                        <AiSettings
-                          showNotice={showNotice}
-                          registerReloader={registerSectionReloader}
-                          aiSelection={{ profileId: aiProfileId, onSelect: setAiProfileId }}
-                        />
+                        <AiSettings aiSelection={aiSelection} showNotice={showNotice} registerReloader={registerSectionReloader} />
                         <SkillsSettings showNotice={showNotice} registerReloader={registerSectionReloader} />
                       </div>
                   </SettingsDialog>
@@ -924,14 +925,16 @@ function ReadingHeatmap({ state }: { state: ReadingOverviewState }) {
  */
 
 /**
- * 分区之上的 AI Provider 选择。
+ * 分区之上的 AI Provider 接线。
  *
- * 由 `SettingsContent` 持有并传给「智能功能」分区，因此切换分区（组件重新挂载）不会
- * 把它重置成列表第一项——那会让栖伴的请求静默改投另一个 Provider。
+ * 由 `SettingsContent` 持有并传给「智能功能」分区：工作台（栖伴）与「AI 设置」面板拿到的是
+ * **同一个控制器实例**，因此分区切换（组件重新挂载）不会把选择重置成列表第一项——那会让
+ * 栖伴的请求静默改投另一个 Provider——两边也永远不会对"当前选中的是哪一个"产生分歧。
  */
 type AiProviderSelection = {
-  profileId: string | null
-  onSelect: (profileId: string | null) => void
+  controller: AiProviderSettingsController
+  /** 打开共享控制器的 AI 设置面板。 */
+  onOpenSettings: () => void
 }
 
 function renderSettingsSection(
@@ -4484,6 +4487,10 @@ function SkillsSettings({ showNotice, registerReloader }: { showNotice: (message
  * - 模型只能来自 Provider 的模型目录；没有可用模型时显示「无可用模型」，
  *   绝不写入或推断示例模型名；
  * - 目录状态与网络错误分开呈现，可重试错误带重试入口。
+ *
+ * 控制器**由调用方（`SettingsContent`）持有并传入**，因此「重读」必须转调同一个
+ * `reload`：本组件会随分区切换被卸载重建，若自己再建一个控制器，栖伴拿到的就未必是
+ * 用户在这里选中的那一份。
  */
 type AiProviderProfileDraftState = {
   mode: "create" | "edit"
@@ -4492,12 +4499,9 @@ type AiProviderProfileDraftState = {
   endpoint: string
 }
 
-function AiSettings({ showNotice, registerReloader, aiSelection }: { showNotice: (message: string) => void; registerReloader: RegisterSettingsSectionReloader; aiSelection: AiProviderSelection }) {
+function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection: AiProviderSelection; showNotice: (message: string) => void; registerReloader: RegisterSettingsSectionReloader }) {
   // 选择由分区之上持有：本组件会随分区切换被卸载重建，选中的 Provider 不能因此丢回列表第一项。
-  const ai = useAiProviderSettings({
-    initialProfileId: aiSelection.profileId,
-    onSelectedProfileChange: aiSelection.onSelect,
-  })
+  const ai = aiSelection.controller
   const reloadAi = ai.reload
   const [draft, setDraft] = useState<AiProviderProfileDraftState | null>(null)
   const [apiKeyDraft, setApiKeyDraft] = useState("")
@@ -4511,7 +4515,11 @@ function AiSettings({ showNotice, registerReloader, aiSelection }: { showNotice:
    */
   const mockMode = getHavenClientMode() === "mock"
 
-  useEffect(() => registerReloader("ai", () => { void reloadAi() }), [registerReloader, reloadAi])
+  // 「重新加载配置」按当前分区转调：这里登记的是**调用方持有的那个**控制器的 reload。
+  useEffect(
+    () => registerReloader("ai", () => { void reloadAi() }),
+    [registerReloader, reloadAi],
+  )
 
   // Provider 列表读取失败时，保留的快照只供恢复后收敛，不能继续驱动任何动作。
   const selected = ai.state.loadError === null ? ai.selectedProfile : null

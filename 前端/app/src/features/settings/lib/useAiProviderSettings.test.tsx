@@ -320,6 +320,71 @@ describe("useAiProviderSettings 的选择跨重新挂载存活", () => {
 })
 
 /**
+ * 分区未激活时**不发请求**，激活后必须真的读一次。
+ *
+ * 「智能功能」分区的默认主视图是 AI 工作台，用户不打开「AI 设置」面板时并不表示他要看
+ * Provider 配置。没有 `enabled` 时，工作台每次挂载都会自动列出 Provider 并拉取模型目录：
+ * 一次用户没要求的 Provider 往返，失败时还会弹出一个他无法归因的错误。
+ *
+ * 反向的一半同样重要——面板一打开就必须读到列表，否则用户看到的是一个永远为空的配置页，
+ * 而"没读"和"没有配置"在界面上长得一模一样。
+ */
+describe("useAiProviderSettings 未激活时不请求 Provider", () => {
+  it("enabled: false 时挂载不发任何请求，既不读列表也不读模型目录", async () => {
+    gateway.listAiProviderProfiles.mockResolvedValue([PROFILE])
+    const { result } = renderHook(() => useAiProviderSettings({ enabled: false }))
+
+    // 不活跃不是"读取中"：一个永远不结束的 loading 会让工作台一直显示在读取。
+    await waitFor(() => expect(result.current.state.loading).toBe(false))
+    expect(result.current.state.loadError).toBeNull()
+    expect(result.current.state.profiles).toEqual([])
+    expect(gateway.listAiProviderProfiles).not.toHaveBeenCalled()
+    expect(gateway.listAiProviderModels).not.toHaveBeenCalled()
+  })
+
+  it("激活后补上那次读取，并选中持久化的那个配置而不是列表第一项", async () => {
+    gateway.listAiProviderProfiles.mockResolvedValue([PROFILE, SECOND_PROFILE])
+    const { result, rerender } = renderHook(
+      ({ enabled }: { enabled: boolean }) => useAiProviderSettings({ enabled }),
+      { initialProps: { enabled: false } },
+    )
+    await waitFor(() => expect(result.current.state.loading).toBe(false))
+    expect(gateway.listAiProviderProfiles).not.toHaveBeenCalled()
+
+    rerender({ enabled: true })
+
+    // 生产配置来自后端（Rust + SQLite），不是页面内的记忆：激活后读到的就是那一份。
+    await waitFor(() => expect(result.current.selectedProfile?.profileId).toBe(PROFILE.profileId))
+    expect(gateway.listAiProviderProfiles).toHaveBeenCalledTimes(1)
+    // 目录只属于已选中的配置，而且是这一刻才去读的。
+    await waitFor(() => expect(gateway.listAiProviderModels).toHaveBeenCalledWith(PROFILE.profileId))
+  })
+
+  it("未激活时 refreshModels 不请求 Provider 的模型列表", async () => {
+    gateway.listAiProviderProfiles.mockResolvedValue([PROFILE])
+    const { result } = renderHook(() => useAiProviderSettings({ enabled: false }))
+    await waitFor(() => expect(result.current.state.loading).toBe(false))
+
+    await act(async () => {
+      await result.current.refreshModels()
+    })
+    expect(gateway.listAiProviderModels).not.toHaveBeenCalled()
+  })
+
+  it("显式 reload 是不活跃之上的明确意图，照常读取", async () => {
+    gateway.listAiProviderProfiles.mockResolvedValue([PROFILE])
+    const { result } = renderHook(() => useAiProviderSettings({ enabled: false }))
+    await waitFor(() => expect(result.current.state.loading).toBe(false))
+
+    await act(async () => {
+      await result.current.reload()
+    })
+    expect(gateway.listAiProviderProfiles).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(result.current.selectedProfile?.profileId).toBe(PROFILE.profileId))
+  })
+})
+
+/**
  * 凭据的写入与清除**不能并发**。
  *
  * 两条写操作改的是同一个凭据：同时放行时，最终状态由两个请求的完成顺序决定，而界面显示的

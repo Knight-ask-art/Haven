@@ -45,6 +45,40 @@ pub enum HttpUrlPolicy {
     UserProvidedSource,
 }
 
+/// One capability/stream owner resolves the outbound URL policy for a
+/// server-side source identity, so every downstream I/O boundary (capability
+/// projection, grant registration, manifest target resolution, DNS validation)
+/// reuses exactly this value instead of re-deriving a policy from a browser
+/// URL, an arbitrary string prefix or a client-supplied flag.
+///
+/// Unscoped resources keep [`HttpUrlPolicy::MediaResource`]; the user-configured
+/// source scope is only reached through a persisted, server-owned source
+/// identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamUrlScope {
+    /// Default fixed/public media boundary.
+    Media,
+    /// Streams persisted by a user-configured source (LAN M3U channel).
+    UserProvidedSource,
+}
+
+impl StreamUrlScope {
+    pub fn policy(self) -> HttpUrlPolicy {
+        match self {
+            Self::Media => HttpUrlPolicy::MediaResource,
+            Self::UserProvidedSource => HttpUrlPolicy::UserProvidedSource,
+        }
+    }
+
+    /// Whether a literal/DNS address is an acceptable destination for this
+    /// scope. This is the single address-class decision shared by literal URL
+    /// validation and post-DNS pinning, so a user-scoped stream may reach a
+    /// private LAN address that the default media policy still denies.
+    pub fn allows_address(self, host: &str, ip: IpAddr) -> bool {
+        is_allowed_http_address(host, ip, self.policy())
+    }
+}
+
 /// Errors are intentionally coarse so callers can map them to a safe user
 /// message without echoing the rejected URL or its credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,11 +351,20 @@ pub fn is_publicly_routable(ip: IpAddr) -> bool {
     }
 }
 
+/// Apply the request policy to one literal or DNS answer before pinning it.
+pub fn is_allowed_http_address(host: &str, ip: IpAddr, policy: HttpUrlPolicy) -> bool {
+    is_publicly_routable(ip)
+        || fixture_loopback_allowed(host, ip)
+        || (policy == HttpUrlPolicy::AiProviderEndpoint && ai_provider_loopback_allowed(host, ip))
+        || (host.parse::<IpAddr>().is_err() && is_local_proxy_fake_ip(ip))
+        || (policy == HttpUrlPolicy::UserProvidedSource && is_user_source_local_ip_allowed(ip))
+}
+
 /// Private destinations are accepted only for an explicitly user-configured
 /// source endpoint. Link-local, unspecified, multicast and reserved ranges are
 /// intentionally excluded; 100.64.0.0/10 is included for common personal VPNs.
 pub fn is_user_source_local_ip_allowed(ip: IpAddr) -> bool {
-    if is_local_proxy_fake_ip(ip) {
+    if is_local_proxy_fake_ip(ip) || ip == IpAddr::V4(Ipv4Addr::new(100, 100, 100, 200)) {
         return false;
     }
     match ip {
@@ -734,7 +777,7 @@ mod tests {
             "http://nas:5001/opds",
             "http://komga.local:8096/api",
             "https://reader.home.internal:5001/opds",
-            "http://100.100.100.200:8096/api",
+            "http://100.64.1.10:8096/api",
         ] {
             assert!(
                 parse_http_url(raw, HttpUrlPolicy::UserProvidedSource).is_ok(),
@@ -779,6 +822,7 @@ mod tests {
             "https://catalog.example.invalid:/opds",
             "https://catalog.example.invalid:65536/opds",
             // Link-local / metadata / reserved ranges.
+            "http://100.100.100.200:8096/api",
             "http://169.254.169.254:8096/latest/meta-data",
             "http://198.18.0.1:8096/api",
             "http://192.0.0.9:8096/api",

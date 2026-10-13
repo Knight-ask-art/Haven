@@ -15,19 +15,19 @@
 
 include!("../command-manifest.rs");
 
+mod support;
+use support::{invoke_request, real_acl_context};
+
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use tauri::ipc::{CallbackFn, Origin, RuntimeAuthority};
-use tauri::test::{
-    get_ipc_response, mock_builder, mock_context, noop_assets, MockRuntime, INVOKE_KEY,
-};
+use tauri::ipc::{Origin, RuntimeAuthority};
+use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, MockRuntime};
 use tauri::utils::acl::capability::Capability;
 use tauri::utils::acl::manifest::Manifest;
 use tauri::utils::acl::resolved::Resolved;
 use tauri::utils::platform::Target;
-use tauri::webview::InvokeRequest;
-use tauri::{Context, Url};
+use tauri::Context;
 
 use haven_infrastructure::Db;
 use haven_tauri_lib::commands::storage_location::run_register_local;
@@ -45,22 +45,6 @@ const BUILT_CAPABILITIES_PATH: &str = concat!(env!("OUT_DIR"), "/capabilities.js
 /// URL 遵循 Tauri 平台规则：Windows/Android 用 `http://tauri.localhost`（本地 origin），
 /// 其余平台用 `tauri://localhost`。否则 Windows 上 `tauri://localhost` 会被判为 remote，
 /// 使已授权命令被 ACL 误拒。
-fn invoke_request(cmd: &str, body: serde_json::Value) -> InvokeRequest {
-    let url = if cfg!(any(windows, target_os = "android")) {
-        Url::parse("http://tauri.localhost").unwrap()
-    } else {
-        Url::parse("tauri://localhost").unwrap()
-    };
-    InvokeRequest {
-        cmd: cmd.into(),
-        callback: CallbackFn(1),
-        error: CallbackFn(2),
-        url,
-        body: body.into(),
-        headers: Default::default(),
-        invoke_key: INVOKE_KEY.to_string(),
-    }
-}
 
 fn json_contains_string(value: &serde_json::Value, needle: &str) -> bool {
     match value {
@@ -78,19 +62,6 @@ fn json_contains_string(value: &serde_json::Value, needle: &str) -> bool {
 /// 用真实 build 产物 ACL/capabilities 构造 authority 的 context（阻塞二）。
 /// `Context::runtime_authority_mut`（doc(hidden) pub）直接替换为
 /// `RuntimeAuthority::new(acl, resolved)`。
-fn real_acl_context() -> Context<MockRuntime> {
-    let mut context = mock_context(noop_assets());
-    let acl_json =
-        std::fs::read_to_string(BUILT_ACL_PATH).expect("build.rs 生成 acl-manifests.json");
-    let caps_json =
-        std::fs::read_to_string(BUILT_CAPABILITIES_PATH).expect("build.rs 生成 capabilities.json");
-    let acl: BTreeMap<String, Manifest> = serde_json::from_str(&acl_json).unwrap();
-    let capabilities: BTreeMap<String, Capability> = serde_json::from_str(&caps_json).unwrap();
-    let resolved = Resolved::resolve(&acl, capabilities, Target::current())
-        .expect("真实 ACL/capabilities 必须可解析");
-    *context.runtime_authority_mut() = RuntimeAuthority::new(acl, resolved);
-    context
-}
 
 /// 空 authority 的普通 context（dispatch deny 测试用：未知命令不应先被 ACL 拒绝）。
 fn empty_context() -> Context<MockRuntime> {

@@ -112,6 +112,22 @@ describe("来源页的设计骨架", () => {
 })
 
 describe("来源设置中的 RSS/Atom 添加流程", () => {
+  it("OPDS 凭据必须带真实用户名，保存后清空密码表单", async () => {
+    const client = getHavenClient()
+    const { sourceId } = await client.sourceAdd({ displayName: "用户名回归书库", endpoint: "https://books.example.invalid/opds", kind: "opds" })
+    const save = vi.spyOn(client, "sourceSetCredential")
+    renderSourcesSettings()
+    fireEvent.click(await screen.findByRole("button", { name: "用户名回归书库 更多操作" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "配置访问凭据" }))
+    const password = screen.getByLabelText("访问密码（仅写入系统凭据管理器，不回显、不落库）")
+    fireEvent.change(password, { target: { value: "synthetic-password" } })
+    expect((screen.getByRole("button", { name: "保存凭据" }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText("OPDS 用户名"), { target: { value: "reader" } })
+    fireEvent.click(screen.getByRole("button", { name: "保存凭据" }))
+    await waitFor(() => expect(save).toHaveBeenCalledWith({ sourceId, secret: "synthetic-password", username: "reader" }))
+    await waitFor(() => expect((password as HTMLInputElement).value).toBe(""))
+  })
+
   it("把用户选择的订阅源类型沿 UI 传入 source_add，并跳过凭据表单", async () => {
     const sourceAdd = vi.spyOn(getHavenClient(), "sourceAdd").mockResolvedValue({
       schemaVersion: 1,
@@ -385,6 +401,7 @@ describe("来源管理异步交互回归", () => {
     renderSourcesSettings()
     fireEvent.click(await screen.findByRole("button", { name: "写入书库 更多操作" }))
     fireEvent.click(screen.getByRole("menuitem", { name: /配置访问凭据/ }))
+    fireEvent.change(screen.getByLabelText("OPDS 用户名"), { target: { value: "reader" } })
     fireEvent.change(screen.getByLabelText(/访问密码（仅写入/), { target: { value: "mock-only-not-a-credential" } })
     fireEvent.click(screen.getByRole("button", { name: "保存凭据" }))
     expect((await screen.findByRole("alert")).textContent).toBe("系统凭据管理器写入失败")

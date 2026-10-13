@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use haven_common::network::{HttpUrlPolicy, parse_http_url};
+use haven_common::network::{StreamUrlScope, parse_http_url};
 use haven_common::{AppError, ErrorKind};
 use haven_domain::contracts::{MediaItemRepository, ResourceRepository, StorageLocationRepository};
 use haven_domain::entities::{Resource, ResourceLocator};
@@ -309,9 +309,8 @@ fn online_readable_locator(
                 })
                 && crate::services::session::resource_type_compatible(engine, resource)
         }
-        ResourceLocator::Http { url } => {
-            media_type_is_playback(media_type)
-                && http_stream_online_readable(resource.resource_type, url)
+        ResourceLocator::Http { .. } => {
+            media_type_is_playback(media_type) && http_stream_online_readable(resource)
         }
     }
 }
@@ -320,14 +319,30 @@ fn online_readable_locator(
 /// session, even though they are not ordinary downloadable files.  Keep this
 /// capability projection deliberately narrow: only the implemented HTTP video
 /// and HLS resource kinds may opt in. DASH remains an explicit domain enum but
-/// is unavailable until a complete player path is implemented. The URL must
-/// also pass the shared outbound HTTP URL policy.
-/// The URL itself never crosses the resource-summary wire boundary.
-pub(crate) fn http_stream_online_readable(resource_type: ResourceType, raw_url: &str) -> bool {
+/// is unavailable until a complete player path is implemented.
+///
+/// Both the capability projection and stream preparation use this predicate.
+/// The source scope comes from the persisted resource, never from the browser.
+pub(crate) fn http_stream_online_readable(resource: &Resource) -> bool {
+    let ResourceLocator::Http { url } = &resource.locator else {
+        return false;
+    };
     matches!(
-        resource_type,
+        resource.resource_type,
         ResourceType::VideoStream | ResourceType::HlsStream
-    ) && parse_http_url(raw_url, HttpUrlPolicy::MediaResource).is_ok()
+    ) && parse_http_url(url, resource_stream_scope(resource).policy()).is_ok()
+}
+
+pub(crate) fn resource_stream_scope(resource: &Resource) -> StreamUrlScope {
+    use crate::services::source_import::{M3U_SOURCE_ID, source_key_for_id};
+
+    if matches!(resource.locator, ResourceLocator::Http { .. })
+        && resource.source_id.and_then(source_key_for_id) == Some(M3U_SOURCE_ID)
+    {
+        StreamUrlScope::UserProvidedSource
+    } else {
+        StreamUrlScope::Media
+    }
 }
 
 fn is_stream_resource(resource_type: ResourceType) -> bool {
@@ -482,6 +497,49 @@ mod tests {
     use haven_domain::ids::{EditionId, WorkId};
     use haven_infrastructure::Db;
     use haven_infrastructure::db::repos::SqliteRepositories;
+
+    fn http_resource(resource_type: ResourceType, raw_url: &str) -> Resource {
+        Resource {
+            id: haven_domain::ResourceId::new(),
+            media_item_id: MediaItemId::new(),
+            resource_type,
+            source_id: None,
+            storage_location_id: None,
+            locator: ResourceLocator::Http {
+                url: raw_url.to_owned(),
+            },
+            mime_type: None,
+            size: None,
+            hash: None,
+            availability: Availability::Available,
+            availability_source: AvailabilitySource::User,
+            modified_ms: None,
+            fingerprint_first: None,
+            fingerprint_last: None,
+            created_at: haven_common::UtcMillis(1),
+            updated_at: haven_common::UtcMillis(1),
+        }
+    }
+
+    fn http_stream_online_readable(resource_type: ResourceType, raw_url: &str) -> bool {
+        super::http_stream_online_readable(&http_resource(resource_type, raw_url))
+    }
+
+    #[test]
+    fn personal_stream_scope_requires_the_persisted_m3u_identity() {
+        for url in [
+            "http://127.0.0.1:8096/live.m3u8",
+            "http://192.168.1.10:8096/live.m3u8",
+        ] {
+            let mut resource = http_resource(ResourceType::HlsStream, url);
+            assert!(!super::http_stream_online_readable(&resource));
+            resource.source_id = Some(crate::services::source_import::m3u_source_id().unwrap());
+            assert!(super::http_stream_online_readable(&resource));
+            assert!(online_readable_locator(&resource, MediaType::Episode, None));
+            resource.source_id = Some(haven_domain::ids::SourceId::new());
+            assert!(!super::http_stream_online_readable(&resource));
+        }
+    }
 
     #[tokio::test]
     async fn list_returns_safe_summary_without_locator() {

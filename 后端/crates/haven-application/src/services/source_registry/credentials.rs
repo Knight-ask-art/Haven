@@ -531,6 +531,11 @@ impl SourceRegistryService {
     /// 撤销引用并登记清理义务 → 外部删除」。两条路径都**没有**任何旧秘密还原分支，
     /// 并且都在**同一份**外部 I/O 租约内完成（租约在这里获取一次，私有 helper 只接收
     /// 已经持有的守卫，绝不递归获取）。
+    ///
+    /// OPDS 的 `username` 在这里被编码进 secret 槽（见 [`super::opds_credential`]）：用户名
+    /// 与密码一起成为**版本化载荷**，因此出站 `Authorization` 头不再需要拿内部分配标识
+    /// 当用户名。Komga/Kavita 的 API key 没有用户名，传了非空 `username` 一律拒绝——那样
+    /// 只会造出一条永远读不出用户名的条目。
     pub async fn set_custom_source_credential(
         &self,
         request: &SourceSetCredentialRequest,
@@ -542,8 +547,12 @@ impl SourceRegistryService {
         if request.secret.as_deref() == Some("") {
             return Err(invalid_argument("凭据内容不能为空"));
         }
+        // 种类由 sourceId 前缀唯一决定；未知来源在这里就 fail closed，绝不先分配槽位。
+        let kind = Self::custom_kind_from_source_id(&request.source_id)
+            .ok_or_else(|| not_found("自定义来源不存在"))?;
+        let encoded = encode_stored_secret(kind, request)?;
         let lease = self.acquire_credential_lease().await?;
-        match request.secret.as_deref() {
+        match encoded {
             None => {
                 self.clear_custom_source_credential(&request.source_id, store, lease.as_ref())
                     .await
@@ -551,7 +560,7 @@ impl SourceRegistryService {
             Some(secret) => {
                 self.write_custom_source_credential(
                     &request.source_id,
-                    secret,
+                    &secret,
                     store,
                     lease.as_ref(),
                 )
@@ -1125,7 +1134,6 @@ struct SourceRemovalPlan {
     removed: bool,
     pending: bool,
 }
-
 /// 某个来源是否还有未完成的清理义务（凭据或配置缓存）。
 fn has_pending_cleanup(payload: &SourcesPayload, source_id: &str) -> bool {
     payload
@@ -1133,4 +1141,50 @@ fn has_pending_cleanup(payload: &SourcesPayload, source_id: &str) -> bool {
         .iter()
         .any(|entry| entry.source_id == source_id)
         || payload.cache_cleanup.iter().any(|id| id == source_id)
+}
+
+/// 把一次 `source_set_credential` 请求编码成**落进凭据槽**的那一段字符串。
+///
+/// - `None` = 清除凭据（调用方走清除路径，本函数不参与）。
+/// - OPDS：把用户名与密码编码成版本化载荷。请求没带 `username` 时编码成一段裸密码，
+///   **仅用于兼容历史调用**——它读出来是「需要重新配置」，不会退化成「用户名 = 内部分配
+///   标识」那种错误认证。
+/// - Komga/Kavita：key 就是 secret 原文；请求带非空 `username` 一律拒绝，因为那条路径
+///   没有消费用户名的位置，静默丢弃会让用户以为账号被保存了。
+/// - 订阅源 / TVBox：不使用单独凭据，`credential_provider` 为 `None`，这里统一拒绝。
+fn encode_stored_secret(
+    kind: CustomSourceKind,
+    request: &SourceSetCredentialRequest,
+) -> Result<Option<String>, AppError> {
+    let Some(secret) = request.secret.as_deref() else {
+        return Ok(None);
+    };
+    let username = request.username.as_deref().map(str::trim);
+    if kind != CustomSourceKind::Opds {
+        if SourceRegistryService::credential_provider(kind).is_none() {
+            return Err(invalid_argument("该来源不使用单独的访问凭据"));
+        }
+        if username.is_some_and(|username| !username.is_empty()) {
+            return Err(invalid_argument("该来源的 API key 不使用用户名"));
+        }
+        return Ok(Some(secret.to_owned()));
+    }
+    let Some(username) = username else {
+        // 历史调用形态：只有一段密码。它仍然是合法写入（槽位与租约语义不变），但读出来
+        // 一定是「需要重新配置」——绝不在读取侧把它按 `:` 切成用户名。
+        return Ok(Some(secret.to_owned()));
+    };
+    if !super::opds_credential::is_valid_opds_basic_username(username) {
+        return Err(invalid_argument(
+            "用户名不能为空、不能包含冒号且不超过 128 字符",
+        ));
+    }
+    if !super::opds_credential::is_valid_opds_basic_password(secret) {
+        return Err(invalid_argument(
+            "密码不能为空、不能包含换行且不超过 512 字符",
+        ));
+    }
+    Ok(Some(super::opds_credential::encode_opds_basic_credential(
+        username, secret,
+    )))
 }

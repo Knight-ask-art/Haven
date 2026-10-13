@@ -37,7 +37,9 @@ use haven_application::services::search_source::SearchSourceParticipant;
 use haven_application::services::source_import::{
     RemoteContentRef, SourceCatalogEntry, SourceCatalogProvider,
 };
-use haven_application::services::source_registry::CustomSourceKind;
+use haven_application::services::source_registry::{
+    CustomSourceKind, OpdsCredentialRead, read_opds_credential,
+};
 use haven_common::network::parse_http_url;
 use haven_common::{AppError, ErrorKind};
 use haven_domain::comic_catalog::ComicChapterCatalog;
@@ -93,6 +95,12 @@ const EPUB_MIME: &str = "application/epub+zip";
 const MAX_REDIRECTS: usize = 3;
 
 /// 单条 OPDS 条目（解析投影）。
+///
+/// `entry_id` 是 Atom 的**身份**（`<id>` 原文），不是「一个地址」：它可以是
+/// `urn:uuid:...`、`tag:example.org,2026:...` 这类**永远不可请求**的标识，也可以是条目页
+/// URL。身份与可抓取地址是两件事，因此候选过滤只对**真正会被请求的地址**做校验，绝不拿
+/// 身份去套 URL 策略——否则一个完全合法的 URN 身份会让整条条目（连同它合法的获取链接）
+/// 被静默丢弃。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpdsEntry {
     pub entry_id: String,
@@ -103,6 +111,24 @@ pub struct OpdsEntry {
     pub pic: Option<String>,
     /// 首个 EPUB 获取链接（绝对地址）。
     pub epub_href: Option<String>,
+}
+
+impl OpdsEntry {
+    /// 目录获取链接；封面由独立图片代理校验，不能使书目被丢弃。
+    ///
+    /// 只包含已经过 `absolutize` 的绝对 http(s) 值；身份不在其中——它是标识符，不是目标。
+    fn fetchable_urls(&self) -> impl Iterator<Item = &str> {
+        self.epub_href.as_deref().into_iter()
+    }
+
+    /// 身份是否**看起来**是一个可以被当作条目页请求的 http(s) 地址。
+    ///
+    /// URN / tag 身份在搜索阶段只是一个标识符，不参与出站校验；只有 http(s) 身份才可能
+    /// 被后续的条目页抓取（`detail` 路径）当成目标。
+    fn identity_is_http_url(&self) -> bool {
+        reqwest::Url::parse(&self.entry_id)
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+    }
 }
 
 fn invalid_feed(detail: &'static str) -> AppError {
@@ -234,6 +260,69 @@ fn book_candidates(entries: Vec<OpdsEntry>) -> Vec<OpdsEntry> {
         .collect()
 }
 
+fn valid_search_feed(xml: &str) -> bool {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut depth = 0usize;
+    let mut root_seen = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                if element.attributes().any(|value| value.is_err()) {
+                    return false;
+                }
+                if depth == 0 {
+                    if root_seen || local_name(&element) != "feed" {
+                        return false;
+                    }
+                    root_seen = true;
+                }
+                depth += 1;
+            }
+            Ok(Event::Empty(element)) => {
+                if element.attributes().any(|value| value.is_err()) {
+                    return false;
+                }
+                if depth == 0 {
+                    if root_seen || local_name(&element) != "feed" {
+                        return false;
+                    }
+                    root_seen = true;
+                }
+            }
+            Ok(Event::End(_)) => {
+                let Some(next) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next;
+            }
+            Ok(Event::Text(text)) if depth == 0 => {
+                let bytes: &[u8] = text.as_ref();
+                if !bytes.iter().all(u8::is_ascii_whitespace) {
+                    return false;
+                }
+            }
+            Ok(Event::Eof) => return root_seen && depth == 0,
+            Err(_) => return false,
+            _ => {}
+        }
+    }
+}
+
+fn apply_opds_auth(
+    builder: reqwest::RequestBuilder,
+    secret: &str,
+) -> Result<reqwest::RequestBuilder, AppError> {
+    match read_opds_credential(secret) {
+        OpdsCredentialRead::Basic { username, password } => {
+            Ok(builder.basic_auth(username, Some(password)))
+        }
+        OpdsCredentialRead::LegacyPassword | OpdsCredentialRead::Malformed => {
+            Err(opds_credential_reconfiguration_required())
+        }
+    }
+}
+
 fn take_summary(raw: &mut str) -> Option<String> {
     let cleaned = clean_text(raw);
     if cleaned.is_empty() {
@@ -311,7 +400,25 @@ fn collect_link(
 
 // ---------- HTTP 客户端 ----------
 
-/// 自定义源凭据解析器：sourceId → Basic Auth 密码（secret 只在内存，禁止落盘/日志）。
+/// 凭据解析阶段的失败：**只有** `Reconfigure` 会走到用户面前。
+///
+/// 历史明文密码（本切片之前的 `haven:opds:<sourceId>` 槽里只有一段密码，确定不了用户名）
+/// 不能靠猜来继续：按 `:` 切一刀会把 `p@ss:word` 静默变成一个**不同的**账号，用错误的
+/// 身份去登录，用户只会看到一次说不清原因的 401。这里如实报成可操作的重新配置状态。
+pub(super) fn opds_credential_reconfiguration_required() -> AppError {
+    AppError::new(
+        "CREDENTIAL_RECONFIGURATION_REQUIRED",
+        ErrorKind::Validation,
+        "该来源的访问凭据是旧格式（没有用户名），无法用于 Basic 认证；请在设置 → 来源中重新填写用户名与密码",
+        false,
+    )
+}
+
+/// 自定义源凭据解析器：sourceId → Basic 凭据（用户名 + 密码，只在内存，禁止落盘/日志）。
+///
+/// 返回 `Ok(None)` = 该来源没有可解析的凭据（未配置 / 已清除）；返回
+/// `Err(CREDENTIAL_RECONFIGURATION_REQUIRED)` = 有凭据但形状不可用。两者必须可区分：
+/// 前者是「匿名请求照常发」，后者是「停下来让用户重新配置」，都不能降级成盲发。
 pub type CredentialResolver = dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
     + Send
     + Sync;
@@ -435,9 +542,11 @@ impl OpdsClient {
     /// 解析器在异步区间之前读到的来源身份/端点/版本，与解析之后重读的那一份必须完全一致；
     /// 任何变化（端点 A→B、A→B→A、凭据轮换、来源被删除）都让本次请求 fail closed，绝不把
     /// 新解析出来的 secret 发往旧上下文选定的端点。**解析结果为空也必须复核**：解析器返回
-    /// `None` 只说明本次拿不到 secret，不说明来源上下文没变；漏掉这一步会让一个已经失效的
-    /// 上下文照常发请求。凭据格式与本切片之前完全一致（Basic `sourceId:password`），来源
-    /// 作用域由解析器自己保证。
+    /// `Ok(None)` 只说明本次拿不到 secret，不说明来源上下文没变；漏掉这一步会让一个已经失效的
+    /// 上下文照常发请求。
+    ///
+    /// 凭据形状本身由解析器判定（它才读得到凭据槽）：历史明文密码在那里变成
+    /// `CREDENTIAL_RECONFIGURATION_REQUIRED`，**绝不**由本函数拿 `sourceId` 顶替用户名。
     async fn resolve_credential(
         &self,
         context: &OpdsRequestContext,
@@ -504,10 +613,9 @@ impl OpdsClient {
                 .map_err(|_| invalid_feed("HTTP 客户端初始化失败"))?;
             let mut builder = client.get(target.url.clone());
             if credential == HopCredential::Authorized {
-                let secret = self.resolve_credential(context, &current).await?;
-                if let (Some(sid), Some(secret)) = (context.source_id(), secret) {
-                    // secret 即取即用；reqwest 内部按 header 编码，不落日志。
-                    builder = builder.basic_auth::<&str, String>(sid, Some(secret));
+                let resolved = self.resolve_credential(context, &current).await?;
+                if let Some(secret) = resolved {
+                    builder = apply_opds_auth(builder, &secret)?;
                 }
             }
             let resp = builder
@@ -689,8 +797,8 @@ impl OpdsClient {
         // Gutenberg：www 镜像优先（m. 对 search.opds 常 504），成功则跳过 OpenSearch。
         if is_gutenberg_endpoint(endpoint) {
             urls.extend(gutenberg_search_mirrors(query));
-        } else if let Ok(url) = self.search_url_with(&context, endpoint, query).await {
-            urls.push(url);
+        } else {
+            urls.push(self.search_url_with(&context, endpoint, query).await?);
         }
         let mut last_err: Option<AppError> = None;
         if let Some(entries) = self
@@ -716,6 +824,8 @@ impl OpdsClient {
         Err(last_err.unwrap_or_else(|| invalid_feed("目录服务不可达")))
     }
 
+    /// 返回首个有效 feed，包括空结果；只有传输或解析失败才尝试镜像。
+    /// 获取链接和 HTTP 身份须属于目录来源；封面另由图片代理校验。
     async fn try_search_urls(
         &self,
         context: &OpdsRequestContext,
@@ -728,15 +838,17 @@ impl OpdsClient {
             match self.get_feed(context, url).await {
                 Ok(body) => {
                     let xml = String::from_utf8_lossy(&body);
+                    if !valid_search_feed(&xml) {
+                        *last_err = Some(invalid_feed("目录返回了无效的 Atom 搜索结果"));
+                        continue;
+                    }
                     let mut entries: Vec<OpdsEntry> = book_candidates(parse_atom(&xml, url).0)
                         .into_iter()
                         .filter(|entry| {
-                            self.is_source_url_allowed(context, source_endpoint, &entry.entry_id)
+                            self.candidate_stays_on_source(context, source_endpoint, entry)
                         })
                         .collect();
-                    if entries.is_empty() {
-                        continue;
-                    }
+                    // 空结果同样是**成功读到的**事实：截断后返回，不再继续试下一个候选。
                     entries.truncate(limit as usize);
                     return Some(entries);
                 }
@@ -744,6 +856,30 @@ impl OpdsClient {
             }
         }
         None
+    }
+
+    /// 一条候选是否仍然留在本次请求的来源权威内。
+    ///
+    /// 判定对象是条目上**真正会被请求的地址**（获取链接、封面），而不是 Atom 身份：
+    /// `urn:uuid:...` 与 `tag:...` 是完全合法的 OPDS 身份，对它们套 URL 策略只能得到
+    /// 「不是 http(s)」这一与安全无关的结论。反过来，一个**看起来像 URL** 的身份必须
+    /// 接受同样的权威校验——它是 `detail` 路径会去抓的条目页，不能借身份字段把请求引到
+    /// 别的 origin。
+    fn candidate_stays_on_source(
+        &self,
+        context: &OpdsRequestContext,
+        source_endpoint: &str,
+        entry: &OpdsEntry,
+    ) -> bool {
+        for target in entry.fetchable_urls() {
+            if !self.is_source_url_allowed(context, source_endpoint, target) {
+                return false;
+            }
+        }
+        if entry.identity_is_http_url() {
+            return self.is_source_url_allowed(context, source_endpoint, &entry.entry_id);
+        }
+        true
     }
 
     /// 条目页 → 只解析单条目元数据，不获取 EPUB 正文。
@@ -1034,10 +1170,7 @@ impl SourceCatalogProvider for OpdsCatalogProvider {
         // 权威上下文来自**注册表**：只有确实登记为自定义 OPDS 书源的 `sourceId` 才拿到
         // 用户来源策略与凭据，未知/其它 `custom_` 家族会在这里 fail closed。
         //
-        // 凭据引用不是由 `sourceId` 拼出来的 profile：解析器读的是注册表当前选中的
-        // **版本化引用**（`CustomSourceRecord.credential_ref` → 系统凭据库），而 Basic 的
-        // 用户名段仍是 `sourceId`，形状与本切片之前一致。引用只在本文件的
-        // `resolve_credential` 里、且只在登记端点 origin 上、复核过配置版本之后才被使用。
+        // 复核登记版本和 origin 后解析当前凭据引用；用户名取自版本化载荷。
         let context = self.client.request_context(Some(source_id)).await?;
         // A candidate handle may only refer to an entry on the configured
         // source authority.  Do not let a caller replace the registered
@@ -1948,8 +2081,7 @@ mod tests {
                 .as_deref(),
             Some("p@ss:word")
         );
-        // Basic 的用户名段是 sourceId：凭据格式与本切片之前完全一致
-        // （解析器被请求的来源 ID 就是将被编码进 `basic_auth(source_id, secret)` 的那一个）。
+        // 这里只验证凭据引用归属；HTTP Basic 用户名由版本化凭据载荷提供。
         assert_eq!(calls.lock().unwrap().clone(), vec![source_id.clone()]);
 
         // 另一个 origin（被篡改的目录链接/模板/重定向）不许继承凭据：连解析都不做。

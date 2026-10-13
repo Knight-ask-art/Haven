@@ -19,12 +19,10 @@ import {
   catalogStateHint,
   capabilityLabel,
   deleteAiProviderProfile,
-  getAiProviderProfile,
   guardAiProviderModel,
   guardAiProviderModelsCatalog,
   guardAiProviderProfile,
   guardAiProviderProfileList,
-  guardCredentialStatus,
   isAiEndpointTransportAllowed,
   toModelOptions,
   upsertAiProviderProfile,
@@ -141,12 +139,6 @@ describe("AI Provider wire runtime guards", () => {
     ).toBe(false)
   })
 
-  it("rejects credential status shapes that could carry a secret", () => {
-    expect(guardCredentialStatus({ configured: true, updatedAt: null })).toBe(true)
-    expect(guardCredentialStatus({ configured: false, updatedAt: "2026-09-18T00:00:00Z" })).toBe(true)
-    expect(guardCredentialStatus({ configured: true, updatedAt: null, secret: "sk-x" })).toBe(false)
-    expect(guardCredentialStatus({ configured: "yes", updatedAt: null })).toBe(false)
-  })
 
   it("only treats a ready non-empty catalog as having available models", () => {
     expect(catalogHasModels(modelsReady as never)).toBe(true)
@@ -189,27 +181,6 @@ describe("AI Provider 网关的身份边界", () => {
     mocks.getHavenClient.mockReset()
   })
 
-  it("参数读取拒绝属于另一个 profile 的响应", async () => {
-    mocks.getHavenClient.mockReturnValue({
-      aiProviderProfileGet: vi.fn(async () => ({ ...PROFILE, profileId: OTHER_PROFILE_ID })),
-    })
-    // 拒绝是稳定错误，且文案不回显被拒绝的载荷内容（这里连 id 都不出现）。
-    const mismatch = await getAiProviderProfile(PROFILE.profileId).then(
-      () => null,
-      (error: unknown) => error as { code?: string; retryable?: boolean; message?: string },
-    )
-    expect(mismatch?.code).toBe("INTERNAL_ERROR")
-    expect(mismatch?.retryable).toBe(false)
-    expect(mismatch?.message ?? "").not.toContain(OTHER_PROFILE_ID)
-
-    // 反向证据：同一份载荷在匹配的 id 下必须通过，否则上面的拒绝可以靠"一律拒绝"通过。
-    mocks.getHavenClient.mockReturnValue({
-      aiProviderProfileGet: vi.fn(async () => PROFILE),
-    })
-    await expect(getAiProviderProfile(PROFILE.profileId)).resolves.toMatchObject({
-      profileId: PROFILE.profileId,
-    })
-  })
 
   it("写入拒绝身份不符的响应", async () => {
     const request = {

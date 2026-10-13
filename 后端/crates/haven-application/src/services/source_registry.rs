@@ -48,6 +48,7 @@ mod credentials;
 mod health;
 mod lease;
 mod mutations;
+mod opds_credential;
 
 pub use credentials::{
     MAX_CREDENTIAL_CLEANUP, MAX_STAGED_CREDENTIALS, SOURCE_CREDENTIAL_CLEANUP_BATCH,
@@ -60,6 +61,11 @@ pub use lease::{
     source_credential_busy, source_credential_lease_io_failed, source_credential_lease_unavailable,
 };
 use mutations::{SourcesMutation, decode_payload, payload_row};
+pub use opds_credential::{
+    OPDS_BASIC_CREDENTIAL_PREFIX, OPDS_BASIC_PASSWORD_MAX_CHARS, OPDS_BASIC_USERNAME_MAX_CHARS,
+    OpdsCredentialRead, is_valid_opds_basic_password, is_valid_opds_basic_username,
+    read_opds_credential,
+};
 
 /// settings 存储中的 section 名（复用 007_settings KV 表；来源管理属于设置域）。
 pub const SOURCES_SETTINGS_SECTION: &str = "sources";
@@ -2089,6 +2095,7 @@ mod tests {
         service
             .set_custom_source_credential(
                 &crate::wire::SourceSetCredentialRequest {
+                    username: None,
                     source_id: source_id.clone(),
                     secret: Some("s3cret".into()),
                 },
@@ -2123,6 +2130,7 @@ mod tests {
         service
             .set_custom_source_credential(
                 &crate::wire::SourceSetCredentialRequest {
+                    username: None,
                     source_id: source_id.clone(),
                     secret: None,
                 },
@@ -2150,6 +2158,7 @@ mod tests {
         let err = service
             .set_custom_source_credential(
                 &crate::wire::SourceSetCredentialRequest {
+                    username: None,
                     source_id: source_id.clone(),
                     secret: Some("x".into()),
                 },
@@ -2180,6 +2189,7 @@ mod tests {
         service
             .set_custom_source_credential(
                 &crate::wire::SourceSetCredentialRequest {
+                    username: None,
                     source_id: source_id.clone(),
                     secret: Some("pw".into()),
                 },
@@ -2241,6 +2251,7 @@ mod tests {
             service
                 .set_custom_source_credential(
                     &crate::wire::SourceSetCredentialRequest {
+                        username: None,
                         source_id: "opds_gutenberg".into(),
                         secret: None
                     },
@@ -2457,6 +2468,7 @@ mod tests {
         let error = service
             .set_custom_source_credential(
                 &crate::wire::SourceSetCredentialRequest {
+                    username: None,
                     source_id: added.source_id.clone(),
                     secret: Some("s3cret".into()),
                 },
@@ -2895,6 +2907,7 @@ mod tests {
         service
             .set_custom_source_credential(
                 &crate::wire::SourceSetCredentialRequest {
+                    username: None,
                     source_id: added.source_id.clone(),
                     secret: Some("komga-api-key".into()),
                 },
@@ -3166,6 +3179,7 @@ mod tests {
         let error = service
             .set_custom_source_credential(
                 &crate::wire::SourceSetCredentialRequest {
+                    username: None,
                     source_id: source_id.clone(),
                     secret: Some("token".into()),
                 },
@@ -3302,6 +3316,7 @@ mod tests {
             service
                 .set_custom_source_credential(
                     &crate::wire::SourceSetCredentialRequest {
+                        username: None,
                         source_id: source_id.clone(),
                         secret: Some("x".into()),
                     },
@@ -3314,6 +3329,7 @@ mod tests {
             service
                 .set_custom_source_credential(
                     &crate::wire::SourceSetCredentialRequest {
+                        username: None,
                         source_id: source_id.clone(),
                         secret: None,
                     },
@@ -3378,6 +3394,7 @@ mod tests {
         service
             .set_custom_source_credential(
                 &crate::wire::SourceSetCredentialRequest {
+                    username: None,
                     source_id: source_id.clone(),
                     secret: Some("pw".into()),
                 },

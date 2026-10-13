@@ -138,6 +138,8 @@ export interface AiAssistantDialogProps {
    * （"尚未选择 AI 服务配置"），而不是退回模板冒充模型输出。
    */
   profileId?: string | null
+  /** Profile initialization is owned by the settings controller. */
+  providerLoading?: boolean
   /**
    * 纯预览模式：不获取任何客户端，批准只产生「本地预览」回执。
    * 保留它是为了让"尚未接线"这条路径可被测试钉住。
@@ -1097,6 +1099,7 @@ export function AiAssistantDialog({
   onOpenSettings,
   client,
   profileId = null,
+  providerLoading = false,
   previewOnly = false,
   traceStepMs = 420,
 }: AiAssistantDialogProps) {
@@ -1237,7 +1240,7 @@ export function AiAssistantDialog({
 
   const submitPrompt = useCallback((raw: string) => {
     const prompt = raw.trim()
-    if (!prompt || Array.from(prompt).length > MAX_USER_INTENT_CHARS || state.status === "drafting") return
+    if (!prompt || providerLoading || Array.from(prompt).length > MAX_USER_INTENT_CHARS || state.status === "drafting") return
     setInput("")
     if (!wantsReadingProposal(prompt)) {
       dispatch({
@@ -1251,11 +1254,11 @@ export function AiAssistantDialog({
     }
     lastPromptRef.current = prompt
     dispatch({ type: "submit", prompt })
-  }, [state.status, previewMode])
+  }, [state.status, previewMode, providerLoading])
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    if (isDrafting || inputTooLong || !input.trim()) return
+    if (isDrafting || providerLoading || inputTooLong || !input.trim()) return
     submitPrompt(input)
     setInput("")
   }
@@ -1425,7 +1428,7 @@ export function AiAssistantDialog({
       )}
       {embedded && state.messages.length === 1 && (
         <div className="haven-ai-workbench__suggestions" aria-label="对话快捷操作">
-          {QUICK_ACTIONS.map((action) => <button key={action.id} type="button" onClick={() => submitPrompt(action.prompt)} disabled={isDrafting}>{action.label}<ArrowRight size={13} aria-hidden="true" /></button>)}
+          {QUICK_ACTIONS.map((action) => <button key={action.id} type="button" onClick={() => submitPrompt(action.prompt)} disabled={isDrafting || providerLoading}>{action.label}<ArrowRight size={13} aria-hidden="true" /></button>)}
         </div>
       )}
     </div>
@@ -1441,7 +1444,7 @@ export function AiAssistantDialog({
           <button
             key={action.id}
             type="button"
-            disabled={isDrafting}
+            disabled={isDrafting || providerLoading}
             onClick={() => submitPrompt(action.prompt)}
             className="rounded-full border border-[var(--haven-settings-border)] bg-[var(--haven-settings-card)] px-3 py-1.5 text-[12px] font-medium text-[var(--haven-settings-foreground)] transition-colors hover:border-[var(--haven-settings-primary)]/40 hover:text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50 dark:border-[var(--haven-settings-border)] dark:bg-[var(--haven-settings-card)] dark:text-[var(--haven-settings-foreground)]"
           >
@@ -1457,8 +1460,8 @@ export function AiAssistantDialog({
           id={inputId}
           value={input}
           onChange={(event) => setInput(event.target.value)}
-          placeholder="描述你想要的设置改动，例如：优化阅读"
-          disabled={isDrafting}
+          placeholder={providerLoading ? "正在读取 AI 服务配置…" : "描述你想要的设置改动，例如：优化阅读"}
+          disabled={isDrafting || providerLoading}
           rows={embedded ? 2 : 1}
           maxLength={MAX_USER_INTENT_CHARS * 2}
           autoComplete="off"
@@ -1473,7 +1476,7 @@ export function AiAssistantDialog({
         <button
           type="submit"
           aria-label="发送"
-          disabled={isDrafting || input.trim().length === 0 || inputTooLong}
+          disabled={isDrafting || providerLoading || input.trim().length === 0 || inputTooLong}
           className={cn("flex h-[32px] w-[32px] shrink-0 items-center justify-center rounded-full bg-[var(--haven-settings-primary)] text-[var(--haven-settings-primary-foreground)] transition-colors hover:bg-[var(--haven-settings-primary-hover)] disabled:cursor-not-allowed disabled:opacity-40", embedded && "h-[40px] w-[128px] rounded-full bg-[var(--haven-settings-primary)] text-[12px] font-semibold hover:bg-[var(--haven-settings-primary-hover)]")}
         >
           {embedded ? <><Send className="mr-[8px] h-[14px] w-[14px]" strokeWidth={2} />生成提案</> : <Send className="h-[15px] w-[15px]" strokeWidth={2} />}

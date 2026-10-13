@@ -1688,6 +1688,7 @@ mod tests {
         // 哨兵只在本测试内存在：Debug 文本里出现它就说明秘密漏了。
         let sentinel = "sentinel-secret-must-not-appear";
         let request = SourceSetCredentialRequest {
+            username: Some("fixture-user-sentinel".into()),
             source_id: "custom_opds_0123456789ab".into(),
             secret: Some(sentinel.into()),
         };
@@ -1698,9 +1699,11 @@ mod tests {
             "Debug 不得输出 secret 原文: {rendered}"
         );
         assert!(rendered.contains("custom_opds_0123456789ab"), "{rendered}");
+        assert!(!rendered.contains("fixture-user-sentinel"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
 
         let cleared = SourceSetCredentialRequest {
+            username: None,
             source_id: "custom_opds_0123456789ab".into(),
             secret: None,
         };
@@ -3001,6 +3004,11 @@ pub struct SourceRemoveResult {
 
 /// `source_set_credential`：写入/清除自定义源凭据。secret 只进系统 keyring；
 /// 持久化仅存 credential_ref；secret 与 target 禁止出 IPC、日志。
+///
+/// `username` 只对 OPDS Basic 有意义：目录服务按 RFC 7617 校验的是**用户自己的账号名**，
+/// 而不是后端生成的内部 `source_id`。写入时它与 `secret` 一起编码成版本化载荷存进凭据
+/// 槽（见 `source_registry::opds_credential`），不在响应中回显，也不进日志。
+/// Komga/Kavita 的 API key 与清除请求都不携带它。
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, rename_all = "camelCase")]
@@ -3008,17 +3016,23 @@ pub struct SourceSetCredentialRequest {
     pub source_id: String,
     /// null = 清除凭据；Some(空串) 非法 → INVALID_ARGUMENT。
     pub secret: Option<String>,
+    /// OPDS Basic 用户名；null/缺省 = 历史调用（只有一段密码，读出来是「需要重新配置」）。
+    /// 只有 OPDS 来源接受非空值，其它种类传非空值 → INVALID_ARGUMENT。
+    #[serde(default)]
+    #[ts(optional)]
+    pub username: Option<String>,
 }
 
 // Rust 侧说明（不进 wire 契约）：该类型刻意不 derive `Debug`，而是手工实现。secret 是
 // 明文秘密，任何日志、panic 或错误包装都不得打印出原文；Debug 只投影「这一次请求有没有
-// 携带秘密」这一位事实，长度、前缀等同样不进 Debug。序列化契约不变：请求方向上 secret
-// 仍然是真实字段。
+// 携带秘密」这一位事实，长度、前缀等同样不进 Debug。用户名与 secret 同属凭据材料，因此
+// 同样只投影有/无。序列化契约不变：请求方向上两者仍然是真实字段。
 impl std::fmt::Debug for SourceSetCredentialRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SourceSetCredentialRequest")
             .field("source_id", &self.source_id)
             .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .field("username", &self.username.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }

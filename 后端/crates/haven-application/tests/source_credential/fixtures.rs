@@ -562,6 +562,7 @@ impl MemoryCredentialStore {
                 let outcome = registry
                     .set_custom_source_credential(
                         &haven_application::wire::SourceSetCredentialRequest {
+                            username: None,
                             source_id,
                             secret: None,
                         },
@@ -790,6 +791,7 @@ pub async fn add_source(registry: &SourceRegistryService, name: &str, endpoint: 
 /// `source_set_credential` 请求（`Some` = 写入，`None` = 清除）。
 pub fn credential_request(source_id: &str, secret: Option<&str>) -> SourceSetCredentialRequest {
     SourceSetCredentialRequest {
+        username: None,
         source_id: source_id.to_owned(),
         secret: secret.map(str::to_owned),
     }

@@ -21,60 +21,18 @@
 //! 完整的 CAS / 空目录 / 停用 / 删除生命周期只在 Windows（真实 Credential Manager）
 //! 上执行。测试不会为跑通而替换成伪造的凭据后端。
 
-use std::collections::BTreeMap;
+mod support;
+use support::{invoke_request, real_acl_context};
+
 use std::sync::Arc;
 
-use tauri::ipc::{CallbackFn, RuntimeAuthority};
-use tauri::test::{
-    get_ipc_response, mock_builder, mock_context, noop_assets, MockRuntime, INVOKE_KEY,
-};
-use tauri::utils::acl::capability::Capability;
-use tauri::utils::acl::manifest::Manifest;
-use tauri::utils::acl::resolved::Resolved;
-use tauri::utils::platform::Target;
-use tauri::webview::InvokeRequest;
-use tauri::{Context, Url};
+use tauri::test::{get_ipc_response, mock_builder, MockRuntime};
 
 #[cfg(windows)]
 use tauri::Manager;
 
 use haven_infrastructure::Db;
 use haven_tauri_lib::state::AppState;
-
-fn invoke_request(cmd: &str, body: serde_json::Value) -> InvokeRequest {
-    InvokeRequest {
-        cmd: cmd.into(),
-        callback: CallbackFn(1),
-        error: CallbackFn(2),
-        // Windows/Android 使用本地 tauri origin；`tauri://` 在这些平台会被判为 remote。
-        url: if cfg!(any(windows, target_os = "android")) {
-            Url::parse("http://tauri.localhost").unwrap()
-        } else {
-            Url::parse("tauri://localhost").unwrap()
-        },
-        body: body.into(),
-        headers: Default::default(),
-        invoke_key: INVOKE_KEY.to_string(),
-    }
-}
-
-fn real_acl_context() -> Context<MockRuntime> {
-    let mut context = mock_context(noop_assets());
-    let acl: BTreeMap<String, Manifest> = serde_json::from_str(
-        &std::fs::read_to_string(concat!(env!("OUT_DIR"), "/acl-manifests.json"))
-            .expect("build.rs 生成 acl-manifests.json"),
-    )
-    .unwrap();
-    let capabilities: BTreeMap<String, Capability> = serde_json::from_str(
-        &std::fs::read_to_string(concat!(env!("OUT_DIR"), "/capabilities.json"))
-            .expect("build.rs 生成 capabilities.json"),
-    )
-    .unwrap();
-    let resolved = Resolved::resolve(&acl, capabilities, Target::current())
-        .expect("真实 ACL/capabilities 必须可解析");
-    *context.runtime_authority_mut() = RuntimeAuthority::new(acl, resolved);
-    context
-}
 
 fn app() -> tauri::App<MockRuntime> {
     let db = Arc::new(Db::open_in_memory().unwrap());

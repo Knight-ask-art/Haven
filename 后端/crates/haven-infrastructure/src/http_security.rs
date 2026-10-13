@@ -9,10 +9,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use haven_common::network::{
-    HttpUrlPolicy, ai_provider_loopback_allowed, fixture_loopback_allowed, is_local_proxy_fake_ip,
-    is_publicly_routable, is_user_source_local_ip_allowed, parse_http_url,
-};
+use haven_common::network::{HttpUrlPolicy, is_allowed_http_address, parse_http_url};
 use reqwest::{ClientBuilder, Url};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,11 +111,7 @@ fn validate_resolved_addresses(
 /// literals are allowed by the AI policy; private LAN/loopback answers are
 /// accepted only for explicitly configured sources.
 fn is_allowed_dns_address(host: &str, ip: IpAddr, policy: HttpUrlPolicy) -> bool {
-    is_publicly_routable(ip)
-        || fixture_loopback_allowed(host, ip)
-        || (policy == HttpUrlPolicy::AiProviderEndpoint && ai_provider_loopback_allowed(host, ip))
-        || (host.parse::<IpAddr>().is_err() && is_local_proxy_fake_ip(ip))
-        || (policy == HttpUrlPolicy::UserProvidedSource && is_user_source_local_ip_allowed(ip))
+    is_allowed_http_address(host, ip, policy)
 }
 
 /// Apply the transport controls that make `target.addresses` authoritative.

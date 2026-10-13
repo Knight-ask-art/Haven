@@ -11,7 +11,7 @@ use std::time::Instant;
 
 #[cfg(test)]
 use haven_common::network::validate_host;
-use haven_common::network::{parse_http_url, HttpUrlPolicy};
+use haven_common::network::{parse_http_url, StreamUrlScope};
 use haven_common::{AppError, ErrorKind};
 use uuid::Uuid;
 
@@ -26,8 +26,14 @@ pub struct StreamGrantFacts {
     pub mime_type: Option<String>,
     pub is_hls: bool,
     pub progress: Option<ProgressSummaryDto>,
-    /// 初始上游地址（manifest 或直连媒体）；仅存于服务端。
+    /// Initial upstream address (manifest or direct media); server-side only.
     pub upstream_url: String,
+    /// Outbound URL scope of this grant. It is derived by the common
+    /// capability/stream owner from the *persisted* resource identity and is
+    /// reused verbatim for initial-host validation, manifest target resolution
+    /// and DNS pinning. It is never derived from a browser URL, a hostname
+    /// shape or a client-supplied flag.
+    pub scope: StreamUrlScope,
 }
 
 pub struct StreamGrantInner {
@@ -71,7 +77,7 @@ impl StreamGrantInner {
         let Some(validated) = candidates
             .iter()
             .map(|(token, target)| {
-                host_of(target).map(|host| (token.clone(), target.clone(), host))
+                host_of(target, self.facts.scope).map(|host| (token.clone(), target.clone(), host))
             })
             .collect::<Option<Vec<_>>>()
         else {
@@ -184,7 +190,7 @@ impl StreamRegistry {
                 false,
             ));
         }
-        let initial_host = host_of(upstream_url).ok_or_else(|| {
+        let initial_host = host_of(upstream_url, facts.scope).ok_or_else(|| {
             AppError::new(
                 "SECURITY_POLICY_DENIED",
                 ErrorKind::Security,
@@ -318,8 +324,8 @@ impl StreamRegistry {
 }
 
 /// 从 URL 提取小写 host。
-pub(crate) fn host_of(url: &str) -> Option<String> {
-    parse_http_url(url, HttpUrlPolicy::MediaResource)
+pub(crate) fn host_of(url: &str, scope: StreamUrlScope) -> Option<String> {
+    parse_http_url(url, scope.policy())
         .ok()
         .map(|safe| safe.host().to_owned())
 }
@@ -385,6 +391,7 @@ mod tests {
             is_hls: true,
             progress: None,
             upstream_url: upstream_url.into(),
+            scope: StreamUrlScope::Media,
         }
     }
 
@@ -404,6 +411,34 @@ mod tests {
         assert!(registry.revoke(&id, "main"));
         assert!(!registry.revoke(&id, "main"), "幂等撤销");
         assert!(registry.lookup(&id, "main").is_none());
+    }
+
+    #[test]
+    fn local_stream_and_manifest_targets_require_a_user_source_grant() {
+        let url = "http://192.168.1.10:8096/live/index.m3u8";
+        let registry = StreamRegistry::new();
+        assert!(registry.register(facts(url), url, "main").is_err());
+        let mut scoped = facts(url);
+        scoped.scope = StreamUrlScope::UserProvidedSource;
+        let grant = registry.register(scoped, url, "main").unwrap();
+        let inner = registry.lookup(&grant.to_string(), "main").unwrap();
+        assert!(inner.commit_manifest(
+            "live",
+            "v1",
+            &[(
+                "segment".into(),
+                "http://192.168.1.10:8096/live/segment.ts".into()
+            )]
+        ));
+        assert_eq!(
+            inner.resolve_target("v1", "segment").as_deref(),
+            Some("http://192.168.1.10:8096/live/segment.ts")
+        );
+        assert!(!inner.commit_manifest(
+            "bad",
+            "v2",
+            &[("bad".into(), "http://169.254.169.254/metadata".into())]
+        ));
     }
 
     #[test]
@@ -495,17 +530,30 @@ mod tests {
     #[test]
     fn host_of_extracts_lowercased_host() {
         assert_eq!(
-            host_of("HTTPS://CDN.Example.COM:8443/a/x.ts").as_deref(),
+            host_of("HTTPS://CDN.Example.COM:8443/a/x.ts", StreamUrlScope::Media).as_deref(),
             Some("cdn.example.com")
         );
-        assert_eq!(host_of("ftp://x/y"), None);
-        assert_eq!(host_of("not-a-url"), None);
+        assert_eq!(host_of("ftp://x/y", StreamUrlScope::Media), None);
+        assert_eq!(host_of("not-a-url", StreamUrlScope::Media), None);
         assert_eq!(
-            host_of("https://[2001:4860:4860::8888]:8443/a/x.ts").as_deref(),
+            host_of(
+                "https://[2001:4860:4860::8888]:8443/a/x.ts",
+                StreamUrlScope::Media
+            )
+            .as_deref(),
             Some("2001:4860:4860::8888")
         );
-        assert_eq!(host_of("https://user:secret@cdn.example.com/a"), None);
-        assert_eq!(host_of("https://cdn.example.com/a\n.ts"), None);
+        assert_eq!(
+            host_of(
+                "https://user:secret@cdn.example.com/a",
+                StreamUrlScope::Media
+            ),
+            None
+        );
+        assert_eq!(
+            host_of("https://cdn.example.com/a\n.ts", StreamUrlScope::Media),
+            None
+        );
     }
 
     #[test]

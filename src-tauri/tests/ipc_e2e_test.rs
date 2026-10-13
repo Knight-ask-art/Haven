@@ -11,20 +11,14 @@
 //! `favorite-changed` / `settings-changed` Tauri transport 名称适配；
 //! DTO 与 fixture 仍保留逻辑契约语义。
 
-use std::collections::BTreeMap;
+mod support;
+use support::{invoke_request, real_acl_context};
+
 use std::sync::Arc;
 
-use tauri::ipc::{CallbackFn, RuntimeAuthority};
-use tauri::test::{
-    get_ipc_response, mock_builder, mock_context, noop_assets, MockRuntime, INVOKE_KEY,
-};
-use tauri::utils::acl::capability::Capability;
-use tauri::utils::acl::manifest::Manifest;
-use tauri::utils::acl::resolved::Resolved;
-use tauri::utils::platform::Target;
-use tauri::webview::InvokeRequest;
+use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, MockRuntime};
 use tauri::Context;
-use tauri::{Listener, Url};
+use tauri::Listener;
 
 use haven_domain::contracts::StorageLocationRepository;
 use haven_infrastructure::db::repos::SqliteRepositories;
@@ -34,42 +28,6 @@ use haven_tauri_lib::ipc::{
     SETTINGS_CHANGED_TRANSPORT_EVENT,
 };
 use haven_tauri_lib::state::AppState;
-
-fn invoke_request(cmd: &str, body: serde_json::Value) -> InvokeRequest {
-    InvokeRequest {
-        cmd: cmd.into(),
-        callback: CallbackFn(1),
-        error: CallbackFn(2),
-        // Windows/Android use the local tauri origin; the custom `tauri://` URL
-        // is classified as remote by RuntimeAuthority on those platforms.
-        url: if cfg!(any(windows, target_os = "android")) {
-            Url::parse("http://tauri.localhost").unwrap()
-        } else {
-            Url::parse("tauri://localhost").unwrap()
-        },
-        body: body.into(),
-        headers: Default::default(),
-        invoke_key: INVOKE_KEY.to_string(),
-    }
-}
-
-fn real_acl_context() -> Context<MockRuntime> {
-    let mut context = mock_context(noop_assets());
-    let acl: BTreeMap<String, Manifest> = serde_json::from_str(
-        &std::fs::read_to_string(concat!(env!("OUT_DIR"), "/acl-manifests.json"))
-            .expect("build.rs 生成 acl-manifests.json"),
-    )
-    .unwrap();
-    let capabilities: BTreeMap<String, Capability> = serde_json::from_str(
-        &std::fs::read_to_string(concat!(env!("OUT_DIR"), "/capabilities.json"))
-            .expect("build.rs 生成 capabilities.json"),
-    )
-    .unwrap();
-    let resolved = Resolved::resolve(&acl, capabilities, Target::current())
-        .expect("真实 ACL/capabilities 必须可解析");
-    *context.runtime_authority_mut() = RuntimeAuthority::new(acl, resolved);
-    context
-}
 
 fn app_with_context(context: Context<MockRuntime>) -> (tauri::App<MockRuntime>, Arc<Db>) {
     let db = Arc::new(Db::open_in_memory().unwrap());
