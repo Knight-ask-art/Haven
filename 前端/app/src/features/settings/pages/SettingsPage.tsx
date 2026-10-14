@@ -4519,6 +4519,21 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
   const [deleteConfirmPending, setDeleteConfirmPending] = useState(false)
   const deleteConfirmPendingRef = useRef(false)
   /**
+   * `deleteConfirmPending` / `deleteConfirmPendingRef` 的**同一个事实**同时交给 Hook：
+   * 确认框由页面持有，Hook 看不到它；没有这枚标记，确认期间用户仍然可以保存配置、写 /
+   * 清 API Key、切启用开关或换模型，而这些写入会和待确认的那次删除交错（最坏的结果是
+   * 系统凭据管理器里留下一份行已经被删掉的孤儿 secret）。
+   */
+  const { setDeleteConfirmPending: markDeleteConfirmPending } = ai
+  const deletePanelMounted = useRef(true)
+  useEffect(() => {
+    deletePanelMounted.current = true
+    return () => {
+      deletePanelMounted.current = false
+      markDeleteConfirmPending(false)
+    }
+  }, [markDeleteConfirmPending])
+  /**
    * 浏览器 Mock / 开发预览。
    *
    * Mock 的凭据与模型目录都是**内存 + 契约 fixture**：说"已写入系统凭据管理器"或
@@ -4635,6 +4650,7 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
       : null
     if (!target) return
     deleteConfirmPendingRef.current = true
+    markDeleteConfirmPending(true)
     setDeleteConfirmPending(true)
     try {
       const confirmed = await confirm({
@@ -4647,6 +4663,7 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
         dedupeKey: `settings:ai:${target.profileId}:delete-confirm`,
       })
       if (!confirmed) return
+      if (!deletePanelMounted.current) return
       const ok = await ai.deleteProfile(target)
       if (ok) {
         setDraft(null)
@@ -4661,6 +4678,7 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
     } finally {
       // 确认与删除都结束后才放行：确认后就解锁会让另一次删除插进来。
       deleteConfirmPendingRef.current = false
+      markDeleteConfirmPending(false)
       setDeleteConfirmPending(false)
     }
   }
@@ -4713,18 +4731,18 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
         ) : isCreating ? (
           <>
             <SettingRow title="配置 ID" description="稳定标识，只允许字母、数字、连字符与下划线。">
-              <input value={draftProfileId} onChange={(event) => updateDraft({ profileId: event.target.value })} className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)]" aria-label="配置 ID" />
+              <input value={draftProfileId} onChange={(event) => updateDraft({ profileId: event.target.value })} disabled={deleteConfirmPending} className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50" aria-label="配置 ID" />
             </SettingRow>
             <SettingRow title="配置名称">
-              <input value={draftDisplayName} onChange={(event) => updateDraft({ displayName: event.target.value })} className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)]" aria-label="配置名称" />
+              <input value={draftDisplayName} onChange={(event) => updateDraft({ displayName: event.target.value })} disabled={deleteConfirmPending} className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50" aria-label="配置名称" />
             </SettingRow>
-            <SettingRow title="API 地址" description="远程服务使用 HTTPS；本机网关可使用 http://127.0.0.1 或 http://[::1] 及端口（写成 localhost 会被拒绝）。不支持局域网或服务发现。">
-              <input value={draftEndpoint} onChange={(event) => updateDraft({ endpoint: event.target.value })} className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)]" aria-label="API 地址" />
+            <SettingRow title="API 地址" description="远程服务使用 HTTPS；本机网关可使用 http://127.0.0.1 或 http://[::1] 及端口（写成 localhost 或其子域名会被拒绝）。不支持局域网或服务发现。">
+              <input value={draftEndpoint} onChange={(event) => updateDraft({ endpoint: event.target.value })} disabled={deleteConfirmPending} className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50" aria-label="API 地址" />
             </SettingRow>
             <SettingRow title="保存配置" description="新服务默认启用；API Key 将单独配置。">
               <div className="flex items-center gap-3">
                 <button type="button" onClick={() => setDraft(null)} className="text-[13px] font-medium text-[var(--haven-settings-muted-strong)]">放弃</button>
-                <button type="button" onClick={() => void submitProfile()} disabled={ai.state.saving} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[var(--haven-settings-primary)] px-[16px] text-[12px] font-semibold leading-none text-[var(--haven-settings-primary-foreground)] transition-colors hover:bg-[var(--haven-settings-primary-hover)] disabled:cursor-not-allowed disabled:opacity-50">保存</button>
+                <button type="button" onClick={() => void submitProfile()} disabled={ai.state.saving || deleteConfirmPending} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[var(--haven-settings-primary)] px-[16px] text-[12px] font-semibold leading-none text-[var(--haven-settings-primary-foreground)] transition-colors hover:bg-[var(--haven-settings-primary-hover)] disabled:cursor-not-allowed disabled:opacity-50">保存</button>
               </div>
             </SettingRow>
           </>
@@ -4734,11 +4752,12 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
               <input
                 value={draftDisplayName}
                 onChange={(event) => updateDraft({ displayName: event.target.value })}
-                className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)]"
+                disabled={deleteConfirmPending}
+                className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50"
                 aria-label="配置名称"
               />
             </SettingRow>
-            <SettingRow title="启用智能功能" description={endpointIsLocalhostAlias ? "该配置的地址写的是 localhost，栖阅只接受显式写出的本机回环地址，因此不能启用。请把主机名改成 127.0.0.1 或 [::1]（保留端口和路径）后保存。" : ai.selectedEndpointInsecure ? "该配置使用远程 HTTP 明文地址，不能启用。请先把地址改成 HTTPS 并保存。" : "停用后不会向该 Provider 发起任何请求。"}>
+            <SettingRow title="启用智能功能" description={endpointIsLocalhostAlias ? "该配置的地址写的是 localhost 或其子域名，栖阅只接受显式写出的本机回环地址，因此不能启用。请把主机名改成 127.0.0.1 或 [::1]（保留端口和路径）后保存。" : ai.selectedEndpointInsecure ? "该配置使用远程 HTTP 明文地址，不能启用。请先把地址改成 HTTPS 并保存。" : "停用后不会向该 Provider 发起任何请求。"}>
               <Toggle
                 checked={selected.enabled}
                 onChange={(value) => void ai.saveProfile({
@@ -4748,25 +4767,26 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
                   enabled: value,
                   selectedModelId: selected.selectedModelId,
                 })}
-                disabled={ai.selectedEndpointInsecure || endpointIsLocalhostAlias}
+                disabled={ai.selectedEndpointInsecure || endpointIsLocalhostAlias || deleteConfirmPending}
                 label="启用智能功能"
               />
             </SettingRow>
             <SettingRow title="API 协议" description="决定请求与响应的编排协议，而不是具体服务商。">
               <span className="text-[13px] font-semibold text-[var(--haven-settings-foreground)]">OpenAI Compatible</span>
             </SettingRow>
-            <SettingRow title="API 地址" description="远程服务使用 HTTPS；本机网关可使用 http://127.0.0.1 或 http://[::1] 及端口（写成 localhost 会被拒绝）。已带 /v1 时不会重复拼接，不支持局域网或服务发现。">
+            <SettingRow title="API 地址" description="远程服务使用 HTTPS；本机网关可使用 http://127.0.0.1 或 http://[::1] 及端口（写成 localhost 或其子域名会被拒绝）。已带 /v1 时不会重复拼接，不支持局域网或服务发现。">
               <input
                 value={draftEndpoint}
                 onChange={(event) => updateDraft({ endpoint: event.target.value })}
-                className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)]"
+                disabled={deleteConfirmPending}
+                className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50"
                 aria-label="API 地址"
               />
             </SettingRow>
             {showEndpointWarning && (
               <div role="alert" className="mx-5 mb-3 rounded-2xl border border-[#ff9500]/25 bg-[#fff8e5] px-4 py-3 text-xs leading-5 text-[#7a5a1a] dark:border-[#ff9500]/30 dark:bg-[#3a2f12] dark:text-[#f0b429]">
                 {endpointIsLocalhostAlias
-                  ? `该配置保存的是 localhost 地址，栖阅不接受这种本机写法（${LOCALHOST_ALIAS_ENDPOINT_CODE}）。本机服务请将 localhost 改为 127.0.0.1 或 [::1]，并保留端口和路径。`
+                  ? `该配置保存的是 localhost 或其子域名地址，栖阅不接受这种本机写法（${LOCALHOST_ALIAS_ENDPOINT_CODE}）。本机服务请将 localhost 或其子域名改为 127.0.0.1 或 [::1]，并保留端口和路径。`
                   : `该配置保存的是远程 HTTP 明文地址，栖阅不会向它发起请求（${INSECURE_ENDPOINT_CODE}）。改成 HTTPS 并保存后即可恢复；本机 127.0.0.1 / [::1] 网关可使用 HTTP。`}
               </div>
             )}
@@ -4774,7 +4794,7 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
               <SettingRow title="保存配置" description="只有本机配置；不包含 API Key。">
                 <div className="flex items-center gap-3">
                   <button type="button" onClick={() => setDraft(null)} className="text-[13px] font-medium text-[var(--haven-settings-muted-strong)]">放弃</button>
-                  <button type="button" onClick={() => void submitProfile()} disabled={ai.state.saving} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[var(--haven-settings-primary)] px-[16px] text-[12px] font-semibold leading-none text-[var(--haven-settings-primary-foreground)] transition-colors hover:bg-[var(--haven-settings-primary-hover)] disabled:cursor-not-allowed disabled:opacity-50">保存</button>
+                  <button type="button" onClick={() => void submitProfile()} disabled={ai.state.saving || deleteConfirmPending} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[var(--haven-settings-primary)] px-[16px] text-[12px] font-semibold leading-none text-[var(--haven-settings-primary-foreground)] transition-colors hover:bg-[var(--haven-settings-primary-hover)] disabled:cursor-not-allowed disabled:opacity-50">保存</button>
                 </div>
               </SettingRow>
             )}
@@ -4790,9 +4810,10 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
                       placeholder="粘贴 API Key"
                       aria-label="API Key"
                       autoComplete="off"
-                      className="h-10 w-[200px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)]"
+                      disabled={deleteConfirmPending}
+                      className="h-10 w-[200px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50"
                     />
-                    <button type="button" onClick={() => void submitApiKey()} disabled={apiKeyDraft.length === 0 || ai.state.saving} className="rounded-full px-[8px] py-[8px] text-xs font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50">保存</button>
+                    <button type="button" onClick={() => void submitApiKey()} disabled={apiKeyDraft.length === 0 || ai.state.saving || deleteConfirmPending} className="rounded-full px-[8px] py-[8px] text-xs font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50">保存</button>
                     <button type="button" onClick={() => { setApiKeyDraft(""); setIsKeyEditorOpen(false) }} className="rounded-full px-[8px] py-[8px] text-xs font-medium text-[var(--haven-settings-muted-strong)]">取消</button>
                   </>
                 ) : (
@@ -4801,8 +4822,8 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
                       写入与清除是两条互相覆盖的写操作：任一条在途时两条都禁用，避免"先点保存
                       再点清除"由完成顺序决定最终状态（Hook 里另有一道互斥闸门兜底）。
                     */}
-                    <button type="button" onClick={() => setIsKeyEditorOpen(true)} disabled={ai.state.saving} className="rounded-full px-[8px] py-[8px] text-xs font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50">配置</button>
-                    {ai.credentialConfigured && <button type="button" onClick={() => { void ai.clearApiKey().then((ok) => showNotice(ok ? mockMode ? "已在浏览器预览的内存状态中清除（Mock/预览）：没有改动系统凭据管理器。" : "已清除 API Key" : "清除失败，请重试")) }} disabled={ai.state.saving} className="rounded-full px-[8px] py-[8px] text-xs font-medium text-[var(--haven-settings-muted-strong)] disabled:cursor-not-allowed disabled:opacity-50">清除</button>}
+                    <button type="button" onClick={() => setIsKeyEditorOpen(true)} disabled={ai.state.saving || deleteConfirmPending} className="rounded-full px-[8px] py-[8px] text-xs font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50">配置</button>
+                    {ai.credentialConfigured && <button type="button" onClick={() => { void ai.clearApiKey().then((ok) => showNotice(ok ? mockMode ? "已在浏览器预览的内存状态中清除（Mock/预览）：没有改动系统凭据管理器。" : "已清除 API Key" : "清除失败，请重试")) }} disabled={ai.state.saving || deleteConfirmPending} className="rounded-full px-[8px] py-[8px] text-xs font-medium text-[var(--haven-settings-muted-strong)] disabled:cursor-not-allowed disabled:opacity-50">清除</button>}
                   </>
                 )}
               </div>
@@ -4836,7 +4857,7 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
                 })
               }}
               ariaLabel="默认模型"
-              disabled={!ai.hasAvailableModel || ai.state.saving}
+              disabled={!ai.hasAvailableModel || ai.state.saving || deleteConfirmPending}
             />
             <button type="button" onClick={() => void ai.refreshModels()} disabled={!selected || ai.state.catalogLoading} className="text-[13px] font-medium text-[var(--haven-settings-primary)] transition-colors hover:text-[#005bb5] hover:underline disabled:cursor-not-allowed disabled:text-[var(--haven-settings-muted-strong)]">{ai.state.catalogLoading ? "读取中…" : "拉取模型"}</button>
           </div>
@@ -4865,7 +4886,7 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
               用户点"重试"，看到的是一次网络请求和一份新目录，而真正失败的写入仍然没有
               发生。凭据写入不可重试（密钥原文按设计不留存），因此那种失败只给"关闭"。
             */}
-            {ai.canRetrySaveError && <button type="button" onClick={() => void ai.retrySaveError()} disabled={ai.state.saving} className="font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50">重试</button>}
+            {ai.canRetrySaveError && <button type="button" onClick={() => void ai.retrySaveError()} disabled={ai.state.saving || deleteConfirmPending} className="font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50">重试</button>}
             <button type="button" onClick={ai.dismissSaveError} className="font-medium text-[var(--haven-settings-muted-strong)]">关闭</button>
           </div>
         </div>

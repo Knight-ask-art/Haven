@@ -49,16 +49,23 @@ export const INSECURE_ENDPOINT_MESSAGE =
  * 因此这里给出的必须是"改主机名"这条唯一可执行的结论：把 `localhost` 写成显式回环
  * 字面量。原来的统一文案让本机用户去"改 HTTPS"，而本机服务改成 HTTPS 只会更难连上，
  * 与后端实际结论也对不上。
+ *
+ * 范围与后端 `validate_host` 对齐：`localhost` **及其子域名**（`api.localhost`）都被按
+ * "主机不被允许"拒绝，所以文案提"localhost 或其子域名"。注意尾部点号：后端
+ * `normalize_host` 会先 `trim_end_matches('.')`，`localhost.` / `api.localhost.` 落进同一
+ * 分类，这里也照做。
  */
 export const LOCALHOST_ALIAS_ENDPOINT_CODE = "AI_PROVIDER_ENDPOINT_INVALID";
 export const LOCALHOST_ALIAS_ENDPOINT_MESSAGE =
-  "本机服务请将 localhost 改为 127.0.0.1 或 [::1]，并保留端口和路径。栖阅只接受显式写出的本机回环地址。";
+  "本机服务请将 localhost 或其子域名改为 127.0.0.1 或 [::1]，并保留端口和路径。栖阅只接受显式写出的本机回环地址。";
 
 /**
- * 输入的主机名是否恰好是 `localhost`（`http://` 或 `https://` 均可）。
+ * 输入的主机名是否为 `localhost` 或它的子域名（`api.localhost`；`http://` 或 `https://` 均可）。
  *
- * 只按字面主机名判断，不解析 DNS，也不枚举其它 loopback 别名（`127.1`、
- * `2130706433`）——那些仍由 [`isAiEndpointTransportAllowed`] 与后端拒绝。
+ * 分类只按字面主机名与后端 `validate_host`（`host == "localhost" || host.ends_with(".localhost")`）
+ * 对齐，不解析 DNS，也不枚举其它 loopback 别名（`127.1`、`2130706433`）——那些仍由
+ * [`isAiEndpointTransportAllowed`] 与后端拒绝。`evil-localhost`、`localhost.example.org`
+ * 是普通 DNS 名，**不**在此列，仍然只走 HTTPS 传输判定。
  * 它是**提示分类**用的，不构成放行：匹配到的地址依然保存不了。
  */
 export function isLocalhostAliasEndpoint(endpoint: string): boolean {
@@ -66,7 +73,10 @@ export function isLocalhostAliasEndpoint(endpoint: string): boolean {
   if (!value.startsWith("http://") && !value.startsWith("https://")) return false;
   const authority = value.split("://")[1]?.split(/[/?#]/u)[0];
   if (!authority) return false;
-  return authority.split("@").pop()?.split(":")[0] === "localhost";
+  // 尾部点号先去掉：后端 normalize_host 同样 trim_end_matches('.')，否则 `localhost.`
+  // 会被后端按"主机不被允许"拒绝，却被这里当成普通域名。
+  const host = (authority.split("@").pop() ?? "").split(":")[0].replace(/\.+$/u, "");
+  return host === "localhost" || host.endsWith(".localhost");
 }
 
 /**
