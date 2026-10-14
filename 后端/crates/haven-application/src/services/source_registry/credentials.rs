@@ -1159,7 +1159,7 @@ fn encode_stored_secret(
     let Some(secret) = request.secret.as_deref() else {
         return Ok(None);
     };
-    let username = request.username.as_deref().map(str::trim);
+    let username = request.username.as_deref();
     if kind != CustomSourceKind::Opds {
         if SourceRegistryService::credential_provider(kind).is_none() {
             return Err(invalid_argument("该来源不使用单独的访问凭据"));
@@ -1187,4 +1187,30 @@ fn encode_stored_secret(
     Ok(Some(super::opds_credential::encode_opds_basic_credential(
         username, secret,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opds_usernames_keep_significant_whitespace() {
+        for username in [" reader ", " "] {
+            let request = SourceSetCredentialRequest {
+                source_id: "custom_opds_0123456789ab".into(),
+                secret: Some("synthetic-password".into()),
+                username: Some(username.into()),
+            };
+            let stored = encode_stored_secret(CustomSourceKind::Opds, &request)
+                .unwrap()
+                .unwrap();
+            let super::super::opds_credential::OpdsCredentialRead::Basic {
+                username: actual, ..
+            } = super::super::opds_credential::read_opds_credential(&stored)
+            else {
+                panic!("expected versioned Basic credential");
+            };
+            assert_eq!(actual, username);
+        }
+    }
 }

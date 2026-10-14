@@ -122,9 +122,9 @@ describe("来源设置中的 RSS/Atom 添加流程", () => {
     const password = screen.getByLabelText("访问密码（仅写入系统凭据管理器，不回显、不落库）")
     fireEvent.change(password, { target: { value: "synthetic-password" } })
     expect((screen.getByRole("button", { name: "保存凭据" }) as HTMLButtonElement).disabled).toBe(true)
-    fireEvent.change(screen.getByLabelText("OPDS 用户名"), { target: { value: "reader" } })
+    fireEvent.change(screen.getByLabelText("OPDS 用户名"), { target: { value: " reader " } })
     fireEvent.click(screen.getByRole("button", { name: "保存凭据" }))
-    await waitFor(() => expect(save).toHaveBeenCalledWith({ sourceId, secret: "synthetic-password", username: "reader" }))
+    await waitFor(() => expect(save).toHaveBeenCalledWith({ sourceId, secret: "synthetic-password", username: " reader " }))
     await waitFor(() => expect((password as HTMLInputElement).value).toBe(""))
   })
 

@@ -756,7 +756,7 @@ function CustomSourceManager({
   const submitCredential = async (sourceId: string, secret = credentialValue) => {
     if (submitting) return
     const opds = !isComicLibrarySourceId(sourceId)
-    const username = credentialUsername.trim()
+    const username = credentialUsername
     if (secret.length > 0 && opds && username.length === 0) {
       setCredentialError("请填写书库的用户名与密码")
       return
@@ -862,7 +862,7 @@ function CustomSourceManager({
             {credentialError && <p role="alert" className="text-xs text-[var(--haven-settings-danger)]">{credentialError}</p>}
             <div className="flex justify-end gap-[8px] text-xs font-semibold">
               <button type="button" disabled={submitting} onClick={() => { setCredentialValue(""); setCredentialUsername(""); setAddStep("done") }} className="rounded-full border border-[var(--haven-settings-border-subtle)] px-[16px] py-[8px]">稍后配置</button>
-              <button type="button" disabled={submitting || credentialValue.length === 0 || (!comicLibraryKind && credentialUsername.trim().length === 0)} onClick={() => { void submitCredential(createdSourceId) }} className="rounded-full bg-[var(--haven-settings-primary)] px-[16px] py-[8px] text-[var(--haven-settings-primary-foreground)] disabled:opacity-50">{submitting ? "保存中…" : "保存并完成"}</button>
+              <button type="button" disabled={submitting || credentialValue.length === 0 || (!comicLibraryKind && credentialUsername.length === 0)} onClick={() => { void submitCredential(createdSourceId) }} className="rounded-full bg-[var(--haven-settings-primary)] px-[16px] py-[8px] text-[var(--haven-settings-primary-foreground)] disabled:opacity-50">{submitting ? "保存中…" : "保存并完成"}</button>
             </div>
           </div>
         )}
@@ -1016,7 +1016,7 @@ function CustomSourceManager({
                       </button>
                       <button
                         type="button"
-                        disabled={submitting || credentialValue.length === 0 || (!comic && credentialUsername.trim().length === 0)}
+                        disabled={submitting || credentialValue.length === 0 || (!comic && credentialUsername.length === 0)}
                         onClick={() => { void submitCredential(source.sourceId) }}
                         className="rounded-full bg-[var(--haven-settings-primary)] px-[14px] py-[6px] text-[var(--haven-settings-primary-foreground)] disabled:opacity-50"
                       >
