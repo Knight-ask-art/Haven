@@ -38,7 +38,7 @@ import type { AppearanceAssetKindWire, AppearanceAssetWire, ComicSettingsValue, 
 import type { SettingsFormController } from "@/features/settings/lib/useSettingsForm"
 import { useSettingsForm } from "@/features/settings/lib/useSettingsForm"
 import { useAiProviderSettings, type AiProviderSettingsController } from "@/features/settings/lib/useAiProviderSettings"
-import { INSECURE_ENDPOINT_CODE, NO_MODEL_SELECTED } from "@/features/settings/ipc/ai-provider-gateway"
+import { INSECURE_ENDPOINT_CODE, LOCALHOST_ALIAS_ENDPOINT_CODE, NO_MODEL_SELECTED, isLocalhostAliasEndpoint } from "@/features/settings/ipc/ai-provider-gateway"
 import { useAgentBrokerSettings } from "@/features/settings/lib/useAgentBrokerSettings"
 import { useAgentSkills } from "@/features/settings/lib/useAgentSkills"
 import { useMcpClientConfig } from "@/features/settings/lib/useMcpClientConfig"
@@ -4503,9 +4503,21 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
   // 选择由分区之上持有：本组件会随分区切换被卸载重建，选中的 Provider 不能因此丢回列表第一项。
   const ai = aiSelection.controller
   const reloadAi = ai.reload
+  const { confirm } = useNotice()
   const [draft, setDraft] = useState<AiProviderProfileDraftState | null>(null)
   const [apiKeyDraft, setApiKeyDraft] = useState("")
   const [isKeyEditorOpen, setIsKeyEditorOpen] = useState(false)
+  /**
+   * 删除确认在途的闸门。
+   *
+   * 确认框是异步的：弹窗还开着的时候用户完全可以切到另一个配置再点确认，于是"确认的是
+   * A、删掉的是 B"——一次在界面上找不到痕迹的数据丢失（连同 B 的 API Key）。点开确认时
+   * 捕获目标 `{profileId, revision}`，确认后按这个目标删除，切分区/重载都改不了它。
+   * 闸门同时挡住同一渲染内的双击；`deleteConfirmPendingRef` 是同步副本，
+   * `deleteConfirmPending` 只驱动 UI。
+   */
+  const [deleteConfirmPending, setDeleteConfirmPending] = useState(false)
+  const deleteConfirmPendingRef = useRef(false)
   /**
    * 浏览器 Mock / 开发预览。
    *
@@ -4540,6 +4552,16 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
   const draftEndpoint = draft?.endpoint ?? selected?.endpoint ?? ""
   const isDirty = draft !== null
   const isCreating = draft?.mode === "create"
+  /**
+   * 明文端点与 `localhost` 别名是两类不同的拒绝原因，提示也必须分开：
+   * 前者要换协议（HTTPS），后者只要把主机名写成显式回环字面量。
+   *
+   * `localhost` 行不算"明文远程地址"（`selectedEndpointInsecure` 对 `https://localhost`
+   * 为 false），但它同样用不了——模型发现与设置建议都会以固定错误失败。这里让它和明文行
+   * 共用同一条可见提示，避免用户只看到"拉不到模型"而没有任何可执行的结论。
+   */
+  const endpointIsLocalhostAlias = selected !== null && isLocalhostAliasEndpoint(selected.endpoint)
+  const showEndpointWarning = ai.selectedEndpointInsecure || endpointIsLocalhostAlias
   const profileOptions = ai.state.profiles.map((profile) => `${profile.displayName} (${profile.profileId})`)
   const selectedProfileOption = selected
     ? `${selected.displayName} (${selected.profileId})`
@@ -4598,6 +4620,51 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
       : "API Key 写入失败，请重试")
   }
 
+  /**
+   * 删除配置：先确认，再删。
+   *
+   * 删除会把行与系统凭据管理器里的 API Key 一起清掉，而且是**不可撤销**的——此前这一步
+   * 没有任何确认，一次误点就要重新填地址、重新粘密钥。确认文案必须说清"会清除 API Key，
+   * 需要重新配置"；Mock/预览下则必须说清它只动预览内存，不碰本机数据库与系统凭据管理器。
+   */
+  const requestDeleteProfile = async () => {
+    if (deleteConfirmPendingRef.current || ai.state.saving) return
+    // 目标在确认之前定下：确认文案与实际删除都绑定它，而不是"确认那一刻选中的东西"。
+    const target = selected
+      ? { profileId: selected.profileId, revision: selected.revision }
+      : null
+    if (!target) return
+    deleteConfirmPendingRef.current = true
+    setDeleteConfirmPending(true)
+    try {
+      const confirmed = await confirm({
+        title: mockMode ? "移除预览中的 AI 服务配置" : "删除 AI 服务配置",
+        message: mockMode
+          ? "浏览器预览（Mock/预览）只影响当前预览的内存状态：不会删除本机数据库里的配置记录，也不会触碰系统凭据管理器。确定继续吗？"
+          : `删除后会清除「${selected?.displayName ?? ""}」的配置及其 API Key（保存在系统凭据管理器里），需要重新填写地址并重新配置 API Key 才能再次使用。确定删除吗？`,
+        confirmLabel: mockMode ? "移除" : "删除",
+        cancelLabel: "取消",
+        dedupeKey: `settings:ai:${target.profileId}:delete-confirm`,
+      })
+      if (!confirmed) return
+      const ok = await ai.deleteProfile(target)
+      if (ok) {
+        setDraft(null)
+        setApiKeyDraft("")
+        setIsKeyEditorOpen(false)
+      }
+      showNotice(ok
+        ? mockMode
+          ? "已从浏览器预览移除该配置（Mock/预览）：没有删除本机数据库记录，也没有触碰系统凭据管理器。"
+          : "已删除配置并清除其 API Key"
+        : "删除失败，请重试")
+    } finally {
+      // 确认与删除都结束后才放行：确认后就解锁会让另一次删除插进来。
+      deleteConfirmPendingRef.current = false
+      setDeleteConfirmPending(false)
+    }
+  }
+
   return (
     <>
       <SettingsGroup title="API 连接" features={["ai.providerProfile", "ai.providerCredential", "ai.providerModel"]} description="当前支持 OpenAI Compatible 协议。填写服务地址与 API Key 后，栖阅直接连接你的服务。">
@@ -4624,12 +4691,12 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
                   ai.selectProfile(profile.profileId)
                 }}
                 ariaLabel="当前 AI 服务"
-                disabled={isDirty || ai.state.saving}
+                disabled={isDirty || ai.state.saving || deleteConfirmPending}
               />
               <button
                 type="button"
                 onClick={beginCreateProfile}
-                disabled={isDirty || ai.state.saving}
+                disabled={isDirty || ai.state.saving || deleteConfirmPending}
                 className="shrink-0 rounded-full px-[8px] py-[8px] text-xs font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50"
               >
                 新建配置
@@ -4651,7 +4718,7 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
             <SettingRow title="配置名称">
               <input value={draftDisplayName} onChange={(event) => updateDraft({ displayName: event.target.value })} className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)]" aria-label="配置名称" />
             </SettingRow>
-            <SettingRow title="API 地址" description="远程服务使用 HTTPS；本机网关可使用 http://127.0.0.1 或 http://[::1] 及端口。不支持局域网或服务发现。">
+            <SettingRow title="API 地址" description="远程服务使用 HTTPS；本机网关可使用 http://127.0.0.1 或 http://[::1] 及端口（写成 localhost 会被拒绝）。不支持局域网或服务发现。">
               <input value={draftEndpoint} onChange={(event) => updateDraft({ endpoint: event.target.value })} className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)]" aria-label="API 地址" />
             </SettingRow>
             <SettingRow title="保存配置" description="新服务默认启用；API Key 将单独配置。">
@@ -4671,7 +4738,7 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
                 aria-label="配置名称"
               />
             </SettingRow>
-            <SettingRow title="启用智能功能" description={ai.selectedEndpointInsecure ? "该配置使用远程 HTTP 明文地址，不能启用。请先把地址改成 HTTPS 并保存。" : "停用后不会向该 Provider 发起任何请求。"}>
+            <SettingRow title="启用智能功能" description={endpointIsLocalhostAlias ? "该配置的地址写的是 localhost，栖阅只接受显式写出的本机回环地址，因此不能启用。请把主机名改成 127.0.0.1 或 [::1]（保留端口和路径）后保存。" : ai.selectedEndpointInsecure ? "该配置使用远程 HTTP 明文地址，不能启用。请先把地址改成 HTTPS 并保存。" : "停用后不会向该 Provider 发起任何请求。"}>
               <Toggle
                 checked={selected.enabled}
                 onChange={(value) => void ai.saveProfile({
@@ -4681,14 +4748,14 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
                   enabled: value,
                   selectedModelId: selected.selectedModelId,
                 })}
-                disabled={ai.selectedEndpointInsecure}
+                disabled={ai.selectedEndpointInsecure || endpointIsLocalhostAlias}
                 label="启用智能功能"
               />
             </SettingRow>
             <SettingRow title="API 协议" description="决定请求与响应的编排协议，而不是具体服务商。">
               <span className="text-[13px] font-semibold text-[var(--haven-settings-foreground)]">OpenAI Compatible</span>
             </SettingRow>
-            <SettingRow title="API 地址" description="远程服务使用 HTTPS；本机网关可使用 http://127.0.0.1 或 http://[::1] 及端口。已带 /v1 时不会重复拼接，不支持局域网或服务发现。">
+            <SettingRow title="API 地址" description="远程服务使用 HTTPS；本机网关可使用 http://127.0.0.1 或 http://[::1] 及端口（写成 localhost 会被拒绝）。已带 /v1 时不会重复拼接，不支持局域网或服务发现。">
               <input
                 value={draftEndpoint}
                 onChange={(event) => updateDraft({ endpoint: event.target.value })}
@@ -4696,9 +4763,11 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
                 aria-label="API 地址"
               />
             </SettingRow>
-            {ai.selectedEndpointInsecure && (
+            {showEndpointWarning && (
               <div role="alert" className="mx-5 mb-3 rounded-2xl border border-[#ff9500]/25 bg-[#fff8e5] px-4 py-3 text-xs leading-5 text-[#7a5a1a] dark:border-[#ff9500]/30 dark:bg-[#3a2f12] dark:text-[#f0b429]">
-                {`该配置保存的是远程 HTTP 明文地址，栖阅不会向它发起请求（${INSECURE_ENDPOINT_CODE}）。改成 HTTPS 并保存后即可恢复；本机 127.0.0.1 / [::1] 网关可使用 HTTP。`}
+                {endpointIsLocalhostAlias
+                  ? `该配置保存的是 localhost 地址，栖阅不接受这种本机写法（${LOCALHOST_ALIAS_ENDPOINT_CODE}）。本机服务请将 localhost 改为 127.0.0.1 或 [::1]，并保留端口和路径。`
+                  : `该配置保存的是远程 HTTP 明文地址，栖阅不会向它发起请求（${INSECURE_ENDPOINT_CODE}）。改成 HTTPS 并保存后即可恢复；本机 127.0.0.1 / [::1] 网关可使用 HTTP。`}
               </div>
             )}
             {isDirty && (
@@ -4802,7 +4871,7 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
         </div>
       )}
       <div className="flex items-center justify-end gap-3">
-        {selected && !isCreating && <button type="button" onClick={() => { void ai.deleteProfile().then((ok) => { if (ok) { setDraft(null); setApiKeyDraft(""); setIsKeyEditorOpen(false) } showNotice(ok ? mockMode ? "已从浏览器预览移除该配置（Mock/预览）：没有删除本机数据库记录，也没有触碰系统凭据管理器。" : "已删除配置并清除其 API Key" : "删除失败，请重试") }) }} disabled={ai.state.saving || isDirty || ai.state.loadError !== null} className="text-[13px] font-medium text-[#d70015] disabled:cursor-not-allowed disabled:opacity-50">删除配置</button>}
+        {selected && !isCreating && <button type="button" onClick={() => { void requestDeleteProfile() }} disabled={ai.state.saving || isDirty || ai.state.loadError !== null || deleteConfirmPending} className="text-[13px] font-medium text-[#d70015] disabled:cursor-not-allowed disabled:opacity-50">删除配置</button>}
         {!isCreating && <button type="button" onClick={() => void ai.refreshModels()} disabled={!selected || ai.state.catalogLoading || ai.state.loadError !== null} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[#1d1d1f] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#2c2c2e] disabled:cursor-not-allowed disabled:opacity-50">测试连接</button>}
       </div>
       <ExternalAgentAccessSettings showNotice={showNotice} registerReloader={registerReloader} />

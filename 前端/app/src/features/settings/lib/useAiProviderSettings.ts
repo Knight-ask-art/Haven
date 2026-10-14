@@ -21,11 +21,14 @@ import type {
 import {
   INSECURE_ENDPOINT_CODE,
   INSECURE_ENDPOINT_MESSAGE,
+  LOCALHOST_ALIAS_ENDPOINT_CODE,
+  LOCALHOST_ALIAS_ENDPOINT_MESSAGE,
   NO_AVAILABLE_MODEL,
   catalogStateHint,
   clearAiProviderApiKey,
   deleteAiProviderProfile,
   isAiEndpointTransportAllowed,
+  isLocalhostAliasEndpoint,
   listAiProviderModels,
   listAiProviderProfiles,
   setAiProviderApiKey,
@@ -119,7 +122,7 @@ export interface AiProviderSettingsController {
   /** 单向提交 API Key；成功后只更新「已配置」事实。 */
   submitApiKey: (secret: string) => Promise<boolean>;
   clearApiKey: () => Promise<boolean>;
-  deleteProfile: () => Promise<boolean>;
+  deleteProfile: (confirmedTarget?: { profileId: string; revision: string }) => Promise<boolean>;
   dismissSaveError: () => void;
 }
 
@@ -366,6 +369,23 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
     }
     // 保存边界：明文端点在这里就被拒绝，省掉一次注定失败的往返。
     // 后端仍会独立地再判一次——前端这条只是快速失败，不是权威结论。
+    //
+    // `localhost` 必须先分类：它是"主机名不被接受"，而不是"明文传输不被接受"。用同一
+    // 句"改成 HTTPS"打发它，用户照做之后仍然保存不了（本机服务改成 HTTPS 只会更难连
+    // 上），而真正该做的是把主机名写成 127.0.0.1 / [::1]。这条只改提示分类，不放行任何
+    // 地址：`localhost` 依然到不了后端保存路径。
+    if (isLocalhostAliasEndpoint(draft.endpoint)) {
+      setState((current) => ({
+        ...current,
+        saveError: {
+          code: LOCALHOST_ALIAS_ENDPOINT_CODE,
+          message: LOCALHOST_ALIAS_ENDPOINT_MESSAGE,
+          retryable: false,
+        },
+        saveErrorAction: "profile",
+      }));
+      return false;
+    }
     if (!isAiEndpointTransportAllowed(draft.endpoint)) {
       setState((current) => ({
         ...current,
@@ -499,8 +519,21 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
     }
   }, [load]);
 
-  const deleteProfile = useCallback(async (): Promise<boolean> => {
+  /**
+   * 删除配置。
+   *
+   * 传入 `confirmedTarget` 时删的是**确认框打开那一刻**定下的那一份：确认框是异步的，
+   * 期间用户可能切到别的配置，按"此刻选中项"删就会删错人。缺省仍按当前选中项。
+   */
+  const deleteProfile = useCallback(async (confirmedTarget?: {
+    profileId: string;
+    revision: string;
+  }): Promise<boolean> => {
     if (state.loading || state.loadError !== null) return false;
+    if (confirmedTarget) {
+      lastDeleteTarget.current = confirmedTarget;
+      return await deleteProfileTarget(confirmedTarget);
+    }
     const profile = state.profiles.find(
       (item) => item.profileId === selectedRef.current,
     );

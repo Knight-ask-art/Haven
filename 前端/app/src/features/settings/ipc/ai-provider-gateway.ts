@@ -39,6 +39,37 @@ export const INSECURE_ENDPOINT_MESSAGE =
   "远程 API 地址必须使用 HTTPS；仅显式配置的本机 127.0.0.1 或 [::1] 地址可使用 HTTP。请修改地址后重新保存。";
 
 /**
+ * `localhost` 非可用写法时的错误码与固定文案。
+ *
+ * `localhost` 与"远程明文地址"是两类不同的拒绝原因：它不是 WHATWG 之外的怪地址，而是
+ * 一个**归一化别名**。后端按"主机不被允许"拒绝（`AI_PROVIDER_ENDPOINT_INVALID`，
+ * 见 `haven-domain/src/ai_provider.rs` 的 `endpoint_error` / `haven-common` 的
+ * `validate_host`），**不是**按明文传输拒绝。
+ *
+ * 因此这里给出的必须是"改主机名"这条唯一可执行的结论：把 `localhost` 写成显式回环
+ * 字面量。原来的统一文案让本机用户去"改 HTTPS"，而本机服务改成 HTTPS 只会更难连上，
+ * 与后端实际结论也对不上。
+ */
+export const LOCALHOST_ALIAS_ENDPOINT_CODE = "AI_PROVIDER_ENDPOINT_INVALID";
+export const LOCALHOST_ALIAS_ENDPOINT_MESSAGE =
+  "本机服务请将 localhost 改为 127.0.0.1 或 [::1]，并保留端口和路径。栖阅只接受显式写出的本机回环地址。";
+
+/**
+ * 输入的主机名是否恰好是 `localhost`（`http://` 或 `https://` 均可）。
+ *
+ * 只按字面主机名判断，不解析 DNS，也不枚举其它 loopback 别名（`127.1`、
+ * `2130706433`）——那些仍由 [`isAiEndpointTransportAllowed`] 与后端拒绝。
+ * 它是**提示分类**用的，不构成放行：匹配到的地址依然保存不了。
+ */
+export function isLocalhostAliasEndpoint(endpoint: string): boolean {
+  const value = endpoint.trim().toLowerCase();
+  if (!value.startsWith("http://") && !value.startsWith("https://")) return false;
+  const authority = value.split("://")[1]?.split(/[/?#]/u)[0];
+  if (!authority) return false;
+  return authority.split("@").pop()?.split(":")[0] === "localhost";
+}
+
+/**
  * 快速判断 HTTPS 或显式本机 HTTP；后端仍负责完整 URL / DNS / 端口策略。
  *
  * 不解析 DNS、不授予 LAN 权限，也不认可 WHATWG 归一化的 loopback 别名。

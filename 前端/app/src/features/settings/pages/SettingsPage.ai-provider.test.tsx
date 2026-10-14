@@ -143,7 +143,7 @@ describe("设置页 AI Provider 写入路径", () => {
   })
 
   it("删除配置后凭据与模型一起清空，回到无可用模型", async () => {
-    renderAiSettings()
+    renderAiSettingsWithNotices([], true)
     await createProfile()
 
     fireEvent.click(await screen.findByRole("button", { name: "配置" }))
@@ -301,8 +301,8 @@ describe("设置页外部 Agent 接入分组", () => {
   })
 })
 
-/** 与 `renderAiSettings` 相同，但把通知中心换成一个可观测的 push。 */
-function renderAiSettingsWithNotices(pushed: string[]) {
+/** 与 `renderAiSettings` 相同，但把通知中心换成一个可观测的 push；`confirmResult` 决定确认框结果。 */
+function renderAiSettingsWithNotices(pushed: string[], confirmResult = false) {
   const rendered = render(
     <NoticeContext.Provider value={{
       notices: [],
@@ -313,7 +313,7 @@ function renderAiSettingsWithNotices(pushed: string[]) {
       dismiss: () => undefined,
       clear: () => undefined,
       resolveConfirm: () => undefined,
-      confirm: async () => false,
+      confirm: async () => confirmResult,
     }}>
       <MemoryRouter initialEntries={["/settings/ai"]}>
         <Routes>
@@ -357,7 +357,7 @@ describe("设置页 AI 分组的 Mock 诚实性", () => {
 
   it("Mock 下删除配置不得声称删除了本机数据库记录", async () => {
     const pushed: string[] = []
-    renderAiSettingsWithNotices(pushed)
+    renderAiSettingsWithNotices(pushed, true)
     await createProfile()
 
     fireEvent.click(await screen.findByRole("button", { name: "删除配置" }))
