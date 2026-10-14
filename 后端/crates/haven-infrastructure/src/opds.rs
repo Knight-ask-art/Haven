@@ -879,7 +879,9 @@ impl OpdsClient {
         if entry.identity_is_http_url() {
             return self.is_source_url_allowed(context, source_endpoint, &entry.entry_id);
         }
-        true
+        // Gutenberg 的导入链路必须重新抓取 HTTP 条目页。仅搜索的自定义
+        // 目录可以保留 URN/tag 身份，不能把它们暴露为可导入候选。
+        context.identity() != OpdsSourceIdentity::BuiltinGutenberg
     }
 
     /// 条目页 → 只解析单条目元数据，不获取 EPUB 正文。

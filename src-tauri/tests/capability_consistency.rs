@@ -41,11 +41,6 @@ const BUILT_ACL_PATH: &str = concat!(env!("OUT_DIR"), "/acl-manifests.json");
 /// build.rs 生成的 capabilities 产物（OUT_DIR；编译期嵌入路径）。
 const BUILT_CAPABILITIES_PATH: &str = concat!(env!("OUT_DIR"), "/capabilities.json");
 
-/// 模拟 IPC 请求（envelope 由各测试构造）。
-/// URL 遵循 Tauri 平台规则：Windows/Android 用 `http://tauri.localhost`（本地 origin），
-/// 其余平台用 `tauri://localhost`。否则 Windows 上 `tauri://localhost` 会被判为 remote，
-/// 使已授权命令被 ACL 误拒。
-
 fn json_contains_string(value: &serde_json::Value, needle: &str) -> bool {
     match value {
         serde_json::Value::String(text) => text.contains(needle),
@@ -58,10 +53,6 @@ fn json_contains_string(value: &serde_json::Value, needle: &str) -> bool {
         _ => false,
     }
 }
-
-/// 用真实 build 产物 ACL/capabilities 构造 authority 的 context（阻塞二）。
-/// `Context::runtime_authority_mut`（doc(hidden) pub）直接替换为
-/// `RuntimeAuthority::new(acl, resolved)`。
 
 /// 空 authority 的普通 context（dispatch deny 测试用：未知命令不应先被 ACL 拒绝）。
 fn empty_context() -> Context<MockRuntime> {

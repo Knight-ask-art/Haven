@@ -172,6 +172,24 @@ fn search_feed_validation_rejects_broken_xml_and_html() {
 }
 
 #[test]
+fn import_enabled_gutenberg_requires_an_http_entry_identity() {
+    let client = OpdsClient::new().unwrap();
+    let context = super::OpdsRequestContext::builtin_gutenberg(super::OPDS_SOURCE_GUTENBERG);
+    let endpoint = "https://www.gutenberg.org/ebooks/";
+    let mut entry = super::OpdsEntry {
+        entry_id: "urn:uuid:book-1".to_owned(),
+        title: "Book".to_owned(),
+        author: None,
+        summary: None,
+        pic: None,
+        epub_href: Some("https://www.gutenberg.org/ebooks/84.epub".to_owned()),
+    };
+    assert!(!client.candidate_stays_on_source(&context, endpoint, &entry));
+    entry.entry_id = "https://www.gutenberg.org/ebooks/84.opds".to_owned();
+    assert!(client.candidate_stays_on_source(&context, endpoint, &entry));
+}
+
+#[test]
 fn basic_auth_uses_saved_username_and_legacy_secret_requires_reconfiguration() {
     let client = reqwest::Client::new();
     let request = super::apply_opds_auth(
