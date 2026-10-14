@@ -130,10 +130,10 @@ export function DownloadsPage() {
     }
   }, [publishDownloadError, runtimeState])
 
-  const runAction = useCallback(async (
+  const runAction = useCallback(async function executeAction(
     taskId: string,
     action: (id: string) => Promise<DownloadTaskDto>,
-  ) => {
+  ) {
     setPendingTaskIds((current) => new Set(current).add(taskId))
     try {
       const updated = await action(taskId)
@@ -152,8 +152,9 @@ export function DownloadsPage() {
         error,
         "下载操作失败",
         `downloads:${taskId}:${normalized.code}`,
+        // 操作失败时重放原动作；任务本身失败的事件入口才使用 retryDownload。
         normalized.retryable
-          ? { label: "重试", onClick: () => runAction(taskId, retryDownload) }
+          ? { label: "重试", onClick: () => executeAction(taskId, action) }
           : undefined,
       )
     } finally {

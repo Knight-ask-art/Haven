@@ -21,11 +21,14 @@ import type {
 import {
   INSECURE_ENDPOINT_CODE,
   INSECURE_ENDPOINT_MESSAGE,
+  LOCALHOST_ALIAS_ENDPOINT_CODE,
+  LOCALHOST_ALIAS_ENDPOINT_MESSAGE,
   NO_AVAILABLE_MODEL,
   catalogStateHint,
   clearAiProviderApiKey,
   deleteAiProviderProfile,
   isAiEndpointTransportAllowed,
+  isLocalhostAliasEndpoint,
   listAiProviderModels,
   listAiProviderProfiles,
   setAiProviderApiKey,
@@ -119,7 +122,15 @@ export interface AiProviderSettingsController {
   /** 单向提交 API Key；成功后只更新「已配置」事实。 */
   submitApiKey: (secret: string) => Promise<boolean>;
   clearApiKey: () => Promise<boolean>;
-  deleteProfile: () => Promise<boolean>;
+  deleteProfile: (confirmedTarget?: { profileId: string; revision: string }) => Promise<boolean>;
+  /**
+   * 标记 / 解除"删除确认在途"。
+   *
+   * 确认框由页面（`useNotice`）持有，Hook 看不到它，因此这枚状态必须由调用方设置：
+   * 置位后所有 profile 与凭据写入（保存、启用、模型选择、API Key 写入 / 清除）都会
+   * 被拒，避免与待确认的那次删除交错留下孤儿 secret。取消纯草稿不算写入，不受影响。
+   */
+  setDeleteConfirmPending: (pending: boolean) => void;
   dismissSaveError: () => void;
 }
 
@@ -174,6 +185,19 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
    * 切换或别的调用方都不该绕过这条闸门。
    */
   const credentialMutationInFlight = useRef(false);
+  /**
+   * 非模态确认框在途。
+   *
+   * 删除确认是**异步且可能长时间挂着**的：确认框打开期间，行上的其余写入控件（保存配置、
+   * 写 / 清 API Key、启用开关、模型选择）如果还能提交，就会和"待确认的那一次删除"交错。
+   * 具体后果不是"顺序不好看"，而是**孤儿凭据**——用户的 credentialSet 先落盘、删除后
+   * 才执行，后端已经按行清理过 `haven:ai:<profileId>`，系统凭据管理器里却留下一份谁都
+   * 引用不到的密钥。
+   *
+   * 因此确认在途期间，删除与凭据写入共用这一道**同步**闸门：先检测、再 true、
+   * `finally` 释放，钩子自身不依赖异步的 `state.saving`（那个状态落后一个渲染）。
+   */
+  const deleteConfirmInFlight = useRef(false);
   /** 最近一次提交的 profile 草稿：重试"保存"时必须重放**同一份**输入，而不是重新拼一份。 */
   const lastSaveDraft = useRef<AiProviderProfileDraft | null>(null);
 
@@ -348,6 +372,9 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
   }, [notifySelection]);
 
   const saveProfile = useCallback(async (draft: AiProviderProfileDraft): Promise<boolean> => {
+    // 删除确认在途时整段 profile 写入都停下来：确认框是异步的，期间任何一次
+    // 保存 / 启用 / 选模型都会写到"用户正在决定要删掉的那一份"上。
+    if (deleteConfirmInFlight.current) return false;
     const existing = state.profiles.find(
       (profile) => profile.profileId === draft.profileId,
     );
@@ -366,6 +393,23 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
     }
     // 保存边界：明文端点在这里就被拒绝，省掉一次注定失败的往返。
     // 后端仍会独立地再判一次——前端这条只是快速失败，不是权威结论。
+    //
+    // `localhost` 必须先分类：它是"主机名不被接受"，而不是"明文传输不被接受"。用同一
+    // 句"改成 HTTPS"打发它，用户照做之后仍然保存不了（本机服务改成 HTTPS 只会更难连
+    // 上），而真正该做的是把主机名写成 127.0.0.1 / [::1]。这条只改提示分类，不放行任何
+    // 地址：`localhost` 依然到不了后端保存路径。
+    if (isLocalhostAliasEndpoint(draft.endpoint)) {
+      setState((current) => ({
+        ...current,
+        saveError: {
+          code: LOCALHOST_ALIAS_ENDPOINT_CODE,
+          message: LOCALHOST_ALIAS_ENDPOINT_MESSAGE,
+          retryable: false,
+        },
+        saveErrorAction: "profile",
+      }));
+      return false;
+    }
     if (!isAiEndpointTransportAllowed(draft.endpoint)) {
       setState((current) => ({
         ...current,
@@ -414,7 +458,8 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
     const profileId = selectedRef.current;
     if (!profileId) return false;
     // 与"清除"互斥：两条写操作不能并发决定同一个凭据的最终状态。
-    if (credentialMutationInFlight.current) return false;
+    // 与"删除确认"同样互斥：删除会连带清理这份凭据，交错写入只会留下孤儿 secret。
+    if (credentialMutationInFlight.current || deleteConfirmInFlight.current) return false;
     credentialMutationInFlight.current = true;
     setState((current) => ({ ...current, saving: true, saveError: null }));
     try {
@@ -442,7 +487,7 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
   const clearApiKey = useCallback(async (): Promise<boolean> => {
     const profileId = selectedRef.current;
     if (!profileId) return false;
-    if (credentialMutationInFlight.current) return false;
+    if (credentialMutationInFlight.current || deleteConfirmInFlight.current) return false;
     credentialMutationInFlight.current = true;
     setState((current) => ({ ...current, saving: true, saveError: null }));
     try {
@@ -471,11 +516,21 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
    * 删除按钮与「重试」共用这一条：两者的区别只在"目标从哪来"——按钮取当前选中的那一份，
    * 重试取失败时记下的那一份。放在同一个函数里是为了让"删的到底是哪一份"只有一处实现，
    * 不会出现"按钮改了、重试没改"这种分叉。
+   *
+   * 删除与**凭据写入**（[`submitApiKey`] / [`clearApiKey`]）共用 [`credentialMutationInFlight`]
+   * 闸门，理由和"写入与清除互斥"一样但更严重：两者交错会留下**孤儿 secret**——写密钥的
+   * 请求在删除之后才落盘，而后端的删除只清理它执行那一刻的行与凭据。闸门是同步
+   * ref（先检测、再 true、`finally` 释放），不依赖异步的 `saving` 状态。
    */
   const deleteProfileTarget = useCallback(async (target: {
     profileId: string;
     revision: string;
   }): Promise<boolean> => {
+    // 闸门先取：没拿到就没有发起删除，也就没有"可重放的目标"要记。
+    if (credentialMutationInFlight.current) return false;
+    credentialMutationInFlight.current = true;
+    // 删除没有可重放的输入：记下这一次的目标，失败之后"重试"重放的就是它；成功后清空。
+    lastDeleteTarget.current = target;
     setState((current) => ({ ...current, saving: true, saveError: null }));
     try {
       await deleteAiProviderProfile(target.profileId, target.revision);
@@ -496,19 +551,40 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
         saveErrorAction: "delete",
       }));
       return false;
+    } finally {
+      credentialMutationInFlight.current = false;
     }
   }, [load]);
 
-  const deleteProfile = useCallback(async (): Promise<boolean> => {
+  /**
+   * 删除配置。
+   *
+   * 传入 `confirmedTarget` 时删的是**确认框打开那一刻**定下的那一份：确认框是异步的，
+   * 期间用户可能切到别的配置，按"此刻选中项"删就会删错人。缺省仍按当前选中项。
+   *
+   * **已经记下的删除目标只应由本人清除**：失败时留着供"重试"重放，成功时由
+   * [`deleteProfileTarget`] 清空。确认在途时这里直接返回，不会把目标改写成别的值。
+   */
+  const deleteProfile = useCallback(async (confirmedTarget?: {
+    profileId: string;
+    revision: string;
+  }): Promise<boolean> => {
     if (state.loading || state.loadError !== null) return false;
+    // 确认期间只允许已确认的固定目标执行，其余写入口继续保持锁定。
+    if (deleteConfirmInFlight.current && !confirmedTarget) return false;
+    if (confirmedTarget) {
+      // 目标在确认框打开那一刻就定下了，原样交给删除：切到别的 profile 也改不了它。
+      return await deleteProfileTarget(confirmedTarget);
+    }
     const profile = state.profiles.find(
       (item) => item.profileId === selectedRef.current,
     );
     if (!profile) return false;
     // 目标在这里定下来并记牢：失败之后的重试要重放它，而不是重放"那一刻选中的东西"。
-    const target = { profileId: profile.profileId, revision: profile.revision };
-    lastDeleteTarget.current = target;
-    return await deleteProfileTarget(target);
+    return await deleteProfileTarget({
+      profileId: profile.profileId,
+      revision: profile.revision,
+    });
   }, [deleteProfileTarget, state.loadError, state.loading, state.profiles]);
 
   /**
@@ -522,6 +598,7 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
    *   无法重放；用一个"重试"按钮去做别的事（例如重新拉模型）只会掩盖真正的失败。
    */
   const retrySaveError = useCallback(async (): Promise<boolean> => {
+    if (deleteConfirmInFlight.current) return false;
     const action = state.saveErrorAction;
     if (action === "profile") {
       const draft = lastSaveDraft.current;
@@ -541,6 +618,10 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
     // 有机会在很久之后被别的东西触发。
     lastDeleteTarget.current = null;
     setState((current) => ({ ...current, saveError: null, saveErrorAction: null }));
+  }, []);
+
+  const setDeleteConfirmPending = useCallback((pending: boolean) => {
+    deleteConfirmInFlight.current = pending;
   }, []);
 
   const selectedProfile = useMemo(
@@ -581,6 +662,7 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
     submitApiKey,
     clearApiKey,
     deleteProfile,
+    setDeleteConfirmPending,
     dismissSaveError,
   };
 }

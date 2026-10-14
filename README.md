@@ -51,13 +51,16 @@ Rust + SQLite 存储引擎：高效管理海量元数据与本地文件索引，
 - Artwork Cache、默认封面 fallback、离线读取和缓存自愈；前端不直接请求第三方海报。
 - 严格 CSP、最小 Tauri Capability、命令清单/ACL 一致性检查和脱敏日志。
 - 播放器 `Ctrl+Shift+S` 截图：受限 JPEG 分块上传，Windows 原生保存对话框，默认保存到“下载 / 栖阅 / 截图”。
-- 设置页的 General、Appearance、Playback、Reading、Comic、Downloads、Privacy、Sources、Storage、Updates 和 About 真实数据闭环；AI、Sync 等未接入分区会明确显示不可用，未配置签名发布时更新安装也会安全显示不可用。
+- 设置页的 General、Appearance、Playback、Reading、Comic、Downloads、Privacy、Sources、Storage、AI 工作台、Updates 和 About 真实数据闭环；Sync 等未接入分区会明确显示不可用，未配置签名发布时更新安装也会安全显示不可用。
+- 来源管理支持内置来源与用户登记的自定义来源（OPDS、CMS10、M3U、RSS/Atom、Komga/Kavita）；自定义来源可指向私网、回环与本地 DNS 名称。
+- 存储支持本地目录与 Google Drive 只读 PDF（需部署方配置 OAuth 客户端）；AI 工作台（栖伴）支持 Provider 配置、模型目录、Agent 提案与 MCP / Skills 管理。
 
 ## Architecture
 
 ```text
 React UI
   -> Feature Hook / Action
+  -> Feature API / Gateway
   -> Typed HavenClient
   -> Tauri Command
   -> Application Service
@@ -73,7 +76,7 @@ Rust + SQLite 是持久化事实源。前端的 Mock 只在显式浏览器开发
 
 目前支持的 Windows 本地内容核心有：视频、TXT、Markdown、EPUB、PDF、HTML、CBZ 和图片目录。支持范围、已知限制和升级说明请参阅[公开变更记录](CHANGELOG.md)。
 
-影视优化分支正在接入受控外挂字幕：当前实现覆盖 SRT/VTT/SBV 的编码归一化、轨道切换与资源生命周期，但尚未完成 runtime/release 四层验收，不能宣称已进入 `v0.1.0-beta.1` 发布能力。音轨切换和 HEVC 控制仍未开放；OCR/翻译/AI、Sync 和“清除全部本地数据”需要独立 Foundation/风险评审后再开放。自动更新在签名 Release 正式发布前保持不可用。
+影视优化分支正在接入受控外挂字幕：当前实现覆盖 SRT/VTT/SBV 的编码归一化、轨道切换与资源生命周期，但尚未完成 runtime/release 四层验收，不能宣称已进入 `v0.1.0-beta.1` 发布能力。音轨切换和 HEVC 控制仍未开放；OCR/翻译、Sync 和“清除全部本地数据”需要独立 Foundation/风险评审后再开放。AI 工作台已接入真实 typed IPC 与消费者，但真实 Provider 响应尚待本机凭据下的联调验收。自动更新在签名 Release 正式发布前保持不可用。
 
 ## Quick start (Windows)
 
@@ -135,7 +138,7 @@ Tauri 桌面版本已经接入固定的 HTTPS GitHub Release 检查链；在维�
 - [文档中心](docs/README.md)
 - [公开变更记录](CHANGELOG.md)
 - [内置来源能力表](SOURCES.md)
-- [CMS10 用户配置说明](CMS10_USER_CONFIG.md)
+- [用户配置参考](用户配置参考.md)
 - [第三方许可说明](THIRD_PARTY_NOTICES.md)
 - [影视四层验收合同](contracts/film-tv/README.md)
 

@@ -40,6 +40,9 @@ PUBLIC_INDEXES = {
 PUBLIC_INDEXES_CASEFOLDED = frozenset(path.as_posix().casefold() for path in PUBLIC_INDEXES)
 GRANDFATHERED_PUBLIC_DOCUMENTS: set[Path] = set()
 PRIVATE_REGISTERS = DOCS / "internal" / "documentation-registers"
+# The private ledger register is found by this id, so the id is pinned here and
+# re-checked in check_local_ledger_policy. Renaming it is a deliberate change.
+PRIVATE_LEDGER_DOC_ID = "work.index"
 LOCAL_RECORD_REGISTERS = (
     (DOCS / "plans", PRIVATE_REGISTERS / "plans.md", False, frozenset({"README.md"})),
     (DOCS / "reviews", PRIVATE_REGISTERS / "reviews.md", False, frozenset({"README.md"})),
@@ -340,6 +343,74 @@ def check_record_register(
     return errors
 
 
+def check_register_entries(
+    directory: Path,
+    register: Path,
+    *,
+    recursive: bool,
+    excluded_names: frozenset[str],
+) -> list[str]:
+    """Report register entries that name a local record which does not exist.
+
+    This is the reverse of check_record_register. That function catches a record
+    missing from its register; this one catches the mirror case, where the
+    register keeps a path that the working tree no longer has. Both directions
+    matter: a register is the only navigation into private material, so a stale
+    row sends the next reader after a file that was moved or deleted.
+
+    A register may still reference history on purpose. Points that are intent
+    rather than a live path are therefore skipped:
+
+    - ``<rev>:<path>`` names a commit or tag that contained the record (for
+      example ``2d9c25b:docs/plans/old-plan.md``). The rev is the anchor, so the
+      row stays useful after the file leaves the tree.
+    - a wildcard such as ``docs/plans/*.md`` describes a class of records.
+    - ``docs/agents/`` is local-only agent instruction material that is never
+      present in a public checkout.
+
+    The glob and history rules are what keep an intentional reference from
+    reading as drift. A row that names neither a rev nor a glob and has no local
+    file is a genuine stale entry.
+    """
+
+    # Public checkouts omit private registers. Missing registers with local
+    # records are still rejected by check_record_register's forward check.
+    if not register.exists():
+        return []
+
+    try:
+        register_text = register.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        return [f"{register.relative_to(ROOT)}: cannot read local record register ({error})"]
+
+    base = directory.relative_to(ROOT).as_posix()
+    candidates: set[str] = set()
+    pattern = re.compile(r"`([^`\n]+\.md)`")
+    for match in pattern.finditer(register_text):
+        candidate = match.group(1).strip()
+        if candidate != base and not candidate.startswith(f"{base}/"):
+            continue
+        if "*" in candidate or "?" in candidate:
+            continue
+        if candidate.startswith("docs/agents/"):
+            continue
+        candidates.add(candidate)
+
+    errors: list[str] = []
+    for candidate in sorted(candidates):
+        if candidate == base:
+            # The directory boundary index itself (docs/plans/README.md).
+            target = directory / "README.md"
+        else:
+            target = ROOT / candidate
+        if not target.is_file():
+            errors.append(
+                f"{candidate}: register entry has no local file "
+                f"({register.relative_to(ROOT).as_posix()})"
+            )
+    return errors
+
+
 def check_plan_register(
     plan_directory: Path = ROOT / "plan",
     register: Path = PRIVATE_REGISTERS / "legacy.md",
@@ -378,6 +449,14 @@ def check_local_record_registers() -> list[str]:
     for directory, register, recursive, excluded_names in LOCAL_RECORD_REGISTERS:
         errors.extend(
             check_record_register(
+                directory,
+                register,
+                recursive=recursive,
+                excluded_names=excluded_names,
+            )
+        )
+        errors.extend(
+            check_register_entries(
                 directory,
                 register,
                 recursive=recursive,
@@ -473,6 +552,17 @@ def check_local_ledger_policy() -> tuple[list[str], list[str]]:
                 if active is not None:
                     documents.append(active)
     policy_errors, warnings = check_ledger_policy(documents)
+
+    # The private register is located by doc_id above, so its identity is part
+    # of the gate. The public docs/work/README.md carries the same doc_id and
+    # docs/internal/ is excluded from the public uniqueness scan, so nothing
+    # else would notice if this file were renamed or its id changed.
+    if document.fields.get("doc_id") != PRIVATE_LEDGER_DOC_ID:
+        errors.append(
+            f"{index.relative_to(ROOT)}: doc_id must stay {PRIVATE_LEDGER_DOC_ID} "
+            "because tools/docs/check.py locates the active-ledger declaration by it"
+        )
+
     return [*errors, *policy_errors], warnings
 
 

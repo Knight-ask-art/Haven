@@ -2,7 +2,8 @@
   "schemaVersion": 1,
   "product": "Haven",
   "feature": "film-tv",
-  "branch": "codex/film-tv-optimization",
+  "branch": "main",
+  "branchNote": "原绑定分支 codex/film-tv-optimization 已不存在（本地与远端均无匹配）；本矩阵现按 main 记录，全部 capabilities 仍为 not-accepted。",
   "principle": "构建和部署只能证明制品或部署动作，不得单独证明影视功能可用。",
   "completionRule": {
     "capabilityPassRequires": ["local", "ci", "runtime", "release"],

@@ -350,28 +350,42 @@ impl DownloadService {
     /// 仍按用户已提交的意图启动，后续可用“暂停”明确阻止它们。
     pub async fn resume_startable(&self) -> Result<u32, AppError> {
         let auto_continue = self.auto_continue_enabled().await;
-        let tasks = self.ports.as_download().list(MAX_LIMIT, 0).await?;
         let mut started = 0_u32;
-        for task in tasks {
-            let start = if should_start_on_boot(task.state, auto_continue) {
-                if task.state == DownloadState::Interrupted {
-                    self.ports
-                        .as_download()
-                        .compare_and_set_state(
-                            task.id,
-                            DownloadState::Interrupted,
-                            DownloadState::Queued,
-                        )
-                        .await?
+        // 历史终态任务也占据列表位置，必须分页才能覆盖旧的待恢复任务。
+        // 状态迁移不改变仓储排序键 created_at / id。
+        let mut offset = 0_u32;
+        loop {
+            let tasks = self.ports.as_download().list(MAX_LIMIT, offset).await?;
+            if tasks.is_empty() {
+                break;
+            }
+            let page_len = tasks.len() as u32;
+            for task in tasks {
+                let start = if should_start_on_boot(task.state, auto_continue) {
+                    if task.state == DownloadState::Interrupted {
+                        self.ports
+                            .as_download()
+                            .compare_and_set_state(
+                                task.id,
+                                DownloadState::Interrupted,
+                                DownloadState::Queued,
+                            )
+                            .await?
+                    } else {
+                        true
+                    }
                 } else {
-                    true
+                    false
+                };
+                if start {
+                    self.runner.start(task.id);
+                    started = started.saturating_add(1);
                 }
-            } else {
-                false
-            };
-            if start {
-                self.runner.start(task.id);
-                started = started.saturating_add(1);
+            }
+            offset = offset.saturating_add(page_len);
+            // 不满一页说明已经是最后一页（空页也在上面的 `is_empty` 处收尾）。
+            if page_len < MAX_LIMIT {
+                break;
             }
         }
         Ok(started)

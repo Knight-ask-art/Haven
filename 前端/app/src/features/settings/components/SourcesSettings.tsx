@@ -21,12 +21,29 @@ function Cms10EndpointRow({
   showNotice: (message: string) => void
   onChanged: () => void
 }) {
+  const { confirm } = useNotice()
   const [endpoint, setEndpoint] = useState("")
   const [saving, setSaving] = useState(false)
+  const [clearing, setClearing] = useState(false)
+  // 保存与清除共用同步锁，覆盖确认和请求，防止确认期间保存新地址后又被清除。
+  const mutating = useRef(false)
+  const mounted = useRef(true)
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
+
   const save = async () => {
+    if (mutating.current) return
+    const next = endpoint.trim()
+    if (next.length === 0) {
+      showNotice("请先填写采集接口地址")
+      return
+    }
+    mutating.current = true
     setSaving(true)
     try {
-      const result = await setSourceEndpoint({ sourceId: source.sourceId, endpoint })
+      const result = await setSourceEndpoint({ sourceId: source.sourceId, endpoint: next })
       if (result.endpointConfigured) {
         showNotice("端点已保存")
       } else {
@@ -36,9 +53,37 @@ function Cms10EndpointRow({
     } catch (error) {
       showNotice(toHavenError(error).dto.userMessage)
     } finally {
+      mutating.current = false
       setSaving(false)
     }
   }
+
+  /** 清除已配置端点：这是会让来源查询失效的动作，先说明后果再执行。 */
+  const clear = async () => {
+    if (mutating.current) return
+    mutating.current = true
+    setClearing(true)
+    try {
+      const confirmed = await confirm({
+        title: "清除采集接口地址",
+        message: "清除后该来源没有可用的采集接口，来源查询与内容获取都会不可用，直到重新填写地址。确定清除吗？",
+        confirmLabel: "清除",
+        cancelLabel: "取消",
+        dedupeKey: `settings:source:${source.sourceId}:endpoint-clear`,
+      })
+      // 面板关闭后旧确认不得清除重新打开面板时保存的新地址。
+      if (!confirmed || !mounted.current) return
+      await setSourceEndpoint({ sourceId: source.sourceId, endpoint: "" })
+      showNotice("端点已清除")
+      onChanged()
+    } catch (error) {
+      showNotice(toHavenError(error).dto.userMessage)
+    } finally {
+      mutating.current = false
+      setClearing(false)
+    }
+  }
+
   return (
     <div className="flex flex-col gap-3 border-t border-[var(--haven-settings-border-subtle)] px-5 py-[16px]">
       <div className="flex flex-col gap-[8px] border-t border-[var(--haven-settings-border-subtle)] pt-3 sm:flex-row sm:items-center">
@@ -52,16 +97,32 @@ function Cms10EndpointRow({
             className="mt-1 w-full rounded-xl border border-[var(--haven-settings-border-subtle)] bg-[var(--haven-settings-card)] px-3 py-[8px] font-mono text-xs text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)]"
             autoComplete="off"
             spellCheck={false}
+            disabled={saving || clearing}
           />
+          <span className="mt-1 block text-[11px] leading-5">
+            {source.endpointConfigured
+              ? "该来源已配置端点；填入新地址保存后会覆盖现有配置（原端点不会回显在这里）。"
+              : "该来源尚未配置端点，填写后保存才会参与来源查询。"}
+          </span>
         </label>
         <button
           type="button"
-          disabled={saving}
+          disabled={saving || clearing || endpoint.trim().length === 0}
           onClick={() => { void save() }}
           className="shrink-0 self-start rounded-full bg-[var(--haven-settings-primary)] px-[16px] py-[8px] text-xs font-semibold text-[var(--haven-settings-primary-foreground)] disabled:opacity-50 sm:self-center"
         >
           {saving ? "保存中…" : "保存端点"}
         </button>
+        {source.endpointConfigured && (
+          <button
+            type="button"
+            disabled={saving || clearing}
+            onClick={() => { void clear() }}
+            className="shrink-0 self-start rounded-full border border-[var(--haven-settings-border-subtle)] px-[16px] py-[8px] text-xs font-semibold text-[var(--haven-settings-danger)] disabled:opacity-50 sm:self-center"
+          >
+            {clearing ? "处理中…" : "清除端点"}
+          </button>
+        )}
       </div>
     </div>
   )
@@ -77,24 +138,74 @@ function M3uEndpointRow({
   showNotice: (message: string) => void
   onChanged: () => void
 }) {
+  const { confirm } = useNotice()
   const [endpoint, setEndpoint] = useState("")
   const [saving, setSaving] = useState(false)
+  const [clearing, setClearing] = useState(false)
+
+  /** 与 CMS10 行同一套闸门：保存与清除互斥，且空输入**不是**一次清除。 */
+  const mutating = useRef(false)
+  const mounted = useRef(true)
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
+
   const save = async () => {
+    if (mutating.current) return
+    const next = endpoint.trim()
+    if (next.length === 0) {
+      showNotice("请先填写 M3U 播放列表地址")
+      return
+    }
+    mutating.current = true
     setSaving(true)
     try {
-      const result = await setSourceEndpoint({ sourceId: source.sourceId, endpoint })
+      const result = await setSourceEndpoint({ sourceId: source.sourceId, endpoint: next })
       showNotice(result.endpointConfigured ? "M3U 地址已保存" : "M3U 地址已清除")
       onChanged()
     } catch (error) {
       showNotice(toHavenError(error).dto.userMessage)
     } finally {
+      mutating.current = false
       setSaving(false)
     }
   }
+
+  /** 清除已配置地址：频道列表与频道搜索都会随即失效，先说明后果再执行。 */
+  const clear = async () => {
+    if (mutating.current) return
+    mutating.current = true
+    setClearing(true)
+    try {
+      const confirmed = await confirm({
+        title: "清除 M3U 播放列表地址",
+        message: "清除后该来源没有可用的播放列表地址，频道列表与频道搜索都会不可用，直到重新填写地址。确定清除吗？",
+        confirmLabel: "清除",
+        cancelLabel: "取消",
+        dedupeKey: `settings:source:${source.sourceId}:endpoint-clear`,
+      })
+      if (!confirmed || !mounted.current) return
+      await setSourceEndpoint({ sourceId: source.sourceId, endpoint: "" })
+      showNotice("M3U 地址已清除")
+      onChanged()
+    } catch (error) {
+      showNotice(toHavenError(error).dto.userMessage)
+    } finally {
+      mutating.current = false
+      setClearing(false)
+    }
+  }
+
   return (
     <div className="flex flex-col gap-[8px] border-t border-[var(--haven-settings-border-subtle)] px-5 py-[16px]">
       <p className="text-xs font-semibold text-[var(--haven-settings-foreground)]">M3U 播放列表地址</p>
       <p className="text-[11px] leading-5 text-[var(--haven-settings-muted)]">填入以 http:// 或 https:// 开头的播放列表地址，本机和局域网地址也可以使用；地址带访问参数时请使用 HTTPS。保存后可按频道名称搜索，播放地址不会显示在搜索结果中。</p>
+      <p className="text-[11px] leading-5 text-[var(--haven-settings-muted)]">
+        {source.endpointConfigured
+          ? "该来源已配置地址；填入新地址保存后会覆盖现有配置（原地址不会回显在这里）。"
+          : "该来源尚未配置地址，填写后保存才会解析播放列表。"}
+      </p>
       <div className="flex flex-col gap-[8px] sm:flex-row sm:items-center">
         <input
           value={endpoint}
@@ -103,17 +214,28 @@ function M3uEndpointRow({
           maxLength={500}
           autoComplete="off"
           spellCheck={false}
+          disabled={saving || clearing}
           className="min-w-0 flex-1 rounded-xl border border-[var(--haven-settings-border-subtle)] bg-[var(--haven-settings-card)] px-3 py-[8px] font-mono text-xs text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)]"
           aria-label="M3U 播放列表地址"
         />
         <button
           type="button"
-          disabled={saving}
+          disabled={saving || clearing || endpoint.trim().length === 0}
           onClick={() => { void save() }}
           className="shrink-0 self-start rounded-full bg-[var(--haven-settings-primary)] px-[16px] py-[8px] text-xs font-semibold text-[var(--haven-settings-primary-foreground)] disabled:opacity-50 sm:self-auto"
         >
           {saving ? "保存中…" : "保存地址"}
         </button>
+        {source.endpointConfigured && (
+          <button
+            type="button"
+            disabled={saving || clearing}
+            onClick={() => { void clear() }}
+            className="shrink-0 self-start rounded-full border border-[var(--haven-settings-border-subtle)] px-[16px] py-[8px] text-xs font-semibold text-[var(--haven-settings-danger)] disabled:opacity-50 sm:self-auto"
+          >
+            {clearing ? "处理中…" : "清除地址"}
+          </button>
+        )}
       </div>
     </div>
   )
