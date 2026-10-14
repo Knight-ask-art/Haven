@@ -3,9 +3,19 @@
 /**
  * `source_set_credential`：写入/清除自定义源凭据。secret 只进系统 keyring；
  * 持久化仅存 credential_ref；secret 与 target 禁止出 IPC、日志。
+ *
+ * `username` 只对 OPDS Basic 有意义：目录服务按 RFC 7617 校验的是**用户自己的账号名**，
+ * 而不是后端生成的内部 `source_id`。写入时它与 `secret` 一起编码成版本化载荷存进凭据
+ * 槽（见 `source_registry::opds_credential`），不在响应中回显，也不进日志。
+ * Komga/Kavita 的 API key 与清除请求都不携带它。
  */
 export type SourceSetCredentialRequest = { sourceId: string, 
 /**
  * null = 清除凭据；Some(空串) 非法 → INVALID_ARGUMENT。
  */
-secret: string | null, };
+secret: string | null, 
+/**
+ * OPDS Basic 用户名；null/缺省 = 历史调用（只有一段密码，读出来是「需要重新配置」）。
+ * 只有 OPDS 来源接受非空值，其它种类传非空值 → INVALID_ARGUMENT。
+ */
+username?: string, };

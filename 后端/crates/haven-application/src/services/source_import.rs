@@ -10,7 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
-use haven_common::network::{HttpUrlPolicy, parse_http_url};
+use haven_common::network::{StreamUrlScope, parse_http_url};
 use haven_common::{AppError, ErrorKind, UtcMillis};
 use haven_domain::comic_catalog::{
     ComicCatalogRefreshOutcomeStatus, ComicCatalogRefreshReceipt, ComicChapterAvailability,
@@ -1359,6 +1359,7 @@ impl SourceImportService {
         if title.is_empty() || title.len() > 240 || has_control_character(title) {
             return Err(invalid_m3u_candidate());
         }
+        let source_uuid = m3u_source_id()?;
         let dedupe_key = format!("{title}\u{1}{url}");
         if let Some(work_id) =
             WorkRepository::id_for_source_ref(&*self.ports, M3U_SOURCE_ID, &dedupe_key).await?
@@ -1423,7 +1424,10 @@ impl SourceImportService {
             id: ResourceId::new(),
             media_item_id: item.id,
             resource_type: stream_resource_type(url),
-            source_id: None,
+            // Persist the user-configured M3U source identity. Playback scope
+            // is derived from this server-owned row (see
+            // `resource_stream_scope`), never from the URL the browser holds.
+            source_id: Some(source_uuid),
             storage_location_id: None,
             locator: haven_domain::entities::ResourceLocator::Http {
                 url: url.to_owned(),
@@ -3367,6 +3371,17 @@ pub(crate) fn stream_url_kind(url: &str) -> StreamUrlKind {
     }
 }
 
+/// Persisted source identity of a user-configured M3U playlist import.
+///
+/// New M3U resources carry this stable, server-owned `SourceId` so every later
+/// boundary (capability projection, stream grant, manifest targets, DNS
+/// pinning) can derive the stream scope from persisted state. Rows imported
+/// before this identity existed keep `source_id = None` and stay on the strict
+/// public media policy.
+pub fn m3u_source_id() -> Result<SourceId, AppError> {
+    stable_source_id(M3U_SOURCE_ID)
+}
+
 fn has_control_character(value: &str) -> bool {
     value.chars().any(|ch| ch == '\0' || ch.is_control())
 }
@@ -3400,10 +3415,16 @@ fn decode_candidate_component_with_separator(value: &str) -> Result<String, AppE
 }
 
 /// Validate the URL carried by an M3U candidate before it becomes a persisted
-/// `ResourceLocator::Http`. This mirrors the controlled stream gate: the M3U
-/// provider may only create HTTP(S) streams with an unambiguous authority.
+/// `ResourceLocator::Http`.
+///
+/// M3U entries come from a playlist the user explicitly registered, so the
+/// user-provided source policy applies: private LAN, loopback and shared
+/// overlay addresses are valid channel destinations. Link-local, reserved,
+/// metadata and malformed targets remain rejected. This is the only place the
+/// M3U scope is established; downstream capability/grant/DNS boundaries read
+/// the persisted source identity instead of re-deriving it from this URL.
 fn validate_m3u_stream_url(url: &str) -> Result<(), AppError> {
-    parse_http_url(url, HttpUrlPolicy::MediaResource)
+    parse_http_url(url, StreamUrlScope::UserProvidedSource.policy())
         .map(|_| ())
         .map_err(|_| invalid_m3u_candidate())
 }
@@ -3878,6 +3899,9 @@ pub fn stable_source_id(source_key: &str) -> Result<SourceId, AppError> {
         // 自托管漫画库同理：具体库身份在 opaque `remote_id` 里，来源键按种类固定。
         KOMGA_SOURCE_KEY => "9fd4a7d0-0d59-4dc5-9f96-5b9bca4c1007",
         KAVITA_SOURCE_KEY => "9fd4a7d0-0d59-4dc5-9f96-5b9bca4c1008",
+        // 用户登记的 M3U 播放列表：频道资源以此为服务端来源身份，播放作用域
+        // （个人 LAN 目标 vs 严格公开目标）只从这一列派生。
+        M3U_SOURCE_ID => "9fd4a7d0-0d59-4dc5-9f96-5b9bca4c1009",
         _ => {
             return Err(AppError::new(
                 "INVALID_ARGUMENT",
@@ -3910,6 +3934,7 @@ pub fn source_key_for_id(source_id: SourceId) -> Option<&'static str> {
         FEED_SOURCE_KEY,
         KOMGA_SOURCE_KEY,
         KAVITA_SOURCE_KEY,
+        M3U_SOURCE_ID,
     ]
     .into_iter()
     .find(|key| stable_source_id(key).ok() == Some(source_id))
@@ -4239,6 +4264,9 @@ mod candidate_tests {
             "https://cdn.example/live.m3u8",
             "http://cdn.example:8080/live.m3u?token=opaque",
             "https://[2001:4860:4860::8888]:8443/live.mp4",
+            "http://127.0.0.1:8096/live.m3u8",
+            "http://192.168.1.10:9973/live.m3u8",
+            "http://nas:8096/live.m3u8",
         ] {
             assert!(
                 validate_m3u_stream_url(url).is_ok(),

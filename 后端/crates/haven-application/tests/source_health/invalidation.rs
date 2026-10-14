@@ -146,6 +146,7 @@ async fn credential_change_invalidates_stale_outcomes_without_touching_the_optio
     registry
         .set_custom_source_credential(
             &SourceSetCredentialRequest {
+                username: None,
                 source_id: added.source_id.clone(),
                 secret: Some("pw".into()),
             },

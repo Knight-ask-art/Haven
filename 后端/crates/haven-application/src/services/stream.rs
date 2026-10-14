@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use haven_common::network::{HttpUrlPolicy, parse_http_url};
+use haven_common::network::StreamUrlScope;
 use haven_common::{AppError, ErrorKind};
 use haven_domain::contracts::{
     EditionRepository, MediaItemRepository, ProgressRepository, ResourceRepository, WorkRepository,
@@ -17,6 +17,7 @@ use haven_domain::ids::{MediaItemId, ResourceId};
 
 use crate::mapper::progress::progress_summary;
 use crate::services::ports::SessionOpenPorts;
+use crate::services::resource::{http_stream_online_readable, resource_stream_scope};
 use crate::services::session::engine_compatible;
 use crate::services::source_import::{StreamUrlKind, stream_url_kind};
 use crate::wire::{ProgressSummaryDto, SessionEngineDto, SessionOpenRequest};
@@ -29,6 +30,11 @@ pub struct StreamOpenFacts {
     pub media_item_id: String,
     pub resource_id: ResourceId,
     pub upstream_url: String,
+    /// Outbound URL scope derived from the persisted resource identity. The
+    /// Tauri layer must reuse this exact value for grant registration,
+    /// manifest target resolution and DNS pinning instead of re-deriving a
+    /// policy; it never comes from the request or a browser-supplied URL.
+    pub scope: StreamUrlScope,
     pub is_hls: bool,
     pub mime_type: Option<String>,
     pub progress: Option<ProgressSummaryDto>,
@@ -90,11 +96,9 @@ impl StreamService {
                 // same narrow capability only for a valid HTTP(S) authority;
                 // accepting a malformed URL here would make the detail page say
                 // "not playable" while `stream_open` still registered a grant.
-                matches!(&resource.locator, ResourceLocator::Http { url } if http_stream_online_readable(resource.resource_type, url))
-                    && matches!(
-                        resource.resource_type,
-                        ResourceType::VideoStream | ResourceType::HlsStream
-                    )
+                // Both call the one shared implementation so a user-scoped M3U
+                // channel is decided identically on both sides.
+                http_stream_online_readable(resource)
                     && matches!(
                         resource.availability,
                         Availability::Available | Availability::OfflineAvailable
@@ -125,6 +129,7 @@ impl StreamService {
             media_item_id: media_item.id.to_string(),
             resource_id: resource.id,
             upstream_url: url.clone(),
+            scope: resource_stream_scope(resource),
             // Keep the transport fact aligned with M3U import and the Tauri
             // proxy: classify only the URL path, case-insensitively. Query
             // parameters such as `?format=.m3u8` must not turn a direct
@@ -145,82 +150,9 @@ fn is_hls_stream(resource_type: ResourceType, url: &str) -> bool {
     matches!(stream_url_kind(url), StreamUrlKind::Hls) || resource_type == ResourceType::HlsStream
 }
 
-/// Keep stream-open URL validation in lockstep with the capability projection
-/// in `services::resource`. A stream grant must never be registered for an
-/// arbitrary locator merely because its resource type looks like a stream.
-///
-/// This uses the shared outbound URL policy for scheme, authority, user-info,
-/// literal private addresses, fragment and port validation. Redirects and
-/// DNS pinning remain owned by the Tauri resource protocol after the grant is
-/// created; this is the application-side fail-closed gate that prevents an
-/// invalid locator from reaching that layer.
-fn http_stream_online_readable(resource_type: ResourceType, raw_url: &str) -> bool {
-    matches!(
-        resource_type,
-        ResourceType::VideoStream | ResourceType::HlsStream
-    ) && parse_http_url(raw_url, HttpUrlPolicy::MediaResource).is_ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn stream_open_accepts_only_supported_http_stream_locators() {
-        for resource_type in [ResourceType::VideoStream, ResourceType::HlsStream] {
-            for url in [
-                "https://stream.example.test/video/index.m3u8?token=opaque",
-                "http://stream.example.test/video/file.mp4",
-                "https://stream.example.test:8443/video/index.m3u8",
-                "https://[2001:4860:4860::8888]:8443/video/index.m3u8",
-            ] {
-                assert!(
-                    http_stream_online_readable(resource_type, url),
-                    "valid stream locator rejected: {url}"
-                );
-            }
-        }
-
-        assert!(!http_stream_online_readable(
-            ResourceType::DashStream,
-            "https://stream.example.test/video/manifest.mpd"
-        ));
-
-        for resource_type in [
-            ResourceType::HttpFile,
-            ResourceType::PublicationFile,
-            ResourceType::ArticleSnapshot,
-        ] {
-            assert!(!http_stream_online_readable(
-                resource_type,
-                "https://stream.example.test/video/file.mp4"
-            ));
-        }
-    }
-
-    #[test]
-    fn stream_open_rejects_malformed_or_ambiguous_locators() {
-        for url in [
-            "",
-            "ftp://stream.example.test/video.m3u8",
-            "file:///tmp/video.m3u8",
-            "https:///video.m3u8",
-            "https://",
-            "https://stream.example.test: /video.m3u8",
-            "https://stream.example.test:99999/video.m3u8",
-            "https://stream.example.test:/video.m3u8",
-            "https://[2001:db8::10/video.m3u8",
-            "https://2001:db8::10/video.m3u8",
-            "https://user:secret@stream.example.test/video.m3u8",
-            "https://stream.example.test/video\n.m3u8",
-            "https://stream.example.test/video.m3u8 extra",
-        ] {
-            assert!(
-                !http_stream_online_readable(ResourceType::HlsStream, url),
-                "malformed stream locator was accepted: {url:?}"
-            );
-        }
-    }
 
     #[test]
     fn stream_open_hls_fact_ignores_query_extension_and_honors_path_case() {

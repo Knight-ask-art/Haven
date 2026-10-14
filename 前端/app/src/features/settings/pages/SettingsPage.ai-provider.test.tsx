@@ -18,6 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { SettingsPage } from "./SettingsPage"
 import { getHavenClient } from "@/lib/ipc/runtime"
+import * as runtime from "@/lib/ipc/runtime"
 import { NoticeContext, type NoticeInput } from "@/app/notice-center/notice-context"
 
 const PROFILE_ID = "gw-main"
@@ -182,7 +183,7 @@ describe("设置页 AI Provider 写入路径", () => {
   })
 
   it("Provider 列表读取失败时显示错误并隐藏配置写入动作", async () => {
-    renderAiSettings()
+    const rendered = renderAiSettings()
     await createProfile()
     const client = getHavenClient()
     vi.spyOn(client, "aiProviderProfileList").mockRejectedValueOnce({
@@ -191,10 +192,10 @@ describe("设置页 AI Provider 写入路径", () => {
       retryable: true,
     })
 
-    fireEvent.click(screen.getByRole("button", { name: "关闭 AI 设置" }))
-    fireEvent.click(screen.getByRole("button", { name: "AI 设置" }))
+    rendered.unmount()
+    renderAiSettings()
 
-    expect(await screen.findByText("读取 Provider 失败")).toBeTruthy()
+    expect((await screen.findAllByText("读取 Provider 失败")).length).toBeGreaterThan(0)
     expect(screen.getByRole("button", { name: "重试读取" })).toBeTruthy()
     expect(screen.queryByRole("button", { name: "删除配置" })).toBeNull()
     expect((screen.getByRole("button", { name: "测试连接" }) as HTMLButtonElement).disabled).toBe(true)
@@ -492,5 +493,64 @@ describe("设置页分区切换不重置选中的 Provider", () => {
     const select = await screen.findByLabelText("当前 AI 服务")
     await waitFor(() => expect(select.textContent).toContain(SECOND_ID))
     expect(select.textContent, "重挂载后不得回落到列表第一项").not.toContain(PROFILE_ID)
+  })
+})
+
+describe("工作台直接读取持久化 Provider", () => {
+  it("配置读取完成前禁用输入和快捷操作", async () => {
+    vi.spyOn(getHavenClient(), "aiProviderProfileList").mockReturnValue(new Promise(() => {}))
+    renderAiWorkbench()
+    const input = await screen.findByLabelText("描述你想要的设置改动")
+    expect((input as HTMLTextAreaElement).disabled).toBe(true)
+    expect((screen.getByRole("button", { name: "优化阅读" }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it("不打开设置面板，首次进入和重新挂载都提交已保存的 profileId", async () => {
+    const client = getHavenClient()
+    await client.aiProviderProfileUpsert({
+      profileId: PROFILE_ID,
+      displayName: "自建网关",
+      kind: "openai_compatible",
+      endpoint: ENDPOINT,
+      enabled: true,
+      selectedModelId: "saved-model",
+      expectedRevision: null,
+    })
+    const generate = vi.spyOn(client, "aiSettingsRecommendationGenerate")
+      .mockRejectedValue(new Error("synthetic provider failure"))
+    // 保留真实客户端方法的 this，同时走 Dialog 的生产请求分支。
+    const facade = new Proxy(client, {
+      getPrototypeOf: () => Object.prototype,
+      get: (target, key) => {
+        const value = Reflect.get(target, key, target)
+        return typeof value === "function" ? value.bind(target) : value
+      },
+    })
+    vi.spyOn(runtime, "getHavenClient").mockReturnValue(facade)
+
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const rendered = renderAiWorkbench()
+      const input = await screen.findByLabelText("描述你想要的设置改动")
+      await waitFor(() => expect((input as HTMLTextAreaElement).disabled).toBe(false))
+      expect(screen.queryByRole("dialog")).toBeNull()
+      fireEvent.change(input, { target: { value: "优化阅读" } })
+      fireEvent.click(screen.getByRole("button", { name: "发送" }))
+      await waitFor(() => expect(generate).toHaveBeenCalledTimes(attempt), { timeout: 6000 })
+      expect(generate.mock.calls[attempt - 1][0].profileId).toBe(PROFILE_ID)
+      rendered.unmount()
+    }
+  })
+
+  it("非 AI 分区不自动读取 Provider", async () => {
+    const client = getHavenClient()
+    const list = vi.spyOn(client, "aiProviderProfileList")
+    render(
+      <MemoryRouter initialEntries={["/settings/reading"]}>
+        <Routes><Route path="/settings/:section" element={<SettingsPage />} /></Routes>
+      </MemoryRouter>,
+    )
+    await screen.findByRole("button", { name: /^AI 工作台/ })
+    expect(list).not.toHaveBeenCalled()
   })
 })

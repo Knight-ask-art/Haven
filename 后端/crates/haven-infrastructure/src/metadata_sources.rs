@@ -1169,7 +1169,12 @@ fn parse_m3u_entries(text: &str) -> Vec<M3uEntry> {
             pending = Some((title, attribute(line, "group-title")));
         } else if !line.starts_with('#') {
             if let Some((title, group)) = pending.take() {
-                if parse_http_url(line, HttpUrlPolicy::MediaResource).is_ok() {
+                // M3U is a user-configured source, so a LAN channel URL must
+                // survive the parse filter. The strict default media policy
+                // would drop exactly the personal/self-hosted entries the user
+                // registered; link-local, reserved and metadata targets stay
+                // denied by the shared policy itself.
+                if parse_http_url(line, HttpUrlPolicy::UserProvidedSource).is_ok() {
                     entries.push(M3uEntry {
                         title,
                         url: line.to_owned(),
@@ -1698,9 +1703,11 @@ mod tests {
         let entries = parse_m3u_entries(
             "#EXTM3U\n#EXTINF:-1 tvg-name=\"News\" group-title=\"Live\",News\nhttps://cdn.example/news.m3u8\n#EXTINF:-1,Offline\nfile:///tmp/nope\n#EXTINF:-1,LAN\nhttp://127.0.0.1:8080/live.m3u8\n",
         );
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].title, "News");
         assert_eq!(entries[0].group.as_deref(), Some("Live"));
+        assert_eq!(entries[1].title, "LAN");
+        assert_eq!(entries[1].url, "http://127.0.0.1:8080/live.m3u8");
     }
 
     #[test]
@@ -1742,6 +1749,19 @@ mod tests {
         assert!(!candidate.contains("https://"));
         assert!(!candidate.contains('\u{1}'));
         assert!(!candidate.contains(' '));
+    }
+
+    #[test]
+    fn m3u_playlist_keeps_personal_streams_and_rejects_reserved_targets() {
+        let text = "#EXTM3U\n#EXTINF:-1,Home\nhttp://192.168.1.10:8096/live.m3u8\n#EXTINF:-1,Local\nhttp://127.0.0.1:9973/live.m3u8\n#EXTINF:-1,Reserved\nhttp://169.254.169.254/metadata\n";
+        let entries = parse_m3u_entries(text);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Home", "Local"]
+        );
     }
 
     #[test]

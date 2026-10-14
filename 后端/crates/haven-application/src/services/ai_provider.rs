@@ -729,10 +729,25 @@ mod tests {
     #[derive(Default)]
     struct MemoryProfileRepository {
         rows: Mutex<HashMap<String, (AiProviderProfile, String)>>,
+        /// 版本序列：**每次成功写入**取下一个值，保证新版本从未出现过。
+        ///
+        /// 不能用 `rows.len()` 这类由表状态派生的值：更新不增行、删除还会减行，
+        /// 派生出来的"新"版本会与旧版本重合，于是过期版本也能匹配成功——
+        /// 陈旧写入被 CAS 放行，测试却全绿。
+        revision_seq: Mutex<u64>,
         /// 下一次 cas_upsert 强制冲突（模拟并发写者抢先提交）。
         force_conflict: Mutex<bool>,
         /// 下一次 cas_delete 返回 NotFound（模拟读后被并发删除）。
         force_not_found: Mutex<bool>,
+    }
+
+    impl MemoryProfileRepository {
+        /// 取一个此前从未用于任何写入的版本号（单调递增，删除后也不会回退）。
+        fn next_revision(&self) -> String {
+            let mut seq = self.revision_seq.lock().unwrap();
+            *seq += 1;
+            format!("rev-{seq}")
+        }
     }
 
     /// 内存替身给新建行钉死的 `created_at`。
@@ -779,7 +794,7 @@ mod tests {
             if !matches {
                 return Ok(None);
             }
-            let revision = format!("rev-{}", rows.len() + 1);
+            let revision = self.next_revision();
             let created_at = current
                 .map(|(existing, _)| existing.created_at())
                 .unwrap_or(MEMORY_CREATED_AT);
@@ -1084,6 +1099,61 @@ mod tests {
         assert_eq!(
             updated.created_at, created.created_at,
             "更新不得改写创建时间"
+        );
+    }
+
+    /// 连续两次更新后，第一次更新的版本必须**已经过期**。
+    ///
+    /// 内存替身曾用 `rows.len() + 1` 造版本：更新不增行，于是同一个 profile 反复得到
+    /// 同一个版本号——"过期版本"与当前版本重合，陈旧写入会被 CAS 放行，而
+    /// `assert_ne!(updated.revision, created.revision)` 这类断言则直接失败。
+    /// 这条回归把"每次成功写入都推进版本"钉在服务层可见的行为上。
+    #[tokio::test]
+    async fn stale_revision_after_two_updates_is_rejected() {
+        let fixture = fixture();
+        let created = fixture
+            .service
+            .upsert(upsert_request("gw", None))
+            .await
+            .unwrap();
+        let first_update = fixture
+            .service
+            .upsert(AiProviderProfileUpsertRequest {
+                display_name: "第一次改名".into(),
+                ..upsert_request("gw", Some(&created.revision))
+            })
+            .await
+            .unwrap();
+        let second_update = fixture
+            .service
+            .upsert(AiProviderProfileUpsertRequest {
+                display_name: "第二次改名".into(),
+                ..upsert_request("gw", Some(&first_update.revision))
+            })
+            .await
+            .unwrap();
+        assert_ne!(created.revision, first_update.revision);
+        assert_ne!(first_update.revision, second_update.revision);
+        assert_ne!(created.revision, second_update.revision);
+
+        // 用第一次更新的版本（已被第二次更新推进）再写：冲突，且零写入。
+        let error = fixture
+            .service
+            .upsert(AiProviderProfileUpsertRequest {
+                display_name: "陈旧写入".into(),
+                ..upsert_request("gw", Some(&first_update.revision))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code().as_str(),
+            "AI_PROVIDER_PROFILE_REVISION_CONFLICT"
+        );
+        assert!(error.retryable());
+        assert_eq!(
+            fixture.service.get("gw").await.unwrap(),
+            second_update,
+            "冲突写入不得改写权威状态"
         );
     }
 

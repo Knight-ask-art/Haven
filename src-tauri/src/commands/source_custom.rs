@@ -357,6 +357,7 @@ mod tests {
             let err = run_source_set_credential(
                 &state,
                 SourceSetCredentialRequest {
+                    username: None,
                     source_id: source_id.into(),
                     secret,
                 },

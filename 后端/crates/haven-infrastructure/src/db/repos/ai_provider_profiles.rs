@@ -5,9 +5,10 @@
 //! 边界：
 //! - 只读写 `ai_provider_profiles`（非敏感配置）。**没有**任何 secret / credential_ref
 //!   列，也不提供访问 CredentialStore 的能力——凭据清理由 Application 用例编排。
-//! - 写路径全部是数据库层条件写（CAS）：`expected_revision` 作为 SQL 谓词，
-//!   `affected == 0` 即冲突。这与 `SqliteSettingsUoW::cas_write` 同规则：
-//!   不把"先读再写"的竞态留给调用方。
+//! - 写路径全部是数据库层条件写（CAS）：`expected_revision` 决定哪条语句可以落地
+//!   （`None` = 仅当行不存在时创建，`Some` = 仅当行存在且版本匹配时更新），
+//!   条件与写入在同一条 SQL 里，`affected == 0` 即冲突——不把"先读再写"的
+//!   竞态留给调用方。
 //! - 读取端做完整校验：脏行（未知 kind、非法 id / endpoint、非法 revision）必须报错，
 //!   不得被静默降级成一个"看起来能用"的 profile。
 
@@ -85,11 +86,19 @@ impl AiProviderProfileRepository for SqliteAiProviderProfileRepository {
         stored.map(StoredRow::into_profile).transpose()
     }
 
-    /// 条件写入。语义与 `SqliteSettingsUoW::cas_write` 一致：
-    /// - 已有行 + expected：`ON CONFLICT DO UPDATE ... WHERE revision = expected`，
-    ///   版本已被并发方推进 → 谓词不匹配 → `affected == 0` → 返回 `None`。
-    /// - 首次 + expected=None：无冲突 INSERT 成功；并发下已有行时
-    ///   `WHERE revision = NULL` 恒假 → `None`（双重兜底）。
+    /// 条件写入。`expected_revision` 决定**哪一条语句**可以落地，而不是交给
+    /// `ON CONFLICT` 的冲突分支去兜底：
+    /// - `expected = None` → `INSERT ... ON CONFLICT(profile_id) DO NOTHING`：
+    ///   只允许"行不存在"时创建；行已存在 → 0 行受影响 → 返回 `None`。
+    /// - `expected = Some(revision)` → `UPDATE ... WHERE profile_id = ?1 AND revision = ?2`：
+    ///   只允许改**已存在且版本匹配**的行；版本被并发方推进 → 0 行受影响 → `None`，
+    ///   行已被删除（读之后删掉）同样 0 行 → `None`，**不会**被重新造出来。
+    ///
+    /// 两条分支各自都是单条条件语句：条件与写入之间没有可插入的窗口，不需要
+    /// "先检查再写"。**不能**把两种情况合并回
+    /// `INSERT ... ON CONFLICT DO UPDATE ... WHERE revision = expected`：那里的谓词只在
+    /// 冲突分支生效，于是 `Some(revision)` 遇到"行已被删除"时会走无冲突的 INSERT 分支，
+    /// 用过期版本把已删除的 profile 复活——这正是 CAS 要禁止的。
     ///
     /// `created_at` 不在 UPDATE 的 SET 列表里：更新不得改写创建时间。正因如此，
     /// 成功路径必须**回读**持久化行再返回：调用方拿到的候选值带着 `created_at = now`，
@@ -102,21 +111,15 @@ impl AiProviderProfileRepository for SqliteAiProviderProfileRepository {
     ) -> Result<Option<AiProviderProfile>, AppError> {
         let revision = new_revision();
         let conn = self.db.lock();
-        let affected = conn
-            .execute(
+        let affected = match expected_revision {
+            // 创建：只在行确实不存在时落地。`DO NOTHING` 把"行已存在"表达成
+            // 0 行受影响（= 冲突），而不是把已有行覆盖成候选值。
+            None => conn.execute(
                 "INSERT INTO ai_provider_profiles
                     (profile_id, kind, display_name, endpoint, enabled, selected_model_id,
                      revision, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 ON CONFLICT(profile_id) DO UPDATE SET
-                     kind = excluded.kind,
-                     display_name = excluded.display_name,
-                     endpoint = excluded.endpoint,
-                     enabled = excluded.enabled,
-                     selected_model_id = excluded.selected_model_id,
-                     revision = excluded.revision,
-                     updated_at = excluded.updated_at
-                 WHERE ai_provider_profiles.revision = ?10",
+                 ON CONFLICT(profile_id) DO NOTHING",
                 rusqlite::params![
                     profile.profile_id(),
                     profile.kind().as_str(),
@@ -127,10 +130,34 @@ impl AiProviderProfileRepository for SqliteAiProviderProfileRepository {
                     revision,
                     profile.created_at(),
                     profile.updated_at(),
-                    expected_revision,
                 ],
-            )
-            .map_err(map_db_error("保存 AI Provider 配置失败"))?;
+            ),
+            // 更新：只在行存在且版本匹配时落地。行不存在时不写、不建行，
+            // 因此"删除后的过期保存"只可能冲突。
+            Some(expected) => conn.execute(
+                "UPDATE ai_provider_profiles SET
+                     kind = ?2,
+                     display_name = ?3,
+                     endpoint = ?4,
+                     enabled = ?5,
+                     selected_model_id = ?6,
+                     revision = ?7,
+                     updated_at = ?8
+                 WHERE profile_id = ?1 AND revision = ?9",
+                rusqlite::params![
+                    profile.profile_id(),
+                    profile.kind().as_str(),
+                    profile.display_name(),
+                    profile.endpoint(),
+                    i64::from(profile.enabled()),
+                    profile.selected_model_id(),
+                    revision,
+                    profile.updated_at(),
+                    expected,
+                ],
+            ),
+        }
+        .map_err(map_db_error("保存 AI Provider 配置失败"))?;
         if affected == 0 {
             return Ok(None);
         }
@@ -337,6 +364,88 @@ mod tests {
             1_700_000_000_000,
             "更新不得改写创建时间"
         );
+    }
+
+    #[tokio::test]
+    async fn cas_upsert_with_revision_on_missing_row_conflicts_without_creating() {
+        let (repo, _db) = repo();
+        let candidate = profile("gw", "https://gateway.example.invalid/v1");
+        assert!(
+            repo.cas_upsert(&candidate, Some("rev-1"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(repo.get("gw").await.unwrap().is_none());
+        assert!(repo.cas_upsert(&candidate, None).await.unwrap().is_some());
+    }
+
+    /// 删除 → 用历史版本保存：行不得复活，也不得被写回任何候选值。
+    ///
+    /// 与上一条的区别是这里存在过**两个**历史版本（`first` 被 `second` 取代），
+    /// 删除用的是当前版本。两个历史版本都必须落空，否则"读到旧版本 → 并发删除 →
+    /// 用旧版本保存"会把用户删除掉的配置原地恢复。
+    #[tokio::test]
+    async fn stale_update_after_delete_cannot_resurrect_profile() {
+        let (repo, db) = repo();
+        let candidate = profile("gw", "https://gateway.example.invalid/v1");
+        let first = repo
+            .cas_upsert(&candidate, None)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision()
+            .expect("写入必须返回持久化行")
+            .to_owned();
+
+        let renamed = AiProviderProfile::new(
+            "gw",
+            "改名后的网关",
+            AiProviderKind::OpenAiCompatible,
+            "https://gateway.example.invalid/v2",
+            false,
+            Some("gpt-4o-mini".into()),
+            1_700_000_999_000,
+        )
+        .unwrap();
+        let second = repo
+            .cas_upsert(&renamed, Some(&first))
+            .await
+            .unwrap()
+            .unwrap()
+            .revision()
+            .expect("更新必须返回持久化行")
+            .to_owned();
+        assert_ne!(first, second, "更新必须推进版本");
+
+        // 旧版本删不掉（不匹配），当前版本才删得掉。
+        assert_eq!(
+            repo.cas_delete("gw", Some(&first)).await.unwrap(),
+            AiProviderProfileDeleteOutcome::RevisionConflict
+        );
+        assert_eq!(
+            repo.cas_delete("gw", Some(&second)).await.unwrap(),
+            AiProviderProfileDeleteOutcome::Deleted
+        );
+
+        for stale in [first.as_str(), second.as_str(), "stale"] {
+            assert!(
+                repo.cas_upsert(&candidate, Some(stale))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "删除后携带过期版本必须冲突: {stale}"
+            );
+        }
+        assert!(repo.get("gw").await.unwrap().is_none());
+        assert!(repo.list().await.unwrap().is_empty());
+        let remaining: i64 = db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM ai_provider_profiles", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, 0, "冲突路径不得留下任何行");
     }
 
     #[tokio::test]

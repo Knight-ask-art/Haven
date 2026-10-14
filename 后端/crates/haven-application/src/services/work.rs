@@ -474,11 +474,8 @@ impl WorkService {
                         ),
                 )
             }
-            ResourceLocator::Http { url } => Ok(media_type_is_playback(media_type)
-                && crate::services::resource::http_stream_online_readable(
-                    resource.resource_type,
-                    url,
-                )),
+            ResourceLocator::Http { .. } => Ok(media_type_is_playback(media_type)
+                && crate::services::resource::http_stream_online_readable(resource)),
             ResourceLocator::LocalPath { path } => {
                 self.local_resource_is_actionable(resource, media_type, path)
                     .await

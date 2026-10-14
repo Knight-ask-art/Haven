@@ -611,6 +611,7 @@ function CustomSourceManager({
   const [editEndpoint, setEditEndpoint] = useState("")
   const [credentialFor, setCredentialFor] = useState<string | null>(null)
   const [credentialValue, setCredentialValue] = useState("")
+  const [credentialUsername, setCredentialUsername] = useState("")
   const [credentialConfigured, setCredentialConfigured] = useState(false)
   const [credentialError, setCredentialError] = useState<string | null>(null)
   const [customTogglingId, setCustomTogglingId] = useState<string | null>(null)
@@ -630,7 +631,7 @@ function CustomSourceManager({
     setEndpoint("")
     setAddError(null)
     setCreatedSourceId(null)
-    setCredentialValue("")
+    setCredentialValue(""); setCredentialUsername("")
     setCredentialConfigured(false)
     setCredentialError(null)
     setAdding(true)
@@ -674,7 +675,7 @@ function CustomSourceManager({
     setEndpoint("")
     setCreatedSourceId(null)
     setAddError(null)
-    setCredentialValue("")
+    setCredentialValue(""); setCredentialUsername("")
     setCredentialConfigured(false)
     setCredentialError(null)
   }
@@ -754,15 +755,22 @@ function CustomSourceManager({
 
   const submitCredential = async (sourceId: string, secret = credentialValue) => {
     if (submitting) return
+    const opds = !isComicLibrarySourceId(sourceId)
+    const username = credentialUsername
+    if (secret.length > 0 && opds && username.length === 0) {
+      setCredentialError("请填写书库的用户名与密码")
+      return
+    }
     setSubmitting(true)
     setCredentialError(null)
     try {
       await setSourceCredential({
         sourceId,
         secret: secret.length > 0 ? secret : null,
+        ...(opds && secret.length > 0 ? { username } : {}),
       })
       setCredentialConfigured(secret.length > 0)
-      setCredentialValue("")
+      setCredentialValue(""); setCredentialUsername("")
       showNotice(secret.length > 0 ? "凭据已保存到系统凭据管理器" : "凭据已清除")
       if (adding) setAddStep("done")
     } catch (error) {
@@ -840,17 +848,21 @@ function CustomSourceManager({
               <p className="mt-1 text-xs leading-5 text-[var(--haven-settings-muted-strong)]">
                 {comicLibraryKind
                   ? `如果 ${comicLibraryLabel} 打开了认证，可以现在填写 API key；它只保存到系统凭据管理器，并作为请求头发送，不会出现在地址、来源列表或日志中。`
-                  : "如果书库需要密码，可以现在填写；凭据只保存到系统凭据管理器，不会出现在来源列表或日志中。"}
+                  : "填写书库的真实用户名与密码。两者只保存到系统凭据管理器；以前只配置密码的书库需要补充用户名。"}
               </p>
             </div>
+            {!comicLibraryKind && <label className="flex flex-col gap-1.5">
+              <span className="text-xs font-semibold">OPDS 用户名</span>
+              <input aria-label="OPDS 用户名" value={credentialUsername} onChange={(event) => { setCredentialUsername(event.target.value); setCredentialError(null) }} disabled={submitting} maxLength={128} autoComplete="off" className="rounded-2xl border border-[var(--haven-settings-border-subtle)] bg-[var(--haven-settings-card)] px-[16px] py-2.5 text-sm outline-none focus:border-[var(--haven-settings-primary)]" />
+            </label>}
             <label className="flex flex-col gap-1.5">
               <span className="text-xs font-semibold">{comicLibraryKind ? "API key（可选）" : "访问凭据（可选）"}</span>
               <input type="password" disabled={submitting} value={credentialValue} onChange={(e) => { setCredentialValue(e.target.value); setCredentialError(null) }} autoComplete="new-password" placeholder={comicLibraryKind ? "不需要认证可留空" : "不需要登录可留空"} className="rounded-2xl border border-[var(--haven-settings-border-subtle)] bg-[var(--haven-settings-card)] px-[16px] py-2.5 text-sm outline-none focus:border-[var(--haven-settings-primary)]" />
             </label>
             {credentialError && <p role="alert" className="text-xs text-[var(--haven-settings-danger)]">{credentialError}</p>}
             <div className="flex justify-end gap-[8px] text-xs font-semibold">
-              <button type="button" disabled={submitting} onClick={() => { setCredentialValue(""); setAddStep("done") }} className="rounded-full border border-[var(--haven-settings-border-subtle)] px-[16px] py-[8px]">稍后配置</button>
-              <button type="button" disabled={submitting || credentialValue.length === 0} onClick={() => { void submitCredential(createdSourceId) }} className="rounded-full bg-[var(--haven-settings-primary)] px-[16px] py-[8px] text-[var(--haven-settings-primary-foreground)] disabled:opacity-50">{submitting ? "保存中…" : "保存并完成"}</button>
+              <button type="button" disabled={submitting} onClick={() => { setCredentialValue(""); setCredentialUsername(""); setAddStep("done") }} className="rounded-full border border-[var(--haven-settings-border-subtle)] px-[16px] py-[8px]">稍后配置</button>
+              <button type="button" disabled={submitting || credentialValue.length === 0 || (!comicLibraryKind && credentialUsername.length === 0)} onClick={() => { void submitCredential(createdSourceId) }} className="rounded-full bg-[var(--haven-settings-primary)] px-[16px] py-[8px] text-[var(--haven-settings-primary-foreground)] disabled:opacity-50">{submitting ? "保存中…" : "保存并完成"}</button>
             </div>
           </div>
         )}
@@ -920,7 +932,7 @@ function CustomSourceManager({
                     }}
                     onCredential={feed ? undefined : () => {
                       setCredentialFor(source.sourceId)
-                      setCredentialValue("")
+                      setCredentialValue(""); setCredentialUsername("")
                       setCredentialConfigured(source.credentialConfigured)
                       setCredentialError(null)
                     }}
@@ -967,6 +979,11 @@ function CustomSourceManager({
                 )}
                 {credentialFor === source.sourceId ? (
                   <div className="flex flex-col gap-[8px]">
+                    {!comic && <label className="flex flex-col gap-1">
+                      <span className="text-xs text-[var(--haven-settings-muted)]">OPDS 用户名</span>
+                      <input aria-label="OPDS 用户名" value={credentialUsername} onChange={(event) => { setCredentialUsername(event.target.value); setCredentialError(null) }} disabled={submitting} maxLength={128} autoComplete="off" className="rounded-2xl border border-[var(--haven-settings-border-subtle)] bg-[var(--haven-settings-card)] px-[16px] py-[8px] text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)]" />
+                      <span className="text-[11px] text-[var(--haven-settings-muted)]">填写书库账户名；以前只配置密码的书库需要补充用户名。</span>
+                    </label>}
                     <label className="flex flex-col gap-1">
                       <span className="text-xs text-[var(--haven-settings-muted)]">
                         {comic
@@ -989,7 +1006,7 @@ function CustomSourceManager({
                         disabled={submitting}
                         onClick={() => {
                           setCredentialFor(null)
-                          setCredentialValue("")
+                          setCredentialValue(""); setCredentialUsername("")
                           setCredentialConfigured(false)
                           setCredentialError(null)
                         }}
@@ -999,7 +1016,7 @@ function CustomSourceManager({
                       </button>
                       <button
                         type="button"
-                        disabled={submitting || credentialValue.length === 0}
+                        disabled={submitting || credentialValue.length === 0 || (!comic && credentialUsername.length === 0)}
                         onClick={() => { void submitCredential(source.sourceId) }}
                         className="rounded-full bg-[var(--haven-settings-primary)] px-[14px] py-[6px] text-[var(--haven-settings-primary-foreground)] disabled:opacity-50"
                       >
@@ -1010,7 +1027,7 @@ function CustomSourceManager({
                           type="button"
                           disabled={submitting}
                           onClick={() => {
-                            setCredentialValue("")
+                            setCredentialValue(""); setCredentialUsername("")
                             void submitCredential(source.sourceId, "")
                           }}
                           className="rounded-full px-[14px] py-[6px] text-[var(--haven-settings-danger)]"

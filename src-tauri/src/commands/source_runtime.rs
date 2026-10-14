@@ -133,6 +133,7 @@ pub fn run_stream_open(
                 is_hls: facts.is_hls,
                 progress: facts.progress.clone(),
                 upstream_url: facts.upstream_url.clone(),
+                scope: facts.scope,
             },
             &facts.upstream_url,
             owner_label,

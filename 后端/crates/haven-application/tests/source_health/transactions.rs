@@ -102,6 +102,7 @@ async fn stale_credential_write_is_rejected_and_only_its_own_slot_is_removed() {
     let error = registry
         .set_custom_source_credential(
             &SourceSetCredentialRequest {
+                username: None,
                 source_id: added.source_id.clone(),
                 secret: Some("pw".into()),
             },
@@ -156,6 +157,7 @@ async fn clear_during_a_config_edit_deletes_exactly_the_revoked_slot() {
     registry
         .set_custom_source_credential(
             &SourceSetCredentialRequest {
+                username: None,
                 source_id: added.source_id.clone(),
                 secret: Some("pw".into()),
             },
@@ -181,6 +183,7 @@ async fn clear_during_a_config_edit_deletes_exactly_the_revoked_slot() {
     registry
         .set_custom_source_credential(
             &SourceSetCredentialRequest {
+                username: None,
                 source_id: added.source_id.clone(),
                 secret: None,
             },
