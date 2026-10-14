@@ -487,6 +487,114 @@ class DocumentationCheckerTests(unittest.TestCase):
     def test_current_local_records_are_all_registered(self) -> None:
         self.assertEqual(DOCS_CHECK.check_local_record_registers(), [])
 
+    def test_register_entry_without_local_file_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory(dir=DOCS_CHECK.ROOT) as temporary:
+            root = Path(temporary)
+            records = root / "records"
+            records.mkdir()
+            (records / "current.md").write_text("history", encoding="utf-8")
+            register = root / "register.md"
+            current = (records / "current.md").relative_to(DOCS_CHECK.ROOT).as_posix()
+            stale = (records / "gone.md").relative_to(DOCS_CHECK.ROOT).as_posix()
+            register.write_text(
+                f"| `{current}` | live |\n| `{stale}` | stale |\n",
+                encoding="utf-8",
+            )
+
+            errors = DOCS_CHECK.check_register_entries(
+                records,
+                register,
+                recursive=False,
+                excluded_names=frozenset(),
+            )
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("register entry has no local file", errors[0])
+        self.assertIn("gone.md", errors[0])
+
+    def test_rev_prefixed_register_entry_is_treated_as_history(self) -> None:
+        with tempfile.TemporaryDirectory(dir=DOCS_CHECK.ROOT) as temporary:
+            root = Path(temporary)
+            records = root / "records"
+            records.mkdir()
+            (records / "current.md").write_text("history", encoding="utf-8")
+            register = root / "register.md"
+            historical = "2d9c25b:" + (
+                records / "removed.md"
+            ).relative_to(DOCS_CHECK.ROOT).as_posix()
+            register.write_text(
+                f"| `{historical}` | kept via commit |\n",
+                encoding="utf-8",
+            )
+
+            errors = DOCS_CHECK.check_register_entries(
+                records,
+                register,
+                recursive=False,
+                excluded_names=frozenset(),
+            )
+
+        self.assertEqual(errors, [])
+
+    def test_glob_and_parent_directory_entries_are_ignored(self) -> None:
+        with tempfile.TemporaryDirectory(dir=DOCS_CHECK.ROOT) as temporary:
+            root = Path(temporary)
+            records = root / "records"
+            records.mkdir()
+            (records / "current.md").write_text("history", encoding="utf-8")
+            register = root / "register.md"
+            globbed = (records / "*.md").relative_to(DOCS_CHECK.ROOT).as_posix()
+            outside = (root / "other.md").relative_to(DOCS_CHECK.ROOT).as_posix()
+            register.write_text(
+                f"| `{globbed}` | a class of records |\n"
+                f"| `{outside}` | another area |\n",
+                encoding="utf-8",
+            )
+
+            errors = DOCS_CHECK.check_register_entries(
+                records,
+                register,
+                recursive=False,
+                excluded_names=frozenset(),
+            )
+
+        self.assertEqual(errors, [])
+
+    def test_private_ledger_doc_id_is_pinned(self) -> None:
+        with tempfile.TemporaryDirectory(dir=DOCS_CHECK.ROOT) as temporary:
+            registers = Path(temporary)
+            index = registers / "work.md"
+            index.write_text(
+                "\n".join(
+                    (
+                        "---",
+                        "doc_id: internal.register.work",
+                        "type: guide",
+                        "status: active",
+                        "owner: integration-owner",
+                        "visibility: public",
+                        "source_of_truth: task-ledger",
+                        "last_reviewed: 2026-10-14",
+                        "review_after: 2026-12-20",
+                        "active_ledger: plan/IMPLEMENTATION_STATUS.md",
+                        "ledger_cutover: pending",
+                        "ledger_state: stale",
+                        "ledger_as_of: 2026-09-15",
+                        "---",
+                        "# Work and Status",
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(DOCS_CHECK, "PRIVATE_REGISTERS", registers):
+                errors, _warnings = DOCS_CHECK.check_local_ledger_policy()
+
+        self.assertTrue(
+            any("doc_id must stay work.index" in error for error in errors),
+            errors,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
