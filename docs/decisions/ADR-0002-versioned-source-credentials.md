@@ -136,13 +136,18 @@ DTOs remain unchanged.
 
 ## Evidence
 
-- `source_registry/credentials.rs` and `source_registry/lease.rs`: same-source
+- `haven-application/src/services/source_registry/credentials.rs` and
+  `haven-application/src/services/source_registry/lease.rs`: same-source
   version slots, adoption fences, revocation and bounded durable cleanup.
-- `source_credential_lease.rs`: file-lock implementation.
-- `tests/source_credential_integration.rs`: transaction, ownership, failure,
-  cancellation and independent-assembly scenarios.
+- `haven-infrastructure/src/source_credential_lease.rs`: file-lock
+  implementation.
+- `haven-application/tests/source_credential_integration.rs` and
+  `haven-application/tests/source_credential/`: transaction, ownership,
+  failure, cancellation and independent-assembly scenarios.
 - `src-tauri/src/state.rs` and `src-tauri/src/source_background.rs`: production
   composition and cleanup recovery.
-- `tvbox_config_import.rs`: save/removal arbitration and missing-lease tests.
-- `opds/request.rs`, `opds/request_tests.rs` and `state.rs`: snapshot-bound
-  credential consumption and invalidation before sending.
+- `haven-application/src/services/tvbox_config_import.rs`: save/removal
+  arbitration and missing-lease tests.
+- `haven-infrastructure/src/opds/request.rs`,
+  `haven-infrastructure/src/opds/request_tests.rs` and `src-tauri/src/state.rs`:
+  snapshot-bound credential consumption and invalidation before sending.

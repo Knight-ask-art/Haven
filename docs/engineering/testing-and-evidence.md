@@ -61,7 +61,10 @@ upgrade, failure and recovery paths.
 Use the commands that exist in the checkout and record the exact command. Do
 not invent a `pnpm test` or `npm run typecheck` alias when the project uses
 `npm run ci:check`, `npm run test`, `npm run build`, `npm run lint`,
-`npm run governance:check` and `npm run fixtures:check` under `前端/app`.
+`npm run governance:check`, `npm run fixtures:check`, `npm run film-tv:contract`
+and `npm run film-tv:local` under `前端/app`. `npm run ci:check` already chains
+the Film/TV contract check, so a passing `ci:check` covers that layer but not
+the Film/TV local layer.
 
 Rust, Tauri, Wire, command-manifest, ACL, migration, CodeQL and real desktop
 checks are separate evidence categories. A green frontend test run does not

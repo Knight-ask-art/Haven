@@ -17,7 +17,8 @@ feature.
 
 ## Start here
 
-- [Haven Copilot Boundary](ai-boundaries.md) separates the product Copilot
-  from engineering-agent permissions.
+- [Product AI Boundary](ai-boundaries.md) separates the product assistant
+  「栖伴」(设置 → 智能 → AI 工作台) from engineering-agent permissions, and records
+  which parts of that boundary are implemented.
 - [Source of Truth](../SOURCE_OF_TRUTH.md) defines the evidence required for a
   capability claim.

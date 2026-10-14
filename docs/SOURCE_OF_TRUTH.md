@@ -5,7 +5,7 @@ status: active
 owner: architecture
 visibility: public
 source_of_truth: accepted-decisions-and-runtime-contracts
-last_reviewed: 2026-10-08
+last_reviewed: 2026-10-14
 review_after: 2027-01-08
 ---
 
@@ -38,6 +38,17 @@ or cloud credential-family semantics. OPDS consumers use one coherent source
 snapshot, bind credentials to the registered HTTPS origin and recheck that
 snapshot after credential resolution before sending.
 
+Local storage locations and cloud drives are separate boundaries. A local
+location is a directory on the user's machine; a cloud drive binds a
+user-authorized account and one chosen folder, and reading a cloud document pins
+a fixed snapshot for that session rather than following a later re-authorization
+or a rewritten remote object. The first implemented cloud provider is Google
+Drive, read-only PDF only: Haven does not upload, delete remote files, sync or
+back up. The OAuth client configuration is a deployment prerequisite, not a
+Haven account. Durable decisions for this boundary are recorded internally but
+are not yet published as a public ADR; until one exists, the runtime contracts,
+migrations, Registry and consumers remain the capability authority.
+
 User-configured source endpoints retain their configured scheme and may target
 private IPv4, loopback, IPv6 ULA, shared VPN addresses, and local DNS names on
 any nonzero service port. Link-local, unspecified, multicast, cloud metadata,
@@ -68,7 +79,8 @@ successful build does not upgrade a planned capability to implemented.
 
 ## Product AI authority
 
-Haven's product AI reads bounded, redacted context through fixed application
+Haven's product AI — user-visible name 「栖伴」, settings section 「AI 工作台」
+(设置 → 智能) — reads bounded, redacted context through fixed application
 services. It can propose intent but does not own Haven permissions. Changes
 require a typed proposal, explicit user approval, revision/CAS validation and
 a receipt. Skills and external MCP clients cannot grant themselves authority.

@@ -24,7 +24,8 @@ the current implementation.
 - [Source of Truth](../SOURCE_OF_TRUTH.md) defines which artifact owns each kind
   of fact.
 - [AI System](AI_SYSTEM.md) defines the product Provider, Proposal, credential
-  and Skill boundaries.
+  and Skill boundaries for the assistant 「栖伴」(`AiAssistantDialog`); it covers
+  Provider profiles, the model catalog, Agent proposals and the Skill runtime.
 - [MCP Transport](MCP_EXTERNAL_AGENT_TRANSPORT.md) defines the external-client
   protocol, local access controls and user-approved configuration.
 - [Comic Content Identity and Continuity](comic-content-continuity.md) preserves

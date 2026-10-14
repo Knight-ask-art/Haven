@@ -82,8 +82,10 @@ current implementation covers encoding normalization, track switching, and
 resource lifecycles for SRT/VTT/SBV, but it has not completed the four-layer
 runtime/release acceptance and must not be presented as a `v0.1.0-beta.1`
 release capability. Audio-track selection and user-controlled HEVC decoding
-remain unavailable. OCR/translation/AI, Sync, and full local-data deletion
-require separate foundations and risk reviews. Auto-update signing is wired to
+remain unavailable. OCR/translation, Sync, and full local-data deletion
+require separate foundations and risk reviews. The AI workbench is wired to
+real typed IPC and consumers; live provider responses still await acceptance
+against a locally configured credential. Auto-update signing is wired to
 the Tauri updater, but installable releases are only
 available after the maintainer configures signing secrets and publishes a
 signed GitHub Release. The beta route is `0.1.0-beta.1`; `0.1.0` is reserved for
@@ -197,7 +199,7 @@ only as GitHub Actions secrets; it is never committed to this repository.
 ## Documentation
 
 - [Documentation home](docs/README.md)
-- [CMS10 user configuration](CMS10_USER_CONFIG.md)
+- [User configuration reference](用户配置参考.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
 
 ## License

@@ -5,15 +5,26 @@ status: active
 owner: product-and-architecture
 visibility: public
 source_of_truth: accepted-product-boundary
-last_reviewed: 2026-09-20
+last_reviewed: 2026-10-14
 review_after: 2026-12-20
 ---
 
-# Haven Copilot Boundary
+# Haven Product AI Boundary (栖伴)
 
-Haven's product AI does not inherit the application's general authority.
+Naming: the internal codename in the agent runtime is `Copilot`
+(`haven-application/src/services/agent.rs`), the user-visible name of this
+assistant is 「栖伴」, and the settings section is 「AI 工作台」
+(设置 → 智能). Component, file and directory names keep the `ai-assistant` /
+`AiAssistantDialog` spelling. Use the visible name in product prose and the
+neutral names when referring to code.
 
-Any Haven Copilot implementation must be context-bound and user-initiated. It may
+The boundary below is implemented, not aspirational: the settings section, its
+Provider profile, credential, model catalog, settings-recommendation, agent
+broker, MCP client auto-configuration and built-in Skill runtime entries are all
+registered as implemented with real bindings and consumers. Real provider
+responses remain a separate live-acceptance step.
+
+Any product-AI capability must be context-bound and user-initiated. It may
 read a bounded context and propose an action, but it never receives Haven's
 general authority. Reads must use fixed Application services and a capability
 manifest. Writes require a typed proposal, explicit user confirmation,

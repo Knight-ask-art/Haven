@@ -36,6 +36,8 @@ product specification.
 | Operations | GitHub, CI, release, rollback and incidents | [operations](operations/README.md) |
 | Decisions | Accepted architectural decisions | [decisions](decisions/README.md) |
 | Reference | Terminology and generated references | [reference](reference/README.md) |
+| Plans | Planning-documentation policy for dated plans | [plans](plans/README.md) |
+| Reviews | Review-evidence policy for dated reviews | [reviews](reviews/README.md) |
 | Work | Public issue and pull-request status | [work](work/README.md) |
 
 ## Public documentation boundary
