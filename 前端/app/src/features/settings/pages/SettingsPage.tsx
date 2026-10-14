@@ -4530,7 +4530,10 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
     deletePanelMounted.current = true
     return () => {
       deletePanelMounted.current = false
-      markDeleteConfirmPending(false)
+      if (deleteConfirmPendingRef.current) {
+        deleteConfirmPendingRef.current = false
+        markDeleteConfirmPending(false)
+      }
     }
   }, [markDeleteConfirmPending])
   /**
@@ -4677,8 +4680,11 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
         : "删除失败，请重试")
     } finally {
       // 确认与删除都结束后才放行：确认后就解锁会让另一次删除插进来。
-      deleteConfirmPendingRef.current = false
-      markDeleteConfirmPending(false)
+      // 卸载时已经释放的旧确认，不能再解锁重新打开面板后的新确认。
+      if (deleteConfirmPendingRef.current) {
+        deleteConfirmPendingRef.current = false
+        markDeleteConfirmPending(false)
+      }
       setDeleteConfirmPending(false)
     }
   }
