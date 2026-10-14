@@ -373,6 +373,11 @@ def check_register_entries(
     file is a genuine stale entry.
     """
 
+    # Public checkouts omit private registers. Missing registers with local
+    # records are still rejected by check_record_register's forward check.
+    if not register.exists():
+        return []
+
     try:
         register_text = register.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
