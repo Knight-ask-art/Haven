@@ -139,6 +139,11 @@ define_commands!(
         commands::agent::agent_settings_proposal_get
     ),
     (
+        "agent_settings_proposal_list",
+        "allow-agent-settings-proposal-list",
+        commands::agent::agent_settings_proposal_list
+    ),
+    (
         "agent_settings_proposal_reject",
         "allow-agent-settings-proposal-reject",
         commands::agent::agent_settings_proposal_reject

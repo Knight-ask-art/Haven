@@ -70,6 +70,14 @@ describe("TauriHavenClient Agent 全局设置 Typed IPC", () => {
     expect(Object.keys(args.request).sort()).toEqual(["expectedDigest", "proposalId"])
   })
 
+  it("分页回读提案历史使用独立的只读 typed 命令", async () => {
+    const request = { before: null, limit: 30 }
+    const payload = { schemaVersion: 1, items: [], nextCursor: null }
+    invoke.mockResolvedValueOnce(payload)
+    await expect(new TauriHavenClient().agentSettingsProposalList(request)).resolves.toBe(payload)
+    expect(invoke).toHaveBeenCalledWith("agent_settings_proposal_list", { request })
+  })
+
   it("拒绝与回执读取都走各自命令", async () => {
     invoke.mockResolvedValueOnce({ proposal: { proposalId: PROPOSAL_ID } })
     await new TauriHavenClient().agentSettingsProposalReject({

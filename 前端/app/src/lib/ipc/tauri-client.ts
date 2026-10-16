@@ -127,6 +127,8 @@ import type {
   AgentSettingsProposalDto,
   AgentSettingsProposalGetRequest,
   AgentSettingsProposalGetResultDto,
+  AgentSettingsProposalListRequest,
+  AgentSettingsProposalListResultDto,
   AgentSettingsProposalRejectRequest,
   AgentSettingsProposalRejectResultDto,
   AgentTraceGetRequest,
@@ -1132,6 +1134,16 @@ export class TauriHavenClient implements HavenClient {
   ): Promise<AgentSettingsProposalGetResultDto> {
     try {
       return await invoke<AgentSettingsProposalGetResultDto>("agent_settings_proposal_get", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async agentSettingsProposalList(
+    request: AgentSettingsProposalListRequest,
+  ): Promise<AgentSettingsProposalListResultDto> {
+    try {
+      return await invoke<AgentSettingsProposalListResultDto>("agent_settings_proposal_list", { request });
     } catch (error) {
       throw toHavenError(error);
     }

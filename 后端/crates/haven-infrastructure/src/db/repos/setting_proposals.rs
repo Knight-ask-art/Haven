@@ -121,6 +121,33 @@ impl SettingProposalRepository for SqliteSettingProposalRepository {
         row.map(decode_proposal).transpose()
     }
 
+    async fn list_agent_reading(
+        &self,
+        before: Option<SettingProposalId>,
+        limit: u32,
+    ) -> Result<Vec<SettingProposal>, AppError> {
+        let conn = self.db.lock();
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT {PROPOSAL_COLUMNS} FROM setting_proposals
+             WHERE scope = 'global' AND section = 'reading'
+               AND id IN (SELECT proposal_id FROM agent_action_bindings)
+               AND (?1 IS NULL OR (created_at, id) < (
+                   SELECT created_at, id FROM setting_proposals WHERE id = ?1
+               ))
+             ORDER BY created_at DESC, id DESC LIMIT ?2"
+            ))
+            .map_err(map_db_error("读取提案列表失败"))?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![before.map(|id| id.to_string()), limit.min(101)],
+                read_proposal_row,
+            )
+            .map_err(map_db_error("读取提案列表失败"))?;
+        rows.map(|row| decode_proposal(row.map_err(map_db_error("读取提案列表失败"))?))
+            .collect()
+    }
+
     async fn get_receipt(
         &self,
         id: SettingProposalId,
@@ -1313,6 +1340,64 @@ mod tests {
             )
             .unwrap();
         assert_eq!(subject_json, canonical_json_of(&subject).unwrap());
+    }
+
+    #[tokio::test]
+    async fn sqlite_agent_reading_history_survives_reopen_and_pages_without_unbound_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let db = Arc::new(Db::open(&path).unwrap());
+        let (writer, _) = service(&db);
+        let subject = agent_subject(&db);
+        writer
+            .create(SettingProposalRequest::new(
+                SettingTarget::global(SettingsSection::Reading),
+                reading_patch(ReadingFontSize::Large),
+                provenance(),
+            ))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            writer
+                .create_with_agent_binding(
+                    SettingProposalRequest::new(
+                        SettingTarget::global(SettingsSection::Reading),
+                        reading_patch(ReadingFontSize::Large),
+                        SettingProvenance::agent(ProvenanceReason::AgentSuggestion),
+                    ),
+                    agent_binding_input(subject),
+                )
+                .await
+                .unwrap();
+        }
+        drop(writer);
+        drop(db);
+        let reopened = Arc::new(Db::open(&path).unwrap());
+        let repository = SqliteSettingProposalRepository::new(reopened.clone());
+        let first = repository.list_agent_reading(None, 2).await.unwrap();
+        assert_eq!(first.len(), 2);
+        let second = repository
+            .list_agent_reading(Some(first[1].id()), 2)
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(first.iter().all(|item| item.id() != second[0].id()));
+        reopened
+            .lock()
+            .execute(
+                "UPDATE setting_proposals SET digest = ?1 WHERE id = ?2",
+                rusqlite::params!["0".repeat(64), first[0].id().to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            repository
+                .list_agent_reading(None, 2)
+                .await
+                .unwrap_err()
+                .code()
+                .as_str(),
+            "SETTING_PROPOSAL_INTEGRITY_MISMATCH"
+        );
     }
 
     #[tokio::test]

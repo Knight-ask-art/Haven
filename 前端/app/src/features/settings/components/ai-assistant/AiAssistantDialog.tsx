@@ -29,8 +29,10 @@ import { MockHavenClient } from "@/lib/ipc/mock-client"
 import type {
   AiSettingsRecommendationGenerateRequest,
   PreferenceReadingPatchDto,
+  AgentSettingsProposalGetResultDto,
 } from "@/lib/ipc/generated/wire"
 import { guardAiSettingsRecommendation } from "@/lib/ipc/ai-recommendation-wire"
+import { useAiProposalHistory } from "../../lib/useAiProposalHistory"
 import "./ai-assistant.css"
 
 /**
@@ -112,6 +114,7 @@ export type AiAssistantAgentClient = {
   agentSettingsProposalCreate: HavenClientShape["agentSettingsProposalCreate"]
   agentSettingsProposalApprove: HavenClientShape["agentSettingsProposalApprove"]
   agentSettingsProposalReject: HavenClientShape["agentSettingsProposalReject"]
+  agentSettingsProposalList?: HavenClientShape["agentSettingsProposalList"]
   aiSettingsRecommendationGenerate?: HavenClientShape["aiSettingsRecommendationGenerate"]
 }
 type HavenClientShape = import("@/lib/ipc/client").HavenClient
@@ -254,6 +257,7 @@ interface AiAssistantTraceStep {
 
 type AiAssistantAction =
   | { type: "reset" }
+  | { type: "history-loaded"; items: AgentSettingsProposalGetResultDto[]; mock: boolean; append: boolean }
   | { type: "submit"; prompt: string }
   | { type: "answer"; prompt: string; text: string }
   | { type: "advance-trace" }
@@ -600,7 +604,7 @@ const QUICK_ACTIONS: Array<{ id: string; label: string; prompt: string }> = [
   { id: "capability", label: "当前能改什么", prompt: "当前能改什么设置" },
 ]
 
-/** 本阶段只接入「阅读排版」一个确定性意图；其余输入只给出能力说明，不生成提案。 */
+/** 仅用于固定模板预览；真实 Provider 接收用户原话，由后端的阅读 patch 契约限制能力。 */
 const READING_INTENT_KEYWORDS = ["阅读", "排版", "字体", "字号", "行高", "正文宽度", "优化"]
 
 export function wantsReadingProposal(prompt: string): boolean {
@@ -679,6 +683,42 @@ function pendingProposalOf(state: AiAssistantState, proposalId: string): AiAssis
 
 function reducer(state: AiAssistantState, action: AiAssistantAction): AiAssistantState {
   switch (action.type) {
+    case "history-loaded": {
+      const recovered = action.items.map(({ proposal, receipt }): AiAssistantProposalRecord => {
+        const existing = state.proposals.find((item) => item.id === proposal.proposalId)
+        return {
+          id: proposal.proposalId,
+          title: existing?.title ?? "阅读设置提案",
+          summary: existing?.summary ?? "已从本机记录恢复，请核对改动后决定是否批准。",
+          target: "global",
+          targetLabel: proposal.targetLabel,
+          expectedRevision: proposal.baseRevision,
+          digest: proposal.digest,
+          modelId: existing?.modelId ?? null,
+          changes: proposal.changes.map((change) => ({ key: change.key, label: settingKeyLabel(change.key), from: settingValueLabel(change.before), to: settingValueLabel(change.after) })),
+          status: proposal.status === "pending" && Date.parse(proposal.expiresAt) <= Date.now() ? "expired" : proposal.status,
+          receipt: receipt ? {
+            revision: receipt.appliedRevision ?? "unchanged", appliedAt: receipt.appliedAt,
+            changedCount: receipt.changes.length, preview: action.mock, receiptId: receipt.receiptId, digest: receipt.proposalDigest,
+          } : null,
+          digestPreview: false,
+          mock: action.mock,
+          template: existing?.template ?? false,
+          notice: null,
+        }
+      })
+      const recoveredIds = new Set(recovered.map((item) => item.id))
+      const retained = state.proposals.filter((item) => !recoveredIds.has(item.id))
+      const latest = recovered.find((item) => item.id === state.latestProposalId)
+      const settled = latest && (latest.status === "applied" || latest.status === "rejected" || latest.status === "expired") ? latest.status : null
+      return {
+        ...state,
+        status: settled ?? state.status,
+        errorMessage: settled ? null : state.errorMessage,
+        failedStage: settled ? null : state.failedStage,
+        proposals: action.append ? [...retained, ...recovered] : [...recovered, ...retained],
+      }
+    }
     case "reset":
       // 新会话只清空当前对话内容；提案记录和最近一条成功执行轨迹仍可从历史中查看。
       // turn 保持单调递增，避免新会话复用上一轮请求的归属编号。
@@ -1129,6 +1169,10 @@ export function AiAssistantDialog({
   }, [client, previewOnly])
 
   const mockMode = resolvedClient instanceof MockHavenClient
+  const restoreHistory = useCallback((items: AgentSettingsProposalGetResultDto[], append: boolean) => {
+    dispatch({ type: "history-loaded", items, mock: mockMode, append })
+  }, [mockMode])
+  const history = useAiProposalHistory(resolvedClient, open && view === "proposals" && !busy, restoreHistory)
 
   useEffect(() => {
     if (open) setView("conversation")
@@ -1242,7 +1286,8 @@ export function AiAssistantDialog({
     const prompt = raw.trim()
     if (!prompt || providerLoading || Array.from(prompt).length > MAX_USER_INTENT_CHARS || state.status === "drafting") return
     setInput("")
-    if (!wantsReadingProposal(prompt)) {
+    const usesProvider = !mockMode && typeof resolvedClient?.aiSettingsRecommendationGenerate === "function"
+    if (prompt === "当前能改什么设置" || (!usesProvider && !wantsReadingProposal(prompt))) {
       dispatch({
         type: "answer",
         prompt,
@@ -1254,7 +1299,7 @@ export function AiAssistantDialog({
     }
     lastPromptRef.current = prompt
     dispatch({ type: "submit", prompt })
-  }, [state.status, previewMode, providerLoading])
+  }, [state.status, previewMode, providerLoading, mockMode, resolvedClient])
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -1273,6 +1318,7 @@ export function AiAssistantDialog({
     if (busy) return
     const record = pendingProposalOf(state, proposalId)
     if (!record) return
+    history.invalidate()
     // 预览草稿没有服务端提案可拒绝，也不该走写入路径：直接推进本地状态。
     if (record.digestPreview || !resolvedClient) {
       dispatch({ type: "reject", proposalId })
@@ -1306,6 +1352,7 @@ export function AiAssistantDialog({
     if (busy) return
     const record = pendingProposalOf(state, proposalId)
     if (!record) return
+    history.invalidate()
     setBusy(true)
     try {
       // 双重防护：即使客户端在提案生成后不可用，也以记录来源标记为准。
@@ -1508,6 +1555,24 @@ export function AiAssistantDialog({
     ? null
     : state.proposals.find((proposal) => proposal.id === selectedProposalId) ?? null
 
+  const historyPane = (
+    <>
+      {history.available && <div className="mb-3 flex items-center justify-between gap-3 text-xs">
+        <span>本机保存的全局阅读提案</span>
+        <button type="button" disabled={history.loading || busy} onClick={() => void history.reload()} className="font-semibold text-[var(--haven-settings-primary)] disabled:opacity-50">重新读取提案</button>
+      </div>}
+      {history.loading && <p role="status" className="mb-3 text-xs">正在读取提案历史…</p>}
+      {history.error && <p role="alert" className="mb-3 text-xs text-[var(--haven-settings-danger)]">{history.error}</p>}
+      {(state.proposals.length > 0 || (!history.loading && !history.error)) && <ProposalHistory
+        proposals={state.proposals}
+        selectedProposalId={selectedProposalId}
+        onSelect={setSelectedProposalId}
+      />}
+      {history.nextCursor && !history.error && <button type="button" disabled={history.loading || busy} onClick={() => void history.loadMore()} className="mt-3 text-xs font-semibold text-[var(--haven-settings-primary)] disabled:opacity-50">加载更多提案</button>}
+      {selectedProposal && <div className="mt-[16px]" aria-label="提案详情">{renderProposalAttachment(selectedProposal.id)}</div>}
+    </>
+  )
+
   if (embedded) {
     return (
       <section
@@ -1607,16 +1672,7 @@ export function AiAssistantDialog({
         {view === "proposals" && (
           <div role="tabpanel" aria-label="提案历史" className="settings-scrollbar-hidden min-h-0 flex-1 overflow-y-auto px-6 py-6 sm:px-10">
             <div className="mx-auto w-full max-w-[760px]">
-              <ProposalHistory
-                proposals={state.proposals}
-                selectedProposalId={selectedProposalId}
-                onSelect={setSelectedProposalId}
-              />
-              {selectedProposal && (
-                <div className="mt-[16px]" aria-label="提案详情">
-                  {renderProposalAttachment(selectedProposal.id)}
-                </div>
-              )}
+              {historyPane}
             </div>
           </div>
         )}
@@ -1760,16 +1816,7 @@ export function AiAssistantDialog({
                 aria-labelledby={`${titleId}-tab-proposals`}
                 className="settings-scrollbar-hidden min-h-0 flex-1 overflow-y-auto px-5 py-5 sm:px-6"
               >
-                <ProposalHistory
-                  proposals={state.proposals}
-                  selectedProposalId={selectedProposalId}
-                  onSelect={setSelectedProposalId}
-                />
-                {selectedProposal && (
-                  <div className="mt-[16px]" aria-label="提案详情">
-                    {renderProposalAttachment(selectedProposal.id)}
-                  </div>
-                )}
+                {historyPane}
               </div>
             )}
           </div>

@@ -119,6 +119,8 @@ import type {
   AgentSettingsProposalDto,
   AgentSettingsProposalGetRequest,
   AgentSettingsProposalGetResultDto,
+  AgentSettingsProposalListRequest,
+  AgentSettingsProposalListResultDto,
   AgentSettingsProposalRejectRequest,
   AgentSettingsProposalRejectResultDto,
   AgentTraceGetRequest,
@@ -376,6 +378,10 @@ export interface HavenClient extends CloudStorageClient {
   agentSettingsProposalGet(
     request: AgentSettingsProposalGetRequest,
   ): Promise<AgentSettingsProposalGetResultDto>;
+  /** 有界恢复全局阅读 Agent 提案与回执（含外部接入创建的提案）。 */
+  agentSettingsProposalList(
+    request: AgentSettingsProposalListRequest,
+  ): Promise<AgentSettingsProposalListResultDto>;
   /** 拒绝提案（零设置写入）。 */
   agentSettingsProposalReject(
     request: AgentSettingsProposalRejectRequest,

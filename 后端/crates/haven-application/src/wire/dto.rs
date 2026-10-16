@@ -4398,6 +4398,25 @@ pub struct AgentSettingsProposalGetResultDto {
     pub receipt: Option<AgentSettingChangeReceiptDto>,
 }
 
+/// 全局阅读 Agent 提案历史。游标不包含路径、凭据或模型内容。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentSettingsProposalListRequest {
+    pub before: Option<String>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AgentSettingsProposalListResultDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub items: Vec<AgentSettingsProposalGetResultDto>,
+    pub next_cursor: Option<String>,
+}
+
 // ---------- 应用外观（Appearance；契约 §12、045/046） ----------
 //
 // 外观切片的 wire 只有两类东西：**不透明资产身份**与**闭合的布局事实**。

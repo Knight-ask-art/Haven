@@ -91,6 +91,8 @@ async function createProfileWith(profileId: string, endpoint: string) {
   fireEvent.click(screen.getByRole("button", { name: "保存" }))
   // 保存成功后草稿收起，配置行渲染出来。
   await waitFor(() => expect(screen.queryByLabelText("配置 ID")).toBeNull())
+  // 列表回读的 loading 分支也会暂时隐藏 ID；等待真正的草稿收敛。
+  await waitFor(() => expect(screen.queryByTestId("ai-profile-draft-notice")).toBeNull())
 }
 
 describe("设置页 AI Provider 写入路径", () => {
@@ -198,7 +200,243 @@ describe("设置页 AI Provider 写入路径", () => {
     expect((await screen.findAllByText("读取 Provider 失败")).length).toBeGreaterThan(0)
     expect(screen.getByRole("button", { name: "重试读取" })).toBeTruthy()
     expect(screen.queryByRole("button", { name: "删除配置" })).toBeNull()
-    expect((screen.getByRole("button", { name: "测试连接" }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole("button", { name: "刷新模型列表" }) as HTMLButtonElement).disabled).toBe(true)
+  })
+})
+
+/**
+ * 未保存的草稿不能让「已保存的那一份」继续在背后干活。
+ *
+ * 面板里的名称 / 地址是草稿，而"读取模型目录 / 切换启用 / 选择默认模型"三条动作读写的是
+ * 本机**已保存**的配置。草稿在屏幕上、请求打到旧地址，用户拿到的是另一份配置的结果却
+ * 没有任何提示——这比"点了没反应"更糟。因此这些入口在草稿保存前停用，并把原因写在界面上。
+ */
+describe("设置页 AI 分组：草稿未保存时不得按已保存的地址动作", () => {
+  /** 建一份配置并写入密钥，让模型目录非空（默认模型选择器才会是可交互的）。 */
+  async function createProfileWithModels() {
+    await createProfile()
+    fireEvent.click(await screen.findByRole("button", { name: "配置" }))
+    fireEvent.change(await screen.findByLabelText("API Key"), { target: { value: API_KEY } })
+    fireEvent.click(screen.getByRole("button", { name: "保存" }))
+    expect(await screen.findByText("已配置")).toBeTruthy()
+    const trigger = (await screen.findByRole("button", { name: "默认模型" })) as HTMLButtonElement
+    await waitFor(() => expect(trigger.disabled).toBe(false))
+  }
+
+  function enabledToggle(): HTMLButtonElement {
+    return screen.getByRole("switch", { name: "启用智能功能" }) as HTMLButtonElement
+  }
+
+  /** 密钥编辑器所在的那一条设置行：里面「保存」与面板上的「保存配置」重名，必须落到行上取。 */
+  function apiKeyRow(): HTMLElement {
+    const row = (screen.getByLabelText("API Key") as HTMLElement).closest("[data-settings-row]")
+    if (!row) throw new Error("未找到 API Key 所属的设置行")
+    return row as HTMLElement
+  }
+
+  it("改地址后停用会打到旧地址的动作，放弃草稿后恢复", async () => {
+    renderAiSettings()
+    await createProfileWithModels()
+    expect(enabledToggle().disabled).toBe(false)
+
+    fireEvent.change(screen.getByLabelText("API 地址"), {
+      target: { value: "https://edited.example.invalid/v1" },
+    })
+
+    expect((screen.getByRole("button", { name: "刷新模型列表" }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole("button", { name: "拉取模型" }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole("button", { name: "默认模型" }) as HTMLButtonElement).disabled).toBe(true)
+    expect(enabledToggle().disabled).toBe(true)
+    // 停用必须说明原因：只把按钮变灰等于给用户一条死路。
+    expect(screen.getByTestId("ai-profile-draft-notice").textContent).toContain("请先保存配置")
+
+    // 放弃草稿：不写任何东西，动作全部恢复，输入框回到已保存的地址。
+    fireEvent.click(screen.getByRole("button", { name: "放弃" }))
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: "刷新模型列表" }) as HTMLButtonElement).disabled).toBe(false),
+    )
+    expect((screen.getByRole("button", { name: "拉取模型" }) as HTMLButtonElement).disabled).toBe(false)
+    expect((screen.getByRole("button", { name: "默认模型" }) as HTMLButtonElement).disabled).toBe(false)
+    expect(enabledToggle().disabled).toBe(false)
+    expect(screen.queryByTestId("ai-profile-draft-notice")).toBeNull()
+    expect((screen.getByLabelText("API 地址") as HTMLInputElement).value).toBe(ENDPOINT)
+  })
+
+  it("地址改脏后既不能提交新密钥，也不能清除已配置的密钥", async () => {
+    renderAiSettings()
+    await createProfileWithModels()
+
+    // 没有草稿时密钥编辑器照常可达：密钥框里有字本身不构成阻塞。
+    fireEvent.click(screen.getByRole("button", { name: "配置" }))
+    const NEW_KEY = "sk-second-not-a-real-key"
+    fireEvent.change(await screen.findByLabelText("API Key"), { target: { value: NEW_KEY } })
+    expect((within(apiKeyRow()).getByRole("button", { name: "保存" }) as HTMLButtonElement).disabled).toBe(false)
+
+    // 地址一改脏，凭据写入绑定的就不再是屏幕上这一份：保存与清除都必须停手。
+    fireEvent.change(screen.getByLabelText("API 地址"), {
+      target: { value: "https://edited.example.invalid/v1" },
+    })
+    expect((within(apiKeyRow()).getByRole("button", { name: "保存" }) as HTMLButtonElement).disabled).toBe(true)
+
+    // 停用不只是"变灰"：这次点击没有写走任何东西，密钥原文还留在框里。
+    fireEvent.click(within(apiKeyRow()).getByRole("button", { name: "保存" }))
+    expect((screen.getByLabelText("API Key") as HTMLInputElement).value).toBe(NEW_KEY)
+
+    // 编辑器关掉后「配置」入口同样停用；放弃草稿后一次性恢复单向保存。
+    fireEvent.click(within(apiKeyRow()).getByRole("button", { name: "取消" }))
+    expect((screen.getByRole("button", { name: "配置" }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole("button", { name: "清除" }) as HTMLButtonElement).disabled).toBe(true)
+
+    fireEvent.click(screen.getByRole("button", { name: "放弃" }))
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: "配置" }) as HTMLButtonElement).disabled).toBe(false),
+    )
+    expect((screen.getByLabelText("API 地址") as HTMLInputElement).value).toBe(ENDPOINT)
+  })
+
+  it("模型目录动作不写成「测试连接」", async () => {
+    renderAiSettings()
+    await createProfileWithModels()
+
+    // 这个按钮只读一次模型目录，一次推理请求都不发：名字里不能出现"测试连接"这种探测承诺。
+    expect(screen.queryByRole("button", { name: /测试连接/ })).toBeNull()
+    expect(screen.getByRole("button", { name: "刷新模型列表" })).toBeTruthy()
+    expect(screen.getByRole("button", { name: "拉取模型" })).toBeTruthy()
+  })
+})
+
+/**
+ * 关闭「AI 设置」面板不得吞掉草稿：三条关闭入口（关闭按钮 / Escape / 点击遮罩）走同一条
+ * 守卫，有草稿先确认（只有"继续编辑"与"显式放弃"两个出口），写入在途时连确认都不弹。
+ *
+ * 确认框是模态内部的一枚面板：通知中心渲染在 `document.body` 的普通层里，原生模态下点不到。
+ */
+describe("设置页 AI 面板：关闭未保存的草稿要确认", () => {
+  const CONFIRM_TITLE = "有未保存的 AI 配置"
+
+  function aiDialog(): HTMLElement {
+    return screen.getByRole("dialog", { name: "AI 设置" })
+  }
+
+  /** 打开面板、建一份配置，再把名称改脏。 */
+  async function openDirtyEditDraft() {
+    renderAiSettings()
+    await createProfile()
+    fireEvent.change(screen.getByLabelText("配置名称"), { target: { value: "改过的名字" } })
+    expect(screen.getByTestId("ai-profile-draft-notice")).toBeTruthy()
+  }
+
+  it("没有草稿时关闭不需要确认", async () => {
+    renderAiSettings()
+    await createProfile()
+
+    fireEvent.click(screen.getByRole("button", { name: "关闭 AI 设置" }))
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "AI 设置" })).toBeNull())
+    expect(screen.queryByText(CONFIRM_TITLE)).toBeNull()
+  })
+
+  it("关闭按钮先确认；继续编辑保留草稿与面板", async () => {
+    await openDirtyEditDraft()
+
+    fireEvent.click(screen.getByRole("button", { name: "关闭 AI 设置" }))
+    expect(screen.getByText(CONFIRM_TITLE)).toBeTruthy()
+
+    fireEvent.click(screen.getByRole("button", { name: "继续编辑" }))
+
+    expect(aiDialog()).toBeTruthy()
+    expect(screen.queryByText(CONFIRM_TITLE)).toBeNull()
+    expect((screen.getByLabelText("配置名称") as HTMLInputElement).value).toBe("改过的名字")
+  })
+
+  it("Escape 与点击遮罩走同一条确认，取消后草稿仍在", async () => {
+    await openDirtyEditDraft()
+
+    // 原生 <dialog> 的 Escape 由浏览器派发 cancel 事件，`SettingsDialog` 在 onCancel 里收口。
+    fireEvent(aiDialog(), new Event("cancel", { cancelable: true }))
+    expect(screen.getByText(CONFIRM_TITLE)).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "继续编辑" }))
+
+    // 遮罩点击：只有 target 就是 <dialog> 本身时才算是点到了遮罩。
+    fireEvent.mouseDown(aiDialog())
+    expect(screen.getByText(CONFIRM_TITLE)).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "继续编辑" }))
+
+    expect(aiDialog()).toBeTruthy()
+    expect((screen.getByLabelText("配置名称") as HTMLInputElement).value).toBe("改过的名字")
+  })
+
+  it("显式放弃才关闭：草稿没有写进任何地方，重新打开回到已保存状态", async () => {
+    await openDirtyEditDraft()
+
+    fireEvent.click(screen.getByRole("button", { name: "关闭 AI 设置" }))
+    fireEvent.click(screen.getByRole("button", { name: "放弃修改" }))
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "AI 设置" })).toBeNull())
+    const { profiles } = await getHavenClient().aiProviderProfileList()
+    expect(profiles).toHaveLength(1)
+    expect(profiles[0]?.displayName).toBe("自建网关")
+
+    fireEvent.click(screen.getByRole("button", { name: "AI 设置" }))
+    const name = (await screen.findByLabelText("配置名称")) as HTMLInputElement
+    expect(name.value).toBe("自建网关")
+  })
+
+  it("未提交的 API Key 输入同样算未保存：只在显式放弃后随面板一起消失", async () => {
+    renderAiSettings()
+    await createProfile()
+
+    fireEvent.click(await screen.findByRole("button", { name: "配置" }))
+    fireEvent.change(await screen.findByLabelText("API Key"), { target: { value: API_KEY } })
+
+    fireEvent.click(screen.getByRole("button", { name: "关闭 AI 设置" }))
+    expect(screen.getByText(CONFIRM_TITLE)).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "继续编辑" }))
+    expect((screen.getByLabelText("API Key") as HTMLInputElement).value).toBe(API_KEY)
+
+    fireEvent.click(screen.getByRole("button", { name: "关闭 AI 设置" }))
+    fireEvent.click(screen.getByRole("button", { name: "放弃修改" }))
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "AI 设置" })).toBeNull())
+    expect(document.body.textContent).not.toContain(API_KEY)
+    // 只粘过、没提交的密钥不会被任何一次关闭顺手写下去。
+    const { profiles } = await getHavenClient().aiProviderProfileList()
+    expect(profiles[0]?.credentialConfigured).toBe(false)
+  })
+
+  it("写入在途时不关闭，也不弹确认", async () => {
+    await openDirtyEditDraft()
+
+    // 一次已经发出去、结果还没回来的写入。
+    vi.spyOn(getHavenClient(), "aiProviderProfileUpsert").mockReturnValue(new Promise(() => {}))
+    fireEvent.click(screen.getByRole("button", { name: "保存" }))
+
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: "关闭 AI 设置" }) as HTMLButtonElement).disabled).toBe(true),
+    )
+    const dialog = aiDialog()
+    fireEvent(dialog, new Event("cancel", { cancelable: true }))
+    fireEvent.mouseDown(dialog)
+
+    expect(aiDialog()).toBeTruthy()
+    expect(screen.queryByText(CONFIRM_TITLE)).toBeNull()
+  })
+
+  it("写入在途时冻结草稿输入：那一次保存不会把期间的新编辑悄悄吃掉", async () => {
+    renderAiSettings()
+    await createProfile()
+
+    fireEvent.change(screen.getByLabelText("配置名称"), { target: { value: "改过的名字" } })
+    // 一次已经发出去、结果还没回来的写入。
+    vi.spyOn(getHavenClient(), "aiProviderProfileUpsert").mockReturnValue(new Promise(() => {}))
+    fireEvent.click(screen.getByRole("button", { name: "保存" }))
+
+    // 保存成功后草稿会被收起，所以这期间敲进去的字符只会随草稿一起消失：输入必须冻住。
+    await waitFor(() =>
+      expect((screen.getByLabelText("配置名称") as HTMLInputElement).disabled).toBe(true),
+    )
+    expect((screen.getByLabelText("API 地址") as HTMLInputElement).disabled).toBe(true)
+    expect((screen.getByRole("button", { name: "保存" }) as HTMLButtonElement).disabled).toBe(true)
   })
 })
 

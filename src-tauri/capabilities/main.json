@@ -32,6 +32,7 @@
     "allow-agent-settings-context-get",
     "allow-agent-settings-proposal-create",
     "allow-agent-settings-proposal-get",
+    "allow-agent-settings-proposal-list",
     "allow-agent-settings-proposal-reject",
     "allow-agent-settings-proposal-approve",
     "allow-agent-setting-change-receipt-get",

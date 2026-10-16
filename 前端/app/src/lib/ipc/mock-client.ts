@@ -144,6 +144,8 @@ import type {
   AgentSettingsProposalDto,
   AgentSettingsProposalGetRequest,
   AgentSettingsProposalGetResultDto,
+  AgentSettingsProposalListRequest,
+  AgentSettingsProposalListResultDto,
   AgentSettingsProposalRejectRequest,
   AgentSettingsProposalRejectResultDto,
   AgentTraceGetRequest,
@@ -2873,6 +2875,25 @@ export class MockHavenClient implements HavenClient {
       proposal: mockProposalDto(record),
       receipt: record.receipt ? mockReceiptDto(record) : null,
     }
+  }
+
+  async agentSettingsProposalList(
+    request: AgentSettingsProposalListRequest,
+  ): Promise<AgentSettingsProposalListResultDto> {
+    const records = [...this.agentProposals.values()].sort((left, right) =>
+      right.createdAt.localeCompare(left.createdAt) || right.proposalId.localeCompare(left.proposalId));
+    const cursor = request.before === null ? -1 : records.findIndex((item) => item.proposalId === request.before);
+    const limit = Math.max(1, Math.min(100, request.limit ?? 30));
+    const remaining = request.before !== null && cursor < 0 ? [] : records.slice(cursor + 1);
+    const page = remaining.slice(0, limit);
+    return {
+      schemaVersion: 1,
+      items: page.map((record) => ({
+        proposal: mockProposalDto(record),
+        receipt: record.receipt ? mockReceiptDto(record) : null,
+      })),
+      nextCursor: remaining.length > limit ? page.at(-1)?.proposalId ?? null : null,
+    };
   }
 
   async agentSettingsProposalReject(

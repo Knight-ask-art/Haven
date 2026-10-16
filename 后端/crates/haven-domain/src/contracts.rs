@@ -677,6 +677,13 @@ pub trait SettingProposalRepository: Send + Sync {
     /// 读取并对存储行做完整性校验：canonical JSON 与 digest 必须自洽、
     /// 载荷版本受支持、target/operation 结构匹配、冗余 target 列与载荷一致。
     async fn get(&self, id: SettingProposalId) -> Result<Option<SettingProposal>, AppError>;
+    /// 按创建时间、ID 倒序读取全局阅读 Agent 提案。游标是上一页最后一条的 ID；
+    /// 仅返回带 Agent 绑定的提案，读取时继续执行与 get 相同的完整性校验。
+    async fn list_agent_reading(
+        &self,
+        before: Option<SettingProposalId>,
+        limit: u32,
+    ) -> Result<Vec<SettingProposal>, AppError>;
     /// 读取变更回执（提案未应用返回 `None`）。
     ///
     /// 返回的回执必须是**自洽的审计事实**：`proposal_digest` 是 64 位 ASCII 小写

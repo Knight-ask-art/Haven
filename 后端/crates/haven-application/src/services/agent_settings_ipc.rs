@@ -37,7 +37,8 @@ use crate::wire::{
     AgentSettingChangeDto, AgentSettingChangeReceiptDto, AgentSettingsContextDto,
     AgentSettingsProposalApproveRequest, AgentSettingsProposalApproveResultDto,
     AgentSettingsProposalCreateRequest, AgentSettingsProposalDto, AgentSettingsProposalGetRequest,
-    AgentSettingsProposalGetResultDto, AgentSettingsProposalRejectRequest,
+    AgentSettingsProposalGetResultDto, AgentSettingsProposalListRequest,
+    AgentSettingsProposalListResultDto, AgentSettingsProposalRejectRequest,
     AgentSettingsProposalRejectResultDto, AgentSettingsReadingSnapshotDto,
     AgentSettingsRedactedFieldDto, AgentSettingsSectionDto, AgentSettingsSubjectDto, ErrorDto,
 };
@@ -269,6 +270,41 @@ impl AgentSettingsIpcService {
         Ok(AgentSettingsProposalGetResultDto {
             proposal: self.project_proposal(&proposal, &proposal_before)?,
             receipt: projected_receipt,
+        })
+    }
+
+    /// 从持久化存储恢复当前工作台支持的全局阅读提案，包含外部 Agent 创建的记录。
+    pub async fn list_proposals(
+        &self,
+        request: &AgentSettingsProposalListRequest,
+    ) -> Result<AgentSettingsProposalListResultDto, AppError> {
+        let before = request
+            .before
+            .as_deref()
+            .map(parse_proposal_id)
+            .transpose()?;
+        let limit = request.limit.unwrap_or(30).clamp(1, 100);
+        let mut proposals = self.proposals.list_agent_reading(before, limit + 1).await?;
+        let has_more = proposals.len() > limit as usize;
+        proposals.truncate(limit as usize);
+        let next_cursor = if has_more {
+            proposals.last().map(|proposal| proposal.id().to_string())
+        } else {
+            None
+        };
+        let mut items = Vec::with_capacity(proposals.len());
+        for proposal in proposals {
+            items.push(
+                self.get_proposal(&AgentSettingsProposalGetRequest {
+                    proposal_id: proposal.id().to_string(),
+                })
+                .await?,
+            );
+        }
+        Ok(AgentSettingsProposalListResultDto {
+            schema_version: 1,
+            items,
+            next_cursor,
         })
     }
 
@@ -963,6 +999,37 @@ pub(crate) mod tests {
             Ok(self.state.lock().unwrap().proposals.get(&id).cloned())
         }
 
+        async fn list_agent_reading(
+            &self,
+            before: Option<SettingProposalId>,
+            limit: u32,
+        ) -> Result<Vec<SettingProposal>, AppError> {
+            let state = self.state.lock().unwrap();
+            let cursor = before
+                .and_then(|id| state.proposals.get(&id))
+                .map(|proposal| (proposal.created_at().0, proposal.id().to_string()));
+            let mut proposals: Vec<_> = state
+                .proposals
+                .values()
+                .filter(|proposal| {
+                    state.bindings.contains_key(&proposal.id())
+                        && proposal.target()
+                            == haven_domain::setting_proposal::SettingTarget::global(
+                                haven_domain::settings::SettingsSection::Reading,
+                            )
+                        && cursor.as_ref().is_none_or(|key| {
+                            (proposal.created_at().0, proposal.id().to_string()) < *key
+                        })
+                })
+                .cloned()
+                .collect();
+            proposals.sort_by_key(|proposal| {
+                std::cmp::Reverse((proposal.created_at().0, proposal.id().to_string()))
+            });
+            proposals.truncate(limit as usize);
+            Ok(proposals)
+        }
+
         async fn get_receipt(
             &self,
             id: SettingProposalId,
@@ -1427,6 +1494,93 @@ pub(crate) mod tests {
     }
 
     // ---------- 读取边界 ----------
+
+    #[tokio::test]
+    async fn proposal_history_restores_receipts_and_terminal_states_with_pagination() {
+        let store = FakeStore::new();
+        seed_reading(&store, Some("rev-0001"));
+        let service = service(&store);
+        let context = service.context().await.unwrap();
+        let (session, request_id) = ids();
+        let rejected = service
+            .create_proposal(
+                session,
+                request_id,
+                &create_request(&context, patch(ReadingFontSize::Large)),
+            )
+            .await
+            .unwrap();
+        let (session, request_id) = ids();
+        let applied = service
+            .create_proposal(
+                session,
+                request_id,
+                &create_request(&context, patch(ReadingFontSize::Small)),
+            )
+            .await
+            .unwrap();
+        service
+            .reject_proposal(&AgentSettingsProposalRejectRequest {
+                proposal_id: rejected.proposal_id.clone(),
+                expected_digest: rejected.digest,
+            })
+            .await
+            .unwrap();
+        service
+            .approve_proposal(&AgentSettingsProposalApproveRequest {
+                proposal_id: applied.proposal_id.clone(),
+                expected_digest: applied.digest,
+            })
+            .await
+            .unwrap();
+        let first = service
+            .list_proposals(&AgentSettingsProposalListRequest {
+                before: None,
+                limit: Some(1),
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.items.len(), 1);
+        let second = service
+            .list_proposals(&AgentSettingsProposalListRequest {
+                before: first.next_cursor,
+                limit: Some(1),
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert!(second.next_cursor.is_none());
+        let mut items = first.items;
+        items.extend(second.items);
+        let applied = items
+            .iter()
+            .find(|item| item.proposal.proposal_id == applied.proposal_id)
+            .unwrap();
+        assert_eq!(
+            applied.proposal.status,
+            AgentSettingsProposalStatusDto::Applied
+        );
+        assert!(!applied.proposal.changes.is_empty());
+        assert!(applied.receipt.as_ref().unwrap().changed);
+        let rejected = items
+            .iter()
+            .find(|item| item.proposal.proposal_id == rejected.proposal_id)
+            .unwrap();
+        assert_eq!(
+            rejected.proposal.status,
+            AgentSettingsProposalStatusDto::Rejected
+        );
+        assert!(rejected.receipt.is_none());
+        assert!(
+            service
+                .list_proposals(&AgentSettingsProposalListRequest {
+                    before: Some("invalid".into()),
+                    limit: None
+                })
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn context_is_redacted_and_has_no_secrets_or_paths() {

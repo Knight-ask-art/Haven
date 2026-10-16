@@ -270,7 +270,7 @@ export const FEATURE_REGISTRY: Readonly<Record<FeatureId, FeatureDescriptor>> = 
     status: "absent",
     binding: "HavenClient.agentSettingsProposalCreate/Approve/Reject",
     consumer: null,
-    note: "Agent 通道是真的（提案创建 / 批准 / 拒绝都有 typed IPC），但模型服务尚未接入：提案只能由本机模板脚本生成，也就不存在真实消费者。生产设置页不再提供任何入口，组件与隔离单测保留为开发材料。",
+    note: "阅读分区不重复提供此入口；真实 Provider 建议与提案审查统一由 ai.recommendation（AI 工作台）提供。",
   },
   "comic.layout": {
     label: "漫画阅读方式",
@@ -468,9 +468,9 @@ export const FEATURE_REGISTRY: Readonly<Record<FeatureId, FeatureDescriptor>> = 
   "ai.recommendation": {
     label: "设置建议（栖伴）",
     status: "implemented",
-    binding: "HavenClient.aiSettingsRecommendationGenerate",
-    consumer: "features/settings/components/ai-assistant/AiAssistantDialog.tsx",
-    note: "请求体、技能投影与 pending 提案各有单测，但没有对任何真实 Provider 发起过一次请求。",
+    binding: "HavenClient.aiSettingsRecommendationGenerate + agentSettingsProposalList/Get/Approve/Reject",
+    consumer: "features/settings/components/ai-assistant/AiAssistantDialog.tsx + features/settings/lib/useAiProposalHistory.ts + features/settings/ipc/agent-proposal-gateway.ts",
+    note: "建议与持久化提案历史有契约和回归测试；历史覆盖全局阅读提案，含外部 Agent 创建的同作用域记录。真实 Provider 与 Windows/WebView2 联调尚未验收。",
   },
   "ai.agentBroker": {
     label: "外部 Agent 接入（MCP Broker）",

@@ -1385,6 +1385,16 @@ impl haven_domain::contracts::SettingProposalRepository for SqliteRepositories {
         self.setting_proposals.get(id).await
     }
 
+    async fn list_agent_reading(
+        &self,
+        before: Option<haven_domain::ids::SettingProposalId>,
+        limit: u32,
+    ) -> Result<Vec<haven_domain::setting_proposal::SettingProposal>, haven_common::AppError> {
+        self.setting_proposals
+            .list_agent_reading(before, limit)
+            .await
+    }
+
     async fn get_receipt(
         &self,
         id: haven_domain::ids::SettingProposalId,

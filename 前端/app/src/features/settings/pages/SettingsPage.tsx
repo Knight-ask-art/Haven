@@ -328,12 +328,48 @@ function SettingsContent() {
   const activeSection = activeNavId === "overview" ? null : activeNavId
   const [aiSettingsOpen, setAiSettingsOpen] = useState(isLegacySkillsRoute)
   const aiSettingsTitleId = useId()
+  /**
+   * 面板的三条关闭入口（关闭按钮 / Escape / 点击遮罩）共用的守卫状态。
+   *
+   * 草稿只活在 `AiSettings` 里、关闭动作由 `SettingsDialog` 发起，所以这里只收两条**事实**
+   * 信号，不复制草稿本身——复制一份就等于多出一个会和真实草稿分歧的事实源。
+   */
+  const [aiSettingsDirty, setAiSettingsDirty] = useState(false)
+  const [aiSettingsBusy, setAiSettingsBusy] = useState(false)
+  const [aiCloseConfirmOpen, setAiCloseConfirmOpen] = useState(false)
   // AI 工作台与设置面板共享控制器；进入 AI 分区就读取保存的配置。
   const ai = useAiProviderSettings({ enabled: activeSection === "ai" })
+  const handleAiDirtyChange = useCallback((dirty: boolean) => { setAiSettingsDirty(dirty) }, [])
+  const handleAiBusyChange = useCallback((busy: boolean) => { setAiSettingsBusy(busy) }, [])
+  /** 关闭面板：唯一一处真正把它关掉的地方，顺带把守卫状态复位，避免下次打开带着旧事实。 */
+  const closeAiSettings = useCallback(() => {
+    setAiCloseConfirmOpen(false)
+    setAiSettingsDirty(false)
+    setAiSettingsBusy(false)
+    setAiSettingsOpen(false)
+    setSearchDestination(null)
+  }, [])
+  /** 在途写入一律不关（那次写入的结果只挂在即将消失的界面上）；有未保存输入先确认。 */
+  const requestCloseAiSettings = useCallback(() => {
+    if (aiSettingsBusy) return
+    if (!aiSettingsDirty) {
+      closeAiSettings()
+      return
+    }
+    setAiCloseConfirmOpen(true)
+  }, [aiSettingsBusy, aiSettingsDirty, closeAiSettings])
+  const openAiSettings = useCallback(() => {
+    setAiCloseConfirmOpen(false)
+    setAiSettingsOpen(true)
+  }, [])
+  /** 确认框挂起期间面板没被冻结：草稿被保存或放弃后，"还有未保存的配置"就不再成立。 */
+  useEffect(() => {
+    if (aiCloseConfirmOpen && !aiSettingsDirty) setAiCloseConfirmOpen(false)
+  }, [aiCloseConfirmOpen, aiSettingsDirty])
   const aiSelection = useMemo<AiProviderSelection>(() => ({
     controller: ai,
-    onOpenSettings: () => { setSearchDestination(null); setAiSettingsOpen(true) },
-  }), [ai])
+    onOpenSettings: () => { setSearchDestination(null); openAiSettings() },
+  }), [ai, openAiSettings])
 
   const aiProfileId = aiSelection.controller.selectedProfile?.profileId ?? null
 
@@ -424,7 +460,10 @@ function SettingsContent() {
           <SettingsNavigation activeId={activeNavId} onSelectSection={selectSection} onSelectFeature={(match) => {
             selectSection(match.navId ?? match.section)
             setSearchDestination(match)
-            if (match.section === "ai") setAiSettingsOpen(match.featureId !== "ai.recommendation")
+            if (match.section === "ai") {
+              if (match.featureId === "ai.recommendation") setAiSettingsOpen(false)
+              else openAiSettings()
+            }
           }} />
 
           <section ref={contentRef} className="settings-scrollbar-hidden min-h-0 min-w-0 flex-1 overflow-y-auto bg-[var(--haven-settings-background)] p-[24px] pb-[112px] sm:p-[32px] sm:pb-[112px] lg:px-[52px] lg:pb-[112px] lg:pt-[24px]">
@@ -472,10 +511,24 @@ function SettingsContent() {
                     description="管理模型服务、外部 Agent / MCP 接入与本机 Skills。"
                     initialFocusSelector={searchDestination?.section === "ai" ? `[data-settings-features~="${searchDestination.featureId}"]` : undefined}
                     closeLabel="关闭 AI 设置"
-                    onClose={() => { setAiSettingsOpen(false); setSearchDestination(null) }}
+                    busy={aiSettingsBusy || aiCloseConfirmOpen}
+                    onClose={requestCloseAiSettings}
                   >
+                      {aiCloseConfirmOpen && (
+                        <AiSettingsDraftCloseConfirm
+                          busy={aiSettingsBusy}
+                          onKeepEditing={() => setAiCloseConfirmOpen(false)}
+                          onDiscard={closeAiSettings}
+                        />
+                      )}
                       <div className="space-y-7">
-                        <AiSettings aiSelection={aiSelection} showNotice={showNotice} registerReloader={registerSectionReloader} />
+                        <AiSettings
+                          aiSelection={aiSelection}
+                          showNotice={showNotice}
+                          registerReloader={registerSectionReloader}
+                          onDirtyChange={handleAiDirtyChange}
+                          onBusyChange={handleAiBusyChange}
+                        />
                         <SkillsSettings showNotice={showNotice} registerReloader={registerSectionReloader} />
                       </div>
                   </SettingsDialog>
@@ -4499,7 +4552,61 @@ type AiProviderProfileDraftState = {
   endpoint: string
 }
 
-function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection: AiProviderSelection; showNotice: (message: string) => void; registerReloader: RegisterSettingsSectionReloader }) {
+/**
+ * 关闭「AI 设置」前的未保存草稿确认。
+ *
+ * 不复用通知中心的 `confirm()`：面板是原生模态 `<dialog>`（top layer），而通知中心渲染在
+ * `document.body` 的普通层里，在那个位置既点不到也看不见。文案只陈述这次操作丢什么：
+ * 草稿与尚未提交的密钥输入，profile 保存与 API Key 保存仍是两条独立写入，不会被一起保存。
+ */
+function AiSettingsDraftCloseConfirm({ busy, onKeepEditing, onDiscard }: {
+  busy: boolean
+  onKeepEditing: () => void
+  onDiscard: () => void
+}) {
+  const keepEditingRef = useRef<HTMLButtonElement>(null)
+  // 初始焦点落在"继续编辑"这一侧：默认停在"放弃修改"上，一次回车就丢草稿。
+  useEffect(() => { keepEditingRef.current?.focus() }, [])
+  return (
+    <div
+      role="group"
+      aria-label="未保存的 AI 配置"
+      className="mb-6 rounded-2xl border border-[var(--haven-settings-border-subtle)] bg-[var(--haven-settings-card)] px-4 py-3"
+    >
+      <p className="text-[13px] font-semibold text-[var(--haven-settings-foreground)]">有未保存的 AI 配置</p>
+      <p className="mt-[6px] text-[12px] leading-5 text-[var(--haven-settings-muted-strong)]">
+        关闭前是否放弃当前未保存的配置与 API Key 输入？
+      </p>
+      <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+        <button
+          ref={keepEditingRef}
+          type="button"
+          onClick={onKeepEditing}
+          className="inline-flex h-[32px] items-center justify-center rounded-full border border-[var(--haven-settings-control-border)] px-[14px] text-[12px] font-medium text-[var(--haven-settings-foreground)] transition-colors hover:bg-[var(--haven-settings-card-hover)]"
+        >
+          继续编辑
+        </button>
+        <button
+          type="button"
+          onClick={onDiscard}
+          disabled={busy}
+          className="inline-flex h-[32px] items-center justify-center rounded-full border border-[var(--haven-settings-danger-20)] px-[14px] text-[12px] font-semibold text-[var(--haven-settings-danger)] transition-colors hover:bg-[var(--haven-settings-danger-06)] disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          放弃修改
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function AiSettings({ aiSelection, showNotice, registerReloader, onDirtyChange, onBusyChange }: {
+  aiSelection: AiProviderSelection
+  showNotice: (message: string) => void
+  registerReloader: RegisterSettingsSectionReloader
+  /** 只上报事实给 `SettingsContent` 的关闭守卫：有没有会丢的输入、有没有写入在途。 */
+  onDirtyChange?: (dirty: boolean) => void
+  onBusyChange?: (busy: boolean) => void
+}) {
   // 选择由分区之上持有：本组件会随分区切换被卸载重建，选中的 Provider 不能因此丢回列表第一项。
   const ai = aiSelection.controller
   const reloadAi = ai.reload
@@ -4510,20 +4617,13 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
   /**
    * 删除确认在途的闸门。
    *
-   * 确认框是异步的：弹窗还开着的时候用户完全可以切到另一个配置再点确认，于是"确认的是
-   * A、删掉的是 B"——一次在界面上找不到痕迹的数据丢失（连同 B 的 API Key）。点开确认时
-   * 捕获目标 `{profileId, revision}`，确认后按这个目标删除，切分区/重载都改不了它。
-   * 闸门同时挡住同一渲染内的双击；`deleteConfirmPendingRef` 是同步副本，
-   * `deleteConfirmPending` 只驱动 UI。
+   * 确认框是异步的：弹窗还开着时用户完全可以切到另一个配置再点确认，于是"确认的是 A、
+   * 删掉的是 B"（连同 B 的 API Key）。目标因此在点开确认时锁定为 `{profileId, revision}`。
+   * `deleteConfirmPendingRef` 是同步副本，`deleteConfirmPending` 只驱动 UI。
    */
   const [deleteConfirmPending, setDeleteConfirmPending] = useState(false)
   const deleteConfirmPendingRef = useRef(false)
-  /**
-   * `deleteConfirmPending` / `deleteConfirmPendingRef` 的**同一个事实**同时交给 Hook：
-   * 确认框由页面持有，Hook 看不到它；没有这枚标记，确认期间用户仍然可以保存配置、写 /
-   * 清 API Key、切启用开关或换模型，而这些写入会和待确认的那次删除交错（最坏的结果是
-   * 系统凭据管理器里留下一份行已经被删掉的孤儿 secret）。
-   */
+  /** 同一个事实也交给 Hook（确认框由页面持有，Hook 看不到它），否则确认期间的写入会和待确认的删除交错留下孤儿 secret。 */
   const { setDeleteConfirmPending: markDeleteConfirmPending } = ai
   const deletePanelMounted = useRef(true)
   useEffect(() => {
@@ -4536,13 +4636,7 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
       }
     }
   }, [markDeleteConfirmPending])
-  /**
-   * 浏览器 Mock / 开发预览。
-   *
-   * Mock 的凭据与模型目录都是**内存 + 契约 fixture**：说"已写入系统凭据管理器"或
-   * "模型来自 Provider 的模型列表"在预览里是假的，而且是很具体的那种假——用户会以为
-   * 本机真的存了密钥、真的探测到了模型。因此预览路径必须逐条改口径，不能复用生产文案。
-   */
+  /** Mock 的凭据与模型目录都是内存 + 契约 fixture：预览路径必须逐条改口径，不能复用"已写入系统凭据管理器"这类生产文案。 */
   const mockMode = getHavenClientMode() === "mock"
 
   // 「重新加载配置」按当前分区转调：这里登记的是**调用方持有的那个**控制器的 reload。
@@ -4550,6 +4644,14 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
     () => registerReloader("ai", () => { void reloadAi() }),
     [registerReloader, reloadAi],
   )
+
+  // 回调放 ref：信号 effect 只跟事实跑；清理函数在卸载时复位父组件标记，免得留下过期事实。
+  const dirtyListenerRef = useRef(onDirtyChange)
+  const busyListenerRef = useRef(onBusyChange)
+  useEffect(() => {
+    dirtyListenerRef.current = onDirtyChange
+    busyListenerRef.current = onBusyChange
+  })
 
   // Provider 列表读取失败时，保留的快照只供恢复后收敛，不能继续驱动任何动作。
   const selected = ai.state.loadError === null ? ai.selectedProfile : null
@@ -4570,6 +4672,29 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
   const draftEndpoint = draft?.endpoint ?? selected?.endpoint ?? ""
   const isDirty = draft !== null
   const isCreating = draft?.mode === "create"
+  // 未提交的 API Key 输入也只活在组件状态里（不落盘、不回填），面板一关同样取不回来。
+  const hasUnsavedInput = isDirty || apiKeyDraft.length > 0
+  // 只取 `saving`：删除确认是另一条生命周期，并进来会拖住关闭；而写入结果只挂在即将消失的界面上。
+  const writeInFlight = ai.state.saving
+  /**
+   * 用**已保存**的那一份去动作的入口，草稿未保存时一律停用。
+   *
+   * 读模型目录 / 切启用 / 选默认模型，以及写、清 API Key，执行的都是本机已保存的配置与
+   * 它的凭据；屏幕上却是另一份还没保存的地址——请求打到旧地址，界面没有任何线索。
+   * `saving` 与 `deleteConfirmPending` 一并带上，与其它写入入口的闸门一致。
+   */
+  const savedConfigActionsBlocked = isDirty || ai.state.saving || deleteConfirmPending
+  // 写入在途时冻结草稿输入：保存成功后会把草稿收起，期间的输入会被静默吃掉。
+  const profileDraftLocked = ai.state.saving || deleteConfirmPending
+
+  useEffect(() => {
+    dirtyListenerRef.current?.(hasUnsavedInput)
+    return () => { dirtyListenerRef.current?.(false) }
+  }, [hasUnsavedInput])
+  useEffect(() => {
+    busyListenerRef.current?.(writeInFlight)
+    return () => { busyListenerRef.current?.(false) }
+  }, [writeInFlight])
   /**
    * 明文端点与 `localhost` 别名是两类不同的拒绝原因，提示也必须分开：
    * 前者要换协议（HTTPS），后者只要把主机名写成显式回环字面量。
@@ -4625,6 +4750,8 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
   }
 
   const submitApiKey = async () => {
+    // 与按钮的停用同一条判断：草稿未保存时凭据写入绑定的是**已保存**那份配置的地址。
+    if (savedConfigActionsBlocked) return
     const secret = apiKeyDraft
     // 先清空本地草稿，再提交：无论成功与否，密钥原文都不留在组件状态里。
     setApiKeyDraft("")
@@ -4698,6 +4825,12 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
             {ai.state.loadError.retryable && <button type="button" onClick={() => void ai.reload()} className="shrink-0 font-semibold text-[var(--haven-settings-primary)]">重试</button>}
           </div>
         )}
+        {/* 停用而不说明原因等于死路；不用 role="alert"：这是持续状态，不是一次新的失败。 */}
+        {isDirty && !ai.state.loadError && (
+          <p data-testid="ai-profile-draft-notice" className="mx-5 mb-3 rounded-2xl border border-[#ff9500]/25 bg-[#fff8e5] px-4 py-3 text-xs leading-5 text-[#7a5a1a] dark:border-[#ff9500]/30 dark:bg-[#3a2f12] dark:text-[#f0b429]">
+            请先保存配置。保存或放弃修改后，即可获取模型、切换启用状态、选择默认模型和管理 API Key。
+          </p>
+        )}
         {!ai.state.loading && !ai.state.loadError && ai.state.profiles.length > 0 && (
           <SettingRow title="当前服务" description={`本机已配置 ${ai.state.profiles.length} 个 AI 服务，可分别保存凭据与默认模型。`}>
             <div className="flex items-center gap-3">
@@ -4715,12 +4848,12 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
                   ai.selectProfile(profile.profileId)
                 }}
                 ariaLabel="当前 AI 服务"
-                disabled={isDirty || ai.state.saving || deleteConfirmPending}
+                disabled={savedConfigActionsBlocked}
               />
               <button
                 type="button"
                 onClick={beginCreateProfile}
-                disabled={isDirty || ai.state.saving || deleteConfirmPending}
+                disabled={savedConfigActionsBlocked}
                 className="shrink-0 rounded-full px-[8px] py-[8px] text-xs font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50"
               >
                 新建配置
@@ -4737,13 +4870,13 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
         ) : isCreating ? (
           <>
             <SettingRow title="配置 ID" description="稳定标识，只允许字母、数字、连字符与下划线。">
-              <input value={draftProfileId} onChange={(event) => updateDraft({ profileId: event.target.value })} disabled={deleteConfirmPending} className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50" aria-label="配置 ID" />
+              <input value={draftProfileId} onChange={(event) => updateDraft({ profileId: event.target.value })} disabled={profileDraftLocked} className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50" aria-label="配置 ID" />
             </SettingRow>
             <SettingRow title="配置名称">
-              <input value={draftDisplayName} onChange={(event) => updateDraft({ displayName: event.target.value })} disabled={deleteConfirmPending} className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50" aria-label="配置名称" />
+              <input value={draftDisplayName} onChange={(event) => updateDraft({ displayName: event.target.value })} disabled={profileDraftLocked} className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50" aria-label="配置名称" />
             </SettingRow>
             <SettingRow title="API 地址" description="远程服务使用 HTTPS；本机网关可使用 http://127.0.0.1 或 http://[::1] 及端口（写成 localhost 或其子域名会被拒绝）。不支持局域网或服务发现。">
-              <input value={draftEndpoint} onChange={(event) => updateDraft({ endpoint: event.target.value })} disabled={deleteConfirmPending} className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50" aria-label="API 地址" />
+              <input value={draftEndpoint} onChange={(event) => updateDraft({ endpoint: event.target.value })} disabled={profileDraftLocked} className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50" aria-label="API 地址" />
             </SettingRow>
             <SettingRow title="保存配置" description="新服务默认启用；API Key 将单独配置。">
               <div className="flex items-center gap-3">
@@ -4758,7 +4891,7 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
               <input
                 value={draftDisplayName}
                 onChange={(event) => updateDraft({ displayName: event.target.value })}
-                disabled={deleteConfirmPending}
+                disabled={profileDraftLocked}
                 className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50"
                 aria-label="配置名称"
               />
@@ -4773,7 +4906,7 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
                   enabled: value,
                   selectedModelId: selected.selectedModelId,
                 })}
-                disabled={ai.selectedEndpointInsecure || endpointIsLocalhostAlias || deleteConfirmPending}
+                disabled={ai.selectedEndpointInsecure || endpointIsLocalhostAlias || savedConfigActionsBlocked}
                 label="启用智能功能"
               />
             </SettingRow>
@@ -4784,7 +4917,7 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
               <input
                 value={draftEndpoint}
                 onChange={(event) => updateDraft({ endpoint: event.target.value })}
-                disabled={deleteConfirmPending}
+                disabled={profileDraftLocked}
                 className="h-10 w-[260px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50"
                 aria-label="API 地址"
               />
@@ -4819,17 +4952,14 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
                       disabled={deleteConfirmPending}
                       className="h-10 w-[200px] rounded-xl border border-[var(--haven-settings-border)] bg-[var(--haven-settings-control)] px-3 text-sm text-[var(--haven-settings-foreground)] outline-none focus:border-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50"
                     />
-                    <button type="button" onClick={() => void submitApiKey()} disabled={apiKeyDraft.length === 0 || ai.state.saving || deleteConfirmPending} className="rounded-full px-[8px] py-[8px] text-xs font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50">保存</button>
+                    <button type="button" onClick={() => void submitApiKey()} disabled={apiKeyDraft.length === 0 || savedConfigActionsBlocked} className="rounded-full px-[8px] py-[8px] text-xs font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50">保存</button>
                     <button type="button" onClick={() => { setApiKeyDraft(""); setIsKeyEditorOpen(false) }} className="rounded-full px-[8px] py-[8px] text-xs font-medium text-[var(--haven-settings-muted-strong)]">取消</button>
                   </>
                 ) : (
                   <>
-                    {/*
-                      写入与清除是两条互相覆盖的写操作：任一条在途时两条都禁用，避免"先点保存
-                      再点清除"由完成顺序决定最终状态（Hook 里另有一道互斥闸门兜底）。
-                    */}
-                    <button type="button" onClick={() => setIsKeyEditorOpen(true)} disabled={ai.state.saving || deleteConfirmPending} className="rounded-full px-[8px] py-[8px] text-xs font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50">配置</button>
-                    {ai.credentialConfigured && <button type="button" onClick={() => { void ai.clearApiKey().then((ok) => showNotice(ok ? mockMode ? "已在浏览器预览的内存状态中清除（Mock/预览）：没有改动系统凭据管理器。" : "已清除 API Key" : "清除失败，请重试")) }} disabled={ai.state.saving || deleteConfirmPending} className="rounded-full px-[8px] py-[8px] text-xs font-medium text-[var(--haven-settings-muted-strong)] disabled:cursor-not-allowed disabled:opacity-50">清除</button>}
+                    {/* 写入与清除互相覆盖：任一条在途时两条都禁用，草稿未保存时同样停用（Hook 里另有同步闸门兜底）。 */}
+                    <button type="button" onClick={() => setIsKeyEditorOpen(true)} disabled={savedConfigActionsBlocked} className="rounded-full px-[8px] py-[8px] text-xs font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50">配置</button>
+                    {ai.credentialConfigured && <button type="button" onClick={() => { void ai.clearApiKey().then((ok) => showNotice(ok ? mockMode ? "已在浏览器预览的内存状态中清除（Mock/预览）：没有改动系统凭据管理器。" : "已清除 API Key" : "清除失败，请重试")) }} disabled={savedConfigActionsBlocked} className="rounded-full px-[8px] py-[8px] text-xs font-medium text-[var(--haven-settings-muted-strong)] disabled:cursor-not-allowed disabled:opacity-50">清除</button>}
                   </>
                 )}
               </div>
@@ -4863,15 +4993,15 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
                 })
               }}
               ariaLabel="默认模型"
-              disabled={!ai.hasAvailableModel || ai.state.saving || deleteConfirmPending}
+              disabled={!ai.hasAvailableModel || savedConfigActionsBlocked}
             />
-            <button type="button" onClick={() => void ai.refreshModels()} disabled={!selected || ai.state.catalogLoading} className="text-[13px] font-medium text-[var(--haven-settings-primary)] transition-colors hover:text-[#005bb5] hover:underline disabled:cursor-not-allowed disabled:text-[var(--haven-settings-muted-strong)]">{ai.state.catalogLoading ? "读取中…" : "拉取模型"}</button>
+            <button type="button" onClick={() => void ai.refreshModels()} disabled={!selected || ai.state.catalogLoading || savedConfigActionsBlocked} title={isDirty ? "请先保存配置：这里的模型目录来自本机已保存的地址" : undefined} className="text-[13px] font-medium text-[var(--haven-settings-primary)] transition-colors hover:text-[#005bb5] hover:underline disabled:cursor-not-allowed disabled:text-[var(--haven-settings-muted-strong)]">{ai.state.catalogLoading ? "读取中…" : "拉取模型"}</button>
           </div>
         </SettingRow>}
         {!isCreating && selected && !ai.hasAvailableModel && ai.state.catalogError && (
           <SettingRow title="模型列表" description={ai.state.catalogError.message}>
             {ai.state.catalogError.retryable
-              ? <button type="button" onClick={() => void ai.refreshModels()} className="text-[13px] font-semibold text-[var(--haven-settings-primary)]">重试</button>
+              ? <button type="button" onClick={() => void ai.refreshModels()} disabled={savedConfigActionsBlocked} title={isDirty ? "请先保存配置：这里的模型目录来自本机已保存的地址" : undefined} className="text-[13px] font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:opacity-50">重试</button>
               : <span className="text-[13px] text-[var(--haven-settings-muted-strong)]">请检查 API 地址与 API Key</span>}
           </SettingRow>
         )}
@@ -4899,7 +5029,12 @@ function AiSettings({ aiSelection, showNotice, registerReloader }: { aiSelection
       )}
       <div className="flex items-center justify-end gap-3">
         {selected && !isCreating && <button type="button" onClick={() => { void requestDeleteProfile() }} disabled={ai.state.saving || isDirty || ai.state.loadError !== null || deleteConfirmPending} className="text-[13px] font-medium text-[#d70015] disabled:cursor-not-allowed disabled:opacity-50">删除配置</button>}
-        {!isCreating && <button type="button" onClick={() => void ai.refreshModels()} disabled={!selected || ai.state.catalogLoading || ai.state.loadError !== null} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[#1d1d1f] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#2c2c2e] disabled:cursor-not-allowed disabled:opacity-50">测试连接</button>}
+        {/*
+          这个按钮做的**只有**一件事：读取已保存那份配置的模型目录（`refreshModels`）。
+          它曾经叫「测试连接」——那是在声称一次可以判定"这个地址能不能用"的推理探测，
+          而它其实一次对话请求都不发。改成一个说得出自己做了什么的名字。
+        */}
+        {!isCreating && <button type="button" onClick={() => void ai.refreshModels()} disabled={!selected || ai.state.catalogLoading || ai.state.loadError !== null || savedConfigActionsBlocked} title={isDirty ? "请先保存配置：模型目录读的是本机已保存的地址" : undefined} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[#1d1d1f] px-[16px] text-[12px] font-semibold leading-none text-white transition-colors hover:bg-[#2c2c2e] disabled:cursor-not-allowed disabled:opacity-50">{ai.state.catalogLoading ? "刷新中…" : "刷新模型列表"}</button>}
       </div>
       <ExternalAgentAccessSettings showNotice={showNotice} registerReloader={registerReloader} />
     </>

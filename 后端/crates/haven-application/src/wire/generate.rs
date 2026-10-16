@@ -292,6 +292,8 @@ pub fn generate_wire_bindings() -> String {
         AgentSettingsProposalApproveRequest::export_to_string(&config).unwrap(),
         AgentSettingsProposalRejectRequest::export_to_string(&config).unwrap(),
         AgentSettingsProposalGetRequest::export_to_string(&config).unwrap(),
+        AgentSettingsProposalListRequest::export_to_string(&config).unwrap(),
+        AgentSettingsProposalListResultDto::export_to_string(&config).unwrap(),
         AgentSettingChangeReceiptGetRequest::export_to_string(&config).unwrap(),
         AgentSettingsProposalApproveResultDto::export_to_string(&config).unwrap(),
         AgentSettingsProposalRejectResultDto::export_to_string(&config).unwrap(),

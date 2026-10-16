@@ -966,6 +966,37 @@ mod tests {
             Ok(self.state.lock().unwrap().proposals.get(&id).cloned())
         }
 
+        async fn list_agent_reading(
+            &self,
+            before: Option<SettingProposalId>,
+            limit: u32,
+        ) -> Result<Vec<SettingProposal>, AppError> {
+            let state = self.state.lock().unwrap();
+            let cursor = before
+                .and_then(|id| state.proposals.get(&id))
+                .map(|proposal| (proposal.created_at().0, proposal.id().to_string()));
+            let mut proposals: Vec<_> = state
+                .proposals
+                .values()
+                .filter(|proposal| {
+                    state.bindings.contains_key(&proposal.id())
+                        && proposal.target()
+                            == haven_domain::setting_proposal::SettingTarget::global(
+                                haven_domain::settings::SettingsSection::Reading,
+                            )
+                        && cursor.as_ref().is_none_or(|key| {
+                            (proposal.created_at().0, proposal.id().to_string()) < *key
+                        })
+                })
+                .cloned()
+                .collect();
+            proposals.sort_by_key(|proposal| {
+                std::cmp::Reverse((proposal.created_at().0, proposal.id().to_string()))
+            });
+            proposals.truncate(limit as usize);
+            Ok(proposals)
+        }
+
         async fn get_receipt(
             &self,
             id: SettingProposalId,

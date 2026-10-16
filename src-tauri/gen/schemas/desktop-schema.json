@@ -249,6 +249,12 @@
           "markdownDescription": "Enables the agent_settings_proposal_get command without any pre-configured scope."
         },
         {
+          "description": "Enables the agent_settings_proposal_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-agent-settings-proposal-list",
+          "markdownDescription": "Enables the agent_settings_proposal_list command without any pre-configured scope."
+        },
+        {
           "description": "Enables the agent_settings_proposal_reject command without any pre-configured scope.",
           "type": "string",
           "const": "allow-agent-settings-proposal-reject",
@@ -1165,6 +1171,12 @@
           "type": "string",
           "const": "deny-agent-settings-proposal-get",
           "markdownDescription": "Denies the agent_settings_proposal_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the agent_settings_proposal_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-agent-settings-proposal-list",
+          "markdownDescription": "Denies the agent_settings_proposal_list command without any pre-configured scope."
         },
         {
           "description": "Denies the agent_settings_proposal_reject command without any pre-configured scope.",
