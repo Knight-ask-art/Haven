@@ -73,6 +73,9 @@ export function SearchPage() {
   const [localResults, setLocalResults] = useState<LocalSearchResult[]>([])
   const [localErrorMessage, setLocalErrorMessage] = useState<string | null>(null)
   const [retryRevision, setRetryRevision] = useState(0)
+  // 来源搜索专用的重试信号：只有同关键词的显式提交才递增，与本地检索的
+  // retryRevision 保持独立，本地重试不会重启来源搜索。
+  const [sourceRetryRevision, setSourceRetryRevision] = useState(0)
 
   useEffect(() => {
     if (clientMode === "unavailable") {
@@ -169,6 +172,12 @@ export function SearchPage() {
       },
       { replace: true }
     )
+    // 同关键词的显式提交不会改变 query，来源搜索需要一次显式重查信号；
+    // 关键词变化时由 query 变化驱动，不能再叠加信号。进行中的来源搜索会
+    // 忽略该信号（见 SourceCandidates 的忙碌判定）。
+    if (trimmed === submittedQuery) {
+      setSourceRetryRevision((current) => current + 1)
+    }
   }
 
   const handleClearHistory = () => {
@@ -293,7 +302,11 @@ export function SearchPage() {
       )}
 
       {searchRuntimeState === "ready_query" && submittedQuery && (
-        <SourceCandidates query={submittedQuery} category={filterType} />
+        <SourceCandidates
+          query={submittedQuery}
+          category={filterType}
+          retryRevision={sourceRetryRevision}
+        />
       )}
     </div>
   )

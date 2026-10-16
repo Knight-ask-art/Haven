@@ -42,10 +42,13 @@ type SectionStatus = "idle" | "searching" | "done" | "failed"
 export function SourceCandidates({
   query,
   category,
+  retryRevision = 0,
 }: {
   query: string
   /** 页面分段筛选；all 时来源搜索不限定分类。 */
   category: QueryCategory | "all"
+  /** 父页面在同关键词显式提交时递增；搜索进行中到达的信号会被忽略。 */
+  retryRevision?: number
 }) {
   const navigate = useNavigate()
   const sourceCategory: QueryCategory | undefined =
@@ -57,7 +60,32 @@ export function SourceCandidates({
   const [warningsOpen, setWarningsOpen] = useState(false)
   const [importingIndex, setImportingIndex] = useState<number | null>(null)
   const [importError, setImportError] = useState<string | null>(null)
+  // 重试版本号由本组件持有：父页面只下发"同关键词显式提交"的信号，
+  // 是否真的重查由这里在终态决定。
+  const [retryNonce, setRetryNonce] = useState(0)
   const operationIdRef = useRef<string | null>(null)
+  const statusRef = useRef<SectionStatus>("idle")
+  const observedRetryRevisionRef = useRef(retryRevision)
+
+  useEffect(() => {
+    statusRef.current = status
+  }, [status])
+
+  // 外部重试信号只消费一次：先记下已观察到的版本号，再判断是否忙碌。
+  // 搜索进行中被忽略的信号不会在终态到达后被重放；进行中的操作也不能被
+  // 取消重启——后端对同一 query 去重，可能对取消中的操作返回 alreadyRunning，
+  // 从而丢失候选与导入索引身份。
+  useEffect(() => {
+    if (observedRetryRevisionRef.current === retryRevision) return
+    observedRetryRevisionRef.current = retryRevision
+    if (statusRef.current === "searching") return
+    setRetryNonce((current) => current + 1)
+  }, [retryRevision])
+
+  const retrySourceSearch = () => {
+    if (status === "searching") return
+    setRetryNonce((current) => current + 1)
+  }
 
   useEffect(() => {
     if (!query) {
@@ -68,6 +96,9 @@ export function SourceCandidates({
     }
     let cancelled = false
     let runningIndex = 0
+    // 启动返回值和事件都可能先到；清理时用已拿到的身份取消，
+    // 若清理早于启动返回，则用返回的 operationId 补一次取消。
+    let cancelWhenStartReturns = false
     operationIdRef.current = null
     setCandidates([])
     setErrorCode(null)
@@ -103,6 +134,14 @@ export function SourceCandidates({
           break
       }
     }, sourceCategory)
+      .then((result) => {
+        if (cancelled) {
+          // 清理发生在启动返回之前：用返回的身份补一次取消，避免遗留运行中的操作。
+          if (cancelWhenStartReturns) void cancelSourceSearch(result.operationId).catch(() => undefined)
+          return
+        }
+        if (operationIdRef.current === null) operationIdRef.current = result.operationId
+      })
       .catch((error: unknown) => {
         if (cancelled) return
         setErrorCode(toHavenError(error).code)
@@ -112,10 +151,15 @@ export function SourceCandidates({
     return () => {
       cancelled = true
       const operationId = operationIdRef.current
-      if (operationId !== null) void cancelSourceSearch(operationId).catch(() => undefined)
+      operationIdRef.current = null
+      if (operationId === null) {
+        cancelWhenStartReturns = true
+        return
+      }
+      void cancelSourceSearch(operationId).catch(() => undefined)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [query, sourceCategory])
+  }, [query, sourceCategory, retryNonce])
 
   const importCandidate = async (candidate: Candidate) => {
     const operationId = operationIdRef.current
@@ -192,6 +236,24 @@ export function SourceCandidates({
               ))}
             </ul>
           )}
+        </div>
+      )}
+      {status !== "searching" && (status === "failed" || warnings.length > 0) && (
+        <div className="search-results__notice">
+          <div className="search-results__notice-toggle">
+            <span>
+              {status === "failed"
+                ? "来源搜索未完成，可重新查询已启用来源。"
+                : "部分来源未返回结果，可重新查询已启用来源。"}
+            </span>
+            <button
+              type="button"
+              onClick={retrySourceSearch}
+              className="search-results__action"
+            >
+              重试
+            </button>
+          </div>
         </div>
       )}
       {candidates.length === 0 && status === "done" && (

@@ -37,12 +37,14 @@ export function createVideoProgressController(options: VideoProgressControllerOp
   const identity = `${session.sessionId}:${session.mediaItemId}:${session.contentUri}`
   let revision = session.progress?.revision ?? null
   let latest: number | undefined
-  let latestCompletion: ProgressSaveRequest["completion"] = "in_progress"
+  // 与 book/pdf/comic 控制器一致：继承 Session 的已完成状态。否则重新打开一部
+  // 已看完的作品后，一次普通的暂停/拖动就会把进度从 completed 改回 in_progress。
+  let completed = session.progress?.completion === "completed"
+  let latestCompletion: ProgressSaveRequest["completion"] = completed ? "completed" : "in_progress"
   let timer: ReturnType<typeof setTimeout> | undefined
   let inFlight: Promise<void> | undefined
   let queued = false
   let stopped = false
-  let completed = false
   let conflictNotified = false
 
   const clear = () => { if (timer) clearTimeout(timer); timer = undefined }

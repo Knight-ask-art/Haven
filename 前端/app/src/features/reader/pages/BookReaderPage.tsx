@@ -405,9 +405,15 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
     setFontSize(presentation.fontSizePx)
     setLineHeight(readingSettings.lineHeight)
     setColumnWidth(readingSettings.contentWidth)
-    pendingPaginationProgressionRef.current = null
+    // 设置可能在内容已按默认 scroll 恢复之后才到达：这次 setPaginationMode 是
+    // 程序化切换，新轴上的首个测量值（0）会覆盖当前阅读位置，所以像用户手动
+    // 切换那样先捕获已恢复的 progression。尚未恢复完成时保持 null，把定位交给
+    // 恢复流程，避免把初始 0 当成已恢复的位置。
+    pendingPaginationProgressionRef.current = progressRestoreSettledRef.current && presentation.pagination !== paginationMode
+      ? latestBookProgressionRef.current
+      : null
     setPaginationMode(presentation.pagination)
-  }, [readingSettings, readingSettingsScopeKey, readingSettingsStatus])
+  }, [readingSettings, readingSettingsScopeKey, readingSettingsStatus, paginationMode])
 
   const changePaginationMode = (next: BookPaginationMode) => {
     if (next === paginationMode) return
@@ -772,6 +778,8 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
   // 分页模式沿用同一个 progression，但把它映射到当前水平 page/spread。
   // 等待两帧让 CSS columns 完成布局，并在恢复完成前禁止首个 0 位置
   // 写回 Progress；这对“首次打开即为分页模式”的 Session 尤其重要。
+  // 恢复只对每个 Session 生效一次：之后的分页模式/视口宽度变化只重排布局，
+  // 不能再用 Session 的初始快照覆盖当前阅读位置。
   useEffect(() => {
     if (sessionView.status !== "ready" || state.status !== "ready") return
     if (tauriRuntime && (contentState.status !== "ready" || !contentMatchesSession)) return
@@ -792,6 +800,13 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
         frame = requestAnimationFrame(restore)
         return
       }
+
+      // 恢复的写入者只有一次。分页模式或视口宽度变化会重建列布局并重新触发
+      // 本 effect，此时 Session 的初始快照已经过期：继续写回会把刚保存的
+      // 当前位置（例如 60%）退回成打开时的旧值（例如 20%）。
+      // 模式/布局切换的位置延续由 changePaginationMode 的
+      // pendingPaginationProgressionRef 与滚动测量的 latestBookProgressionRef 负责。
+      if (progressRestoreSettledRef.current) return
 
       restoreBookProgress(scrollContainer, state.session, restoredProgressRef, paginationMode)
       latestBookProgressionRef.current = safeProgress

@@ -129,6 +129,19 @@ fn refill_bucket(tokens: f64, elapsed_secs: f64, weight: f64) -> f64 {
     (tokens + elapsed_secs * BUCKET_REFILL_PER_SEC_PER_WEIGHT * weight).min(weight)
 }
 
+/// Token 不足时距离“攒够 1 个 token”的等待时长；按当前权重对应的补液速率推算，
+/// 因此下一次醒来时刚好够用。已有 ≥1 token 时返回 `None`（无需等待补液）。
+/// 不变式：`weight` 只取 8/4/1，故速率为正的有限值，无需零速率兜底；
+/// 时长只是唤醒截止时间，不受桶容量约束。1ms 下限仅用于规避浮点导致的零时长自旋。
+fn token_wait_duration(tokens: f64, weight: f64) -> Option<Duration> {
+    if tokens >= 1.0 {
+        return None;
+    }
+    let rate = BUCKET_REFILL_PER_SEC_PER_WEIGHT * weight;
+    let secs = (1.0 - tokens) / rate;
+    Some(Duration::from_secs_f64(secs).max(Duration::from_millis(1)))
+}
+
 /// 进程内下载准入控制。设置变更会在下一个任务获得槽位时生效，
 /// 不强制中断已经运行的任务。
 struct DownloadScheduler {
@@ -165,10 +178,14 @@ impl DownloadScheduler {
         let host = task.host_key.clone().unwrap_or_else(|| "default".into());
         let weight = priority_weight(task.priority);
         loop {
-            // 先建立通知 future，再检查计数，避免释放发生在检查与 await 之间时丢唤醒。
+            // 通知 future 必须先 pin + enable 再读取设置/检查计数：
+            // enable 会在检查状态前完成注册，确保此后到达的多次唤醒不会被合并成
+            // 一个 permit 而漏掉未注册的等待者。
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let policy = load_download_policy(settings).await;
-            let acquired = {
+            let (acquired, token_wait) = {
                 let mut global = self
                     .global_active
                     .lock()
@@ -198,9 +215,9 @@ impl DownloadScheduler {
                     *global += 1;
                     *hosts.entry(host.clone()).or_insert(0) += 1;
                     bucket.tokens -= 1.0;
-                    true
+                    (true, None)
                 } else {
-                    false
+                    (false, token_wait_duration(bucket.tokens, weight))
                 }
             };
             if acquired {
@@ -210,7 +227,17 @@ impl DownloadScheduler {
                     host,
                 };
             }
-            notified.await;
+            // 计数/Host 满时只等通知；Token 不足时补液没有通知源，
+            // 必须同时等一个按当前补液速率算出的截止时间，否则会永久挂起。
+            match token_wait {
+                Some(delay) => {
+                    tokio::select! {
+                        _ = notified => {}
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
+                None => notified.await,
+            }
         }
     }
 
@@ -2075,6 +2102,55 @@ mod tests {
             .expect("释放同 Host 槽位后等待任务应继续")
             .expect("等待任务不应 panic");
         drop(third);
+    }
+
+    #[tokio::test]
+    async fn scheduler_waits_for_token_refill_instead_of_hanging_when_bucket_is_empty() {
+        let db = Arc::new(crate::Db::open_in_memory().unwrap());
+        let settings = settings_service(db);
+
+        let scheduler = Arc::new(DownloadScheduler::new());
+        let task = scheduling_task(
+            Some("provider-a".into()),
+            Some("host-1".into()),
+            DownloadPriority::Normal,
+        );
+        // 四个快速获取/释放循环（Normal 权重 4）会把桶耗尽，且中间没有补液时间。
+        for _ in 0..4 {
+            let permit = scheduler.acquire(&task, &settings).await;
+            drop(permit);
+        }
+        assert_eq!(
+            *scheduler
+                .global_active
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            0,
+            "四个快速循环结束后不应残留活跃任务"
+        );
+
+        // 桶空且无其它活跃任务时，第五次获取必须靠补液截止时间自行醒来：
+        // 依赖通知会永久挂起。
+        let fifth =
+            tokio::time::timeout(Duration::from_secs(3), scheduler.acquire(&task, &settings))
+                .await
+                .expect("桶耗尽后必须由补液唤醒，而不是无限等待通知");
+        assert_eq!(
+            *scheduler
+                .global_active
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            1
+        );
+        drop(fifth);
+        assert_eq!(
+            *scheduler
+                .global_active
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            0,
+            "释放许可后活跃计数必须回到 0"
+        );
     }
 
     #[test]
