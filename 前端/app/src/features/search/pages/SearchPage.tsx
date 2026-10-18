@@ -62,6 +62,7 @@ export function SearchPage() {
   const hasSubmittedQuery = submittedQuery.length > 0
   const [searchValue, setSearchValue] = useState(queryParam)
   const debouncedSearchValue = useDebouncedValue(searchValue, 300)
+  const searchInputTooLong = Array.from(searchValue.trim()).length > 200
   const searchRuntimeState = resolveSearchRuntimeState(clientMode, submittedQuery)
   const localMode = searchRuntimeState === "ready_empty" || searchRuntimeState === "ready_query"
   const [history, setHistory] = useState<string[]>([])
@@ -154,11 +155,33 @@ export function SearchPage() {
     debouncedCommittedRef.current = submittedQuery
   }, [submittedQuery])
 
+  // 清空输入、按 Escape、按清除按钮必须同一语义：同时移除 URL 的 q，
+  // 否则输入框已空但旧提交结果与发现区会同时出现。
+  const clearSubmittedQuery = () => {
+    setSearchParams(
+      (prev) => {
+        if (!prev.has("q")) return prev
+        const next = new URLSearchParams(prev)
+        next.delete("q")
+        return next
+      },
+      { replace: true }
+    )
+  }
+
+  const handleSearchValueChange = (value: string) => {
+    setSearchValue(value)
+    if (!value.trim()) clearSubmittedQuery()
+  }
+
   const commitSearch = (value: string) => {
-    if (clientMode === "unavailable") return
     const trimmed = value.trim()
-    if (!trimmed) return
-    if (trimmed.length > 200) return
+    if (!trimmed) {
+      clearSearch()
+      return
+    }
+    if (clientMode === "unavailable") return
+    if (Array.from(trimmed).length > 200) return
     // 设置读取完成前不产生隐式写入，避免用户在冷启动窗口中绕过已关闭的搜索历史开关。
     if (historyLoaded && historyEnabled) {
       void recordSearchHistory(trimmed).then(setHistory).catch(() => undefined)
@@ -209,9 +232,7 @@ export function SearchPage() {
 
   const clearSearch = () => {
     setSearchValue("")
-    const next = new URLSearchParams(searchParams)
-    next.delete("q")
-    setSearchParams(next, { replace: true })
+    clearSubmittedQuery()
   }
 
   const suggestItems = searchValue.trim()
@@ -227,7 +248,7 @@ export function SearchPage() {
       <div className={hasSubmittedQuery ? "search-results__search-wrap" : "w-full max-w-5xl mx-auto relative"}>
         <SearchBar
           value={searchValue}
-          onChange={(e) => setSearchValue(e.target.value)}
+          onChange={(e) => handleSearchValueChange(e.target.value)}
           onSearch={() => commitSearch(searchValue)}
           onClear={clearSearch}
           onFocus={() => setShowSuggest(true)}
@@ -235,6 +256,7 @@ export function SearchPage() {
           disabled={clientMode === "unavailable"}
           placeholder={clientMode === "unavailable" ? "搜索服务未启用" : "搜索本地媒体库"}
         />
+        {searchInputTooLong && <p role="alert" className="mt-2 px-6 text-sm text-destructive">搜索词过长，请缩短到 200 个字符以内。</p>}
         {showSuggest && suggestItems.length > 0 && (
           <div className="search-results__suggestions absolute left-0 right-0 top-full z-20 mt-2 rounded-2xl border border-black/5 bg-white p-1.5 shadow-xl dark:border-white/10 dark:bg-zinc-900">
             {suggestItems.map((item) => (

@@ -9,6 +9,8 @@
 // - **没有可用模型时显示「无可用模型」**：不写入、不推断任何示例模型名，
 //   也不会把 `selectedModelId` 的原值当成已确认的选择。
 // - Provider 错误只做可重试展示：`errorRetryable` 直接来自后端 ErrorDto。
+//   但写入失败后必须回读权威列表；CAS 冲突不能原样重放，只提示用户看过最新内容后
+//   再次显式提交 / 确认，绝不用回读到的新 revision 自动覆盖或删除未读数据。
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -64,6 +66,14 @@ export interface AiProviderSettingsState {
   saveError: AiProviderErrorInfo | null;
   /** 失败的是哪一次操作；`null` 表示当前没有失败。 */
   saveErrorAction: AiProviderFailedAction | null;
+  /**
+   * 最近一次失败是 CAS 冲突（权威列表已推进到用户没看过的一版）。
+   *
+   * 这种失败**不能重放同一个操作**：拿旧 revision 重试只会再次冲突；把 revision
+   * 自动升级成回读后的新值再重试，则会在用户没看过的新数据上覆盖/删除。页面据此
+   * 隐藏「重试」，让用户看过回读后的列表再显式提交/确认一次。
+   */
+  saveErrorConflict: boolean;
 }
 
 /**
@@ -145,11 +155,34 @@ const EMPTY_STATE: AiProviderSettingsState = {
   saving: false,
   saveError: null,
   saveErrorAction: null,
+  saveErrorConflict: false,
 };
 
 function toErrorInfo(error: unknown): AiProviderErrorInfo {
   const haven = toHavenError(error);
   return { code: haven.code, message: haven.message, retryable: haven.retryable };
+}
+
+/**
+ * 后端 CAS 冲突的稳定错误码（`haven-application/src/services/ai_provider.rs` 的
+ * `revision_conflict()`）。
+ *
+ * 冲突是一类**不能原样重放**的失败：用户手里的 revision 已经过期，本机存在一版他
+ * 没看过的数据。它必须与"网络失败 / 响应丢失"区分开——后者的写入结果不确定，但用
+ * 同一个 revision 重放是安全的（真写成功时会落进冲突，不会覆盖）。
+ */
+const PROFILE_REVISION_CONFLICT_CODE = "AI_PROVIDER_PROFILE_REVISION_CONFLICT";
+
+/** 冲突失败的恢复文案：说明权威列表已经回读，下一步是"看过后再显式提交一次"。 */
+function withConflictRecovery(
+  info: AiProviderErrorInfo,
+  action: "profile" | "delete",
+): AiProviderErrorInfo {
+  const next = action === "delete" ? "检查后重新确认删除" : "检查后再次保存";
+  return {
+    ...info,
+    message: `${info.message}。请核对重新读取的配置后${next}；若读取失败，请先重新加载。`,
+  };
 }
 
 export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): AiProviderSettingsController {
@@ -198,8 +231,17 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
    * `finally` 释放，钩子自身不依赖异步的 `state.saving`（那个状态落后一个渲染）。
    */
   const deleteConfirmInFlight = useRef(false);
-  /** 最近一次提交的 profile 草稿：重试"保存"时必须重放**同一份**输入，而不是重新拼一份。 */
-  const lastSaveDraft = useRef<AiProviderProfileDraft | null>(null);
+  /**
+   * 最近一次提交的 profile 草稿**及其 CAS 依据**。
+   *
+   * 重试"保存"必须重放同一份输入，也必须重放**提交时**的 `expectedRevision`：失败后
+   * 本 Hook 会回读权威列表，若重试时再从列表里现查 revision，就等于自动升级到用户
+   * 没看过的那一版，并在它上面覆盖写入。
+   */
+  const lastSaveRequest = useRef<{
+    draft: AiProviderProfileDraft;
+    expectedRevision: string | null;
+  } | null>(null);
 
   /**
    * 失败的那一次删除指向的是**哪一个** profile。
@@ -371,7 +413,21 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
     }));
   }, [notifySelection]);
 
-  const saveProfile = useCallback(async (draft: AiProviderProfileDraft): Promise<boolean> => {
+  /**
+   * 用**提交时定下的 CAS 依据**写入一份 profile 草稿。
+   *
+   * `expectedRevision` 不从 `state.profiles` 现查：失败后本 Hook 会回读权威列表，
+   * 「重试」若现查就会拿到用户还没看过的新 revision——那正是"自动升级版本并覆盖
+   * 未读改动"。重放必须用提交时的值；真要接受新版本，只能由用户看过列表后重新提交。
+   *
+   * `checkExisting` 只服务一次新的界面提交（create-only 快速失败）。重试交给服务端的
+   * create-only CAS：回读后"已经存在"可能只是上一次写入其实已落盘，不能因此改写错误。
+   */
+  const runProfileSave = useCallback(async (
+    draft: AiProviderProfileDraft,
+    expectedRevision: string | null,
+    checkExisting: boolean,
+  ): Promise<boolean> => {
     // 删除确认在途时整段 profile 写入都停下来：确认框是异步的，期间任何一次
     // 保存 / 启用 / 选模型都会写到"用户正在决定要删掉的那一份"上。
     if (deleteConfirmInFlight.current) return false;
@@ -379,7 +435,7 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
       (profile) => profile.profileId === draft.profileId,
     );
     if (state.loading || state.loadError !== null) return false;
-    if (draft.createOnly && existing) {
+    if (checkExisting && draft.createOnly && existing) {
       setState((current) => ({
         ...current,
         saveError: {
@@ -388,6 +444,7 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
           retryable: false,
         },
         saveErrorAction: "profile",
+        saveErrorConflict: false,
       }));
       return false;
     }
@@ -407,6 +464,7 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
           retryable: false,
         },
         saveErrorAction: "profile",
+        saveErrorConflict: false,
       }));
       return false;
     }
@@ -419,11 +477,18 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
           retryable: false,
         },
         saveErrorAction: "profile",
+        saveErrorConflict: false,
       }));
       return false;
     }
-    lastSaveDraft.current = draft;
-    setState((current) => ({ ...current, saving: true, saveError: null }));
+    lastSaveRequest.current = { draft, expectedRevision };
+    setState((current) => ({
+      ...current,
+      saving: true,
+      saveError: null,
+      saveErrorAction: null,
+      saveErrorConflict: false,
+    }));
     try {
       const saved = await upsertAiProviderProfile({
         profileId: draft.profileId,
@@ -433,26 +498,46 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
         enabled: draft.enabled,
         selectedModelId: draft.selectedModelId,
         // 服务端也执行 create-only CAS：即使 UI 列表过期或并发新建，也不能覆盖现有项。
-        expectedRevision: draft.createOnly ? null : existing?.revision ?? null,
+        expectedRevision,
       });
+      lastSaveRequest.current = null;
       setState((current) => ({
         ...current,
         saving: false,
         saveError: null,
         saveErrorAction: null,
+        saveErrorConflict: false,
       }));
       await load(saved.profileId);
       return true;
     } catch (error) {
+      const info = toErrorInfo(error);
+      // 冲突意味着本机已有一版用户没看过的数据：保留用户草稿与这次失败提示，
+      // 回读权威列表，并**禁用重放**。不确定结果的写入（IPC 失败可能发生在后端
+      // 已提交之后）同样必须回读，但可以用原 revision 安全重放。
+      const conflict = info.code === PROFILE_REVISION_CONFLICT_CODE;
       setState((current) => ({
         ...current,
         saving: false,
-        saveError: toErrorInfo(error),
+        saveError: conflict ? withConflictRecovery(info, "profile") : info,
         saveErrorAction: "profile",
+        saveErrorConflict: conflict,
       }));
+      // 回读不清空 `saveError`，也不触碰页面持有的草稿：失败提示与未保存输入都保留。
+      await load(draft.profileId);
       return false;
     }
   }, [load, state.loadError, state.loading, state.profiles]);
+
+  const saveProfile = useCallback(async (draft: AiProviderProfileDraft): Promise<boolean> => {
+    const existing = state.profiles.find(
+      (profile) => profile.profileId === draft.profileId,
+    );
+    // 界面上的「保存」是一次新的显式提交：使用此刻权威列表里的 revision 是正确的。
+    // create-only 的 CAS 依据固定为 null，服务端会拒绝覆盖同名配置。
+    const expectedRevision = draft.createOnly ? null : existing?.revision ?? null;
+    return await runProfileSave(draft, expectedRevision, true);
+  }, [runProfileSave, state.profiles]);
 
   const submitApiKey = useCallback(async (secret: string): Promise<boolean> => {
     const profileId = selectedRef.current;
@@ -461,7 +546,13 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
     // 与"删除确认"同样互斥：删除会连带清理这份凭据，交错写入只会留下孤儿 secret。
     if (credentialMutationInFlight.current || deleteConfirmInFlight.current) return false;
     credentialMutationInFlight.current = true;
-    setState((current) => ({ ...current, saving: true, saveError: null }));
+    setState((current) => ({
+      ...current,
+      saving: true,
+      saveError: null,
+      saveErrorAction: null,
+      saveErrorConflict: false,
+    }));
     try {
       await setAiProviderApiKey(profileId, secret);
       // secret 到此为止：不写入本地状态、不缓存、不回显。
@@ -475,6 +566,7 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
         saving: false,
         saveError: toErrorInfo(error),
         saveErrorAction: "credential",
+        saveErrorConflict: false,
       }));
       // IPC 失败可能发生在后端已提交之后；刷新权威状态，不推测是否写入成功。
       await load(profileId);
@@ -489,7 +581,13 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
     if (!profileId) return false;
     if (credentialMutationInFlight.current || deleteConfirmInFlight.current) return false;
     credentialMutationInFlight.current = true;
-    setState((current) => ({ ...current, saving: true, saveError: null }));
+    setState((current) => ({
+      ...current,
+      saving: true,
+      saveError: null,
+      saveErrorAction: null,
+      saveErrorConflict: false,
+    }));
     try {
       await clearAiProviderApiKey(profileId);
       setState((current) => ({ ...current, saving: false }));
@@ -502,6 +600,7 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
         saving: false,
         saveError: toErrorInfo(error),
         saveErrorAction: "credential",
+        saveErrorConflict: false,
       }));
       await load(profileId);
       return false;
@@ -531,7 +630,13 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
     credentialMutationInFlight.current = true;
     // 删除没有可重放的输入：记下这一次的目标，失败之后"重试"重放的就是它；成功后清空。
     lastDeleteTarget.current = target;
-    setState((current) => ({ ...current, saving: true, saveError: null }));
+    setState((current) => ({
+      ...current,
+      saving: true,
+      saveError: null,
+      saveErrorAction: null,
+      saveErrorConflict: false,
+    }));
     try {
       await deleteAiProviderProfile(target.profileId, target.revision);
       lastDeleteTarget.current = null;
@@ -540,16 +645,27 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
         saving: false,
         saveError: null,
         saveErrorAction: null,
+        saveErrorConflict: false,
       }));
       await load(null);
       return true;
     } catch (error) {
+      const info = toErrorInfo(error);
+      // CAS 冲突：目标行已被推进到用户没看过的一版。保留旧 revision 重试只会再次
+      // 冲突；自动换成刚读到的 revision 则会在没看过的数据上执行删除。两者都不行，
+      // 因此清掉可重放目标、禁用重试，只把回读后的目标留给用户重新确认。
+      const conflict = info.code === PROFILE_REVISION_CONFLICT_CODE;
+      if (conflict) lastDeleteTarget.current = null;
       setState((current) => ({
         ...current,
         saving: false,
-        saveError: toErrorInfo(error),
+        saveError: conflict ? withConflictRecovery(info, "delete") : info,
         saveErrorAction: "delete",
+        saveErrorConflict: conflict,
       }));
+      // 冲突或结果不确定（响应丢失时删除可能已经落盘）：回读权威列表，不在旧快照上
+      // 继续展示；失败提示保留，不因回读被清掉。
+      await load(null);
       return false;
     } finally {
       credentialMutationInFlight.current = false;
@@ -562,8 +678,9 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
    * 传入 `confirmedTarget` 时删的是**确认框打开那一刻**定下的那一份：确认框是异步的，
    * 期间用户可能切到别的配置，按"此刻选中项"删就会删错人。缺省仍按当前选中项。
    *
-   * **已经记下的删除目标只应由本人清除**：失败时留着供"重试"重放，成功时由
-   * [`deleteProfileTarget`] 清空。确认在途时这里直接返回，不会把目标改写成别的值。
+   * **已经记下的删除目标只应由本人清除**：失败时留着供"重试"重放（CAS 冲突除外：
+   * 那种目标已经过期，不能安全重放），成功时由 [`deleteProfileTarget`] 清空。
+   * 确认在途时这里直接返回，不会把目标改写成别的值。
    */
   const deleteProfile = useCallback(async (confirmedTarget?: {
     profileId: string;
@@ -591,19 +708,22 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
    * 重试失败的那一次操作。
    *
    * 只有"重放同一件事"才算重试：
-   * - `profile`：重放最近一次提交的**同一份**草稿；
+   * - `profile`：重放最近一次提交的**同一份**草稿与**同一个** expectedRevision；
    * - `delete`：重放失败时记下的**那个** profile 与它的 revision——不是"此刻选中的那个"。
    *   用户完全可能在删除失败之后切到别的 profile，此时按当前选中项重试就是删错人；
+   * - **CAS 冲突不重试**：旧 revision 只会再次冲突，升级 revision 则会覆盖/删除用户
+   *   没看过的新数据。冲突时已回读权威列表，用户必须看过之后重新提交或重新确认；
    * - `credential`：**不重试**。密钥原文按设计不留存在任何组件状态里，拿不到输入就
    *   无法重放；用一个"重试"按钮去做别的事（例如重新拉模型）只会掩盖真正的失败。
    */
   const retrySaveError = useCallback(async (): Promise<boolean> => {
     if (deleteConfirmInFlight.current) return false;
+    if (state.saveErrorConflict) return false;
     const action = state.saveErrorAction;
     if (action === "profile") {
-      const draft = lastSaveDraft.current;
-      if (!draft) return false;
-      return await saveProfile(draft);
+      const request = lastSaveRequest.current;
+      if (!request) return false;
+      return await runProfileSave(request.draft, request.expectedRevision, false);
     }
     if (action === "delete") {
       const target = lastDeleteTarget.current;
@@ -611,13 +731,19 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
       return await deleteProfileTarget(target);
     }
     return false;
-  }, [deleteProfileTarget, saveProfile, state.saveErrorAction]);
+  }, [deleteProfileTarget, runProfileSave, state.saveErrorAction, state.saveErrorConflict]);
 
   const dismissSaveError = useCallback(() => {
-    // 提示被关掉之后就不再保留可重放的删除目标：留着它只会让一次"已经作废的失败"
+    // 提示被关掉之后就不再保留可重放的输入：留着它们只会让一次"已经作废的失败"
     // 有机会在很久之后被别的东西触发。
     lastDeleteTarget.current = null;
-    setState((current) => ({ ...current, saveError: null, saveErrorAction: null }));
+    lastSaveRequest.current = null;
+    setState((current) => ({
+      ...current,
+      saveError: null,
+      saveErrorAction: null,
+      saveErrorConflict: false,
+    }));
   }, []);
 
   const setDeleteConfirmPending = useCallback((pending: boolean) => {
@@ -649,10 +775,12 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
     // 界面据此给出"必须改成 https"的可执行结论，而不是让用户去猜为什么拉不到模型。
     selectedEndpointInsecure:
       selectedProfile !== null && !isAiEndpointTransportAllowed(selectedProfile.endpoint),
-    // 只有"重试真的会重做那件事"时才提供重试——凭据写入的密钥原文按设计不留存。
+    // 只有"重试真的会重做那件事"时才提供重试——凭据写入的密钥原文按设计不留存，
+    // CAS 冲突也不能原样重放（旧 revision 会再次冲突，新 revision 会覆盖未读数据）。
     canRetrySaveError:
       state.saveError !== null
       && state.saveError.retryable
+      && !state.saveErrorConflict
       && (state.saveErrorAction === "profile" || state.saveErrorAction === "delete"),
     selectProfile,
     reload: load,

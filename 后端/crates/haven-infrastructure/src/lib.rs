@@ -35,6 +35,8 @@ pub use credential::credential_store;
 pub use db::Db;
 pub use source_credential_lease::FileSourceCredentialLease;
 
+pub(crate) use haven_common::local_path_identity;
+
 pub(crate) fn lower_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);

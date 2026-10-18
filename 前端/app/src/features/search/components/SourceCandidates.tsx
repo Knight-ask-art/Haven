@@ -64,6 +64,7 @@ export function SourceCandidates({
   // 是否真的重查由这里在终态决定。
   const [retryNonce, setRetryNonce] = useState(0)
   const operationIdRef = useRef<string | null>(null)
+  const searchEpochRef = useRef(0)
   const statusRef = useRef<SectionStatus>("idle")
   const observedRetryRevisionRef = useRef(retryRevision)
 
@@ -88,6 +89,8 @@ export function SourceCandidates({
   }
 
   useEffect(() => {
+    searchEpochRef.current += 1
+    setImportingIndex(null)
     if (!query) {
       operationIdRef.current = null
       setCandidates([])
@@ -150,6 +153,7 @@ export function SourceCandidates({
 
     return () => {
       cancelled = true
+      searchEpochRef.current += 1
       const operationId = operationIdRef.current
       operationIdRef.current = null
       if (operationId === null) {
@@ -164,14 +168,17 @@ export function SourceCandidates({
   const importCandidate = async (candidate: Candidate) => {
     const operationId = operationIdRef.current
     if (operationId === null || importingIndex !== null) return
+    const epoch = searchEpochRef.current
+    const isCurrent = () => searchEpochRef.current === epoch && operationIdRef.current === operationId
     setImportingIndex(candidate.index)
     setImportError(null)
     try {
       const result = await importSourceWork({ operationId, index: candidate.index })
-      navigate(`/work/${result.workId}`)
+      if (isCurrent()) navigate(`/work/${result.workId}`)
     } catch (error) {
-      setImportError(toHavenError(error).dto.userMessage)
-      setImportingIndex(null)
+      if (isCurrent()) setImportError(toHavenError(error).dto.userMessage)
+    } finally {
+      if (isCurrent()) setImportingIndex(null)
     }
   }
 

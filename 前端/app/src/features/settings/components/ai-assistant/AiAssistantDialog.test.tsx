@@ -1186,6 +1186,21 @@ describe("栖伴真实 Provider 路径", () => {
 })
 
 describe("正式嵌入式 AI 工作台", () => {
+  it("基线失效的历史提案明确提示且不再提供批准入口", async () => {
+    const list = vi.fn().mockResolvedValue({ schemaVersion: 1, items: [{
+      proposal: { ...proposalDto(), expiresAt: "2099-01-01T00:00:00Z", baselineStale: true, changes: [] },
+      receipt: null,
+    }], nextCursor: null })
+    const approve = vi.fn()
+    renderDialog({ client: fakeClient({ agentSettingsProposalList: list, agentSettingsProposalApprove: approve }), embedded: true })
+    fireEvent.click(screen.getByRole("button", { name: "提案历史" }))
+    const entries = await screen.findByRole("list", { name: "提案记录" })
+    fireEvent.click(within(entries).getByRole("button"))
+    expect(screen.getAllByText(/原提案基线已失效/).length).toBeGreaterThan(0)
+    expect(screen.queryByRole("button", { name: "批准并应用" })).toBeNull()
+    expect(approve).not.toHaveBeenCalled()
+  })
+
   it("批准响应丢失后，权威回执消除未确认写入的错误状态", async () => {
     const list = vi.fn()
       .mockResolvedValueOnce({ schemaVersion: 1, items: [{ proposal: { ...proposalDto(), expiresAt: "2099-01-01T00:00:00Z" }, receipt: null }], nextCursor: null })

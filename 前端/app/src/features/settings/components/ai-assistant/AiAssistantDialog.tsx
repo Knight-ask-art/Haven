@@ -689,14 +689,18 @@ function reducer(state: AiAssistantState, action: AiAssistantAction): AiAssistan
         return {
           id: proposal.proposalId,
           title: existing?.title ?? "阅读设置提案",
-          summary: existing?.summary ?? "已从本机记录恢复，请核对改动后决定是否批准。",
+          summary: proposal.baselineStale
+            ? "阅读设置已变化，原提案基线已失效；旧记录未保留改前快照，请重新生成提案。"
+            : existing?.summary ?? "已从本机记录恢复，请核对改动后决定是否批准。",
           target: "global",
           targetLabel: proposal.targetLabel,
           expectedRevision: proposal.baseRevision,
           digest: proposal.digest,
           modelId: existing?.modelId ?? null,
           changes: proposal.changes.map((change) => ({ key: change.key, label: settingKeyLabel(change.key), from: settingValueLabel(change.before), to: settingValueLabel(change.after) })),
-          status: proposal.status === "pending" && Date.parse(proposal.expiresAt) <= Date.now() ? "expired" : proposal.status,
+          status: proposal.status === "pending"
+            ? Date.parse(proposal.expiresAt) <= Date.now() ? "expired" : proposal.baselineStale ? "conflict" : "pending"
+            : proposal.status,
           receipt: receipt ? {
             revision: receipt.appliedRevision ?? "unchanged", appliedAt: receipt.appliedAt,
             changedCount: receipt.changes.length, preview: action.mock, receiptId: receipt.receiptId, digest: receipt.proposalDigest,
@@ -1897,6 +1901,9 @@ function ProposalAttachment({
         </span>
       </div>
 
+      {record.changes.length === 0 && (
+        <p className="mt-3 text-[12px] leading-5 text-[var(--haven-settings-muted-strong)]">{record.summary}</p>
+      )}
       <ul className="mt-3 space-y-1.5">
         {record.changes.map((change) => (
           <li

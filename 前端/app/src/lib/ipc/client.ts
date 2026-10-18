@@ -38,6 +38,9 @@ import type {
   DownloadEvent,
   DownloadListRequest,
   DownloadMutationResultDto,
+  DownloadResourceActionRequest,
+  DownloadResourceMutationResultDto,
+  DownloadResourceRevealResultDto,
   DownloadRevealResultDto,
   DownloadTaskActionRequest,
   DownloadTaskDto,
@@ -293,6 +296,13 @@ export interface HavenClient extends CloudStorageClient {
   downloadRemoveRecord(request: DownloadTaskActionRequest): Promise<DownloadMutationResultDto>;
   downloadDeleteOffline(request: DownloadTaskActionRequest): Promise<DownloadMutationResultDto>;
   downloadRevealOffline(request: DownloadTaskActionRequest): Promise<DownloadRevealResultDto>;
+  // Resource-level offline actions: the Task row may already be gone.
+  downloadDeleteOfflineResource(
+    request: DownloadResourceActionRequest,
+  ): Promise<DownloadResourceMutationResultDto>;
+  downloadRevealOfflineResource(
+    request: DownloadResourceActionRequest,
+  ): Promise<DownloadResourceRevealResultDto>;
   downloadSubscribe(
     subscriptionId: string,
     onEvent: (event: DownloadEvent) => void,

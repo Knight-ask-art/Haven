@@ -12,6 +12,7 @@ import type {
   TvboxConfigPreviewDto,
 } from "@/lib/ipc/generated/wire"
 import { SettingsPage } from "./SettingsPage"
+import { NoticeProvider } from "@/app/notice-center/NoticeCenter"
 
 const TVBOX_CONFIG_URL = "https://config.example.invalid/tvbox.json"
 const TVBOX_SOURCE_ID = "custom_tvbox_0123456789ab"
@@ -72,17 +73,30 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
-function renderSourcesSettings() {
-  return render(
+function renderSourcesSettings(withNotices = false) {
+  const page = (
     <MemoryRouter initialEntries={["/settings/sources"]}>
       <Routes>
         <Route path="/settings/:section" element={<SettingsPage />} />
       </Routes>
-    </MemoryRouter>,
+    </MemoryRouter>
   )
+  return render(withNotices ? <NoticeProvider>{page}</NoticeProvider> : page)
 }
 
 describe("来源页的设计骨架", () => {
+  it("自定义 OPDS 只声明搜索能力，并说明正文尚未开放", async () => {
+    const client = getHavenClient()
+    const { sourceId } = await client.sourceAdd({ displayName: "能力回归书库", endpoint: "https://catalog.example.invalid/opds", kind: "opds" })
+    const descriptor = (await client.sourceRegistryList()).sources.find((source) => source.sourceId === sourceId)
+    expect(descriptor?.kinds).toEqual(["search"])
+    expect(descriptor?.notes).toContain("当前仅支持搜索")
+    renderSourcesSettings()
+    await screen.findByText("能力回归书库")
+    const row = within(document.querySelector(`[data-source-id="${sourceId}"]`) as HTMLElement)
+    expect(row.getByText("搜索")).toBeTruthy()
+    expect(row.queryByText(/下载/)).toBeNull()
+  })
   it("在列表上方提供紧凑分类、搜索和添加入口，不使用示例来源占位", async () => {
     renderSourcesSettings()
 
@@ -246,6 +260,38 @@ describe("来源设置中的自托管漫画库（Komga/Kavita）", () => {
 })
 
 describe("来源设置中的 TVBox / FongMi 配置导入", () => {
+  it("删除 TVBox 时可取消，确认后只移除所选来源并回源更新列表", async () => {
+    const listing = vi.spyOn(getHavenClient(), "sourceRegistryList").mockResolvedValue(registryWith([tvboxDescriptor()]))
+    const pending = deferred<{ schemaVersion: 1; sourceId: string; credentialDeleted: boolean }>()
+    const remove = vi.spyOn(getHavenClient(), "sourceRemove").mockReturnValue(pending.promise)
+    renderSourcesSettings(true)
+    fireEvent.click(await screen.findByRole("button", { name: "删除来源：客厅电视源" }))
+    expect(remove).not.toHaveBeenCalled()
+    fireEvent.click(await screen.findByRole("button", { name: "取消" }))
+    await waitFor(() => expect((screen.getByRole("button", { name: "删除来源：客厅电视源" }) as HTMLButtonElement).disabled).toBe(false))
+    expect(remove).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole("button", { name: "删除来源：客厅电视源" }))
+    fireEvent.click(await screen.findByRole("button", { name: "删除" }))
+    await waitFor(() => expect(remove).toHaveBeenCalledExactlyOnceWith({ sourceId: TVBOX_SOURCE_ID }))
+    expect((screen.getByRole("button", { name: "删除来源：客厅电视源" }) as HTMLButtonElement).disabled).toBe(true)
+    listing.mockResolvedValue(registryWith([]))
+    await act(async () => { pending.resolve({ schemaVersion: 1, sourceId: TVBOX_SOURCE_ID, credentialDeleted: false }) })
+    await waitFor(() => expect(screen.queryByText("客厅电视源")).toBeNull())
+    expect(listing).toHaveBeenCalledTimes(2)
+  })
+
+  it("TVBox 外部清理失败时仍重新读取已撤销的来源记录", async () => {
+    const listing = vi.spyOn(getHavenClient(), "sourceRegistryList")
+      .mockResolvedValueOnce(registryWith([tvboxDescriptor()]))
+      .mockResolvedValue(registryWith([]))
+    vi.spyOn(getHavenClient(), "sourceRemove").mockRejectedValue(new HavenError({ code: "CREDENTIAL_ACCESS_FAILED", userMessage: "配置清理失败，可重试", retryable: true }))
+    renderSourcesSettings(true)
+    fireEvent.click(await screen.findByRole("button", { name: "删除来源：客厅电视源" }))
+    fireEvent.click(await screen.findByRole("button", { name: "删除" }))
+    expect(await screen.findByText("配置清理失败，可重试")).toBeTruthy()
+    await waitFor(() => expect(screen.queryByText("客厅电视源")).toBeNull())
+    expect(listing).toHaveBeenCalledTimes(2)
+  })
   it("演示环境里预览失败时如实报错，保存保持不可用", async () => {
     // 浏览器预览没有受控 HTTP：mock 客户端不编造摘要，页面必须把失败如实呈现。
     const tvboxConfigSave = vi.spyOn(getHavenClient(), "tvboxConfigSave")
@@ -316,6 +362,21 @@ describe("来源设置中的 TVBox / FongMi 配置导入", () => {
 })
 
 describe("来源管理异步交互回归", () => {
+  it("普通自定义来源沿用同一删除确认与列表刷新通路", async () => {
+    const source: SourceDescriptorDto = { ...tvboxDescriptor(), sourceId: "custom_feed_0123456789ab", displayName: "待删订阅", categories: ["periodical"] }
+    const listing = vi.spyOn(getHavenClient(), "sourceRegistryList")
+      .mockResolvedValueOnce(registryWith([source]))
+      .mockResolvedValue(registryWith([]))
+    const remove = vi.spyOn(getHavenClient(), "sourceRemove").mockResolvedValue({ schemaVersion: 1, sourceId: source.sourceId, credentialDeleted: false })
+    renderSourcesSettings(true)
+    fireEvent.click(await screen.findByRole("button", { name: "待删订阅 更多操作" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "删除来源" }))
+    expect(remove).not.toHaveBeenCalled()
+    fireEvent.click(await screen.findByRole("button", { name: "删除" }))
+    await waitFor(() => expect(screen.queryByText("待删订阅")).toBeNull())
+    expect(remove).toHaveBeenCalledExactlyOnceWith({ sourceId: source.sourceId })
+    expect(listing).toHaveBeenCalledTimes(2)
+  })
   it("初次读取完成前禁用添加，读取后 TVBox 大表单可以立即打开、取消和重开", async () => {
     const initial = deferred<SourceRegistryDto>()
     vi.spyOn(getHavenClient(), "sourceRegistryList").mockReturnValue(initial.promise)
@@ -365,7 +426,7 @@ describe("来源管理异步交互回归", () => {
   it("已有凭据时空白保存不可用，清除显式发送 null 而不是当前输入", async () => {
     const source: SourceDescriptorDto = {
       ...tvboxDescriptor(), sourceId: "custom_opds_0123456789ab", displayName: "已认证书库",
-      categories: ["book"], kinds: ["search", "online_read"], credentialConfigured: true,
+      categories: ["book"], kinds: ["search"], credentialConfigured: true,
     }
     vi.spyOn(getHavenClient(), "sourceRegistryList")
       .mockResolvedValueOnce(registryWith([source]))

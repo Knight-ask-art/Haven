@@ -35,8 +35,10 @@ import type { ComicWorkChapterCatalogDto, PrimaryActionDto } from "@/lib/ipc/gen
 import {
   createDownloadForMediaItem,
   deleteOfflineDownload,
+  deleteOfflineResource,
   getMediaItemDownloadInfo,
   revealOfflineDownload,
+  revealOfflineResource,
   subscribeDownloadEvents,
   type MediaItemDownloadInfo,
   type DownloadStatus,
@@ -882,6 +884,9 @@ function MediaDetailExperience({ production }: { production: boolean }) {
   const favoriteRequestRef = useRef(0)
   const [downloadStatus, setDownloadStatus] = useState<DownloadStatus>("idle")
   const [downloadTaskId, setDownloadTaskId] = useState<string | null>(null)
+  // The Offline Resource outlives the task record: reveal/delete must remain
+  // available after the user removes the completed row from Downloads.
+  const [offlineResourceId, setOfflineResourceId] = useState<string | null>(null)
   const [hasOfflineResource, setHasOfflineResource] = useState(false)
   const [moreActionPending, setMoreActionPending] = useState<"folder" | "reset" | "delete" | null>(null)
   const mediaActionGenerationRef = useRef(0)
@@ -903,6 +908,7 @@ function MediaDetailExperience({ production }: { production: boolean }) {
     setDownloadStatus(info.status)
     downloadTaskIdRef.current = info.taskId
     setDownloadTaskId(info.taskId)
+    setOfflineResourceId(info.offlineResourceId)
     setHasOfflineResource(info.hasOfflineResource)
     setDownloadCapability(info.canDownload || info.hasOfflineResource || info.status === "queued" ? "available" : "unavailable")
     setOnlineReadCapability(info.canOnlineRead ? "available" : "unavailable")
@@ -913,6 +919,7 @@ function MediaDetailExperience({ production }: { production: boolean }) {
     setDownloadStatus("idle")
     downloadTaskIdRef.current = null
     setDownloadTaskId(null)
+    setOfflineResourceId(null)
     setHasOfflineResource(false)
     setDownloadCapability("loading")
     setOnlineReadCapability("loading")
@@ -930,6 +937,7 @@ function MediaDetailExperience({ production }: { production: boolean }) {
       setDownloadStatus("idle")
       downloadTaskIdRef.current = null
       setDownloadTaskId(null)
+      setOfflineResourceId(null)
       setHasOfflineResource(false)
       setDownloadCapability("error")
       setOnlineReadCapability("error")
@@ -991,6 +999,7 @@ function MediaDetailExperience({ production }: { production: boolean }) {
     setDownloadStatus("idle")
     downloadTaskIdRef.current = null
     setDownloadTaskId(null)
+    setOfflineResourceId(null)
     setHasOfflineResource(false)
     setDownloadCapability(production ? "loading" : "unavailable")
     setOnlineReadCapability(production ? "loading" : "available")
@@ -1103,6 +1112,7 @@ function MediaDetailExperience({ production }: { production: boolean }) {
         // fast local task may emit a terminal event in this same turn.
         downloadTaskIdRef.current = task.taskId
         setDownloadTaskId(task.taskId)
+        setOfflineResourceId(null)
         setHasOfflineResource(false)
         // The command response and its progress event have no ordering
         // guarantee. Re-read the authoritative resource/task projection so a
@@ -1143,13 +1153,22 @@ function MediaDetailExperience({ production }: { production: boolean }) {
         setToastMessage("已重置进度")
         return
       }
-      if (!downloadTaskId || !hasOfflineResource) throw new Error(action === "folder" ? "当前作品没有可定位的离线文件" : "当前作品没有可删除的离线内容")
+      // The task row may have been removed from Downloads while the Offline
+      // Resource remains. Prefer the task handle when present; otherwise fall
+      // back to the Resource identity, which the backend validates on its own.
+      const taskId = downloadTaskId
+      const resourceId = offlineResourceId
+      if (!hasOfflineResource || (!taskId && !resourceId)) {
+        throw new Error(action === "folder" ? "当前作品没有可定位的离线文件" : "当前作品没有可删除的离线内容")
+      }
       if (action === "folder") {
-        await revealOfflineDownload(downloadTaskId)
+        if (taskId) await revealOfflineDownload(taskId)
+        else if (resourceId) await revealOfflineResource(resourceId)
         if (!isCurrent()) return
         setToastMessage("已打开离线文件夹")
       } else {
-        await deleteOfflineDownload(downloadTaskId)
+        if (taskId) await deleteOfflineDownload(taskId)
+        else if (resourceId) await deleteOfflineResource(resourceId)
         if (!isCurrent()) return
         invalidateOfflineDownload()
         const refreshed = await refreshDownloadInfo(downloadableMediaItemId, requestGeneration)
@@ -1309,6 +1328,7 @@ function MediaDetailExperience({ production }: { production: boolean }) {
       setDownloadStatus("idle")
       downloadTaskIdRef.current = null
       setDownloadTaskId(null)
+      setOfflineResourceId(null)
       setHasOfflineResource(false)
       setDownloadCapability("unavailable")
       setOnlineReadCapability(production && detailState === "data" ? "unavailable" : production ? "loading" : "available")
@@ -1684,8 +1704,8 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                           "bg-white/90 dark:bg-zinc-900/90 backdrop-blur-2xl border border-black/10 dark:border-white/15",
                           "flex flex-col gap-1.5 animate-in fade-in zoom-in-95 duration-150"
                         )}>
-                          <button 
-                            disabled={moreActionPending !== null || !hasOfflineResource || !downloadTaskId}
+                          <button
+                            disabled={moreActionPending !== null || !hasOfflineResource || (!downloadTaskId && !offlineResourceId)}
                             onClick={() => void handleMoreAction("folder")}
                             className="flex items-center gap-3.5 px-[16px] py-3 rounded-xl text-base font-medium text-foreground hover:bg-black/5 dark:hover:bg-white/10 transition-colors text-left whitespace-nowrap disabled:opacity-40"
                           >
@@ -1701,8 +1721,8 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                             重置进度
                           </button>
                           <div className="h-px bg-black/5 dark:bg-white/10 my-1.5" />
-                          <button 
-                            disabled={moreActionPending !== null || !hasOfflineResource || !downloadTaskId}
+                          <button
+                            disabled={moreActionPending !== null || !hasOfflineResource || (!downloadTaskId && !offlineResourceId)}
                             onClick={() => void handleMoreAction("delete")}
                             className="flex items-center gap-3.5 px-[16px] py-3 rounded-xl text-base font-medium text-destructive hover:bg-destructive/10 transition-colors text-left whitespace-nowrap disabled:opacity-40"
                           >

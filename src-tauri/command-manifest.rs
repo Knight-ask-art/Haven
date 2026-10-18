@@ -408,6 +408,16 @@ define_commands!(
         commands::download::download_reveal_offline
     ),
     (
+        "download_delete_offline_resource",
+        "allow-download-delete-offline-resource",
+        commands::download::download_delete_offline_resource
+    ),
+    (
+        "download_reveal_offline_resource",
+        "allow-download-reveal-offline-resource",
+        commands::download::download_reveal_offline_resource
+    ),
+    (
         "download_subscribe",
         "allow-download-subscribe",
         commands::download::download_subscribe

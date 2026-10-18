@@ -9,4 +9,9 @@ import type { AgentSettingsSubjectDto } from "./AgentSettingsSubjectDto";
  * `digest` 是 Rust 生成的 canonical digest（64 位小写十六进制）；UI 必须原样
  * 回传它，不得自行计算领域 digest。这里**没有** Approval Token 字段。
  */
-export type AgentSettingsProposalDto = { schemaVersion: 1, proposalId: string, status: AgentSettingsProposalStatusDto, subject: AgentSettingsSubjectDto, targetLabel: string, baseRevision: string | null, digest: string, createdAt: string, expiresAt: string, changes: Array<AgentSettingChangeDto>, };
+export type AgentSettingsProposalDto = { schemaVersion: 1, proposalId: string, status: AgentSettingsProposalStatusDto, subject: AgentSettingsSubjectDto, targetLabel: string, baseRevision: string | null, 
+/**
+ * A projection flag, not a persisted proposal status. Older proposals do
+ * not retain a before snapshot; do not reconstruct it from newer settings.
+ */
+baselineStale?: boolean, digest: string, createdAt: string, expiresAt: string, changes: Array<AgentSettingChangeDto>, };

@@ -1888,13 +1888,31 @@ fn push_paragraph(paragraphs: &mut Vec<String>, text: &mut String) {
 }
 
 fn decode_basic_entities(value: &str) -> String {
-    value
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
+    let mut decoded = String::with_capacity(value.len());
+    let mut remaining = value;
+    while let Some(index) = remaining.find('&') {
+        decoded.push_str(&remaining[..index]);
+        remaining = &remaining[index..];
+        if let Some((entity, replacement)) = [
+            ("&nbsp;", " "),
+            ("&amp;", "&"),
+            ("&lt;", "<"),
+            ("&gt;", ">"),
+            ("&quot;", "\""),
+            ("&#39;", "'"),
+        ]
+        .into_iter()
+        .find(|(entity, _)| remaining.starts_with(entity))
+        {
+            decoded.push_str(replacement);
+            remaining = &remaining[entity.len()..];
+        } else {
+            decoded.push('&');
+            remaining = &remaining[1..];
+        }
+    }
+    decoded.push_str(remaining);
+    decoded
 }
 
 pub(crate) fn safe_article_html(title: &str, paragraphs: &[String]) -> String {
@@ -1993,6 +2011,18 @@ fn internal_error(message: &'static str) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn article_entity_decoding_consumes_each_entity_only_once() {
+        assert_eq!(
+            html_to_plain_paragraphs("<p>&amp;lt;b&amp;gt; &amp;amp; &amp;quot; &amp;#39;</p>"),
+            vec!["&lt;b&gt; &amp; &quot; &#39;"]
+        );
+        assert_eq!(
+            html_to_plain_paragraphs("<p>&lt;b&gt; &amp; &quot; &#39; &nbsp; &unknown;</p>"),
+            vec!["<b> & \" '   &unknown;"]
+        );
+    }
 
     #[test]
     fn fixed_host_policy_rejects_untrusted_redirects() {

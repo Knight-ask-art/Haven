@@ -361,10 +361,14 @@ export function LibraryBrowsePage() {
     }, { replace: true })
   }
 
+  // Tauri 的 library_list 已按 query 做服务端检索（含原名/描述等命中的
+  // 权威结果），页面不能再按标题子串二次过滤，否则会丢掉 FTS 命中项。
+  // 浏览器演示目录不消费 query，仍保留本地标题匹配。
+  const queryFilteredByBackend = isTauriRuntime()
   const filteredItems = browseItems
     .filter((item) => matchesLibraryCategory(item, categoryKey))
     .filter((item) => {
-      const normalizedQuery = query.trim().toLowerCase()
+      const normalizedQuery = queryFilteredByBackend ? "" : query.trim().toLowerCase()
       const matchesQuery = !normalizedQuery
         || item.title.toLowerCase().includes(normalizedQuery)
         || item.originalTitle?.toLowerCase().includes(normalizedQuery)
@@ -544,7 +548,10 @@ export function LibraryBrowsePage() {
               {query && (
                 <button
                   type="button"
-                  onClick={() => setQuery("")}
+                  onClick={() => {
+                    setQuery("")
+                    syncParams(filters, "", sortBy)
+                  }}
                   aria-label="清除搜索"
                   className="text-muted-foreground hover:text-foreground transition-colors"
                 >

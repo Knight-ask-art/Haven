@@ -94,6 +94,7 @@ pub(crate) fn loopback_fixture_target(
 pub(crate) struct FixtureResponse {
     content_type: &'static str,
     body: String,
+    location: Option<String>,
 }
 
 impl FixtureResponse {
@@ -101,6 +102,7 @@ impl FixtureResponse {
         Self {
             content_type: "application/atom+xml; charset=utf-8",
             body: body.into(),
+            location: None,
         }
     }
 
@@ -108,6 +110,7 @@ impl FixtureResponse {
         Self {
             content_type: "application/opensearchdescription+xml; charset=utf-8",
             body: body.into(),
+            location: None,
         }
     }
 
@@ -115,6 +118,7 @@ impl FixtureResponse {
         Self {
             content_type: "application/json; charset=utf-8",
             body: body.into(),
+            location: None,
         }
     }
 
@@ -122,6 +126,15 @@ impl FixtureResponse {
         Self {
             content_type: "text/plain; charset=utf-8",
             body: body.into(),
+            location: None,
+        }
+    }
+
+    pub(crate) fn redirect(location: &str) -> Self {
+        Self {
+            content_type: "text/plain",
+            body: String::new(),
+            location: Some(location.to_owned()),
         }
     }
 }
@@ -292,11 +305,23 @@ fn serve(
     let path = target.split('?').next().unwrap_or("/").to_owned();
     let fallback = FixtureResponse::text("not found");
     let (status, response) = match routes.get(&path) {
-        Some(response) => ("200 OK", response),
+        Some(response) => (
+            if response.location.is_some() {
+                "302 Found"
+            } else {
+                "200 OK"
+            },
+            response,
+        ),
         None => ("404 Not Found", &fallback),
     };
+    let location = response
+        .location
+        .as_ref()
+        .map(|value| format!("Location: {value}\r\n"))
+        .unwrap_or_default();
     let head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\n{location}Content-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         response.content_type,
         response.body.len()
     );

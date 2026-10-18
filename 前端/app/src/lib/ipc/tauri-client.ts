@@ -46,6 +46,9 @@ import type {
   DownloadEvent,
   DownloadListRequest,
   DownloadMutationResultDto,
+  DownloadResourceActionRequest,
+  DownloadResourceMutationResultDto,
+  DownloadResourceRevealResultDto,
   DownloadRevealResultDto,
   DownloadTaskActionRequest,
   DownloadTaskDto,
@@ -749,6 +752,24 @@ export class TauriHavenClient implements HavenClient {
     return this.invokeDownloadManagement<DownloadRevealResultDto>("download_reveal_offline", request);
   }
 
+  async downloadDeleteOfflineResource(
+    request: DownloadResourceActionRequest,
+  ): Promise<DownloadResourceMutationResultDto> {
+    return this.invokeDownloadManagement<DownloadResourceMutationResultDto>(
+      "download_delete_offline_resource",
+      request,
+    );
+  }
+
+  async downloadRevealOfflineResource(
+    request: DownloadResourceActionRequest,
+  ): Promise<DownloadResourceRevealResultDto> {
+    return this.invokeDownloadManagement<DownloadResourceRevealResultDto>(
+      "download_reveal_offline_resource",
+      request,
+    );
+  }
+
   async downloadSubscribe(
     subscriptionId: string,
     onEvent: (event: DownloadEvent) => void,
@@ -787,7 +808,7 @@ export class TauriHavenClient implements HavenClient {
 
   private async invokeDownloadManagement<T>(
     command: string,
-    request: DownloadTaskActionRequest,
+    request: DownloadTaskActionRequest | DownloadResourceActionRequest,
   ): Promise<T> {
     try {
       return await invoke<T>(command, { request });

@@ -195,9 +195,12 @@ pub struct FeedEntry {
     pub title: String,
     /// 发布时间原文（Feed 给出的形式；只用于展示与年份推导）。
     pub published: Option<String>,
-    /// Feed 自带正文（原始标记，消费前仍需清洗）。
+    /// Feed 自带正文（已按 Atom `type` 归一化到 HTML 载体，消费前仍需清洗）。
+    ///
+    /// Atom `text` 已整体转义、`xhtml` 已序列化，因此下游仍然只需要一次
+    /// [`html_to_plain_paragraphs`]。
     pub content: Option<String>,
-    /// Feed 自带摘要（已转为纯文本）。
+    /// Feed 自带摘要（已转为纯文本；Atom `text` 保留字面量尖括号）。
     pub summary: Option<String>,
 }
 
@@ -218,6 +221,21 @@ enum Field {
     Content,
 }
 
+/// Atom `content`/`summary` 的文本语义。
+///
+/// 解析阶段就把三种类型归一化到现有的 HTML 载体上，消费端仍只有
+/// [`html_to_plain_paragraphs`] 一个清洗入口：`text` 的字面量尖括号在归一化时
+/// 转义，`xhtml` 的内联标记被序列化，`html` 保持原样。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum FieldMode {
+    #[default]
+    Html,
+    Text,
+    Xhtml,
+    /// 非文本媒体类型（例如 base64 图片）：不收集正文，避免被误判为可读。
+    Skip,
+}
+
 #[derive(Default)]
 struct EntryBuilder {
     key: Option<String>,
@@ -228,10 +246,65 @@ struct EntryBuilder {
     content: Option<String>,
     /// 当前正在收集文本的字段及其元素名。
     field: Option<(Field, String)>,
+    /// 当前字段的文本语义；只在 Atom 的 `content`/`summary` 上可能不是 HTML。
+    field_mode: FieldMode,
+    /// 当前字段元素打开后的 XML 深度，用来区分它的结束标签与同名嵌套元素。
+    field_depth: usize,
     text: String,
 }
 
 impl EntryBuilder {
+    /// 收集当前字段里的一段文本。
+    ///
+    /// `xhtml` 的文本节点是字符数据，必须转义后才能与内联标记一起成为 HTML
+    /// 载体；`text` 先保留字面量，字段结束时再整体转义。`html` 与 RSS 的
+    /// description/content:encoded 一样按标记原样保留。
+    fn append_text(&mut self, value: &str) {
+        match self.field_mode {
+            FieldMode::Html | FieldMode::Text => self.text.push_str(value),
+            FieldMode::Xhtml => push_escaped_html(&mut self.text, value),
+            FieldMode::Skip => {}
+        }
+    }
+
+    fn append_xhtml_start(&mut self, name: &str) {
+        self.text.push('<');
+        self.text.push_str(name);
+        self.text.push('>');
+    }
+
+    fn append_xhtml_end(&mut self, name: &str) {
+        self.text.push_str("</");
+        self.text.push_str(name);
+        self.text.push('>');
+    }
+
+    fn append_xhtml_empty(&mut self, name: &str) {
+        // XML 的自闭合非 void 元素转为 HTML 时必须显式闭合，否则 script/iframe
+        // 等元素会让 HTML 清洗器继续抑制后面的真实正文。
+        self.append_xhtml_start(name);
+        if !["img", "meta", "link", "embed", "br"].contains(&name) {
+            self.append_xhtml_end(name);
+        }
+    }
+
+    /// 按字段类型与文本语义收尾：摘要落库前已是纯文本，正文统一成为 HTML 载体。
+    fn finish_field(&mut self, field: Field, raw: String) {
+        let value = match (field, self.field_mode) {
+            (_, FieldMode::Skip) => None,
+            // 字面量正文整体转义一次，后续 `html_to_plain_paragraphs` 才会把它当
+            // 文本解码，而不是把 `<button>`/`<script>` 当成待剥离的标记。
+            (Field::Content, FieldMode::Text) => Some(escape_html_text(&raw)),
+            (Field::Content, _) => Some(raw),
+            (Field::Summary, FieldMode::Text) => Some(collapse_whitespace(&raw)),
+            (Field::Summary, _) => Some(plain_text(&raw)),
+            _ => Some(raw),
+        };
+        if let Some(value) = value {
+            self.assign(field, value);
+        }
+    }
+
     fn assign(&mut self, field: Field, value: String) {
         let value = value.trim().to_owned();
         if value.is_empty() {
@@ -254,7 +327,7 @@ impl EntryBuilder {
     fn finish(mut self) -> Option<FeedEntry> {
         if let Some((field, _)) = self.field.take() {
             let text = std::mem::take(&mut self.text);
-            self.assign(field, text);
+            self.finish_field(field, text);
         }
         let title = self
             .title
@@ -263,11 +336,7 @@ impl EntryBuilder {
             .filter(|value| !value.is_empty())
             .map(|value| truncate_chars(value, MAX_ENTRY_TITLE_CHARS));
         let content = self.content;
-        let summary = self
-            .summary
-            .as_deref()
-            .map(plain_text)
-            .filter(|value| !value.is_empty());
+        let summary = self.summary.filter(|value| !value.is_empty());
         // 既没有标题也没有正文的条目无法被用户识别或阅读，直接跳过。
         if title.is_none() && content.is_none() && summary.is_none() {
             return None;
@@ -345,11 +414,20 @@ pub fn parse_feed(xml: &str) -> Result<Vec<FeedEntry>, AppError> {
                     }
                     _ => {
                         if let Some(entry) = builder.as_mut() {
-                            if entry.field.is_none()
-                                && let Some(field) = classify_field(&name, format)
+                            if entry.field.is_none() {
+                                if let Some(field) = classify_field(&name, format) {
+                                    entry.field = Some((field, name.clone()));
+                                    entry.field_mode = field_mode(&name, format, &event);
+                                    entry.field_depth = open_depth;
+                                    entry.text.clear();
+                                }
+                            } else if entry.field_mode == FieldMode::Xhtml
+                                && open_depth > entry.field_depth
                             {
-                                entry.field = Some((field, name.clone()));
-                                entry.text.clear();
+                                // XHTML 正文的内联标记：只序列化元素名，属性随后由
+                                // 单一清洗入口统一剥离，脚本/iframe/图片不会变成可执行
+                                // 标记，也不会被当成纯文本而误判为可读。
+                                entry.append_xhtml_start(&name);
                             }
                             if name == "link"
                                 && let Some(href) = attribute(&event, "href")
@@ -361,11 +439,15 @@ pub fn parse_feed(xml: &str) -> Result<Vec<FeedEntry>, AppError> {
                 }
             }
             Ok(Event::Empty(event)) => {
-                if let Some(entry) = builder.as_mut()
-                    && element_name(&event) == "link"
-                    && let Some(href) = attribute(&event, "href")
-                {
-                    entry.assign(Field::Link, href);
+                if let Some(entry) = builder.as_mut() {
+                    if entry.field.is_some() && entry.field_mode == FieldMode::Xhtml {
+                        entry.append_xhtml_empty(&element_name(&event));
+                    }
+                    if element_name(&event) == "link"
+                        && let Some(href) = attribute(&event, "href")
+                    {
+                        entry.assign(Field::Link, href);
+                    }
                 }
             }
             Ok(Event::Text(event)) => {
@@ -373,7 +455,7 @@ pub fn parse_feed(xml: &str) -> Result<Vec<FeedEntry>, AppError> {
                     && entry.field.is_some()
                     && let Some(decoded) = crate::unescape_xml_text(&event)
                 {
-                    entry.text.push_str(&decoded);
+                    entry.append_text(&decoded);
                 }
             }
             Ok(Event::GeneralRef(reference)) => {
@@ -381,7 +463,7 @@ pub fn parse_feed(xml: &str) -> Result<Vec<FeedEntry>, AppError> {
                     && entry.field.is_some()
                     && let Some(decoded) = crate::unescape_xml_reference(&reference)
                 {
-                    entry.text.push_str(&decoded);
+                    entry.append_text(&decoded);
                 }
             }
             Ok(Event::CData(event)) => {
@@ -389,7 +471,7 @@ pub fn parse_feed(xml: &str) -> Result<Vec<FeedEntry>, AppError> {
                 if let Some(entry) = builder.as_mut()
                     && entry.field.is_some()
                 {
-                    entry.text.push_str(&String::from_utf8_lossy(raw.as_ref()));
+                    entry.append_text(&String::from_utf8_lossy(raw.as_ref()));
                 }
             }
             Ok(Event::End(event)) => {
@@ -404,11 +486,18 @@ pub fn parse_feed(xml: &str) -> Result<Vec<FeedEntry>, AppError> {
                 }
                 if let Some(entry) = builder.as_mut()
                     && let Some((field, field_name)) = entry.field.clone()
-                    && name == field_name
                 {
-                    let text = std::mem::take(&mut entry.text);
-                    entry.field = None;
-                    entry.assign(field, text);
+                    // 只有与字段元素同一深度、且元素名相同的结束标签才收尾。
+                    // XHTML 里可能嵌有同名元素，不能让它提前终止整个字段。
+                    if name == field_name && open_depth + 1 == entry.field_depth {
+                        let text = std::mem::take(&mut entry.text);
+                        entry.field = None;
+                        entry.finish_field(field, text);
+                    } else if entry.field_mode == FieldMode::Xhtml
+                        && open_depth + 1 > entry.field_depth
+                    {
+                        entry.append_xhtml_end(&name);
+                    }
                 }
             }
             Ok(_) => {}
@@ -444,6 +533,54 @@ fn classify_field(name: &str, format: FeedFormat) -> Option<Field> {
         "link" if format == FeedFormat::Rss => Some(Field::Link),
         _ => None,
     }
+}
+
+/// Atom `content`/`summary` 的 `type` → 文本语义。
+///
+/// Atom 规定省略 `type` 时按 `text` 处理；其余格式（包括 RSS）保持原来的
+/// HTML 语义。显式声明的非文本媒体类型（例如 base64 图片）不收集正文，避免
+/// 把二进制块当成可读内容。
+fn field_mode(name: &str, format: FeedFormat, event: &BytesStart<'_>) -> FieldMode {
+    if format != FeedFormat::Atom || (name != "content" && name != "summary") {
+        return FieldMode::Html;
+    }
+    match attribute(event, "type") {
+        None => FieldMode::Text,
+        Some(value) => match value
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "text" | "text/plain" => FieldMode::Text,
+            "html" | "text/html" => FieldMode::Html,
+            "xhtml" | "application/xhtml+xml" => FieldMode::Xhtml,
+            _ => FieldMode::Skip,
+        },
+    }
+}
+
+fn escape_html_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    push_escaped_html(&mut escaped, value);
+    escaped
+}
+
+fn push_escaped_html(out: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+}
+
+fn collapse_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn element_name(event: &BytesStart<'_>) -> String {
@@ -509,11 +646,7 @@ fn truncate_chars(value: &str, max: usize) -> String {
 
 /// 把一段 Feed 文本转成单行纯文本（用于卡片与作品描述）。
 fn plain_text(raw: &str) -> String {
-    html_to_plain_paragraphs(raw)
-        .join(" ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    collapse_whitespace(&html_to_plain_paragraphs(raw).join(" "))
 }
 
 /// 从发布时间中取年份。
@@ -539,9 +672,10 @@ fn published_year(published: &str) -> Option<i32> {
 /// 脚本/iframe/外链图片。
 ///
 /// 两个字段的信任级别不同，因此处理方式也不同：`content` 是 Feed 自带的原始
-/// 标记，必须（且只）经过一次 [`html_to_plain_paragraphs`]；`summary` 在解析
-/// 阶段已经由 [`plain_text`] 转成纯文本，再当 HTML 洗一遍会把摘要里字面量书写
-/// 的 `<i>`/`<script>` 当成标签剥掉，用户看到的是被吞掉一部分的摘要。摘要因此
+/// 标记（Atom `text` 已按字面量转义、`xhtml` 已序列化为标记），必须（且只）
+/// 经过一次 [`html_to_plain_paragraphs`]；`summary` 在解析阶段已经转成纯文本
+/// （Atom `text` 保持字面量），再当 HTML 洗一遍会把摘要里字面量书写的
+/// `<i>`/`<script>` 当成标签剥掉，用户看到的是被吞掉一部分的摘要。摘要因此
 /// 直接作为文本段落进入 [`safe_article_html`]，由它统一转义。
 fn entry_paragraphs(entry: &FeedEntry) -> Vec<String> {
     let mut paragraphs = entry
@@ -953,6 +1087,42 @@ mod tests {
   </channel>
 </rss>"#;
 
+    /// Atom `content`/`summary` 的 text/html/xhtml 语义与省略 `type` 的默认值。
+    ///
+    /// `text` 里的尖括号来自 XML 实体，解析后是字面量文本而不是待清洗标记；
+    /// `xhtml` 的相邻段落必须保持独立；`html` 保持既有标记语义；同名嵌套元素
+    /// 不能提前结束外层 `content`。
+    const ATOM_CONTENT_TYPES_FIXTURE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Atom 内容类型</title>
+  <entry>
+    <id>tag:feed.example.invalid,2026:text</id>
+    <title>纯文本正文</title>
+    <summary type="text">摘要里的 &lt;button&gt;Save&lt;/button&gt; 是字面量</summary>
+    <content type="text">Use &lt;button&gt;Save&lt;/button&gt; &amp; &lt;script&gt;alert(1)&lt;/script&gt;</content>
+  </entry>
+  <entry>
+    <id>tag:feed.example.invalid,2026:default</id>
+    <title>省略类型</title>
+    <content>默认 &lt;em&gt;文本&lt;/em&gt;</content>
+  </entry>
+  <entry>
+    <id>tag:feed.example.invalid,2026:html</id>
+    <title>HTML 正文</title>
+    <content type="html">&lt;p&gt;HTML 第一段&lt;/p&gt;&lt;p&gt;HTML 第二段&lt;/p&gt;</content>
+  </entry>
+  <entry>
+    <id>tag:feed.example.invalid,2026:xhtml</id>
+    <title>XHTML 正文</title>
+    <content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml"><p>XHTML 第一段</p><p>XHTML 第二段</p></div></content>
+  </entry>
+  <entry>
+    <id>tag:feed.example.invalid,2026:nested</id>
+    <title>嵌套内容</title>
+    <content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml"><p>外</p><content>内</content><p>尾</p></div></content>
+  </entry>
+</feed>"#;
+
     struct StaticFeedSource {
         body: String,
         requested: Mutex<Vec<String>>,
@@ -1267,6 +1437,150 @@ mod tests {
         assert!(!html.contains("<b>"), "字面量 <b> 不得变成真实标记");
         assert!(!html.contains("<script"), "被剥离的正文脚本不得回到正文里");
         assert!(!html.contains("cdn.example.invalid"), "外链必须被剥离");
+    }
+
+    #[test]
+    fn atom_content_types_preserve_literal_text_and_xhtml_paragraph_boundaries() {
+        let entries = parse_feed(ATOM_CONTENT_TYPES_FIXTURE).unwrap();
+        assert_eq!(entries.len(), 5);
+
+        // type=text：字面量尖括号必须保留，脚本字符串也只是文本。
+        let text = entry(&entries, "tag:feed.example.invalid,2026:text");
+        assert_eq!(
+            text.summary.as_deref(),
+            Some("摘要里的 <button>Save</button> 是字面量"),
+            "Atom text 摘要不能被当成 HTML 再洗一次"
+        );
+        assert!(
+            text.content
+                .as_deref()
+                .is_some_and(|body| body.contains("&lt;button&gt;Save&lt;/button&gt;")),
+            "Atom text 正文在进入清洗入口前必须整体转义: {:?}",
+            text.content
+        );
+        assert!(entry_has_readable_body(&text));
+        let html = render_entry_html(&text).unwrap();
+        assert!(
+            html.contains("&lt;button&gt;Save&lt;/button&gt;"),
+            "字面量按钮标签必须显示出来: {html}"
+        );
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(!html.contains("<script"), "字面量 script 不得变成真实标记");
+        assert!(!html.contains("<button"), "字面量 button 不得变成真实标记");
+
+        // 省略 type：Atom 默认是 text，而不是 HTML。
+        let default_typed = entry(&entries, "tag:feed.example.invalid,2026:default");
+        let html = render_entry_html(&default_typed).unwrap();
+        assert!(html.contains("默认 &lt;em&gt;文本&lt;/em&gt;"));
+        assert!(!html.contains("<em>"), "省略 type 的正文按字面量处理");
+
+        // type=html：保持既有的标记语义。
+        let html =
+            render_entry_html(&entry(&entries, "tag:feed.example.invalid,2026:html")).unwrap();
+        assert_eq!(html.matches("<p>HTML 第一段</p>").count(), 1);
+        assert_eq!(html.matches("<p>HTML 第二段</p>").count(), 1);
+
+        // type=xhtml：相邻段落不能被拼成一段。
+        let html =
+            render_entry_html(&entry(&entries, "tag:feed.example.invalid,2026:xhtml")).unwrap();
+        assert_eq!(html.matches("<p>XHTML 第一段</p>").count(), 1);
+        assert_eq!(html.matches("<p>XHTML 第二段</p>").count(), 1);
+        assert!(!html.contains("XHTML 第一段XHTML 第二段"));
+
+        // 同名嵌套元素不能提前结束外层 content：后续段落必须仍在字段里。
+        let nested = entry(&entries, "tag:feed.example.invalid,2026:nested");
+        let content = nested.content.as_deref().unwrap();
+        assert!(content.contains("内"), "嵌套元素内容必须被收集: {content}");
+        assert!(
+            content.contains("尾"),
+            "嵌套元素之后的正文不能被截断: {content}"
+        );
+        let html = render_entry_html(&nested).unwrap();
+        assert!(html.contains("外") && html.contains("尾"), "{html}");
+    }
+
+    /// XHTML 里的脚本/iframe/图片必须作为标记交给单一清洗入口处理，不能因为
+    /// 序列化时丢标签而把脚本文本当正文读出来。
+    #[test]
+    fn atom_xhtml_with_only_scripts_iframes_and_images_is_not_readable() {
+        let xml = r#"<feed xmlns="http://www.w3.org/2005/Atom"><entry>
+          <id>tag:feed.example.invalid,2026:unsafe</id>
+          <title>只有脚本与外链</title>
+          <content type="xhtml"><script>alert(1)</script><iframe src="https://cdn.example.invalid/frame"></iframe><img src="https://cdn.example.invalid/a.png"/></content>
+        </entry></feed>"#;
+        let entries = parse_feed(xml).unwrap();
+        let only = entry(&entries, "tag:feed.example.invalid,2026:unsafe");
+        assert!(
+            !entry_has_readable_body(&only),
+            "XHTML 正文清洗后只剩脚本与外链时不算可读"
+        );
+        let error = render_entry_html(&only).unwrap_err();
+        assert_eq!(error.code().as_str(), "SOURCE_UNAVAILABLE");
+    }
+
+    #[tokio::test]
+    async fn provider_read_keeps_atom_text_literal_and_xhtml_paragraphs() {
+        let source = StaticFeedSource::new(ATOM_CONTENT_TYPES_FIXTURE);
+        let registry = registry();
+        let source_id = feed_source_id(&registry).await;
+        let provider = FeedProvider::new(registry, source.clone());
+
+        // 详情里的摘要仍是纯文本，但字面量尖括号必须原样保留。
+        let text_digest = feed_entry_digest("tag:feed.example.invalid,2026:text");
+        let detail = provider.detail(&source_id, "", &text_digest).await.unwrap();
+        assert_eq!(
+            detail.content.as_deref(),
+            Some("摘要里的 <button>Save</button> 是字面量")
+        );
+
+        let remote_id = feed_remote_id(&source_id, &text_digest).unwrap();
+        let body = provider
+            .read(FEED_SOURCE_KEY, &remote_id, None)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.bytes).unwrap();
+        assert!(html.contains("&lt;button&gt;Save&lt;/button&gt;"), "{html}");
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(!html.contains("<script"));
+
+        let xhtml_digest = feed_entry_digest("tag:feed.example.invalid,2026:xhtml");
+        let remote_id = feed_remote_id(&source_id, &xhtml_digest).unwrap();
+        let body = provider
+            .read(FEED_SOURCE_KEY, &remote_id, None)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.bytes).unwrap();
+        assert_eq!(html.matches("<p>XHTML 第一段</p>").count(), 1);
+        assert_eq!(html.matches("<p>XHTML 第二段</p>").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_read_preserves_entity_literals_after_empty_xhtml_elements() {
+        let registry = registry();
+        let source_id = feed_source_id(&registry).await;
+        for content in [
+            r#"<content type="text">A &amp;lt;b&amp;gt; B &amp;quot; C &amp;#39;</content>"#,
+            r#"<content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml"><script/><iframe/><p>A &amp;lt;b&amp;gt; B &amp;quot; C &amp;#39;</p></div></content>"#,
+        ] {
+            let xml = format!(
+                r#"<feed xmlns="http://www.w3.org/2005/Atom"><entry><id>literal-entity</id><title>Literal</title>{content}</entry></feed>"#
+            );
+            let source = StaticFeedSource::new(&xml);
+            let provider = FeedProvider::new(registry.clone(), source);
+            let digest = feed_entry_digest("literal-entity");
+            provider.detail(&source_id, "", &digest).await.unwrap();
+            let remote_id = feed_remote_id(&source_id, &digest).unwrap();
+            let body = provider
+                .read(FEED_SOURCE_KEY, &remote_id, None)
+                .await
+                .unwrap();
+            let html = String::from_utf8(body.bytes).unwrap();
+            assert!(
+                html.contains("<p>A &amp;lt;b&amp;gt; B &amp;quot; C &amp;#39;</p>"),
+                "{html}"
+            );
+            assert!(!html.contains("<script") && !html.contains("<iframe"));
+        }
     }
 
     #[test]

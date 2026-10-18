@@ -671,9 +671,35 @@ impl LocalLibraryScanner {
             )
             .optional()
             .map_err(map_db_error("查询已有资源失败"))?;
+        // Older download workers persisted native Windows separators. Keep the
+        // indexed lookup first, then recognize those rows without reimporting
+        // the same file or destructively rewriting existing library facts.
+        #[cfg(windows)]
+        let row = match row {
+            Some(resource) => Some(resource),
+            None => conn
+                .query_row(
+                    "SELECT id, media_item_id, resource_type, source_id, storage_location_id,
+                            locator_json, mime_type, size, hash_algorithm, hash_digest,
+                            availability, availability_source, modified_ms, fingerprint_first, fingerprint_last,
+                            created_at, updated_at
+                     FROM resources
+                     WHERE storage_location_id = ?1 AND locator_kind = 'local_path'
+                       AND replace(json_extract(locator_json, '$.local_path.path'), char(92), '/') = ?2
+                     LIMIT 1",
+                    rusqlite::params![storage_id.to_string(), path],
+                    crate::db::repos::resource::row_to_resource,
+                )
+                .optional()
+                .map_err(map_db_error("查询旧版下载资源失败"))?,
+        };
         match row {
             Some(resource) => match &resource.locator {
-                ResourceLocator::LocalPath { path: p } if p == path => Ok(Some(resource)),
+                ResourceLocator::LocalPath { path: p }
+                    if crate::local_path_identity(Path::new(p)) == path =>
+                {
+                    Ok(Some(resource))
+                }
                 // 防御：索引/JSON 语义与内存比对不一致时不误判（返回 None 走新建路径）。
                 _ => Ok(None),
             },
@@ -1023,7 +1049,7 @@ fn format_enumeration_warning(path: Option<&Path>, kind: Option<std::io::ErrorKi
 
 /// 统一路径分隔符为反斜杠无关的规范形式（Windows 存储用 `\`，比较时统一为 `/` 便于跨盘比较）。
 fn normalize_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    crate::local_path_identity(path)
 }
 
 fn media_index_for(media_type: MediaType) -> haven_domain::entities::MediaIndex {
@@ -1105,6 +1131,58 @@ mod tests {
         assert!(!warning.contains("Secrets"));
         assert!(!warning.contains("owner"));
         assert!(!warning.contains(&path.to_string_lossy().to_string()));
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn rescan_recognizes_legacy_download_separators() {
+        let dir = TempDir::new().unwrap();
+        let (storage_id, root) = sample_storage(&dir);
+        write(&root, "download.txt", b"downloaded text");
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let query_plan: String = db
+            .lock()
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id FROM resources WHERE storage_location_id = ?1
+               AND locator_kind = 'local_path'
+               AND replace(json_extract(locator_json, '$.local_path.path'), char(92), '/') = ?2",
+                rusqlite::params![
+                    storage_id.to_string(),
+                    normalize_path(&root.join("download.txt"))
+                ],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(
+            query_plan.contains("idx_resources_windows_local_path"),
+            "{query_plan}"
+        );
+        let scanner = LocalLibraryScanner::new(db.clone());
+        assert_eq!(
+            scanner
+                .scan_storage_location(storage_id, &root)
+                .await
+                .unwrap()
+                .new,
+            1
+        );
+        db.lock()
+            .execute(
+                "UPDATE resources SET locator_json = json_set(locator_json, '$.local_path.path',
+                 replace(json_extract(locator_json, '$.local_path.path'), '/', char(92)))",
+                [],
+            )
+            .unwrap();
+        let report = scanner
+            .scan_storage_location(storage_id, &root)
+            .await
+            .unwrap();
+        assert_eq!(report.new, 0);
+        let count: i64 = db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM works", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]

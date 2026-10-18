@@ -74,14 +74,14 @@ impl EnrichmentService {
         let stale =
             EnrichmentRepository::list_stale_pending(&*self.ports, cutoff_ms, MAX_BATCH as u32)
                 .await?;
-        let all = WorkRepository::list(&*self.ports, MAX_BATCH as u32, 0).await?;
 
         let mut candidates = Vec::with_capacity(MAX_BATCH);
+        let mut outcomes = Vec::new();
         let mut seen = HashSet::new();
 
         // 先处理恢复项，避免新作品很多时陈旧 pending 长期饥饿。
         for state in stale {
-            if candidates.len() >= MAX_BATCH {
+            if candidates.len() + outcomes.len() >= MAX_BATCH {
                 break;
             }
             let work_exists = WorkRepository::get(&*self.ports, state.work_id)
@@ -91,28 +91,60 @@ impl EnrichmentService {
                 || !WorkRepository::has_any_source_ref(&*self.ports, state.work_id).await?;
             if eligible && seen.insert(state.work_id) {
                 candidates.push(state.work_id);
+            } else if !eligible {
+                // An import may have completed between pending and a crash.
+                // Retire that recovery entry so it cannot occupy the oldest
+                // pending window forever; do not claim a new CMS10 match.
+                self.record(
+                    state.work_id,
+                    "failed",
+                    None,
+                    Some("已有来源引用，无需自动补全"),
+                )
+                .await?;
+                outcomes.push(EnrichedWorkOutcome {
+                    work_id: state.work_id,
+                    status: EnrichmentStatusWire::Failed,
+                });
             }
         }
 
-        // 无 external 引用且无记录的 Work 即"新作品"；新鲜 pending 会被跳过。
-        for work in all {
-            if candidates.len() >= MAX_BATCH {
+        // 已有记录（含新鲜 pending）的 Work 不再重跑。一次读取全部状态，
+        // 避免为一页页扫描的每个 Work 单独查询。
+        let recorded: HashSet<_> = EnrichmentRepository::list(&*self.ports, None)
+            .await?
+            .into_iter()
+            .map(|state| state.work_id)
+            .collect();
+
+        // 无 external 引用且无记录的 Work 即"新作品"；必须按页遍历完整作品集。
+        // 只读首批 MAX_BATCH 条时，若这些作品都已有记录，后面的作品将永远轮不到。
+        let page_size = MAX_BATCH as u32;
+        let mut offset = 0u32;
+        while candidates.len() + outcomes.len() < MAX_BATCH {
+            let page = WorkRepository::list(&*self.ports, page_size, offset).await?;
+            let page_len = page.len() as u32;
+            for work in page {
+                if candidates.len() + outcomes.len() >= MAX_BATCH {
+                    break;
+                }
+                if seen.contains(&work.id) || recorded.contains(&work.id) {
+                    continue;
+                }
+                if !WorkRepository::has_any_source_ref(&*self.ports, work.id).await? {
+                    seen.insert(work.id);
+                    candidates.push(work.id);
+                }
+            }
+            if page_len < page_size {
                 break;
             }
-            if seen.contains(&work.id) {
-                continue;
-            }
-            if EnrichmentRepository::get(&*self.ports, work.id)
-                .await?
-                .is_none()
-                && !WorkRepository::has_any_source_ref(&*self.ports, work.id).await?
-            {
-                seen.insert(work.id);
-                candidates.push(work.id);
-            }
+            let Some(next_offset) = offset.checked_add(page_len) else {
+                break;
+            };
+            offset = next_offset;
         }
 
-        let mut outcomes = Vec::new();
         for work_id in candidates {
             match self.enrich_one(work_id).await {
                 Ok(outcome) => outcomes.push(outcome),
@@ -388,6 +420,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_pending_advances_beyond_processed_first_page() {
+        let (svc, ports, _registry) = fixture().await;
+        for index in 0..51 {
+            seed_work(ports.as_ref(), &format!("Title {index:03}")).await;
+        }
+        assert_eq!(svc.run_pending().await.unwrap().len(), 50);
+        assert_eq!(svc.run_pending().await.unwrap().len(), 1);
+        assert!(svc.run_pending().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn run_pending_skips_already_processed_works() {
         let (svc, ports, _registry) = fixture().await;
         let _id = seed_work(ports.as_ref(), "三体").await;
@@ -444,6 +487,59 @@ mod tests {
             svc.status(Some(work_id.to_string())).await.unwrap()[0].status,
             EnrichmentStatusWire::Enriched
         );
+    }
+
+    #[tokio::test]
+    async fn linked_stale_pending_entries_release_the_recovery_window() {
+        let (svc, ports, _registry) = fixture().await;
+        for index in 0..MAX_BATCH {
+            let id = seed_work(ports.as_ref(), &format!("Imported {index:03}")).await;
+            WorkRepository::save_source_ref(
+                ports.as_ref(),
+                "manual",
+                &format!("import-{index}"),
+                id,
+            )
+            .await
+            .unwrap();
+            EnrichmentRepository::upsert(
+                ports.as_ref(),
+                &EnrichmentState {
+                    work_id: id,
+                    status: "pending".into(),
+                    source_id: None,
+                    error: None,
+                    updated_at: UtcMillis(1),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let recover = seed_work(ports.as_ref(), "三体").await;
+        EnrichmentRepository::upsert(
+            ports.as_ref(),
+            &EnrichmentState {
+                work_id: recover,
+                status: "pending".into(),
+                source_id: None,
+                error: None,
+                updated_at: UtcMillis(2),
+            },
+        )
+        .await
+        .unwrap();
+        let first = svc.run_pending().await.unwrap();
+        assert_eq!(first.len(), MAX_BATCH);
+        assert!(
+            first
+                .iter()
+                .all(|outcome| outcome.status == EnrichmentStatusWire::Failed)
+        );
+        let second = svc.run_pending().await.unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].work_id, recover);
+        assert_eq!(second[0].status, EnrichmentStatusWire::Enriched);
+        assert!(svc.run_pending().await.unwrap().is_empty());
     }
 
     #[tokio::test]

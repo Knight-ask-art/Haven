@@ -106,7 +106,8 @@ const PROPOSAL_FIELDS = [
 ] as const
 
 export function guardAgentSettingsProposal(value: unknown, pendingOnly = false): value is AgentSettingsProposalDto {
-  if (!isRecord(value) || !hasExactFields(value, PROPOSAL_FIELDS)) return false
+  if (!isRecord(value)
+    || !(hasExactFields(value, PROPOSAL_FIELDS) || hasExactFields(value, [...PROPOSAL_FIELDS, "baselineStale"]))) return false
   const subject = value.subject
   return value.schemaVersion === 1
     && isText(value.proposalId)
@@ -117,6 +118,8 @@ export function guardAgentSettingsProposal(value: unknown, pendingOnly = false):
     && subject.section === "reading"
     && isText(value.targetLabel)
     && isNullableText(value.baseRevision)
+    && (value.baselineStale === undefined || typeof value.baselineStale === "boolean")
+    && (!pendingOnly || value.baselineStale !== true)
     && typeof value.digest === "string"
     && /^[0-9a-f]{64}$/.test(value.digest)
     && isText(value.createdAt)

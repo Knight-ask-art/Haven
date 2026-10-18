@@ -338,11 +338,11 @@ impl SearchSourceService {
                 false,
             ));
         }
-        if query.len() > MAX_QUERY_LEN {
+        if query.chars().count() > MAX_QUERY_LEN {
             return Err(AppError::new(
                 "INVALID_ARGUMENT",
                 ErrorKind::Validation,
-                "搜索词超长",
+                "搜索词过长（不超过 200 字符）",
                 false,
             ));
         }
@@ -670,9 +670,15 @@ async fn run_dispatch(
 
     let mut pending: VecDeque<ScheduledSource> = jobs.into();
     let mut running: JoinSet<SourceOutcome> = JoinSet::new();
+    // JoinError 不携带业务身份；保留任务与来源的对应关系才能报告具体失败来源。
+    let mut running_sources = HashMap::new();
     let mut health_observations = Vec::new();
 
     let spawn_next = |running: &mut JoinSet<SourceOutcome>,
+                      running_sources: &mut HashMap<
+        tokio::task::Id,
+        (String, UtcMillis, std::time::Instant),
+    >,
                       pending: &mut VecDeque<ScheduledSource>,
                       query: &DispatchQuery,
                       cancel: &Arc<AtomicBool>| {
@@ -685,7 +691,12 @@ async fn run_dispatch(
             let cancel = Arc::clone(cancel);
             let participant = job.participant.clone();
             let source_id = job.source_id.clone();
-            running.spawn(async move {
+            let failure_context = (
+                source_id.clone(),
+                UtcMillis::now(),
+                std::time::Instant::now(),
+            );
+            let task = running.spawn(async move {
                 let is_cancelled = || cancel.load(Ordering::Acquire);
                 let probe_started_at = UtcMillis::now();
                 let probed = !is_cancelled();
@@ -725,13 +736,20 @@ async fn run_dispatch(
                     },
                 }
             });
+            running_sources.insert(task.id(), failure_context);
         }
     };
 
     // 初始填充
     {
         let cancel = emitter.cancel.clone();
-        spawn_next(&mut running, &mut pending, &query, &cancel);
+        spawn_next(
+            &mut running,
+            &mut running_sources,
+            &mut pending,
+            &query,
+            &cancel,
+        );
     }
 
     enum End {
@@ -751,11 +769,17 @@ async fn run_dispatch(
                 break End::Completed;
             }
             let cancel = emitter.cancel.clone();
-            spawn_next(&mut running, &mut pending, &query, &cancel);
+            spawn_next(
+                &mut running,
+                &mut running_sources,
+                &mut pending,
+                &query,
+                &cancel,
+            );
             continue;
         }
 
-        let joined = tokio::time::timeout(CANCEL_POLL, running.join_next()).await;
+        let joined = tokio::time::timeout(CANCEL_POLL, running.join_next_with_id()).await;
         let Some(joined) = (match joined {
             Err(_) => continue,
             Ok(v) => v,
@@ -764,7 +788,13 @@ async fn run_dispatch(
                 break End::Completed;
             }
             let cancel = emitter.cancel.clone();
-            spawn_next(&mut running, &mut pending, &query, &cancel);
+            spawn_next(
+                &mut running,
+                &mut running_sources,
+                &mut pending,
+                &query,
+                &cancel,
+            );
             continue;
         };
 
@@ -775,11 +805,18 @@ async fn run_dispatch(
         }
 
         match joined {
-            Ok(SourceOutcome { kind, probe }) => {
+            Ok((task_id, SourceOutcome { kind, probe })) => {
+                running_sources.remove(&task_id);
                 // 先补位，避免 sink 慢时浪费并发
                 {
                     let cancel = emitter.cancel.clone();
-                    spawn_next(&mut running, &mut pending, &query, &cancel);
+                    spawn_next(
+                        &mut running,
+                        &mut running_sources,
+                        &mut pending,
+                        &query,
+                        &cancel,
+                    );
                 }
                 match kind {
                     SourceOutcomeKind::Result { source_id, works } => {
@@ -825,8 +862,27 @@ async fn run_dispatch(
                 }
             }
             Err(join_err) => {
-                // participant 不应 panic；网络错误已转为 Warning
-                let _ = join_err;
+                if let Some((source_id, started_at, started)) =
+                    running_sources.remove(&join_err.id())
+                {
+                    emitter.emit(
+                        SearchSourceEventKind::Warning,
+                        Some(source_id.clone()),
+                        Vec::new(),
+                        Some("SOURCE_UNAVAILABLE".to_owned()),
+                        Some("该搜索源处理结果时发生异常，请稍后重试。".to_owned()),
+                    );
+                    let probe = SourceProbe {
+                        started_at,
+                        latency_ms: started.elapsed().as_millis() as u64,
+                        probed: true,
+                    };
+                    if let Some(observation) =
+                        health.observation(&source_id, &probe, false, &emitter)
+                    {
+                        health_observations.push(observation);
+                    }
+                }
             }
         }
     };
@@ -885,6 +941,118 @@ fn new_id(prefix: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[tokio::test]
+    async fn query_limit_counts_unicode_characters_instead_of_bytes() {
+        let db = Arc::new(haven_infrastructure::Db::open_in_memory().unwrap());
+        let repos = Arc::new(haven_infrastructure::db::repos::SqliteRepositories::new(db));
+        let service = SearchSourceService::new(
+            SourceRegistryService::new(repos),
+            vec![],
+            Arc::new(CaptureSink {
+                events: Mutex::new(Vec::new()),
+            }),
+        );
+        for query in ["书".repeat(200), "📚".repeat(200), "a".repeat(200)] {
+            assert!(
+                service
+                    .start(SearchSourceStartRequest {
+                        query,
+                        category: None,
+                        limit_per_source: None
+                    })
+                    .await
+                    .is_ok()
+            );
+        }
+        for query in ["书".repeat(201), "📚".repeat(201), "a".repeat(201)] {
+            let error = service
+                .start(SearchSourceStartRequest {
+                    query,
+                    category: None,
+                    limit_per_source: None,
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(error.code().as_str(), "INVALID_ARGUMENT");
+            assert!(error.user_message().contains("200"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_participant_emits_a_source_warning_and_dispatch_continues() {
+        struct PanickingParticipant;
+        #[async_trait::async_trait]
+        impl SearchSourceParticipant for PanickingParticipant {
+            fn source_id(&self) -> &str {
+                "tvmaze"
+            }
+            async fn search(
+                &self,
+                _: &str,
+                _: u32,
+                _: &(dyn Fn() -> bool + Send + Sync),
+            ) -> Result<Vec<WorkCardDto>, AppError> {
+                panic!("synthetic provider panic");
+            }
+        }
+        let db = Arc::new(haven_infrastructure::Db::open_in_memory().unwrap());
+        let repos = Arc::new(haven_infrastructure::db::repos::SqliteRepositories::new(db));
+        let enabled = SourceRegistryService::new(repos)
+            .list()
+            .await
+            .unwrap()
+            .sources
+            .into_iter()
+            .filter(|s| s.source_id == "tvmaze" || s.source_id == "bangumi")
+            .collect();
+        let sink = Arc::new(CaptureSink {
+            events: Mutex::new(Vec::new()),
+        });
+        let emitter = Arc::new(TaskEmitter {
+            operation_id: "op-panic".into(),
+            sink: sink.clone(),
+            emit_lock: Mutex::new(0),
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        let healthy_calls = Arc::new(AtomicUsize::new(0));
+        let participants: Vec<Arc<dyn SearchSourceParticipant>> = vec![
+            Arc::new(PanickingParticipant),
+            Arc::new(ImmediateParticipant {
+                id: "bangumi".into(),
+                calls: healthy_calls.clone(),
+            }),
+        ];
+        let terminal = run_dispatch(
+            participants,
+            DispatchQuery {
+                text: "book".into(),
+                category: None,
+                limit: 5,
+            },
+            enabled,
+            emitter,
+            Arc::new(Mutex::new(Vec::new())),
+            no_health(),
+        )
+        .await;
+        assert_eq!(terminal, None);
+        assert_eq!(healthy_calls.load(Ordering::SeqCst), 1);
+        let events = sink.events.lock().unwrap();
+        let warnings: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == SearchSourceEventKind::Warning)
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].data.source_id.as_deref(), Some("tvmaze"));
+        assert_eq!(warnings[0].data.code.as_deref(), Some("SOURCE_UNAVAILABLE"));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == SearchSourceEventKind::SourceResult
+                    && e.data.source_id.as_deref() == Some("bangumi"))
+        );
+    }
 
     struct FakeParticipant {
         id: String,

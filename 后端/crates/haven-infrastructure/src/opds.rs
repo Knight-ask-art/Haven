@@ -329,7 +329,13 @@ fn take_summary(raw: &mut str) -> Option<String> {
         None
     } else {
         let mut out = cleaned;
-        out.truncate(2000);
+        if out.len() > 2000 {
+            let mut end = 2000;
+            while !out.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.truncate(end);
+        }
         Some(out)
     }
 }
@@ -365,7 +371,9 @@ fn attr(e: &quick_xml::events::BytesStart<'_>, key: &str) -> Option<String> {
         let a = a.ok()?;
         let k = String::from_utf8_lossy(a.key.as_ref());
         if k.rsplit(':').next()? == key {
-            Some(String::from_utf8_lossy(&a.value).into_owned())
+            a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .ok()
+                .map(|value| value.into_owned())
         } else {
             None
         }
@@ -425,8 +433,10 @@ pub type CredentialResolver = dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future:
 
 #[derive(Clone)]
 pub struct OpdsClient {
-    /// 每个端点的 OpenSearch atom 模板（含 `{searchTerms}`）。二次搜索跳过根目录 + 描述文件 hop。
-    search_templates: Arc<Mutex<HashMap<String, String>>>,
+    /// 每个端点的 OpenSearch atom 模板（含 `{searchTerms}`）及**发现它的描述文件地址**。
+    /// 模板可能是相对 `results.opds?...`：二次搜索必须仍以描述文件为解析基准，
+    /// 不能改用登记端点（否则会落到端点所在的目录下）。二次搜索跳过根目录 + 描述文件 hop。
+    search_templates: Arc<Mutex<HashMap<String, (String, String)>>>,
     /// 私有源凭据提供方。
     credential_resolver: Option<Arc<CredentialResolver>>,
     /// 注册表：用来**正向确认**某个 `sourceId` 确实是已登记的自定义 OPDS 书源，并给出它
@@ -574,7 +584,7 @@ impl OpdsClient {
         context: &OpdsRequestContext,
         url: &str,
         cap: usize,
-    ) -> Result<Vec<u8>, AppError> {
+    ) -> Result<(String, Vec<u8>), AppError> {
         // 网络对部分书目站存在间歇性 TLS 重置：传输层错误单次重试（响应上限不变）。
         match self.get_limited_once(context, url, cap).await {
             Err(e) if e.retryable() => self.get_limited_once(context, url, cap).await,
@@ -587,7 +597,7 @@ impl OpdsClient {
         context: &OpdsRequestContext,
         url: &str,
         cap: usize,
-    ) -> Result<Vec<u8>, AppError> {
+    ) -> Result<(String, Vec<u8>), AppError> {
         let origin = self.validate_request_url(url, context)?;
         let mut current = origin.clone();
         for _ in 0..=MAX_REDIRECTS {
@@ -655,12 +665,16 @@ impl OpdsClient {
                 }
                 out.extend_from_slice(chunk.as_ref());
             }
-            return Ok(out);
+            return Ok((current.to_string(), out));
         }
         Err(invalid_feed("目录重定向次数过多"))
     }
 
-    async fn get_feed(&self, context: &OpdsRequestContext, url: &str) -> Result<Vec<u8>, AppError> {
+    async fn get_feed(
+        &self,
+        context: &OpdsRequestContext,
+        url: &str,
+    ) -> Result<(String, Vec<u8>), AppError> {
         self.get_limited(context, url, FEED_CAP_BYTES).await
     }
 
@@ -672,7 +686,7 @@ impl OpdsClient {
         let mut last = None;
         for candidate in with_gutenberg_host_fallbacks(url) {
             match self.get_feed(context, &candidate).await {
-                Ok(body) => return Ok((candidate, body)),
+                Ok(response) => return Ok(response),
                 Err(err) => last = Some(err),
             }
         }
@@ -688,23 +702,26 @@ impl OpdsClient {
         let mut last = None;
         for candidate in with_gutenberg_host_fallbacks(url) {
             match self.get_limited(context, &candidate, cap).await {
-                Ok(body) => return Ok(body),
+                Ok((_, body)) => return Ok(body),
                 Err(err) => last = Some(err),
             }
         }
         Err(last.unwrap_or_else(|| invalid_feed("目录服务不可达")))
     }
 
-    fn cached_template(&self, endpoint: &str) -> Option<String> {
+    /// 返回缓存的 `(模板, 描述文件地址)`。描述文件地址是相对模板的唯一解析基准。
+    fn cached_template(&self, endpoint: &str) -> Option<(String, String)> {
         self.search_templates
             .lock()
             .ok()
             .and_then(|g| g.get(endpoint).cloned())
     }
 
-    fn remember_template(&self, endpoint: &str, template: String) {
+    /// 连同发现模板的描述文件地址一起缓存：模板里的 `{searchTerms}` 原样保留，
+    /// 二次搜索才能在不重新访问根目录/描述文件的前提下解析出同一个结果地址。
+    fn remember_template(&self, endpoint: &str, template: String, base: String) {
         if let Ok(mut g) = self.search_templates.lock() {
-            g.insert(endpoint.to_owned(), template);
+            g.insert(endpoint.to_owned(), (template, base));
         }
     }
 
@@ -731,8 +748,8 @@ impl OpdsClient {
         endpoint: &str,
         query: &str,
     ) -> Result<String, AppError> {
-        if let Some(tpl) = self.cached_template(endpoint) {
-            if let Some(url) = Self::apply_template(&tpl, query, endpoint) {
+        if let Some((tpl, base)) = self.cached_template(endpoint) {
+            if let Some(url) = Self::apply_template(&tpl, query, &base) {
                 if self.is_source_url_allowed(context, endpoint, &url) {
                     return Ok(url);
                 }
@@ -744,7 +761,7 @@ impl OpdsClient {
         let (resolved_endpoint, root) = if is_gutenberg_endpoint(endpoint) {
             self.get_feed_with_host_fallback(context, endpoint).await?
         } else {
-            (endpoint.to_owned(), self.get_feed(context, endpoint).await?)
+            self.get_feed(context, endpoint).await?
         };
         let xml = std::str::from_utf8(&root).map_err(|_| invalid_feed("目录编码异常"))?;
         let (_, feed_links) = parse_atom(xml, &resolved_endpoint);
@@ -752,12 +769,13 @@ impl OpdsClient {
             let absolute_desc = absolutize(&resolved_endpoint, search_desc)
                 .ok_or_else(|| invalid_feed("搜索描述地址非法"))?;
             if self.is_source_url_allowed(context, endpoint, &absolute_desc)
-                && let Ok(desc) = self.get_limited(context, &absolute_desc, 256 * 1024).await
+                && let Ok((descriptor_url, desc)) =
+                    self.get_limited(context, &absolute_desc, 256 * 1024).await
             {
                 if let Some(tpl) = extract_atom_template(&String::from_utf8_lossy(&desc)) {
-                    if let Some(url) = Self::apply_template(&tpl, query, &absolute_desc) {
+                    if let Some(url) = Self::apply_template(&tpl, query, &descriptor_url) {
                         if self.is_source_url_allowed(context, endpoint, &url) {
-                            self.remember_template(endpoint, tpl);
+                            self.remember_template(endpoint, tpl, descriptor_url);
                             return Ok(url);
                         }
                     }
@@ -836,18 +854,19 @@ impl OpdsClient {
     ) -> Option<Vec<OpdsEntry>> {
         for url in urls {
             match self.get_feed(context, url).await {
-                Ok(body) => {
+                Ok((resolved_url, body)) => {
                     let xml = String::from_utf8_lossy(&body);
                     if !valid_search_feed(&xml) {
                         *last_err = Some(invalid_feed("目录返回了无效的 Atom 搜索结果"));
                         continue;
                     }
-                    let mut entries: Vec<OpdsEntry> = book_candidates(parse_atom(&xml, url).0)
-                        .into_iter()
-                        .filter(|entry| {
-                            self.candidate_stays_on_source(context, source_endpoint, entry)
-                        })
-                        .collect();
+                    let mut entries: Vec<OpdsEntry> =
+                        book_candidates(parse_atom(&xml, &resolved_url).0)
+                            .into_iter()
+                            .filter(|entry| {
+                                self.candidate_stays_on_source(context, source_endpoint, entry)
+                            })
+                            .collect();
                     // 空结果同样是**成功读到的**事实：截断后返回，不再继续试下一个候选。
                     entries.truncate(limit as usize);
                     return Some(entries);

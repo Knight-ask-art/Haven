@@ -2683,6 +2683,35 @@ pub struct DownloadRevealResultDto {
     pub task_id: String,
 }
 
+// Resource-level offline actions: the completed DownloadTask record may be
+// removed while its Offline Resource remains. These types carry only the
+// resource identity; they never borrow the task ID field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct DownloadResourceActionRequest {
+    pub resource_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct DownloadResourceMutationResultDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub resource_id: String,
+    pub offline_resource_removed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct DownloadResourceRevealResultDto {
+    #[ts(type = "1")]
+    pub schema_version: u32,
+    pub resource_id: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, rename_all = "snake_case")]
@@ -4312,6 +4341,11 @@ pub struct AgentSettingsProposalDto {
     pub subject: AgentSettingsSubjectDto,
     pub target_label: String,
     pub base_revision: Option<String>,
+    /// A projection flag, not a persisted proposal status. Older proposals do
+    /// not retain a before snapshot; do not reconstruct it from newer settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub baseline_stale: Option<bool>,
     pub digest: String,
     pub created_at: String,
     pub expires_at: String,

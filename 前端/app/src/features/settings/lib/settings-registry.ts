@@ -296,9 +296,9 @@ export const FEATURE_REGISTRY: Readonly<Record<FeatureId, FeatureDescriptor>> = 
   "sources.registry": {
     label: "来源注册表",
     status: "implemented",
-    binding: "features/settings/ipc/sources-gateway.ts（source_registry_*）",
+    binding: "features/settings/ipc/sources-gateway.ts（source_registry_* / source_add / source_update / source_remove / source_set_credential）",
     consumer: "features/settings/components/SourcesSettings.tsx SourcesSettings",
-    note: "",
+    note: "自定义 OPDS 当前仅支持搜索；TVBox 配置可登记和删除，影视搜索与播放尚未接通。",
   },
   "sources.feedSubscription": {
     label: "RSS/Atom 订阅源",

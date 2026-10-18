@@ -733,7 +733,7 @@ fn normalize_for_compare(path: &str) -> String {
 
 /// 统一路径分隔符（与 Scanner 存储格式一致：Windows 用 `\` 输入，存 `/`）。
 fn normalize_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    haven_common::local_path_identity(path)
 }
 
 /// **Path 组件 / relative path 语义**的 rebase（R-MAIN-08；禁止字符串 replace）：

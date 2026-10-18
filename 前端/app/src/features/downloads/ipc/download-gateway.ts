@@ -22,6 +22,14 @@ export interface MediaItemDownloadInfo {
   canOnlineRead: boolean
   sourceResourceId: string | null
   taskId: string | null
+  /**
+   * The Offline Resource backing `hasOfflineResource`.
+   *
+   * This survives removal of the completed DownloadTask record, so resource
+   * reveal/delete do not depend on a task row that the user may have removed
+   * from the downloads list.
+   */
+  offlineResourceId: string | null
 }
 
 const DOWNLOAD_PAGE_SIZE = 200
@@ -61,6 +69,20 @@ export async function deleteOfflineDownload(taskId: string) {
 
 export async function revealOfflineDownload(taskId: string) {
   return getHavenClient().downloadRevealOffline({ taskId })
+}
+
+/**
+ * Resource-level offline management.
+ *
+ * A completed task record can be removed while its Offline Resource remains;
+ * these actions use the Resource identity only.
+ */
+export async function deleteOfflineResource(resourceId: string) {
+  return getHavenClient().downloadDeleteOfflineResource({ resourceId })
+}
+
+export async function revealOfflineResource(resourceId: string) {
+  return getHavenClient().downloadRevealOfflineResource({ resourceId })
 }
 
 let subscriptionSequence = 0
@@ -176,9 +198,10 @@ function projectMediaItemDownloadInfo(
   tasks: DownloadTaskDto[],
   resources: ResourceListDto,
 ): MediaItemDownloadInfo {
-  const offlineResourceIds = new Set(resources.items
-    .filter((item) => item.isOffline && item.availability === "offline_available")
-    .map((item) => item.resourceId))
+  const offlineItems = resources.items.filter((item) => (
+    item.isOffline && item.availability === "offline_available"
+  ))
+  const offlineResourceIds = new Set(offlineItems.map((item) => item.resourceId))
   const completedOfflineTask = tasks.find((task) => (
     task.mediaItemId === mediaItemId
     && task.state === "completed"
@@ -191,9 +214,12 @@ function projectMediaItemDownloadInfo(
     && task.state !== "cancelled"
     && task.state !== "failed"
   ))
-  const offlineResource = resources.items.some((item) => (
-    item.isOffline && item.availability === "offline_available"
-  ))
+  // Prefer the resource named by the completed task; otherwise the first
+  // explicit Offline Resource is still a valid resource-level handle.
+  const offlineResource = offlineItems.find((item) => (
+    item.resourceId === completedOfflineTask?.offlineResourceId
+  )) ?? offlineItems[0] ?? null
+  const offlineResourcePresent = offlineResource !== null
   const onlineResource = resources.items.some((item) => (
     item.canOnlineRead
     && (item.availability === "available" || item.availability === "offline_available")
@@ -203,18 +229,19 @@ function projectMediaItemDownloadInfo(
     // An existing Offline Resource is always preferred over a stale queued
     // task. This mirrors the resolver's offline-first rule and prevents a
     // duplicate-download affordance after a task has already completed.
-    status: offlineResource
+    status: offlineResourcePresent
       ? "downloaded"
       : activeTask
         ? "queued"
         : "idle",
     canDownload: source !== null,
-    hasOfflineResource: offlineResource,
+    hasOfflineResource: offlineResourcePresent,
     canOnlineRead: onlineResource,
     sourceResourceId: source?.resourceId ?? null,
-    taskId: offlineResource
+    taskId: offlineResourcePresent
       ? completedOfflineTask?.taskId ?? null
       : activeTask?.taskId ?? null,
+    offlineResourceId: offlineResource?.resourceId ?? null,
   }
 }
 

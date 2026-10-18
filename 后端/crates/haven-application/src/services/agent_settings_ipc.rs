@@ -255,7 +255,7 @@ impl AgentSettingsIpcService {
             .ok_or_else(setting_proposal_not_found)?;
         ensure_global_reading_proposal(&proposal)?;
         let receipt = self.proposals.get_receipt(proposal_id).await?;
-        let (_, reading) = self.read_authoritative().await?;
+        let (revision, reading) = self.read_authoritative().await?;
         // 已应用提案的当前值就是 after；用它重新投影会把 Diff 压成空列表。
         // Receipt 的 before 是同一 UoW 写入的审计事实，因此优先用它重建提案 Diff。
         let proposal_before = receipt
@@ -267,8 +267,13 @@ impl AgentSettingsIpcService {
             .as_ref()
             .map(|receipt| self.project_receipt(receipt, &proposal, &reading))
             .transpose()?;
+        let mut projected = self.project_proposal(&proposal, &proposal_before)?;
+        if receipt.is_none() && proposal.base_revision() != revision.as_deref() {
+            projected.baseline_stale = Some(true);
+            projected.changes.clear();
+        }
         Ok(AgentSettingsProposalGetResultDto {
-            proposal: self.project_proposal(&proposal, &proposal_before)?,
+            proposal: projected,
             receipt: projected_receipt,
         })
     }
@@ -473,6 +478,7 @@ impl AgentSettingsIpcService {
             },
             target_label: "全局默认 · 阅读".to_owned(),
             base_revision: proposal.base_revision().map(str::to_owned),
+            baseline_stale: None,
             digest: proposal.digest().to_owned(),
             created_at: format_millis(proposal.created_at()),
             expires_at: format_millis(proposal.expires_at()),
@@ -1857,6 +1863,29 @@ pub(crate) mod tests {
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
         assert_eq!(keys.len(), 2, "批准响应只有 proposal 与 receipt");
+    }
+
+    #[tokio::test]
+    async fn stale_pending_history_never_rebases_its_display_or_changes_digest() {
+        let store = FakeStore::new();
+        seed_reading(&store, Some("rev-0001"));
+        let (service, proposal) = run_full_flow(&store).await;
+        store.write_reading_for_test(ReadingPatch {
+            font_size: Some(ReadingFontSize::Large),
+            ..ReadingPatch::default()
+        });
+        let reread = service
+            .get_proposal(&crate::wire::AgentSettingsProposalGetRequest {
+                proposal_id: proposal.proposal_id.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(reread.proposal.baseline_stale, Some(true));
+        assert!(reread.proposal.changes.is_empty());
+        assert_eq!(reread.proposal.digest, proposal.digest);
+        assert_eq!(reread.proposal.base_revision, proposal.base_revision);
+        assert!(reread.receipt.is_none());
+        assert_eq!(store.target_writes(), 0);
     }
 
     #[tokio::test]

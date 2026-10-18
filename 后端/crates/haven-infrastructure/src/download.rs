@@ -1216,9 +1216,9 @@ impl LocalDownloadRunner {
             .list_by_media_item(source.media_item_id)
             .await
             .map_err(|_| repository_failure())?;
-        let final_string = final_path.to_string_lossy().into_owned();
+        let final_string = crate::local_path_identity(final_path);
         if let Some(existing) = resources.iter().find(|item| {
-            matches!(&item.locator, ResourceLocator::LocalPath { path } if path == &final_string)
+            matches!(&item.locator, ResourceLocator::LocalPath { path } if crate::local_path_identity(Path::new(path)) == final_string)
         }) {
             return Ok(OfflineResourceHandle {
                 id: existing.id,
@@ -2452,6 +2452,30 @@ mod tests {
             .unwrap();
         assert_eq!(retry.state, DownloadStateDto::Queued);
         assert_eq!(retry_runner.starts.load(Ordering::Relaxed), 1);
+
+        // A removed task must not remove the user's ability to manage its
+        // retained download. Resource actions must still reject original files.
+        let rejected = retry_service
+            .reveal_offline_resource(haven_application::wire::DownloadResourceActionRequest {
+                resource_id: source_id.to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            rejected.code().as_str(),
+            "DOWNLOAD_OFFLINE_RESOURCE_INVALID"
+        );
+        std::fs::write(path, b"haven offline content").unwrap();
+        let deleted = retry_service
+            .delete_offline_resource(haven_application::wire::DownloadResourceActionRequest {
+                resource_id: offline.id.to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(deleted.offline_resource_removed);
+        assert!(!Path::new(path).exists());
+        assert!(repos.resource.get(offline.id).await.unwrap().is_none());
+        assert!(repos.resource.get(source_id).await.unwrap().is_some());
     }
 
     #[derive(Clone)]

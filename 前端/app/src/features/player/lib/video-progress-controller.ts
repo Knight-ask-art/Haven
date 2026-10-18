@@ -42,53 +42,68 @@ export function createVideoProgressController(options: VideoProgressControllerOp
   let completed = session.progress?.completion === "completed"
   let latestCompletion: ProgressSaveRequest["completion"] = completed ? "completed" : "in_progress"
   let timer: ReturnType<typeof setTimeout> | undefined
-  let inFlight: Promise<void> | undefined
-  let queued = false
+  let drainPromise: Promise<boolean> | undefined
   let stopped = false
+  let closed = false
   let conflictNotified = false
 
   const clear = () => { if (timer) clearTimeout(timer); timer = undefined }
-  const conflict = (error: unknown) => {
-    if (error instanceof HavenError && error.code === "REVISION_CONFLICT") {
-      stopped = true; clear(); queued = false
-      if (!conflictNotified) { conflictNotified = true; options.onRevisionConflict?.(); options.retry?.() }
-    }
+  const conflict = (error: unknown): boolean => {
+    if (!(error instanceof HavenError) || error.code !== "REVISION_CONFLICT") return false
+    stopped = true; clear(); latest = undefined
+    if (!conflictNotified) { conflictNotified = true; options.onRevisionConflict?.(); options.retry?.() }
+    return true
   }
-  const run = async (): Promise<void> => {
-    if (stopped || latest === undefined || inFlight) return
-    const position = latest
-    const completion = latestCompletion
-    latest = undefined
-    let keyframe: string | null = null
-    if (options.captureKeyframe) {
-      try {
-        keyframe = await options.captureKeyframe()
-      } catch {
-        keyframe = null
+  /** Single drain chain: every queued update is saved before this resolves. */
+  const drain = (): Promise<boolean> => {
+    if (drainPromise) return drainPromise
+    const work = (async (): Promise<boolean> => {
+      while (!stopped && !closed && latest !== undefined) {
+        const position = latest
+        const completion = latestCompletion
+        latest = undefined
+        let keyframe: string | null = null
+        if (options.captureKeyframe) {
+          try {
+            keyframe = await options.captureKeyframe()
+          } catch {
+            keyframe = null
+          }
+        }
+        const request: ProgressSaveRequest = {
+          mediaItemId: session.mediaItemId,
+          locator: { version: 1, kind: "video", data: { positionMs: Math.max(0, Math.round(position * 1000)) } },
+          completion,
+          expectedRevision: revision,
+          ...(keyframe ? { keyframe } : {}),
+        } as ProgressSaveRequest
+        try {
+          const result = await save(request)
+          revision = result.revision
+        } catch (error: unknown) {
+          // Ordinary failures retain the latest position for a later flush but
+          // must not spin a tight retry loop; conflicts stop saving entirely.
+          if (!conflict(error) && !stopped && !closed) latest = latest ?? position
+          return true
+        }
       }
-    }
-    const request: ProgressSaveRequest = {
-      mediaItemId: session.mediaItemId,
-      locator: { version: 1, kind: "video", data: { positionMs: Math.max(0, Math.round(position * 1000)) } },
-      completion,
-      expectedRevision: revision,
-      ...(keyframe ? { keyframe } : {}),
-    } as ProgressSaveRequest
-    inFlight = save(request).then((result) => { revision = result.revision }).catch((error) => {
-      conflict(error)
-      if (!(error instanceof HavenError && error.code === "REVISION_CONFLICT") && !stopped) {
-        latest = latest ?? position
-      }
-    }).finally(() => { inFlight = undefined })
-    await inFlight
-    if (!stopped && queued) { queued = false; await run() }
+      return false
+    })()
+    drainPromise = work.finally(() => { drainPromise = undefined })
+    return drainPromise
   }
-  const flush = async () => { clear(); if (latest !== undefined) { if (inFlight) queued = true; else await run() } if (inFlight) await inFlight; if (queued && !stopped) { queued = false; await run() } }
+  const flush = async () => {
+    let failed = false
+    do {
+      clear()
+      if (!drainPromise && latest === undefined) return
+      failed = await drain()
+    } while (!stopped && !closed && !failed && latest !== undefined)
+  }
   const update = (positionSeconds: number, completion: ProgressSaveRequest["completion"] = "in_progress") => {
-    if (stopped || !Number.isFinite(positionSeconds) || positionSeconds < 0) return
+    if (stopped || closed || !Number.isFinite(positionSeconds) || positionSeconds < 0) return
     latest = positionSeconds; latestCompletion = completed ? "completed" : completion
-    if (inFlight) queued = true
-    else if (!timer) timer = setTimeout(() => { timer = undefined; void run() }, throttleMs)
+    if (!drainPromise && !timer) timer = setTimeout(() => { timer = undefined; void drain() }, throttleMs)
   }
   return {
     identity,
@@ -97,7 +112,14 @@ export function createVideoProgressController(options: VideoProgressControllerOp
     seeked: (position) => { update(position); return flush() },
     ended: (position) => { completed = true; update(position, "completed"); latestCompletion = "completed"; return flush() },
     flush,
-    cleanup: async () => { await flush() },
+    cleanup: async () => {
+      try {
+        await flush()
+      } finally {
+        closed = true
+        clear()
+      }
+    },
   }
 }
 

@@ -456,6 +456,39 @@ describe("useAiProviderSettings 凭据写入与清除互斥", () => {
  * 和一份新目录，而真正失败的写入仍然没有发生——一次被误认为成功的失败，比直接报错更糟。
  */
 describe("useAiProviderSettings 的重试语义", () => {
+  it("真实 CAS 冲突后回读配置，但不自动升级版本重放保存", async () => {
+    gateway.listAiProviderProfiles.mockResolvedValue([PROFILE])
+    const { result } = renderHook(() => useAiProviderSettings())
+    await waitFor(() => expect(result.current.selectedProfile?.profileId).toBe(PROFILE.profileId))
+    gateway.listAiProviderProfiles.mockResolvedValue([{ ...PROFILE, revision: "revision-new", displayName: "其它操作的修改" }])
+    gateway.upsertAiProviderProfile.mockRejectedValueOnce({
+      code: "AI_PROVIDER_PROFILE_REVISION_CONFLICT", userMessage: "请重新读取", retryable: true,
+    })
+    await act(async () => {
+      await expect(result.current.saveProfile({ ...PROFILE, displayName: "我的草稿" })).resolves.toBe(false)
+    })
+    expect(result.current.selectedProfile?.revision).toBe("revision-new")
+    expect(result.current.canRetrySaveError).toBe(false)
+    await act(async () => { await expect(result.current.retrySaveError()).resolves.toBe(false) })
+    expect(gateway.upsertAiProviderProfile).toHaveBeenCalledTimes(1)
+    expect(result.current.state.saveError).not.toBeNull()
+  })
+
+  it("删除冲突后回读新状态并要求重新确认，不能删除新版配置", async () => {
+    gateway.listAiProviderProfiles.mockResolvedValue([PROFILE])
+    const { result } = renderHook(() => useAiProviderSettings())
+    await waitFor(() => expect(result.current.selectedProfile?.profileId).toBe(PROFILE.profileId))
+    gateway.listAiProviderProfiles.mockResolvedValue([{ ...PROFILE, revision: "revision-new" }])
+    gateway.deleteAiProviderProfile.mockRejectedValueOnce({
+      code: "AI_PROVIDER_PROFILE_REVISION_CONFLICT", userMessage: "请重新读取", retryable: true,
+    })
+    await act(async () => { await expect(result.current.deleteProfile()).resolves.toBe(false) })
+    expect(result.current.selectedProfile?.revision).toBe("revision-new")
+    expect(result.current.canRetrySaveError).toBe(false)
+    await act(async () => { await expect(result.current.retrySaveError()).resolves.toBe(false) })
+    expect(gateway.deleteAiProviderProfile).toHaveBeenCalledTimes(1)
+  })
+
   it("保存失败后的重试重放同一份草稿，而不是去拉模型", async () => {
     gateway.listAiProviderProfiles.mockResolvedValue([PROFILE])
     gateway.upsertAiProviderProfile.mockRejectedValueOnce({

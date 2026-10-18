@@ -110,15 +110,9 @@ export async function getFavoriteFootprintItems(): Promise<FootprintActionCard[]
     }))
   }
   if (mode !== "tauri") return []
-  const page: PageDto<WorkCardDto> = await getHavenClient().libraryList({
-    category: "all",
-    mediaTypes: null,
-    query: null,
-    sort: "recently_added",
-    cursor: null,
-    limit: LIST_LIMIT,
-  })
-  return page.items.filter((card) => card.favorite).map(toMediaCard)
+  // 收藏可能落在任意分页，必须复用完整 cursor 链；只取首屏会漏掉第 200 项之后的作品。
+  const cards = await loadAllWorkCards()
+  return cards.filter((card) => card.favorite).map(toMediaCard)
 }
 
 const PROGRESS_LABEL: Record<string, string> = {

@@ -13,8 +13,10 @@ const comicWorkCatalog = comicWorkCatalogFixture as unknown as ComicWorkChapterC
 const gateway = vi.hoisted(() => ({
   createDownloadForMediaItem: vi.fn(),
   deleteOfflineDownload: vi.fn(),
+  deleteOfflineResource: vi.fn(),
   getMediaItemDownloadInfo: vi.fn(),
   revealOfflineDownload: vi.fn(),
+  revealOfflineResource: vi.fn(),
   subscribeDownloadEvents: vi.fn(),
 }))
 const work = vi.hoisted(() => ({ getWorkDetail: vi.fn() }))
@@ -59,9 +61,9 @@ vi.mock("@/features/progress/ipc/progress-gateway", () => progress)
 vi.mock("@/components/ui/haven/ArtworkImage", () => ({ ArtworkImage: () => null }))
 vi.mock("@/components/ui/haven/ShareCardModal", () => ({ ShareCardModal: () => null }))
 
-const downloadable = { status: "idle", canDownload: true, hasOfflineResource: false, canOnlineRead: false, sourceResourceId: "source", taskId: null }
+const downloadable = { status: "idle", canDownload: true, hasOfflineResource: false, canOnlineRead: false, sourceResourceId: "source", taskId: null, offlineResourceId: null }
 const queued = { ...downloadable, status: "queued", taskId: "task-a" }
-const offline = { status: "downloaded", canDownload: true, hasOfflineResource: true, canOnlineRead: true, sourceResourceId: "source", taskId: "task-a" }
+const offline = { status: "downloaded", canDownload: true, hasOfflineResource: true, canOnlineRead: true, sourceResourceId: "source", taskId: "task-a", offlineResourceId: "offline-a" }
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -136,6 +138,25 @@ beforeEach(() => {
 afterEach(() => { cleanup(); localStorage.clear(); vi.clearAllMocks(); vi.unstubAllGlobals() })
 
 describe("MediaDetailPage download lifecycle", () => {
+  it("manages retained offline resources after the task record is removed", async () => {
+    gateway.getMediaItemDownloadInfo.mockResolvedValue({ ...offline, taskId: null })
+    gateway.revealOfflineResource.mockResolvedValue(undefined)
+    gateway.deleteOfflineResource.mockImplementation(async () => {
+      gateway.getMediaItemDownloadInfo.mockResolvedValue(downloadable)
+    })
+    renderPage()
+    await screen.findByLabelText("已下载")
+    await openMore()
+    fireEvent.click(screen.getByRole("button", { name: "在文件夹中定位" }))
+    await waitFor(() => expect(gateway.revealOfflineResource).toHaveBeenCalledWith("offline-a"))
+    await openMore()
+    fireEvent.click(screen.getByRole("button", { name: "删除离线内容" }))
+    await waitFor(() => expect(gateway.deleteOfflineResource).toHaveBeenCalledWith("offline-a"))
+    expect(gateway.revealOfflineDownload).not.toHaveBeenCalled()
+    expect(gateway.deleteOfflineDownload).not.toHaveBeenCalled()
+    await screen.findByLabelText("下载至本地")
+  })
+
   it("does not pass an empty source to the native hero image while detail data is loading", () => {
     const pending = deferred<{ id: string }>()
     work.getWorkDetail.mockReturnValue(pending.promise)

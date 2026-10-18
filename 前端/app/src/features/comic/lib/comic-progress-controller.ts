@@ -28,51 +28,73 @@ export function createComicProgressController(options: ComicProgressControllerOp
   let completed = session.progress?.completion === "completed"
   let latest: { pageIndex: number; pageProgression: number | null } | undefined
   let timer: ReturnType<typeof setTimeout> | undefined
-  let inFlight: Promise<void> | undefined
-  let queued = false
+  let drainPromise: Promise<boolean> | undefined
   let stopped = false
+  let closed = false
   let conflictNotified = false
 
   const clear = () => { if (timer) clearTimeout(timer); timer = undefined }
-  const conflict = (error: unknown) => {
-    if (error instanceof HavenError && error.code === "REVISION_CONFLICT") {
-      stopped = true; clear(); queued = false
-      if (!conflictNotified) { conflictNotified = true; options.onRevisionConflict?.(); options.retry?.() }
-    }
+  const conflict = (error: unknown): boolean => {
+    if (!(error instanceof HavenError) || error.code !== "REVISION_CONFLICT") return false
+    stopped = true; clear(); latest = undefined
+    if (!conflictNotified) { conflictNotified = true; options.onRevisionConflict?.(); options.retry?.() }
+    return true
   }
-  const run = async (): Promise<void> => {
-    if (stopped || latest === undefined || inFlight) return
-    const entry = latest
-    latest = undefined
-    const request: ProgressSaveRequest = {
-      mediaItemId: session.mediaItemId,
-      locator: { version: 1, kind: "comic", data: { chapterItemId: session.mediaItemId, pageIndex: Math.max(0, entry.pageIndex - 1), pageProgression: entry.pageProgression } },
-      completion: completed ? "completed" : "in_progress",
-      expectedRevision: revision,
-    }
-    inFlight = save(request).then((result) => { revision = result.revision }).catch((error) => {
-      conflict(error)
-      if (!(error instanceof HavenError && error.code === "REVISION_CONFLICT") && !stopped) {
-        latest = latest ?? entry
+  /** Single drain chain: every queued update is saved before this resolves. */
+  const drain = (): Promise<boolean> => {
+    if (drainPromise) return drainPromise
+    const work = (async (): Promise<boolean> => {
+      while (!stopped && !closed && latest !== undefined) {
+        const entry = latest
+        latest = undefined
+        const request: ProgressSaveRequest = {
+          mediaItemId: session.mediaItemId,
+          locator: { version: 1, kind: "comic", data: { chapterItemId: session.mediaItemId, pageIndex: Math.max(0, entry.pageIndex - 1), pageProgression: entry.pageProgression } },
+          completion: completed ? "completed" : "in_progress",
+          expectedRevision: revision,
+        }
+        try {
+          const result = await save(request)
+          revision = result.revision
+        } catch (error: unknown) {
+          // Ordinary failures retain the latest page for a later flush but
+          // must not spin a tight retry loop; conflicts stop saving entirely.
+          if (!conflict(error) && !stopped && !closed) latest = latest ?? entry
+          return true
+        }
       }
-    }).finally(() => { inFlight = undefined })
-    await inFlight
-    if (!stopped && queued) { queued = false; await run() }
+      return false
+    })()
+    drainPromise = work.finally(() => { drainPromise = undefined })
+    return drainPromise
   }
-  const flush = async () => { clear(); if (latest !== undefined) { if (inFlight) queued = true; else await run() } if (inFlight) await inFlight; if (queued && !stopped) { queued = false; await run() } }
+  const flush = async () => {
+    let failed = false
+    do {
+      clear()
+      if (!drainPromise && latest === undefined) return
+      failed = await drain()
+    } while (!stopped && !closed && !failed && latest !== undefined)
+  }
   const update = (pageIndex: number, pageProgression?: number) => {
-    if (stopped || !Number.isInteger(pageIndex) || pageIndex < 1 || pageIndex > totalPages) return
+    if (stopped || closed || !Number.isInteger(pageIndex) || pageIndex < 1 || pageIndex > totalPages) return
     const pp = pageProgression != null && Number.isFinite(pageProgression) && pageProgression >= 0 && pageProgression <= 1 ? pageProgression : null
     if (pageIndex === totalPages) completed = true
     latest = { pageIndex, pageProgression: pp }
-    if (inFlight) queued = true
-    else if (!timer) timer = setTimeout(() => { timer = undefined; void run() }, throttleMs)
+    if (!drainPromise && !timer) timer = setTimeout(() => { timer = undefined; void drain() }, throttleMs)
   }
   return {
     identity,
     pageChange: update,
     flush,
-    cleanup: async () => { await flush() },
+    cleanup: async () => {
+      try {
+        await flush()
+      } finally {
+        closed = true
+        clear()
+      }
+    },
   }
 }
 

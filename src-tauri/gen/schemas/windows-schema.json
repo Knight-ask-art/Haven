@@ -561,6 +561,12 @@
           "markdownDescription": "Enables the download_delete_offline command without any pre-configured scope."
         },
         {
+          "description": "Enables the download_delete_offline_resource command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-download-delete-offline-resource",
+          "markdownDescription": "Enables the download_delete_offline_resource command without any pre-configured scope."
+        },
+        {
           "description": "Enables the download_list command without any pre-configured scope.",
           "type": "string",
           "const": "allow-download-list",
@@ -595,6 +601,12 @@
           "type": "string",
           "const": "allow-download-reveal-offline",
           "markdownDescription": "Enables the download_reveal_offline command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the download_reveal_offline_resource command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-download-reveal-offline-resource",
+          "markdownDescription": "Enables the download_reveal_offline_resource command without any pre-configured scope."
         },
         {
           "description": "Enables the download_subscribe command without any pre-configured scope.",
@@ -1485,6 +1497,12 @@
           "markdownDescription": "Denies the download_delete_offline command without any pre-configured scope."
         },
         {
+          "description": "Denies the download_delete_offline_resource command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-download-delete-offline-resource",
+          "markdownDescription": "Denies the download_delete_offline_resource command without any pre-configured scope."
+        },
+        {
           "description": "Denies the download_list command without any pre-configured scope.",
           "type": "string",
           "const": "deny-download-list",
@@ -1519,6 +1537,12 @@
           "type": "string",
           "const": "deny-download-reveal-offline",
           "markdownDescription": "Denies the download_reveal_offline command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the download_reveal_offline_resource command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-download-reveal-offline-resource",
+          "markdownDescription": "Denies the download_reveal_offline_resource command without any pre-configured scope."
         },
         {
           "description": "Denies the download_subscribe command without any pre-configured scope.",

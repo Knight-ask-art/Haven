@@ -31,6 +31,232 @@ use super::fixture::{
 use super::url::urlencode;
 use super::{OpdsClient, OpdsSearchParticipant};
 
+#[tokio::test]
+async fn registered_directory_slashes_survive_add_update_and_real_search() {
+    let server = FixtureServer::start(|_| {
+        ["/opds", "/library"].into_iter().flat_map(|base| [
+            (format!("{base}/"), FixtureResponse::atom(r#"<feed><link rel="search" href="search.xml"/></feed>"#)),
+            (format!("{base}/search.xml"), FixtureResponse::opensearch(r#"<OpenSearchDescription><Url type="application/atom+xml" template="results?q={searchTerms}"/></OpenSearchDescription>"#)),
+            (format!("{base}/results"), FixtureResponse::atom(r#"<feed><entry><id>urn:book</id><title>Book</title></entry></feed>"#)),
+        ]).collect()
+    });
+    let repos = Arc::new(crate::db::repos::SqliteRepositories::new(Arc::new(
+        crate::Db::open_in_memory().unwrap(),
+    )));
+    let registry = SourceRegistryService::new(repos);
+    let source_id = registry
+        .add_custom_source("Directory", &format!("{}/opds/", server.origin()))
+        .await
+        .unwrap()
+        .source_id;
+    let client = OpdsClient::new()
+        .unwrap()
+        .with_source_registry(registry.clone());
+    for (index, base) in ["/opds/", "/library/"].into_iter().enumerate() {
+        let endpoint = format!("{}{base}", server.origin());
+        if index > 0 {
+            registry
+                .update_custom_source(haven_application::wire::SourceUpdateRequest {
+                    source_id: source_id.clone(),
+                    display_name: None,
+                    endpoint: Some(endpoint.clone()),
+                })
+                .await
+                .unwrap();
+        }
+        let stored = registry.endpoint(&source_id).await.unwrap().unwrap();
+        assert_eq!(stored, endpoint);
+        let entries = client
+            .search_entries(Some(&source_id), &stored, "book", 10)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+    assert_eq!(
+        server.paths(),
+        vec![
+            "/opds/",
+            "/opds/search.xml",
+            "/opds/results",
+            "/library/",
+            "/library/search.xml",
+            "/library/results"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn long_unicode_summaries_keep_search_results_within_the_byte_limit() {
+    let server = FixtureServer::start(|_| {
+        vec![
+            ("/opds".into(), FixtureResponse::atom(root_feed())),
+            (
+                "/opensearch.xml".into(),
+                FixtureResponse::opensearch(
+                    r#"<OpenSearchDescription><Url type="application/atom+xml" template="/results?q={searchTerms}"/></OpenSearchDescription>"#,
+                ),
+            ),
+            (
+                "/results".into(),
+                FixtureResponse::atom(format!(
+                    r#"<feed><entry><id>urn:chinese</id><title>中文</title><summary>{}</summary></entry><entry><id>urn:emoji</id><title>Emoji</title><summary>{}</summary></entry><entry><id>urn:ascii</id><title>ASCII</title><summary>{}</summary></entry></feed>"#,
+                    "书".repeat(700),
+                    "📚".repeat(501),
+                    "a".repeat(2100)
+                )),
+            ),
+        ]
+    });
+    let endpoint = format!("{}/opds", server.origin());
+    let (registry, source_id) = seeded_opds_registry(&endpoint, false).await;
+    let client = OpdsClient::new().unwrap().with_source_registry(registry);
+    let entries = client
+        .search_entries(Some(&source_id), &endpoint, "book", 10)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(
+        entries[0].summary.as_deref(),
+        Some("书".repeat(666).as_str())
+    );
+    assert_eq!(
+        entries[1].summary.as_deref(),
+        Some("📚".repeat(500).as_str())
+    );
+    assert_eq!(entries[2].summary.as_ref().unwrap().len(), 2000);
+}
+
+#[tokio::test]
+async fn xml_link_attributes_are_decoded_once_for_search_and_artwork() {
+    let server = FixtureServer::start(|_| {
+        vec![
+            ("/opds".into(), FixtureResponse::atom(root_feed())),
+            (
+                "/opensearch.xml".into(),
+                FixtureResponse::opensearch(
+                    r#"<OpenSearchDescription><Url type="application/atom+xml" template="/results?kind=book&amp;q={searchTerms}"/></OpenSearchDescription>"#,
+                ),
+            ),
+            (
+                "/results".into(),
+                FixtureResponse::atom(
+                    r#"<feed><entry><id>urn:book</id><title>Book</title><link rel="http://opds-spec.org/image" type="image/png" href="/cover?size=small&amp;id=1&amp;amp;literal=yes"/></entry></feed>"#,
+                ),
+            ),
+        ]
+    });
+    let endpoint = format!("{}/opds", server.origin());
+    let (registry, source_id) = seeded_opds_registry(&endpoint, false).await;
+    let client = OpdsClient::new().unwrap().with_source_registry(registry);
+    for query in ["first", "second"] {
+        let entries = client
+            .search_entries(Some(&source_id), &endpoint, query, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            entries[0].pic,
+            Some(format!(
+                "{}/cover?size=small&id=1&amp;literal=yes",
+                server.origin()
+            ))
+        );
+    }
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .map(|r| r.target())
+            .collect::<Vec<_>>(),
+        vec![
+            "/opds",
+            "/opensearch.xml",
+            "/results?kind=book&q=first",
+            "/results?kind=book&q=second"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn redirects_preserve_the_final_base_for_discovery_results_and_entry_links() {
+    let server = FixtureServer::start(|_| {
+        vec![
+            (
+                "/opds".into(),
+                FixtureResponse::redirect("/catalog/index.xml"),
+            ),
+            (
+                "/catalog/index.xml".into(),
+                FixtureResponse::atom(r#"<feed><link rel="search" href="search.xml"/></feed>"#),
+            ),
+            (
+                "/catalog/search.xml".into(),
+                FixtureResponse::redirect("/discovery/description.xml"),
+            ),
+            (
+                "/discovery/description.xml".into(),
+                FixtureResponse::opensearch(
+                    r#"<OpenSearchDescription><Url type="application/atom+xml" template="results?q={searchTerms}"/></OpenSearchDescription>"#,
+                ),
+            ),
+            (
+                "/discovery/results".into(),
+                FixtureResponse::redirect("/final/feed.xml"),
+            ),
+            (
+                "/final/feed.xml".into(),
+                FixtureResponse::atom(
+                    r#"<feed><entry><id>urn:book</id><title>Book</title><link rel="http://opds-spec.org/acquisition" type="application/epub+zip" href="book.epub"/><link rel="http://opds-spec.org/image" type="image/png" href="cover.png"/></entry></feed>"#,
+                ),
+            ),
+            (
+                "/entry".into(),
+                FixtureResponse::redirect("/final/feed.xml"),
+            ),
+        ]
+    });
+    let endpoint = format!("{}/opds", server.origin());
+    let (registry, source_id) = seeded_opds_registry(&endpoint, false).await;
+    let client = OpdsClient::new().unwrap().with_source_registry(registry);
+    for query in ["first", "second"] {
+        let entries = client
+            .search_entries(Some(&source_id), &endpoint, query, 10)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].epub_href,
+            Some(format!("{}/final/book.epub", server.origin()))
+        );
+        assert_eq!(
+            entries[0].pic,
+            Some(format!("{}/final/cover.png", server.origin()))
+        );
+    }
+    let entry = client
+        .fetch_entry_metadata(Some(&source_id), &format!("{}/entry", server.origin()))
+        .await
+        .unwrap();
+    assert_eq!(
+        entry.epub_href,
+        Some(format!("{}/final/book.epub", server.origin()))
+    );
+    assert_eq!(
+        server.paths(),
+        vec![
+            "/opds",
+            "/catalog/index.xml",
+            "/catalog/search.xml",
+            "/discovery/description.xml",
+            "/discovery/results",
+            "/final/feed.xml",
+            "/discovery/results",
+            "/final/feed.xml",
+            "/entry",
+            "/final/feed.xml"
+        ]
+    );
+}
+
 /// 根目录：feed 级 `rel="search"` 指向 OpenSearch 描述文件。
 fn root_feed() -> String {
     r#"<?xml version="1.0" encoding="utf-8"?>
@@ -93,6 +319,131 @@ fn catalog_server() -> FixtureServer {
             ),
         ]
     })
+}
+
+/// 根目录在 `/opds/root.xml`，`rel="search"` 指向另一个目录里的描述文件。
+fn relative_template_root_feed() -> String {
+    r#"<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <id>urn:haven:fixture:relative-root</id>
+  <title>自建书库</title>
+  <link rel="search" type="application/atom+xml" href="/discovery/description.xml"/>
+</feed>"#
+        .to_owned()
+}
+
+/// 模板是**相对描述文件**的路径：只有以描述文件地址为基准解析才会落到
+/// `/discovery/results.opds`；若改用登记端点（`/opds/root.xml`）为基准，就会错落到
+/// `/opds/results.opds`。
+fn relative_opensearch_description() -> String {
+    r#"<?xml version="1.0"?>
+<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+  <ShortName>自建书库</ShortName>
+  <Url type="application/atom+xml" template="results.opds?q={searchTerms}"/>
+</OpenSearchDescription>"#
+        .to_owned()
+}
+
+fn relative_template_server() -> FixtureServer {
+    FixtureServer::start(|_| {
+        vec![
+            (
+                "/opds/root.xml".to_owned(),
+                FixtureResponse::atom(relative_template_root_feed()),
+            ),
+            (
+                "/discovery/description.xml".to_owned(),
+                FixtureResponse::opensearch(relative_opensearch_description()),
+            ),
+            (
+                "/discovery/results.opds".to_owned(),
+                FixtureResponse::atom(
+                    r#"<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry><id>urn:uuid:relative-1</id><title>Relative Result</title></entry>
+</feed>"#,
+                ),
+            ),
+        ]
+    })
+}
+
+/// 二次搜索命中缓存模板时，仍以**发现模板的描述文件**为相对基准。
+///
+/// 旧实现只缓存原始模板文本，并用登记端点作 base：相对模板 `results.opds?...` 会被解析到
+/// `/opds/results.opds`（或直接超出权威范围），第二次搜索要么失败、要么落到错误地址。
+#[tokio::test]
+async fn cached_search_template_keeps_the_descriptor_as_its_base() {
+    let server = relative_template_server();
+    let endpoint = format!("{}/opds/root.xml", server.origin());
+    let (registry, source_id) = seeded_opds_registry(&endpoint, false).await;
+    let client = OpdsClient::new()
+        .unwrap()
+        .with_loopback_fixture()
+        .with_source_registry(registry);
+
+    let first = client
+        .search_url(Some(&source_id), &endpoint, "first")
+        .await
+        .unwrap();
+    let second = client
+        .search_url(Some(&source_id), &endpoint, "second")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        first,
+        format!("{}/discovery/results.opds?q=first", server.origin())
+    );
+    assert_eq!(
+        second,
+        format!("{}/discovery/results.opds?q=second", server.origin())
+    );
+    assert_eq!(
+        server.paths(),
+        vec!["/opds/root.xml", "/discovery/description.xml"],
+        "缓存命中不得再访问根目录或描述文件"
+    );
+}
+
+/// 公开消费者 `search_entries` 连搜两次：第二次只请求缓存模板解析出的结果地址。
+#[tokio::test]
+async fn search_entries_reuses_the_descriptor_base_across_searches() {
+    let server = relative_template_server();
+    let endpoint = format!("{}/opds/root.xml", server.origin());
+    let (registry, source_id) = seeded_opds_registry(&endpoint, false).await;
+    let client = OpdsClient::new()
+        .unwrap()
+        .with_loopback_fixture()
+        .with_source_registry(registry);
+
+    let first = client
+        .search_entries(Some(&source_id), &endpoint, "first", 10)
+        .await
+        .unwrap();
+    let second = client
+        .search_entries(Some(&source_id), &endpoint, "second", 10)
+        .await
+        .unwrap();
+
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+    assert_eq!(first[0].title, "Relative Result");
+    assert_eq!(second[0].title, "Relative Result");
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .map(|request| request.target())
+            .collect::<Vec<_>>(),
+        vec![
+            "/opds/root.xml",
+            "/discovery/description.xml",
+            "/discovery/results.opds?q=first",
+            "/discovery/results.opds?q=second",
+        ],
+        "第二次搜索只复用缓存的 (模板, 描述文件地址)，不再走根目录与描述文件"
+    );
 }
 
 #[tokio::test]
