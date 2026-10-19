@@ -613,6 +613,26 @@ impl SourceRegistryService {
         Ok(self.custom_source(source_id).await?.map(|c| c.endpoint))
     }
 
+    /// Read enablement without health projection or configuration writes.
+    pub async fn is_enabled(&self, source_id: &str) -> Result<bool, AppError> {
+        Ok(enabled_from_payload(&self.payload().await?).contains(source_id))
+    }
+
+    /// Enablement and endpoint belong to the same configuration snapshot.
+    pub async fn enabled_endpoint(&self, source_id: &str) -> Result<Option<String>, AppError> {
+        let payload = self.payload().await?;
+        if !enabled_from_payload(&payload).contains(source_id) {
+            return Ok(None);
+        }
+        Ok(payload.endpoints.get(source_id).cloned().or_else(|| {
+            payload
+                .custom_sources
+                .iter()
+                .find(|source| source.source_id == source_id)
+                .map(|source| source.endpoint.clone())
+        }))
+    }
+
     /// 由 `sourceId` 前缀恢复的**自定义**来源种类（非 `custom_` 家族返回 `None`）。
     ///
     /// 前缀是注册表生成 `sourceId` 时唯一决定种类的地方，因此这个判定与持久化记录里的

@@ -299,6 +299,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
   const resourceRequestRef = useRef(0)
   const markerListRequestRef = useRef(0)
   const bookmarkRequestRef = useRef(0)
+  const highlightRequestRef = useRef(0)
   const storageScopeRef = useRef(storageScope)
   const persistedStorageScopeRef = useRef(storageScope)
   const readingSettingsAppliedRef = useRef(false)
@@ -382,6 +383,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
     migrationFailedRef.current.clear()
     markerListRequestRef.current += 1
     bookmarkRequestRef.current += 1
+    highlightRequestRef.current += 1
     setIsBookmarked(loadDemoArticleReaderValue(
       clientMode,
       () => (
@@ -392,6 +394,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
     ))
     setArticleMarkerId(null)
     setIsBookmarkPending(false)
+    setIsHighlightPending(false)
     setSessionMarkers([])
     setMarkersLoaded(false)
     setHighlights(loadDemoArticleReaderValue(clientMode, () => readHighlights(storageId), []))
@@ -824,7 +827,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
   }
 
   const addHighlight = () => {
-    if (isHighlightPending || !selectedText || !selectedBlockId) return
+    if (isHighlightPending || !selectedText || !selectedBlockId || (tauriRuntime && !markersLoaded)) return
     const blockId = selectedBlockId
     const text = selectedText
     if (tauriRuntime && mediaItemId) {
@@ -843,6 +846,14 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
         dismissSelection()
         return
       }
+      // A pending list must not replace a marker saved after its snapshot.
+      markerListRequestRef.current += 1
+      const requestId = ++highlightRequestRef.current
+      const requestStorageScope = storageScope
+      const requestIsCurrent = () => (
+        highlightRequestRef.current === requestId
+        && storageScopeRef.current === requestStorageScope
+      )
       setIsHighlightPending(true)
       setMarkerError(null)
       setMarkerRetryKind(null)
@@ -854,17 +865,21 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
         excerpt: text,
         note: null,
       })
-        .then((marker) => setSessionMarkers((current) => [...current, marker]))
-        .then(() => {
+        .then((marker) => {
+          if (!requestIsCurrent()) return
+          setSessionMarkers((current) => [...current.filter((item) => item.markerId !== marker.markerId), marker])
           setMarkerError(null)
           setMarkerRetryKind(null)
           dismissSelection()
         })
         .catch(() => {
+          if (!requestIsCurrent()) return
           setMarkerRetryKind("highlight")
           setMarkerError("划线保存失败，请重试；当前选择仍保留")
         })
-        .finally(() => setIsHighlightPending(false))
+        .finally(() => {
+          if (requestIsCurrent()) setIsHighlightPending(false)
+        })
       return
     }
     const markerId = crypto.randomUUID()
@@ -1263,7 +1278,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
 
       {selectionPosition && (
         <div style={{ left: selectionPosition.x, top: selectionPosition.y }} className="fixed z-[70] flex -translate-x-1/2 -translate-y-full items-center gap-1 rounded-full border border-white/15 bg-[#1c1c1e]/95 px-[8px] py-1.5 text-xs font-semibold text-white shadow-2xl backdrop-blur-xl">
-          <button type="button" onClick={addHighlight} disabled={isHighlightPending || !selectedBlockId} className="flex items-center gap-1 rounded-full px-[10px] py-1.5 hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-45"><Highlighter className="h-3.5 w-3.5 text-amber-300" />{isHighlightPending ? "保存中" : "划线"}</button>
+          <button type="button" onClick={addHighlight} disabled={isHighlightPending || !selectedBlockId || (tauriRuntime && !markersLoaded)} className="flex items-center gap-1 rounded-full px-[10px] py-1.5 hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-45"><Highlighter className="h-3.5 w-3.5 text-amber-300" />{isHighlightPending ? "保存中" : tauriRuntime && !markersLoaded ? "加载划线中" : "划线"}</button>
           {demoRuntime && <button type="button" onClick={askAboutSelection} className="flex items-center gap-1 rounded-full px-[10px] py-1.5 text-amber-200 hover:bg-white/15"><Sparkles className="h-3.5 w-3.5" />问 AI</button>}
         </div>
       )}

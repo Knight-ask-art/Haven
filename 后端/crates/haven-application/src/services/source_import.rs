@@ -26,7 +26,9 @@ use haven_domain::contracts::{
     EditionRepository, MediaItemRepository, PeriodicalRepository, ResourceRepository,
     WorkRepository,
 };
-use haven_domain::entities::{Edition, MediaIndex, MediaItem, Resource, ResourceLocator, Work};
+use haven_domain::entities::{
+    ArtworkKind, ArtworkRef, Edition, MediaIndex, MediaItem, Resource, ResourceLocator, Work,
+};
 use haven_domain::enums::{
     Availability, AvailabilitySource, MediaItemStatus, MediaType, ResourceType, WorkStatus,
     WorkType,
@@ -46,7 +48,8 @@ use crate::services::periodical::{
     PeriodicalProvider, PeriodicalTree, PeriodicalVolumeTree,
 };
 use crate::services::ports::{
-    ComicChapterRefreshPlan, ComicEditionWrite, PeriodicalImportPlan, SourceImportPorts, UnitOfWork,
+    ComicChapterRefreshPlan, ComicEditionWrite, PeriodicalImportPlan, SourceImportPorts,
+    UnitOfWork, WorkEnrichmentOutcome, WorkEnrichmentPlan, WorkEnrichmentSourceRef,
 };
 use crate::services::source_registry::{
     CUSTOM_FEED_SOURCE_PREFIX, CustomSourceKind, SourceRegistryService,
@@ -181,7 +184,24 @@ pub struct ImportedWork {
     pub media_item_id: MediaItemId,
 }
 
+/// 自动补全对既有 Work 的一次匹配结果。
+///
+/// `Applied` 的取值来自事务内结果：只有 `Applied`/`NothingToFill` 才表示「来源条目与
+/// 目标 Work 匹配且补丁被接受」；放弃结果（标题已变、类型不同类、Work 已删除）必须
+/// 由调用方记为未补全。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cms10WorkMetadataOutcome {
+    /// 来源未启用或未配置端点：没有发起任何请求。
+    SourceUnavailable,
+    /// 来源启用且可用，但没有标题完全相等的条目。
+    NotFound,
+    /// 已按「只补空缺」语义执行，结果见 `WorkEnrichmentOutcome`。
+    Applied(WorkEnrichmentOutcome),
+}
+
 const SOURCE_PROVIDER: &str = "cms10";
+/// CMS10 外部条目 ID 的字节上限（显式导入与自动补全共用同一形状守卫）。
+const MAX_CMS10_EXTERNAL_ID_BYTES: usize = 64;
 /// OPDS 家族入库时 work_source_refs 的 provider 值。
 pub const OPDS_SOURCE_PROVIDER: &str = "opds";
 
@@ -231,12 +251,15 @@ pub const MAX_COMIC_LIBRARY_REMOTE_ID_BYTES: usize = 200;
 /// 单个 opaque 漫画库标识（seriesId / bookId / chapterId）的字节上限。
 pub const MAX_COMIC_LIBRARY_ID_BYTES: usize = 64;
 
+/// 可提供漫画章节目录的固定来源键（MangaDex + 自托管 Komga/Kavita）。
+///
+/// 这是「哪些来源键走漫画章节目录路径」的**唯一**清单：路由判定与 Work 级刷新入口
+/// 都从它派生，新增来源时只改这一处，不会出现某条路径静默漏掉新来源。
+pub const COMIC_CATALOG_SOURCE_KEYS: [&str; 3] = ["mangadex", KOMGA_SOURCE_KEY, KAVITA_SOURCE_KEY];
+
 /// 该来源键是否走「漫画章节目录 + 章节归档资源」的持久化路径。
 pub fn is_comic_catalog_source_key(source_key: &str) -> bool {
-    matches!(
-        source_key,
-        "mangadex" | KOMGA_SOURCE_KEY | KAVITA_SOURCE_KEY
-    )
+    COMIC_CATALOG_SOURCE_KEYS.contains(&source_key)
 }
 
 /// 动态漫画库 sourceId → 固定来源键（`custom_komga_*` → `komga`）。
@@ -417,13 +440,33 @@ impl SourceImportService {
             .run_source_import(provider, external_id, work, edition, items, resources)
     }
 
+    /// 海报经受控图片代理注册（契约 §36 C1）：外部 URL 不进 IPC 或 Work
+    /// 业务事实；仅落到受控技术映射，业务引用只保存 haven://artwork/<uuid>。
+    /// 登记失败按「该条目没有海报」处理，不影响其余元数据。
+    async fn register_source_poster(&self, url: &str) -> Option<ArtworkRef> {
+        match haven_domain::contracts::ImageProxyRepository::register(
+            &*self.ports,
+            SOURCE_PROVIDER,
+            url,
+        )
+        .await
+        {
+            Ok(id) => Some(ArtworkRef {
+                kind: ArtworkKind::Poster,
+                uri: format!("haven://artwork/{id}"),
+                provider: Some(SOURCE_PROVIDER.to_string()),
+            }),
+            Err(_) => None,
+        }
+    }
+
     /// 导入（幂等）：已存在引用时直接返回既有身份。
     pub async fn import_cms10_candidate(
         &self,
         external_id: &str,
     ) -> Result<ImportedWork, AppError> {
         let external_id = external_id.trim();
-        if external_id.is_empty() || external_id.len() > 64 {
+        if external_id.is_empty() || external_id.len() > MAX_CMS10_EXTERNAL_ID_BYTES {
             return Err(AppError::new(
                 "INVALID_ARGUMENT",
                 ErrorKind::Validation,
@@ -461,22 +504,7 @@ impl SourceImportService {
         // 海报经受控图片代理注册（契约 §36 C1）：外部 URL 不进 IPC 或 Work
         // 业务事实；仅落到受控技术映射，业务引用只保存 haven://artwork/<uuid>。
         let poster = match entry.pic.as_deref() {
-            Some(url) => {
-                match haven_domain::contracts::ImageProxyRepository::register(
-                    &*self.ports,
-                    SOURCE_PROVIDER,
-                    url,
-                )
-                .await
-                {
-                    Ok(id) => Some(haven_domain::entities::ArtworkRef {
-                        kind: haven_domain::entities::ArtworkKind::Poster,
-                        uri: format!("haven://artwork/{id}"),
-                        provider: Some(SOURCE_PROVIDER.to_string()),
-                    }),
-                    Err(_) => None,
-                }
-            }
+            Some(url) => self.register_source_poster(url).await,
             None => None,
         };
 
@@ -976,6 +1004,39 @@ impl SourceImportService {
             return Ok((self.comic_library_provider()?.clone(), custom_id));
         }
         Err(comic_catalog_unsupported())
+    }
+
+    /// 该来源键是否走 Work 级章节刷新（MangaDex + 自托管 Komga/Kavita）。
+    ///
+    /// 复用 [`is_comic_catalog_source_key`] 这一单一事实源，避免刷新入口另维护一份
+    /// 可能漂移的来源清单；刷新路由本身仍由 `comic_catalog_dispatch` 决定，因此
+    /// 判定为 true 不代表任意身份都会被发出去。
+    pub fn supports_work_catalog_refresh(&self, source_key: &str) -> bool {
+        is_comic_catalog_source_key(source_key)
+    }
+
+    /// 停用的漫画来源不得被 Work 级刷新自动访问。
+    ///
+    /// MangaDex 是内置来源，启用位直接来自注册表；Komga/Kavita 的 `external_id` 形如
+    /// `<sourceId>:<seriesId>`，启用位属于具体库的 sourceId，而不是固定的来源键。
+    /// 身份形状异常时 fail closed（不请求）。
+    pub async fn comic_catalog_source_enabled(
+        &self,
+        source_key: &str,
+        remote_work_id: &str,
+    ) -> Result<bool, AppError> {
+        let source_id = match source_key {
+            "mangadex" => "mangadex".to_owned(),
+            KOMGA_SOURCE_KEY | KAVITA_SOURCE_KEY => {
+                let (custom_id, _series_id) = split_comic_library_work_ref(remote_work_id)?;
+                if comic_library_source_key(&custom_id)? != source_key {
+                    return Ok(false);
+                }
+                custom_id
+            }
+            _ => return Ok(false),
+        };
+        self.registry.is_enabled(&source_id).await
     }
 
     /// Refresh and persist a MangaDex chapter catalog. Network I/O is completed
@@ -1912,12 +1973,20 @@ impl SourceImportService {
             .await
     }
 
-    /// enrichment 标题精确匹配（契约 §36.8）：CMS10 搜索后取标题完全相等的首条。
-    /// 未配置端点/未命中返回 Ok(None)——不是错误，只是没有匹配。
+    /// CMS10 标题精确匹配：搜索后取标题完全相等的首条并**导入**为新媒体库作品。
+    ///
+    /// 自动补全不再走这里（见 [`Self::enrich_existing_work_from_cms10`]）：它会给同名
+    /// 的本地 Work 另建一份重复作品。保留该方法仅供仍需要「新建作品」语义的调用方。
+    /// 来源未启用、未配置端点或未命中都返回 Ok(None)——不是错误，只是没有匹配。
     pub async fn match_cms10_by_title(
         &self,
         title: &str,
     ) -> Result<Option<crate::services::source_import::ImportedWork>, AppError> {
+        // 停用的来源不得被自动路径搜索或导入：启用位是用户的出站授权，
+        // 端点已配置不等于允许访问。
+        if !self.registry.is_enabled(SOURCE_PROVIDER).await? {
+            return Ok(None);
+        }
         let Some(endpoint) = self.registry.endpoint(SOURCE_PROVIDER).await? else {
             return Ok(None);
         };
@@ -1933,6 +2002,73 @@ impl SourceImportService {
             Some(external_id) => self.import_cms10_candidate(&external_id).await.map(Some),
             None => Ok(None),
         }
+    }
+
+    /// Queue eligibility only; the request path still rechecks its endpoint.
+    pub(crate) async fn cms10_enrichment_available(&self) -> Result<bool, AppError> {
+        Ok(self
+            .registry
+            .enabled_endpoint(SOURCE_PROVIDER)
+            .await?
+            .is_some())
+    }
+
+    /// 自动补全：把 CMS10 同标题条目的**缺失**元数据补到既有 Work 上（契约 §36.8）。
+    ///
+    /// 与 [`Self::import_cms10_candidate`] 的边界：这里绝不新建 Work/Edition/MediaItem/
+    /// Resource，也不把播放地址写进本地事实；只把来源条目的展示型元数据（简介/年份/
+    /// 导演/主演/受控海报）与来源身份作为补丁交给 UnitOfWork，由它在单一事务内补齐空缺。
+    /// 来源未启用或未配置端点时返回 [`Cms10WorkMetadataOutcome::SourceUnavailable`]，
+    /// 且不发起任何请求。
+    pub async fn enrich_existing_work_from_cms10(
+        &self,
+        work: &Work,
+    ) -> Result<Cms10WorkMetadataOutcome, AppError> {
+        let Some(endpoint) = self.registry.enabled_endpoint(SOURCE_PROVIDER).await? else {
+            return Ok(Cms10WorkMetadataOutcome::SourceUnavailable);
+        };
+        let candidates = self
+            .catalog
+            .search(SOURCE_PROVIDER, &endpoint, &work.canonical_title, 10)
+            .await?;
+        let Some(entry) = candidates
+            .into_iter()
+            .find(|entry| entry.title == work.canonical_title)
+        else {
+            return Ok(Cms10WorkMetadataOutcome::NotFound);
+        };
+        let poster = match entry.pic.as_deref() {
+            Some(url) => self.register_source_poster(url).await,
+            None => None,
+        };
+        let remote_media_type = entry
+            .media_type
+            .unwrap_or_else(|| derive_media_type(entry.type_name.as_deref(), entry.episodes.len()));
+        // 来源身份的字节形状与显式导入共用同一守卫：形状异常时只补元数据，不绑定引用。
+        let external_id = entry.external_id;
+        let source_ref =
+            if !external_id.trim().is_empty() && external_id.len() <= MAX_CMS10_EXTERNAL_ID_BYTES {
+                Some(WorkEnrichmentSourceRef {
+                    provider: SOURCE_PROVIDER.to_string(),
+                    external_id,
+                })
+            } else {
+                None
+            };
+        let plan = WorkEnrichmentPlan {
+            work_id: work.id,
+            expected_title: work.canonical_title.clone(),
+            remote_media_type,
+            description: entry.content,
+            release_year: entry.year,
+            director: entry.director,
+            actor: entry.actor,
+            poster,
+            source_ref,
+            updated_at: UtcMillis::now(),
+        };
+        let outcome = self.uow.run_work_enrichment(&plan)?;
+        Ok(Cms10WorkMetadataOutcome::Applied(outcome))
     }
 
     /// Read all persisted refresh observations for a Work. The catalog service

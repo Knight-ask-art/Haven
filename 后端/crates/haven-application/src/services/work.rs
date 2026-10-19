@@ -3,7 +3,9 @@ use std::sync::Arc;
 use haven_common::AppError;
 use haven_domain::contracts::{ProgressRepository, StorageLocationRepository, WorkRepository};
 use haven_domain::entities::{FavoriteTarget, MediaItem, Progress, Resource, ResourceLocator};
-use haven_domain::enums::{Availability, MediaType, StorageProviderType, StorageStatus};
+use haven_domain::enums::{
+    Availability, CompletionState, MediaType, StorageProviderType, StorageStatus,
+};
 use haven_domain::ids::WorkId;
 
 use crate::mapper::work_card::{WorkCardInput, work_card};
@@ -53,25 +55,28 @@ impl WorkService {
 
         let mut available_resources = 0u32;
         let mut markers = 0u32;
-        let mut selected = None;
+        let mut actionable = Vec::with_capacity(media_items.len());
         for item in &media_items {
             let resources = self.ports.list_by_media_item(item.id).await?;
+            let mut item_actionable = false;
             for resource in &resources {
                 if self
                     .resource_is_actionable(resource, item.media_type)
                     .await?
                 {
                     available_resources += 1;
-                    selected.get_or_insert(item);
+                    item_actionable = true;
                 }
+            }
+            if item_actionable {
+                actionable.push(item);
             }
             markers += self.ports.list_for_media_item(item.id).await?.len() as u32;
         }
 
-        let progress = match selected {
-            Some(item) => self.progress_for_media_item(item).await?,
-            None => None,
-        };
+        // 与 mapper::primary_action 的规则一致：先在所有可操作条目中找最近有进度的一条，
+        // 无进度时才回退到排序首个可操作条目，避免"续看"跳到第 1 集。
+        let (selected, progress) = self.select_actionable_progress(&actionable).await?;
         let favorite = self
             .ports
             .is_favorite(&FavoriteTarget::Work(work_id))
@@ -168,8 +173,9 @@ impl WorkService {
             let mut available = 0;
             let mut offline_available = 0;
             let mut unavailable = 0;
-            let mut action_item = None;
+            let mut actionable = Vec::new();
             for item in &media_items {
+                let mut item_actionable = false;
                 for resource in self.ports.list_by_media_item(item.id).await? {
                     match resource.availability {
                         haven_domain::enums::Availability::Available => {
@@ -178,7 +184,7 @@ impl WorkService {
                                 .resource_is_actionable(&resource, item.media_type)
                                 .await?
                             {
-                                action_item.get_or_insert(item);
+                                item_actionable = true;
                             }
                         }
                         haven_domain::enums::Availability::OfflineAvailable => {
@@ -187,18 +193,19 @@ impl WorkService {
                                 .resource_is_actionable(&resource, item.media_type)
                                 .await?
                             {
-                                action_item.get_or_insert(item);
+                                item_actionable = true;
                             }
                         }
                         _ => unavailable += 1,
                     }
                 }
+                if item_actionable {
+                    actionable.push(item);
+                }
             }
-            let progress = match action_item {
-                Some(item) => self.progress_for_media_item(item).await?,
-                None => None,
-            };
-            let primary_action = match action_item {
+            // 与 mapper::primary_action 一致：优先最近有进度的可操作条目，否则回退首个。
+            let (progress_item, progress) = self.select_actionable_progress(&actionable).await?;
+            let primary_action = match progress_item {
                 Some(item) => crate::mapper::work_card::primary_action(&WorkCardInput {
                     work: &work,
                     editions: std::slice::from_ref(&edition),
@@ -321,6 +328,34 @@ impl WorkService {
             description: edition.description,
             items,
         })
+    }
+
+    /// 完整加载每个条目的进度（不短路）：主操作选择需要比较所有可操作条目的
+    /// last_active_at，而 comic 条目仍走 Subject 解析。
+    async fn select_actionable_progress<'a>(
+        &self,
+        items: &[&'a MediaItem],
+    ) -> Result<(Option<&'a MediaItem>, Option<Progress>), AppError> {
+        let mut selected = items.first().copied();
+        let mut selected_progress: Option<Progress> = None;
+        for item in items {
+            if let Some(progress) = self.progress_for_media_item(item).await? {
+                if progress.completion != CompletionState::NotStarted
+                    && selected_progress.as_ref().is_none_or(|current| {
+                        current.completion == CompletionState::NotStarted
+                            || progress.last_active_at > current.last_active_at
+                    })
+                {
+                    selected = Some(*item);
+                    selected_progress = Some(progress);
+                } else if selected_progress.is_none()
+                    && selected.is_some_and(|first| first.id == item.id)
+                {
+                    selected_progress = Some(progress);
+                }
+            }
+        }
+        Ok((selected, selected_progress))
     }
 
     async fn progress_for_media_item(

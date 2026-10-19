@@ -47,7 +47,7 @@ pub trait DownloadPorts:
     + Send
     + Sync
 {
-    fn as_download(&self) -> &dyn DownloadRepository;
+    fn as_download(&self) -> &(dyn DownloadRepository + Sync);
     fn as_resource(&self) -> &dyn ResourceRepository;
     fn as_storage(&self) -> &dyn StorageLocationRepository;
     fn as_media_item(&self) -> &dyn MediaItemRepository;
@@ -66,7 +66,7 @@ where
         + Send
         + Sync,
 {
-    fn as_download(&self) -> &dyn DownloadRepository {
+    fn as_download(&self) -> &(dyn DownloadRepository + Sync) {
         self
     }
     fn as_resource(&self) -> &dyn ResourceRepository {
@@ -87,8 +87,25 @@ where
 }
 
 /// 具体传输实现由 Infrastructure 注入；Command 不直接触碰文件或网络。
+#[async_trait]
 pub trait DownloadRunner: Send + Sync {
     fn start(&self, task_id: DownloadTaskId);
+    /// Serialize cleanup with the worker before discarding an unfinished task.
+    /// Non-filesystem runners have no partial file to release.
+    async fn discard_partial(&self, _task: &DownloadTask) -> Result<(), AppError> {
+        Ok(())
+    }
+    /// Filesystem runners keep their worker slot through terminal deletion.
+    async fn remove_task_record(
+        &self,
+        task: &DownloadTask,
+        downloads: &(dyn DownloadRepository + Sync),
+    ) -> Result<bool, AppError> {
+        if task.state != DownloadState::Completed {
+            self.discard_partial(task).await?;
+        }
+        downloads.delete_terminal(task.id).await
+    }
 }
 
 /// 下载长任务的有序进度出口。具体 Channel 注册与发送由 Tauri Interface 实现。
@@ -449,7 +466,11 @@ impl DownloadService {
                 false,
             ));
         }
-        if !self.ports.as_download().delete_terminal(id).await? {
+        if !self
+            .runner
+            .remove_task_record(&task, self.ports.as_download())
+            .await?
+        {
             return Err(AppError::new(
                 "DOWNLOAD_TASK_REMOVE_CONFLICT",
                 ErrorKind::Conflict,
@@ -663,7 +684,12 @@ impl DownloadService {
                 .await?
                 .ok_or_else(|| not_found("DOWNLOAD_TASK_NOT_FOUND", "下载任务不存在"))?;
             let next = match transition.next(current.state) {
-                TransitionResult::Noop => return self.to_dto(current).await,
+                TransitionResult::Noop => {
+                    if matches!(transition, Transition::Cancel) {
+                        self.finish_cancel_cleanup(&current).await?;
+                    }
+                    return self.to_dto(current).await;
+                }
                 TransitionResult::Invalid => {
                     return Err(AppError::new(
                         "DOWNLOAD_STATE_INVALID",
@@ -699,6 +725,9 @@ impl DownloadService {
                     .await?
                     .ok_or_else(|| not_found("DOWNLOAD_TASK_NOT_FOUND", "下载任务不存在"))?;
                 self.events.emit_task(&updated, None);
+                if next == DownloadState::Cancelled {
+                    self.finish_cancel_cleanup(&updated).await?;
+                }
                 return self.to_dto(updated).await;
             }
         }
@@ -708,6 +737,15 @@ impl DownloadService {
             "下载任务状态已变化，请刷新后重试",
             true,
         ))
+    }
+
+    async fn finish_cancel_cleanup(&self, task: &DownloadTask) -> Result<(), AppError> {
+        match self.runner.discard_partial(task).await {
+            // The live worker observes Cancelled and releases its output.
+            // Removing the record still requires successful idle cleanup.
+            Err(error) if error.code().as_str() == "DOWNLOAD_CLEANUP_BUSY" => Ok(()),
+            result => result,
+        }
     }
 
     async fn to_dto(&self, task: DownloadTask) -> Result<DownloadTaskDto, AppError> {

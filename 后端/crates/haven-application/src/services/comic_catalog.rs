@@ -273,7 +273,17 @@ impl ComicCatalogService {
         Ok(catalog_to_dto(&catalog))
     }
 
-    /// Refresh every MangaDex source attached to a Work independently.
+    /// Refresh every comic source attached to a Work independently.
+    ///
+    /// The refreshed source set is exactly the comic-catalog source keys
+    /// (`mangadex` + `komga` + `kavita`, via
+    /// `SourceImportService::supports_work_catalog_refresh`): a Work may carry
+    /// source refs from providers that have no chapter-catalog routing, and
+    /// sending those to the catalog refresh would only produce fabricated
+    /// failures. Komga/Kavita refs store their library identity inside
+    /// `external_id`, so the enabled check resolves the concrete sourceId
+    /// instead of the fixed source key; a disabled source is skipped and no
+    /// request is issued.
     ///
     /// Each provider request and each source transaction is isolated from the
     /// others. A remote-source observation failure is represented by its
@@ -297,10 +307,19 @@ impl ComicCatalogService {
         let source_refs = WorkRepository::list_source_refs(ports.as_work(), work_id).await?;
         validate_work_scope(work_id, &source_refs, &[])?;
 
-        for source_ref in source_refs
-            .iter()
-            .filter(|source_ref| source_ref.provider == "mangadex")
-        {
+        for source_ref in source_refs.iter().filter(|source_ref| {
+            self.source_import
+                .supports_work_catalog_refresh(&source_ref.provider)
+        }) {
+            // 停用的漫画来源（例如已登记的 Komga/Kavita 库）不发起请求：启用位是
+            // 用户的出站授权，端点已配置不等于允许访问。
+            if !self
+                .source_import
+                .comic_catalog_source_enabled(&source_ref.provider, &source_ref.external_id)
+                .await?
+            {
+                continue;
+            }
             if let Err(error) = self
                 .source_import
                 .refresh_comic_chapter_catalog_for_work(
@@ -328,6 +347,14 @@ impl ComicCatalogService {
             }
         }
 
+        self.work_catalog_refresh_result(work_id).await
+    }
+
+    /// 刷新后重新聚合 Work 目录并叠加最新 Receipt 摘要。
+    async fn work_catalog_refresh_result(
+        &self,
+        work_id: WorkId,
+    ) -> Result<ComicWorkChapterCatalogRefreshResult, AppError> {
         let mut catalog = self
             .work_catalog_get(ComicWorkChapterCatalogRequest {
                 work_id: Some(work_id),

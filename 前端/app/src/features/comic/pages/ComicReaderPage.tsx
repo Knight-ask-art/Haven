@@ -457,6 +457,13 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
   const [stripViewportWidth, setStripViewportWidth] = useState(760)
   const [stripHeights, setStripHeights] = useState<Record<number, number>>({})
   const stripModeInitializedRef = useRef(false)
+  const stripNavigationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => {
+    if (stripNavigationTimerRef.current !== null) {
+      clearTimeout(stripNavigationTimerRef.current)
+      stripNavigationTimerRef.current = null
+    }
+  }, [readerSessionIdentity, viewMode])
   const previousStripOffsetsRef = useRef<readonly number[] | null>(null)
   const previousStripAnchorPageRef = useRef<number | null>(null)
 
@@ -464,6 +471,7 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
   const [imageDimensions, setImageDimensions] = useState<Record<number, { width: number, height: number }>>({})
   const progressControllerRef = useRef<ComicProgressController | null>(null)
   const restoredProgressRef = useRef<string | null>(null)
+  const [progressRestoredIdentity, setProgressRestoredIdentity] = useState<string | null>(null)
   const markerListRequestRef = useRef(0)
   const bookmarkOperationRef = useRef(0)
 
@@ -478,6 +486,7 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     setIsBookmarkPending(false)
     setMarkersLoaded(false)
     restoredProgressRef.current = null
+    setProgressRestoredIdentity(demoMode ? "demo" : null)
     setCurrentPage(1)
     setViewMode("single")
     setDirection("rtl")
@@ -491,7 +500,7 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     previousStripOffsetsRef.current = null
     previousStripAnchorPageRef.current = null
     setEditionFilter(null)
-  }, [readerSessionIdentity])
+  }, [demoMode, readerSessionIdentity])
 
   useEffect(() => {
     if (!readerSessionIdentity || comicSettingsState.status === "loading") return
@@ -574,14 +583,16 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     if (totalPages <= 0 || sessionView.status !== "ready" || state.status !== "ready" || manifestState.status !== "ready") return
     const restored = restoreComicProgress(totalPages, state.session, restoredProgressRef)
     if (restored) setCurrentPage(restored.pageIndex)
-  }, [manifestState.status, sessionIdentity, sessionView.status, state, totalPages])
+    setProgressRestoredIdentity(readerSessionIdentity)
+  }, [manifestState.status, readerSessionIdentity, sessionIdentity, sessionView.status, state, totalPages])
 
   // currentPage 变化时向进度控制器上报（Tauri 环境节流）。
   useEffect(() => {
-    if (isTauriRuntime() && sessionView.status === "ready" && manifestState.status === "ready") {
+    if (isTauriRuntime() && sessionView.status === "ready" && manifestState.status === "ready"
+      && readerSessionIdentity !== null && progressRestoredIdentity === readerSessionIdentity) {
       progressControllerRef.current?.pageChange(currentPage)
     }
-  }, [currentPage, manifestState.status, sessionView.status])
+  }, [currentPage, manifestState.status, progressRestoredIdentity, readerSessionIdentity, sessionView.status])
 
   useEffect(() => {
     if (totalPages <= 0) return
@@ -787,68 +798,6 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     return () => document.removeEventListener("fullscreenchange", handleFullscreenChange)
   }, [])
 
-  // 翻页控制
-  const nextPage = useCallback(() => {
-    setCurrentPage((prev) => {
-      if (viewMode !== "double") return Math.min(totalPages, prev + 1)
-      const currentSpread = getSpreadForPage(prev)
-      const currentIndex = spreads.findIndex((spread) => spread === currentSpread)
-      const nextSpread = spreads[currentIndex + 1]
-      return nextSpread ? nextSpread[0] : totalPages
-    })
-    resetAutoHideTimer()
-  }, [getSpreadForPage, resetAutoHideTimer, spreads, totalPages, viewMode])
-
-  const prevPage = useCallback(() => {
-    setCurrentPage((prev) => {
-      if (viewMode !== "double") return Math.max(1, prev - 1)
-      const currentSpread = getSpreadForPage(prev)
-      const currentIndex = spreads.findIndex((spread) => spread === currentSpread)
-      return currentIndex > 0 ? spreads[currentIndex - 1][0] : 1
-    })
-    resetAutoHideTimer()
-  }, [getSpreadForPage, resetAutoHideTimer, spreads, viewMode])
-
-  // 按阅读方向处理左右点击翻页
-  const handleLeftClick = () => {
-    if (direction === "rtl") {
-      nextPage() // 日漫: 点击左侧前进
-    } else {
-      prevPage() // 国漫: 点击左侧后退
-    }
-  }
-
-  const handleRightClick = () => {
-    if (direction === "rtl") {
-      prevPage() // 日漫: 点击右侧后退
-    } else {
-      nextPage() // 国漫: 点击右侧前进
-    }
-  }
-
-  // 键盘快捷键监听
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "ArrowLeft") {
-        if (direction === "rtl") nextPage()
-        else prevPage()
-      } else if (e.key === "ArrowRight") {
-        if (direction === "rtl") prevPage()
-        else nextPage()
-      } else if (e.key === " ") {
-        e.preventDefault()
-        nextPage()
-      } else if (e.key === "Escape") {
-        setIsDrawerOpen(false)
-      } else if (e.key === "f" || e.key === "F") {
-        toggleFullscreen()
-      }
-    }
-
-    window.addEventListener("keydown", handleKeyDown)
-    return () => window.removeEventListener("keydown", handleKeyDown)
-  }, [direction, nextPage, prevPage])
-
   // 全屏切换
   const toggleFullscreen = () => {
     if (!document.fullscreenElement) {
@@ -925,6 +874,7 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
   }, [preloadRadius, totalPages])
 
   const handleStripScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
+    if (!stripModeInitializedRef.current) return
     const container = e.currentTarget
     const scrollTop = container.scrollTop
     const containerCenter = scrollTop + container.clientHeight / 2
@@ -952,20 +902,55 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     })
   }, [currentPage, getStripPageOffset, getStripWindowForPage, totalPages])
 
-  // 进度条拖动响应
-  const handleSliderChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const page = Number(e.target.value)
+  // 所有显式跳页入口共用此动作；自然滚动仍由 handleStripScroll 回报可视页。
+  const goToPage = useCallback((requestedPage: number) => {
+    const page = Math.max(1, Math.min(totalPages, requestedPage))
     setCurrentPage(page)
     if (viewMode === "strip" && stripScrollRef.current) {
       setStripWindow(getStripWindowForPage(page))
-      window.setTimeout(() => {
+      if (stripNavigationTimerRef.current !== null) clearTimeout(stripNavigationTimerRef.current)
+      stripNavigationTimerRef.current = setTimeout(() => {
+        stripNavigationTimerRef.current = null
         const container = stripScrollRef.current
         if (container) {
-          container.scrollTo({ top: getStripPageOffset(page) - container.clientHeight / 2 + getStripPageHeight(page) / 2, behavior: "smooth" })
+          container.scrollTo({ top: getStripPageOffset(page) - container.clientHeight / 2 + getStripPageHeight(page) / 2, behavior: "auto" })
         }
       }, 0)
     }
-  }
+    resetAutoHideTimer()
+  }, [getStripPageHeight, getStripPageOffset, getStripWindowForPage, resetAutoHideTimer, totalPages, viewMode])
+
+  const nextPage = useCallback(() => {
+    if (viewMode !== "double") return goToPage(currentPage + 1)
+    const index = spreads.findIndex((spread) => spread === getSpreadForPage(currentPage))
+    goToPage(spreads[index + 1]?.[0] ?? totalPages)
+  }, [currentPage, getSpreadForPage, goToPage, spreads, totalPages, viewMode])
+
+  const prevPage = useCallback(() => {
+    if (viewMode !== "double") return goToPage(currentPage - 1)
+    const index = spreads.findIndex((spread) => spread === getSpreadForPage(currentPage))
+    goToPage(index > 0 ? spreads[index - 1][0] : 1)
+  }, [currentPage, getSpreadForPage, goToPage, spreads, viewMode])
+
+  const handleLeftClick = () => direction === "rtl" ? nextPage() : prevPage()
+  const handleRightClick = () => direction === "rtl" ? prevPage() : nextPage()
+  const handleSliderChange = (e: React.ChangeEvent<HTMLInputElement>) => goToPage(Number(e.target.value))
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target instanceof HTMLElement ? e.target : null
+      if (e.defaultPrevented || target?.closest("input, textarea, select, button, [contenteditable='true'], [role='slider']")) return
+      if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === " ") {
+        e.preventDefault()
+        if (e.key === " ") nextPage()
+        else if ((e.key === "ArrowLeft") === (direction === "rtl")) nextPage()
+        else prevPage()
+      } else if (e.key === "Escape") setIsDrawerOpen(false)
+      else if (e.key === "f" || e.key === "F") toggleFullscreen()
+    }
+    window.addEventListener("keydown", handleKeyDown)
+    return () => window.removeEventListener("keydown", handleKeyDown)
+  }, [direction, nextPage, prevPage])
 
   // 触屏：中心轻点显示工具栏，边缘轻点和左右滑动翻页，双指手势缩放。
   const getTouchDistance = (touches: React.TouchList) => {
@@ -1049,16 +1034,21 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     const resizeObserver = new ResizeObserver(updateViewportWidth)
     resizeObserver.observe(container)
     return () => resizeObserver.disconnect()
-  }, [viewMode])
+  }, [totalPages, viewMode])
 
   useEffect(() => {
     if (viewMode !== "strip") {
       stripModeInitializedRef.current = false
       return
     }
+    if (!sequence || totalPages <= 0 || !readerSessionIdentity
+      || progressRestoredIdentity !== readerSessionIdentity || !stripScrollRef.current) {
+      stripModeInitializedRef.current = false
+      return
+    }
     if (stripModeInitializedRef.current) return
-    stripModeInitializedRef.current = true
-    setStripWindow(getStripWindowForPage(currentPage))
+    const window = getStripWindowForPage(currentPage)
+    setStripWindow((previous) => previous.start === window.start && previous.end === window.end ? previous : window)
     const frame = requestAnimationFrame(() => {
       const container = stripScrollRef.current
       if (!container) return
@@ -1066,9 +1056,10 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
         top: getStripPageOffset(currentPage) - container.clientHeight / 2 + getStripPageHeight(currentPage) / 2,
         behavior: "auto",
       })
+      stripModeInitializedRef.current = true
     })
     return () => cancelAnimationFrame(frame)
-  }, [currentPage, getStripPageHeight, getStripPageOffset, getStripWindowForPage, totalPages, viewMode])
+  }, [currentPage, getStripPageHeight, getStripPageOffset, getStripWindowForPage, progressRestoredIdentity, readerSessionIdentity, sequence, totalPages, viewMode])
 
   if (!demoMode && (!sequence || manifestState.status !== "ready")) {
     return (
@@ -1508,17 +1499,7 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                   key={pageNum}
                   type="button"
                   onClick={() => {
-                    setCurrentPage(pageNum)
-                    if (viewMode === "strip") {
-                      setStripWindow(getStripWindowForPage(pageNum))
-                      window.setTimeout(() => {
-                        const container = stripScrollRef.current
-                        if (container) container.scrollTo({
-                          top: getStripPageOffset(pageNum) - container.clientHeight / 2 + getStripPageHeight(pageNum) / 2,
-                          behavior: "smooth",
-                        })
-                      }, 0)
-                    }
+                    goToPage(pageNum)
                     setIsDrawerOpen(false)
                   }}
                   className={cn(

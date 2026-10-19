@@ -970,20 +970,39 @@ export function PlayerPage() {
     return () => window.removeEventListener("keydown", onKeyDown)
   }, [handleVideoScreenshot])
 
-  // 快捷键支持 (Space / F)
+  // 快捷键支持 (Space / F / ← →)
   useEffect(() => {
+    // 交互控件自己处理按键（输入框、下拉、按钮、滑块、菜单、对话框等），全局处理器必须让路，
+    // 否则滑块的方向键会被二次 seek、下拉框无法切换选项、聚焦按钮时空格会被劫持。
+    const KEY_OWNING_ROLES = [
+      "slider", "spinbutton", "combobox", "listbox", "option", "menu", "menubar",
+      "menuitem", "menuitemradio", "menuitemcheckbox", "dialog", "alertdialog", "tablist", "tab",
+      "textbox", "searchbox", "switch", "checkbox", "radio", "tree", "treeitem", "grid",
+    ].map((role) => `[role='${role}']`).join(",")
+    const ownsKey = (target: EventTarget | null) => {
+      const element = target instanceof HTMLElement ? target : null
+      if (!element) return false
+      return element.isContentEditable
+        || element.closest(`input, textarea, select, button, a, summary, ${KEY_OWNING_ROLES}, [contenteditable]:not([contenteditable='false'])`) !== null
+    }
     const handleKeyDown = (e: KeyboardEvent) => {
+      // 已被更具体的处理器（如进度条滑块）消费的按键不再重复处理。
+      if (e.defaultPrevented || e.isComposing) return
       if (e.code === "Space") {
+        if (ownsKey(e.target)) return
         e.preventDefault()
         togglePlay()
         resetHideTimer()
       } else if (e.code === "KeyF") {
+        if (ownsKey(e.target)) return
         e.preventDefault()
         toggleFullscreen()
       } else if (e.code === "ArrowRight") {
+        if (ownsKey(e.target)) return
         if (videoRef.current) handleSeek(videoRef.current.currentTime + 5)
         resetHideTimer()
       } else if (e.code === "ArrowLeft") {
+        if (ownsKey(e.target)) return
         if (videoRef.current) handleSeek(videoRef.current.currentTime - 5)
         resetHideTimer()
       }

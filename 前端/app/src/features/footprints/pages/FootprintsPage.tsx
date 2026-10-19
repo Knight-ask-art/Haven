@@ -159,6 +159,7 @@ function buildMarkerItems(): MarkerItem[] {
 }
 
 function getMarkerRoute(mode: string, mediaItemId: string): string {
+  if (mode === "video") return `/player/${mediaItemId}`
   if (mode === "comic") return `/comic/${mediaItemId}`
   if (mode === "article") return `/article/${mediaItemId}`
   return `/reader/${mediaItemId}`

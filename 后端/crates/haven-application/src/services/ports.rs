@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use async_trait::async_trait;
-use haven_common::AppError;
+use haven_common::{AppError, UtcMillis};
 use haven_domain::comic_catalog::{ComicCatalogRefreshReceipt, ComicChapterCatalogState};
 use haven_domain::comic_identity::{
     ChapterSourceRef, ComicProgressMigrationSnapshot, EditionProfile, PageIdentity,
@@ -18,7 +18,10 @@ use haven_domain::contracts::{
     MediaItemRepository, ProgressRepository, ResourceRepository, SettingsRepository,
     StorageLocationRepository, WorkRepository,
 };
-use haven_domain::entities::{Edition, FavoriteTarget, MediaItem, Progress, Resource, Work};
+use haven_domain::entities::{
+    ArtworkRef, Edition, FavoriteTarget, MediaItem, Progress, Resource, Work,
+};
+use haven_domain::enums::MediaType;
 use haven_domain::ids::{ComicCatalogRefreshId, ComicProgressMigrationId, MediaItemId, WorkId};
 use haven_domain::periodical::{Periodical, PeriodicalArticle, PeriodicalIssue, PeriodicalVolume};
 
@@ -367,6 +370,76 @@ pub trait UnitOfWork: Send + Sync {
             false,
         ))
     }
+
+    /// 把一次「自动补全」的缺失元数据补丁应用到**既有** Work。
+    ///
+    /// 补丁只提供候选值，因此实现必须在同一事务内重新读取目标 Work 后**只补空缺**：
+    /// 不改写已有值（含用户编辑），不改变 identity、Work 类型或任何本地关系，也不
+    /// 新建 Work/Edition/MediaItem/Resource。默认实现给不支持该事务的测试替身返回
+    /// 明确的 Unsupported，避免退化成事务外的读-改-写或整包覆盖写。
+    fn run_work_enrichment(
+        &self,
+        _plan: &WorkEnrichmentPlan,
+    ) -> Result<WorkEnrichmentOutcome, AppError> {
+        Err(AppError::new(
+            "WORK_ENRICHMENT_UOW_UNAVAILABLE",
+            haven_common::ErrorKind::Internal,
+            "当前 UnitOfWork 不支持作品元数据补全事务",
+            false,
+        ))
+    }
+}
+
+/// 一次「自动补全」对既有 Work 的**元数据补丁**。
+///
+/// 只携带来源条目的展示型元数据与受控海报引用：不含播放地址、集数、远端请求细节
+/// 或本地路径。语义是「只补空缺」——实现方绝不能覆盖 Work 上已有的值，也不能据此
+/// 创建任何新的 Work/Edition/MediaItem/Resource。
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkEnrichmentPlan {
+    pub work_id: WorkId,
+    /// 事务内 CAS 前置条件：目标 Work 的标题必须仍与该值完全相等。标题在事务外被
+    /// 改写（用户改名）后，本次匹配结果不再可信，整个补丁必须放弃。
+    pub expected_title: String,
+    /// 来源条目的媒介类型（Application 已按 `type_name`/集数推导）。实现方据此拒绝
+    /// 把视频元数据套到非视频作品（例如同名书籍）上。
+    pub remote_media_type: MediaType,
+    /// 以下字段是候选值：`None` 表示来源没有该字段，`Some` 也只用于补空缺。
+    pub description: Option<String>,
+    pub release_year: Option<i32>,
+    pub director: Option<String>,
+    pub actor: Option<String>,
+    /// 受控海报引用（`haven://artwork/<id>`）；外部 URL 已在事务外经图片代理注册。
+    pub poster: Option<ArtworkRef>,
+    /// 可选的来源身份绑定；只在安全时（目标 Work 尚无任何来源引用且该身份未被其它
+    /// Work 占用）由实现方绑定，见 [`WorkEnrichmentOutcome`]。
+    pub source_ref: Option<WorkEnrichmentSourceRef>,
+    pub updated_at: UtcMillis,
+}
+
+/// 自动补全可以绑定的来源身份（`work_source_refs` 的键）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkEnrichmentSourceRef {
+    pub provider: String,
+    pub external_id: String,
+}
+
+/// 一次元数据补丁的事务内结果。
+///
+/// 前两项都表示「本次补全成立」（来源条目与目标 Work 匹配），区别只在有没有真正写入；
+/// 后三项表示补丁被放弃，调用方不得把状态记成已补全。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkEnrichmentOutcome {
+    /// 至少写入了一列（元数据或来源身份）。
+    Applied,
+    /// 目标 Work 已具备全部候选字段且没有可绑定的来源身份：没有任何写入。
+    NothingToFill,
+    /// 目标 Work 已不存在（删除竞态）。
+    WorkMissing,
+    /// 目标 Work 的标题已变化，本次匹配结果不再可信。
+    TitleChanged,
+    /// 目标 Work 的版本类型与来源条目的媒介类型不同类（例如同名书籍与视频）。
+    MediaTypeMismatch,
 }
 
 /// 一次报刊文章导入的完整原子写入计划。

@@ -14,8 +14,9 @@ use haven_application::services::download_batch::DownloadBatchService;
 use haven_application::services::ports::RemoteAcquisitionPort;
 use haven_application::services::settings::SettingsService;
 use haven_application::services::source_import::{
-    source_key_for_id, validate_remote_source_object,
+    source_key_for_id, split_comic_library_chapter_remote_id, validate_remote_source_object,
 };
+use haven_application::services::source_registry::SourceRegistryService;
 use haven_application::services::{DownloadEventSink, DownloadRunner, OfflineResourceFiles};
 use haven_common::{AppError, ErrorKind};
 use haven_domain::contracts::{DownloadRepository, ResourceRepository, StorageLocationRepository};
@@ -166,16 +167,29 @@ impl DownloadScheduler {
         }
     }
 
+    #[cfg(test)]
     async fn acquire(
         self: &Arc<Self>,
         task: &DownloadTask,
         settings: &SettingsService,
     ) -> DownloadPermit {
+        self.acquire_inner(task, settings, None)
+            .await
+            .expect("unconditional admission")
+    }
+
+    async fn acquire_inner(
+        self: &Arc<Self>,
+        task: &DownloadTask,
+        settings: &SettingsService,
+        repos: Option<&SqliteRepositories>,
+    ) -> Option<DownloadPermit> {
         let provider = task
             .provider_key
             .clone()
             .unwrap_or_else(|| "default".into());
         let host = task.host_key.clone().unwrap_or_else(|| "default".into());
+        let enforce_host_limit = !matches!(provider.as_str(), "local" | "feed");
         let weight = priority_weight(task.priority);
         loop {
             // 通知 future 必须先 pin + enable 再读取设置/检查计数：
@@ -185,6 +199,13 @@ impl DownloadScheduler {
             tokio::pin!(notified);
             notified.as_mut().enable();
             let policy = load_download_policy(settings).await;
+            if let Some(repos) = repos {
+                if !matches!(repos.download.get(task.id).await,
+                    Ok(Some(current)) if matches!(current.state, DownloadState::Queued | DownloadState::Interrupted))
+                {
+                    return None;
+                }
+            }
             let (acquired, token_wait) = {
                 let mut global = self
                     .global_active
@@ -209,7 +230,7 @@ impl DownloadScheduler {
                 bucket.last_refill = Instant::now();
                 let host_count = hosts.get(&host).copied().unwrap_or(0);
                 if *global < policy.max_concurrent
-                    && host_count < HOST_MAX_CONCURRENT
+                    && (!enforce_host_limit || host_count < HOST_MAX_CONCURRENT)
                     && bucket.tokens >= 1.0
                 {
                     *global += 1;
@@ -221,11 +242,11 @@ impl DownloadScheduler {
                 }
             };
             if acquired {
-                return DownloadPermit {
+                return Some(DownloadPermit {
                     scheduler: Arc::clone(self),
                     provider,
                     host,
-                };
+                });
             }
             // 计数/Host 满时只等通知；Token 不足时补液没有通知源，
             // 必须同时等一个按当前补液速率算出的截止时间，否则会永久挂起。
@@ -433,17 +454,28 @@ impl LocalDownloadRunner {
 
     async fn run(&self, task_id: DownloadTaskId) {
         // 先取任务以获取 provider/host/priority（三层调度入参），再申请准入槽位。
-        let Some(task) = self.repos.download.get(task_id).await.ok().flatten() else {
+        let Some(mut task) = self.repos.download.get(task_id).await.ok().flatten() else {
             self.active
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .remove(&task_id);
             return;
         };
-        let _permit = self.scheduler.acquire(&task, &self.settings).await;
+        // Derive admission identity from the current owned Resource, including
+        // old/batch tasks whose persisted scheduler fields were never filled.
+        let (provider, host) = self.scheduling_identity(&task).await;
+        task.provider_key = Some(provider);
+        task.host_key = Some(host);
+        let permit = self
+            .scheduler
+            .acquire_inner(&task, &self.settings, Some(&self.repos))
+            .await;
         let policy = load_download_policy(&self.settings).await;
         let mut failure = None;
         for attempt in 0..=MAX_WORKER_RETRIES {
+            if permit.is_none() {
+                break;
+            }
             match self.run_inner(task_id, policy).await {
                 Ok(()) => break,
                 Err(error) if error.retryable && attempt < MAX_WORKER_RETRIES => {
@@ -490,11 +522,62 @@ impl LocalDownloadRunner {
             .remove(&task_id);
         // Resume 可能与旧 Worker 退出同时发生。旧 Worker 释放去重标记后再次检查，
         // 确保该竞态不会把已转回 Queued 的任务永久遗留在队列中。
-        if matches!(
-            self.repos.download.get(task_id).await,
-            Ok(Some(task)) if task.state == DownloadState::Queued
-        ) {
-            self.start(task_id);
+        if let Ok(Some(task)) = self.repos.download.get(task_id).await {
+            if task.state == DownloadState::Queued {
+                self.start(task_id);
+            } else if task.state == DownloadState::Cancelled {
+                // Cancellation can arrive after a paused worker's last state
+                // read. Reconcile after releasing the slot so either this
+                // worker or the cancelling call can claim cleanup.
+                let _ = self.discard_partial(&task).await;
+            }
+        }
+    }
+
+    async fn scheduling_identity(&self, task: &DownloadTask) -> (String, String) {
+        let Ok(Some(resource)) = self.repos.resource.get(task.source_resource_id).await else {
+            return ("unknown".into(), "unknown-network".into());
+        };
+        match &resource.locator {
+            ResourceLocator::LocalPath { .. } | ResourceLocator::StorageObject { .. } => {
+                ("local".into(), "non-network".into())
+            }
+            ResourceLocator::SourceObject {
+                source_id,
+                remote_id,
+            } => {
+                let Some(source_key) = source_key_for_id(*source_id) else {
+                    return ("unknown".into(), "unknown-network".into());
+                };
+                if source_key == "feed" {
+                    return ("feed".into(), "non-network".into());
+                }
+                let source_id = if matches!(source_key, "komga" | "kavita") {
+                    match split_comic_library_chapter_remote_id(remote_id) {
+                        Ok((source_id, _, _)) => source_id,
+                        Err(_) => return (source_key.to_owned(), "unknown-network".into()),
+                    }
+                } else {
+                    source_key.to_owned()
+                };
+                let registry = SourceRegistryService::new(self.repos.clone());
+                let endpoint = match source_key {
+                    "mangadex" => Some(crate::online_sources::MANGADEX_API.to_owned()),
+                    "arxiv" => Some(crate::online_sources::ARXIV_API.to_owned()),
+                    "europepmc" => Some(crate::online_sources::EUROPE_PMC_API.to_owned()),
+                    "wikisource" => Some(crate::online_sources::WIKISOURCE_API.to_owned()),
+                    _ => registry.endpoint(&source_id).await.ok().flatten(),
+                };
+                let host = endpoint
+                    .and_then(|endpoint| reqwest::Url::parse(&endpoint).ok())
+                    .and_then(|url| {
+                        url.host_str()
+                            .map(|host| format!("http-host:{}", host.to_ascii_lowercase()))
+                    })
+                    .unwrap_or_else(|| "unknown-network".into());
+                (source_key.to_owned(), host)
+            }
+            _ => ("unknown".into(), "unknown-network".into()),
         }
     }
 
@@ -620,6 +703,9 @@ impl LocalDownloadRunner {
                 false,
             ));
         }
+        let mut source = File::open(&source_path)
+            .await
+            .map_err(|error| io_failure(&error, "DOWNLOAD_SOURCE_UNAVAILABLE"))?;
 
         let offline_dir = download_category_dir(Path::new(&storage.root_ref), &resource);
         fs::create_dir_all(&offline_dir)
@@ -630,7 +716,10 @@ impl LocalDownloadRunner {
         let part_path = offline_dir.join(format!("{}.part", task_id));
 
         match fs::metadata(&final_path).await {
-            Ok(final_meta) if final_meta.len() == total => {
+            Ok(final_meta)
+                if final_meta.len() == total
+                    && file_prefix_matches(&mut source, &final_path, total).await? =>
+            {
                 let offline = match self
                     .ensure_offline_resource(&resource, task.target_storage_id, &final_path, total)
                     .await
@@ -716,11 +805,16 @@ impl LocalDownloadRunner {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
             Err(error) => return Err(io_failure(&error, "DOWNLOAD_DIRECTORY_UNAVAILABLE")),
         };
+        // A path and byte count are not a source identity. Verify the saved
+        // prefix against the file opened for this attempt before appending.
+        if partial > 0 && !file_prefix_matches(&mut source, &part_path, partial).await? {
+            fs::remove_file(&part_path)
+                .await
+                .map_err(|error| io_failure(&error, "DOWNLOAD_DIRECTORY_UNAVAILABLE"))?;
+            partial = 0;
+        }
         self.ensure_space(&offline_dir, total.saturating_sub(partial))
             .await?;
-        let mut source = File::open(&source_path)
-            .await
-            .map_err(|error| io_failure(&error, "DOWNLOAD_SOURCE_UNAVAILABLE"))?;
         source
             .seek(std::io::SeekFrom::Start(partial))
             .await
@@ -868,6 +962,25 @@ impl LocalDownloadRunner {
             .map_err(|error| io_failure(&error, "DOWNLOAD_PARTIAL_INVALID"))?;
         if part_meta.len() != total {
             return Err(DownloadWorkerFailure::new("DOWNLOAD_PARTIAL_INVALID", true));
+        }
+        // Reopen the current source to detect replacement/in-place edits during
+        // transfer as well as changes made while the task was paused.
+        let mut verification_source = File::open(&source_path)
+            .await
+            .map_err(|error| io_failure(&error, "DOWNLOAD_SOURCE_UNAVAILABLE"))?;
+        let current_size = verification_source
+            .metadata()
+            .await
+            .map_err(|error| io_failure(&error, "DOWNLOAD_SOURCE_UNAVAILABLE"))?
+            .len();
+        if current_size != total
+            || !file_prefix_matches(&mut verification_source, &part_path, total).await?
+        {
+            let _ = fs::remove_file(&part_path).await;
+            return Err(DownloadWorkerFailure::new(
+                "DOWNLOAD_SOURCE_UNAVAILABLE",
+                false,
+            ));
         }
         // 同一目录内 rename 是原子的；完成态之前不暴露最终文件。
         fs::rename(&part_path, &final_path)
@@ -1311,6 +1424,84 @@ impl LocalDownloadRunner {
         }
     }
 
+    async fn discard_idle_partial(&self, task: &DownloadTask) -> Result<(), AppError> {
+        let Some(current) = self.repos.download.get(task.id).await? else {
+            return Ok(());
+        };
+        if !matches!(
+            current.state,
+            DownloadState::Cancelled | DownloadState::Failed
+        ) {
+            return Err(AppError::new(
+                "DOWNLOAD_STATE_CONFLICT",
+                ErrorKind::Conflict,
+                "下载任务状态已变化，请刷新后重试",
+                true,
+            ));
+        }
+        let storage = self
+            .repos
+            .storage_location
+            .get(current.target_storage_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::new(
+                    "DOWNLOAD_DIRECTORY_UNAVAILABLE",
+                    ErrorKind::Io,
+                    "下载目录不可用，请恢复存储位置后重试清理",
+                    true,
+                )
+            })?;
+        if storage.provider_type != StorageProviderType::Local {
+            return Err(AppError::new(
+                "DOWNLOAD_DIRECTORY_UNAVAILABLE",
+                ErrorKind::Validation,
+                "该存储位置不支持本地临时文件清理",
+                false,
+            ));
+        }
+        let io_error = || {
+            AppError::new(
+                "DOWNLOAD_PARTIAL_CLEANUP_FAILED",
+                ErrorKind::Io,
+                "无法清理下载临时文件，请稍后重试",
+                true,
+            )
+        };
+        let root = fs::canonicalize(&storage.root_ref)
+            .await
+            .map_err(|_| io_error())?;
+        for category in ["books", "comics", "articles"] {
+            let directory = match fs::canonicalize(root.join(category)).await {
+                Ok(directory) => directory,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return Err(io_error()),
+            };
+            if directory == root || !directory.starts_with(&root) {
+                return Err(AppError::new(
+                    "SECURITY_POLICY_DENIED",
+                    ErrorKind::Security,
+                    "下载临时目录不在登记存储位置内",
+                    false,
+                ));
+            }
+            let partial = directory.join(format!("{}.part", current.id));
+            match fs::symlink_metadata(&partial).await {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    match fs::remove_file(&partial).await {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(_) => return Err(io_error()),
+                    }
+                }
+                Ok(_) => return Err(io_error()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(io_error()),
+            }
+        }
+        Ok(())
+    }
+
     async fn remove_partial_if_cancelled(&self, task_id: DownloadTaskId, part_path: &Path) {
         if matches!(
             self.repos.download.get(task_id).await,
@@ -1390,6 +1581,7 @@ async fn resolve_registered_local_source(
     Ok(canonical)
 }
 
+#[async_trait]
 impl DownloadRunner for LocalDownloadRunner {
     fn start(&self, task_id: DownloadTaskId) {
         let should_start = self
@@ -1411,6 +1603,103 @@ impl DownloadRunner for LocalDownloadRunner {
         };
         handle.spawn(async move { runner.run(task_id).await });
     }
+
+    async fn discard_partial(&self, task: &DownloadTask) -> Result<(), AppError> {
+        self.cleanup_task(task, false).await.map(|_| ())
+    }
+
+    async fn remove_task_record(
+        &self,
+        task: &DownloadTask,
+        _downloads: &(dyn DownloadRepository + Sync),
+    ) -> Result<bool, AppError> {
+        self.cleanup_task(task, true).await
+    }
+}
+
+impl LocalDownloadRunner {
+    async fn cleanup_task(
+        &self,
+        task: &DownloadTask,
+        remove_record: bool,
+    ) -> Result<bool, AppError> {
+        self.scheduler.notify.notify_waiters();
+        // Claim the same slot as start(): never unlink a worker's open output.
+        if !self
+            .active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(task.id)
+        {
+            return Err(AppError::new(
+                "DOWNLOAD_CLEANUP_BUSY",
+                ErrorKind::Conflict,
+                "下载正在停止，请稍后重试清理或移除记录",
+                true,
+            ));
+        }
+        let result = async {
+            let Some(current) = self.repos.download.get(task.id).await? else {
+                return Ok(false);
+            };
+            if current.state != DownloadState::Completed {
+                self.discard_idle_partial(&current).await?;
+            }
+            if remove_record {
+                self.repos.download.delete_terminal(task.id).await
+            } else {
+                Ok(true)
+            }
+        }
+        .await;
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&task.id);
+        // A retry may have queued while cleanup owned the worker slot.
+        if matches!(self.repos.download.get(task.id).await, Ok(Some(current)) if current.state == DownloadState::Queued)
+        {
+            self.start(task.id);
+        }
+        result
+    }
+}
+
+async fn file_prefix_matches(
+    source: &mut File,
+    candidate_path: &Path,
+    bytes: u64,
+) -> Result<bool, DownloadWorkerFailure> {
+    source
+        .seek(std::io::SeekFrom::Start(0))
+        .await
+        .map_err(|error| io_failure(&error, "DOWNLOAD_SOURCE_UNAVAILABLE"))?;
+    let mut candidate = File::open(candidate_path)
+        .await
+        .map_err(|error| io_failure(&error, "DOWNLOAD_PARTIAL_INVALID"))?;
+    let mut source_buffer = vec![0; CHUNK_SIZE];
+    let mut candidate_buffer = vec![0; CHUNK_SIZE];
+    let mut remaining = bytes;
+    while remaining > 0 {
+        let length = remaining.min(CHUNK_SIZE as u64) as usize;
+        if let Err(error) = source.read_exact(&mut source_buffer[..length]).await {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Ok(false);
+            }
+            return Err(io_failure(&error, "DOWNLOAD_SOURCE_UNAVAILABLE"));
+        }
+        if let Err(error) = candidate.read_exact(&mut candidate_buffer[..length]).await {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Ok(false);
+            }
+            return Err(io_failure(&error, "DOWNLOAD_PARTIAL_INVALID"));
+        }
+        if source_buffer[..length] != candidate_buffer[..length] {
+            return Ok(false);
+        }
+        remaining -= length as u64;
+    }
+    Ok(true)
 }
 
 async fn throttle_transfer(started: Instant, bytes: u64, limit_bps: u64) {

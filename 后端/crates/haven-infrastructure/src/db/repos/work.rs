@@ -77,6 +77,27 @@ fn parse_enum<T: serde::de::DeserializeOwned>(s: &str) -> rusqlite::Result<T> {
 
 const SELECT_COLUMNS: &str = "id, canonical_title, original_title, sort_title, description, work_type, release_year, language, director, actor, status, rating_value, rating_scale, poster, cover, backdrop, thumbnail, created_at, updated_at";
 
+/// Canonical search-body derivation for full saves and metadata-only patches.
+pub(crate) fn work_search_body(
+    description: Option<&str>,
+    director: Option<&str>,
+    actor: Option<&str>,
+) -> String {
+    let mut body = String::new();
+    if let Some(description) = description {
+        body.push_str(description);
+        body.push(' ');
+    }
+    if let Some(director) = director {
+        body.push_str(director);
+        body.push(' ');
+    }
+    if let Some(actor) = actor {
+        body.push_str(actor);
+    }
+    haven_common::tokenizer::tokenize(&body).join(" ")
+}
+
 /// 在指定连接上保存 Work（普通连接或事务连接复用；scanner 单文件原子写入用）。
 pub(crate) fn save_on_conn(conn: &rusqlite::Connection, work: &Work) -> Result<(), AppError> {
     let [poster, cover, backdrop, thumbnail] = artwork_to_json(&work.artwork)?;
@@ -86,19 +107,11 @@ pub(crate) fn save_on_conn(conn: &rusqlite::Connection, work: &Work) -> Result<(
         .as_ref()
         .map(|s| haven_common::tokenizer::tokenize(s).join(" "))
         .unwrap_or_default();
-    let mut body = String::new();
-    if let Some(desc) = &work.description {
-        body.push_str(desc);
-        body.push(' ');
-    }
-    if let Some(director) = &work.director {
-        body.push_str(director);
-        body.push(' ');
-    }
-    if let Some(actor) = &work.actor {
-        body.push_str(actor);
-    }
-    let search_body = haven_common::tokenizer::tokenize(&body).join(" ");
+    let search_body = work_search_body(
+        work.description.as_deref(),
+        work.director.as_deref(),
+        work.actor.as_deref(),
+    );
     conn.execute(
         "INSERT INTO works
             (id, canonical_title, original_title, sort_title, description, work_type,

@@ -556,6 +556,27 @@ impl ComicProgressSubjectService {
         set_authoritative_pointer(subject, pointer)
     }
 
+    /// Read the last observed manifest even when it is unchanged on reopening;
+    /// remote catalog entries need not carry a page_count themselves.
+    pub(super) async fn known_page_count(
+        &self,
+        media_item_id: MediaItemId,
+    ) -> Result<Option<u32>, AppError> {
+        let snapshot =
+            ComicPageIdentityRepository::get_snapshot(&*self.ports, media_item_id).await?;
+        if snapshot.revision.is_none() {
+            return Ok(None);
+        }
+        u32::try_from(snapshot.pages.len()).map(Some).map_err(|_| {
+            AppError::new(
+                "INVALID_ARGUMENT",
+                ErrorKind::Validation,
+                "漫画页数超出支持范围",
+                false,
+            )
+        })
+    }
+
     pub async fn ensure_for_media_item(
         &self,
         media_item_id: MediaItemId,

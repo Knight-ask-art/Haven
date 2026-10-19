@@ -45,10 +45,10 @@ use crate::comic::page_identity_for_provider;
 use crate::http_security::{pin_client_builder, resolve_public_http_target};
 use crate::periodical::parse_europe_pmc_article;
 
-const MANGADEX_API: &str = "https://api.mangadex.org";
-const ARXIV_API: &str = "https://export.arxiv.org";
+pub(crate) const MANGADEX_API: &str = "https://api.mangadex.org";
+pub(crate) const ARXIV_API: &str = "https://export.arxiv.org";
 pub(crate) const EUROPE_PMC_API: &str = "https://www.ebi.ac.uk/europepmc/webservices/rest";
-const WIKISOURCE_API: &str = "https://zh.wikisource.org/w/api.php";
+pub(crate) const WIKISOURCE_API: &str = "https://zh.wikisource.org/w/api.php";
 
 const MAX_REDIRECTS: usize = 3;
 const MAX_API_BYTES: usize = 8 * 1024 * 1024;
