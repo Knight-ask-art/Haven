@@ -11,7 +11,7 @@ export function LibraryTVHeroInfo({ item }: LibraryTVHeroInfoProps) {
     <div className="relative w-full pt-[64px] md:pt-[96px] px-[32px] max-w-5xl select-none z-10 min-h-[45vh] flex flex-col justify-end pb-[32px]">
       <div className="flex flex-col gap-[16px] animate-in fade-in duration-500">
         
-        {/* 顶栏元数据 Badge 组: New, Year, Rating, Quality, Audio */}
+        {/* 仅展示媒体数据实际提供的元信息。 */}
         <div className="flex flex-wrap items-center gap-3 text-lg md:text-xl font-bold text-white/90 drop-shadow-md">
           {item.badge && (
             <span className="px-[8px] py-0.5 rounded bg-red-600 text-white font-black text-sm uppercase tracking-widest">
@@ -19,12 +19,6 @@ export function LibraryTVHeroInfo({ item }: LibraryTVHeroInfoProps) {
             </span>
           )}
           <span>{item.year}</span>
-          <span className="px-[8px] py-0.5 rounded border border-white/40 text-sm font-extrabold uppercase text-white/80 tracking-wider">
-            {item.type === "movie" ? "HD" : item.type === "tv" ? "4K" : "TEXT"}
-          </span>
-          <span className="px-[8px] py-0.5 rounded border border-white/40 text-sm font-extrabold uppercase text-white/80 tracking-wider">
-            5.1
-          </span>
           {item.rating && (
             <span className="flex items-center gap-1.5 text-amber-400">
               <Star className="w-5 h-5 fill-current" />

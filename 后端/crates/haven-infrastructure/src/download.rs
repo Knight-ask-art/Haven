@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use haven_application::services::download_batch::DownloadBatchService;
-use haven_application::services::ports::RemoteAcquisitionPort;
+use haven_application::services::ports::{
+    RemoteAcquisitionObserver, RemoteAcquisitionProgress, RemoteAcquisitionPort,
+    RemoteTransferContext,
+};
 use haven_application::services::settings::SettingsService;
 use haven_application::services::source_import::{
     source_key_for_id, split_comic_library_chapter_remote_id, validate_remote_source_object,
@@ -39,6 +42,9 @@ const CHUNK_SIZE: usize = 1024 * 1024;
 const DISK_SPACE_RESERVE_BYTES: u64 = 16 * 1024 * 1024;
 const SPACE_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_WORKER_RETRIES: u8 = 2;
+/// 远端获取期间「最新进度」的落库与事件发布间隔（同时是取消/暂停状态轮询间隔）。
+/// 每块网络读取只更新内存里的最新值，不做每块数据库写入。
+const REMOTE_PROGRESS_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DownloadWorkerFailure {
@@ -338,6 +344,36 @@ impl RemoteAcquisitionPort for UnavailableRemoteAcquisition {
             true,
         ))
     }
+
+    /// 未接线远端来源时受控路径与既有路径同样明确失败（保持同一错误码与可重试性），
+    /// 不因为默认实现的「不支持限速」分支改变这里的用户可见行为。
+    async fn acquire_controlled(
+        &self,
+        source_key: &str,
+        remote_id: &str,
+        destination: &Path,
+        _transfer: &RemoteTransferContext<'_>,
+    ) -> Result<haven_application::services::ports::RemoteAcquiredFile, AppError> {
+        self.acquire(source_key, remote_id, destination).await
+    }
+}
+
+/// 远端获取的最新进度槽：观察者只写最新值（不做 IO），Worker 按界读取并落库/发布。
+#[derive(Default)]
+struct RemoteProgressSlot {
+    latest: Mutex<Option<RemoteAcquisitionProgress>>,
+}
+
+impl RemoteProgressSlot {
+    fn latest(&self) -> Option<RemoteAcquisitionProgress> {
+        *self.latest.lock().unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+impl RemoteAcquisitionObserver for RemoteProgressSlot {
+    fn on_progress(&self, progress: RemoteAcquisitionProgress) {
+        *self.latest.lock().unwrap_or_else(|error| error.into_inner()) = Some(progress);
+    }
 }
 
 #[async_trait]
@@ -595,6 +631,9 @@ impl LocalDownloadRunner {
         {
             return Ok(());
         }
+        // 状态真正推进到 Resolving 后立刻发布一次任务事件：远端获取在拿到第一个
+        // 字节前可能等待很久，UI 不能一直停在 Queued/0。
+        self.emit_current(task_id).await;
         let task = self
             .repos
             .download
@@ -630,7 +669,15 @@ impl LocalDownloadRunner {
         } = &resource.locator
         {
             return self
-                .run_remote_inner(task_id, &task, &resource, &storage, *source_id, remote_id)
+                .run_remote_inner(
+                    task_id,
+                    &task,
+                    &resource,
+                    &storage,
+                    *source_id,
+                    remote_id,
+                    policy,
+                )
                 .await;
         }
         let source_path = match &resource.locator {
@@ -1038,6 +1085,7 @@ impl LocalDownloadRunner {
         storage: &haven_domain::entities::StorageLocation,
         source_id: haven_domain::ids::SourceId,
         remote_id: &str,
+        policy: DownloadPolicy,
     ) -> Result<(), DownloadWorkerFailure> {
         let source_key = source_key_for_id(source_id)
             .ok_or_else(|| DownloadWorkerFailure::new("DOWNLOAD_SOURCE_UNAVAILABLE", false))?;
@@ -1166,11 +1214,20 @@ impl LocalDownloadRunner {
         {
             return Ok(());
         }
+        // 进入 Downloading 后立即发布状态事件（远端获取的首个字节可能还要等很久）。
+        self.emit_current(task_id).await;
 
         // Poll the task state while the provider is awaiting network IO. The
         // future is dropped on cancellation, which aborts reqwest's in-flight
         // request; providers also clean their own temporary file on errors.
-        let acquisition = self.remote.acquire(source_key, remote_id, &part_path);
+        //
+        // 进度走同一次获取内的共享上下文：有限速率（B/s）作用于真实网络字节读取，
+        // 观察者只写最新值，本循环按界落库并发布 bytes/known total/speed/ETA。
+        let progress_slot = RemoteProgressSlot::default();
+        let transfer = RemoteTransferContext::new(policy.speed_limit_bps, &progress_slot);
+        let acquisition = self
+            .remote
+            .acquire_controlled(source_key, remote_id, &part_path, &transfer);
         tokio::pin!(acquisition);
         let acquired = loop {
             tokio::select! {
@@ -1181,7 +1238,9 @@ impl LocalDownloadRunner {
                         return Err(map_remote_error(error));
                     }
                 },
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                _ = tokio::time::sleep(REMOTE_PROGRESS_FLUSH_INTERVAL) => {
+                    // 进度落库失败只影响进度显示，不能把仍在正常获取的任务判为失败。
+                    let _ = self.flush_remote_progress(task_id, &progress_slot).await;
                     let state = self
                         .repos
                         .download
@@ -1312,6 +1371,49 @@ impl LocalDownloadRunner {
         };
         if !completed {
             self.compensate_failed_promotion(&final_path, offline).await;
+        }
+        Ok(())
+    }
+
+    /// 立即发布一次当前任务快照（状态切换等即时事件；失败静默，不改变任务状态）。
+    async fn emit_current(&self, task_id: DownloadTaskId) {
+        if let Ok(Some(snapshot)) = self.repos.download.get(task_id).await {
+            self.events.emit_task(&snapshot, None);
+        }
+    }
+
+    /// 远端获取期间按界落库并发布最新进度。
+    ///
+    /// `bytes` 是累计真实网络字节，`total_bytes` 未知时保持 `None`（不伪造百分比）；
+    /// 最终产物大小在获取成功后由 `RemoteAcquiredFile::size_bytes` 单独写入。
+    async fn flush_remote_progress(
+        &self,
+        task_id: DownloadTaskId,
+        slot: &RemoteProgressSlot,
+    ) -> Result<(), DownloadWorkerFailure> {
+        let Some(progress) = slot.latest() else {
+            return Ok(());
+        };
+        self.repos
+            .download
+            .update_progress(
+                task_id,
+                DownloadState::Downloading,
+                progress.total_bytes,
+                progress.bytes,
+                progress.speed_bps,
+                progress.eta_seconds,
+            )
+            .await
+            .map_err(|_| repository_failure())?;
+        if let Ok(Some(mut snapshot)) = self.repos.download.get(task_id).await {
+            if snapshot.state == DownloadState::Downloading {
+                snapshot.bytes_total = progress.total_bytes;
+                snapshot.bytes_downloaded = progress.bytes;
+                snapshot.speed_bps = progress.speed_bps;
+                snapshot.eta_seconds = progress.eta_seconds;
+                self.events.emit_task(&snapshot, None);
+            }
         }
         Ok(())
     }

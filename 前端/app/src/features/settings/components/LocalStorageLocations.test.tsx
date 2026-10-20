@@ -9,7 +9,7 @@ import { LocalStorageLocations } from "./LocalStorageLocations"
 type StorageController = ReturnType<typeof useStorageLocations>
 const READ_ONLY: StorageLocationDto = { locationId: "1f2a3b4c-5d6e-4f70-8192-a3b4c5d6e7f8", displayName: "只读漫画目录", providerType: "local", status: "read_only" }
 const CONNECTED: StorageLocationDto = { locationId: "2a3b4c5d-6e7f-4081-92a3-b4c5d6e7f809", displayName: "本地影视目录", providerType: "local", status: "connected" }
-const RUNNING: StorageScanState = { taskId: "3b4c5d6e-7f80-4192-a3b4-c5d6e7f80912", phaseCode: "started", phase: "开始扫描", filesSeen: 12, newItem: 3, message: null, terminal: false }
+const RUNNING: StorageScanState = { taskId: "3b4c5d6e-7f80-4192-a3b4-c5d6e7f80912", phaseCode: "started", phase: "开始扫描", filesSeen: 12, newItem: 3, errors: 0, message: null, warning: null, terminal: false }
 
 function controller(overrides: Partial<StorageController> = {}): StorageController {
   return {

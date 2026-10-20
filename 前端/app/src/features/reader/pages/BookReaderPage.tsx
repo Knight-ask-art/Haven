@@ -1,3 +1,4 @@
+import { useMarkerNavigation } from "@/features/markers/lib/use-marker-navigation"
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react"
 import { useNavigate, useParams } from "react-router"
 import { ArrowLeft, Bookmark, ChevronLeft, ChevronRight, ListTree, Minus, Plus, Search, Trash2, X } from "lucide-react"
@@ -311,6 +312,7 @@ function BookReaderUnavailable() {
 function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode }) {
   const navigate = useNavigate()
   const { mediaItemId } = useParams<{ mediaItemId?: string }>()
+  const initialPosition = useMarkerNavigation(mediaItemId)
   const runtimeState = resolveBookReaderRuntimeState(clientMode)
   const tauriRuntime = runtimeState === "production"
   const demoRuntime = runtimeState === "demo"
@@ -384,6 +386,9 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
   // horizontal offset (always 0) can be flushed as a real progress update
   // before the persisted position has been mapped to the current columns.
   const progressRestoreSettledRef = useRef(!tauriRuntime)
+  useEffect(() => {
+    progressRestoreSettledRef.current = !tauriRuntime
+  }, [initialPosition?.key, tauriRuntime])
   // A mode change rerenders the columns before the new layout effect can read
   // the old axis. Capture the format-independent progression in the click
   // handler so the first measurement of the new layout cannot overwrite it.
@@ -791,7 +796,7 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
     let attempts = 0
     const restore = () => {
       if (cancelled) return
-      const safeProgress = bookResumeProgression(state.session)
+      const safeProgress = bookResumeProgression(state.session, initialPosition)
       const layoutReady = paginationMode === "scroll"
         ? scrollContainer.clientHeight > 0 && (safeProgress <= 0 || scrollContainer.scrollHeight > scrollContainer.clientHeight)
         : scrollContainer.clientWidth > 0 && (safeProgress <= 0 || scrollContainer.scrollWidth > scrollContainer.clientWidth)
@@ -808,7 +813,7 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
       // pendingPaginationProgressionRef 与滚动测量的 latestBookProgressionRef 负责。
       if (progressRestoreSettledRef.current) return
 
-      restoreBookProgress(scrollContainer, state.session, restoredProgressRef, paginationMode)
+      restoreBookProgress(scrollContainer, state.session, restoredProgressRef, paginationMode, initialPosition)
       latestBookProgressionRef.current = safeProgress
       setReadingProgress(Math.round(safeProgress * 100))
       // Keep the controller's latest value aligned with the restored locator;
@@ -823,7 +828,7 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
       cancelled = true
       if (frame !== null) cancelAnimationFrame(frame)
     }
-  }, [contentMatchesSession, contentState.status, paginationMode, paginationViewportWidth, sessionView.status, state, sessionContentUri, tauriRuntime])
+  }, [contentMatchesSession, contentState.status, initialPosition, paginationMode, paginationViewportWidth, sessionView.status, state, sessionContentUri, tauriRuntime])
 
   useEffect(() => {
     if (demoRuntime) localStorage.setItem(bookmarkStorageKey, JSON.stringify(bookmarks))
@@ -1279,8 +1284,8 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
             </button>
           </>
         )}
-        {contentReady && pdfSource && state.status === "ready" && <PdfReader key={state.session.sessionId} source={pdfSource} restoreLocator={(pageCount) => (
-          restorePdfProgress(pageCount, state.session, restoredPdfProgressRef)
+        {contentReady && pdfSource && state.status === "ready" && <PdfReader key={`${state.session.sessionId}:${initialPosition?.key ?? ""}`} source={pdfSource} restoreLocator={(pageCount) => (
+          restorePdfProgress(pageCount, state.session, restoredPdfProgressRef, initialPosition)
         )} onLocatorChange={(locator) => {
           const percentage = locator.pageCount <= 1 ? 0 : Math.round((locator.pageIndex / (locator.pageCount - 1)) * 100)
           setReadingProgress(percentage)

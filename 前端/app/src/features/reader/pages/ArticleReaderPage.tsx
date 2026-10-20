@@ -1,3 +1,4 @@
+import { useMarkerNavigation } from "@/features/markers/lib/use-marker-navigation"
 import { createElement, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import type { CSSProperties, KeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode } from "react"
 import { useNavigate, useParams } from "react-router"
@@ -209,6 +210,7 @@ function ArticleReaderUnavailable() {
 function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleReaderMode }) {
   const navigate = useNavigate()
   const { mediaItemId } = useParams<{ mediaItemId?: string }>()
+  const initialPosition = useMarkerNavigation(mediaItemId)
   const runtimeState = resolveArticleReaderRuntimeState(clientMode)
   const tauriRuntime = runtimeState === "production"
   const demoRuntime = canUseDemoArticleReaderTools(clientMode)
@@ -631,15 +633,27 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
   // 恢复进度：优先使用与真实大纲同源的 blockId，结构已变时才回退 progression。
   useEffect(() => {
     if (!contentReady || !articleDocument || sessionView.status !== "ready" || state.status !== "ready") return
-    const restored = restoreArticleProgress(state.session, restoredProgressRef)
+    const restored = restoreArticleProgress(state.session, restoredProgressRef, initialPosition)
     if (!restored) return
     const maxScroll = document.documentElement.scrollHeight - window.innerHeight
     if (maxScroll <= 0) return
+    // 显式文本标记优先按锚点定位；普通进度仍只使用全篇 progression。
+    const markerLocator = initialPosition?.locator
+    if (markerLocator?.kind === "article" && markerLocator.data.textAnchor) {
+      const block = Array.from(articleRef.current?.querySelectorAll<HTMLElement>("[data-article-block-id]") ?? [])
+        .find((element) => element.dataset.articleBlockId === markerLocator.data.blockId)
+      const anchor = block && resolveArticleTextAnchor(block.textContent ?? "", markerLocator.data.textAnchor)
+      const range = block && anchor && createArticleTextRange(block, anchor.start, anchor.end)
+      if (range) {
+        window.scrollTo({ top: Math.max(0, window.scrollY + range.getBoundingClientRect().top - 96) })
+        return
+      }
+    }
     // `progression` is the whole-document ratio. A block id is only a coarse
     // activity label, not a second coordinate; applying both double-counts
     // the remaining distance (p * (2 - p)).
     window.scrollTo({ top: Math.min(maxScroll, Math.max(0, restored.progression * maxScroll)) })
-  }, [articleDocument, contentReady, outline, sessionView.status, state, sessionContentUri])
+  }, [articleDocument, contentReady, initialPosition, outline, sessionView.status, state, sessionContentUri])
 
   useEffect(() => {
     if (!demoRuntime) {
@@ -1157,8 +1171,8 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
             )}
           </div>
         )}
-        {contentReady && pdfSource && state.status === "ready" && <PdfReader key={state.session.sessionId} source={pdfSource} restoreLocator={(pageCount) => (
-          restorePdfProgress(pageCount, state.session, restoredPdfProgressRef)
+        {contentReady && pdfSource && state.status === "ready" && <PdfReader key={`${state.session.sessionId}:${initialPosition?.key ?? ""}`} source={pdfSource} restoreLocator={(pageCount) => (
+          restorePdfProgress(pageCount, state.session, restoredPdfProgressRef, initialPosition)
         )} onLocatorChange={(locator) => {
           const progression = locator.pageCount <= 1 ? 0 : locator.pageIndex / (locator.pageCount - 1)
           setProgress(progression * 100)

@@ -1,3 +1,4 @@
+import { resolveRestorePosition, type InitialPosition } from "@/features/progress/lib/restore-position"
 import type { ProgressSaveRequest, ProgressSaveResult, SessionOpenResultDto } from "@/lib/ipc/generated/wire"
 import { HavenError } from "@/lib/ipc/errors"
 import { saveProgress } from "@/features/progress/ipc/progress-gateway"
@@ -30,10 +31,10 @@ function publicationResourceOf(mediaItemId: string): string {
  * controller update. A reset intentionally retains its locator on the server,
  * but it must never make that stale position visible or writable again.
  */
-export function bookResumeProgression(session: SessionOpenResultDto): number {
-  const progress = session.progress
-  if (!progress || progress.locator.kind !== "book" || progress.completion === "not_started") return 0
-  const progression = progress.locator.data.progression
+export function bookResumeProgression(session: SessionOpenResultDto, initial?: InitialPosition): number {
+  const { locator, reset } = resolveRestorePosition(session, initial)
+  if (locator?.kind !== "book" || reset) return 0
+  const progression = locator.data.progression
   return typeof progression === "number" && Number.isFinite(progression)
     ? Math.min(1, Math.max(0, progression))
     : 0
@@ -130,18 +131,18 @@ export function restoreBookProgress(
   session: SessionOpenResultDto,
   restored?: { current: string | null },
   mode: BookPaginationMode = "scroll",
+  initial?: InitialPosition,
 ): boolean {
-  if (!session.progress) return false
-  if (session.progress.locator.kind !== "book") return false
-  const identity = `${session.sessionId}:${session.mediaItemId}:${session.contentUri}`
+  const { locator, reset, identity } = resolveRestorePosition(session, initial)
+  if (locator?.kind !== "book") return false
   if (restored?.current === identity) return false
-  if (session.progress.completion === "not_started") {
+  if (reset) {
     if (mode !== "scroll" && scrollContainer.scrollLeft === undefined) return false
     setBookPaginationOffsetInstant(scrollContainer, 0, mode)
     if (restored) restored.current = identity
     return true
   }
-  const progression = session.progress.locator.data.progression
+  const progression = locator.data.progression
   if (progression == null || !Number.isFinite(progression) || progression < 0) return false
   const viewport: BookPaginationViewport = {
     scrollLeft: scrollContainer.scrollLeft ?? 0,

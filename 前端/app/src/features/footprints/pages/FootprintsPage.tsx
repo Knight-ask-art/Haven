@@ -1,3 +1,5 @@
+import type { LocatorDto } from "@/lib/ipc/generated/wire"
+import type { MarkerNavigationState } from "@/features/markers/lib/use-marker-navigation"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Link, useNavigate, useSearchParams } from "react-router"
 import { HavenStage } from "@/features/home/components/HavenStage"
@@ -118,6 +120,7 @@ interface MarkerItem {
   id: string
   mode: string
   mediaItemId: string
+  locator?: LocatorDto
   title: string
   subtitle: string
   type: string
@@ -826,7 +829,12 @@ export function FootprintsPage() {
                   ) : (
                     <MarkerList
                       markers={isEmptyState ? [] : markerItems}
-                      onOpen={(mode, mediaItemId) => navigate(getMarkerRoute(mode, mediaItemId))}
+                      onOpen={(marker) => {
+                        const state: MarkerNavigationState | undefined = marker.locator
+                          ? { markerNavigation: { markerId: marker.id, mediaItemId: marker.mediaItemId, locator: marker.locator } }
+                          : undefined
+                        navigate(getMarkerRoute(marker.mode, marker.mediaItemId), { state })
+                      }}
                       onDelete={deleteMarker}
                     />
                   )}
@@ -859,7 +867,7 @@ function MarkerList({
   onDelete,
 }: {
   markers: MarkerItem[]
-  onOpen: (mode: string, mediaItemId: string) => void
+  onOpen: (marker: MarkerItem) => void
   onDelete: (id: string) => void
 }) {
   if (markers.length === 0) {
@@ -876,7 +884,7 @@ function MarkerList({
     <div className="mx-[48px] max-h-[60vh] overflow-y-auto overscroll-contain rounded-2xl border border-border/60 bg-background/70 scrollbar-none md:mx-[64px] lg:mx-[96px]">
       {markers.map((marker) => (
         <div key={marker.id} className="group/marker flex min-h-[88px] w-full items-center gap-5 border-b border-border/50 px-5 py-[16px] text-left transition-colors last:border-b-0 hover:bg-muted/50">
-          <button type="button" onClick={() => onOpen(marker.mode, marker.mediaItemId)} className="flex min-w-0 flex-1 items-center gap-5 text-left">
+          <button type="button" onClick={() => onOpen(marker)} className="flex min-w-0 flex-1 items-center gap-5 text-left">
             <span className="relative flex h-[64px] w-[64px] shrink-0 items-center justify-center overflow-hidden rounded-2xl border border-border/60 bg-muted">
               <ArtworkImage
                 src={marker.imageUrl}

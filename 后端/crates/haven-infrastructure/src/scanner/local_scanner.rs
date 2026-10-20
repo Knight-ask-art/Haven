@@ -220,7 +220,15 @@ impl LocalLibraryScanner {
         if let Some(o) = observer {
             o.on_phase(ScanPhase::Enumerating);
         }
-        for entry in WalkDir::new(&root).follow_links(false) {
+        for entry in WalkDir::new(&root)
+            .follow_links(false)
+            // 忽略的目录必须在**枚举阶段**剪枝：只 `continue` 会跳过目录条目本身，
+            // 但 WalkDir 仍会进入其子目录，隐藏/临时目录里的文件照样进入媒体库。
+            // 根目录自身（depth 0）永不剪枝——即使存储根目录名恰好是临时样式；
+            // 出错条目交给下面的错误分支计数与上报。
+            .into_iter()
+            .filter_entry(|entry| entry.depth() == 0 || !is_pruned_directory(entry))
+        {
             // 协作式取消（端口契约）：文件边界检查；取消时返回 Ok，已索引部分保留。
             if observer.is_some_and(|o| o.is_cancelled()) {
                 break;
@@ -314,8 +322,15 @@ impl LocalLibraryScanner {
                 Err(e) if is_file_level_error(&e) => {
                     report.errors += 1;
                     if let Some(o) = observer {
+                        // C-06：Warning 只带稳定错误码与条目名；`{e}` 可能携带底层
+                        // IO/解析错误的原文（含路径），且会被前端保留最近一条，
+                        // 因此不上报原始错误详情。
                         o.on_warning(
-                            format!("文件索引失败（{}）: {e}", e.code().as_str()),
+                            format!(
+                                "文件索引失败（{}）: {}",
+                                e.code().as_str(),
+                                file_name(path)
+                            ),
                             to_progress(&report, Some(path)),
                         );
                     }
@@ -1026,6 +1041,14 @@ fn is_temporary(path: &Path) -> bool {
         || name.ends_with(".partial")
         || name.ends_with(".tmp")
         || name.ends_with("~")
+}
+
+/// 枚举剪枝判定：只对目录生效（`filter_entry` 同样会对文件调用）。
+/// 与 `is_temporary` 使用同一套命名规则：隐藏目录（`.` 前缀）与 `*.part` /
+/// `*.partial` / `*.tmp` / `*~` 临时目录整棵子树都不进入媒体库。
+/// 符号链接目录由 `follow_links(false)` 保证不会被遍历。
+fn is_pruned_directory(entry: &walkdir::DirEntry) -> bool {
+    entry.file_type().is_dir() && is_temporary(entry.path())
 }
 
 fn file_name(path: &Path) -> String {

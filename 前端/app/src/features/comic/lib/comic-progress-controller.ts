@@ -1,3 +1,4 @@
+import { resolveRestorePosition, type InitialPosition } from "@/features/progress/lib/restore-position"
 import type { ProgressSaveRequest, ProgressSaveResult, SessionOpenResultDto } from "@/lib/ipc/generated/wire"
 import { HavenError } from "@/lib/ipc/errors"
 import { saveProgress } from "@/features/progress/ipc/progress-gateway"
@@ -103,17 +104,17 @@ export function restoreComicProgress(
   totalPages: number,
   session: SessionOpenResultDto,
   restored?: { current: string | null },
+  initial?: InitialPosition,
 ): { pageIndex: number; pageProgression: number | null } | null {
-  if (!session.progress) return null
-  if (session.progress.locator.kind !== "comic") return null
+  const { locator, reset, identity } = resolveRestorePosition(session, initial)
+  if (locator?.kind !== "comic") return null
   if (!Number.isInteger(totalPages) || totalPages <= 0) return null
-  const identity = `${session.sessionId}:${session.mediaItemId}:${session.contentUri}`
   if (restored?.current === identity) return null
-  if (session.progress.completion === "not_started") {
+  if (reset) {
     if (restored) restored.current = identity
     return { pageIndex: 1, pageProgression: null }
   }
-  const data = session.progress.locator.data
+  const data = locator.data
   if (!Number.isInteger(data.pageIndex) || data.pageIndex < 0 || data.pageIndex >= totalPages) return null
   if (restored) restored.current = identity
   return { pageIndex: data.pageIndex + 1, pageProgression: data.pageProgression ?? null }

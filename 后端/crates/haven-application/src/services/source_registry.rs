@@ -1260,15 +1260,18 @@ fn endpoint_validator(source_id: &str) -> fn(&str) -> Result<Option<String>, App
 /// M3U 地址由用户提供，因而可指向本机/局域网及任意非零端口。
 /// 带 query 的播放列表 URL 可能包含访问令牌，因此只允许 HTTPS 承载 query。
 fn validate_m3u_playlist_endpoint(raw: &str) -> Result<Option<String>, AppError> {
-    let endpoint = validate_user_provided_endpoint(raw)?;
-    if let Some(endpoint) = endpoint.as_deref() {
-        let parsed = parse_http_url(endpoint, HttpUrlPolicy::UserProvidedSource)
-            .map_err(|_| invalid_endpoint())?;
-        if parsed.as_url().query().is_some() && parsed.as_url().scheme() != "https" {
-            return Err(invalid_argument("带查询参数的 M3U 地址必须使用 HTTPS"));
-        }
+    if validate_user_provided_endpoint(raw)?.is_none() {
+        return Ok(None);
     }
-    Ok(endpoint)
+    // A playlist is a complete request URL, not a base URL. Preserve path
+    // delimiters and query values after validation, including a trailing '/'.
+    let endpoint = raw.trim();
+    let parsed = parse_http_url(endpoint, HttpUrlPolicy::UserProvidedSource)
+        .map_err(|_| invalid_endpoint())?;
+    if parsed.as_url().query().is_some() && parsed.as_url().scheme() != "https" {
+        return Err(invalid_argument("带查询参数的 M3U 地址必须使用 HTTPS"));
+    }
+    Ok(Some(endpoint.to_owned()))
 }
 
 /// TVBox / FongMi 配置地址：在**用户提供来源**策略之上只放宽**长度**，不改任何安全判定。

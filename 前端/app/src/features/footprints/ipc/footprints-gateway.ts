@@ -19,6 +19,7 @@ import { contentCategoryLabel } from "@/features/media/lib/periodical-presentati
 import type {
 
   HistoryEntryDto,
+  LocatorDto,
   MarkerDto,
   PageDto,
   ProgressSummaryDto,
@@ -292,6 +293,7 @@ export interface FootprintMarkerCard {
   id: string
   mode: string
   mediaItemId: string
+  locator: LocatorDto
   title: string
   subtitle: string
   type: string
@@ -324,6 +326,7 @@ export async function getMarkerFootprintCards(): Promise<FootprintMarkerCard[]> 
       id: marker.markerId,
       mode,
       mediaItemId: marker.mediaItemId,
+      locator: marker.locator,
       title: card?.title ?? "媒体条目",
       subtitle: marker.title ?? "在阅读 / 播放时标记的位置",
       type: MARKER_MODE_LABEL[mode] ?? "阅读",

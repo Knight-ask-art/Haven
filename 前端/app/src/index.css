@@ -9,10 +9,21 @@
 /* PDF 文本选择层：透明文本覆盖画布，仅提供选区与复制能力。
    容器保持 opacity:1（pdfjs 惯例）——span 文本本身透明，压暗容器会连带削弱选区高亮。 */
 .pdf-text-layer {
+  /* pdfjs 6 TextLayer emits font/rotation variables; keep its CSS geometry
+     aligned with the canvas viewport for selection and search ranges. */
+  --total-scale-factor: 1;
+  --scale-round-x: 1px;
+  --scale-round-y: 1px;
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
   position: absolute;
   inset: 0;
   overflow: hidden;
   line-height: 1;
+  text-align: initial;
+  letter-spacing: normal;
+  word-spacing: normal;
   text-size-adjust: none;
   forced-color-adjust: none;
   transform-origin: 0 0;
@@ -25,6 +36,26 @@
   white-space: pre;
   cursor: text;
   transform-origin: 0 0;
+}
+.pdf-text-layer > :not(.markedContent),
+.pdf-text-layer .markedContent span:not(.markedContent) {
+  --font-height: 0;
+  --scale-x: 1;
+  --rotate: 0deg;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+}
+.pdf-text-layer .markedContent {
+  display: contents;
+}
+.pdf-text-layer[data-main-rotation="90"] {
+  transform: rotate(90deg) translateY(-100%);
+}
+.pdf-text-layer[data-main-rotation="180"] {
+  transform: rotate(180deg) translate(-100%, -100%);
+}
+.pdf-text-layer[data-main-rotation="270"] {
+  transform: rotate(270deg) translateX(-100%);
 }
 .pdf-text-layer ::selection {
   background: rgba(59, 130, 246, 0.3);

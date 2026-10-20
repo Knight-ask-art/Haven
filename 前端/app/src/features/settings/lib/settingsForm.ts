@@ -123,15 +123,43 @@ export function formRetrySave(state: SettingsFormState): SettingsFormState {
 }
 
 /**
- * 重新加载快照（conflict / validation-error 的 retry）：保留本地 draft，以最新 revision 重新比对。
- * draft 与新 saved 相同（数据已被其他窗口保存）→ ready；否则保持 dirty。
+ * 把本地草稿重放到最新快照（formRebase 与 formRefresh 的唯一合并逻辑）。
+ *
+ * 不能把旧 draft 整份套到新快照上：draft 是「旧 saved + 用户改动」，而服务器在
+ * 这段时间里可能改过**其它**字段。这里只用 `buildSettingsPatch` 取回用户自己改过
+ * 的字段，再 `applySettingsPatch` 落到最新快照，因此无关的新字段保留服务器值。
+ * 用户改过的同一字段仍以本地草稿为准，是否覆盖交给下一次保存的 CAS。
+ */
+function mergeDraftOntoSnapshot(base: FormBase, snapshot: SettingsSnapshot): SettingsFormState {
+  const localPatch = buildSettingsPatch(base.saved, base.draft);
+  if (!localPatch) return { status: "ready", saved: snapshot.value, revision: snapshot.revision };
+  const draft = applySettingsPatch(snapshot.value, localPatch);
+  return settingsValuesEqual(draft, snapshot.value)
+    ? { status: "ready", saved: snapshot.value, revision: snapshot.revision }
+    : { status: "dirty", saved: snapshot.value, revision: snapshot.revision, draft };
+}
+
+/**
+ * 重新加载快照（conflict / validation-error 的 retry）：保留本地改动，以最新 revision 重新比对。
+ * 只把用户自己改过的字段重放到新快照，服务器在这段时间改过的无关字段保留服务器值。
+ * 合并结果与新 saved 相同（数据已被其他窗口保存）→ ready；否则保持 dirty。
  */
 export function formRebase(state: SettingsFormState, snapshot: SettingsSnapshot): SettingsFormState {
   const base = baseOf(state);
   if (!base) return { status: "ready", saved: snapshot.value, revision: snapshot.revision };
-  return settingsValuesEqual(base.draft, snapshot.value)
-    ? { status: "ready", saved: snapshot.value, revision: snapshot.revision }
-    : { status: "dirty", saved: snapshot.value, revision: snapshot.revision, draft: base.draft };
+  return mergeDraftOntoSnapshot(base, snapshot);
+}
+
+/**
+ * 外部写入（例如栖伴批准提案）后的静默回源；合并语义同 formRebase。
+ *
+ * `saving` 不在这里处理：在途保存的结果比这次读取更晚落定，由 Hook 延迟回源。
+ */
+export function formRefresh(state: SettingsFormState, snapshot: SettingsSnapshot): SettingsFormState {
+  if (state.status === "saving") return state;
+  const base = baseOf(state);
+  if (!base) return { status: "ready", saved: snapshot.value, revision: snapshot.revision };
+  return mergeDraftOntoSnapshot(base, snapshot);
 }
 
 /** Rebase 拉取失败：保留 conflict/validation 的本地草稿与 revision；其他状态不覆盖。 */

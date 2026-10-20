@@ -642,7 +642,6 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
       lastDeleteTarget.current = null;
       setState((current) => ({
         ...current,
-        saving: false,
         saveError: null,
         saveErrorAction: null,
         saveErrorConflict: false,
@@ -658,7 +657,6 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
       if (conflict) lastDeleteTarget.current = null;
       setState((current) => ({
         ...current,
-        saving: false,
         saveError: conflict ? withConflictRecovery(info, "delete") : info,
         saveErrorAction: "delete",
         saveErrorConflict: conflict,
@@ -669,6 +667,8 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
       return false;
     } finally {
       credentialMutationInFlight.current = false;
+      // 恢复读取结束才释放按钮，与删除锁保持同一生命周期。
+      setState((current) => ({ ...current, saving: false }));
     }
   }, [load]);
 

@@ -1,3 +1,4 @@
+import { useMarkerNavigation } from "@/features/markers/lib/use-marker-navigation"
 import { useCallback, useState, useRef, useEffect, useLayoutEffect } from "react"
 import { useParams, useNavigate } from "react-router"
 import { VideoControls } from "../components/VideoControls"
@@ -57,6 +58,7 @@ const SAMPLE_VIDEOS: Record<string, PlayerPresentation> = {
 
 export function PlayerPage() {
   const { mediaItemId } = useParams<{ mediaItemId: string }>()
+  const initialPosition = useMarkerNavigation(mediaItemId)
   const navigate = useNavigate()
   const clientMode = getHavenClientMode()
   const runtimeState = resolvePlayerRuntimeState(clientMode)
@@ -227,6 +229,14 @@ export function PlayerPage() {
   const activeSessionId = state.status === "ready" && sessionView.status === "ready"
     ? state.session.sessionId
     : null
+  const autoAdvanceGenerationRef = useRef(0)
+  const cancelPendingAutoAdvance = useCallback(() => {
+    autoAdvanceGenerationRef.current += 1
+  }, [])
+  useLayoutEffect(() => {
+    cancelPendingAutoAdvance()
+    return cancelPendingAutoAdvance
+  }, [activeSessionId, currentEpisodeId, sessionContentUri, playbackSettings.autoNext, playbackSettings.status, cancelPendingAutoAdvance])
   const subtitleOptions: PlayerSubtitleOption[] = [
     ...sessionSubtitleTracks.map(externalSubtitleOption),
     ...hlsSubtitleOptionList,
@@ -267,13 +277,12 @@ export function PlayerPage() {
     if (
       !video ||
       !metadataReadyRef.current ||
-      playbackSettings.status === "loading" ||
-      !playbackSettings.autoResume ||
+      (!initialPosition && (playbackSettings.status === "loading" || !playbackSettings.autoResume)) ||
       sessionView.status !== "ready" ||
       sessionForProgress === null
     ) return
-    restoreVideoProgress(video, sessionForProgress, restoredProgressRef)
-  }, [playbackSettings.autoResume, playbackSettings.status, sessionForProgress, sessionView.status])
+    restoreVideoProgress(video, sessionForProgress, restoredProgressRef, initialPosition)
+  }, [initialPosition, playbackSettings.autoResume, playbackSettings.status, sessionForProgress, sessionView.status])
 
   useEffect(() => {
     restoreProgressIfAllowed()
@@ -718,6 +727,7 @@ export function PlayerPage() {
   // 播放 / 暂停切换
   const togglePlay = () => {
     if (!videoRef.current || sessionView.status !== "ready") return
+    cancelPendingAutoAdvance()
     if (isPlaying) {
       videoRef.current.pause()
       setIsPlaying(false)
@@ -731,6 +741,7 @@ export function PlayerPage() {
   // 进度跳转
   const handleSeek = (time: number) => {
     if (!videoRef.current || sessionView.status !== "ready") return
+    cancelPendingAutoAdvance()
     const nextTime = clampVideoSeek(time, videoRef.current.duration)
     videoRef.current.currentTime = nextTime
     setCurrentTime(nextTime)
@@ -891,18 +902,24 @@ export function PlayerPage() {
   }, [currentEpisodeId, demoMode, drawerEpisodes, navigate, playbackSettings.autoNext, playbackSettings.status])
 
   const handleVideoEnded = useCallback(() => {
+    const generation = ++autoAdvanceGenerationRef.current
+    const advanceIfCurrent = () => {
+      if (autoAdvanceGenerationRef.current !== generation) return
+      cancelPendingAutoAdvance()
+      advanceToNextEpisode()
+    }
     setIsPlaying(false)
     const positionSeconds = videoRef.current?.currentTime
     const completion = positionSeconds === undefined
       ? undefined
       : progressControllerRef.current?.ended(positionSeconds)
     if (!completion) {
-      advanceToNextEpisode()
+      advanceIfCurrent()
       return
     }
     // 先提交完成进度，再切换到下一项；写入失败也不能把用户卡在结束画面。
-    void completion.then(advanceToNextEpisode, advanceToNextEpisode)
-  }, [advanceToNextEpisode])
+    void completion.then(advanceIfCurrent, advanceIfCurrent)
+  }, [advanceToNextEpisode, cancelPendingAutoAdvance])
 
   const showScreenshotNotice = useCallback((
     message: string,
@@ -1176,7 +1193,10 @@ export function PlayerPage() {
           onRateChange={handleRateChange}
           onQualityChange={demoMode ? setQuality : undefined}
           onToggleFullscreen={toggleFullscreen}
-          onBack={() => navigate(-1)}
+          onBack={() => {
+            cancelPendingAutoAdvance()
+            navigate(-1)
+          }}
           onOpenEpisodes={drawerEpisodes ? () => setIsSidePanelOpen(!isSidePanelOpen) : undefined}
           onToggleBookmark={toggleVideoBookmark}
           onSubtitleChange={subtitleOptions.length > 0 ? handleSubtitleChange : undefined}
@@ -1192,6 +1212,7 @@ export function PlayerPage() {
           currentEpisodeId={currentEpisodeId}
           castMediaItemId={currentEpisodeId || mediaItemId}
           onSelectEpisode={(ep) => {
+            cancelPendingAutoAdvance()
             if (demoMode) {
               setDemoCurrentEpisodeId(ep.id)
               if (videoRef.current) {
@@ -1204,7 +1225,10 @@ export function PlayerPage() {
             }
             navigate(`/player/${ep.id}`)
           }}
-          onOpenDetails={() => navigate(`/work/${state.status === "ready" ? state.session.workId : (mediaItemId || "4")}`)}
+          onOpenDetails={() => {
+            cancelPendingAutoAdvance()
+            navigate(`/work/${state.status === "ready" ? state.session.workId : (mediaItemId || "4")}`)
+          }}
           mediaTitle={playerTitle}
           secondaryTitle={currentEp ? `${currentEp.number}` : (demoMode ? (videoData.subtitle || "正片") : undefined)}
           mediaYear={drawerMeta?.year}

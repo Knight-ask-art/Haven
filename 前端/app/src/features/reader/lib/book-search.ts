@@ -44,7 +44,10 @@ export interface BookSearchIndexChapter {
   title: string
   /** 归一化全文（段落以单个空格连接；段间空格映射为 -1）。 */
   norm: string
-  /** norm 字符 i → 章原文（paragraphs.join("\n\n")）字符偏移；段间空格为 -1。 */
+  /**
+   * norm 的 UTF-16 下标 i → 章原文（paragraphs.join("\n\n")）的 UTF-16 偏移；
+   * 段间空格为 -1。长度恒等于 norm.length。
+   */
   map: number[]
   /** 每段起点在 join 原文中的偏移（段长 + 2 分隔符）。 */
   paragraphStarts: number[]
@@ -101,27 +104,47 @@ export function normalizeForMatch(text: string): string {
   return result
 }
 
-/** 归一化 + 稀疏 checkpoint 映射（norm 字符 → 原文字符偏移）。 */
+/**
+ * 归一化 + 映射（norm 的 UTF-16 下标 → 原文 UTF-16 偏移，两数组等长）。
+ *
+ * 段落内部被折叠的普通空白映射到原空白的位置，而不是 -1：检索跨空白的
+ * 短语（如「hello world」对「hello   world」）仍然落在同一段内。只有
+ * buildBookSearchIndex 插入的段间分隔符才是 -1。
+ */
 export function normalizeWithMap(text: string): { norm: string; map: number[] } {
   const norm: string[] = []
   const map: number[] = []
   let pendingSpace = false
+  let pendingSpaceIndex = 0
   let index = 0
   for (const character of fullWidthToHalfWidth(text)) {
     const code = character.codePointAt(0)!
     if (isWhitespaceCode(code)) {
+      if (!pendingSpace) pendingSpaceIndex = index
       pendingSpace = true
-      index += 1
+      index += character.length
       continue
     }
     if (pendingSpace && norm.length > 0) {
       norm.push(" ")
-      map.push(-1)
+      map.push(pendingSpaceIndex)
     }
     pendingSpace = false
-    norm.push(character.toLowerCase())
-    map.push(index)
-    index += 1
+    // `norm` is addressed with String.indexOf offsets, i.e. UTF-16 units, so
+    // the map carries exactly one entry per output unit and `index` advances
+    // by the source character's UTF-16 length (an astral character such as an
+    // emoji occupies two units). Each output unit maps to its own source unit
+    // while the lowering is 1:1, and is clamped to the source character's last
+    // unit when lowering expands (İ -> i + combining dot) or shrinks, so a
+    // match ending anywhere inside the character still resolves to a boundary
+    // that covers the whole character (`map[end - 1] + 1` must never split an
+    // astral pair).
+    const lowered = character.toLowerCase()
+    for (let unit = 0; unit < lowered.length; unit += 1) {
+      norm.push(lowered[unit])
+      map.push(index + Math.min(unit, character.length - 1))
+    }
+    index += character.length
   }
   return { norm: norm.join(""), map }
 }

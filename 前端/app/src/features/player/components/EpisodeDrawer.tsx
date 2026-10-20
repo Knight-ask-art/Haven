@@ -66,20 +66,32 @@ export function EpisodeDrawer({
   const castDiscovery = useCastDiscovery(isCastDialogOpen, 5000)
 
   useEffect(() => {
+    let active = true
     if (!isOpen && castSessionId) {
-      void stopCast(castSessionId).catch(() => undefined)
-      setCastSessionId(null)
-      setIsCasting(false)
+      void stopCast(castSessionId).then(() => {
+        if (!active) return
+        setCastSessionId(null)
+        setIsCasting(false)
+      }).catch(() => {
+        if (active) setCastError("停止投屏失败，请重新打开投屏窗口重试")
+      })
     }
+    return () => { active = false }
   }, [isOpen, castSessionId])
 
   // 切集自动停止：当前集变化且正在投屏 → 停止旧会话
   useEffect(() => {
+    let active = true
     if (isCasting && castSessionId) {
-      void stopCast(castSessionId).catch(() => undefined)
-      setCastSessionId(null)
-      setIsCasting(false)
+      void stopCast(castSessionId).then(() => {
+        if (!active) return
+        setCastSessionId(null)
+        setIsCasting(false)
+      }).catch(() => {
+        if (active) setCastError("停止上一集投屏失败，请在投屏窗口重试")
+      })
     }
+    return () => { active = false }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentEpisodeId])
 
@@ -97,8 +109,11 @@ export function EpisodeDrawer({
   const castDevices = castDiscovery.devices.map((d) => ({
     id: d.deviceId,
     name: d.friendlyName,
-    detail: `${d.protocol === "chromecast" ? "Chromecast" : "DLNA"} · ${d.ip}${d.modelName ? ` · ${d.modelName}` : ""}`,
+    supported: d.protocol === "dlna",
+    detail: `${d.protocol === "chromecast" ? "Chromecast · 暂不支持控制" : "DLNA"} · ${d.ip}${d.modelName ? ` · ${d.modelName}` : ""}`,
   }))
+
+  const selectedDevice = castDevices.find((device) => device.id === selectedCastDevice)
 
   const chooseDownloadTarget = (target: "all" | "current") => {
     setIsDownloaded(true)
@@ -390,10 +405,11 @@ export function EpisodeDrawer({
                   <button
                     key={device.id}
                     type="button"
+                    disabled={!device.supported}
                     onClick={() => setSelectedCastDevice(device.id)}
                     aria-pressed={isSelected}
                     className={cn(
-                      "flex w-full items-center justify-between rounded-2xl border p-3.5 text-left transition-colors",
+                      "flex w-full items-center justify-between rounded-2xl border p-3.5 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-50",
                       isSelected
                         ? "border-foreground/50 bg-black/[0.04] dark:bg-white/[0.08]"
                         : "border-black/10 hover:border-foreground/30 dark:border-white/10 dark:hover:bg-white/[0.04]"
@@ -425,18 +441,23 @@ export function EpisodeDrawer({
 
             <button
               type="button"
-              disabled={(!selectedCastDevice && !isCasting) || (!castMediaItemId && !isCasting)}
+              disabled={!isCasting && (!selectedDevice?.supported || !castMediaItemId)}
               onClick={async () => {
                 if (isCasting && castSessionId) {
-                  try { await stopCast(castSessionId) } catch { /* ignore */ }
-                  setIsCasting(false)
-                  setCastSessionId(null)
+                  setCastError(null)
+                  try {
+                    await stopCast(castSessionId)
+                    setIsCasting(false)
+                    setCastSessionId(null)
+                  } catch (error: unknown) {
+                    setCastError(error instanceof Error ? error.message : "停止投屏失败，请重试")
+                  }
                   return
                 }
-                if (!selectedCastDevice || !castMediaItemId) return
+                if (!selectedDevice?.supported || !castMediaItemId) return
                 setCastError(null)
                 try {
-                  const res = await playCast(castMediaItemId, selectedCastDevice)
+                  const res = await playCast(castMediaItemId, selectedDevice.id)
                   setCastSessionId(res.castSessionId)
                   setIsCasting(true)
                 } catch (e: unknown) {

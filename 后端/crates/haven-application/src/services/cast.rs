@@ -227,16 +227,18 @@ impl CastService {
 
     pub async fn stop(&self, req: CastStopRequest) -> Result<CastStopResult, AppError> {
         let device_id = {
-            let mut g = self
+            let g = self
                 .grant_registry
                 .inner
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            g.remove(&req.cast_session_id).map(|v| v.device_id)
+            g.get(&req.cast_session_id).map(|v| v.device_id.clone())
         };
         if let Some(did) = device_id {
-            let _ = self.control.stop(&did).await;
+            // 保留失败会话以便重试，只有设备确认停止后才撤销授权。
+            self.control.stop(&did).await?;
         }
+        self.grant_registry.revoke(&req.cast_session_id);
         self.media.revoke(&req.cast_session_id);
         Ok(CastStopResult {
             schema_version: 1,

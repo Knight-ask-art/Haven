@@ -1,3 +1,4 @@
+import { resolveRestorePosition, type InitialPosition } from "@/features/progress/lib/restore-position"
 import type { ProgressSaveRequest, ProgressSaveResult, SessionOpenResultDto } from "@/lib/ipc/generated/wire"
 import { HavenError } from "@/lib/ipc/errors"
 import { saveProgress } from "@/features/progress/ipc/progress-gateway"
@@ -123,18 +124,18 @@ export function createVideoProgressController(options: VideoProgressControllerOp
   }
 }
 
-export function restoreVideoProgress(video: Pick<HTMLVideoElement, "currentTime" | "duration">, session: SessionOpenResultDto, restored?: { current: string | null }): boolean {
-  if (session.progress?.locator.kind !== "video") return false
-  const identity = `${session.sessionId}:${session.mediaItemId}:${session.contentUri}`
+export function restoreVideoProgress(video: Pick<HTMLVideoElement, "currentTime" | "duration">, session: SessionOpenResultDto, restored?: { current: string | null }, initial?: InitialPosition): boolean {
+  const { locator, reset, identity } = resolveRestorePosition(session, initial)
+  if (locator?.kind !== "video") return false
   if (restored?.current === identity) return false
-  if (session.progress.completion === "not_started") {
+  if (reset) {
     // Progress reset intentionally preserves the last locator for audit and
     // conflict semantics, but consumers must resume from the beginning.
     video.currentTime = 0
     if (restored) restored.current = identity
     return true
   }
-  const positionMs = session.progress.locator.data.positionMs
+  const positionMs = locator.data.positionMs
   if (!Number.isFinite(positionMs) || positionMs < 0) return false
   const duration = video.duration
   video.currentTime = Number.isFinite(duration) && duration >= 0 ? Math.min(positionMs / 1000, duration) : positionMs / 1000

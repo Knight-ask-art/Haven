@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState } from "react"
+import React, { useRef, useEffect, useState, useCallback } from "react"
 import { cn } from "@/lib/utils"
 import { MediaCard } from "@/components/ui/haven/MediaCard"
 import type { MediaCardProps } from "@/components/ui/haven/MediaCard"
@@ -13,15 +13,16 @@ interface ContentShelfProps {
 
 export function ContentShelf({ title, items, className, actionRight }: ContentShelfProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
+  const contentRef = useRef<HTMLDivElement>(null)
   const [canScrollLeft, setCanScrollLeft] = useState(false)
-  const [canScrollRight, setCanScrollRight] = useState(true)
+  const [canScrollRight, setCanScrollRight] = useState(false)
 
-  const checkScroll = () => {
+  const checkScroll = useCallback(() => {
     const el = scrollRef.current
     if (!el) return
     setCanScrollLeft(el.scrollLeft > 10)
     setCanScrollRight(el.scrollLeft < el.scrollWidth - el.clientWidth - 10)
-  }
+  }, [])
 
   // 1. 监听滚动更新左右悬浮按钮状态
   useEffect(() => {
@@ -30,14 +31,20 @@ export function ContentShelf({ title, items, className, actionRight }: ContentSh
 
     el.addEventListener("scroll", checkScroll, { passive: true })
     
-    // 初始化检查 (延迟确保 DOM 渲染完成)
-    const timer = setTimeout(checkScroll, 100)
+    checkScroll()
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(checkScroll)
+    observer?.observe(el)
+    if (contentRef.current) observer?.observe(contentRef.current)
+    window.addEventListener("resize", checkScroll)
 
     return () => {
       el.removeEventListener("scroll", checkScroll)
-      clearTimeout(timer)
+      observer?.disconnect()
+      window.removeEventListener("resize", checkScroll)
     }
-  }, [])
+  }, [checkScroll])
+
+  useEffect(checkScroll, [items, checkScroll])
 
 
 
@@ -92,17 +99,17 @@ export function ContentShelf({ title, items, className, actionRight }: ContentSh
           </div>
         )}
 
-        {/* 隐藏滚动条但保留全套流畅交互 (依靠按钮滚动) */}
+        {/* 小窗口保留原生横向滚动，桌面也可使用两侧按钮。 */}
         <div 
           ref={scrollRef}
           className={cn(
-            "flex overflow-x-hidden overflow-y-hidden pb-[16px] pt-[8px] -mt-[8px]",
+            "flex overflow-x-auto overflow-y-hidden pb-[16px] pt-[8px] -mt-[8px]",
             "scroll-smooth"
           )}
         >
           <div className="w-[48px] md:w-[64px] lg:w-[96px] shrink-0" aria-hidden="true" />
           
-          <div className="flex gap-[16px] md:gap-6 shrink-0">
+          <div ref={contentRef} className="flex gap-[16px] md:gap-6 shrink-0">
             {items.map((item) => (
               <MediaCard key={item.id} {...item} />
             ))}

@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from "react"
+import { useEffect, useState, useRef, type FocusEvent } from "react"
 import { useNavigate, useSearchParams } from "react-router"
 import { ArrowDownWideNarrow, ChevronRight, Library, Star, RefreshCw, Search, SearchX } from "lucide-react"
 import { SearchBar } from "../components/SearchBar"
@@ -240,35 +240,81 @@ export function SearchPage() {
     : []
   const [showSuggest, setShowSuggest] = useState(false)
 
+  // 焦点作用域是整个搜索控件区：输入框、清空与搜索按钮、联想列表（含列表内按钮）。
+  // 焦点在作用域内任意控件之间移动都不收起；只有离开整个作用域才收起。
+  // 指针按下列表项时 SearchBar 的输入框会失焦，而焦点在作用域外，所以延迟收起，
+  // 让 onClick 先完成选择（选择本身会立即收起）。
+  const searchControlsRef = useRef<HTMLDivElement>(null)
+  const suggestHideTimerRef = useRef<number | null>(null)
+
+  const cancelSuggestHide = () => {
+    if (suggestHideTimerRef.current === null) return
+    window.clearTimeout(suggestHideTimerRef.current)
+    suggestHideTimerRef.current = null
+  }
+
+  const handleSearchControlsBlur = (event: FocusEvent<HTMLDivElement>) => {
+    if (event.currentTarget.contains(event.relatedTarget as Node | null)) return
+    cancelSuggestHide()
+    suggestHideTimerRef.current = window.setTimeout(() => {
+      suggestHideTimerRef.current = null
+      const active = document.activeElement
+      if (active instanceof Node && searchControlsRef.current?.contains(active)) return
+      setShowSuggest(false)
+    }, 150)
+  }
+
+  // 唯一的选择路径：键盘 Enter/Space 与指针点击都会走到 onClick，不会各触发一次搜索。
+  const selectSuggestion = (item: string) => {
+    cancelSuggestHide()
+    setShowSuggest(false)
+    setSearchValue(item)
+    commitSearch(item)
+  }
+
+  useEffect(() => () => {
+    if (suggestHideTimerRef.current !== null) window.clearTimeout(suggestHideTimerRef.current)
+  }, [])
+
   return (
     <div className={hasSubmittedQuery
       ? "search-results-page"
       : "w-full flex flex-col min-h-full bg-background/50 pt-[32px] pb-[120px] px-[24px] md:px-[48px] lg:px-[64px] gap-10 max-w-[1600px] mx-auto"}>
       {/* 巨型搜索框 + 联想下拉 */}
-      <div className={hasSubmittedQuery ? "search-results__search-wrap" : "w-full max-w-5xl mx-auto relative"}>
+      <div
+        ref={searchControlsRef}
+        className={hasSubmittedQuery ? "search-results__search-wrap" : "w-full max-w-5xl mx-auto relative"}
+        // 焦点重新进入作用域（含输入框重新聚焦）就取消待执行的收起。
+        onFocusCapture={cancelSuggestHide}
+        onBlurCapture={handleSearchControlsBlur}
+      >
         <SearchBar
           value={searchValue}
           onChange={(e) => handleSearchValueChange(e.target.value)}
           onSearch={() => commitSearch(searchValue)}
           onClear={clearSearch}
-          onFocus={() => setShowSuggest(true)}
-          onBlur={() => setTimeout(() => setShowSuggest(false), 150)}
+          onFocus={() => {
+            cancelSuggestHide()
+            setShowSuggest(true)
+          }}
           disabled={clientMode === "unavailable"}
           placeholder={clientMode === "unavailable" ? "搜索服务未启用" : "搜索本地媒体库"}
         />
         {searchInputTooLong && <p role="alert" className="mt-2 px-6 text-sm text-destructive">搜索词过长，请缩短到 200 个字符以内。</p>}
         {showSuggest && suggestItems.length > 0 && (
-          <div className="search-results__suggestions absolute left-0 right-0 top-full z-20 mt-2 rounded-2xl border border-black/5 bg-white p-1.5 shadow-xl dark:border-white/10 dark:bg-zinc-900">
+          <div
+            className="search-results__suggestions absolute left-0 right-0 top-full z-20 mt-2 rounded-2xl border border-black/5 bg-white p-1.5 shadow-xl dark:border-white/10 dark:bg-zinc-900"
+          >
             {suggestItems.map((item) => (
               <button
                 key={item}
                 type="button"
-                onMouseDown={(e) => {
-                  e.preventDefault()
-                  setSearchValue(item)
-                  commitSearch(item)
-                  setShowSuggest(false)
-                }}
+                // 指针按下时不夺取输入框焦点（保留原生输入焦点与 IME 行为），
+                // 选择统一由 onClick 完成：键盘 Enter/Space 与指针点击是同一条路径。
+                onPointerDown={cancelSuggestHide}
+                onMouseDown={(e) => e.preventDefault()}
+                onFocus={cancelSuggestHide}
+                onClick={() => selectSuggestion(item)}
                 className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm hover:bg-black/5 dark:hover:bg-white/10"
               >
                 <Search className="h-3.5 w-3.5 text-muted-foreground" />

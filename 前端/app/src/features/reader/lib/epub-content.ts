@@ -408,14 +408,52 @@ export function htmlToPlainText(html: string): string {
  * Gutenberg 导出常把「START OF THE PROJECT GUTENBERG EBOOK」头页整节、
  * 以及「*** END OF … ***」之后的许可与捐赠样板拼进正文文档。
  * 阅读流按标记裁剪；磁盘上的 EPUB 文件保持原样，不修改用户数据。
+ *
+ * 只有真实样板形态（`*** … ***`）的 START/END 标记才裁剪：正文里偶然提到的
+ * 书名或句子不会被当成标记。标记与正文同处一个文档时裁掉标记之前的头页并
+ * 保留其后的正文；裁剪后只有真正没有内容的文档才跳过，其余内容（包括无法
+ * 判定的许可文案）一律保留，不做关键词猜测。
+ *
+ * 后端 `reader_search.rs` 必须保持同一套标记与裁剪语义，否则同一章的段落
+ * 下标会与阅读器 DOM 漂移。
  */
-const PG_START_MARKER = /START OF THE PROJECT GUTENBERG EBOOK/i
+const PG_START_MARKER = /\*{3}\s*START OF (?:THE|THIS) PROJECT GUTENBERG EBOOK\b[^\r\n]{0,200}?\*{3}/i
 const PG_END_MARKER = /\*{3}\s*END OF THE PROJECT GUTENBERG EBOOK/i
 
+/**
+ * Markers are often wrapped in an HTML comment. Cropping through the marker
+ * alone would leave an unterminated comment (or a stray `-->`) in the body, so
+ * resolve the enclosing comment bounds before slicing.
+ */
+function enclosingCommentStart(html: string, index: number): number {
+  const commentStart = html.lastIndexOf("<!--", index)
+  if (commentStart < 0) return -1
+  if (html.lastIndexOf("-->", index) > commentStart) return -1
+  return commentStart
+}
+
+function enclosingCommentEnd(html: string, index: number): number {
+  if (enclosingCommentStart(html, index) < 0) return -1
+  const commentEnd = html.indexOf("-->", index)
+  return commentEnd < 0 ? -1 : commentEnd + 3
+}
+
 function trimGutenbergBoilerplate(html: string): string | null {
-  if (PG_START_MARKER.test(html)) return null
-  const endMatch = PG_END_MARKER.exec(html)
-  return endMatch ? html.slice(0, endMatch.index) : html
+  let body = html
+  const startMatch = PG_START_MARKER.exec(body)
+  if (startMatch) {
+    const markerEnd = startMatch.index + startMatch[0].length
+    const commentEnd = enclosingCommentEnd(body, startMatch.index)
+    body = body.slice(commentEnd > markerEnd ? commentEnd : markerEnd)
+  }
+  const endMatch = PG_END_MARKER.exec(body)
+  if (endMatch) {
+    const commentStart = enclosingCommentStart(body, endMatch.index)
+    body = body.slice(0, commentStart >= 0 ? commentStart : endMatch.index)
+  }
+  // Cropping is the only reason to drop a document: what survives is kept
+  // verbatim, including licence prose this parser cannot classify.
+  return htmlToPlainText(body) ? body : null
 }
 
 function buildAnchorMap(html: string, text: string, paragraphs: readonly string[]): Readonly<Record<string, number>> {
@@ -468,7 +506,9 @@ function chapterFromXhtml(index: number, item: PublicationManifestItem, html: st
   if (!trimmedHtml) return null
   const text = htmlToPlainText(trimmedHtml)
   if (!text) return null
-  const title = extractTagText(html, ["h1", "h2", "h3", "title"])
+  // The title must come from the surviving content, otherwise a cropped header
+  // page would name a chapter whose text now starts at the real story.
+  const title = extractTagText(trimmedHtml, ["h1", "h2", "h3", "title"])
     ?? `第 ${index + 1} 章`
   const paragraphs = text
     .split(/\n{2,}/)

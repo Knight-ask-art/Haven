@@ -7,7 +7,21 @@ import {
 
 export interface StorageScanState {
   taskId: string; phaseCode: string; phase: string; filesSeen: number; newItem: number
-  message: string | null; terminal: boolean
+  /** 后端权威失败条目数（扫描已见条目中未能索引的数量）。 */
+  errors: number
+  message: string | null
+  /** 同一任务内最近一条安全警告（只保留一条；终态后保留供排查）。 */
+  warning: string | null
+  terminal: boolean
+  cancelling?: boolean
+}
+
+/** 警告展示上限：后端文案本身有界，这里再兜一层，避免异常长度挤占进度行。 */
+const MAX_WARNING_LENGTH = 120
+
+function boundedWarning(message: string | null): string | null {
+  if (!message) return null
+  return message.length > MAX_WARNING_LENGTH ? `${message.slice(0, MAX_WARNING_LENGTH - 1)}…` : message
 }
 
 /** 权威位置读回、原生目录动作与扫描状态；过期请求不覆盖更新的目录列表。 */
@@ -83,16 +97,28 @@ export function useStorageLocations(showNotice: (message: string) => void) {
       if (!alive.current) return
       const terminal = ["completed", "cancelled", "failed"].includes(event.kind)
       const phase = SCAN_PHASE_LABELS[event.kind] ?? event.kind
-      setScans(previous => ({ ...previous, [location.locationId]: {
-        taskId: event.data.taskId, phaseCode: event.kind, phase, filesSeen: event.data.filesSeen,
-        newItem: event.data.new, message: event.data.message ?? null, terminal,
-      } }))
-      if (terminal) showNotice(`${location.displayName}：${phase}`)
+      const errors = event.data.errors ?? 0
+      setScans(previous => {
+        const prior = previous[location.locationId]
+        // 只沿用**同一任务**的取消中状态与最近警告；换任务（含新任务复用位置）时重置。
+        const sameTask = prior?.taskId === event.data.taskId
+        const cancelling = !terminal && sameTask && prior?.cancelling === true
+        // 终态事件的 message 是后端有界的计数摘要；其它阶段的 message 只在警告事件里出现。
+        const warning = sameTask
+          ? boundedWarning(event.kind === "warning" ? event.data.message ?? prior?.warning ?? null : prior?.warning ?? null)
+          : boundedWarning(event.kind === "warning" ? event.data.message : null)
+        return { ...previous, [location.locationId]: {
+          taskId: event.data.taskId, phaseCode: event.kind, phase: cancelling ? "正在取消" : phase,
+          filesSeen: event.data.filesSeen, newItem: event.data.new,
+          errors, message: terminal ? event.data.message ?? null : null, warning, terminal, cancelling,
+        } }
+      })
+      if (terminal) showNotice(`${location.displayName}：${phase}${errors > 0 ? `（${errors} 个条目未能索引）` : ""}`)
     })
     if (!alive.current) return
     setScans(previous => ({ ...previous, [location.locationId]: previous[location.locationId]?.taskId === result.taskId ? previous[location.locationId] : {
       taskId: result.taskId, phaseCode: "started", phase: SCAN_PHASE_LABELS.started,
-      filesSeen: 0, newItem: 0, message: null, terminal: false,
+      filesSeen: 0, newItem: 0, errors: 0, message: null, warning: null, terminal: false,
     } }))
     if (result.alreadyRunning) showNotice("该目录已有扫描任务，已接入现有任务")
   })
@@ -100,10 +126,19 @@ export function useStorageLocations(showNotice: (message: string) => void) {
   const cancelDirectoryScan = (location: StorageLocationWire, scan: StorageScanState) => action(async () => {
     const result = await cancelScan(scan.taskId)
     if (!alive.current) return
-    setScans(previous => ({ ...previous, [location.locationId]: {
-      ...scan, phaseCode: result.phase, phase: SCAN_PHASE_LABELS[result.phase] ?? result.phase, terminal: true,
-    } }))
-    showNotice(result.alreadyTerminal ? "扫描已结束" : "已取消扫描")
+    setScans(previous => {
+      const current = previous[location.locationId]
+      // 终态事件可能先于取消响应到达；不能用响应覆盖终态或另一任务。
+      if (!current || current.taskId !== scan.taskId || current.terminal) return previous
+      return { ...previous, [location.locationId]: {
+        ...current,
+        phaseCode: result.alreadyTerminal ? result.phase : current.phaseCode,
+        phase: result.alreadyTerminal ? (SCAN_PHASE_LABELS[result.phase] ?? result.phase) : "正在取消",
+        terminal: result.alreadyTerminal,
+        cancelling: !result.alreadyTerminal,
+      } }
+    })
+    showNotice(result.alreadyTerminal ? "扫描已结束" : "取消请求已受理")
   })
 
   return { locations, scans, isLoading, error, busy, reload, addDirectory, rebindDirectory, removeDirectory, scanDirectory, cancelDirectoryScan }

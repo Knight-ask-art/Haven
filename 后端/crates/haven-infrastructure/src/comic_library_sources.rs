@@ -24,7 +24,9 @@ use haven_application::services::comic::{
     ComicImageMime, ComicPageBody, PreparedComicPage, PreparedComicPageAvailability,
     PreparedComicPageSource, RemoteComicPageProvider,
 };
-use haven_application::services::ports::{RemoteAcquiredFile, RemoteAcquisitionPort};
+use haven_application::services::ports::{
+    RemoteAcquiredFile, RemoteAcquisitionPort, RemoteTransferContext,
+};
 use haven_application::services::search_source::SearchSourceParticipant;
 use haven_application::services::session::{PreparedSession, PreparedSessionSource};
 use haven_application::services::source_import::{
@@ -66,8 +68,12 @@ const CATALOG_PAGE_SIZE: usize = 100;
 /// 搜索分页大小上限。
 const MAX_SEARCH_PAGE_SIZE: u32 = 50;
 const MAX_REDIRECTS: usize = 3;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// 单个网络等待（连接、响应头、每一块正文读取）的上界，与既有整段请求超时相同。
+///
+/// 远端获取带有限速时，限速睡眠发生在两次读取之间，**不计入**任何网络等待超时；
+/// 否则一个大归档或整章分页在有限速率下会因为「等待配额」被误判为网络超时。
+const NETWORK_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 const USER_AGENT: &str = "Haven/0.1.0 (offline content importer)";
 
 /// Komga API key 请求头（官方 API key auth scheme）。
@@ -109,6 +115,11 @@ pub struct LibraryResponse {
 
 /// 漫画库网络端口。实现方负责 URL 策略、DNS 解析与固定、逐跳重定向校验、
 /// 超时、请求头上限与响应大小上限。
+///
+/// `send_with` 刻意返回装箱 future 而不是 `async fn`：默认空实现（返回 Err）
+/// 若以 `async fn` 形式持有 `&RemoteTransferContext`，`async_trait` 推导的
+/// future 会要求 `&dyn` 在 await 之后仍可用而变得非 `Send`，连带污染所有
+/// `send` 调用点。
 #[async_trait]
 pub trait ComicLibraryGateway: Send + Sync {
     async fn send(
@@ -116,6 +127,26 @@ pub trait ComicLibraryGateway: Send + Sync {
         request: LibraryRequest,
         max_bytes: usize,
     ) -> Result<LibraryResponse, AppError>;
+
+    /// 受控发送：把有限速率贯穿到真实网络字节读取路径，并上报进度。
+    /// `total_from_response` 只在「响应体就是最终产物」时置真（整章归档），
+    /// 分页/逐页重试必须保持未知总大小。默认实现只在没有限速时退化为
+    /// [`ComicLibraryGateway::send`]；施加了有限速率时显式失败，绝不静默绕过。
+    fn send_with<'a>(
+        &'a self,
+        request: LibraryRequest,
+        max_bytes: usize,
+        transfer: Option<&'a RemoteTransferContext<'a>>,
+        total_from_response: bool,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<LibraryResponse, AppError>> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = total_from_response;
+            if transfer.is_some_and(|value| value.limit_bps().is_some()) {
+                return Err(internal_error("该漫画库客户端尚未实现受控获取路径"));
+            }
+            self.send(request, max_bytes).await
+        })
+    }
 }
 
 /// 生产实现：按登记的 endpoint 逐跳校验的受控 HTTP 客户端。
@@ -134,6 +165,30 @@ impl ComicLibraryGateway for HttpComicLibraryGateway {
         &self,
         request: LibraryRequest,
         max_bytes: usize,
+    ) -> Result<LibraryResponse, AppError> {
+        self.send_inner(request, max_bytes, None, false).await
+    }
+
+    fn send_with<'a>(
+        &'a self,
+        request: LibraryRequest,
+        max_bytes: usize,
+        transfer: Option<&'a RemoteTransferContext<'a>>,
+        total_from_response: bool,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<LibraryResponse, AppError>> + Send + 'a>> {
+        // `send_inner` 是 `async fn`，返回的 future 不能直接当作装箱 trait object；
+        // 这里显式装箱，trait 的签名与所有 `send_with` 调用点保持不变。
+        Box::pin(self.send_inner(request, max_bytes, transfer, total_from_response))
+    }
+}
+
+impl HttpComicLibraryGateway {
+    async fn send_inner(
+        &self,
+        request: LibraryRequest,
+        max_bytes: usize,
+        transfer: Option<&RemoteTransferContext<'_>>,
+        total_from_response: bool,
     ) -> Result<LibraryResponse, AppError> {
         // endpoint 已在登记时校验；这里仍然重新走一次策略，避免持久化数据被
         // 手工改写后绕过策略。端口按用户提供来源策略（自建 Komga/Kavita 常监听
@@ -164,9 +219,10 @@ impl ComicLibraryGateway for HttpComicLibraryGateway {
                 resolve_public_http_target(current.as_str(), HttpUrlPolicy::UserProvidedSource)
                     .await
                     .map_err(|_| security_denied("漫画库地址解析不安全"))?;
+            // 连接与响应头各有独立超时；不再设置整段请求超时，否则有限速时的
+            // 限速睡眠会被计入网络超时。
             let builder = reqwest::Client::builder()
                 .connect_timeout(CONNECT_TIMEOUT)
-                .timeout(REQUEST_TIMEOUT)
                 .user_agent(USER_AGENT)
                 .http1_only()
                 .redirect(reqwest::redirect::Policy::none());
@@ -185,9 +241,9 @@ impl ComicLibraryGateway for HttpComicLibraryGateway {
                 // secret 只在此处进入请求头；reqwest 内部按 header 编码，不落日志。
                 call = call.header(request.api_key_header, secret.as_str());
             }
-            let response = call
-                .send()
+            let response = tokio::time::timeout(NETWORK_WAIT_TIMEOUT, call.send())
                 .await
+                .map_err(|_| source_unavailable("漫画库暂时不可达"))?
                 .map_err(|_| source_unavailable("漫画库暂时不可达"))?;
             if response.status().is_redirection() {
                 let location = response
@@ -221,17 +277,34 @@ impl ComicLibraryGateway for HttpComicLibraryGateway {
             {
                 return Err(source_unavailable("漫画库响应超出大小上限"));
             }
+            if let (Some(transfer), true) = (transfer, total_from_response) {
+                // 一次新的产物尝试（传输层重试后的最终归档响应）：产物进度归零、
+                // 总大小回到未知，累计网络字节保持不变。只有跳转后的最终归档响应
+                // 才声明整体总大小。
+                transfer.begin_artifact_attempt();
+                transfer.set_total_bytes(response.content_length());
+            }
             let mut body = Vec::with_capacity(64 * 1024);
             let mut response = response;
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|_| source_unavailable("漫画库响应读取中断"))?
-            {
+            loop {
+                let next = tokio::time::timeout(NETWORK_WAIT_TIMEOUT, response.chunk())
+                    .await
+                    .map_err(|_| source_unavailable("漫画库响应读取中断"))?
+                    .map_err(|_| source_unavailable("漫画库响应读取中断"))?;
+                let Some(chunk) = next else { break };
                 if body.len().saturating_add(chunk.len()) > max_bytes {
                     return Err(source_unavailable("漫画库响应超出大小上限"));
                 }
                 body.extend_from_slice(&chunk);
+                if let Some(transfer) = transfer {
+                    // 真实网络字节：限速睡眠发生在这次读取之后，不在网络超时窗口内。
+                    // 只有整章归档响应体才算产物进度；JSON 元数据响应只计网络字节。
+                    if total_from_response {
+                        transfer.record_artifact(chunk.len() as u64).await;
+                    } else {
+                        transfer.record(chunk.len() as u64).await;
+                    }
+                }
             }
             return Ok(LibraryResponse { bytes: body });
         }
@@ -328,6 +401,22 @@ impl ComicLibraryProvider {
 
     async fn json(&self, request: LibraryRequest, max_bytes: usize) -> Result<Value, AppError> {
         let response = self.gateway.send(request, max_bytes).await?;
+        serde_json::from_slice(&response.bytes)
+            .map_err(|_| source_unavailable("漫画库返回了无效 JSON"))
+    }
+
+    /// 受控 JSON 读取（章节页清单等获取前元数据）：只计网络字节与限速，
+    /// 不计入产物进度，也不声明总大小。
+    async fn json_with(
+        &self,
+        request: LibraryRequest,
+        max_bytes: usize,
+        transfer: Option<&RemoteTransferContext<'_>>,
+    ) -> Result<Value, AppError> {
+        let response = self
+            .gateway
+            .send_with(request, max_bytes, transfer, false)
+            .await?;
         serde_json::from_slice(&response.bytes)
             .map_err(|_| source_unavailable("漫画库返回了无效 JSON"))
     }
@@ -534,10 +623,23 @@ impl ComicLibraryProvider {
     }
 
     /// 读取章节页清单（页标识由本模块生成，不接受服务端 URL）。
+    ///
+    /// 公开的两参数形式保留给在线漫画会话等既有（不受控）调用；显式下载走
+    /// [`ComicLibraryProvider::chapter_pages_with`]，把同一次获取的 `transfer`
+    /// 带进页清单请求，使整章组装的每一字节都经过同一次限速。
     pub async fn chapter_pages(
         &self,
         source_id: &str,
         chapter_id: &str,
+    ) -> Result<Vec<ChapterPage>, AppError> {
+        self.chapter_pages_with(source_id, chapter_id, None).await
+    }
+
+    async fn chapter_pages_with(
+        &self,
+        source_id: &str,
+        chapter_id: &str,
+        transfer: Option<&RemoteTransferContext<'_>>,
     ) -> Result<Vec<ChapterPage>, AppError> {
         let kind = Self::kind_of(source_id)?;
         if !haven_application::services::source_import::is_comic_library_opaque_id(chapter_id) {
@@ -555,7 +657,7 @@ impl ComicLibraryProvider {
                         "application/json",
                     )
                     .await?;
-                let value = self.json(request, MAX_JSON_BYTES).await?;
+                let value = self.json_with(request, MAX_JSON_BYTES, transfer).await?;
                 let pages = value
                     .as_array()
                     .ok_or_else(|| source_unavailable("Komga 页面列表结构异常"))?;
@@ -583,7 +685,7 @@ impl ComicLibraryProvider {
                         "application/json",
                     )
                     .await?;
-                let value = self.json(request, MAX_JSON_BYTES).await?;
+                let value = self.json_with(request, MAX_JSON_BYTES, transfer).await?;
                 let count = json_u32(&value, &["pageNumber", "pages", "pageCount"])
                     .ok_or_else(|| source_unavailable("Kavita 章节页数不可用"))?;
                 if count == 0 || count as usize > MAX_CHAPTER_PAGES {
@@ -606,6 +708,7 @@ impl ComicLibraryProvider {
         kind: CustomSourceKind,
         chapter_id: &str,
         page: &ChapterPage,
+        transfer: Option<&RemoteTransferContext<'_>>,
     ) -> Result<Vec<u8>, AppError> {
         let path = match kind {
             CustomSourceKind::Komga => format!(
@@ -623,7 +726,11 @@ impl ComicLibraryProvider {
         let request = self
             .request(source_id, kind, LibraryMethod::Get, path, None, "image/*")
             .await?;
-        let response = self.gateway.send(request, MAX_PAGE_BYTES).await?;
+        // 单页响应不是整章产物：不声明总大小。
+        let response = self
+            .gateway
+            .send_with(request, MAX_PAGE_BYTES, transfer, false)
+            .await?;
         Ok(response.bytes)
     }
 
@@ -635,6 +742,7 @@ impl ComicLibraryProvider {
         source_id: &str,
         chapter_id: &str,
         destination: &std::path::Path,
+        transfer: Option<&RemoteTransferContext<'_>>,
     ) -> Result<RemoteAcquiredFile, AppError> {
         let kind = Self::kind_of(source_id)?;
         let archive_path = match kind {
@@ -659,7 +767,11 @@ impl ComicLibraryProvider {
                 "application/zip,application/octet-stream,*/*;q=0.1",
             )
             .await?;
-        match self.gateway.send(request, MAX_ARCHIVE_BYTES).await {
+        match self
+            .gateway
+            .send_with(request, MAX_ARCHIVE_BYTES, transfer, true)
+            .await
+        {
             Ok(response) if response.bytes.starts_with(b"PK\x03\x04") => {
                 let size = write_bytes_to(destination.to_path_buf(), response.bytes).await?;
                 Ok(RemoteAcquiredFile {
@@ -668,9 +780,14 @@ impl ComicLibraryProvider {
                 })
             }
             // 无 ZIP 本地文件头（例如 CBR）或归档端点不可用时，改用逐页组装，
-            // 由本地 ZIP writer 生成 CBZ。
+            // 由本地 ZIP writer 生成 CBZ。归档响应不是最终产物：撤销它的总大小
+            // 与产物进度（`begin_artifact_attempt` 同时归零），逐页阶段继续保持
+            // 整章总大小未知；归档响应已读到的字节仍计入累计网络限速。
             Ok(_) | Err(_) => {
-                self.assemble_chapter_cbz(source_id, chapter_id, destination)
+                if let Some(transfer) = transfer {
+                    transfer.begin_artifact_attempt();
+                }
+                self.assemble_chapter_cbz(source_id, chapter_id, destination, transfer)
                     .await
             }
         }
@@ -681,13 +798,18 @@ impl ComicLibraryProvider {
         source_id: &str,
         chapter_id: &str,
         destination: &std::path::Path,
+        transfer: Option<&RemoteTransferContext<'_>>,
     ) -> Result<RemoteAcquiredFile, AppError> {
         let kind = Self::kind_of(source_id)?;
-        let pages = self.chapter_pages(source_id, chapter_id).await?;
+        let pages = self
+            .chapter_pages_with(source_id, chapter_id, transfer)
+            .await?;
         let mut collected: Vec<(String, Vec<u8>)> = Vec::with_capacity(pages.len());
         let mut total = 0usize;
         for page in &pages {
-            let bytes = self.page_bytes(source_id, kind, chapter_id, page).await?;
+            let bytes = self
+                .page_bytes(source_id, kind, chapter_id, page, transfer)
+                .await?;
             let extension = image_extension(&bytes)
                 .ok_or_else(|| source_unavailable("漫画库返回了非图片页面"))?;
             total = total.saturating_add(bytes.len());
@@ -836,7 +958,7 @@ impl RemoteComicPageProvider for ComicLibraryProvider {
             .find(|candidate| &candidate.name == page_name)
             .ok_or_else(|| source_unavailable("漫画页面已不存在"))?;
         let bytes = self
-            .page_bytes(&source_id, kind, &chapter_id, &resolved)
+            .page_bytes(&source_id, kind, &chapter_id, &resolved, None)
             .await?;
         let mime_type =
             image_mime(&bytes).ok_or_else(|| source_unavailable("漫画库返回了非图片页面"))?;
@@ -852,6 +974,30 @@ impl RemoteAcquisitionPort for ComicLibraryProvider {
         remote_id: &str,
         destination: &std::path::Path,
     ) -> Result<RemoteAcquiredFile, AppError> {
+        self.acquire_inner(source_key, remote_id, destination, None)
+            .await
+    }
+
+    async fn acquire_controlled(
+        &self,
+        source_key: &str,
+        remote_id: &str,
+        destination: &std::path::Path,
+        transfer: &RemoteTransferContext<'_>,
+    ) -> Result<RemoteAcquiredFile, AppError> {
+        self.acquire_inner(source_key, remote_id, destination, Some(transfer))
+            .await
+    }
+}
+
+impl ComicLibraryProvider {
+    async fn acquire_inner(
+        &self,
+        source_key: &str,
+        remote_id: &str,
+        destination: &std::path::Path,
+        transfer: Option<&RemoteTransferContext<'_>>,
+    ) -> Result<RemoteAcquiredFile, AppError> {
         if !matches!(source_key, KOMGA_SOURCE_KEY | KAVITA_SOURCE_KEY) {
             return Err(invalid_argument("该来源不支持漫画库离线获取"));
         }
@@ -863,7 +1009,7 @@ impl RemoteAcquisitionPort for ComicLibraryProvider {
         if comic_library_source_key(&source_id)? != source_key {
             return Err(invalid_argument("漫画库章节身份与来源不一致"));
         }
-        self.chapter_archive(&source_id, &chapter_id, destination)
+        self.chapter_archive(&source_id, &chapter_id, destination, transfer)
             .await
     }
 }

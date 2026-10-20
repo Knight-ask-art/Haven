@@ -424,7 +424,7 @@ export function DownloadsPage() {
 
       {/* 存储配额 Banner（P1） */}
       <div className="mx-[24px] mt-[16px] flex items-center justify-between rounded-lg border border-border/60 bg-muted/30 px-[16px] py-[10px] text-xs md:mx-[48px] lg:mx-[72px]">
-        <span className="text-muted-foreground">存储配额：本地离线内容由下载任务管理；空间不足时，下载任务会等待可用空间释放。</span>
+        <span className="text-muted-foreground">存储配额：本地离线内容由下载任务管理；空间不足时，请释放空间后手动重试失败的任务。</span>
         <span className="hidden text-muted-foreground sm:block">当前版本暂不支持拖拽导入本地文件</span>
       </div>
 

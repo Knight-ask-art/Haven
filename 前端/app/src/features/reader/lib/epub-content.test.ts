@@ -272,15 +272,20 @@ describe("epub-content", () => {
     expect(publication.chapters[1].paragraphs.join(" ")).not.toContain("General Information")
   })
 
-  it("skips whole Gutenberg front-matter documents", async () => {
+  it("keeps post-marker prose instead of guessing at Gutenberg boilerplate", async () => {
     const publication = await parseEpubBook(validEpub({
       first: "<html><body><h1>The Project Gutenberg eBook of Frankenstein</h1>"
         + "<p>*** START OF THE PROJECT GUTENBERG EBOOK FRANKENSTEIN ***</p>"
         + "<p>donations to the Project Gutenberg Literary Archive Foundation.</p>"
         + "</body></html>",
     }))
-    expect(publication.chapters).toHaveLength(1)
-    expect(publication.chapters[0].title).toBe("第二章")
+    // The same words can be story text, so only the marker itself is cropped
+    // and the prose that follows must be preserved.
+    expect(publication.chapters).toHaveLength(2)
+    expect(publication.chapters[0].paragraphs).toEqual([
+      "donations to the Project Gutenberg Literary Archive Foundation.",
+    ])
+    expect(publication.chapters[1].title).toBe("第二章")
   })
 
   it("enforces the bounded resource input", async () => {

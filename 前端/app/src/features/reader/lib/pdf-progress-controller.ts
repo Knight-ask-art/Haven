@@ -1,3 +1,4 @@
+import { resolveRestorePosition, type InitialPosition } from "@/features/progress/lib/restore-position"
 import type { ProgressSaveRequest, ProgressSaveResult, SessionOpenResultDto, TextAnchorDto } from "@/lib/ipc/generated/wire"
 import { HavenError } from "@/lib/ipc/errors"
 import { saveProgress } from "@/features/progress/ipc/progress-gateway"
@@ -157,16 +158,17 @@ export function restorePdfProgress(
   pageCount: number,
   session: SessionOpenResultDto,
   restored?: { current: string | null },
+  initial?: InitialPosition,
 ): { pageIndex: number; zoom: number } | null {
   if (!Number.isInteger(pageCount) || pageCount <= 0) return null
-  if (!session.progress || session.progress.locator.kind !== "pdf") return null
-  const identity = `${session.sessionId}:${session.mediaItemId}:${session.contentUri}`
+  const { locator, reset, identity } = resolveRestorePosition(session, initial)
+  if (locator?.kind !== "pdf") return null
   if (restored?.current === identity) return null
-  if (session.progress.completion === "not_started") {
+  if (reset) {
     if (restored) restored.current = identity
     return { pageIndex: 0, zoom: 1 }
   }
-  const data = session.progress.locator.data
+  const data = locator.data
   if (!Number.isInteger(data.pageIndex) || data.pageIndex < 0) return null
   const zoom = typeof data.zoom === "number" ? clampPdfZoom(data.zoom) : 1
   const result = {

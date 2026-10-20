@@ -3,9 +3,11 @@
 //! 依赖方向：Application → Domain 契约；具体实现由组装层（src-tauri / 测试）提供。
 
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use haven_common::{AppError, UtcMillis};
+use haven_common::{AppError, ErrorKind, UtcMillis};
 use haven_domain::comic_catalog::{ComicCatalogRefreshReceipt, ComicChapterCatalogState};
 use haven_domain::comic_identity::{
     ChapterSourceRef, ComicProgressMigrationSnapshot, EditionProfile, PageIdentity,
@@ -618,14 +620,194 @@ pub struct RemoteContentRange {
     pub total: u64,
 }
 
+/// 一次远端获取的**真实网络字节**进度快照。
+///
+/// `bytes` 是**当前产物尝试**已经读到的字节（限速与速率仍按累计网络字节计算）：
+/// 已知总大小时它夹在总大小内，且绝不把失败/被丢弃尝试读到的字节算进完成度；
+/// 总大小未知时它就是本次获取累计读取的网络字节，此时不宣称任何百分比。
+/// 它**不是**最终产物大小：转换类来源（订阅源、Europe PMC、Wikisource）的网络字节
+/// 与落盘产物不同，最终产物大小只由 [`RemoteAcquiredFile::size_bytes`] 给出。
+/// `total_bytes` 未知时为 `None`（诚实表达未知），绝不拿单页/单次响应大小冒充整体。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemoteAcquisitionProgress {
+    pub bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub speed_bps: Option<u64>,
+    pub eta_seconds: Option<u64>,
+}
+
+/// 远端获取进度观察者。
+///
+/// 实现方会在网络读取路径上被同步调用，因此**只能保存最新值**：不得执行阻塞 IO、
+/// 数据库写入或 IPC 发布；持久化与事件发布由调用方按界（例如 100ms）完成。
+pub trait RemoteAcquisitionObserver: Send + Sync {
+    fn on_progress(&self, progress: RemoteAcquisitionProgress);
+}
+
+/// 一次受控远端获取的作用域上下文：有限速率（字节/秒）+ 进度上报。
+///
+/// 同一个 `acquire_controlled` 调用内的多页下载、重试与主机回退**必须共享**同一个
+/// 实例：限速按累计网络字节计算，不随单页或单次尝试重置。获取产物之前为定位产物而
+/// 发出的元数据/目录请求（条目页、页清单）同样必须携带这个实例：它们只计网络字节，
+/// 不计入产物进度。上下文只在该次获取内存在，不使用全局状态或任务局部上下文。
+///
+/// 限速语义：`record` 在**网络读取之外**按累计字节补齐应等待的时长，因此调用方
+/// 必须把每块网络等待（连接/响应头/单块读取）各自包在独立超时里，不能用一个总
+/// 超时同时约束限速睡眠——否则大文件在有限速率下必然超时失败。
+pub struct RemoteTransferContext<'a> {
+    limit_bps: Option<u64>,
+    observer: &'a dyn RemoteAcquisitionObserver,
+    started: Instant,
+    state: Mutex<RemoteTransferState>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RemoteTransferState {
+    /// 累计网络字节：限速与速率的唯一依据，跨重试/主机回退**从不重置**。
+    network_bytes: u64,
+    /// 当前**产物**尝试已经读到的字节；每次尝试（重试/主机回退）开始时归零。
+    artifact_bytes: u64,
+    total_bytes: Option<u64>,
+}
+
+impl<'a> RemoteTransferContext<'a> {
+    /// `limit_bps`：字节/秒；`None` 表示不限速（仍然上报进度）。
+    pub fn new(limit_bps: Option<u64>, observer: &'a dyn RemoteAcquisitionObserver) -> Self {
+        Self {
+            limit_bps: limit_bps.filter(|limit| *limit > 0),
+            observer,
+            started: Instant::now(),
+            state: Mutex::new(RemoteTransferState::default()),
+        }
+    }
+
+    /// 本次获取生效的有限速率（字节/秒）；`None` 表示不限速。
+    pub fn limit_bps(&self) -> Option<u64> {
+        self.limit_bps
+    }
+
+    /// 声明**当前产物尝试**的已知总大小。只有「响应体就是最终产物」的获取可以声明；
+    /// 分页下载与转换类来源必须保持 `None`（未知总大小是诚实值）。
+    /// 每次新的产物尝试（[`RemoteTransferContext::begin_artifact_attempt`]）都会把它
+    /// 清回未知，避免上一次尝试的响应大小冒充这一次的整体大小。
+    pub fn set_total_bytes(&self, total_bytes: Option<u64>) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .total_bytes = total_bytes;
+    }
+
+    /// 开始一次**产物**获取尝试：产物进度归零，已知总大小回到未知。
+    ///
+    /// 只由「响应体就是最终产物」的获取在每次尝试（传输层重试、主机回退、逐页读取）
+    /// 开始时调用。累计网络字节与限速依据**不重置**：被丢弃尝试读到的字节仍然计入
+    /// 网络上限，只是不再冒充当前产物的完成度。
+    pub fn begin_artifact_attempt(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.artifact_bytes = 0;
+        state.total_bytes = None;
+    }
+
+    /// 记录一次**非产物**网络读取的字节数（目录页、条目元数据、分页响应、转换类正文）：
+    /// 只计入限速与速率，不计入产物进度——元数据字节绝不能冒充产物完成度。
+    /// 先记账，再按有限速率补齐应等待的时长，最后把最新进度交给观察者；
+    /// 等待发生在网络读取之外。
+    pub async fn record(&self, bytes: u64) {
+        self.record_read(bytes, false).await;
+    }
+
+    /// 记录一次**产物**响应体的网络读取：同时计入限速、速率与当前产物尝试的进度。
+    pub async fn record_artifact(&self, bytes: u64) {
+        self.record_read(bytes, true).await;
+    }
+
+    async fn record_read(&self, bytes: u64, artifact: bool) {
+        let network_bytes = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.network_bytes = state.network_bytes.saturating_add(bytes);
+            if artifact {
+                state.artifact_bytes = state.artifact_bytes.saturating_add(bytes);
+            }
+            state.network_bytes
+        };
+        if let Some(limit) = self.limit_bps {
+            let delay = transfer_delay(self.started.elapsed(), network_bytes, limit);
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+        }
+        self.observer.on_progress(self.progress());
+    }
+
+    /// 当前进度快照。
+    ///
+    /// 已知总大小时上报的是**当前产物尝试**读到的字节（夹在总大小内，不超过 100%）：
+    /// 失败尝试读到的字节已经计入网络与限速，但绝不能与当前尝试的产物字节相加，
+    /// 否则回退/重试后的累计网络字节一碰到总大小就会谎报 100%。总大小未知时保持
+    /// 未知，只报累计网络字节，不伪造百分比。
+    pub fn progress(&self) -> RemoteAcquisitionProgress {
+        let state = *self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let speed_bps = (elapsed > 0.0).then(|| (state.network_bytes as f64 / elapsed).round() as u64);
+        let bytes = match state.total_bytes {
+            Some(total) => state.artifact_bytes.min(total),
+            None => state.network_bytes,
+        };
+        let eta_seconds = state.total_bytes.and_then(|total| {
+            speed_bps
+                .filter(|speed| *speed > 0)
+                .map(|speed| total.saturating_sub(bytes).div_ceil(speed))
+        });
+        RemoteAcquisitionProgress {
+            bytes,
+            total_bytes: state.total_bytes,
+            speed_bps,
+            eta_seconds,
+        }
+    }
+}
+
+/// 按累计字节与有限速率推算还需等待的时长（限速睡眠不进入任何网络超时窗口）。
+fn transfer_delay(elapsed: Duration, bytes: u64, limit_bps: u64) -> Duration {
+    if limit_bps == 0 || bytes == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_secs_f64(bytes as f64 / limit_bps as f64).saturating_sub(elapsed)
+}
+
 #[async_trait]
 pub trait RemoteAcquisitionPort: Send + Sync {
+    /// 既有获取路径：无观察者、无显式限速。保留以兼容既有调用方与夹具；
+    /// 生产 Provider 必须同时实现 [`RemoteAcquisitionPort::acquire_controlled`]。
     async fn acquire(
         &self,
         source_key: &str,
         remote_id: &str,
         destination: &Path,
     ) -> Result<RemoteAcquiredFile, AppError>;
+
+    /// 受控获取：把有限速率约束贯穿到**真实网络字节读取路径**（不是获取完成后的
+    /// 补睡眠），并按界上报进度。取消语义与 `acquire` 一致：future 被丢弃即中止。
+    ///
+    /// 默认实现只在**没有**有限速率约束时退化为 `acquire`；一旦调用方施加了有限
+    /// 速率，默认实现必须显式失败，绝不静默绕过限速。
+    async fn acquire_controlled(
+        &self,
+        source_key: &str,
+        remote_id: &str,
+        destination: &Path,
+        transfer: &RemoteTransferContext<'_>,
+    ) -> Result<RemoteAcquiredFile, AppError> {
+        if transfer.limit_bps().is_some() {
+            return Err(AppError::new(
+                "INTERNAL_ERROR",
+                ErrorKind::Internal,
+                "该来源尚未实现受控获取路径，无法应用下载限速",
+                false,
+            ));
+        }
+        self.acquire(source_key, remote_id, destination).await
+    }
 }
 
 /// Controlled remote read port used by Article/PDF sessions.  Implementations

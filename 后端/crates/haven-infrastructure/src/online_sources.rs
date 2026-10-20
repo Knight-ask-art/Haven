@@ -17,9 +17,9 @@ use haven_application::services::comic::{
     ComicImageMime, ComicPageBody, PreparedComicPage, PreparedComicPageAvailability,
     PreparedComicPageSource, RemoteComicPageProvider,
 };
-use haven_application::services::ports::{RemoteAcquiredFile, RemoteAcquisitionPort};
 use haven_application::services::ports::{
-    RemoteByteRange, RemoteContentRange, RemoteSessionBody, RemoteSessionPort,
+    RemoteAcquiredFile, RemoteAcquisitionPort, RemoteByteRange, RemoteContentRange,
+    RemoteSessionBody, RemoteSessionPort, RemoteTransferContext,
 };
 use haven_application::services::session::{PreparedSession, PreparedSessionSource};
 use haven_application::services::source_import::{
@@ -59,8 +59,12 @@ const MAX_MANGA_PAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_MANGA_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_MANGA_CHAPTERS: usize = 500;
 const MANGADEX_FEED_PAGE_LIMIT: usize = 100;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// 单个网络等待（连接、响应头、每一块正文读取）的上界，与既有整段请求超时相同。
+///
+/// 远端获取带有限速时，限速睡眠发生在两次读取之间，**不计入**任何网络等待超时；
+/// 否则一个大文件在有限速率下会因为「等待配额」被误判为网络超时。
+const NETWORK_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_TRANSIENT_ATTEMPTS: usize = 3;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(3);
 const USER_AGENT: &str = "Haven/0.1.0 (offline content importer)";
@@ -85,7 +89,19 @@ impl OnlineContentClient {
     }
 
     pub(crate) async fn json(&self, url: &str, policy: HostPolicy) -> Result<Value, AppError> {
-        let bytes = self.bytes(url, policy, MAX_API_BYTES).await?;
+        self.json_with(url, policy, None).await
+    }
+
+    /// 受控 JSON 读取：`transfer` 携带本次获取共享的有限速率与进度观察者。
+    pub(crate) async fn json_with(
+        &self,
+        url: &str,
+        policy: HostPolicy,
+        transfer: Option<&RemoteTransferContext<'_>>,
+    ) -> Result<Value, AppError> {
+        let bytes = self
+            .bytes_with(url, policy, MAX_API_BYTES, transfer, false)
+            .await?;
         serde_json::from_slice(&bytes).map_err(|_| source_unavailable("正文来源返回了无效 JSON"))
     }
 
@@ -98,7 +114,20 @@ impl OnlineContentClient {
         policy: HostPolicy,
         max_bytes: usize,
     ) -> Result<String, AppError> {
-        let bytes = self.bytes(url, policy, max_bytes).await?;
+        self.text_with(url, policy, max_bytes, None).await
+    }
+
+    /// 受控文本读取（Europe PMC 全文等转换类来源）。
+    pub(crate) async fn text_with(
+        &self,
+        url: &str,
+        policy: HostPolicy,
+        max_bytes: usize,
+        transfer: Option<&RemoteTransferContext<'_>>,
+    ) -> Result<String, AppError> {
+        let bytes = self
+            .bytes_with(url, policy, max_bytes, transfer, false)
+            .await?;
         String::from_utf8(bytes).map_err(|_| source_unavailable("正文来源返回了无法读取的文本"))
     }
 
@@ -126,7 +155,24 @@ impl OnlineContentClient {
         policy: HostPolicy,
         max_bytes: usize,
     ) -> Result<Vec<u8>, AppError> {
-        Ok(self.fetch(url, policy, max_bytes, None).await?.bytes)
+        self.bytes_with(url, policy, max_bytes, None, false).await
+    }
+
+    /// 受控字节读取。`total_from_response` 只在「响应体就是最终产物」时置真，
+    /// 转换类响应（JSON/XML 摘要页）保持未知总大小；分页下载由调用方保持 `None`。
+    async fn bytes_with(
+        &self,
+        url: &str,
+        policy: HostPolicy,
+        max_bytes: usize,
+        transfer: Option<&RemoteTransferContext<'_>>,
+        total_from_response: bool,
+    ) -> Result<Vec<u8>, AppError> {
+        Ok(self
+            .fetch_optional_with(url, policy, max_bytes, None, transfer, total_from_response)
+            .await?
+            .ok_or_else(|| source_unavailable("正文来源返回异常状态"))?
+            .bytes)
     }
 
     async fn fetch(
@@ -149,15 +195,29 @@ impl OnlineContentClient {
         max_bytes: usize,
         range: Option<RemoteByteRange>,
     ) -> Result<Option<RemoteHttpResponse>, AppError> {
+        self.fetch_optional_with(url, policy, max_bytes, range, None, false)
+            .await
+    }
+
+    async fn fetch_optional_with(
+        &self,
+        url: &str,
+        policy: HostPolicy,
+        max_bytes: usize,
+        range: Option<RemoteByteRange>,
+        transfer: Option<&RemoteTransferContext<'_>>,
+        total_from_response: bool,
+    ) -> Result<Option<RemoteHttpResponse>, AppError> {
         let mut current = validate_url(url, policy)?;
         for _ in 0..=MAX_REDIRECTS {
             let target =
                 resolve_public_http_target(current.as_str(), HttpUrlPolicy::SourceEndpoint)
                     .await
                     .map_err(|_| source_unavailable("正文来源地址解析不安全"))?;
+            // 连接与响应头各有独立超时；不再设置整段请求超时，否则有限速时的
+            // 限速睡眠会被计入网络超时，大文件必然失败。
             let builder = reqwest::Client::builder()
                 .connect_timeout(CONNECT_TIMEOUT)
-                .timeout(REQUEST_TIMEOUT)
                 .user_agent(USER_AGENT)
                 // Keep the fixed-source client predictable on Windows while
                 // preserving HTTPS certificate validation.
@@ -183,8 +243,8 @@ impl OnlineContentClient {
             let response = {
                 let mut response = None;
                 for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
-                    match build_request().send().await {
-                        Ok(candidate) => {
+                    match tokio::time::timeout(NETWORK_WAIT_TIMEOUT, build_request().send()).await {
+                        Ok(Ok(candidate)) => {
                             let status = candidate.status();
                             if let Some(delay) =
                                 transient_retry_delay(status, candidate.headers(), attempt)
@@ -196,10 +256,10 @@ impl OnlineContentClient {
                             response = Some(candidate);
                             break;
                         }
-                        Err(_) if attempt + 1 < MAX_TRANSIENT_ATTEMPTS => {
+                        Ok(Err(_)) | Err(_) if attempt + 1 < MAX_TRANSIENT_ATTEMPTS => {
                             tokio::time::sleep(transient_backoff(attempt)).await;
                         }
-                        Err(_) => break,
+                        Ok(Err(_)) | Err(_) => break,
                     }
                 }
                 response.ok_or_else(|| source_unavailable("正文来源暂时不可达"))?
@@ -250,17 +310,40 @@ impl OnlineContentClient {
             if content_range.is_some_and(|range| range.total > max_bytes as u64) {
                 return Err(source_unavailable("正文来源总大小超过安全上限"));
             }
+            if let (Some(transfer), true) = (transfer, total_from_response) {
+                // 一次新的产物尝试（传输层重试后的最终响应）：产物进度归零、总大小
+                // 回到未知，累计网络字节保持不变。只有跳转后的最终响应才可能声明
+                // 整体总大小；范围响应（分页读取）的总大小是对象大小而非本次产物，
+                // 按未知处理。
+                transfer.begin_artifact_attempt();
+                transfer.set_total_bytes(if content_range.is_none() {
+                    response.content_length()
+                } else {
+                    None
+                });
+            }
             let mut body = Vec::with_capacity(64 * 1024);
             let mut response = response;
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|_| source_unavailable("正文来源响应读取中断"))?
-            {
+            loop {
+                let next = tokio::time::timeout(NETWORK_WAIT_TIMEOUT, response.chunk())
+                    .await
+                    .map_err(|_| source_unavailable("正文来源响应读取中断"))?
+                    .map_err(|_| source_unavailable("正文来源响应读取中断"))?;
+                let Some(chunk) = next else { break };
                 if body.len().saturating_add(chunk.len()) > max_bytes {
                     return Err(source_unavailable("正文来源响应超出大小上限"));
                 }
                 body.extend_from_slice(&chunk);
+                if let Some(transfer) = transfer {
+                    // 真实网络字节：限速睡眠发生在这次读取之后，不在网络超时窗口内。
+                    // 只有响应体就是最终产物时才同时计入产物进度；JSON/XML 元数据
+                    // 响应只计网络字节，绝不冒充产物的完成度。
+                    if total_from_response {
+                        transfer.record_artifact(chunk.len() as u64).await;
+                    } else {
+                        transfer.record(chunk.len() as u64).await;
+                    }
+                }
             }
             let total_size = content_range
                 .map(|value| value.total)
@@ -466,12 +549,15 @@ impl OnlineCatalogProvider {
         .ok_or_else(|| source_unavailable("MangaDex 章节目录身份无效"))
     }
 
+    /// 多页下载共享同一个 `transfer`：累计网络字节与限速不按页重置，页清单（元数据）
+    /// 与逐页响应都经过同一次限速；整章总大小未知（每页大小不是整章总量），保持 `None`。
     async fn download_mangadex_chapter(
         &self,
         chapter_id: &str,
         destination: &std::path::Path,
+        transfer: Option<&RemoteTransferContext<'_>>,
     ) -> Result<RemoteAcquiredFile, AppError> {
-        let (base_url, hash, names) = self.mangadex_page_manifest(chapter_id).await?;
+        let (base_url, hash, names) = self.mangadex_page_manifest(chapter_id, transfer).await?;
 
         let mut pages: Vec<(String, Vec<u8>)> = Vec::with_capacity(names.len());
         let mut total = 0usize;
@@ -479,7 +565,7 @@ impl OnlineCatalogProvider {
             let url = format!("{}/data/{hash}/{name}", base_url.trim_end_matches('/'));
             let bytes = self
                 .client
-                .bytes(&url, HostPolicy::MangadexCdn, MAX_MANGA_PAGE_BYTES)
+                .bytes_with(&url, HostPolicy::MangadexCdn, MAX_MANGA_PAGE_BYTES, transfer, false)
                 .await?;
             let extension = image_extension(&bytes)
                 .ok_or_else(|| source_unavailable("MangaDex 返回了非图片页面"))?;
@@ -499,15 +585,19 @@ impl OnlineCatalogProvider {
 
     /// Fetch only the MangaDex page manifest. No page bytes are downloaded;
     /// this method is used by online comic sessions before a grant is issued.
+    ///
+    /// 显式下载必须把同一次获取的 `transfer` 带进来：页清单是元数据，只计网络
+    /// 字节与限速，不计入产物进度（每页大小也不是整章总大小）。
     async fn mangadex_page_manifest(
         &self,
         chapter_id: &str,
+        transfer: Option<&RemoteTransferContext<'_>>,
     ) -> Result<(String, String, Vec<String>), AppError> {
         validate_uuid_like(chapter_id, "MangaDex 章节标识")?;
         let at_home_url = format!("{MANGADEX_API}/at-home/server/{chapter_id}");
         let value = self
             .client
-            .json(&at_home_url, HostPolicy::MangadexApi)
+            .json_with(&at_home_url, HostPolicy::MangadexApi, transfer)
             .await?;
         let base_url = value
             .get("baseUrl")
@@ -629,12 +719,14 @@ impl OnlineCatalogProvider {
         &self,
         arxiv_id: &str,
         destination: &std::path::Path,
+        transfer: Option<&RemoteTransferContext<'_>>,
     ) -> Result<RemoteAcquiredFile, AppError> {
         let arxiv_id = validate_arxiv_id(arxiv_id)?;
         let pdf_url = format!("{ARXIV_API}/pdf/{arxiv_id}.pdf");
+        // 响应体就是最终 PDF：可用于声明已知总大小。
         let pdf = self
             .client
-            .bytes(&pdf_url, HostPolicy::Arxiv, MAX_PDF_BYTES)
+            .bytes_with(&pdf_url, HostPolicy::Arxiv, MAX_PDF_BYTES, transfer, true)
             .await?;
         if !pdf.starts_with(b"%PDF-") {
             return Err(source_unavailable("arXiv 返回的文件不是 PDF"));
@@ -650,14 +742,16 @@ impl OnlineCatalogProvider {
         &self,
         pmcid: &str,
         destination: &std::path::Path,
+        transfer: Option<&RemoteTransferContext<'_>>,
     ) -> Result<RemoteAcquiredFile, AppError> {
         if !is_pmcid(pmcid) {
             return Err(invalid_argument("Europe PMC 标识非法"));
         }
         let url = format!("{EUROPE_PMC_API}/{pmcid}/fullTextXML");
+        // 网络读的是 XML 全文，落盘的是转换后的 HTML：网络总大小未知。
         let xml = self
             .client
-            .text(&url, HostPolicy::EuropePmc, MAX_HTML_BYTES)
+            .text_with(&url, HostPolicy::EuropePmc, MAX_HTML_BYTES, transfer)
             .await?;
         validate_europe_pmc_full_text(&xml, pmcid)?;
         let document = parse_europe_pmc(&xml);
@@ -684,13 +778,18 @@ impl OnlineCatalogProvider {
         &self,
         title: &str,
         destination: &std::path::Path,
+        transfer: Option<&RemoteTransferContext<'_>>,
     ) -> Result<RemoteAcquiredFile, AppError> {
         validate_wikisource_title(title)?;
         let url = format!(
             "{WIKISOURCE_API}?action=parse&page={}&prop=text&format=json&formatversion=2",
             encode_query(title)
         );
-        let value = self.client.json(&url, HostPolicy::Wikisource).await?;
+        // 网络读的是 API JSON，落盘的是转换后的 HTML：网络总大小未知。
+        let value = self
+            .client
+            .json_with(&url, HostPolicy::Wikisource, transfer)
+            .await?;
         let parsed = value
             .get("parse")
             .ok_or_else(|| source_unavailable("Wikisource 页面不存在"))?;
@@ -766,6 +865,30 @@ impl RemoteAcquisitionPort for OnlineCatalogProvider {
         remote_id: &str,
         destination: &std::path::Path,
     ) -> Result<RemoteAcquiredFile, AppError> {
+        self.acquire_inner(source_key, remote_id, destination, None)
+            .await
+    }
+
+    async fn acquire_controlled(
+        &self,
+        source_key: &str,
+        remote_id: &str,
+        destination: &std::path::Path,
+        transfer: &RemoteTransferContext<'_>,
+    ) -> Result<RemoteAcquiredFile, AppError> {
+        self.acquire_inner(source_key, remote_id, destination, Some(transfer))
+            .await
+    }
+}
+
+impl OnlineCatalogProvider {
+    async fn acquire_inner(
+        &self,
+        source_key: &str,
+        remote_id: &str,
+        destination: &std::path::Path,
+        transfer: Option<&RemoteTransferContext<'_>>,
+    ) -> Result<RemoteAcquiredFile, AppError> {
         if destination.as_os_str().is_empty() {
             return Err(storage_error("正文临时文件路径无效"));
         }
@@ -775,16 +898,31 @@ impl RemoteAcquisitionPort for OnlineCatalogProvider {
                     .split_once(':')
                     .ok_or_else(|| invalid_argument("MangaDex 远端身份无效"))?;
                 validate_mangadex_id(manga_id)?;
-                self.download_mangadex_chapter(chapter_id, destination)
+                self.download_mangadex_chapter(chapter_id, destination, transfer)
                     .await
             }
-            "arxiv" => self.acquire_arxiv_to(remote_id, destination).await,
-            "europepmc" => self.acquire_europe_pmc_to(remote_id, destination).await,
-            "wikisource" => self.acquire_wikisource_to(remote_id, destination).await,
-            "feed" => {
-                self.feed_provider()?
-                    .acquire(source_key, remote_id, destination)
+            "arxiv" => {
+                self.acquire_arxiv_to(remote_id, destination, transfer)
                     .await
+            }
+            "europepmc" => {
+                self.acquire_europe_pmc_to(remote_id, destination, transfer)
+                    .await
+            }
+            "wikisource" => {
+                self.acquire_wikisource_to(remote_id, destination, transfer)
+                    .await
+            }
+            "feed" => {
+                let provider = self.feed_provider()?;
+                match transfer {
+                    Some(transfer) => {
+                        provider
+                            .acquire_controlled(source_key, remote_id, destination, transfer)
+                            .await
+                    }
+                    None => provider.acquire(source_key, remote_id, destination).await,
+                }
             }
             _ => Err(invalid_argument("未知远端正文来源")),
         }
@@ -808,7 +946,7 @@ impl RemoteComicPageProvider for OnlineCatalogProvider {
         let (_, chapter_id) = remote_id
             .split_once(':')
             .ok_or_else(|| invalid_argument("MangaDex 远端章节身份无效"))?;
-        let (_, _, names) = self.mangadex_page_manifest(chapter_id).await?;
+        let (_, _, names) = self.mangadex_page_manifest(chapter_id, None).await?;
         Ok(names
             .into_iter()
             .map(|page_name| PreparedComicPage {
@@ -842,7 +980,7 @@ impl RemoteComicPageProvider for OnlineCatalogProvider {
         let (_, chapter_id) = remote_id
             .split_once(':')
             .ok_or_else(|| invalid_argument("MangaDex 远端章节身份无效"))?;
-        let (base_url, hash, names) = self.mangadex_page_manifest(chapter_id).await?;
+        let (base_url, hash, names) = self.mangadex_page_manifest(chapter_id, None).await?;
         if !names.iter().any(|name| name == page_name) {
             return Err(source_unavailable("MangaDex 页面已不存在"));
         }

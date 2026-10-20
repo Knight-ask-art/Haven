@@ -34,7 +34,7 @@ import { AboutSettings, GeneralSettings, UpdateSettings } from "../components/Sy
 import { SystemSettingsRow, SystemSettingsSection } from "../components/SystemSettingsLayout"
 import { toHavenError } from "@/lib/ipc/errors"
 import { getHavenClientMode } from "@/lib/ipc/runtime"
-import type { AppearanceAssetKindWire, AppearanceAssetWire, ComicSettingsValue, GeneralSettingsValue, AppearanceSettingsValue, PlaybackSettingsValue, PreferenceComicPatchWire, PreferenceGetResult, PreferenceReadingPatchWire, PreferenceTargetWire, PrivacySettingsValue, ReadingFontFamilyWire, ReadingPatchWire, ReadingSettingsValue, SettingsValue, ThemeWire, UiFontPresetWire, WallpaperSelection } from "@/lib/ipc/settings-wire"
+import type { AppearanceAssetKindWire, AppearanceAssetWire, ComicSettingsValue, GeneralSettingsValue, AppearanceSettingsValue, PlaybackSettingsValue, PreferenceComicPatchWire, PreferenceGetResult, PreferenceReadingPatchWire, PreferenceTargetWire, PrivacySettingsValue, ReadingFontFamilyWire, ReadingPatchWire, ReadingSettingsValue, SettingsSectionWire, SettingsValue, ThemeWire, UiFontPresetWire, WallpaperSelection } from "@/lib/ipc/settings-wire"
 import type { SettingsFormController } from "@/features/settings/lib/useSettingsForm"
 import { useSettingsForm } from "@/features/settings/lib/useSettingsForm"
 import { useAiProviderSettings, type AiProviderSettingsController } from "@/features/settings/lib/useAiProviderSettings"
@@ -425,6 +425,23 @@ function SettingsContent() {
   const downloadsForm = useSettingsForm("downloads", settingsGateway, onFormSaved)
   const privacyForm = useSettingsForm("privacy", settingsGateway, onFormSaved)
   const forms = { general: generalForm, appearance: appearanceForm, playback: playbackForm, reading: readingForm, comic: comicForm, downloads: downloadsForm, privacy: privacyForm }
+  /**
+   * 栖伴成功写入后的失效通知：只按分区名回源读取 authoritative 快照，
+   * 不把回执里的 before/after 当成已保存值写进表单。保留本地草稿：Hook 会用
+   * `buildSettingsPatch(oldSaved, oldDraft)` 只重放用户自己改过的字段。
+   */
+  const applyExternalSettingsSections = useCallback((sections: readonly SettingsSectionWire[]) => {
+    const bySection: Record<SettingsSectionWire, SettingsFormController> = {
+      general: generalForm,
+      appearance: appearanceForm,
+      playback: playbackForm,
+      reading: readingForm,
+      comic: comicForm,
+      downloads: downloadsForm,
+      privacy: privacyForm,
+    }
+    for (const section of sections) bySection[section].reload({ preserveDraft: true })
+  }, [generalForm, appearanceForm, playbackForm, readingForm, comicForm, downloadsForm, privacyForm])
   // 阅读总览：真实聚合（7 天窗口 + 当前环境的显式 UTC 偏移）。loading / empty / ready /
   // error 四态都由后端事实决定，页面不再持有一份手写的统计。
   const readingOverview = useReadingOverview()
@@ -494,6 +511,7 @@ function SettingsContent() {
                         onOpenSettings={aiSelection.onOpenSettings}
                         profileId={ai.state.loadError ? null : aiProfileId}
                         providerLoading={ai.state.loading || ai.state.loadError !== null}
+                        onSettingsApplied={applyExternalSettingsSections}
                       />
                     </>
                     : activeSection && renderSettingsSection(
@@ -1697,6 +1715,8 @@ function AppearanceSettings({ form, showNotice, overviewLayout, assets }: { form
 
 /** 预览专用 @font-face 宿主；与 AppShell 注入的那条（haven-interface-font-face）分开。 */
 const INTERFACE_FONT_PREVIEW_STYLE_ID = "haven-interface-font-preview-face"
+/** 已导入字体列表的 `@font-face` 宿主：每行用自己的资产族名渲染，必须各自有一条 face。 */
+const INTERFACE_FONT_ASSET_LIST_STYLE_ID = "haven-interface-font-asset-list-faces"
 const INTERFACE_FONT_SELECTION_PANEL_ID = "interface-font-selection-panel"
 
 /**
@@ -1738,6 +1758,26 @@ export function InterfaceFontSettings({
 
   const visibleAssets = filterInterfaceFontAssets(assets, query)
   const visibleFamilies = filterFontFamilies(familiesState.families, query)
+  /**
+   * 已导入列表的每一行都用该资产派生的族名渲染；只给当前选中项注入 face 会让
+   * 其它导入字体退回到兜底栈，看起来像"导入后没有生效"。
+   *
+   * 这里只对**当前可见**的资产各注入一条，仍然复用 `resolveInterfaceFont` 的
+   * 受控 URI 解析（opaque id → haven-resource，不出现文件名或路径）；宿主 id 与
+   * AppShell 保存值、设置页草稿预览都不同，互不覆盖。
+   */
+  const visibleAssetFaceCss = custom
+    ? visibleAssets
+      .map((asset) => resolveInterfaceFont(
+        { interfaceFontMode: "custom", interfaceFontAssetId: asset.id },
+        assets,
+        controlledResourceUri,
+      ).fontFaceCss)
+      .filter((css): css is string => css !== null)
+      .join("") || null
+    : null
+  useInjectedFontFace(INTERFACE_FONT_ASSET_LIST_STYLE_ID, visibleAssetFaceCss)
+
   const queryHasNoResults =
     query.trim().length > 0 &&
     assetsState.status === "ready" &&
@@ -4238,12 +4278,27 @@ function McpClientAutoConfigRows({ showNotice }: { showNotice: (message: string)
 
   if (clients.status === null) {
     return (
-      <SettingRow
-        title="一键配置外部 MCP 客户端"
-        description="只写 Codex 的 ~/.codex/config.toml 与 Claude Code 的 ~/.claude.json 里的 Haven 这一条，其它配置保持原样。"
-      >
-        <span className="text-[13px] text-[var(--haven-settings-muted-strong)]">{clients.error === null ? "读取中…" : "未能读取客户端配置状态"}</span>
-      </SettingRow>
+      <>
+        <SettingRow
+          title="一键配置外部 MCP 客户端"
+          description="只写 Codex 的 ~/.codex/config.toml 与 Claude Code 的 ~/.claude.json 里的 Haven 这一条，其它配置保持原样。"
+        >
+          {/*
+            首次读取就失败时没有可用的 status，也就走不到下面的状态行：
+            重读入口必须留在这里，否则一次 IPC 失败会变成一行既没有按钮、
+            也看不到原因的「读取中」。
+          */}
+          <div className="flex items-center gap-3">
+            <span className="text-[13px] text-[var(--haven-settings-muted-strong)]">{clients.loading ? "读取中…" : "未能读取客户端配置状态"}</span>
+            <button type="button" onClick={() => void clients.reload()} disabled={clients.busy} className="text-[13px] font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:text-[var(--haven-settings-muted-strong)]">重新读取状态</button>
+          </div>
+        </SettingRow>
+        {clients.error !== null && (
+          <SettingRow title="客户端配置读取失败" description={clients.error.message}>
+            <button type="button" onClick={clients.dismissError} className="text-[13px] font-medium text-[var(--haven-settings-muted-strong)]">关闭</button>
+          </SettingRow>
+        )}
+      </>
     )
   }
 

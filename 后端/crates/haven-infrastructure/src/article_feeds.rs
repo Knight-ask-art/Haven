@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 
 use haven_application::services::ports::{
     RemoteAcquiredFile, RemoteAcquisitionPort, RemoteByteRange, RemoteSessionBody,
-    RemoteSessionPort,
+    RemoteSessionPort, RemoteTransferContext,
 };
 use haven_application::services::search_source::SearchSourceParticipant;
 use haven_application::services::source_import::{
@@ -60,8 +60,12 @@ const MAX_FEED_ARTICLE_BYTES: usize = 4 * 1024 * 1024;
 /// 单次解析的条目数上限。超过上限时明确失败，而不是静默返回一个前缀。
 const MAX_FEED_ENTRIES: usize = 500;
 const MAX_ENTRY_TITLE_CHARS: usize = 300;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// 单个网络等待（连接、响应头、每一块正文读取）的上界，与既有整段请求超时相同。
+///
+/// 远端获取带有限速时，限速睡眠发生在两次读取之间，**不计入**任何网络等待超时；
+/// 否则一个大订阅源在有限速率下会因为「等待配额」被误判为网络超时。
+const NETWORK_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const USER_AGENT: &str = "Haven/0.1.0 (offline content importer)";
 
 /// 有界获取一个用户登记的订阅源正文。
@@ -71,6 +75,19 @@ const USER_AGENT: &str = "Haven/0.1.0 (offline content importer)";
 #[async_trait]
 pub trait FeedSource: Send + Sync {
     async fn fetch(&self, url: &str) -> Result<String, AppError>;
+
+    /// 受控获取：把有限速率贯穿到真实网络字节读取路径。默认实现只在没有限速时
+    /// 退化为 [`FeedSource::fetch`]；一旦施加了有限速率，必须显式失败，绝不静默绕过。
+    async fn fetch_with(
+        &self,
+        url: &str,
+        transfer: Option<&RemoteTransferContext<'_>>,
+    ) -> Result<String, AppError> {
+        if transfer.is_some_and(|value| value.limit_bps().is_some()) {
+            return Err(internal_error("该订阅源客户端尚未实现受控获取路径"));
+        }
+        self.fetch(url).await
+    }
 }
 
 /// 生产实现：单个有界 HTTP 客户端，逐跳重新校验地址与 DNS。
@@ -81,20 +98,39 @@ impl FeedClient {
     pub fn new() -> Result<Self, AppError> {
         Ok(Self)
     }
-}
 
-#[async_trait]
-impl FeedSource for FeedClient {
-    async fn fetch(&self, url: &str) -> Result<String, AppError> {
+    /// 装箱入口：`fetch_bounded` 是 `async fn`，返回的 future 不能直接当作装箱 trait
+    /// object。两个名字相同的生命周期分别对应「`self` 借用」与「`transfer` 借用」，
+    /// 装箱 future 的生命周期取二者较短者，`transfer` 引用因此在 await 期间始终有效。
+    fn fetch_inner<'a, 'b>(
+        &'a self,
+        url: &str,
+        transfer: Option<&'b RemoteTransferContext<'b>>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, AppError>> + Send + 'a>>
+    where
+        'b: 'a,
+    {
+        let url = url.to_owned();
+        Box::pin(async move { self.fetch_bounded(&url, transfer).await })
+    }
+
+    /// 有界抓取主体：逐跳校验地址/DNS，连接与单块读取各自有超时，
+    /// 限速睡眠只发生在两次网络读取之间。
+    async fn fetch_bounded(
+        &self,
+        url: &str,
+        transfer: Option<&RemoteTransferContext<'_>>,
+    ) -> Result<String, AppError> {
         let mut current = validate_feed_request_url(url)?.into_url();
         for _ in 0..=MAX_REDIRECTS {
             let target =
                 resolve_public_http_target(current.as_str(), HttpUrlPolicy::UserProvidedSource)
                     .await
                     .map_err(|_| security_denied("订阅源地址解析不安全"))?;
+            // 连接与响应头各有独立超时；不再设置整段请求超时，否则有限速时的
+            // 限速睡眠会被计入网络超时。
             let builder = reqwest::Client::builder()
                 .connect_timeout(CONNECT_TIMEOUT)
-                .timeout(REQUEST_TIMEOUT)
                 .user_agent(USER_AGENT)
                 // Keep the client predictable on Windows while preserving
                 // HTTPS certificate validation. Redirects are followed
@@ -104,15 +140,19 @@ impl FeedSource for FeedClient {
             let client = pin_client_builder(builder, &target)
                 .build()
                 .map_err(|_| internal_error("订阅源客户端初始化失败"))?;
-            let response = client
-                .get(target.url.clone())
-                .header(
-                    reqwest::header::ACCEPT,
-                    "application/rss+xml,application/atom+xml,application/xml,text/xml;q=0.9,*/*;q=0.1",
-                )
-                .send()
-                .await
-                .map_err(|_| feed_unavailable("订阅源暂时不可达"))?;
+            let response = tokio::time::timeout(
+                NETWORK_WAIT_TIMEOUT,
+                client
+                    .get(target.url.clone())
+                    .header(
+                        reqwest::header::ACCEPT,
+                        "application/rss+xml,application/atom+xml,application/xml,text/xml;q=0.9,*/*;q=0.1",
+                    )
+                    .send(),
+            )
+            .await
+            .map_err(|_| feed_unavailable("订阅源暂时不可达"))?
+            .map_err(|_| feed_unavailable("订阅源暂时不可达"))?;
             if response.status().is_redirection() {
                 let location = response
                     .headers()
@@ -131,21 +171,42 @@ impl FeedSource for FeedClient {
             {
                 return Err(feed_unavailable("订阅源响应超出大小上限"));
             }
+            // 网络读的是订阅源 XML，落盘的是转换后的条目 HTML：网络总大小未知。
             let mut body = Vec::with_capacity(64 * 1024);
             let mut response = response;
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|_| feed_unavailable("订阅源响应读取中断"))?
-            {
+            loop {
+                let next = tokio::time::timeout(NETWORK_WAIT_TIMEOUT, response.chunk())
+                    .await
+                    .map_err(|_| feed_unavailable("订阅源响应读取中断"))?
+                    .map_err(|_| feed_unavailable("订阅源响应读取中断"))?;
+                let Some(chunk) = next else { break };
                 if body.len().saturating_add(chunk.len()) > MAX_FEED_BYTES {
                     return Err(feed_unavailable("订阅源响应超出大小上限"));
                 }
                 body.extend_from_slice(&chunk);
+                if let Some(transfer) = transfer {
+                    // 真实网络字节：限速睡眠发生在这次读取之后，不在网络超时窗口内。
+                    transfer.record(chunk.len() as u64).await;
+                }
             }
             return String::from_utf8(body).map_err(|_| feed_unavailable("订阅源编码无法读取"));
         }
         Err(feed_unavailable("订阅源重定向次数过多"))
+    }
+}
+
+#[async_trait]
+impl FeedSource for FeedClient {
+    async fn fetch(&self, url: &str) -> Result<String, AppError> {
+        self.fetch_inner(url, None).await
+    }
+
+    async fn fetch_with(
+        &self,
+        url: &str,
+        transfer: Option<&RemoteTransferContext<'_>>,
+    ) -> Result<String, AppError> {
+        self.fetch_inner(url, transfer).await
     }
 }
 
@@ -745,6 +806,15 @@ impl FeedProvider {
     /// 摘要不可逆，因此唯一的解析方式就是把这次有界抓取到的条目逐个摘要化再比对；
     /// 原始 `guid`/`link` 始终只在本次调用栈内存在。
     async fn load_entry(&self, source_id: &str, entry_digest: &str) -> Result<FeedEntry, AppError> {
+        self.load_entry_with(source_id, entry_digest, None).await
+    }
+
+    async fn load_entry_with(
+        &self,
+        source_id: &str,
+        entry_digest: &str,
+        transfer: Option<&RemoteTransferContext<'_>>,
+    ) -> Result<FeedEntry, AppError> {
         if !SourceRegistryService::is_feed_source_id(source_id) {
             return Err(invalid_argument("未知订阅来源"));
         }
@@ -758,7 +828,7 @@ impl FeedProvider {
             .endpoint(source_id)
             .await?
             .ok_or_else(|| feed_unavailable("该订阅源当前不可用"))?;
-        let xml = self.source.fetch(&endpoint).await?;
+        let xml = self.source.fetch_with(&endpoint, transfer).await?;
         let entries = parse_feed(&xml)?;
         entries
             .into_iter()
@@ -831,6 +901,32 @@ impl RemoteAcquisitionPort for FeedProvider {
         remote_id: &str,
         destination: &std::path::Path,
     ) -> Result<RemoteAcquiredFile, AppError> {
+        self.acquire_inner(source_key, remote_id, destination, None)
+            .await
+    }
+
+    /// 订阅源的 `acquire` 本身会通过 `load_entry` 发起真实网络抓取，因此受控路径
+    /// 必须把同一个 `transfer` 一路带到订阅源客户端的网络字节读取循环。
+    async fn acquire_controlled(
+        &self,
+        source_key: &str,
+        remote_id: &str,
+        destination: &std::path::Path,
+        transfer: &RemoteTransferContext<'_>,
+    ) -> Result<RemoteAcquiredFile, AppError> {
+        self.acquire_inner(source_key, remote_id, destination, Some(transfer))
+            .await
+    }
+}
+
+impl FeedProvider {
+    async fn acquire_inner(
+        &self,
+        source_key: &str,
+        remote_id: &str,
+        destination: &std::path::Path,
+        transfer: Option<&RemoteTransferContext<'_>>,
+    ) -> Result<RemoteAcquiredFile, AppError> {
         if source_key != FEED_SOURCE_KEY {
             return Err(invalid_argument("该来源不支持订阅离线获取"));
         }
@@ -838,8 +934,11 @@ impl RemoteAcquisitionPort for FeedProvider {
             return Err(storage_error("订阅正文临时文件路径无效"));
         }
         let (source_id, entry_digest) = split_feed_remote_id(remote_id)?;
-        let entry = self.load_entry(&source_id, &entry_digest).await?;
+        let entry = self
+            .load_entry_with(&source_id, &entry_digest, transfer)
+            .await?;
         // 大小上限由渲染生产者保证；这里不再重复判定，避免出现两份口径。
+        // 落盘的是转换后的条目 HTML，网络字节与之不同：进度总大小保持未知。
         let html = render_entry_html(&entry)?;
         let size = write_bytes_to(destination.to_path_buf(), html.into_bytes()).await?;
         Ok(RemoteAcquiredFile {

@@ -18,6 +18,7 @@ import {
 import {
   boundPdfPageText,
   flattenPdfSearchHits,
+  normalizePdfQuery,
   searchPdfPages,
   type PdfSearchHit,
 } from "../lib/pdf-search"
@@ -48,10 +49,31 @@ type PdfState =
 type PdfSearchUiState =
   | { status: "idle" }
   | { status: "scanning"; scanned: number }
-  | { status: "done"; hits: PdfSearchHit[]; flat: Array<{ pageNumber: number; occurrence: number }>; totalMatches: number; activeIndex: number }
+  | { status: "done"; query: string; hits: PdfSearchHit[]; flat: Array<{ pageNumber: number; occurrence: number }>; totalMatches: number; activeIndex: number }
 
 const MAX_CANVAS_PIXELS = 16_000_000
 const MAX_CANVAS_SIDE = 8_192
+
+function pdfScrollContainer(stage: HTMLElement): HTMLElement {
+  let parent = stage.parentElement
+  while (parent) {
+    if (/(auto|scroll|overlay)/.test(window.getComputedStyle(parent).overflowY)) return parent
+    parent = parent.parentElement
+  }
+  return (document.scrollingElement ?? document.documentElement) as HTMLElement
+}
+
+// Search uses case-folded text, whose UTF-16 length can differ from the source.
+function sourceTextOffset(text: string, foldedOffset: number): number {
+  let sourceOffset = 0
+  let remaining = foldedOffset
+  for (const character of text) {
+    if (remaining <= 0) break
+    remaining -= character.toLowerCase().length
+    sourceOffset += character.length
+  }
+  return sourceOffset
+}
 
 function readablePdfError(error: unknown, fallback: string): HavenErrorType {
   if (!(error instanceof PdfReaderError)) return toHavenError(error)
@@ -80,7 +102,9 @@ function readablePdfError(error: unknown, fallback: string): HavenErrorType {
 export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, className }: PdfReaderProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const stageRef = useRef<HTMLDivElement>(null)
+  const pageScrollRef = useRef<HTMLDivElement>(null)
   const textLayerRef = useRef<HTMLDivElement>(null)
+  const renderedTextRef = useRef<{ page: number; layer: PdfTextLayer } | null>(null)
   const documentRef = useRef<PDFDocumentProxy | null>(null)
   const renderTaskRef = useRef<RenderTask | null>(null)
   const textLayerTaskRef = useRef<PdfTextLayer | null>(null)
@@ -95,6 +119,8 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
   const [searchOpen, setSearchOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState("")
   const [searchState, setSearchState] = useState<PdfSearchUiState>({ status: "idle" })
+  const [textLayerVersion, setTextLayerVersion] = useState(0)
+  const [searchRects, setSearchRects] = useState<Array<{ left: number; top: number; width: number; height: number }>>([])
 
   useEffect(() => {
     restoreLocatorRef.current = restoreLocator
@@ -186,10 +212,13 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
     textLayerTaskRef.current?.cancel()
     textLayerTaskRef.current = null
     textLayerRef.current?.replaceChildren()
+    renderedTextRef.current = null
+    setSearchRects([])
 
     const buildTextLayer = async (source: NonNullable<typeof page>, viewport: import("pdfjs-dist/legacy/build/pdf.mjs").PageViewport): Promise<string | null> => {
       const layerElement = textLayerRef.current
       if (!layerElement || cancelled || requestRef.current !== requestId) return null
+      layerElement.style.setProperty("--total-scale-factor", String(viewport.scale))
       const textLayer = new TextLayer({
         textContentSource: source.streamTextContent({ includeMarkedContent: false }),
         container: layerElement,
@@ -198,6 +227,9 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
       textLayerTaskRef.current = textLayer
       try {
         await textLayer.render()
+        if (cancelled || requestRef.current !== requestId) return null
+        renderedTextRef.current = { page: state.page, layer: textLayer }
+        setTextLayerVersion((version) => version + 1)
         const normalized = (layerElement.textContent ?? "").replace(/\s+/g, " ").trim()
         return normalized
       } catch {
@@ -273,6 +305,63 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
     }
   }, [state, zoom])
 
+  useEffect(() => {
+    setSearchRects([])
+    const rendered = renderedTextRef.current
+    const stage = stageRef.current
+    if (state.status !== "ready" || searchState.status !== "done" || !rendered || !stage) return
+    const hit = searchState.flat[searchState.activeIndex]
+    if (!hit || hit.pageNumber !== state.page || rendered.page !== state.page) return
+    const strings = rendered.layer.textContentItemsStr
+    const foldedText = boundPdfPageText(strings.join(" ")).toLowerCase()
+    let matchStart = -1
+    for (let occurrence = 0; occurrence < hit.occurrence; occurrence += 1) {
+      matchStart = foldedText.indexOf(searchState.query, matchStart < 0 ? 0 : matchStart + searchState.query.length)
+      if (matchStart < 0) return
+    }
+    const matchEnd = matchStart + searchState.query.length
+    const range = document.createRange()
+    let offset = 0
+    let hasStart = false
+    let hasEnd = false
+    for (let index = 0; index < strings.length; index += 1) {
+      const text = strings[index]
+      const end = offset + text.toLowerCase().length
+      const node = rendered.layer.textDivs[index]?.firstChild
+      if (node?.nodeType === Node.TEXT_NODE) {
+        if (!hasStart && matchStart >= offset && matchStart < end) {
+          range.setStart(node, sourceTextOffset(text, matchStart - offset))
+          hasStart = true
+        }
+        if (hasStart && matchEnd > offset && matchEnd <= end) {
+          range.setEnd(node, sourceTextOffset(text, matchEnd - offset))
+          hasEnd = true
+          break
+        }
+      }
+      offset = end + 1 // Matches the separator used by getTextForPage.
+    }
+    if (!hasStart || !hasEnd) return
+    const rectangles = Array.from(range.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0)
+    const stageRect = stage.getBoundingClientRect()
+    setSearchRects(rectangles.map((rect) => ({
+      left: rect.left - stageRect.left + stage.scrollLeft,
+      top: rect.top - stageRect.top + stage.scrollTop,
+      width: rect.width,
+      height: rect.height,
+    })))
+    if (rectangles[0]) {
+      const pageScroll = pageScrollRef.current
+      if (pageScroll) {
+        const pageScrollRect = pageScroll.getBoundingClientRect()
+        pageScroll.scrollLeft += rectangles[0].left - pageScrollRect.left - pageScroll.clientWidth / 2
+      }
+      const scrollContainer = pdfScrollContainer(stage)
+      const containerRect = scrollContainer.getBoundingClientRect()
+      scrollContainer.scrollTop += rectangles[0].top - containerRect.top - scrollContainer.clientHeight / 2
+    }
+  }, [searchState, state, textLayerVersion])
+
   if (state.status === "loading") {
     return <div className={cn("flex min-h-[240px] items-center justify-center text-sm opacity-60", className)}>正在解析 PDF…</div>
   }
@@ -281,8 +370,14 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
   }
 
   const setPage = (page: number) => {
+    const stage = stageRef.current
+    if (stage) {
+      pdfScrollContainer(stage).scrollTop = 0
+      stage.scrollTop = 0
+    }
+    if (pageScrollRef.current) pageScrollRef.current.scrollLeft = 0
     setState((current) => current.status === "ready"
-      ? { ...current, page: clampPdfPage(page, current.numPages) }
+      ? clampPdfPage(page, current.numPages) === current.page ? current : { ...current, page: clampPdfPage(page, current.numPages) }
       : current)
   }
 
@@ -324,7 +419,7 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
       })
       if (controller.signal.aborted) return
       const flat = flattenPdfSearchHits(hits)
-      setSearchState({ status: "done", hits, flat, totalMatches: flat.length, activeIndex: 0 })
+      setSearchState({ status: "done", query: normalizePdfQuery(query), hits, flat, totalMatches: flat.length, activeIndex: 0 })
       if (flat[0]) setPage(flat[0].pageNumber)
     } catch {
       // Aborted by a newer search or unmount; the newer run owns the UI.
@@ -351,7 +446,7 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
     }
     if (searchState.status === "done") {
       return searchState.totalMatches > 0
-        ? <span className="tabular-nums">共 {searchState.totalMatches} 处 · 第 {searchState.flat[searchState.activeIndex].pageNumber} 页</span>
+        ? <span className="tabular-nums">第 {searchState.activeIndex + 1}/{searchState.totalMatches} 处 · 第 {searchState.flat[searchState.activeIndex].pageNumber} 页</span>
         : <span className="opacity-60">无匹配</span>
     }
     return null
@@ -423,9 +518,14 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
         </div>
       )}
 
-      <div ref={stageRef} className="relative max-w-full overflow-auto rounded-sm bg-white shadow-xl">
-        <canvas ref={canvasRef} aria-label={`PDF 第 ${state.page} 页`} className="block h-full w-full" />
-        <div ref={textLayerRef} className="pdf-text-layer" aria-hidden="true" />
+      <div ref={pageScrollRef} className="w-full shrink-0 overflow-x-auto overflow-y-hidden">
+        <div ref={stageRef} className="relative mx-auto overflow-hidden rounded-sm bg-white shadow-xl">
+          <canvas ref={canvasRef} aria-label={`PDF 第 ${state.page} 页`} className="block h-full w-full" />
+          <div ref={textLayerRef} className="pdf-text-layer" aria-hidden="true" />
+          <div className="pointer-events-none absolute inset-0" aria-hidden="true">
+            {searchRects.map((rect, index) => <span key={index} className="absolute bg-amber-400/40 outline outline-1 outline-amber-500/60" style={rect} />)}
+          </div>
+        </div>
       </div>
     </section>
   )

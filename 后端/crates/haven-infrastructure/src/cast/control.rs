@@ -1,4 +1,4 @@
-//! 控制：DLNA SOAP AVTransport + Chromecast CASTV2（rust_cast 成熟库）。
+//! 控制：DLNA SOAP AVTransport；Chromecast 播放/停止尚未实现，状态返回 Unknown。
 
 use async_trait::async_trait;
 use haven_application::services::CastControlPort;
@@ -152,14 +152,24 @@ impl SoapCastControl {
     }
 
     async fn stop_dlna(&self, device_id: &str) -> Result<(), AppError> {
-        let Some(info) = device_registry::get(device_id) else {
-            return Ok(());
-        };
-        let Some(control_url) = info.control_url else {
-            return Ok(());
-        };
+        let info = device_registry::get(device_id).ok_or_else(|| {
+            AppError::new(
+                "CAST_DEVICE_UNREACHABLE",
+                ErrorKind::NotFound,
+                "设备不可达或已离线",
+                true,
+            )
+        })?;
+        let control_url = info.control_url.ok_or_else(|| {
+            AppError::new(
+                "CAST_DEVICE_UNREACHABLE",
+                ErrorKind::NotFound,
+                "设备不支持投屏控制",
+                false,
+            )
+        })?;
         let body = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:Stop xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>0</InstanceID></u:Stop></s:Body></s:Envelope>"#;
-        let _ = self
+        let response = self
             .client
             .post(&control_url)
             .header("Content-Type", r#"text/xml; charset="utf-8""#)
@@ -169,7 +179,23 @@ impl SoapCastControl {
             )
             .body(body.to_owned())
             .send()
-            .await;
+            .await
+            .map_err(|_| {
+                AppError::new(
+                    "CAST_STOP_FAILED",
+                    ErrorKind::Network,
+                    "停止投屏失败，请检查设备连接后重试",
+                    true,
+                )
+            })?;
+        if !response.status().is_success() {
+            return Err(AppError::new(
+                "CAST_STOP_FAILED",
+                ErrorKind::Network,
+                "设备未确认停止投屏，请重试",
+                true,
+            ));
+        }
         Ok(())
     }
 
@@ -215,61 +241,25 @@ impl SoapCastControl {
 
     async fn play_chromecast(
         &self,
-        device_id: &str,
-        lan_url: &str,
+        _device_id: &str,
+        _lan_url: &str,
         _title: &str,
     ) -> Result<(), AppError> {
-        let info = device_registry::get(device_id).ok_or_else(|| {
-            AppError::new(
-                "CAST_DEVICE_UNREACHABLE",
-                ErrorKind::NotFound,
-                "Chromecast 设备不可达",
-                false,
-            )
-        })?;
-        let _ip = info.ip.clone();
-        let _url = lan_url.to_owned();
-        // 成熟库已接入（rust_cast 0.21.0），当前无真机验收，保持编译期链路
-        let _ = std::any::type_name::<rust_cast::CastDevice>();
-        let url = lan_url.to_owned();
-        let res = tokio::task::spawn_blocking(move || -> Result<(), String> {
-            // 占位：校验 URL 可达性（不实际建连，避免无设备时阻塞 8009 超时）
-            if url.is_empty() {
-                return Err("empty url".into());
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| {
-            AppError::new(
-                "CAST_LOAD_FAILED",
-                ErrorKind::Network,
-                format!("Chromecast 任务失败: {e}"),
-                true,
-            )
-        })?;
-        res.map_err(|e| {
-            AppError::new(
-                "CAST_LOAD_FAILED",
-                ErrorKind::Network,
-                format!("Chromecast 播放失败: {e}"),
-                true,
-            )
-        })
+        Err(chromecast_unsupported())
     }
 
-    async fn stop_chromecast(&self, device_id: &str) -> Result<(), AppError> {
-        let Some(info) = device_registry::get(device_id) else {
-            return Ok(());
-        };
-        let _ip = info.ip.clone();
-        let _ = std::any::type_name::<rust_cast::CastDevice>();
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = std::any::type_name::<rust_cast::CastDevice>();
-        })
-        .await;
-        Ok(())
+    async fn stop_chromecast(&self, _device_id: &str) -> Result<(), AppError> {
+        Err(chromecast_unsupported())
     }
+}
+
+fn chromecast_unsupported() -> AppError {
+    AppError::new(
+        "CAST_PROTOCOL_UNSUPPORTED",
+        ErrorKind::Unsupported,
+        "暂不支持 Chromecast 控制，请使用支持 DLNA 的设备",
+        false,
+    )
 }
 
 fn xml_escape(s: &str) -> String {

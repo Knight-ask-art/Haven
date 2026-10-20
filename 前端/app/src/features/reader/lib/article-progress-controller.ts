@@ -1,3 +1,4 @@
+import { resolveRestorePosition, type InitialPosition } from "@/features/progress/lib/restore-position"
 import type { ProgressSaveRequest, ProgressSaveResult, SessionOpenResultDto } from "@/lib/ipc/generated/wire"
 import { HavenError } from "@/lib/ipc/errors"
 import { saveProgress } from "@/features/progress/ipc/progress-gateway"
@@ -100,16 +101,16 @@ export function createArticleProgressController(options: ArticleProgressControll
 export function restoreArticleProgress(
   session: SessionOpenResultDto,
   restored?: { current: string | null },
+  initial?: InitialPosition,
 ): { progression: number; blockId: string | null } | null {
-  if (!session.progress) return null
-  if (session.progress.locator.kind !== "article") return null
-  const identity = `${session.sessionId}:${session.mediaItemId}:${session.contentUri}`
+  const { locator, reset, identity } = resolveRestorePosition(session, initial)
+  if (locator?.kind !== "article") return null
   if (restored?.current === identity) return null
-  if (session.progress.completion === "not_started") {
+  if (reset) {
     if (restored) restored.current = identity
     return { progression: 0, blockId: null }
   }
-  const data = session.progress.locator.data
+  const data = locator.data
   if (data.progression == null || !Number.isFinite(data.progression) || data.progression < 0) return null
   if (restored) restored.current = identity
   return { progression: data.progression, blockId: data.blockId }

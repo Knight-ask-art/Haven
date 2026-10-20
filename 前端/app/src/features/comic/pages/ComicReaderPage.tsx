@@ -1,3 +1,4 @@
+import { useMarkerNavigation } from "@/features/markers/lib/use-marker-navigation"
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from "react"
 import { useNavigate, useParams } from "react-router"
 import {
@@ -334,6 +335,7 @@ function ComicWorkChapterCard({
 function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
   const navigate = useNavigate()
   const { mediaItemId } = useParams<{ mediaItemId?: string }>()
+  const initialPosition = useMarkerNavigation(mediaItemId)
 
   // Session + 进度：Tauri 环境接真实 useMediaSession（engine=comic）；
   // 浏览器演示环境保持既有静态演示内容。
@@ -581,10 +583,10 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
   // 恢复进度：session ready 时恢复至上次阅读页。
   useEffect(() => {
     if (totalPages <= 0 || sessionView.status !== "ready" || state.status !== "ready" || manifestState.status !== "ready") return
-    const restored = restoreComicProgress(totalPages, state.session, restoredProgressRef)
+    const restored = restoreComicProgress(totalPages, state.session, restoredProgressRef, initialPosition)
     if (restored) setCurrentPage(restored.pageIndex)
     setProgressRestoredIdentity(readerSessionIdentity)
-  }, [manifestState.status, readerSessionIdentity, sessionIdentity, sessionView.status, state, totalPages])
+  }, [initialPosition, manifestState.status, readerSessionIdentity, sessionIdentity, sessionView.status, state, totalPages])
 
   // currentPage 变化时向进度控制器上报（Tauri 环境节流）。
   useEffect(() => {
@@ -1159,6 +1161,11 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
       {/* 主阅读区域 */}
       <main
         className="relative flex h-[100dvh] w-full items-center justify-center pt-[calc(4rem+env(safe-area-inset-top))] pb-[calc(5rem+env(safe-area-inset-bottom))]"
+        onClickCapture={(event) => {
+          if (!suppressClickRef.current) return
+          event.preventDefault()
+          event.stopPropagation()
+        }}
         onClick={() => {
           if (suppressClickRef.current) return
           setShowTools(prev => !prev)
