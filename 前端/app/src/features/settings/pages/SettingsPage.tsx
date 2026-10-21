@@ -4267,8 +4267,29 @@ function agentBrokerStatusPresentation(status: AgentBrokerStatusDto | null, load
  *   已经连上"；`blocked` / `malformed` 是"没有写入"，必须与"未配置"分开显示。
  * - **不显示任何文件内容**：这里只显示后端给出的状态、路径与原因。
  */
-function McpClientAutoConfigRows({ showNotice }: { showNotice: (message: string) => void }) {
+function McpClientAutoConfigRows({
+  showNotice,
+  brokerStatus,
+  brokerEndpoint,
+}: {
+  showNotice: (message: string) => void
+  brokerStatus: AgentBrokerStatusDto | null
+  brokerEndpoint: string | null
+}) {
   const clients = useMcpClientConfig()
+
+  // Broker 的稳定标量（状态、端点）变化后重读自动配置状态：启用/停用只改 Broker，
+  // 一键配置的 blocked/writable 由端点决定，否则会永久停在「被阻止」。
+  // 只依赖两个原始值，不依赖 hook 返回的整个对象，避免 reload 循环。
+  const reloadClients = clients.reload
+  const firstBrokerObservation = useRef(true)
+  useEffect(() => {
+    if (firstBrokerObservation.current) {
+      firstBrokerObservation.current = false
+      return
+    }
+    void reloadClients()
+  }, [brokerStatus, brokerEndpoint, reloadClients])
 
   const configure = async (entry: McpClientTargetStatusWire) => {
     const ok = await clients.configure(entry.target)
@@ -4308,9 +4329,13 @@ function McpClientAutoConfigRows({ showNotice }: { showNotice: (message: string)
         title="一键配置外部 MCP 客户端"
         description="授权范围只有两个固定位置：Codex 的 ~/.codex/config.toml（[mcp_servers.haven]）与 Claude Code 的 ~/.claude.json（mcpServers.haven）。写入是结构化合并，其它配置项原样保留，并在写入前留一份可恢复备份。"
       >
-        <span className="text-[13px] text-[var(--haven-settings-muted-strong)]">
-          {clients.status.runtimeReady ? "随包分发的运行时已就绪" : "运行时未就绪"}
-        </span>
+        <div className="flex items-center gap-3">
+          <span className="text-[13px] text-[var(--haven-settings-muted-strong)]">
+            {clients.status.runtimeReady ? "随包分发的运行时已就绪" : "运行时未就绪"}
+          </span>
+          {/* 常驻刷新入口：Broker 已在外部就绪但仍显示 blocked 时，用户不必离开分区。 */}
+          <button type="button" onClick={() => void clients.reload()} disabled={clients.busy} className="text-[13px] font-semibold text-[var(--haven-settings-primary)] disabled:cursor-not-allowed disabled:text-[var(--haven-settings-muted-strong)]">重新读取状态</button>
+        </div>
       </SettingRow>
       {!clients.status.runtimeReady && clients.status.runtimeDetail.length > 0 && (
         <SettingRow title="运行时不可用" description={clients.status.runtimeDetail}>
@@ -4476,7 +4501,11 @@ function ExternalAgentAccessSettings({ showNotice, registerReloader }: { showNot
           </div>
         </SettingRow>
       )}
-      <McpClientAutoConfigRows showNotice={showNotice} />
+      <McpClientAutoConfigRows
+        showNotice={showNotice}
+        brokerStatus={broker.status}
+        brokerEndpoint={broker.endpoint}
+      />
       {copyError !== null && (
         <SettingRow title="复制失败" description={copyError}>
           <button type="button" onClick={() => setCopyError(null)} className="text-[13px] font-medium text-[var(--haven-settings-muted-strong)]">关闭</button>

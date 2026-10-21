@@ -10,6 +10,13 @@ export interface BookChapter {
   quote?: string
   /** EPUB-only source identity retained for internal TOC/anchor resolution. */
   sourceHref?: string
+  /**
+   * EPUB-only position in the original package spine. Retained chapters can
+   * skip title-only spine documents, so this is not the array index.
+   */
+  spineIndex?: number
+  /** EPUB-only number of documents in the original package spine. */
+  spineCount?: number
   /** EPUB fragment/name anchors mapped to the rendered paragraph index. */
   anchorMap?: Readonly<Record<string, number>>
 }

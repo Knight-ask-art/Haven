@@ -949,28 +949,45 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
     setDrawerOpen(false)
   }
 
-  // 目录条目跳转：progression 在滚动模式映射到纵向位置，在分页模式映射到
-  // 水平 page/spread；TXT/Markdown 回退章节 id 跳转。
+  // 目录条目跳转：progression 是原始 spine 文档坐标（含被过滤的纯标题文档），
+  // 先按章节显式记录的 spineIndex 精确对应。fragment 只在同一 spine 文档内
+  // 查找，不能跨文档命中同名锚点；标题仅作同文档内或无 spine 坐标时的降级。
   const scrollToTocItem = (item: TocItemDto) => {
     const scrollContainer = readerScrollRef.current
     if (!scrollContainer) return
     const operation = ++navigationOperationRef.current
+    const chaptersWithSpine = chapters.filter((chapter) => chapter.spineIndex !== undefined)
+    const spineCount = chaptersWithSpine[0]?.spineCount
+      ?? Math.max(0, ...chaptersWithSpine.map((chapter) => (chapter.spineIndex ?? -1) + 1))
+    // Clamped target spine document. Title-only documents are filtered out of
+    // `chapters`; the first retained document at or after the target is the
+    // closest readable fallback for such an entry. Rounding avoids float error
+    // (`29/100*100` is `28.999…`) landing on the previous chapter.
+    const targetSpine = spineCount > 0
+      ? Math.min(spineCount - 1, Math.max(0, Math.round(item.progression * spineCount)))
+      : null
+    const spineChapter = targetSpine === null ? undefined : (
+      chaptersWithSpine.find((chapter) => chapter.spineIndex === targetSpine)
+      ?? chaptersWithSpine.find((chapter) => (chapter.spineIndex ?? -1) > targetSpine)
+      ?? chaptersWithSpine[chaptersWithSpine.length - 1]
+    )
+    const fragment = item.fragment ?? ""
+    const fragmentCandidates = spineChapter
+      ? (spineChapter.anchorMap?.[fragment] !== undefined ? [spineChapter] : [])
+      : chapters.filter((chapter) => chapter.anchorMap?.[fragment] !== undefined)
+    const titleCandidates = spineChapter
+      ? (spineChapter.title.trim() === item.title.trim() ? [spineChapter] : [])
+      : chapters.filter((chapter) => chapter.title.trim() === item.title.trim())
     const expectedIndex = chapters.length === 0
       ? 0
       : Math.min(chapters.length - 1, Math.max(0, Math.floor(item.progression * chapters.length)))
-    const fragmentCandidates = item.fragment
-      ? chapters
-        .map((chapter, index) => ({ chapter, index }))
-        .filter(({ chapter }) => chapter.anchorMap?.[item.fragment!] !== undefined)
-      : []
-    const candidates = fragmentCandidates.length > 0
-      ? fragmentCandidates
-      : chapters
-        .map((chapter, index) => ({ chapter, index }))
-        .filter(({ chapter }) => chapter.title.trim() === item.title.trim())
-    const targetChapter = (candidates.length > 0
-      ? candidates.slice().sort((left, right) => Math.abs(left.index - expectedIndex) - Math.abs(right.index - expectedIndex))[0]
-      : { chapter: chapters[expectedIndex], index: expectedIndex })?.chapter
+    const nearestByIndex = (candidates: BookChapter[]) => candidates
+      .map((chapter) => ({ chapter, index: chapters.indexOf(chapter) }))
+      .sort((left, right) => Math.abs(left.index - expectedIndex) - Math.abs(right.index - expectedIndex))[0].chapter
+    const targetChapter = spineChapter
+      ?? (fragmentCandidates.length > 0
+        ? nearestByIndex(fragmentCandidates)
+        : titleCandidates.length > 0 ? nearestByIndex(titleCandidates) : chapters[expectedIndex])
     if (!targetChapter) {
       setDrawerOpen(false)
       return

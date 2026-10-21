@@ -1,5 +1,5 @@
 import { useMarkerNavigation } from "@/features/markers/lib/use-marker-navigation"
-import { useCallback, useState, useRef, useEffect, useLayoutEffect } from "react"
+import { useCallback, useMemo, useState, useRef, useEffect, useLayoutEffect } from "react"
 import { useParams, useNavigate } from "react-router"
 import { VideoControls } from "../components/VideoControls"
 import { EpisodeDrawer, type EpisodeItem } from "../components/EpisodeDrawer"
@@ -27,6 +27,12 @@ import { SubtitleTrackRuntime, type SubtitleTrackAsset } from "../lib/subtitle-t
 import { externalSubtitleOption, hlsSubtitleOptions as mapHlsSubtitleOptions, type PlayerSubtitleOption } from "../lib/subtitle-options"
 import { defaultCoverPath } from "@/lib/default-cover"
 import { useNotice } from "@/app/notice-center/notice-context"
+import { usePlayerEpisodeActions } from "../hooks/usePlayerEpisodeActions"
+import {
+  episodeBadgeLabel,
+  presentEpisodeDownload,
+  summarizeEpisodeDownloadsText,
+} from "../lib/episode-actions-state"
 
 // 模拟播放展示数据（实际内容源始终来自媒体会话）
 interface PlayerPresentation {
@@ -152,13 +158,16 @@ export function PlayerPage() {
   const [posterRawUri, setPosterRawUri] = useState<string | null>(null)
   const posterUri = artworkRequestUri(posterRawUri) || undefined
   const [drawerMeta, setDrawerMeta] = useState<{ year?: number; description?: string } | null>(null)
+  const [drawerWorkResolved, setDrawerWorkResolved] = useState(false)
   useEffect(() => {
     if (!productionMode || !workIdForPoster) {
       setPosterRawUri(null)
       setDrawerMeta(null)
+      setDrawerWorkResolved(false)
       return undefined
     }
     let active = true
+    setDrawerWorkResolved(false)
     void getWorkDetail(workIdForPoster)
       .then((detail) => {
         if (!active) return
@@ -170,8 +179,46 @@ export function PlayerPage() {
         setPosterRawUri(null)
         setDrawerMeta(null)
       })
+      .finally(() => {
+        if (active) setDrawerWorkResolved(true)
+      })
     return () => { active = false }
   }, [productionMode, workIdForPoster])
+
+  // 选集抽屉的收藏 / 下载动作：真实 IPC 只在 production 接线，组件仅渲染 hook 结论。
+  const drawerEpisodeIds = useMemo(() => (demoMode ? videoData.episodes ?? [] : editionEpisodes ?? []), [demoMode, editionEpisodes, videoData.episodes])
+  const drawerWorkId = demoMode ? null : workIdForPoster
+  const drawerActions = usePlayerEpisodeActions(clientMode, {
+    enabled: productionMode,
+    episodeIds: drawerEpisodeIds.map((episode) => episode.id),
+    workId: drawerWorkId,
+    currentEpisodeId: demoMode ? demoCurrentEpisodeId : (mediaItemId ?? null),
+    // 收藏需要权威 Work Header；未读到时说明原因，而不是给出假的收藏状态。
+    unavailableReason: !productionMode ? null : workIdForPoster === null
+      ? "播放会话尚未建立，暂时无法收藏或下载该作品"
+      : (drawerWorkResolved ? null : "正在读取作品信息…"),
+  })
+  const drawerDownloadPresentationOf = useCallback((episodeId: string) => (
+    presentEpisodeDownload(drawerActions.downloads.viewOf(episodeId), null)
+  ), [drawerActions.downloads.viewOf])
+  const drawerDownloadBadgeOf = useCallback((episodeId: string) => (
+    episodeBadgeLabel(drawerDownloadPresentationOf(episodeId))
+  ), [drawerDownloadPresentationOf])
+  const drawerFavoriteDisabledReason = demoMode
+    ? "浏览器预览没有本地作品数据，收藏不可用"
+    : !drawerActions.favorite.canWrite
+      ? "未读取到作品的权威收藏状态，暂时无法收藏"
+      : null
+  const downloadCurrent = drawerActions.downloads.downloadCurrent
+  const downloadAll = drawerActions.downloads.downloadAll
+  const handleDownloadAll = useCallback(async () => {
+    const summary = await downloadAll()
+    return summary ? summarizeEpisodeDownloadsText(summary) : null
+  }, [downloadAll])
+  const handleDownloadCurrent = useCallback(async () => {
+    const summary = await downloadCurrent()
+    return summary ? summarizeEpisodeDownloadsText(summary) : null
+  }, [downloadCurrent])
 
   const videoRef = useRef<HTMLVideoElement>(null)
   const activePlaybackSourceRef = useRef<string | null>(sessionContentUri)
@@ -1233,6 +1280,22 @@ export function PlayerPage() {
           secondaryTitle={currentEp ? `${currentEp.number}` : (demoMode ? (videoData.subtitle || "正片") : undefined)}
           mediaYear={drawerMeta?.year}
           mediaDescription={drawerMeta?.description}
+          isFavorited={demoMode ? null : drawerActions.favorite.isFavorite}
+          isFavoritePending={drawerActions.favorite.saving || drawerActions.favorite.loading}
+          favoriteError={demoMode ? null : drawerActions.favorite.error}
+          favoriteDisabledReason={drawerFavoriteDisabledReason}
+          onToggleFavorite={demoMode ? undefined : () => { void drawerActions.favorite.toggle() }}
+          onReloadFavorite={productionMode ? () => { void drawerActions.favorite.reload() } : undefined}
+          downloadStateOf={productionMode ? drawerDownloadPresentationOf : undefined}
+          downloadBadgeOf={productionMode ? drawerDownloadBadgeOf : undefined}
+          onDownloadCurrent={productionMode ? handleDownloadCurrent : undefined}
+          onDownloadAll={productionMode ? handleDownloadAll : undefined}
+          onReloadDownloads={productionMode ? () => { void drawerActions.downloads.reload() } : undefined}
+          downloadUnavailableReason={productionMode
+            ? (workIdForPoster === null ? "播放会话尚未建立，暂时无法创建下载任务" : null)
+            : "浏览器预览不会创建真实下载任务。"}
+          downloadPending={drawerActions.downloads.pending}
+          downloadError={drawerActions.downloads.error}
         />
       )}
     </div>

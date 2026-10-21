@@ -501,7 +501,7 @@ function buildAnchorMap(html: string, text: string, paragraphs: readonly string[
   return result
 }
 
-function chapterFromXhtml(index: number, item: PublicationManifestItem, html: string, sourceHref: string): BookChapter | null {
+function chapterFromXhtml(index: number, spineCount: number, item: PublicationManifestItem, html: string, sourceHref: string): BookChapter | null {
   const trimmedHtml = trimGutenbergBoilerplate(html)
   if (!trimmedHtml) return null
   const text = htmlToPlainText(trimmedHtml)
@@ -522,6 +522,8 @@ function chapterFromXhtml(index: number, item: PublicationManifestItem, html: st
     title: title || item.id,
     paragraphs,
     sourceHref,
+    spineIndex: index,
+    spineCount,
     anchorMap: buildAnchorMap(trimmedHtml, text, paragraphs),
   }
 }
@@ -584,11 +586,13 @@ export async function parseEpubBook(bytes: ArrayBuffer, signal?: AbortSignal): P
       throw unsupported("EPUB spine 包含不支持的文档")
     }
     const path = resolveHref(opfDirectory, item.href)
+    // A spine document that cannot be read fails the whole book: silently
+    // dropping it would hide content and shift what the reader shows.
     const chapterBytes = await readEntry(bytes, entries, path, signal)
     totalTextBytes += chapterBytes.byteLength
     if (totalTextBytes > MAX_EPUB_TEXT_BYTES) throw denied("EPUB 正文总大小超过安全限制")
     const chapterHtml = decodeUtf8(chapterBytes)
-    const chapter = chapterFromXhtml(index, item, chapterHtml, path)
+    const chapter = chapterFromXhtml(index, spineAttributes.length, item, chapterHtml, path)
     if (chapter) chapters.push(chapter)
   }
   const title = extractTagText(opfXml, ["dc:title", "title"])

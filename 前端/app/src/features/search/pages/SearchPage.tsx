@@ -66,8 +66,11 @@ export function SearchPage() {
   const searchRuntimeState = resolveSearchRuntimeState(clientMode, submittedQuery)
   const localMode = searchRuntimeState === "ready_empty" || searchRuntimeState === "ready_query"
   const [history, setHistory] = useState<string[]>([])
-  const [historyEnabled, setHistoryEnabled] = useState(true)
+  // 隐私状态三态：未知（读取中/失败）时一律禁止记录，失败关闭。
+  const [historyEnabled, setHistoryEnabled] = useState(false)
   const [historyLoaded, setHistoryLoaded] = useState(false)
+  const [historyLoadFailed, setHistoryLoadFailed] = useState(false)
+  const [historyRetryRevision, setHistoryRetryRevision] = useState(0)
   const [filterType, setFilterType] = useState<ResultFilter>(() => parseFilter(categoryParam))
   const [sortMode, setSortMode] = useState<SortMode>(() => parseSort(sortParam))
   const [localStatus, setLocalStatus] = useState<LocalSearchStatus>("idle")
@@ -77,29 +80,54 @@ export function SearchPage() {
   // 来源搜索专用的重试信号：只有同关键词的显式提交才递增，与本地检索的
   // retryRevision 保持独立，本地重试不会重启来源搜索。
   const [sourceRetryRevision, setSourceRetryRevision] = useState(0)
+  // 输入法组合态由 SearchBar 上报：组词中不提交、不响应 Enter/Escape。
+  const [isComposing, setIsComposing] = useState(false)
 
+  // 隐私开关与历史列表分开读取：历史列表会触发遗留迁移（写 SQLite），
+  // 只有在隐私状态已确认为开启之后才允许发起，避免在未知隐私时产生隐式写入。
   useEffect(() => {
     if (clientMode === "unavailable") {
       setHistory([])
+      setHistoryEnabled(false)
       setHistoryLoaded(true)
+      setHistoryLoadFailed(false)
       return
     }
     let active = true
     setHistoryLoaded(false)
-    void Promise.all([listSearchHistory(), getSearchHistorySetting()]).then(([terms, enabled]) => {
-      if (!active) return
-      setHistory(terms)
-      setHistoryEnabled(enabled)
-      setHistoryLoaded(true)
-    }).catch(() => {
-      if (!active) return
-      setHistory([])
-      setHistoryLoaded(true)
-    })
+    setHistoryEnabled(false)
+    setHistoryLoadFailed(false)
+    void getSearchHistorySetting()
+      .then(async (enabled) => {
+        if (!active) return
+        setHistoryEnabled(enabled)
+        setHistoryLoaded(true)
+        if (!enabled) {
+          setHistory([])
+          return
+        }
+        try {
+          const terms = await listSearchHistory()
+          if (!active) return
+          setHistory(terms)
+        } catch {
+          if (!active) return
+          setHistory([])
+          setHistoryLoadFailed(true)
+        }
+      })
+      .catch(() => {
+        // 隐私读取失败：保持禁止记录，并给出可见的重试入口。
+        if (!active) return
+        setHistoryEnabled(false)
+        setHistory([])
+        setHistoryLoaded(false)
+        setHistoryLoadFailed(true)
+      })
     return () => {
       active = false
     }
-  }, [clientMode])
+  }, [clientMode, historyRetryRevision])
 
   useEffect(() => {
     setSearchValue(queryParam)
@@ -140,16 +168,25 @@ export function SearchPage() {
     return () => controller.abort()
   }, [filterType, localMode, retryRevision, submittedQuery])
 
-  // 防抖：输入 300ms 后自动提交（AbortController 已在 localMode effect 中处理取消）
+  // 防抖：输入 300ms 后自动提交（AbortController 已在 localMode effect 中处理取消）。
+  // 输入法组词期间不提交。compositionEnd 后（isComposing 变 false）只会在防抖值
+  // 已等于当前输入时提交：避免把组词前 300ms 内的旧拼音/旧中间值提交上去。
   const debouncedCommittedRef = useRef<string>(submittedQuery)
+  const isComposingRef = useRef(isComposing)
+  isComposingRef.current = isComposing
+  const searchValueRef = useRef(searchValue)
+  searchValueRef.current = searchValue
   useEffect(() => {
+    // 组合结束后仍等待最终输入稳定，不读取事件之前的中间值。
+    if (isComposingRef.current) return
+    if (debouncedSearchValue !== searchValueRef.current) return
     const trimmed = debouncedSearchValue.trim()
     if (trimmed && trimmed !== debouncedCommittedRef.current && trimmed !== submittedQuery) {
       debouncedCommittedRef.current = trimmed
       commitSearch(trimmed)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedSearchValue])
+  }, [debouncedSearchValue, isComposing])
 
   useEffect(() => {
     debouncedCommittedRef.current = submittedQuery
@@ -196,8 +233,8 @@ export function SearchPage() {
       { replace: true }
     )
     // 同关键词的显式提交不会改变 query，来源搜索需要一次显式重查信号；
-    // 关键词变化时由 query 变化驱动，不能再叠加信号。进行中的来源搜索会
-    // 忽略该信号（见 SourceCandidates 的忙碌判定）。
+    // 关键词变化时由 query 变化驱动，不能再叠加信号（防抖提交时 URL 尚未更新，
+    // 也不能发信号）。进行中的来源搜索会忽略该信号（见 SourceCandidates 的忙碌判定）。
     if (trimmed === submittedQuery) {
       setSourceRetryRevision((current) => current + 1)
     }
@@ -291,8 +328,18 @@ export function SearchPage() {
         <SearchBar
           value={searchValue}
           onChange={(e) => handleSearchValueChange(e.target.value)}
-          onSearch={() => commitSearch(searchValue)}
-          onClear={clearSearch}
+          onCompositionChange={(composing, value) => {
+            setIsComposing(composing)
+            if (!composing) handleSearchValueChange(value)
+          }}
+          onSearch={() => {
+            if (isComposing) return
+            commitSearch(searchValue)
+          }}
+          onClear={() => {
+            if (isComposing) return
+            clearSearch()
+          }}
           onFocus={() => {
             cancelSuggestHide()
             setShowSuggest(true)
@@ -301,6 +348,22 @@ export function SearchPage() {
           placeholder={clientMode === "unavailable" ? "搜索服务未启用" : "搜索本地媒体库"}
         />
         {searchInputTooLong && <p role="alert" className="mt-2 px-6 text-sm text-destructive">搜索词过长，请缩短到 200 个字符以内。</p>}
+        {historyLoadFailed && (
+          <div role="alert" className="mt-2 flex items-center gap-3 px-6 text-xs text-muted-foreground">
+            <span>{historyLoadFailed
+              ? (historyEnabled
+                ? "无法读取搜索历史，本次搜索仍会照常记录。"
+                : "无法读取隐私设置，本次不会记录搜索历史。")
+              : ""}</span>
+            <button
+              type="button"
+              onClick={() => setHistoryRetryRevision((current) => current + 1)}
+              className="font-semibold text-primary"
+            >
+              重试
+            </button>
+          </div>
+        )}
         {showSuggest && suggestItems.length > 0 && (
           <div
             className="search-results__suggestions absolute left-0 right-0 top-full z-20 mt-2 rounded-2xl border border-black/5 bg-white p-1.5 shadow-xl dark:border-white/10 dark:bg-zinc-900"

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { 
+import {
   X, Download, Heart, Tv, ArrowUpDown, ChevronRight, Check, LoaderCircle
 } from "lucide-react"
 import { cn } from "@/lib/utils"
@@ -12,8 +12,27 @@ export interface EpisodeItem {
   title: string
   durationOrPages?: string
   progress?: number
+  /** 仅演示数据使用；生产下载状态一律来自 `downloadBadgeOf` 的权威投影。 */
   isDownloaded?: boolean
   thumbnail?: string
+}
+
+/** 单集下载展示结论（由 player hook 从权威下载投影推出，组件只渲染）。 */
+export type EpisodeDownloadBadge = "downloaded" | "queued" | "creating" | null
+
+export type EpisodeDownloadActionState =
+  | { state: "downloaded" }
+  | { state: "queued" }
+  | { state: "creating" }
+  | { state: "actionable"; canStart: boolean; reason: string | null; error: string | null }
+  | { state: "unknown"; error: string | null }
+
+const NO_DOWNLOAD_STATE: EpisodeDownloadActionState = { state: "unknown", error: null }
+
+function disabledStyle(disabled: boolean): string {
+  return disabled
+    ? "text-muted-foreground/50 cursor-not-allowed"
+    : "text-muted-foreground hover:text-foreground cursor-pointer"
 }
 
 interface EpisodeDrawerProps {
@@ -28,6 +47,23 @@ interface EpisodeDrawerProps {
   mediaYear?: number
   mediaDescription?: string
   castMediaItemId?: string
+  /** 收藏是 Work 的事实；null 表示当前没有权威 Work（只读）。 */
+  isFavorited?: boolean | null
+  isFavoritePending?: boolean
+  favoriteError?: string | null
+  favoriteDisabledReason?: string | null
+  onToggleFavorite?: () => void
+  onReloadFavorite?: () => void
+  /** 由 player hook 提供的每集真实下载状态（仅 production）。 */
+  downloadStateOf?: (episodeId: string) => EpisodeDownloadActionState
+  downloadBadgeOf?: (episodeId: string) => EpisodeDownloadBadge
+  /** 下载本集 / 下载全集；返回本批真实结果文案（无失败时为 null）。 */
+  onDownloadCurrent?: () => Promise<string | null>
+  onDownloadAll?: () => Promise<string | null>
+  onReloadDownloads?: () => void
+  downloadUnavailableReason?: string | null
+  downloadPending?: boolean
+  downloadError?: string | null
 }
 
 export function EpisodeDrawer({
@@ -42,6 +78,20 @@ export function EpisodeDrawer({
   mediaYear,
   mediaDescription = "",
   castMediaItemId,
+  isFavorited = null,
+  isFavoritePending = false,
+  favoriteError = null,
+  favoriteDisabledReason = null,
+  onToggleFavorite,
+  onReloadFavorite,
+  downloadStateOf,
+  downloadBadgeOf,
+  onDownloadCurrent,
+  onDownloadAll,
+  onReloadDownloads,
+  downloadUnavailableReason = null,
+  downloadPending = false,
+  downloadError = null,
 }: EpisodeDrawerProps) {
   const [isAscending, setIsAscending] = useState<boolean>(() => {
     try {
@@ -55,9 +105,9 @@ export function EpisodeDrawer({
       localStorage.setItem(key, isAscending ? "asc" : "desc")
     } catch { /* ignore */ }
   }, [isAscending, mediaTitle])
-  const [isFavorited, setIsFavorited] = useState<boolean>(false)
-  const [isDownloaded, setIsDownloaded] = useState<boolean>(false)
   const [isDownloadDialogOpen, setIsDownloadDialogOpen] = useState<boolean>(false)
+  // 本页最近一次「下载」批次的结果文案（真实失败 / 部分失败才出现）。
+  const [downloadResultText, setDownloadResultText] = useState<string | null>(null)
   const [isCastDialogOpen, setIsCastDialogOpen] = useState<boolean>(false)
   const [selectedCastDevice, setSelectedCastDevice] = useState<string | null>(null)
   const [isCasting, setIsCasting] = useState<boolean>(false)
@@ -115,11 +165,48 @@ export function EpisodeDrawer({
 
   const selectedDevice = castDevices.find((device) => device.id === selectedCastDevice)
 
-  const chooseDownloadTarget = (target: "all" | "current") => {
-    setIsDownloaded(true)
-    setIsDownloadDialogOpen(false)
-    // 当前 UI 只负责表达下载意图，实际队列由 Download Engine 接管。
-    void target
+  // 下载入口的真实状态：只依据 hook 给出的权威投影，组件自身不推断「已下载」。
+  const currentDownloadState = currentEpisode
+    ? (downloadStateOf?.(currentEpisode.id) ?? NO_DOWNLOAD_STATE)
+    : null
+  const drawerDownloadReady = downloadStateOf !== undefined && onDownloadAll !== undefined
+  const currentCanDownload = currentDownloadState !== null
+    && drawerDownloadReady
+    && downloadUnavailableReason === null
+    && (currentDownloadState.state === "unknown"
+      || currentDownloadState.state === "actionable" && currentDownloadState.canStart)
+  const downloadButtonDisabled = downloadUnavailableReason !== null
+    || !drawerDownloadReady || episodes.length === 0 || downloadPending
+  // 下载不可用（无真实服务 / 无权威状态）时必须可辨：禁用并给出说明，而不是假成功。
+  const drawerDownloadUnavailableReason = downloadUnavailableReason
+    ?? (!drawerDownloadReady ? "当前运行环境没有本地下载服务，无法创建真实下载任务。" : null)
+  const downloadActionLabel = currentDownloadState === null
+    ? "下载"
+    : currentDownloadState.state === "downloaded"
+      ? "已下载"
+      : currentDownloadState.state === "queued"
+        ? "下载中"
+        : currentDownloadState.state === "creating"
+          ? "提交中"
+          : "下载"
+  const downloadActionHint = downloadUnavailableReason
+    ?? (currentDownloadState?.state === "actionable" ? currentDownloadState.reason : null)
+  const currentDownloadError = currentDownloadState?.state === "unknown" || currentDownloadState?.state === "actionable"
+    ? currentDownloadState.error : null
+
+  const runDownloadTarget = async (target: "all" | "current") => {
+    if (!drawerDownloadReady || downloadUnavailableReason !== null || (target === "current" && !currentCanDownload)) return
+    const action = target === "all" ? onDownloadAll : onDownloadCurrent
+    if (!action) return
+    setDownloadResultText(null)
+    try {
+      setDownloadResultText(await action())
+    } catch (cause) {
+      setDownloadResultText(cause instanceof Error ? cause.message : "创建下载任务失败，请稍后重试。")
+    } finally {
+      // 关闭弹窗：结果只反映真实创建（排队），不代表下载完成。
+      setIsDownloadDialogOpen(false)
+    }
   }
 
   return (
@@ -199,26 +286,40 @@ export function EpisodeDrawer({
 
         {/* 快捷功能工具栏 */}
         <div className="grid grid-cols-3 gap-[8px] p-3 rounded-2xl bg-black/5 dark:bg-white/5 border border-black/5 dark:border-white/5">
-          <button 
+          <button
             onClick={() => setIsDownloadDialogOpen(true)}
+            disabled={!drawerDownloadReady || downloadUnavailableReason !== null || downloadButtonDisabled || downloadPending}
+            title={downloadActionHint ?? drawerDownloadUnavailableReason ?? undefined}
             className={cn(
-              "flex flex-col items-center justify-center gap-1 py-1.5 transition-colors cursor-pointer",
-              isDownloaded ? "text-emerald-500" : "text-muted-foreground hover:text-foreground"
+              "flex flex-col items-center justify-center gap-1 py-1.5 transition-colors rounded-xl",
+              currentDownloadState?.state === "downloaded"
+                ? "text-emerald-500"
+                : currentDownloadState?.state === "queued" || currentDownloadState?.state === "creating"
+                  ? "text-blue-500"
+                  : disabledStyle(!drawerDownloadReady || downloadUnavailableReason !== null || downloadButtonDisabled || downloadPending)
             )}
             aria-label="下载"
+            aria-disabled={!drawerDownloadReady || downloadUnavailableReason !== null || downloadButtonDisabled || downloadPending}
           >
-            <Download className="w-5 h-5" />
-            <span className="text-[11px] font-semibold">{isDownloaded ? "已下载" : "下载"}</span>
+            <Download className={cn("w-5 h-5", downloadPending && "opacity-60")} />
+            <span className="text-[11px] font-semibold">
+              {downloadPending ? "提交中" : downloadActionLabel}
+            </span>
           </button>
-          <button 
-            onClick={() => setIsFavorited(!isFavorited)}
+          <button
+            onClick={() => onToggleFavorite?.()}
+            disabled={isFavorited === null || isFavoritePending || favoriteDisabledReason !== null || !onToggleFavorite}
+            title={favoriteDisabledReason ?? "收藏"}
+            aria-pressed={isFavorited === true}
             className={cn(
-              "flex flex-col items-center justify-center gap-1 py-1.5 transition-colors cursor-pointer",
-              isFavorited ? "text-red-500" : "text-muted-foreground hover:text-foreground"
+              "flex flex-col items-center justify-center gap-1 py-1.5 transition-colors rounded-xl",
+              isFavorited === true
+                ? "text-red-500"
+                : disabledStyle(isFavorited === null || isFavoritePending || favoriteDisabledReason !== null || !onToggleFavorite)
             )}
           >
-            <Heart className={cn("w-5 h-5", isFavorited && "fill-current")} />
-            <span className="text-[11px] font-semibold">{isFavorited ? "已收藏" : "已收藏"}</span>
+            <Heart className={cn("w-5 h-5", isFavorited === true && "fill-current")} />
+            <span className="text-[11px] font-semibold">{isFavoritePending ? "保存中" : "收藏"}</span>
           </button>
           <button
             onClick={() => setIsCastDialogOpen(true)}
@@ -232,6 +333,21 @@ export function EpisodeDrawer({
             <span className="text-[11px] font-semibold">{isCasting ? "已投屏" : "投屏"}</span>
           </button>
         </div>
+
+        {(favoriteError || downloadError || currentDownloadError || downloadResultText || drawerDownloadUnavailableReason) && (
+          <div className="flex flex-col gap-1 text-xs leading-relaxed">
+            {favoriteError && <div className="flex items-center gap-2 text-red-600 dark:text-red-400">
+              <p role="alert">{favoriteError}</p>
+              {onReloadFavorite && <button type="button" onClick={onReloadFavorite} disabled={isFavoritePending} className="shrink-0 underline disabled:opacity-50">重新读取</button>}
+            </div>}
+            {drawerDownloadUnavailableReason && <p className="text-muted-foreground">{drawerDownloadUnavailableReason}</p>}
+            {(downloadError || currentDownloadError) && <div className="flex items-center gap-2 text-red-600 dark:text-red-400">
+              <p role="alert">{downloadError ?? currentDownloadError}</p>
+              {onReloadDownloads && <button type="button" onClick={onReloadDownloads} disabled={downloadPending} className="shrink-0 underline disabled:opacity-50">重新读取</button>}
+            </div>}
+            {downloadResultText && <p className="text-amber-600 dark:text-amber-400">{downloadResultText}</p>}
+          </div>
+        )}
 
         {/* 选集 Selector Grid (带集数与二级标题) */}
         <div className="flex flex-col gap-3 pt-[8px]">
@@ -257,6 +373,7 @@ export function EpisodeDrawer({
               const isSelected = ep.id === currentEpisodeId
               const isWatched = ep.progress === 100
               const hasProgress = ep.progress !== undefined && ep.progress > 0 && ep.progress < 100
+              const downloadBadge = downloadBadgeOf?.(ep.id) ?? null
 
               return (
                 <button
@@ -264,17 +381,27 @@ export function EpisodeDrawer({
                   onClick={() => onSelectEpisode(ep)}
                   className={cn(
                     "relative min-h-[44px] px-3.5 py-[8px] rounded-xl text-xs transition-all cursor-pointer border flex flex-col justify-center text-left overflow-hidden",
-                    isSelected 
-                      ? "bg-blue-500/10 text-blue-500 dark:text-blue-400 border-blue-500/40 shadow-sm font-bold" 
+                    isSelected
+                      ? "bg-blue-500/10 text-blue-500 dark:text-blue-400 border-blue-500/40 shadow-sm font-bold"
                       : isWatched
                         ? "bg-green-500/10 text-green-700 dark:text-green-400 border-green-500/20 font-medium"
                         : "bg-black/5 dark:bg-white/5 text-foreground/80 border-transparent hover:bg-black/10 dark:hover:bg-white/10 font-medium"
                   )}
-                  title={`${ep.number} ${ep.title}${isWatched ? " · 已看" : hasProgress ? ` · ${Math.round(ep.progress!)}%` : ""}`}
+                  title={`${ep.number} ${ep.title}${downloadBadge === "downloaded" ? " · 已下载" : downloadBadge ? " · 下载中" : ""}${isWatched ? " · 已看" : hasProgress ? ` · ${Math.round(ep.progress!)}%` : ""}`}
                 >
                   <span className="flex items-center gap-1 font-bold text-xs truncate w-full">
                     {isWatched && <Check className="h-3 w-3 shrink-0" />}
                     {ep.number}
+                    {downloadBadge && (
+                      <span className={cn(
+                        "ml-auto shrink-0 rounded px-1 text-[10px] font-semibold",
+                        downloadBadge === "downloaded"
+                          ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
+                          : "bg-blue-500/15 text-blue-600 dark:text-blue-400"
+                      )}>
+                        {downloadBadge === "downloaded" ? "已下载" : downloadBadge === "creating" ? "提交中" : "下载中"}
+                      </span>
+                    )}
                   </span>
                   {ep.title && (
                     <span className="text-[11px] opacity-75 truncate w-full mt-0.5">
@@ -318,8 +445,9 @@ export function EpisodeDrawer({
             <div className="mt-5 space-y-3">
               <button
                 type="button"
-                onClick={() => chooseDownloadTarget("all")}
-                className="flex w-full items-center justify-between rounded-2xl border border-black/10 p-[16px] text-left transition-colors hover:border-foreground/40 hover:bg-black/[0.03] dark:border-white/10 dark:hover:bg-white/[0.04]"
+                onClick={() => void runDownloadTarget("all")}
+                disabled={!drawerDownloadReady || downloadUnavailableReason !== null || downloadPending}
+                className="flex w-full items-center justify-between rounded-2xl border border-black/10 p-[16px] text-left transition-colors hover:border-foreground/40 hover:bg-black/[0.03] disabled:cursor-not-allowed disabled:opacity-50 dark:border-white/10 dark:hover:bg-white/[0.04]"
               >
                 <span className="flex items-center gap-3">
                   <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-black/5 dark:bg-white/10">
@@ -335,8 +463,9 @@ export function EpisodeDrawer({
 
               <button
                 type="button"
-                onClick={() => chooseDownloadTarget("current")}
-                className="flex w-full items-center justify-between rounded-2xl border border-black/10 p-[16px] text-left transition-colors hover:border-foreground/40 hover:bg-black/[0.03] dark:border-white/10 dark:hover:bg-white/[0.04]"
+                onClick={() => void runDownloadTarget("current")}
+                disabled={!currentCanDownload || downloadPending}
+                className="flex w-full items-center justify-between rounded-2xl border border-black/10 p-[16px] text-left transition-colors hover:border-foreground/40 hover:bg-black/[0.03] disabled:cursor-not-allowed disabled:opacity-50 dark:border-white/10 dark:hover:bg-white/[0.04]"
               >
                 <span className="flex items-center gap-3">
                   <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-black/5 dark:bg-white/10">
@@ -353,8 +482,13 @@ export function EpisodeDrawer({
               </button>
             </div>
 
+            {currentDownloadState?.state === "actionable" && currentDownloadState.reason && (
+              <p className="mt-3 text-xs text-muted-foreground">{currentDownloadState.reason}</p>
+            )}
             <p className="mt-[16px] text-xs leading-relaxed text-muted-foreground">
-              栖阅会自动选择可播放源并加入下载队列，无需手动切换线路。
+              {drawerDownloadReady
+                ? "栖阅会为每一集选择可下载的来源并加入下载队列；加入队列后仍需在下载页查看完成进度。"
+                : "当前运行环境没有本地下载服务，下载功能不可用。"}
             </p>
           </div>
         </div>

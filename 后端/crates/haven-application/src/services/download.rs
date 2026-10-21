@@ -13,8 +13,8 @@ use haven_domain::contracts::{
 };
 use haven_domain::entities::{DownloadTask, Resource, ResourceLocator, StorageLocation};
 use haven_domain::enums::{
-    Availability, ContentCategory, DownloadPriority, DownloadState, MediaType, StorageProviderType,
-    StorageStatus,
+    Availability, ContentCategory, DownloadPriority, DownloadState, MediaType, ResourceType,
+    StorageProviderType, StorageStatus,
 };
 use haven_domain::ids::{DownloadTaskId, MediaItemId, ResourceId, StorageLocationId};
 use haven_domain::settings::{SettingsSection, SettingsValue};
@@ -186,6 +186,16 @@ impl DownloadService {
             ));
         }
         if matches!(&resource.locator, ResourceLocator::Http { .. }) {
+            return Err(AppError::new(
+                "DOWNLOAD_SOURCE_UNSUPPORTED",
+                ErrorKind::Validation,
+                "该资源没有受控的可下载来源",
+                false,
+            ));
+        }
+        // 下载器只传输单个文件；ImageSequence 本地漫画是目录，没有受控的
+        // 目录归档传输，必须在创建任务前拒绝，而不是等 Worker 解析目录失败。
+        if resource.resource_type == ResourceType::ImageSequence {
             return Err(AppError::new(
                 "DOWNLOAD_SOURCE_UNSUPPORTED",
                 ErrorKind::Validation,

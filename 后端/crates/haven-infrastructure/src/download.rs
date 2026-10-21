@@ -286,7 +286,9 @@ impl DownloadScheduler {
             }
         }
         drop(hosts);
-        self.notify.notify_one();
+        // 槽位释放必须广播：被唤醒的等待者可能因自身已暂停/取消而直接退出，
+        // 单次 notify_one 会把唯一唤醒交给它并吞掉，其他等待者永久排队。
+        self.notify.notify_waiters();
     }
 }
 

@@ -452,7 +452,24 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     startedAt: number
     pinchDistance: number | null
     pinchZoom: number
+    /** The whole touch sequence has involved more than one finger. */
+    multiTouch: boolean
   } | null>(null)
+  // Survives a pan-y pointercancel: the remaining finger's own touchend must
+  // not be treated as a single-finger tap. Only a fresh sequence resets it.
+  const multiTouchGestureRef = useRef(false)
+  const clickSuppressionTimerRef = useRef<number | null>(null)
+  const suppressCompatibilityClick = () => {
+    suppressClickRef.current = true
+    if (clickSuppressionTimerRef.current !== null) window.clearTimeout(clickSuppressionTimerRef.current)
+    clickSuppressionTimerRef.current = window.setTimeout(() => {
+      suppressClickRef.current = false
+      clickSuppressionTimerRef.current = null
+    }, 350)
+  }
+  useEffect(() => () => {
+    if (clickSuppressionTimerRef.current !== null) window.clearTimeout(clickSuppressionTimerRef.current)
+  }, [])
 
   // 条漫模式只保留视口附近的页面节点，避免几百张图片同时进入 DOM。
   const [stripWindow, setStripWindow] = useState({ start: 1, end: 8 })
@@ -904,7 +921,7 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     })
   }, [currentPage, getStripPageOffset, getStripWindowForPage, totalPages])
 
-  // 所有显式跳页入口共用此动作；自然滚动仍由 handleStripScroll 回报可视页。
+  // 显式跳页入口（目录/滑块/上一页下一页/轻点/滑动）把目标页对齐到 pageOffset 页顶。
   const goToPage = useCallback((requestedPage: number) => {
     const page = Math.max(1, Math.min(totalPages, requestedPage))
     setCurrentPage(page)
@@ -915,12 +932,12 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
         stripNavigationTimerRef.current = null
         const container = stripScrollRef.current
         if (container) {
-          container.scrollTo({ top: getStripPageOffset(page) - container.clientHeight / 2 + getStripPageHeight(page) / 2, behavior: "auto" })
+          container.scrollTo({ top: getStripPageOffset(page), behavior: "auto" })
         }
       }, 0)
     }
     resetAutoHideTimer()
-  }, [getStripPageHeight, getStripPageOffset, getStripWindowForPage, resetAutoHideTimer, totalPages, viewMode])
+  }, [getStripPageOffset, getStripWindowForPage, resetAutoHideTimer, totalPages, viewMode])
 
   const nextPage = useCallback(() => {
     if (viewMode !== "double") return goToPage(currentPage + 1)
@@ -936,7 +953,9 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
 
   const handleLeftClick = () => direction === "rtl" ? nextPage() : prevPage()
   const handleRightClick = () => direction === "rtl" ? prevPage() : nextPage()
-  const handleSliderChange = (e: React.ChangeEvent<HTMLInputElement>) => goToPage(Number(e.target.value))
+  const handleSliderChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    goToPage(Number(e.target.value))
+  }
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -955,6 +974,7 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
   }, [direction, nextPage, prevPage])
 
   // 触屏：中心轻点显示工具栏，边缘轻点和左右滑动翻页，双指手势缩放。
+  // 一旦本次触摸序列出现过多指，序列结束时既不翻页也不切换工具栏。
   const getTouchDistance = (touches: React.TouchList) => {
     if (touches.length < 2) return null
     const first = touches[0]
@@ -966,12 +986,20 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     resetAutoHideTimer()
     const firstTouch = e.touches[0]
     const pinchDistance = getTouchDistance(e.touches)
+    if (e.touches.length === 1) {
+      // A fresh single-finger sequence can only start when no contact is left
+      // (any earlier sequence ended normally or was cancelled by pan-y).
+      multiTouchGestureRef.current = false
+    } else if (e.touches.length > 1 || pinchDistance !== null) {
+      multiTouchGestureRef.current = true
+    }
     touchRef.current = {
       x: firstTouch.clientX,
       y: firstTouch.clientY,
       startedAt: Date.now(),
       pinchDistance,
       pinchZoom: zoomScale,
+      multiTouch: multiTouchGestureRef.current,
     }
   }
 
@@ -979,6 +1007,10 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     const gesture = touchRef.current
     if (!gesture) return
     const pinchDistance = getTouchDistance(e.touches)
+    if (pinchDistance !== null && e.touches.length > 1) {
+      multiTouchGestureRef.current = true
+      gesture.multiTouch = true
+    }
     if (pinchDistance && gesture.pinchDistance) {
       e.preventDefault()
       setZoomScale(Math.min(2.5, Math.max(1, gesture.pinchZoom * (pinchDistance / gesture.pinchDistance))))
@@ -988,8 +1020,16 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
   const handleTouchEnd = (e: React.TouchEvent<HTMLElement>) => {
     const gesture = touchRef.current
     touchRef.current = null
+    const multiTouch = gesture?.multiTouch || multiTouchGestureRef.current
+    if (e.touches.length === 0) {
+      // Every contact of this sequence has left; the next touch starts clean.
+      multiTouchGestureRef.current = false
+    }
+    if (multiTouch) {
+      suppressCompatibilityClick()
+      return
+    }
     if (!gesture) return
-
     const lastTouch = e.changedTouches[0]
     const dx = lastTouch.clientX - gesture.x
     const dy = lastTouch.clientY - gesture.y
@@ -1020,8 +1060,13 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     }
 
     if (suppressClickRef.current) {
-      window.setTimeout(() => { suppressClickRef.current = false }, 350)
+      suppressCompatibilityClick()
     }
+  }
+  const handleTouchCancel = (e: React.TouchEvent<HTMLElement>) => {
+    touchRef.current = null
+    if (e.touches.length === 0) multiTouchGestureRef.current = false
+    suppressCompatibilityClick()
   }
 
   useEffect(() => {
@@ -1054,14 +1099,15 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     const frame = requestAnimationFrame(() => {
       const container = stripScrollRef.current
       if (!container) return
+      // 初始入页与显式跳页一致：对齐页顶，让长图从上半段开始阅读。
       container.scrollTo({
-        top: getStripPageOffset(currentPage) - container.clientHeight / 2 + getStripPageHeight(currentPage) / 2,
+        top: getStripPageOffset(currentPage),
         behavior: "auto",
       })
       stripModeInitializedRef.current = true
     })
     return () => cancelAnimationFrame(frame)
-  }, [currentPage, getStripPageHeight, getStripPageOffset, getStripWindowForPage, progressRestoredIdentity, readerSessionIdentity, sequence, totalPages, viewMode])
+  }, [currentPage, getStripPageOffset, getStripWindowForPage, progressRestoredIdentity, readerSessionIdentity, sequence, totalPages, viewMode])
 
   if (!demoMode && (!sequence || manifestState.status !== "ready")) {
     return (
@@ -1173,6 +1219,7 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
         onTouchStart={handleTouchStart}
         onTouchMove={handleTouchMove}
         onTouchEnd={handleTouchEnd}
+        onTouchCancel={handleTouchCancel}
         style={{ touchAction: viewMode === "strip" ? "pan-y" : "none" }}
       >
         {/* 左右两侧交互翻页热区 */}

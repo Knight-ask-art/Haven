@@ -248,6 +248,9 @@ fn downloadable_locator(
                         )
                 })
                 && !is_stream_resource(resource.resource_type)
+                // 本地图片目录（ImageSequence）可离线阅读，但下载器只传输单个
+                // 文件，没有目录归档能力；投影为可下载会让任务提交后才失败。
+                && resource.resource_type != ResourceType::ImageSequence
         }
         // HTTP resources are intentionally not downloadable through the generic
         // resource capability.  Stream resources are only playable through the

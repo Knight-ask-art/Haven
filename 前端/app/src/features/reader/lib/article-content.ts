@@ -74,7 +74,6 @@ const HTML_SANITIZE_CONFIG: Config = {
 }
 
 export const ARTICLE_HTML_BLOCK_TAGS = ["h1", "h2", "h3", "h4", "h5", "h6", "p", "blockquote", "li", "td", "th"] as const
-const ARTICLE_HTML_PARAGRAPH_TAGS = ARTICLE_HTML_BLOCK_TAGS.slice(6)
 
 function htmlBlockElements(root: ParentNode): Element[] {
   const blockTags = new Set<string>(ARTICLE_HTML_BLOCK_TAGS)
@@ -99,50 +98,8 @@ export function sanitizeArticleHtml(html: string): string {
   return DOMPurify.sanitize(html, HTML_SANITIZE_CONFIG)
 }
 
-function plainTextFromHtml(html: string): string {
-  const template = document.createElement("template")
-  template.innerHTML = html
-  const lines: string[] = []
-  const blocks = htmlBlockElements(template.content)
-  const hasHeading = blocks.some((element) => /^h[1-6]$/i.test(element.tagName))
-  if (!hasHeading) lines.push("# 文章", "")
-  for (const element of blocks) {
-    const text = element.textContent?.replace(/\s+/g, " ").trim()
-    if (!text) continue
-    if (/^h[1-6]$/i.test(element.tagName)) {
-      const prefix = element.tagName.toLowerCase() === "h1" ? "#" : "##"
-      lines.push(`${prefix} ${text}`)
-    } else {
-      lines.push(text)
-    }
-    lines.push("")
-  }
-  return lines.join("\n")
-}
-
-function addStableHtmlBlockIds(html: string, documentModel: ArticleDocument): string {
-  const template = document.createElement("template")
-  template.innerHTML = html
-  const blocks = htmlBlockElements(template.content)
-  const headings = blocks.filter((element) => /^h[1-6]$/i.test(element.tagName))
-  // Keep this order identical to plainTextFromHtml. List items and table cells
-  // are paragraphs in the article model too; omitting them shifts every later
-  // marker onto the wrong DOM block.
-  const paragraphs = blocks.filter((element) => ARTICLE_HTML_PARAGRAPH_TAGS.includes(element.tagName.toLowerCase() as (typeof ARTICLE_HTML_PARAGRAPH_TAGS)[number]))
-  const sections = documentModel.sections
-  headings.forEach((heading, index) => {
-    const section = sections[index]
-    if (section) heading.id = section.id
-  })
-  let paragraphIndex = 0
-  for (const section of sections) {
-    for (const paragraph of section.paragraphs) {
-      const block = paragraphs[paragraphIndex]
-      if (block) block.setAttribute("data-article-block-id", paragraph.id)
-      paragraphIndex += 1
-    }
-  }
-  return template.innerHTML
+function isHeadingTag(tagName: string): boolean {
+  return /^h[1-6]$/i.test(tagName)
 }
 
 interface RawArticleSection {
@@ -250,18 +207,90 @@ export function parseArticleText(text: string, format: "text" | "markdown" = "te
   }
 }
 
+/**
+ * HTML 的单一投影：按文档顺序遍历一次非空块，同一遍里构造模型并在该 DOM
+ * 元素上写 stable hash ID。模型与 DOM 身份来自同一个元素，不再二次解析或
+ * 按位置配对，因此空白块、标题前的导语都不会让真实正文丢掉块 ID。
+ * 每个 ID 进入全篇共享的 `used`：章节 ID 与段落 ID 互不相同，标题通过
+ * `id` 锚点、段落通过 `data-article-block-id` 定位。
+ */
+function projectHtmlDocument(sanitizedHtml: string): ArticleDocument | null {
+  const template = document.createElement("template")
+  template.innerHTML = sanitizedHtml
+  const blocks = htmlBlockElements(template.content)
+  // HTML 也可能只有 div 或裸文本；保留其可阅读内容并提供一个真实段落锚点。
+  if (blocks.length === 0 && template.content.textContent?.trim()) {
+    const body = document.createElement("div")
+    body.append(template.content)
+    template.content.append(body)
+    blocks.push(body)
+  }
+  if (!blocks.some((element) => (element.textContent ?? "").trim().length > 0)) return null
+
+  const used = new Map<string, number>()
+  // 文档标题取首个非空标题块的纯文本（不是 HTML 源）；没有标题时用合成标题。
+  const firstHeadingText = blocks
+    .filter((element) => isHeadingTag(element.tagName))
+    .map((element) => element.textContent?.replace(/\s+/g, " ").trim() ?? "")
+    .find((text) => text.length > 0)
+  const documentTitle = firstHeadingText ?? "文章"
+  // 合成“文章”section 只承载标题前的导语；没有导语且首个块就是标题时不分配，
+  // 否则会白白消耗 used 计数，让首个同名章节 ID 变成 -2。
+  let rootSection: ArticleSection | null = null
+  const ensureRoot = (): ArticleSection => {
+    rootSection ??= {
+      id: uniqueBlockId("article-section", "1:文章", used),
+      level: 1,
+      title: "文章",
+      paragraphs: [],
+    }
+    return rootSection
+  }
+  const sections: ArticleSection[] = []
+  let current: ArticleSection | null = null
+
+  for (const element of blocks) {
+    const text = element.textContent?.replace(/\s+/g, " ").trim() ?? ""
+    if (!text) continue
+    if (isHeadingTag(element.tagName)) {
+      const level = element.tagName.toLowerCase() === "h1" ? 1 : 2
+      const section: ArticleSection = {
+        id: uniqueBlockId("article-section", `${level}:${text}`, used),
+        level,
+        title: text,
+        paragraphs: [],
+      }
+      element.id = section.id
+      sections.push(section)
+      current = section
+      continue
+    }
+    const section: ArticleSection = current ?? ensureRoot()
+    if (sections.length === 0) sections.push(section)
+    current = section
+    const paragraph: ArticleParagraph = {
+      id: uniqueBlockId(`${section.id}-paragraph`, text, used),
+      text,
+    }
+    element.setAttribute("data-article-block-id", paragraph.id)
+    section.paragraphs.push(paragraph)
+  }
+
+  return {
+    title: documentTitle,
+    sections,
+    characterCount: sections.reduce(
+      (total, section) => total + section.title.length + section.paragraphs.reduce((sum, paragraph) => sum + paragraph.text.length, 0),
+      0,
+    ),
+    format: "html",
+    sanitizedHtml: template.innerHTML,
+  }
+}
+
 export function parseArticleContent(text: string, contentType: string): ArticleDocument | null {
   const normalizedType = contentType.split(";", 1)[0].trim().toLowerCase()
-  if (normalizedType === "text/html") {
-    const sanitizedHtml = sanitizeArticleHtml(text)
-    const parsed = parseArticleText(plainTextFromHtml(sanitizedHtml), "text")
-    if (!parsed) return null
-    return {
-      ...parsed,
-      format: "html",
-      sanitizedHtml: addStableHtmlBlockIds(sanitizedHtml, parsed),
-    }
-  }
+  if (normalizedType === "text/html") return projectHtmlDocument(sanitizeArticleHtml(text))
   if (normalizedType === "text/markdown") return parseArticleText(text, "markdown")
   return parseArticleText(text, "text")
 }
