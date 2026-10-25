@@ -120,6 +120,9 @@ function ComicPageView({
   onLoad,
   onError,
   resourcePool,
+  recoverable,
+  onRecover,
+  failedByProvider = false,
 }: {
   page: ComicPageModel | null
   src: string | null
@@ -129,6 +132,11 @@ function ComicPageView({
   onLoad?: React.ReactEventHandler<HTMLImageElement>
   onError?: React.ReactEventHandler<HTMLImageElement>
   resourcePool?: ComicPageResourcePool | null
+  /** 生产页只在主阅读位给出重开动作；缩略图不重复提供。 */
+  recoverable?: boolean
+  onRecover?: (pageNumber: number) => void
+  /** 页面级已判定该页加载失败（失败集合），缩略图同样要显示失败而不是无限等待。 */
+  failedByProvider?: boolean
 }) {
   const [managedResource, setManagedResource] = useState<ComicPageResource | null>(null)
   const [managedError, setManagedError] = useState(false)
@@ -165,10 +173,29 @@ function ComicPageView({
   }, [managed, page, resourcePool])
 
   const imageSrc = managed ? managedResource?.src ?? null : src
-  if (!page || page.availability !== "ready" || !imageSrc) {
+  const failed = managedError || (page !== null && failedByProvider)
+  // Provider 已判失败的页面即使地址非空也必须进入恢复分支：过期租约签发的地址
+  // 仍可能指向 404，不能继续渲染（否则重开入口永远不出现）。
+  if (!page || page.availability !== "ready" || !imageSrc || failed) {
+    if (failed && recoverable && onRecover && page) {
+      // 会话租约过期后，已签发的页面地址会 404；这里只给出用户可触发的重开入口，
+      // 真正的恢复走既有 session retry / 租约流水线，不在页面里刷新地址或延长 TTL。
+      return (
+        <div className={cn("flex flex-col items-center justify-center gap-2 rounded-md border border-white/10 bg-white/[0.03] px-5 py-6 text-center text-xs text-white/60", className)}>
+          <span>第 {page.pageNumber} 页加载失败，页面地址可能已过期</span>
+          <button
+            type="button"
+            onClick={(event) => { event.stopPropagation(); onRecover(page.pageNumber) }}
+            className="rounded-full bg-white px-4 py-1.5 text-[11px] font-semibold text-black hover:bg-white/85"
+          >
+            重新打开页面
+          </button>
+        </div>
+      )
+    }
     return (
       <div className={cn("flex min-h-[180px] items-center justify-center rounded-md border border-white/10 bg-white/[0.03] px-5 text-center text-xs text-white/50", className)}>
-        {managedError ? `第 ${page?.pageNumber ?? "?"} 页加载失败` : `第 ${page?.pageNumber ?? "?"} 页暂不可用`}
+        {failed ? `第 ${page?.pageNumber ?? "?"} 页加载失败` : `第 ${page?.pageNumber ?? "?"} 页暂不可用`}
       </div>
     )
   }
@@ -411,9 +438,64 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     ? manifestState.sequence
     : null
 
+  const pendingReopenTargetRef = useRef<{ key: string; page: number; mediaItemId: string } | null>(null)
+  // 在途重开：同步闩锁，从点击到新会话 manifest + 进度恢复完成前一直持有，
+  // 期间所有恢复按钮都保持禁用/隐藏，避免并发触发第二份 retry。
+  const reopenInFlightRef = useRef(false)
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => { mountedRef.current = false }
+  }, [])
+  const [reopenInFlight, setReopenInFlight] = useState(false)
+  const releaseReopenTarget = useCallback((key: string | null) => {
+    if (key !== null && pendingReopenTargetRef.current?.key !== key) return
+    pendingReopenTargetRef.current = null
+    reopenInFlightRef.current = false
+    if (mountedRef.current) setReopenInFlight(false)
+  }, [])
+  const hasPendingReopen = reopenInFlight
+
   // 阅读器状态
   const [currentPage, setCurrentPage] = useState(1)
   const totalPages = sequence?.pageCount ?? 0
+  const mediaItemIdRef = useRef(mediaItemId)
+  mediaItemIdRef.current = mediaItemId
+  const totalPagesRef = useRef(totalPages)
+  totalPagesRef.current = totalPages
+  const recoverySessionRef = useRef(readerSessionIdentity)
+  useLayoutEffect(() => { recoverySessionRef.current = readerSessionIdentity }, [readerSessionIdentity])
+
+  const recoverPage = useCallback((pageNumber: number) => {
+    // 同步守卫：同一帧里的重复点击、以及切作品 / 换会话后到达的迟到点击一律忽略。
+    const key = readerSessionIdentity
+    if (demoMode || key === null || totalPagesRef.current <= 0 || mediaItemIdRef.current !== mediaItemId) return
+    if (reopenInFlightRef.current || pendingReopenTargetRef.current?.key === key) return
+    const target = { key, page: Math.max(1, Math.min(totalPagesRef.current, pageNumber)), mediaItemId: mediaItemIdRef.current ?? "" }
+    pendingReopenTargetRef.current = target
+    reopenInFlightRef.current = true
+    setReopenInFlight(true)
+    // 恢复必须开一个新会话而不是重取同一个过期会话。既有租约流水线：先等进度控制器
+    // cleanup（flush）落盘，再触发 retry()；useMediaSession 的 retryNonce 会让租约
+    // 释放同样等待这份 barrier。这里不延长 TTL、不改资源鉴权，也不轮询刷新。
+    const controller = progressControllerRef.current
+    const flush = controller !== null
+      ? controller.cleanup().catch(() => undefined)
+      : Promise.resolve()
+    void flush.then(() => {
+      if (!mountedRef.current || mediaItemIdRef.current !== target.mediaItemId) {
+        // 组件已卸载或已切换作品：没有可触发的新会话，释放闩锁即可。
+        releaseReopenTarget(target.key)
+        return
+      }
+      // A progress conflict can already have reopened the session during flush.
+      // Its new generation owns recovery; do not issue a second retry from the old callback.
+      if (recoverySessionRef.current !== target.key) return
+      retry()
+    })
+  }, [demoMode, mediaItemId, readerSessionIdentity, releaseReopenTarget, retry])
+  const recover = demoMode ? undefined : recoverPage
+
   const [viewMode, setViewMode] = useState<ViewMode>("single")
   const [direction, setDirection] = useState<ReadDirection>("rtl")
   const [pageGapPx, setPageGapPx] = useState<0 | 12 | 24>(12)
@@ -522,6 +604,37 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
   }, [demoMode, readerSessionIdentity])
 
   useEffect(() => {
+    // 新的页面池（新会话 / 新 manifest）就绪后清空失败集合，让恢复后的页面重新尝试加载。
+    setFailedPages(new Set())
+  }, [readerSessionIdentity, sequence])
+
+  useEffect(() => () => {
+    // 卸载后不再保留重开目标与闩锁。
+    pendingReopenTargetRef.current = null
+    reopenInFlightRef.current = false
+  }, [])
+
+  useEffect(() => {
+    const key = readerSessionIdentity ?? ""
+    const pending = pendingReopenTargetRef.current
+    // 目标跨越旧会话 → opening → 新会话保留；只有新会话的 manifest 就绪、且进度
+    // 恢复已按该身份落页之后才释放。旧身份、opening 或新会话出错时都不释放，
+    // 避免迟到点击在恢复完成前再次触发重开。
+    if (pending === null || pending.mediaItemId !== (mediaItemId ?? "")) {
+      // 目标属于已离开的作品：不再等待，释放闩锁以免恢复入口永久禁用。
+      if (pending !== null) releaseReopenTarget(null)
+      return
+    }
+    if (state.status === "retryable_error" || state.status === "terminal_error") {
+      releaseReopenTarget(pending.key)
+      return
+    }
+    if (key === "" || key === pending.key || manifestState.status !== "ready" || totalPages <= 0) return
+    if (progressRestoredIdentity !== key) return
+    releaseReopenTarget(null)
+  }, [manifestState.status, mediaItemId, progressRestoredIdentity, readerSessionIdentity, releaseReopenTarget, state.status, totalPages])
+
+  useEffect(() => {
     if (!readerSessionIdentity || comicSettingsState.status === "loading") return
     const expectedScopeKey = !demoMode && mediaItemId && preferenceEditionId
       ? `resource:${mediaItemId}:${preferenceEditionId}`
@@ -584,15 +697,19 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     setComicMarkerId(marker?.markerId ?? null)
   }, [currentPage, isBookmarkPending, manifestState.status, markersLoaded, mediaItemId, sessionMarkers, sessionView.status, totalPages])
 
-  // 进度控制器生命周期：仅 Tauri 环境 session ready 时创建。
+  // 进度控制器生命周期：仅 Tauri 环境 session ready 时创建。每次创建（含同一会话的
+  // manifest 重取）都重新注册 barrier，保证协议打开时租约释放等的一定是当前控制器。
   useEffect(() => {
     progressControllerRef.current = null
     if (totalPages <= 0 || sessionView.status !== "ready" || state.status !== "ready" || manifestState.status !== "ready") return
     const controller = createComicProgressController({ session: state.session, totalPages, retry })
     progressControllerRef.current = controller
+    // 重开时旧会话的租约释放仍会等待已注册的 barrier：新会话的 barrier 只清理新会话
+    // 的页面池，绝不能在旧会话的 barrier 里 dispose 新会话的页面池。
+    const ownedPool = resourcePoolRef.current
     registerReleaseBarrier(async () => {
       await controller.cleanup()
-      resourcePoolRef.current?.dispose()
+      ownedPool?.dispose()
     })
     return () => { progressControllerRef.current = null; registerReleaseBarrier(null) }
   }, [manifestState.status, sessionIdentity, sessionView.status, state, retry, registerReleaseBarrier, totalPages])
@@ -601,9 +718,15 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
   useEffect(() => {
     if (totalPages <= 0 || sessionView.status !== "ready" || state.status !== "ready" || manifestState.status !== "ready") return
     const restored = restoreComicProgress(totalPages, state.session, restoredProgressRef, initialPosition)
-    if (restored) setCurrentPage(restored.pageIndex)
+    // 同一作品内的「重新打开页面」：保留失败时所在页，优先于已保存的旧进度。
+    const reopen = pendingReopenTargetRef.current
+    const reopenPage = reopen !== null && reopen.mediaItemId === (mediaItemId ?? "")
+      ? Math.max(1, Math.min(totalPages, reopen.page))
+      : null
+    if (reopenPage !== null) setCurrentPage(reopenPage)
+    else if (restored) setCurrentPage(restored.pageIndex)
     setProgressRestoredIdentity(readerSessionIdentity)
-  }, [initialPosition, manifestState.status, readerSessionIdentity, sessionIdentity, sessionView.status, state, totalPages])
+  }, [initialPosition, manifestState.status, readerSessionIdentity, sessionIdentity, sessionView.status, state, totalPages, mediaItemId])
 
   // currentPage 变化时向进度控制器上报（Tauri 环境节流）。
   useEffect(() => {
@@ -1264,6 +1387,9 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
               )}
               style={{ transform: `scale(${zoomScale})` }}
               resourcePool={renderResourcePool}
+              failedByProvider={failedPages.has(currentPage)}
+              recoverable={!hasPendingReopen}
+              onRecover={recover}
             />
           </div>
         )}
@@ -1289,6 +1415,9 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                       className="h-full w-auto max-w-[48%] rounded-r-md object-contain shadow-2xl"
                       style={{ transform: `scale(${zoomScale})` }}
                       resourcePool={renderResourcePool}
+                      failedByProvider={failedPages.has(spread[1])}
+                      recoverable={!hasPendingReopen}
+                      onRecover={recover}
                     />
                     <ComicPageView
                       page={getPage(spread[0])}
@@ -1299,6 +1428,9 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                       className="h-full w-auto max-w-[48%] rounded-l-md object-contain shadow-2xl"
                       style={{ transform: `scale(${zoomScale})` }}
                       resourcePool={renderResourcePool}
+                      failedByProvider={failedPages.has(spread[0])}
+                      recoverable={!hasPendingReopen}
+                      onRecover={recover}
                     />
                   </>
                 ) : (
@@ -1312,6 +1444,9 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                       className="h-full w-auto max-w-[48%] rounded-l-md object-contain shadow-2xl"
                       style={{ transform: `scale(${zoomScale})` }}
                       resourcePool={renderResourcePool}
+                      failedByProvider={failedPages.has(spread[0])}
+                      recoverable={!hasPendingReopen}
+                      onRecover={recover}
                     />
                     <ComicPageView
                       page={getPage(spread[1])}
@@ -1322,6 +1457,9 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                       className="h-full w-auto max-w-[48%] rounded-r-md object-contain shadow-2xl"
                       style={{ transform: `scale(${zoomScale})` }}
                       resourcePool={renderResourcePool}
+                      failedByProvider={failedPages.has(spread[1])}
+                      recoverable={!hasPendingReopen}
+                      onRecover={recover}
                     />
                   </>
                 )
@@ -1336,6 +1474,9 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                     className="h-full w-full rounded-md object-contain shadow-2xl"
                     style={{ transform: `scale(${zoomScale})` }}
                     resourcePool={renderResourcePool}
+                    failedByProvider={failedPages.has(spread[0])}
+                    recoverable={!hasPendingReopen}
+                    onRecover={recover}
                   />
                 )
               }
@@ -1375,6 +1516,9 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                     alt={`第 ${pageNum} 页`}
                     className="w-full h-auto object-contain block"
                     resourcePool={renderResourcePool}
+                    failedByProvider={failedPages.has(pageNum)}
+                    recoverable={!hasPendingReopen}
+                    onRecover={recover}
                     onLoad={(e) => {
                       handlePageLoad(pageNum, e, renderResourcePoolGeneration)
                       // React 的事件对象在异步 state updater 执行前可能已经释放 currentTarget。
@@ -1571,6 +1715,9 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                     alt={`Page ${pageNum}`}
                     className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
                     resourcePool={renderResourcePool}
+                    failedByProvider={failedPages.has(pageNum)}
+                    recoverable={!hasPendingReopen}
+                    onRecover={recover}
                   />
                   <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent p-[8px] pt-6">
                     <span className="text-[11px] font-bold text-white drop-shadow-md">

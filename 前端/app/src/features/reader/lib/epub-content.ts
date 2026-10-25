@@ -456,47 +456,39 @@ function trimGutenbergBoilerplate(html: string): string | null {
   return htmlToPlainText(body) ? body : null
 }
 
-function buildAnchorMap(html: string, text: string, paragraphs: readonly string[]): Readonly<Record<string, number>> {
-  const result: Record<string, number> = {}
-  const paragraphStarts: number[] = []
-  let cursor = 0
-  for (const paragraph of paragraphs) {
-    const start = text.indexOf(paragraph, cursor)
-    if (start < 0) {
-      paragraphStarts.push(cursor)
-      cursor += paragraph.length + 2
-    } else {
-      paragraphStarts.push(start)
-      cursor = start + paragraph.length + 2
-    }
-  }
-
-  const tagPattern = /<[^>]+>/g
-  for (const tagMatch of html.matchAll(tagPattern)) {
-    const tag = tagMatch[0]
+/** Project inert anchor markers through the same whole-document text conversion. */
+function buildAnchorMap(html: string, paragraphs: readonly string[], titleRemoved: boolean): Readonly<Record<string, number>> {
+  const result: Record<string, number> = Object.create(null) as Record<string, number>
+  if (paragraphs.length === 0) return result
+  let markerPrefix = "\uE000HAVEN"
+  while (html.includes(markerPrefix)) markerPrefix += "\uE000"
+  const anchors: string[] = []
+  const annotated = html.replace(/<!--[\s\S]*?-->|<[^>]+>/g, (tag) => {
     const tagName = /^<\s*([A-Za-z][\w:.-]*)/.exec(tag)?.[1]?.toLowerCase()
-    if (!tagName || /^(?:script|style|svg|math|iframe|object|embed|form|textarea)$/.test(tagName)) continue
-    const attributePattern = /\b(?:id|name)\s*=\s*(["'])(.*?)\1/gi
-    for (const attributeMatch of tag.matchAll(attributePattern)) {
-      let anchor: string
-      try {
-        anchor = htmlEntityText(attributeMatch[2]).trim()
-      } catch {
-        continue
-      }
-      if (
-        !anchor
-        || anchor.length > 512
-        || [...anchor].some((character) => character.codePointAt(0)! < 0x20 || /[\\/?#<>"']/.test(character))
-        || result[anchor] !== undefined
-      ) continue
-      const prefix = htmlToPlainText(html.slice(0, (tagMatch.index ?? 0)))
-      let paragraphIndex = 0
-      for (let index = 0; index < paragraphStarts.length; index += 1) {
-        if (paragraphStarts[index] <= prefix.length) paragraphIndex = index
-      }
-      result[anchor] = paragraphIndex
+    if (!tagName || /^(?:head|script|style|svg|math|iframe|object|embed|form|textarea)$/.test(tagName)) return tag
+    let markers = ""
+    for (const match of tag.matchAll(/\b(?:id|name)\s*=\s*(["'])(.*?)\1/gi)) {
+      const anchor = htmlEntityText(match[2]).trim()
+      if (!anchor || anchor.length > 512
+        || [...anchor].some((ch) => ch.codePointAt(0)! < 0x20 || /[\\/?#<>"']/.test(ch))) continue
+      markers += `${markerPrefix}${anchors.length}\uE001`
+      anchors.push(anchor)
     }
+    return tag + markers
+  })
+  const markerPattern = new RegExp(`${markerPrefix}(\\d+)\uE001`, "g")
+  let paragraphIndex = 0
+  for (const chunk of htmlToPlainText(annotated).split(/\n{2,}/)) {
+    const indexes = [...chunk.matchAll(markerPattern)].map((match) => Number(match[1]))
+    const content = chunk.replace(markerPattern, "").replace(/\s*\n\s*/g, " ").trim()
+    const target = Math.max(0, Math.min(paragraphs.length - 1, paragraphIndex - Number(titleRemoved)))
+    for (const index of indexes) {
+      const anchor = anchors[index]
+      if (!Object.prototype.hasOwnProperty.call(result, anchor)) result[anchor] = target
+    }
+    // A container's marker can occupy an empty chunk before its first child.
+    // It points forward but must never count as a rendered paragraph itself.
+    if (content) paragraphIndex += 1
   }
   return result
 }
@@ -514,7 +506,8 @@ function chapterFromXhtml(index: number, spineCount: number, item: PublicationMa
     .split(/\n{2,}/)
     .map((paragraph) => paragraph.replace(/\s*\n\s*/g, " ").trim())
     .filter(Boolean)
-  if (paragraphs[0] === title) paragraphs.shift()
+  const titleRemoved = paragraphs[0] === title
+  if (titleRemoved) paragraphs.shift()
   if (paragraphs.length === 0) return null
   return {
     id: `epub-chapter-${index + 1}`,
@@ -524,7 +517,7 @@ function chapterFromXhtml(index: number, spineCount: number, item: PublicationMa
     sourceHref,
     spineIndex: index,
     spineCount,
-    anchorMap: buildAnchorMap(trimmedHtml, text, paragraphs),
+    anchorMap: buildAnchorMap(trimmedHtml, paragraphs, titleRemoved),
   }
 }
 

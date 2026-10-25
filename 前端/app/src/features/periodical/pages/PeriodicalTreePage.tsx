@@ -128,6 +128,30 @@ export function PeriodicalTreePage() {
   // 在途登记表跨代存在，代际由 generation 区分（每次渲染多建的那个实例会被丢弃）。
   const capabilityRequests = useRef(createArticleCapabilityRequestRegistry()).current
   const capabilitiesRef = useRef<Record<string, ArticleCapability>>({})
+  // 逐篇修订号：每次有新的单篇重查开始就递增，批量响应据此判断自己是否已经过期。
+  const capabilityRevisions = useRef(new Map<string, number>())
+  const capabilityRevisionSeed = useRef(0)
+  const bumpCapabilityRevision = useCallback((mediaItemId: string) => {
+    const next = ++capabilityRevisionSeed.current
+    capabilityRevisions.current.set(mediaItemId, next)
+    return next
+  }, [])
+  // 合并式脏标记 / 尾随刷新：同一篇在一次重查在途时被再次要求重读（例如下载事件在
+  // 批量回包之前落地），不能在 begin() 返回 null 时把这次完成事件丢掉，而是记一笔，
+  // 等这次重查收尾后在同一代里再补跑一次。
+  //
+  // 标记按 (mediaItemId → generation) 记账：旧代的在途请求收尾时只能消费 / 删除自己
+  // 那一代的标记，绝不能抹掉新代（换树 / 换作品）里刚记下的脏标记。
+  const dirtyCapabilitiesRef = useRef(new Map<string, number>())
+  // 卸载后任何尾随刷新都不再发起。
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      dirtyCapabilitiesRef.current.clear()
+    }
+  }, [])
   const [capabilities, setCapabilities] = useState<Record<string, ArticleCapability>>({})
   // 下载动作事实（创建在途 / 最近一次失败）与能力事实分开记账：它只影响按钮此刻
   // 能做什么，永远不参与「能不能读」的判断。
@@ -227,6 +251,10 @@ export function PeriodicalTreePage() {
     const generation = ++capabilityGeneration.current
     // 下载归属同属这一代，随代一并作废：旧代的任务事件不能落到新树的行上。
     taskOwners.current.clear()
+    // 上一代的脏标记 / 修订号同样作废：旧代标记不得让新代补跑刷新，修订号表按代
+    // 重建也避免它在反复换树时无限增长。
+    dirtyCapabilitiesRef.current.clear()
+    capabilityRevisions.current = new Map()
     replaceDownloadAttempts({})
     if (articleMediaItemIds.length === 0) {
       replaceCapabilities({})
@@ -234,17 +262,34 @@ export function PeriodicalTreePage() {
     }
     replaceCapabilities(pendingArticleCapabilities(articleMediaItemIds))
 
+    // 批量开始时为每一篇拍一张修订号：批量响应只许写回「批量开始后没有被单篇重查
+    // 取代过」的那些行，否则迟到的批量结果会覆盖掉它之后才开始的单篇刷新。
+    const revisions = new Map<string, number>()
+    for (const mediaItemId of articleMediaItemIds) revisions.set(mediaItemId, bumpCapabilityRevision(mediaItemId))
+    const applyIfCurrent = (landed: Record<string, ArticleCapability>) => {
+      if (!mountedRef.current || capabilityGeneration.current !== generation) return
+      const current = capabilitiesRef.current
+      const next: Record<string, ArticleCapability> = {}
+      for (const [mediaItemId, capability] of Object.entries(landed)) {
+        next[mediaItemId] = revisions.get(mediaItemId) === capabilityRevisions.current.get(mediaItemId)
+          ? capability
+          : current[mediaItemId] ?? capability
+      }
+      replaceCapabilities(next)
+      // 归属只按真正落地的行对账：被单篇重查取代的行由那次重查自己负责。
+      noteTaskOwners(next, generation)
+    }
+
     void getMediaItemsDownloadInfo(articleMediaItemIds).then((projected) => {
-      if (capabilityGeneration.current !== generation) return
       // 投影缺条目时保持 unknown：缺失的事实不能当成「明确不可用」的结论。
-      const landed = projectArticleCapabilities(articleMediaItemIds, projected)
-      replaceCapabilities(landed)
-      noteTaskOwners(landed, generation)
+      applyIfCurrent(projectArticleCapabilities(articleMediaItemIds, projected))
     }).catch(() => {
-      if (capabilityGeneration.current !== generation) return
-      replaceCapabilities(failedArticleCapabilities(articleMediaItemIds))
+      applyIfCurrent(failedArticleCapabilities(articleMediaItemIds))
     })
-  }, [articleMediaItemIds, replaceCapabilities, replaceDownloadAttempts, noteTaskOwners])
+    return () => {
+      if (capabilityGeneration.current === generation) capabilityGeneration.current += 1
+    }
+  }, [articleMediaItemIds, bumpCapabilityRevision, replaceCapabilities, replaceDownloadAttempts, noteTaskOwners])
 
   /**
    * 单篇重查：同一篇在**同一代**里已有在途请求时不再重复发起，避免一次点击打出一串
@@ -258,25 +303,44 @@ export function PeriodicalTreePage() {
     mediaItemId: string,
     generation = capabilityGeneration.current,
   ) => {
-    if (capabilityGeneration.current !== generation) return
+    if (!mountedRef.current || capabilityGeneration.current !== generation) return
     const release = capabilityRequests.begin(mediaItemId, generation)
-    if (release === null) return
+    if (release === null) {
+      // 同代已有在途重查：这次要求不能丢，记成这一代的脏标记，由在途的那一次收尾后补跑。
+      if (mountedRef.current && capabilityGeneration.current === generation) {
+        dirtyCapabilitiesRef.current.set(mediaItemId, generation)
+      }
+      return
+    }
+    // 单篇修订号在发起那一刻递增：此后完成的批量响应不得再覆盖这一行。
+    bumpCapabilityRevision(mediaItemId)
     updateCapability(mediaItemId, { info: null, failed: false })
     try {
       // 与批量查询共用同一条投影规则：投影里没有这一篇时保持 unknown。
       // 不能退回单篇助手的空投影兜底——那会把「这次没拿到事实」写成「明确不可用」。
       const projected = await getMediaItemsDownloadInfo([mediaItemId])
-      if (capabilityGeneration.current !== generation) return
+      if (!mountedRef.current || capabilityGeneration.current !== generation) return
       const landed = projectArticleCapabilities([mediaItemId], projected)[mediaItemId]
       updateCapability(mediaItemId, landed)
       noteTaskOwners({ [mediaItemId]: landed }, generation)
     } catch {
-      if (capabilityGeneration.current !== generation) return
+      if (!mountedRef.current || capabilityGeneration.current !== generation) return
       updateCapability(mediaItemId, failedArticleCapabilities([mediaItemId])[mediaItemId])
     } finally {
       release()
+      // 尾随刷新只属于发起它的那一代；只有这一代的标记归属本次请求时才消费。
+      // 新代（换树 / 换作品）的标记由新代自己的请求负责，这里既不补跑也不删除。
+      if (mountedRef.current && capabilityGeneration.current === generation
+        && dirtyCapabilitiesRef.current.get(mediaItemId) === generation) {
+        dirtyCapabilitiesRef.current.delete(mediaItemId)
+        queueMicrotask(() => {
+          if (mountedRef.current && capabilityGeneration.current === generation) {
+            void refreshCapability(mediaItemId, generation)
+          }
+        })
+      }
     }
-  }, [updateCapability, capabilityRequests, noteTaskOwners])
+  }, [bumpCapabilityRevision, updateCapability, capabilityRequests, noteTaskOwners])
 
   // 下载生命周期：任务到达终态时重新读取真实能力。
   //

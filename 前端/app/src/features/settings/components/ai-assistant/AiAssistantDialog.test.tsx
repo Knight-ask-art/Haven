@@ -636,7 +636,7 @@ describe("栖伴提案状态机", () => {
 
     await waitFor(() => expect(within(region).getByRole("alert").textContent).toContain("拒绝失败"))
     expect(within(region).getByText("待批准")).toBeTruthy()
-    expect(within(region).getByText("本次没有写入任何设置，提案仍待批准，可以重试。")).toBeTruthy()
+    expect(within(region).getByText("本次没有写入任何设置，提案仍待处理，可以重试拒绝。")).toBeTruthy()
     expect((within(region).getByRole("button", { name: "拒绝" }) as HTMLButtonElement).disabled).toBe(false)
     expect((within(region).getByRole("button", { name: "批准并应用" }) as HTMLButtonElement).disabled).toBe(false)
 

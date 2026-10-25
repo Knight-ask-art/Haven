@@ -547,6 +547,38 @@ afterEach(() => {
 })
 
 describe("PeriodicalTreePage", () => {
+  it("rechecks after a completion event arrives during an older capability snapshot", async () => {
+    resourcesByMediaItem.set(MEDIA_A, downloadOnly(MEDIA_A))
+    resourcesByMediaItem.set(MEDIA_B, notReadable())
+    resourcesByMediaItem.set(MEDIA_C, notReadable())
+    renderPage()
+    await waitFor(() => expect(within(articleRow(TITLE_A)).getByText("需要下载后阅读")).toBeTruthy())
+    const gate = defer()
+    const original = client.downloadList.getMockImplementation()!
+    let held = false
+    client.downloadList.mockImplementation(async () => {
+      if (!held && downloadTasks.length > 0) {
+        held = true
+        const snapshot = downloadTasks.map((task) => ({ ...task }))
+        await gate.promise
+        return snapshot
+      }
+      return downloadTasks
+    })
+    try {
+      fireEvent.click(openButton(TITLE_A))
+      await waitFor(() => expect(held).toBe(true))
+      const taskId = downloadTasks[0].taskId
+      completeDownload(taskId)
+      await act(async () => { emitDownloadEvent({ taskId, state: "completed", offlineResourceId: `offline-${MEDIA_A}` }) })
+      await act(async () => { gate.resolve() })
+      await waitFor(() => expect(within(articleRow(TITLE_A)).getByText("可离线阅读")).toBeTruthy())
+    } finally {
+      gate.resolve()
+      client.downloadList.mockImplementation(original)
+    }
+  })
+
   it("renders the periodical identity and every level in backend order", async () => {
     renderPage()
 

@@ -141,6 +141,18 @@ function validEpub(overrides: Partial<Record<string, string>> = {}, options: Epu
 }
 
 describe("epub-content", () => {
+  it("maps block, inline and prototype-named anchors to rendered paragraphs after removing the title", async () => {
+    const publication = await parseEpubBook(validEpub({
+      first: '<html><head><title>Title</title><meta id="hidden"/></head><body><h1>Title</h1><section id="container"><p id="constructor">Same</p><p id="toString">Same <span id="inline">&amp; more</span><br/>text.</p><p id="__proto__">Last</p></section><script><span id="hidden-script">ignored</span></script></body></html>',
+    }))
+    const chapter = publication.chapters[0]
+    expect(chapter.paragraphs).toEqual(["Same", "Same & more text.", "Last"])
+    expect(chapter.anchorMap).toEqual({ container: 0, constructor: 0, toString: 1, inline: 1, ["__proto__"]: 2 })
+    expect(Object.hasOwn(chapter.anchorMap!, "__proto__")).toBe(true)
+    expect(chapter.anchorMap?.hidden).toBeUndefined()
+    expect(chapter.anchorMap?.["hidden-script"]).toBeUndefined()
+  })
+
   it("parses package/spine order and renders inert chapter text", async () => {
     const publication = await parseEpubBook(validEpub())
 

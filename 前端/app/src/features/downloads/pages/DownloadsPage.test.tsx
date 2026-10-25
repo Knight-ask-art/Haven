@@ -133,7 +133,7 @@ describe("DownloadsPage asynchronous refreshes", () => {
 
     renderPage()
 
-    expect(await screen.findByText(/空间不足时，下载任务会等待可用空间释放/)).toBeTruthy()
+    expect(await screen.findByText(/空间不足时，请释放空间后手动重试失败的任务。/)).toBeTruthy()
     expect(screen.getByText("当前版本暂不支持拖拽导入本地文件")).toBeTruthy()
     expect(screen.queryByText(/WaitingForSpace|P1 预览|拖拽文件到此处可导入/)).toBeNull()
   })

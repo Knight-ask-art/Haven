@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import {
   X, Download, Heart, Tv, ArrowUpDown, ChevronRight, Check, LoaderCircle
 } from "lucide-react"
@@ -111,48 +111,177 @@ export function EpisodeDrawer({
   const [isCastDialogOpen, setIsCastDialogOpen] = useState<boolean>(false)
   const [selectedCastDevice, setSelectedCastDevice] = useState<string | null>(null)
   const [isCasting, setIsCasting] = useState<boolean>(false)
-  const [castSessionId, setCastSessionId] = useState<string | null>(null)
   const [castError, setCastError] = useState<string | null>(null)
+  const [isCastPending, setIsCastPending] = useState<boolean>(false)
   const castDiscovery = useCastDiscovery(isCastDialogOpen, 5000)
 
-  useEffect(() => {
-    let active = true
-    if (!isOpen && castSessionId) {
-      void stopCast(castSessionId).then(() => {
-        if (!active) return
-        setCastSessionId(null)
-        setIsCasting(false)
-      }).catch(() => {
-        if (active) setCastError("停止投屏失败，请重新打开投屏窗口重试")
-      })
-    }
-    return () => { active = false }
-  }, [isOpen, castSessionId])
+  // 投屏动作的同步闸门与归属。
+  //
+  // `castPendingRef` 是同步闩锁：React 的 pending state 要等下一次渲染才生效，同一帧里的
+  // 第二次点击读不到它，所以「开始 / 停止」是否已有 play/stop 收尾在途只认 ref。
+  // 闩锁只在 play/stop 真正收尾后才释放（即使代已失效），旧动作在途期间绝不放行
+  // 新动作，避免 B 先开始、迟到的 A 再被清理。
+  // `castGenerationRef` 是本次动作的归属：关闭、切集、换视频、卸载都会让它失效，迟到的
+  // 成功 / 失败回调据此丢弃，不会把旧的 castSessionId 写回新的一集。
+  // `currentCastSessionRef` 始终指向「当前有效的投屏会话」（唯一权威来源），清理与替换
+  // 只依据它，从而不会误停同设备上的新会话。
+  // `castStopInFlightRef` 去重重复停止：同一会话的停止请求只会真正调用一次 stopCast。
+  const castPendingRef = useRef<boolean>(false)
+  const castGenerationRef = useRef<number>(0)
+  const currentCastSessionRef = useRef<string | null>(null)
+  const castStopInFlightRef = useRef<Map<string, Promise<boolean>>>(new Map())
+  const castMounted = useRef<boolean>(true)
+  const castOpenRef = useRef<boolean>(isOpen)
+  castOpenRef.current = isOpen
 
-  // 切集自动停止：当前集变化且正在投屏 → 停止旧会话
-  useEffect(() => {
-    let active = true
-    if (isCasting && castSessionId) {
-      void stopCast(castSessionId).then(() => {
-        if (!active) return
-        setCastSessionId(null)
-        setIsCasting(false)
-      }).catch(() => {
-        if (active) setCastError("停止上一集投屏失败，请在投屏窗口重试")
-      })
-    }
-    return () => { active = false }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentEpisodeId])
+  /** 只让代失效；闩锁保持到在途 play/stop 收尾。 */
+  const invalidateCastGeneration = useCallback(() => {
+    castGenerationRef.current += 1
+  }, [])
 
-  // 离开播放页自动停止：卸载时清理
+  /** 释放同步闩锁（只应由真正收尾的 play/stop 调用）。 */
+  const releaseCastLatch = useCallback(() => {
+    castPendingRef.current = false
+    if (castMounted.current) setIsCastPending(false)
+  }, [])
+
+  useEffect(() => {
+    // StrictMode 会重放 setup：必须重新标记已挂载，否则后续迟到回调全部被丢弃。
+    castMounted.current = true
+    return () => { castMounted.current = false }
+  }, [])
+
+  /** 停止指定会话；同一会话的并发停止共享同一个 promise。返回是否成功。 */
+  const requestCastStop = useCallback((sessionId: string): Promise<boolean> => {
+    const existing = castStopInFlightRef.current.get(sessionId)
+    if (existing) return existing
+    const request = stopCast(sessionId)
+      .then(() => true, () => false)
+      .finally(() => { castStopInFlightRef.current.delete(sessionId) })
+    castStopInFlightRef.current.set(sessionId, request)
+    return request
+  }, [])
+
+  /**
+   * 停止当前归属的会话。成功或确认失败后都按 sessionId 清掉当前引用（不依赖代，
+   * 代已变化也不会阻止释放闩锁）；失败时保留可重试的归属并在弹窗内提示。
+   */
+  const stopCurrentCast = useCallback(async (failureMessage: string | null) => {
+    const sessionId = currentCastSessionRef.current
+    if (sessionId === null) return
+    const stopped = await requestCastStop(sessionId)
+    if (stopped) {
+      if (currentCastSessionRef.current === sessionId) {
+        currentCastSessionRef.current = null
+        if (castMounted.current) setIsCasting(false)
+      }
+      return
+    }
+    // 失败：保留 currentCastSessionRef 作为可重试的归属，下次停止 / 卸载会再次尝试。
+    if (castMounted.current && failureMessage !== null && castOpenRef.current) {
+      setCastError(failureMessage)
+    }
+  }, [requestCastStop])
+
+  // 关闭侧栏：停止当前投屏（真实清理）。只对「打开 → 关闭」这一转变生效，
+  // 首次挂载时并不存在需要停止的会话。清理同样必须占用同步闩锁：在途的
+  // play/stop 收尾前不放行新的开始。
+  const wasCastOpenRef = useRef<boolean>(isOpen)
+  useEffect(() => {
+    const wasOpen = wasCastOpenRef.current
+    wasCastOpenRef.current = isOpen
+    if (!wasOpen || isOpen) return
+    invalidateCastGeneration()
+    if (currentCastSessionRef.current === null) return
+    if (castPendingRef.current) {
+      // 已有动作在途（play 或 stop）：由它收尾；若它随后建立了会话，本代已失效，
+      // 迟到的成功会自行停止；若它正在停止，重复请求会复用同一个 stop。
+      void stopCurrentCast(null)
+      return
+    }
+    castPendingRef.current = true
+    setIsCastPending(true)
+    void stopCurrentCast("停止投屏失败，请重新打开投屏窗口重试").finally(releaseCastLatch)
+  }, [invalidateCastGeneration, isOpen, releaseCastLatch, stopCurrentCast])
+
+  const previousEpisodeIdRef = useRef<string | undefined>(currentEpisodeId)
+  // 切集 / 换视频：当前会话、在途的开始动作一并作废；旧会话仍按归属停止，
+  // 停止收尾（或复用已在途的停止）前保持闩锁。
+  const previousCastMediaItemIdRef = useRef<string | undefined>(castMediaItemId)
+  useEffect(() => {
+    const changed = previousEpisodeIdRef.current !== currentEpisodeId
+      || previousCastMediaItemIdRef.current !== castMediaItemId
+    previousEpisodeIdRef.current = currentEpisodeId
+    previousCastMediaItemIdRef.current = castMediaItemId
+    if (!changed) return
+    invalidateCastGeneration()
+    setCastError(null)
+    if (currentCastSessionRef.current === null) return
+    if (castPendingRef.current) {
+      void stopCurrentCast(null)
+      return
+    }
+    castPendingRef.current = true
+    setIsCastPending(true)
+    void stopCurrentCast("停止上一集投屏失败，请在投屏窗口重试").finally(releaseCastLatch)
+  }, [currentEpisodeId, castMediaItemId, invalidateCastGeneration, releaseCastLatch, stopCurrentCast])
+
+  // 离开播放页时撤销当前授权；在途开始请求由其迟到结果分支收尾。
   useEffect(() => {
     return () => {
-      if (castSessionId) void stopCast(castSessionId).catch(() => undefined)
+      castMounted.current = false
+      castGenerationRef.current += 1
+      castPendingRef.current = false
+      const sessionId = currentCastSessionRef.current
+      currentCastSessionRef.current = null
+      if (sessionId) void requestCastStop(sessionId)
     }
-  }, [castSessionId])
+  }, [requestCastStop])
 
-  if (!isOpen) return null
+  const runCastToggle = async () => {
+    // 同步闸门：上一次 play/stop 收尾未完成时不允许再开始新的动作。
+    if (castPendingRef.current) return
+    const generation = castGenerationRef.current
+    castPendingRef.current = true
+    setIsCastPending(true)
+    setCastError(null)
+    if (currentCastSessionRef.current !== null) {
+      // 停止路径：清引用只在会话身份匹配时发生，且不依赖代是否仍有效。
+      await stopCurrentCast("停止投屏失败，请重试")
+      releaseCastLatch()
+      return
+    }
+    if (!selectedDevice?.supported || !castMediaItemId) {
+      releaseCastLatch()
+      return
+    }
+    try {
+      const res = await playCast(castMediaItemId, selectedDevice.id)
+      if (!castMounted.current || castGenerationRef.current !== generation) {
+        // 迟到的成功：授权属于已失效的页面（关闭 / 切集 / 卸载），必须真正释放，
+        // 否则设备上会留下一个无人管理的投屏会话。
+        const stopped = await requestCastStop(res.castSessionId)
+        if (!stopped && castMounted.current) {
+          currentCastSessionRef.current = res.castSessionId
+          setIsCasting(true)
+          setCastError("停止投屏失败，请重试")
+        }
+        return
+      }
+      currentCastSessionRef.current = res.castSessionId
+      setIsCasting(true)
+    } catch (e: unknown) {
+      if (!castMounted.current || castGenerationRef.current !== generation) {
+        // 没有返回授权句柄；旧页面不接管这次失败。
+        return
+      }
+      setCastError(e instanceof Error ? e.message : "投屏失败，请检查设备是否在线")
+    } finally {
+      // 无论代是否变化，play 都已收尾，必须释放闩锁；迟到的成功已在上面自行停止。
+      releaseCastLatch()
+    }
+  }
+
 
   const displayEpisodes = isAscending ? episodes : [...episodes].reverse()
   const currentEpisode = episodes.find((episode) => episode.id === currentEpisodeId) ?? episodes[0]
@@ -208,6 +337,9 @@ export function EpisodeDrawer({
       setIsDownloadDialogOpen(false)
     }
   }
+
+  // 所有 Hook 都已在上面按固定顺序执行完毕；这里只决定是否渲染。
+  if (!isOpen) return null
 
   return (
     <aside className="w-[min(460px,34vw)] min-w-[320px] h-full bg-white dark:bg-zinc-950 text-foreground border-l border-black/10 dark:border-white/10 flex flex-col shrink-0 select-none shadow-2xl z-30 transition-all duration-300">
@@ -330,7 +462,7 @@ export function EpisodeDrawer({
             aria-label="投屏"
           >
             <Tv className="w-5 h-5" />
-            <span className="text-[11px] font-semibold">{isCasting ? "已投屏" : "投屏"}</span>
+            <span className="text-[11px] font-semibold">{isCastPending ? "处理中" : isCasting ? "已投屏" : "投屏"}</span>
           </button>
         </div>
 
@@ -575,33 +707,13 @@ export function EpisodeDrawer({
 
             <button
               type="button"
-              disabled={!isCasting && (!selectedDevice?.supported || !castMediaItemId)}
-              onClick={async () => {
-                if (isCasting && castSessionId) {
-                  setCastError(null)
-                  try {
-                    await stopCast(castSessionId)
-                    setIsCasting(false)
-                    setCastSessionId(null)
-                  } catch (error: unknown) {
-                    setCastError(error instanceof Error ? error.message : "停止投屏失败，请重试")
-                  }
-                  return
-                }
-                if (!selectedDevice?.supported || !castMediaItemId) return
-                setCastError(null)
-                try {
-                  const res = await playCast(castMediaItemId, selectedDevice.id)
-                  setCastSessionId(res.castSessionId)
-                  setIsCasting(true)
-                } catch (e: unknown) {
-                  const msg = e instanceof Error ? e.message : "投屏失败，请检查设备是否在线"
-                  setCastError(msg)
-                }
-              }}
-              className="mt-5 flex h-11 w-full items-center justify-center rounded-full bg-foreground px-[16px] text-sm font-bold text-background transition-opacity hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-40"
+              disabled={(!isCasting && (!selectedDevice?.supported || !castMediaItemId)) || isCastPending}
+              aria-busy={isCastPending}
+              onClick={() => { void runCastToggle() }}
+              className="mt-5 flex h-11 w-full items-center justify-center gap-2 rounded-full bg-foreground px-[16px] text-sm font-bold text-background transition-opacity hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              {isCasting ? "停止投屏" : "开始投屏"}
+              {isCastPending && <LoaderCircle className="h-4 w-4 animate-spin" />}
+              {isCastPending ? (isCasting ? "正在停止投屏…" : "正在开始投屏…") : (isCasting ? "停止投屏" : "开始投屏")}
             </button>
           </div>
         </div>

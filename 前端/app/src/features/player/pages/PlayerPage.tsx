@@ -361,7 +361,22 @@ export function PlayerPage() {
   }, [])
 
   // 缓冲态 + 看门狗：waiting 300ms 后显 spinner，playing/canplay 消；4s 无进展兜底 nudge
+  //
+  // `<video key={sessionContentUri}>` 在换源 / 重开会话时会替换整个元素，所以本 effect 必须
+  // 绑定到真正挂载的那一个视频元素，而不是首次渲染时的元素：换源后旧元素不再收事件，
+  // 迟到的 waiting / stalled 计时器还会把 spinner 留在新会话上。绑定前先清掉上一条源的
+  // 计时器、监听、缓冲区间与 spinner，watchdog 也只观察当前元素。换源时的清除与重置
+  // 完全由本 effect 的入口负责，不再用渲染期 setState 镜像源地址。
   useEffect(() => {
+    if (bufferingTimeoutRef.current) clearTimeout(bufferingTimeoutRef.current)
+    bufferingTimeoutRef.current = null
+    if (watchdogRef.current) window.clearInterval(watchdogRef.current as unknown as number)
+    watchdogRef.current = null
+    setIsBuffering(false)
+    setBufferedRanges([])
+    lastTimeRef.current = 0
+    lastTimeUpdateRef.current = Date.now()
+
     const video = videoRef.current
     if (!video) return undefined
     const onWaiting = () => {
@@ -399,7 +414,7 @@ export function PlayerPage() {
     // 看门狗：!paused && readyState<=2 持续 >4s 则 nudge
     watchdogRef.current = window.setInterval(() => {
       const v = videoRef.current
-      if (!v || v.paused || v.ended) return
+      if (!v || v !== video || v.paused || v.ended) return
       const now = Date.now()
       const progressed = Math.abs(v.currentTime - lastTimeRef.current) > 0.05
       if (progressed) {
@@ -422,9 +437,11 @@ export function PlayerPage() {
       video.removeEventListener("stalled", onStalled)
       window.clearInterval(bufferedTimer)
       if (watchdogRef.current) window.clearInterval(watchdogRef.current as unknown as number)
+      watchdogRef.current = null
       if (bufferingTimeoutRef.current) clearTimeout(bufferingTimeoutRef.current)
+      bufferingTimeoutRef.current = null
     }
-  }, [])
+  }, [sessionContentUri])
 
   // Clear media element state whenever the route or validated session changes.
   useLayoutEffect(() => {

@@ -160,6 +160,17 @@ function parseBeforeYear(value: string): number | null {
   return match ? Number(match[1]) : null
 }
 
+/**
+ * 年份筛选的唯一判定：`year <= 0`（含 gateway 对缺省 releaseYear 的 0 投影）
+ * 表示年份未知，任何年份筛选都不命中——它不是「很旧」，也不能被 `0` 字符串匹配。
+ */
+function matchesYearFilter(item: LibraryMediaItemData, value: string): boolean {
+  if (item.year <= 0) return false
+  const beforeYear = parseBeforeYear(value)
+  if (beforeYear !== null) return item.year <= beforeYear
+  return String(item.year) === value
+}
+
 function matchesMetaFilter(item: LibraryMediaItemData, key: string, value: string): boolean {
   if (value === "全部" || !value) return true
 
@@ -169,10 +180,7 @@ function matchesMetaFilter(item: LibraryMediaItemData, key: string, value: strin
   }
 
   if (key === "year") {
-    const beforeYear = parseBeforeYear(value)
-    if (beforeYear !== null) return item.year > 0 && item.year <= beforeYear
-    const exactYear = Number(value)
-    return Number.isInteger(exactYear) && item.year === exactYear
+    return matchesYearFilter(item, value)
   }
 
   const meta = ITEM_META[item.id]
@@ -385,9 +393,7 @@ export function LibraryBrowsePage() {
         }
 
         if (group.key === "year") {
-          const beforeYear = parseBeforeYear(value)
-          const matchesYear = beforeYear !== null ? item.year <= beforeYear : String(item.year) === value
-          if (!matchesYear) return false
+          if (!matchesYearFilter(item, value)) return false
           continue
         }
 

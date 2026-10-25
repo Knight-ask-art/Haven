@@ -925,8 +925,11 @@ impl OpdsClient {
         }
     }
 
+    /// 模板展开的唯一所有者：缓存模板与刚发现的模板都走这里。
+    ///
+    /// `None` 表示模板不可用；已发现的搜索描述不能静默退回另一个查询协议。
     fn apply_template(template: &str, query: &str, base: &str) -> Option<String> {
-        absolutize(base, &template.replace("{searchTerms}", &urlencode(query)))
+        expand_search_template(template, query).and_then(|expanded| absolutize(base, &expanded))
     }
 
     /// 搜索地址解析：优先缓存模板 → OpenSearch atom 模板 → Gutenberg search.opds → `?query=`。
@@ -949,11 +952,12 @@ impl OpdsClient {
         query: &str,
     ) -> Result<String, AppError> {
         if let Some((tpl, base)) = self.cached_template(endpoint) {
-            if let Some(url) = Self::apply_template(&tpl, query, &base) {
-                if self.is_source_url_allowed(context, endpoint, &url) {
-                    return Ok(url);
-                }
+            let url = Self::apply_template(&tpl, query, &base)
+                .ok_or_else(|| invalid_feed("搜索描述模板含不支持的必填变量或格式无效"))?;
+            if self.is_source_url_allowed(context, endpoint, &url) {
+                return Ok(url);
             }
+            return Err(invalid_feed("搜索地址解析失败"));
         }
         // Gutenberg 的 m./www. 镜像在部分网络中的可用性不同；根目录解析
         // 也必须走同一组受控镜像回退，否则仅因根目录一次 TLS/504 波动就
@@ -976,12 +980,13 @@ impl OpdsClient {
                     self.get_limited(context, &absolute_desc, 256 * 1024).await
             {
                 if let Some(tpl) = extract_atom_template(&String::from_utf8_lossy(&desc)) {
-                    if let Some(url) = Self::apply_template(&tpl, query, &descriptor_url) {
-                        if self.is_source_url_allowed(context, endpoint, &url) {
-                            self.remember_template(endpoint, tpl, descriptor_url);
-                            return Ok(url);
-                        }
+                    let url = Self::apply_template(&tpl, query, &descriptor_url)
+                        .ok_or_else(|| invalid_feed("搜索描述模板含不支持的必填变量或格式无效"))?;
+                    if !self.is_source_url_allowed(context, endpoint, &url) {
+                        return Err(invalid_feed("搜索地址解析失败"));
                     }
+                    self.remember_template(endpoint, tpl, descriptor_url);
+                    return Ok(url);
                 }
             }
         }
@@ -1157,6 +1162,72 @@ impl OpdsClient {
             .await?;
         Ok((entry, data.to_vec()))
     }
+}
+
+/// 搜索调用方不传分页参数，因此模板里只出现 searchTerms 时地址与旧行为逐字节一致；
+/// 分页变量取「第 1 页」的一致默认值，避免把空串塞进 `startIndex`/`count` 造成服务端
+/// 解析失败或溢出（OpenSearch 未给 count 时的标准默认是每页 10 条，这里沿用常见的
+/// 20 条目录页大小）。
+const OPENSEARCH_DEFAULT_COUNT: u32 = 20;
+const OPENSEARCH_DEFAULT_START_INDEX: u32 = 1;
+/// 展开后模板地址的长度上界：既限制输入量，也保证描述文件给出的模板不能借展开把
+/// 请求放大到任意长度。
+const MAX_TEMPLATE_EXPANDED_BYTES: usize = 8 * 1024;
+
+/// 按 OpenSearch 1.1 语法展开搜索模板。
+///
+/// - `{searchTerms}` 与 `{searchTerms?}` → 百分号编码后的关键字。
+/// - `{count}` / `{startIndex}` / `{startPage}` → 上述有界默认值，三者同属第 1 页。
+/// - `{language}` / `{inputEncoding}` / `{outputEncoding}` → 编码 `UTF-8`，语言 `*`
+///   （OpenSearch 约定的「未指定」通配）。
+/// - 其余 `{name?}` 可选变量省略；其余 `{name}` 必填变量视为模板不可用。
+/// - 花括号不配对、空变量名、变量名含非 ASCII 字母数字字符、展开结果超过
+///   `MAX_TEMPLATE_EXPANDED_BYTES` 时不可用。
+fn expand_search_template(template: &str, query: &str) -> Option<String> {
+    if template.len() > MAX_TEMPLATE_EXPANDED_BYTES || query.len() > MAX_TEMPLATE_EXPANDED_BYTES {
+        return None;
+    }
+    let terms = urlencode(query);
+    let count = OPENSEARCH_DEFAULT_COUNT.to_string();
+    let start_index = OPENSEARCH_DEFAULT_START_INDEX.to_string();
+    // count 决定整页大小，startIndex 从 1 起计，因此第 1 页的 startPage 恒为 1。
+    let start_page = "1".to_owned();
+    let mut out = String::with_capacity(template.len().min(MAX_TEMPLATE_EXPANDED_BYTES));
+    let mut rest = template;
+    while let Some(open) = rest.find(['{', '}']) {
+        if rest[open..].starts_with('}') {
+            return None;
+        }
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let close = after.find('}')?;
+        let (name, optional) = match after[..close].strip_suffix('?') {
+            Some(base) => (base, true),
+            None => (&after[..close], false),
+        };
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_:.-".contains(&b)) {
+            return None;
+        }
+        let value = match name {
+            "searchTerms" => Some(terms.as_str()),
+            "count" => Some(count.as_str()),
+            "startIndex" => Some(start_index.as_str()),
+            "startPage" => Some(start_page.as_str()),
+            "language" => Some("*"),
+            "inputEncoding" | "outputEncoding" => Some("UTF-8"),
+            _ if optional => None,
+            _ => return None,
+        };
+        if let Some(value) = value {
+            out.push_str(value);
+        }
+        if out.len() > MAX_TEMPLATE_EXPANDED_BYTES {
+            return None;
+        }
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    (out.len() <= MAX_TEMPLATE_EXPANDED_BYTES).then_some(out)
 }
 
 /// OpenSearch 描述里第一个 type 含 atom 的 `<Url template="...">`（首个命中即返回；
@@ -2131,6 +2202,39 @@ mod tests {
     use std::io::{Cursor, Write as _};
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
+
+    #[test]
+    fn expands_opensearch_optional_terms_and_paging_without_literal_braces() {
+        let expanded = OpdsClient::apply_template(
+            "search?q={searchTerms?}&count={count?}&start={startIndex}&page={startPage?}&extra={vendor:unused?}",
+            "a & 中",
+            "https://catalog.example.invalid/opensearch/description.xml",
+        ).unwrap();
+        let url = reqwest::Url::parse(&expanded).unwrap();
+        let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(url.path(), "/opensearch/search");
+        assert_eq!(pairs.get("q").map(String::as_str), Some("a & 中"));
+        assert_eq!(pairs.get("count").map(String::as_str), Some("20"));
+        assert_eq!(pairs.get("start").map(String::as_str), Some("1"));
+        assert_eq!(pairs.get("page").map(String::as_str), Some("1"));
+        assert_eq!(pairs.get("extra").map(String::as_str), Some(""));
+        for template in ["?q={unknown}", "?q={searchTerms", "?q=}", "?q={?}"] {
+            assert!(OpdsClient::apply_template(template, "q", "https://catalog.example.invalid/").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_opensearch_template_uses_the_same_expansion_and_reports_invalid_required_variables() {
+        let endpoint = "https://catalog.example.invalid/opds";
+        let (registry, source) = seeded_opds_registry(endpoint, false).await;
+        let client = OpdsClient::new().unwrap().with_source_registry(registry);
+        let context = client.request_context(Some(&source)).await.unwrap();
+        client.remember_template(endpoint, "?q={searchTerms?}&count={count?}".into(), endpoint.into());
+        let url = client.search_url_with(&context, endpoint, "test").await.unwrap();
+        assert!(url.contains("q=test&count=20"));
+        client.remember_template(endpoint, "?q={unknownRequired}".into(), endpoint.into());
+        assert!(client.search_url_with(&context, endpoint, "test").await.is_err());
+    }
 
     #[test]
     fn builtin_gutenberg_policy_rejects_untrusted_urls() {

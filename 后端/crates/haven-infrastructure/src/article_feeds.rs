@@ -265,6 +265,9 @@ pub struct FeedEntry {
     pub summary: Option<String>,
 }
 
+// 标题：RSS 原样保留、Atom 按 Text Construct 归一化为纯文本（`text` 保留字面量，
+// `html`/`xhtml` 做单次去标记）。条目标题字段的语义由 `EntryBuilder::finish_field` 决定。
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FeedFormat {
     Unknown,
@@ -282,7 +285,7 @@ enum Field {
     Content,
 }
 
-/// Atom `content`/`summary` 的文本语义。
+/// Atom `content`/`summary`/`title`（Text Construct）的文本语义。
 ///
 /// 解析阶段就把三种类型归一化到现有的 HTML 载体上，消费端仍只有
 /// [`html_to_plain_paragraphs`] 一个清洗入口：`text` 的字面量尖括号在归一化时
@@ -307,7 +310,7 @@ struct EntryBuilder {
     content: Option<String>,
     /// 当前正在收集文本的字段及其元素名。
     field: Option<(Field, String)>,
-    /// 当前字段的文本语义；只在 Atom 的 `content`/`summary` 上可能不是 HTML。
+    /// 当前字段的文本语义；只在 Atom 的 `content`/`summary`/`title` 上可能不是 HTML。
     field_mode: FieldMode,
     /// 当前字段元素打开后的 XML 深度，用来区分它的结束标签与同名嵌套元素。
     field_depth: usize,
@@ -350,6 +353,11 @@ impl EntryBuilder {
     }
 
     /// 按字段类型与文本语义收尾：摘要落库前已是纯文本，正文统一成为 HTML 载体。
+    ///
+    /// Atom 的 `title` 也是 Text Construct：按 `type` 决定语义后把标题还原为纯文本。
+    /// 标题最终以纯文本进入候选句柄与卡片展示，下游不会再洗一遍：`text` 保留字面量
+    /// （不会被当成 HTML 再剥离一次），`html`/`xhtml` 则走与摘要相同的单次纯文本
+    /// 清洗。RSS 的 `title` 保持原有语义：原样保留（调用方按纯文本使用）。
     fn finish_field(&mut self, field: Field, raw: String) {
         let value = match (field, self.field_mode) {
             (_, FieldMode::Skip) => None,
@@ -357,6 +365,8 @@ impl EntryBuilder {
             // 文本解码，而不是把 `<button>`/`<script>` 当成待剥离的标记。
             (Field::Content, FieldMode::Text) => Some(escape_html_text(&raw)),
             (Field::Content, _) => Some(raw),
+            (Field::Title, FieldMode::Text) => Some(raw),
+            (Field::Title, _) => Some(plain_text(&raw)),
             (Field::Summary, FieldMode::Text) => Some(collapse_whitespace(&raw)),
             (Field::Summary, _) => Some(plain_text(&raw)),
             _ => Some(raw),
@@ -596,13 +606,18 @@ fn classify_field(name: &str, format: FeedFormat) -> Option<Field> {
     }
 }
 
-/// Atom `content`/`summary` 的 `type` → 文本语义。
+/// Atom `content`/`summary`/`title` 的 `type` → 文本语义。
 ///
-/// Atom 规定省略 `type` 时按 `text` 处理；其余格式（包括 RSS）保持原来的
-/// HTML 语义。显式声明的非文本媒体类型（例如 base64 图片）不收集正文，避免
-/// 把二进制块当成可读内容。
+/// Atom 规定省略 `type` 时按 `text` 处理；`title` 同样属于 Text Construct，适用
+/// 同一套 `text`/`html`/`xhtml` 规则。RSS 标题保持原样字面量，正文与摘要保持 HTML
+/// 语义。显式声明的非文本媒体类型（例如 base64 图片）不会让
+/// `content`/`summary` 被收集，避免把二进制块当成可读内容；标题属于 Text Construct，
+/// 只接受 `text`/`html`/`xhtml`，其余类型按 `text` 处理而不是丢弃。
 fn field_mode(name: &str, format: FeedFormat, event: &BytesStart<'_>) -> FieldMode {
-    if format != FeedFormat::Atom || (name != "content" && name != "summary") {
+    if name == "title" && format != FeedFormat::Atom {
+        return FieldMode::Text;
+    }
+    if format != FeedFormat::Atom || (name != "content" && name != "summary" && name != "title") {
         return FieldMode::Html;
     }
     match attribute(event, "type") {
@@ -618,6 +633,7 @@ fn field_mode(name: &str, format: FeedFormat, event: &BytesStart<'_>) -> FieldMo
             "text" | "text/plain" => FieldMode::Text,
             "html" | "text/html" => FieldMode::Html,
             "xhtml" | "application/xhtml+xml" => FieldMode::Xhtml,
+            _ if name == "title" => FieldMode::Text,
             _ => FieldMode::Skip,
         },
     }
@@ -1095,6 +1111,20 @@ mod tests {
     use crate::db::repos::SqliteRepositories;
     use haven_application::services::source_import::CONTENT_CANDIDATE_PREFIX;
     use std::sync::Mutex;
+
+    #[test]
+    fn atom_titles_respect_text_html_and_xhtml_without_changing_rss_literals() {
+        let entries = parse_feed(r#"<feed xmlns="http://www.w3.org/2005/Atom">
+          <entry><id>one</id><title type="html">&lt;b&gt;News&lt;/b&gt; &amp;amp; more</title></entry>
+          <entry><id>two</id><title>&lt;b&gt;Literal&lt;/b&gt;</title></entry>
+          <entry><id>three</id><title type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml">A <b>bold</b> title</div></title></entry>
+        </feed>"#).unwrap();
+        assert_eq!(entries[0].title, "News & more");
+        assert_eq!(entries[1].title, "<b>Literal</b>");
+        assert_eq!(entries[2].title, "A bold title");
+        let rss = parse_feed("<rss><channel><item><title>&lt;b&gt;Literal&lt;/b&gt;</title></item></channel></rss>").unwrap();
+        assert_eq!(rss[0].title, "<b>Literal</b>");
+    }
 
     const RSS_FIXTURE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
