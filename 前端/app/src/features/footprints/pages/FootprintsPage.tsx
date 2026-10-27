@@ -10,7 +10,7 @@ import { defaultCoverCategoryForMediaType } from "@/lib/default-cover"
 import { ArrowRight, Bookmark, Heart, Trash2 } from "lucide-react"
 import type { MediaCardProps } from "@/components/ui/haven/MediaCard"
 import { setFavorite } from "@/features/media/ipc/favorite-gateway"
-import { createDownloadForMediaItem, deleteOfflineDownload, getMediaItemDownloadInfo, revealOfflineDownload, subscribeDownloadEvents, type MediaItemDownloadInfo } from "@/features/downloads/ipc/download-gateway"
+import { deleteOfflineDownload, getMediaItemDownloadInfo, revealOfflineDownload, startDownloadFromProjection, subscribeDownloadEvents, type MediaItemDownloadInfo } from "@/features/downloads/ipc/download-gateway"
 import type { DownloadEvent } from "@/lib/ipc/generated/wire"
 import { getCatalogItem, getStoredMarkers, removeStoredMarker } from "@/lib/havenState"
 import { getHavenClientMode } from "@/lib/ipc/runtime"
@@ -470,6 +470,9 @@ export function FootprintsPage() {
         if (heroDownloadCreationPendingRef.current) {
           heroDownloadEventsDuringCreationRef.current.add(event.data.taskId)
         }
+        if (["completed", "failed", "cancelled", "interrupted"].includes(event.data.state)) {
+          refreshHeroDownloadInfo()
+        }
         return
       }
       if (
@@ -480,7 +483,10 @@ export function FootprintsPage() {
     }
     void subscribeDownloadEvents(onEvent).then((cleanup) => {
       if (!mounted) void cleanup().catch(() => undefined)
-      else dispose = cleanup
+      else {
+        dispose = cleanup
+        refreshHeroDownloadInfo()
+      }
     }).catch(() => {})
     return () => {
       mounted = false
@@ -575,13 +581,16 @@ export function FootprintsPage() {
         if (!isCurrent() || heroDownloadRequestRef.current !== requestId) return
         let createdTaskId: string | null = null
         let earlyCreatedTaskEvent = false
+        const recoverable = info.status === "paused" || info.status === "interrupted"
         if (info.hasOfflineResource && info.taskId) await revealOfflineDownload(info.taskId)
         else if (info.hasOfflineResource) throw new Error("当前离线内容没有可定位的下载任务")
         else if (!info.hasOfflineResource) {
           heroDownloadCreationPendingRef.current = true
           heroDownloadEventsDuringCreationRef.current.clear()
           try {
-            const createdTask = await createDownloadForMediaItem(mediaItemId)
+            // A Paused / Interrupted task is resumed / retried on its own id;
+            // creating would only return the same active task without starting it.
+            const createdTask = await startDownloadFromProjection(info, mediaItemId)
             if (!isCurrent() || heroDownloadRequestRef.current !== requestId) return
             createdTaskId = createdTask.taskId
             heroDownloadTaskIdRef.current = createdTask.taskId
@@ -607,7 +616,7 @@ export function FootprintsPage() {
           setHeroDownloadInfo(completedInfo)
           setHeroDownloadMediaItemId(mediaItemId)
         }
-        showMessage(info.hasOfflineResource ? "已打开本地文件夹" : "已加入下载队列")
+        showMessage(info.hasOfflineResource ? "已打开本地文件夹" : recoverable ? "已继续下载" : "已加入下载队列")
       } else if (action === "reset") {
         const mediaItemId = actionMediaItemId
         if (!mediaItemId) throw new Error("当前内容没有可重置的媒体版本")
@@ -704,6 +713,7 @@ export function FootprintsPage() {
           isFavorite={heroStageData.isFavorite}
           isDownloaded={heroDownloadMediaItemId === productionHero?.mediaItemId && (heroDownloadInfo?.hasOfflineResource ?? false)}
           canManageOffline={heroDownloadMediaItemId === productionHero?.mediaItemId && Boolean(heroDownloadInfo?.hasOfflineResource && heroDownloadInfo.taskId)}
+          downloadStatus={heroDownloadMediaItemId === productionHero?.mediaItemId ? heroDownloadInfo?.status ?? "idle" : "idle"}
           isActionPending={heroActionPending}
           onAction={(action) => void handleHeroAction(action)}
         />

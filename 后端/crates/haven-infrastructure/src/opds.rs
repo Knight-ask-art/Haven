@@ -205,10 +205,8 @@ fn parse_atom(xml: &str, base: &str) -> (Vec<OpdsEntry>, Vec<(String, String)>) 
                     break;
                 }
                 let name = local_name(&e);
-                let element_base = scoped_base(
-                    base_stack.last().map(String::as_str).unwrap_or(base),
-                    &e,
-                );
+                let element_base =
+                    scoped_base(base_stack.last().map(String::as_str).unwrap_or(base), &e);
                 base_stack.push(element_base.clone());
                 match name.as_str() {
                     "entry" => {
@@ -257,10 +255,8 @@ fn parse_atom(xml: &str, base: &str) -> (Vec<OpdsEntry>, Vec<(String, String)>) 
             }
             Ok(Event::Empty(e)) => {
                 if local_name(&e) == "link" {
-                    let element_base = scoped_base(
-                        base_stack.last().map(String::as_str).unwrap_or(base),
-                        &e,
-                    );
+                    let element_base =
+                        scoped_base(base_stack.last().map(String::as_str).unwrap_or(base), &e);
                     collect_link(
                         &e,
                         depth_entry,
@@ -559,10 +555,11 @@ pub type CredentialResolver = dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future:
 
 #[derive(Clone)]
 pub struct OpdsClient {
-    /// 每个端点的 OpenSearch atom 模板（含 `{searchTerms}`）及**发现它的描述文件地址**。
-    /// 模板可能是相对 `results.opds?...`：二次搜索必须仍以描述文件为解析基准，
-    /// 不能改用登记端点（否则会落到端点所在的目录下）。二次搜索跳过根目录 + 描述文件 hop。
-    search_templates: Arc<Mutex<HashMap<String, (String, String)>>>,
+    /// 每个端点的 OpenSearch atom 模板（含 `{searchTerms}` 与 Url 级 `indexOffset`/
+    /// `pageOffset`）及**发现它的描述文件地址**。模板可能是相对 `results.opds?...`：
+    /// 二次搜索必须仍以描述文件为解析基准，不能改用登记端点（否则会落到端点所在的目录下）。
+    /// 二次搜索跳过根目录 + 描述文件 hop；偏移量随结构化模板一起缓存。
+    search_templates: Arc<Mutex<HashMap<String, (SearchTemplate, String)>>>,
     /// 私有源凭据提供方。
     credential_resolver: Option<Arc<CredentialResolver>>,
     /// 注册表：用来**正向确认**某个 `sourceId` 确实是已登记的自定义 OPDS 书源，并给出它
@@ -910,7 +907,7 @@ impl OpdsClient {
     }
 
     /// 返回缓存的 `(模板, 描述文件地址)`。描述文件地址是相对模板的唯一解析基准。
-    fn cached_template(&self, endpoint: &str) -> Option<(String, String)> {
+    fn cached_template(&self, endpoint: &str) -> Option<(SearchTemplate, String)> {
         self.search_templates
             .lock()
             .ok()
@@ -918,8 +915,9 @@ impl OpdsClient {
     }
 
     /// 连同发现模板的描述文件地址一起缓存：模板里的 `{searchTerms}` 原样保留，
-    /// 二次搜索才能在不重新访问根目录/描述文件的前提下解析出同一个结果地址。
-    fn remember_template(&self, endpoint: &str, template: String, base: String) {
+    /// 二次搜索才能在不重新访问根目录/描述文件的前提下解析出同一个结果地址；
+    /// Url 的 `indexOffset`/`pageOffset` 同样随模板缓存，二次搜索走同一套分页换算。
+    fn remember_template(&self, endpoint: &str, template: SearchTemplate, base: String) {
         if let Ok(mut g) = self.search_templates.lock() {
             g.insert(endpoint.to_owned(), (template, base));
         }
@@ -928,7 +926,7 @@ impl OpdsClient {
     /// 模板展开的唯一所有者：缓存模板与刚发现的模板都走这里。
     ///
     /// `None` 表示模板不可用；已发现的搜索描述不能静默退回另一个查询协议。
-    fn apply_template(template: &str, query: &str, base: &str) -> Option<String> {
+    fn apply_template(template: &SearchTemplate, query: &str, base: &str) -> Option<String> {
         expand_search_template(template, query).and_then(|expanded| absolutize(base, &expanded))
     }
 
@@ -1167,31 +1165,95 @@ impl OpdsClient {
 /// 搜索调用方不传分页参数，因此模板里只出现 searchTerms 时地址与旧行为逐字节一致；
 /// 分页变量取「第 1 页」的一致默认值，避免把空串塞进 `startIndex`/`count` 造成服务端
 /// 解析失败或溢出（OpenSearch 未给 count 时的标准默认是每页 10 条，这里沿用常见的
-/// 20 条目录页大小）。
+/// 20 条目录页大小）。`startIndex` / `startPage` 的**实际取值**由 Url 元素的
+/// `indexOffset` / `pageOffset` 抬升，见 [OpenSearch 分页偏移]。
 const OPENSEARCH_DEFAULT_COUNT: u32 = 20;
-const OPENSEARCH_DEFAULT_START_INDEX: u32 = 1;
+/// Url 元素未给出 `indexOffset` / `pageOffset` 时的标准默认值（OpenSearch 1.1 规定，
+/// 显式写 `0` 同样合法并且必须照用——它表示索引/页码从 0 起计）。
+///
+/// 「OpenSearch 分页偏移」策略见 `url_paging_offsets` 与 `paging_values`：缺失 → 1，
+/// 合法整数（含 0）照用，畸形逐属性退回 1。没有分页参数时，`{startIndex}` /
+/// `{startPage}` 的取值**就是**这两个偏移本身，不再额外加 1。
+const OPENSEARCH_DEFAULT_OFFSET: u32 = 1;
 /// 展开后模板地址的长度上界：既限制输入量，也保证描述文件给出的模板不能借展开把
 /// 请求放大到任意长度。
 const MAX_TEMPLATE_EXPANDED_BYTES: usize = 8 * 1024;
 
+/// 一个可用的 OpenSearch atom 模板：模板原文 + 该 `<Url>` 元素的分页偏移。
+///
+/// 偏移是**元素级**属性，必须与模板绑定在一起传播：首次发现时用它展开搜索地址，随后
+/// 整个结构（含 base）进入缓存，二次搜索换关键字而不重新访问描述文件，也不会丢掉它。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchTemplate {
+    template: String,
+    /// OpenSearch 1.1 `indexOffset`：`{startIndex}` 的最小值。
+    index_offset: u32,
+    /// OpenSearch 1.1 `pageOffset`：`{startPage}` 的最小值。
+    page_offset: u32,
+}
+
+impl SearchTemplate {
+    /// 未声明偏移的模板：两个偏移都是标准默认 1。
+    #[cfg(test)]
+    fn bare(template: impl Into<String>) -> Self {
+        Self {
+            template: template.into(),
+            index_offset: OPENSEARCH_DEFAULT_OFFSET,
+            page_offset: OPENSEARCH_DEFAULT_OFFSET,
+        }
+    }
+}
+
+/// 读取 `<Url>` 元素上的 `indexOffset` / `pageOffset`（按 local-name 匹配，命名空间前缀
+/// 无所谓；复用既有 `attr` 解析器，属性值经 XML 规范化）。
+///
+/// [OpenSearch 分页偏移] 的确定性策略：
+/// - 属性缺失 → 默认 1（OpenSearch 1.1 规定的默认）。
+/// - 出现且去空白后是合法 u32 字面量 → 照用，包括显式 `0`（从 0 起计）。
+/// - 出现但畸形（非整数、负数、超出 u32）→ **该属性**退回默认 1；绝不猜测、
+///   绝不放过畸形值、也绝不让整份描述文件失效。搜索仍可能返回结果，只是分页起点按
+///   标准默认值计算，与旧行为逐字节一致。
+fn url_paging_offsets(e: &quick_xml::events::BytesStart<'_>) -> (u32, u32) {
+    let offset = |key: &str| -> u32 {
+        attr(e, key)
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .unwrap_or(OPENSEARCH_DEFAULT_OFFSET)
+    };
+    let index_offset = offset("indexOffset");
+    let page_offset = offset("pageOffset");
+    (index_offset, page_offset)
+}
+
+/// 按 OpenSearch 1.1 换算分页变量的取值。
+///
+/// 没有分页参数时请求的是**第一页**：`startIndex` **就是** Url 的 `indexOffset`，
+/// `startPage` **就是** `pageOffset`——OpenSearch 1.1 规定这两个属性的值即对应变量
+/// 的取值（未给出时的默认值同样是 1）。两者独立，混合偏移同样成立。
+fn paging_values(index_offset: u32, page_offset: u32) -> (u32, u32) {
+    (index_offset, page_offset)
+}
+
 /// 按 OpenSearch 1.1 语法展开搜索模板。
 ///
 /// - `{searchTerms}` 与 `{searchTerms?}` → 百分号编码后的关键字。
-/// - `{count}` / `{startIndex}` / `{startPage}` → 上述有界默认值，三者同属第 1 页。
+/// - `{count}` → 有界默认值；`{startIndex}` → `indexOffset`；`{startPage}` →
+///   `pageOffset`（两者均见 `<Url>` 元素，缺省 1）。没有分页参数时请求第一页。
 /// - `{language}` / `{inputEncoding}` / `{outputEncoding}` → 编码 `UTF-8`，语言 `*`
 ///   （OpenSearch 约定的「未指定」通配）。
 /// - 其余 `{name?}` 可选变量省略；其余 `{name}` 必填变量视为模板不可用。
 /// - 花括号不配对、空变量名、变量名含非 ASCII 字母数字字符、展开结果超过
 ///   `MAX_TEMPLATE_EXPANDED_BYTES` 时不可用。
-fn expand_search_template(template: &str, query: &str) -> Option<String> {
+fn expand_search_template(search: &SearchTemplate, query: &str) -> Option<String> {
+    let template = search.template.as_str();
     if template.len() > MAX_TEMPLATE_EXPANDED_BYTES || query.len() > MAX_TEMPLATE_EXPANDED_BYTES {
         return None;
     }
     let terms = urlencode(query);
     let count = OPENSEARCH_DEFAULT_COUNT.to_string();
-    let start_index = OPENSEARCH_DEFAULT_START_INDEX.to_string();
-    // count 决定整页大小，startIndex 从 1 起计，因此第 1 页的 startPage 恒为 1。
-    let start_page = "1".to_owned();
+    // count 决定整页大小；没有分页参数时是描述文件声明的第一页。
+    let (start_index, start_page) = paging_values(search.index_offset, search.page_offset);
+    let start_index = start_index.to_string();
+    let start_page = start_page.to_string();
     let mut out = String::with_capacity(template.len().min(MAX_TEMPLATE_EXPANDED_BYTES));
     let mut rest = template;
     while let Some(open) = rest.find(['{', '}']) {
@@ -1205,7 +1267,11 @@ fn expand_search_template(template: &str, query: &str) -> Option<String> {
             Some(base) => (base, true),
             None => (&after[..close], false),
         };
-        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_:.-".contains(&b)) {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_:.-".contains(&b))
+        {
             return None;
         }
         let value = match name {
@@ -1232,7 +1298,10 @@ fn expand_search_template(template: &str, query: &str) -> Option<String> {
 
 /// OpenSearch 描述里第一个 type 含 atom 的 `<Url template="...">`（首个命中即返回；
 /// Gutenberg 的描述文件中 text/html 与 suggestions 条目排在 atom 前后，不能取末尾）。
-fn extract_atom_template(desc: &str) -> Option<String> {
+///
+/// 分页偏移（`indexOffset` / `pageOffset`）是**同一个元素**上的属性，必须与模板一起
+/// 取出：首次发现与缓存查找都只经过这一个结构，偏移不会在两条路径上分叉。
+fn extract_atom_template(desc: &str) -> Option<SearchTemplate> {
     let mut reader = quick_xml::Reader::from_str(desc);
     loop {
         match reader.read_event() {
@@ -1241,7 +1310,12 @@ fn extract_atom_template(desc: &str) -> Option<String> {
                     let typ = attr(&e, "type").unwrap_or_default();
                     if typ.contains("atom") {
                         if let Some(tpl) = attr(&e, "template") {
-                            return Some(tpl);
+                            let (index_offset, page_offset) = url_paging_offsets(&e);
+                            return Some(SearchTemplate {
+                                template: tpl,
+                                index_offset,
+                                page_offset,
+                            });
                         }
                     }
                 }
@@ -2206,7 +2280,9 @@ mod tests {
     #[test]
     fn expands_opensearch_optional_terms_and_paging_without_literal_braces() {
         let expanded = OpdsClient::apply_template(
-            "search?q={searchTerms?}&count={count?}&start={startIndex}&page={startPage?}&extra={vendor:unused?}",
+            &SearchTemplate::bare(
+                "search?q={searchTerms?}&count={count?}&start={startIndex}&page={startPage?}&extra={vendor:unused?}",
+            ),
             "a & 中",
             "https://catalog.example.invalid/opensearch/description.xml",
         ).unwrap();
@@ -2219,21 +2295,197 @@ mod tests {
         assert_eq!(pairs.get("page").map(String::as_str), Some("1"));
         assert_eq!(pairs.get("extra").map(String::as_str), Some(""));
         for template in ["?q={unknown}", "?q={searchTerms", "?q=}", "?q={?}"] {
-            assert!(OpdsClient::apply_template(template, "q", "https://catalog.example.invalid/").is_none());
+            assert!(
+                OpdsClient::apply_template(
+                    &SearchTemplate::bare(template),
+                    "q",
+                    "https://catalog.example.invalid/"
+                )
+                .is_none()
+            );
         }
     }
 
     #[tokio::test]
-    async fn cached_opensearch_template_uses_the_same_expansion_and_reports_invalid_required_variables() {
+    async fn cached_opensearch_template_uses_the_same_expansion_and_reports_invalid_required_variables()
+     {
         let endpoint = "https://catalog.example.invalid/opds";
         let (registry, source) = seeded_opds_registry(endpoint, false).await;
         let client = OpdsClient::new().unwrap().with_source_registry(registry);
         let context = client.request_context(Some(&source)).await.unwrap();
-        client.remember_template(endpoint, "?q={searchTerms?}&count={count?}".into(), endpoint.into());
-        let url = client.search_url_with(&context, endpoint, "test").await.unwrap();
+        client.remember_template(
+            endpoint,
+            SearchTemplate::bare("?q={searchTerms?}&count={count?}"),
+            endpoint.into(),
+        );
+        let url = client
+            .search_url_with(&context, endpoint, "test")
+            .await
+            .unwrap();
         assert!(url.contains("q=test&count=20"));
-        client.remember_template(endpoint, "?q={unknownRequired}".into(), endpoint.into());
-        assert!(client.search_url_with(&context, endpoint, "test").await.is_err());
+        client.remember_template(
+            endpoint,
+            SearchTemplate::bare("?q={unknownRequired}"),
+            endpoint.into(),
+        );
+        assert!(
+            client
+                .search_url_with(&context, endpoint, "test")
+                .await
+                .is_err()
+        );
+    }
+
+    /// 模板按**偏移换算后**的第一页展开：把描述文件里 `<Url>` 的 `indexOffset` /
+    /// `pageOffset` 换成结构化模板，其余路径与搜索相同。
+    ///
+    /// 首次发现与缓存命中共用这一条：模板与 base 一起缓存，偏移随结构一起保存，因此
+    /// 二次搜索（不重新访问描述文件）得到的分页起点与首次完全一致。
+    #[tokio::test]
+    async fn cached_template_keeps_url_offsets_for_later_searches() {
+        let endpoint = "https://catalog.example.invalid/opds";
+        let (registry, source) = seeded_opds_registry(endpoint, false).await;
+        let client = OpdsClient::new().unwrap().with_source_registry(registry);
+        let context = client.request_context(Some(&source)).await.unwrap();
+        let template = SearchTemplate {
+            template: "?q={searchTerms}&i={startIndex}&p={startPage}".into(),
+            index_offset: 0,
+            page_offset: 4,
+        };
+        for query in ["first", "second"] {
+            client.remember_template(endpoint, template.clone(), endpoint.into());
+            let url = client
+                .search_url_with(&context, endpoint, query)
+                .await
+                .unwrap();
+            assert_eq!(
+                url,
+                format!("{endpoint}?q={query}&i=0&p=4"),
+                "显式 0 的 indexOffset 缓存命中后仍然生效"
+            );
+        }
+    }
+
+    // ---- OpenSearch 1.1 Url 级分页偏移（indexOffset / pageOffset） ----
+    //
+    // 真实请求（根目录 → 描述文件 → 搜索结果，以及缓存命中后的第二次搜索）在
+    // `super::catalog_tests`：那里用夹具服务器抓取真实的查询串断言。这里只覆盖结构化
+    // 模板的解析、换算与畸形属性的确定性策略。
+
+    /// 描述文件里 `<Url>` 的偏移解析：缺失 → 1，显式 0 合法，混合偏移各自独立；
+    /// 没有分页参数时 `{startIndex}`/`{startPage}` 的取值**就是**偏移本身。
+    #[test]
+    fn opensearch_url_offsets_default_to_one_and_honor_explicit_zero() {
+        let page = |attrs: &str| {
+            format!(
+                r#"<?xml version="1.0"?>
+<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+  <Url type="text/html" template="results.html?q={{searchTerms}}"/>
+  <Url {attrs} type="application/atom+xml" template="results.opds?q={{searchTerms}}&amp;start={{startIndex}}&amp;page={{startPage}}"/>
+</OpenSearchDescription>"#
+            )
+        };
+        let template_of = |attrs: &str| extract_atom_template(&page(attrs)).unwrap();
+
+        // 缺失：两个偏移都是标准默认 1。
+        let defaulted = template_of("");
+        assert_eq!(
+            defaulted.template,
+            "results.opds?q={searchTerms}&start={startIndex}&page={startPage}"
+        );
+        assert_eq!((defaulted.index_offset, defaulted.page_offset), (1, 1));
+        let expanded = expand_search_template(&defaulted, "a & 中").unwrap();
+        assert_eq!(
+            expanded,
+            "results.opds?q=a%20%26%20%E4%B8%AD&start=1&page=1"
+        );
+
+        // 显式 0：完全合法，按 0 起计（不是「未声明」）。
+        let zeroed = template_of(r#"indexOffset="0" pageOffset="0""#);
+        assert_eq!((zeroed.index_offset, zeroed.page_offset), (0, 0));
+        assert_eq!(
+            expand_search_template(&zeroed, "q").unwrap(),
+            "results.opds?q=q&start=0&page=0"
+        );
+
+        // 混合偏移：startIndex/startPage 分别取各自偏移。
+        let mixed = template_of(r#"indexOffset="40" pageOffset="3""#);
+        assert_eq!((mixed.index_offset, mixed.page_offset), (40, 3));
+        assert_eq!(
+            expand_search_template(&mixed, "q").unwrap(),
+            "results.opds?q=q&start=40&page=3"
+        );
+        // 只有 pageOffset：indexOffset 保持默认 1。
+        let page_only = template_of(r#"pageOffset="7""#);
+        assert_eq!((page_only.index_offset, page_only.page_offset), (1, 7));
+        assert_eq!(
+            expand_search_template(&page_only, "q").unwrap(),
+            "results.opds?q=q&start=1&page=7"
+        );
+
+        // 属性值可以带 XML 字符引用/前导空白：规范化后去空白仍是同一个非负整数。
+        let normalized = template_of(r#"indexOffset="&#49;0" pageOffset=" 2 ""#);
+        assert_eq!((normalized.index_offset, normalized.page_offset), (10, 2));
+    }
+
+    /// 畸形偏移：**逐属性**退回默认 1，不影响另一属性、模板与模板内的其它变量。
+    #[test]
+    fn malformed_opensearch_url_offsets_fall_back_to_one_per_attribute() {
+        for (index, page, expected) in [
+            ("abc", "2", (1, 2)),
+            ("-1", "2", (1, 2)),
+            ("1.5", "2", (1, 2)),
+            ("", "2", (1, 2)),
+            ("4294967296", "2", (1, 2)), // u32 溢出
+            ("999999999999999999999", "2", (1, 2)),
+            ("3", "x", (3, 1)),
+            ("3", "page1", (3, 1)),
+            ("3", "999999999999999999999", (3, 1)),
+            ("0x10", "1", (1, 1)),
+        ] {
+            let desc = format!(
+                r#"<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/"><Url type="application/atom+xml" template="s?q={{searchTerms}}&amp;i={{startIndex}}&amp;p={{startPage}}" indexOffset="{index}" pageOffset="{page}"/></OpenSearchDescription>"#
+            );
+            let template = extract_atom_template(&desc).unwrap();
+            assert_eq!(
+                (template.index_offset, template.page_offset),
+                expected,
+                "indexOffset={index:?} pageOffset={page:?}"
+            );
+            // 模板本身仍然可用：畸形偏移只影响分页起点取值。
+            let expanded = expand_search_template(&template, "q").unwrap();
+            assert_eq!(expanded, format!("s?q=q&i={}&p={}", expected.0, expected.1));
+        }
+    }
+
+    /// 偏移只取 atom 类型的 `<Url>`：排在它前面的 text/html 条目上的偏移不得混用；
+    /// u32::MAX 原样展开；可选/必填变量的既有行为不变。
+    #[test]
+    fn opensearch_offsets_bind_to_the_atom_url_and_keep_variable_rules() {
+        let desc = r#"<OpenSearchDescription>
+  <Url type="text/html" template="results.html?q={searchTerms}" indexOffset="99" pageOffset="99"/>
+  <Url type="application/atom+xml" template="results.opds?q={searchTerms}&amp;s={startIndex}&amp;p={startPage?}&amp;c={count?}" indexOffset="4294967295" pageOffset="0"/>
+</OpenSearchDescription>"#;
+        let template = extract_atom_template(desc).unwrap();
+        assert_eq!((template.index_offset, template.page_offset), (u32::MAX, 0));
+        assert_eq!(
+            expand_search_template(&template, "x").unwrap(),
+            format!("results.opds?q=x&s={}&p=0&c=20", u32::MAX)
+        );
+        assert!(extract_atom_template(
+            r#"<OpenSearchDescription><Url type="text/html" template="x?q={searchTerms}"/></OpenSearchDescription>"#
+        )
+        .is_none());
+        let required = extract_atom_template(
+            r#"<OpenSearchDescription><Url type="application/atom+xml" template="x?q={vendorRequired}"/></OpenSearchDescription>"#,
+        )
+        .unwrap();
+        assert!(expand_search_template(&required, "x").is_none());
+        let optional = extract_atom_template(
+            r#"<OpenSearchDescription><Url type="application/atom+xml" template="x?q={searchTerms}&amp;v={vendorOptional?}"/></OpenSearchDescription>"#,
+        )
+        .unwrap();
+        assert_eq!(expand_search_template(&optional, "x").unwrap(), "x?q=x&v=");
     }
 
     #[test]

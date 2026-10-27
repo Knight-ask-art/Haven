@@ -25,6 +25,18 @@ function renderStage(props: Partial<HavenStageProps> = {}) {
 }
 
 describe("HavenStage controlled actions", () => {
+  it.each([
+    ["paused", "继续下载"],
+    ["interrupted", "重试下载"],
+  ] as const)("presents %s as an actionable recovery control", (downloadStatus, label) => {
+    const onAction = vi.fn()
+    renderStage({ downloadStatus, onAction, isDownloaded: false })
+    const button = screen.getByRole("button", { name: label })
+    expect(button.hasAttribute("disabled")).toBe(false)
+    fireEvent.click(button)
+    expect(onAction).toHaveBeenCalledWith("download")
+  })
+
   it("hides offline management actions without a manageable task", () => {
     renderStage({ isDownloaded: false, canManageOffline: false })
     fireEvent.click(screen.getByTitle("更多选项"))
@@ -50,5 +62,14 @@ describe("HavenStage controlled actions", () => {
     expect((screen.getByRole("button", { name: "继续阅读" }) as HTMLButtonElement).disabled).toBe(true)
     expect((screen.getByTitle("加入收藏") as HTMLButtonElement).disabled).toBe(true)
     expect((screen.getByTitle("下载至本地") as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it("says resume / retry for a recoverable download instead of 下载至本地", () => {
+    renderStage({ isDownloaded: false, downloadStatus: "paused" })
+    expect(screen.getByTitle("下载已暂停，可继续")).toBeTruthy()
+    cleanup()
+    renderStage({ isDownloaded: false, downloadStatus: "interrupted" })
+    expect(screen.getByTitle("下载已中断，可继续或重试")).toBeTruthy()
+    expect(screen.queryByTitle("下载至本地")).toBeNull()
   })
 })

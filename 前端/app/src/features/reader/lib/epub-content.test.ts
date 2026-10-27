@@ -153,6 +153,56 @@ describe("epub-content", () => {
     expect(chapter.anchorMap?.["hidden-script"]).toBeUndefined()
   })
 
+  it("ignores data-id/data-name and quoted attribute text when mapping anchors", async () => {
+    const publication = await parseEpubBook(validEpub({
+      first: '<html><head><title>Title</title></head><body><h1>Title</h1>'
+        + '<p data-id="target">Intro</p>'
+        + '<p data-name="target">Intro two</p>'
+        + "<p title='a > b data-id=\"target\" id=\"fake\"' data-id='target'>Quoted</p>"
+        + '<p id="target">Target</p>'
+        + '</body></html>',
+    }))
+    const chapter = publication.chapters[0]
+    expect(chapter.title).toBe("Title")
+    expect(chapter.paragraphs).toEqual(["Intro", "Intro two", "Quoted", "Target"])
+    expect(chapter.anchorMap).toEqual({ target: 3 })
+    expect(chapter.anchorMap?.fake).toBeUndefined()
+  })
+
+  it("maps inline and container anchors through a quote-aware whole-document projection", async () => {
+    const publication = await parseEpubBook(validEpub({
+      first: '<html><body><h1>Résumé</h1>'
+        + "<div id=\"chapter-start\"><p title=\"a > b\" name='c > d'>正文 <span id=\"inner\">内文</span></p>"
+        + '<p data-id="decoy">第二段</p>'
+        + '<p class="x" id="end" title="1 > 0">尾段。</p></div>'
+        + "<script>var s = \"<span id='bad'>x</span>\"</script>"
+        + '</body></html>',
+    }))
+    const chapter = publication.chapters[0]
+    expect(chapter.paragraphs).toEqual(["正文 内文", "第二段", "尾段。"])
+    // The container marker projects onto its first rendered paragraph; the
+    // removed title paragraph is not part of the offset.
+    expect(chapter.anchorMap).toEqual({ "chapter-start": 0, inner: 0, end: 2 })
+    expect(chapter.anchorMap?.decoy).toBeUndefined()
+    expect(chapter.anchorMap?.bad).toBeUndefined()
+    expect(chapter.anchorMap && Object.getPrototypeOf(chapter.anchorMap)).toBeNull()
+  })
+
+  it("keeps quoted '>' inside attributes out of plain text for both quote kinds", () => {
+    expect(htmlToPlainText('<p title="a > b">正文。</p>')).toBe("正文。")
+    expect(htmlToPlainText("<p title='a > b'>正文。</p>")).toBe("正文。")
+    expect(htmlToPlainText("<p data-x=\"<span id='x'>\">可见。<script>bad</script></p><p>后段</p>")).toBe("可见。\n\n后段")
+  })
+
+  it("decodes entities in anchor names and keeps the first real anchor", async () => {
+    const publication = await parseEpubBook(validEpub({
+      first: '<html><body><p id="a&amp;b">One</p><p id="a&amp;b">Two</p><p id="c&#x3e;d">Three</p></body></html>',
+    }))
+    const chapter = publication.chapters[0]
+    expect(chapter.anchorMap?.["a&b"]).toBe(0)
+    expect(chapter.anchorMap?.["c>d"]).toBeUndefined()
+  })
+
   it("parses package/spine order and renders inert chapter text", async () => {
     const publication = await parseEpubBook(validEpub())
 

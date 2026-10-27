@@ -270,10 +270,47 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// 截取错误正文前 `n` 字节作为错误详情；设备返回的 UTF-8 可能在任意字节处被
+/// 截断（非 ASCII 字符跨界），因此必须回退到最近的字符边界而不是直接切片。
 fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
-        s.to_owned()
-    } else {
-        format!("{}…", &s[..n])
+        return s.to_owned();
+    }
+    let mut end = n;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate;
+
+    #[test]
+    fn truncate_keeps_long_ascii_body() {
+        let body = "x".repeat(150);
+        assert_eq!(truncate(&body, 200), body);
+    }
+
+    #[test]
+    fn truncate_does_not_panic_when_cut_crosses_utf8_boundary() {
+        // 每个汉字 3 字节：199 字节处是字符中间，200 处也是。
+        let body = "电".repeat(300);
+        let out = truncate(&body, 200);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.trim_end_matches('…'), "电".repeat(66));
+        assert_eq!(out.len(), 66 * 3 + '…'.len_utf8());
+    }
+
+    #[test]
+    fn truncate_mixed_body_stays_bounded_and_valid() {
+        let body = format!("{}{}", "a".repeat(199), "视".repeat(50));
+        let out = truncate(&body, 200);
+        assert_eq!(out, format!("{}…", "a".repeat(199)));
+        // 截断点恰好落在边界时保留完整前缀。
+        assert_eq!(truncate("a视b", 4), "a视…");
+        assert_eq!(truncate("a视", 5), "a视");
+        assert_eq!(truncate("a视", 3), "a…");
     }
 }

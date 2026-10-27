@@ -26,6 +26,23 @@ function selectTv() {
   fireEvent.click(screen.getByText("Test TV"))
 }
 
+it.each([
+  ["resume", "继续下载"],
+  ["retry", "重试下载"],
+] as const)("keeps the %s action available for the existing episode task", async (action, label) => {
+  const onDownloadCurrent = vi.fn(async () => null)
+  render(<EpisodeDrawer {...props}
+    downloadStateOf={() => ({ state: "recoverable", action, label })}
+    onDownloadAll={vi.fn(async () => null)}
+    onDownloadCurrent={onDownloadCurrent}
+  />)
+  const control = screen.getByRole("button", { name: label })
+  expect(control.hasAttribute("disabled")).toBe(false)
+  fireEvent.click(control)
+  fireEvent.click(screen.getByRole("button", { name: new RegExp(`${label}本集`) }))
+  await waitFor(() => expect(onDownloadCurrent).toHaveBeenCalledTimes(1))
+})
+
 it("serializes double start and revokes a late successful grant after close, including StrictMode replay", async () => {
   const start = deferred<typeof result>()
   const stop = deferred<{ stopped: boolean }>()

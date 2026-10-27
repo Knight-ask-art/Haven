@@ -10,7 +10,7 @@ export type EpisodeDownloadView =
   /** 尚未拿到投影：不禁用（用户可点击，由创建前的实时判定兜底）。 */
   | { kind: "unknown"; canDownload: boolean }
   /** 已拿到权威投影。`canDownload` 是后端能力，不是本地推断。 */
-  | { kind: "info"; status: "idle" | "queued" | "downloaded"; canDownload: boolean; taskId: string | null }
+  | { kind: "info"; status: "idle" | "queued" | "paused" | "interrupted" | "downloaded"; canDownload: boolean; taskId: string | null }
   /** 投影失败：既不是「可下载」也不是「不可下载」，只是这次没读到事实。 */
   | { kind: "failed"; message: string; canDownload: boolean }
   /** 本页发起的创建请求在途。 */
@@ -28,7 +28,7 @@ export function viewFromDownloadInfo(info: MediaItemDownloadInfo): EpisodeDownlo
     kind: "info",
     status: info.status,
     canDownload: info.canDownload,
-    taskId: info.status === "queued" ? info.taskId : null,
+    taskId: info.status === "idle" || info.status === "downloaded" ? null : info.taskId,
   }
 }
 
@@ -39,6 +39,8 @@ export function failedDownloadView(message: string): EpisodeDownloadView {
 export type EpisodeDownloadPresentation =
   | { state: "downloaded" }
   | { state: "queued" }
+  /** Backend retains a paused / interrupted task; actionable on the same id. */
+  | { state: "recoverable"; action: "resume" | "retry"; label: string }
   | { state: "creating" }
   | { state: "actionable"; canStart: boolean; reason: string | null; error: string | null }
   | { state: "unknown"; error: string | null }
@@ -57,6 +59,8 @@ export function presentEpisodeDownload(view: EpisodeDownloadView, unavailableRea
     case "info":
       if (view.status === "downloaded") return { state: "downloaded" }
       if (view.status === "queued") return { state: "queued" }
+      if (view.status === "paused") return { state: "recoverable", action: "resume", label: "继续下载" }
+      if (view.status === "interrupted") return { state: "recoverable", action: "retry", label: "重试下载" }
       return {
         state: "actionable",
         canStart: view.canDownload,
@@ -128,6 +132,7 @@ export function episodeBadgeLabel(presentation: EpisodeDownloadPresentation): "d
     case "downloaded": return "downloaded"
     case "queued": return "queued"
     case "creating": return "creating"
+    case "recoverable":
     case "unknown":
     case "actionable":
       return null

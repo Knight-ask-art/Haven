@@ -236,7 +236,7 @@ export function usePlayerEpisodeActions(
       if (readEpochRef.current.get(owner) !== epochs.get(owner)) continue
       const view = views.get(owner)
       if (!views.has(owner)) continue
-      if (view?.kind === "info" && view.status === "queued" && view.taskId === taskId) continue
+      if (view?.kind === "info" && (view.status === "queued" || view.status === "paused" || view.status === "interrupted") && view.taskId === taskId) continue
       taskOwnersRef.current.delete(taskId)
     }
     const nextInfo = new Map(infoRef.current)
@@ -245,7 +245,7 @@ export function usePlayerEpisodeActions(
       if (readEpochRef.current.get(mediaItemId) !== epochs.get(mediaItemId)) continue
       nextInfo.set(mediaItemId, view)
       applied.push(mediaItemId)
-      if (view.kind === "info" && view.status === "queued" && view.taskId) {
+      if (view.kind === "info" && view.taskId && (view.status === "queued" || view.status === "paused" || view.status === "interrupted")) {
         taskOwnersRef.current.set(view.taskId, mediaItemId)
       }
     }
@@ -338,7 +338,9 @@ export function usePlayerEpisodeActions(
         if (known?.kind === "info") {
           if (known.status === "downloaded") { outcomes.set(mediaItemId, { outcome: "already", state: "downloaded" }); continue }
           if (known.status === "queued") { outcomes.set(mediaItemId, { outcome: "already", state: "queued" }); continue }
-          if (!known.canDownload) {
+          // Paused / Interrupted stay actionable: startEpisodeDownload resumes /
+          // retries the existing task id instead of creating a new one.
+          if (!known.canDownload && known.status !== "paused" && known.status !== "interrupted") {
             outcomes.set(mediaItemId, { outcome: "blocked", reason: "当前剧集没有可保存到离线位置的资源" })
             continue
           }
@@ -354,8 +356,9 @@ export function usePlayerEpisodeActions(
         if (!same()) return null
         if (result.outcome === "started") {
           taskOwnersRef.current.set(result.taskId, mediaItemId)
+          // A resume / retry keeps the same task and is reported as such.
           outcomes.set(mediaItemId, { outcome: "started" })
-          // 创建成功只代表已排队。
+          // 恢复 / 创建成功只代表已排队。
           patchSession(new Map([[mediaItemId, { kind: "queued", taskId: result.taskId, canDownload: true } satisfies EpisodeDownloadView]]))
         } else if (result.outcome === "already") {
           // 后端说已下载 / 已排队：按真实结论落一个明确状态，而不是继续显示创建中。

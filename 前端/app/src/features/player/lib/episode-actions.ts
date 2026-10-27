@@ -10,6 +10,7 @@ import { getWorkDetail } from "@/features/media/ipc/work-gateway"
 import {
   createDownloadForMediaItem,
   getMediaItemsDownloadInfo,
+  startDownloadFromProjection,
   subscribeDownloadEvents,
   type MediaItemDownloadInfo,
 } from "@/features/downloads/ipc/download-gateway"
@@ -82,16 +83,18 @@ export function subscribeEpisodeDownloadEvents(
 }
 
 export type EpisodeDownloadStartResult =
-  | { outcome: "started"; mediaItemId: string; taskId: string }
+  | { outcome: "started"; mediaItemId: string; taskId: string; /** Resumed / retried the existing task instead of creating. */ resumed?: boolean }
   | { outcome: "already"; mediaItemId: string; state: "downloaded" | "queued"; taskId: string | null }
   | { outcome: "blocked"; mediaItemId: string; reason: string }
   | { outcome: "failed"; mediaItemId: string; message: string }
 
 /**
- * 为一集创建真实下载任务。
+ * 为一集发起真实下载（明确用户意图）。
  *
- * 创建前按点击那一刻的后端投影复核：没有可下载来源就不发起；已下载 / 已排队
- * 不重复创建。创建成功只代表任务已排队，返回 `started`，由调用方重新读投影。
+ * 创建前按点击那一刻的后端投影复核：没有可下载来源且没有可恢复任务就不发起；
+ * 已下载 / 已排队不重复发起。Paused / Interrupted 任务经 `download_resume` /
+ * `download_retry` 按原 taskId 恢复，绝不先 create（后端 find_active 只会返回旧任务）。
+ * 成功只代表任务已排队，返回 `started`，由调用方重新读投影。
  */
 export async function startEpisodeDownload(mediaItemId: string): Promise<EpisodeDownloadStartResult> {
   let info: MediaItemDownloadInfo | null = null
@@ -101,16 +104,17 @@ export async function startEpisodeDownload(mediaItemId: string): Promise<Episode
     // 没读到投影不等于没有来源：交给 gateway 按同一规则重新选源并给出明确失败。
     info = null
   }
+  const recoverable = info !== null && (info.status === "paused" || info.status === "interrupted")
   if (info !== null) {
     if (info.status === "downloaded") return { outcome: "already", mediaItemId, state: "downloaded", taskId: null }
     if (info.status === "queued") return { outcome: "already", mediaItemId, state: "queued", taskId: info.taskId }
   }
-  if (!canStartEpisodeDownload(info)) {
+  if (!recoverable && !canStartEpisodeDownload(info)) {
     return { outcome: "blocked", mediaItemId, reason: "当前剧集没有可保存到离线位置的资源" }
   }
   try {
-    const task = await createDownloadForMediaItem(mediaItemId)
-    return { outcome: "started", mediaItemId, taskId: task.taskId }
+    const task = info !== null ? await startDownloadFromProjection(info, mediaItemId) : await createDownloadForMediaItem(mediaItemId)
+    return { outcome: "started", mediaItemId, taskId: task.taskId, resumed: recoverable ? true : undefined }
   } catch (cause) {
     return { outcome: "failed", mediaItemId, message: downloadStartFailureMessage(cause) }
   }

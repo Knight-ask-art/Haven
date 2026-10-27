@@ -294,19 +294,135 @@ function stripXmlUnsafeConstructs(xml: string): string {
   return xml.replace(/<!--(?:.|[\r\n])*?-->/g, "")
 }
 
-function parseAttributes(tag: string): Map<string, string> {
+/**
+ * One quote-aware tag scan shared by attribute parsing, title extraction,
+ * anchor annotation and plain-text conversion, mirroring the backend
+ * `reader_search.rs` rules: a tag ends at the first `>` outside `"`/`'`
+ * quotes, comments run to `-->` (or swallow the rest of the document), and a
+ * `<` that never closes is literal text. Attribute tokens are split on
+ * whitespace so `data-id="x"` is never read as `id` and text inside one
+ * quoted value is never read as another attribute.
+ */
+type MarkupToken =
+  | { kind: "text"; start: number; end: number }
+  | { kind: "comment"; start: number; end: number }
+  | { kind: "tag"; start: number; end: number; name: string; closing: boolean; attributes: Map<string, string> }
+
+const ATTRIBUTE_NAME = /[A-Za-z_:][\w:.-]*/y
+
+function attributeNameAt(tag: string, offset: number): string | null {
+  ATTRIBUTE_NAME.lastIndex = offset
+  const match = ATTRIBUTE_NAME.exec(tag)
+  return match ? match[0].toLowerCase() : null
+}
+
+/** Parse attributes from the end of the tag name; quoted `>` never terminates. */
+function parseTagAttributes(tag: string, cursor: number): Map<string, string> {
   const attributes = new Map<string, string>()
-  const pattern = /([A-Za-z_][\w:.-]*)\s*=\s*(["'])(.*?)\2/g
-  for (const match of tag.matchAll(pattern)) {
-    attributes.set(match[1].toLowerCase(), match[3])
+  const length = tag.length
+  while (cursor < length) {
+    const ch = tag[cursor]
+    if (/\s/.test(ch) || ch === "/") {
+      cursor += 1
+      continue
+    }
+    const name = attributeNameAt(tag, cursor)
+    if (!name) {
+      cursor += 1
+      continue
+    }
+    cursor += name.length
+    while (cursor < length && /\s/.test(tag[cursor])) cursor += 1
+    if (tag[cursor] !== "=") continue
+    cursor += 1
+    while (cursor < length && /\s/.test(tag[cursor])) cursor += 1
+    const quote = tag[cursor]
+    if (quote !== '"' && quote !== "'") {
+      let valueEnd = cursor
+      while (valueEnd < length && !/[\s>]/.test(tag[valueEnd])) valueEnd += 1
+      if (!attributes.has(name)) attributes.set(name, tag.slice(cursor, valueEnd))
+      cursor = valueEnd
+      continue
+    }
+    const valueEnd = tag.indexOf(quote, cursor + 1)
+    if (valueEnd < 0) break
+    if (!attributes.has(name)) attributes.set(name, tag.slice(cursor + 1, valueEnd))
+    cursor = valueEnd + 1
   }
   return attributes
 }
 
+function findTagEnd(html: string, cursor: number): number {
+  let quote = ""
+  while (cursor < html.length) {
+    const ch = html[cursor]
+    if (quote) {
+      if (ch === quote) quote = ""
+    } else if (ch === '"' || ch === "'") {
+      quote = ch
+    } else if (ch === ">") {
+      return cursor
+    }
+    cursor += 1
+  }
+  return -1
+}
+
+function* lexMarkup(html: string): Generator<MarkupToken> {
+  let cursor = 0
+  while (cursor < html.length) {
+    const tagStart = html.indexOf("<", cursor)
+    if (tagStart < 0) {
+      yield { kind: "text", start: cursor, end: html.length }
+      return
+    }
+    if (tagStart > cursor) yield { kind: "text", start: cursor, end: tagStart }
+    if (html.startsWith("<!--", tagStart)) {
+      const commentEnd = html.indexOf("-->", tagStart + 4)
+      if (commentEnd < 0) {
+        // A malformed comment has no end: discard the remainder rather than
+        // exposing active markup.
+        yield { kind: "comment", start: tagStart, end: html.length }
+        return
+      }
+      yield { kind: "comment", start: tagStart, end: commentEnd + 3 }
+      cursor = commentEnd + 3
+      continue
+    }
+    const tagEnd = findTagEnd(html, tagStart + 1)
+    if (tagEnd < 0) {
+      yield { kind: "text", start: tagStart, end: html.length }
+      return
+    }
+    const body = html.slice(tagStart + 1, tagEnd)
+    // A closing tag's leading `/` and any spaces before it belong to the
+    // marker, not the name; `< /p>` would otherwise yield an empty name and
+    // never close the skipped or title block.
+    let nameStart = 0
+    while (nameStart < body.length && /\s/.test(body[nameStart])) nameStart += 1
+    const closing = body[nameStart] === "/"
+    if (closing) nameStart += 1
+    let nameEnd = nameStart
+    while (nameEnd < body.length && !/[\s/]/.test(body[nameEnd])) nameEnd += 1
+    yield {
+      kind: "tag",
+      start: tagStart,
+      end: tagEnd + 1,
+      name: body.slice(nameStart, nameEnd).toLowerCase(),
+      closing,
+      attributes: parseTagAttributes(body, nameEnd),
+    }
+    cursor = tagEnd + 1
+  }
+}
+
 function findTags(xml: string, tagName: string): Map<string, string>[] {
-  const escaped = tagName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-  const pattern = new RegExp(`<(?:(?:[A-Za-z_][\\w.-]*):)?${escaped}\\b([^>]*)>`, "gi")
-  return [...xml.matchAll(pattern)].map((match) => parseAttributes(match[1]))
+  const tags: Map<string, string>[] = []
+  for (const token of lexMarkup(xml)) {
+    if (token.kind !== "tag" || token.closing) continue
+    if (token.name === tagName || token.name.endsWith(`:${tagName}`)) tags.push(token.attributes)
+  }
+  return tags
 }
 
 function xmlEntityText(value: string): string {
@@ -360,11 +476,18 @@ function resolveHref(directory: string, rawHref: string): string {
   return safeArchiveName(directory ? `${directory}/${decoded}` : decoded)
 }
 
+/** The first boundary-valid opening tag decides that tag name (backend parity). */
 function extractTagText(html: string, names: readonly string[]): string | null {
+  const tags = [...lexMarkup(html)].filter((token) => token.kind === "tag") as Extract<MarkupToken, { kind: "tag" }>[]
   for (const name of names) {
-    const match = new RegExp(`<${name}\\b[^>]*>([\\s\\S]*?)</${name}>`, "i").exec(html)
-    if (!match) continue
-    const value = htmlToPlainText(match[1])
+    const tagsByName = tags.filter((token) => token.name === name)
+    const openingIndex = tagsByName.findIndex((token) => !token.closing)
+    if (openingIndex < 0) continue
+    const opening = tagsByName[openingIndex]
+    const closing = tagsByName.slice(openingIndex + 1).find((token) => token.closing)
+    // An unterminated candidate leaves the scan looking for a later pair.
+    if (!closing) continue
+    const value = htmlToPlainText(html.slice(opening.end, closing.start))
     if (value) return value.split("\n", 1)[0].trim().slice(0, 160)
   }
   return null
@@ -384,18 +507,39 @@ function htmlEntityText(value: string): string {
     })
 }
 
+const ACTIVE_TAGS = new Set(["head", "script", "style", "iframe", "object", "embed", "svg", "math", "form", "textarea"])
+const BOUNDARY_TAGS = new Set(["p", "div", "section", "article", "header", "footer", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "pre", "tr", "td", "th"])
+
 /** Convert untrusted XHTML to plain text; scripts and active embeds never reach React. */
 export function htmlToPlainText(html: string): string {
-  const withoutDocumentMetadata = html.replace(/<head\b[^>]*>[\s\S]*?<\/head>/gi, "\n")
-  const withoutActiveContent = withoutDocumentMetadata
-    .replace(/<(?:script|style|iframe|object|embed|svg|math|form|textarea)\b[^>]*>[\s\S]*?<\/(?:script|style|iframe|object|embed|svg|math|form|textarea)>/gi, "\n")
-    .replace(/<(?:script|style|iframe|object|embed|svg|math|form|textarea)\b[^>]*\/?\s*>/gi, "\n")
-  const withBoundaries = withoutActiveContent
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<(?:p|div|section|article|header|footer|h[1-6]|li|blockquote|pre|tr|td|th)\b[^>]*>/gi, "\n")
-    .replace(/<\/(?:p|div|section|article|header|footer|h[1-6]|li|blockquote|pre|tr|td|th)>/gi, "\n")
-    .replace(/<[^>]*>/g, "")
-  return htmlEntityText(withBoundaries)
+  return convertMarkupToPlainText(html)
+}
+
+function convertMarkupToPlainText(html: string): string {
+  const chunks: string[] = []
+  let skippedTag = ""
+  for (const token of lexMarkup(html)) {
+    if (token.kind === "comment") continue
+    if (token.kind === "text") {
+      if (!skippedTag) chunks.push(html.slice(token.start, token.end))
+      continue
+    }
+    if (skippedTag) {
+      if (token.closing && token.name === skippedTag) skippedTag = ""
+      continue
+    }
+    const selfClosing = /\/\s*>$/.test(html.slice(token.start, token.end))
+    if (ACTIVE_TAGS.has(token.name)) {
+      if (!token.closing && !selfClosing) skippedTag = token.name
+      continue
+    }
+    if (token.name === "br") {
+      chunks.push("\n")
+      continue
+    }
+    if (BOUNDARY_TAGS.has(token.name)) chunks.push("\n")
+  }
+  return htmlEntityText(chunks.join(""))
     .replace(/\u00a0/g, " ")
     .replace(/[ \t]+/g, " ")
     .replace(/\n[ \t]+/g, "\n")
@@ -463,22 +607,29 @@ function buildAnchorMap(html: string, paragraphs: readonly string[], titleRemove
   let markerPrefix = "\uE000HAVEN"
   while (html.includes(markerPrefix)) markerPrefix += "\uE000"
   const anchors: string[] = []
-  const annotated = html.replace(/<!--[\s\S]*?-->|<[^>]+>/g, (tag) => {
-    const tagName = /^<\s*([A-Za-z][\w:.-]*)/.exec(tag)?.[1]?.toLowerCase()
-    if (!tagName || /^(?:head|script|style|svg|math|iframe|object|embed|form|textarea)$/.test(tagName)) return tag
-    let markers = ""
-    for (const match of tag.matchAll(/\b(?:id|name)\s*=\s*(["'])(.*?)\1/gi)) {
-      const anchor = htmlEntityText(match[2]).trim()
+  const annotated: string[] = []
+  let cursor = 0
+  for (const token of lexMarkup(html)) {
+    if (token.kind === "text" || token.kind === "comment") continue
+    annotated.push(html.slice(cursor, token.end))
+    cursor = token.end
+    // Attribute tokens come from the shared lexer, so `data-id` is not `id`
+    // and text inside an unrelated quoted value is never an anchor.
+    if (token.closing || ACTIVE_TAGS.has(token.name)) continue
+    for (const name of ["id", "name"]) {
+      const raw = token.attributes.get(name)
+      if (raw === undefined) continue
+      const anchor = htmlEntityText(raw).trim()
       if (!anchor || anchor.length > 512
         || [...anchor].some((ch) => ch.codePointAt(0)! < 0x20 || /[\\/?#<>"']/.test(ch))) continue
-      markers += `${markerPrefix}${anchors.length}\uE001`
+      annotated.push(`${markerPrefix}${anchors.length}\uE001`)
       anchors.push(anchor)
     }
-    return tag + markers
-  })
+  }
+  annotated.push(html.slice(cursor))
   const markerPattern = new RegExp(`${markerPrefix}(\\d+)\uE001`, "g")
   let paragraphIndex = 0
-  for (const chunk of htmlToPlainText(annotated).split(/\n{2,}/)) {
+  for (const chunk of htmlToPlainText(annotated.join("")).split(/\n{2,}/)) {
     const indexes = [...chunk.matchAll(markerPattern)].map((match) => Number(match[1]))
     const content = chunk.replace(markerPattern, "").replace(/\s*\n\s*/g, " ").trim()
     const target = Math.max(0, Math.min(paragraphs.length - 1, paragraphIndex - Number(titleRemoved)))

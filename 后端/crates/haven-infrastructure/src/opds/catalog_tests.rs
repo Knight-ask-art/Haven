@@ -446,6 +446,81 @@ async fn search_entries_reuses_the_descriptor_base_across_searches() {
     );
 }
 
+/// 描述文件首个 atom `<Url>` 声明 `indexOffset="0" pageOffset="0"`：没有分页参数时
+/// `{startIndex}`/`{startPage}` 的取值就是这两个偏移本身（0/0，不是 1/0）。
+/// 首次发现与缓存命中的第二次搜索都必须发出 `start=0&page=0`。
+#[tokio::test]
+async fn search_requests_use_the_descriptor_paging_offsets_on_every_search() {
+    let server = FixtureServer::start(|_| {
+        vec![
+            (
+                "/feed/search.xml".to_owned(),
+                FixtureResponse::atom(
+                    r#"<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <id>urn:haven:fixture:offset-root</id>
+  <title>Offset Library</title>
+  <link rel="search" type="application/atom+xml" href="/feed/description.xml"/>
+</feed>"#
+                        .to_owned(),
+                ),
+            ),
+            (
+                "/feed/description.xml".to_owned(),
+                FixtureResponse::opensearch(
+                    r#"<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+  <Url type="text/html" template="results.html?q={searchTerms}" indexOffset="9" pageOffset="9"/>
+  <Url type="application/atom+xml" template="results.opds?q={searchTerms}&amp;start={startIndex}&amp;page={startPage}" indexOffset="0" pageOffset="0"/>
+</OpenSearchDescription>"#
+                        .to_owned(),
+                ),
+            ),
+            (
+                "/feed/results.opds".to_owned(),
+                FixtureResponse::atom(
+                    r#"<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry><id>urn:uuid:offset-1</id><title>Offset Result</title></entry>
+</feed>"#
+                        .to_owned(),
+                ),
+            ),
+        ]
+    });
+    let endpoint = format!("{}/feed/search.xml", server.origin());
+    let (registry, source_id) = seeded_opds_registry(&endpoint, false).await;
+    let client = OpdsClient::new()
+        .unwrap()
+        .with_loopback_fixture()
+        .with_source_registry(registry);
+
+    let first = client
+        .search_entries(Some(&source_id), &endpoint, "first", 10)
+        .await
+        .unwrap();
+    let second = client
+        .search_entries(Some(&source_id), &endpoint, "second", 10)
+        .await
+        .unwrap();
+
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+    let targets: Vec<String> = server
+        .requests()
+        .iter()
+        .map(|request| request.target().to_owned())
+        .collect();
+    assert_eq!(
+        targets,
+        vec![
+            "/feed/search.xml",
+            "/feed/description.xml",
+            "/feed/results.opds?q=first&start=0&page=0",
+            "/feed/results.opds?q=second&start=0&page=0",
+        ]
+    );
+}
+
 #[tokio::test]
 async fn search_accepts_empty_feed_and_urn_book_with_external_cover() {
     for (xml, count) in [

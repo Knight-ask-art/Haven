@@ -5,6 +5,7 @@ import {
 import { cn } from "@/lib/utils"
 import { useCastDiscovery } from "@/features/player/hooks/useCastDiscovery"
 import { playCast, stopCast } from "@/features/cast/ipc/cast-gateway"
+import type { EpisodeDownloadPresentation } from "../lib/episode-actions-state"
 
 export interface EpisodeItem {
   id: string
@@ -20,12 +21,7 @@ export interface EpisodeItem {
 /** 单集下载展示结论（由 player hook 从权威下载投影推出，组件只渲染）。 */
 export type EpisodeDownloadBadge = "downloaded" | "queued" | "creating" | null
 
-export type EpisodeDownloadActionState =
-  | { state: "downloaded" }
-  | { state: "queued" }
-  | { state: "creating" }
-  | { state: "actionable"; canStart: boolean; reason: string | null; error: string | null }
-  | { state: "unknown"; error: string | null }
+export type EpisodeDownloadActionState = EpisodeDownloadPresentation
 
 const NO_DOWNLOAD_STATE: EpisodeDownloadActionState = { state: "unknown", error: null }
 
@@ -303,6 +299,7 @@ export function EpisodeDrawer({
     && drawerDownloadReady
     && downloadUnavailableReason === null
     && (currentDownloadState.state === "unknown"
+      || currentDownloadState.state === "recoverable"
       || currentDownloadState.state === "actionable" && currentDownloadState.canStart)
   const downloadButtonDisabled = downloadUnavailableReason !== null
     || !drawerDownloadReady || episodes.length === 0 || downloadPending
@@ -315,13 +312,19 @@ export function EpisodeDrawer({
       ? "已下载"
       : currentDownloadState.state === "queued"
         ? "下载中"
+        : currentDownloadState.state === "recoverable"
+          ? currentDownloadState.label
         : currentDownloadState.state === "creating"
           ? "提交中"
           : "下载"
   const downloadActionHint = downloadUnavailableReason
     ?? (currentDownloadState?.state === "actionable" ? currentDownloadState.reason : null)
+    ?? (currentDownloadState?.state === "recoverable"
+      ? currentDownloadState.action === "resume" ? "下载已暂停，可继续" : "下载已中断，可重试"
+      : null)
   const currentDownloadError = currentDownloadState?.state === "unknown" || currentDownloadState?.state === "actionable"
-    ? currentDownloadState.error : null
+    ? currentDownloadState.error
+    : null
 
   const runDownloadTarget = async (target: "all" | "current") => {
     if (!drawerDownloadReady || downloadUnavailableReason !== null || (target === "current" && !currentCanDownload)) return
@@ -430,7 +433,7 @@ export function EpisodeDrawer({
                   ? "text-blue-500"
                   : disabledStyle(!drawerDownloadReady || downloadUnavailableReason !== null || downloadButtonDisabled || downloadPending)
             )}
-            aria-label="下载"
+            aria-label={downloadActionLabel}
             aria-disabled={!drawerDownloadReady || downloadUnavailableReason !== null || downloadButtonDisabled || downloadPending}
           >
             <Download className={cn("w-5 h-5", downloadPending && "opacity-60")} />
@@ -604,7 +607,7 @@ export function EpisodeDrawer({
                     <Download className="h-5 w-5" />
                   </span>
                   <span>
-                    <span className="block text-sm font-bold">下载本集</span>
+                    <span className="block text-sm font-bold">{currentDownloadState?.state === "recoverable" ? `${currentDownloadState.label}本集` : "下载本集"}</span>
                     <span className="mt-0.5 block text-xs text-muted-foreground">
                       {currentEpisode?.number ?? secondaryTitle} · {currentEpisode?.title ?? "当前播放内容"}
                     </span>

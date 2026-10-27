@@ -17,7 +17,7 @@
 // 缺失的事实不会被写成「明确不可用」的结论。
 //
 // download_only 不是死状态：后端给了可下载来源，页面就必须提供一个真实可执行的动作。
-// 点击只调用既有 `createDownloadForMediaItem(mediaItemId)`，绝不直接发 IPC、拼 URL 或
+// 点击只调用既有 `startDownloadFromProjection(info, mediaItemId)`，绝不直接发 IPC、拼 URL 或
 // 查 SQLite，也绝不因此导航到阅读器——**创建成功不等于可读**。只有重新读到的真实能力
 // （离线资源或在线读取能力）才把文章升级成 readable；仅有离线资源时也绝不称其为在线阅读。
 //
@@ -49,8 +49,8 @@ import type {
 import { HavenError, toHavenError } from "@/lib/ipc/errors"
 import { getHavenClientMode } from "@/lib/ipc/runtime"
 import {
-  createDownloadForMediaItem,
   getMediaItemsDownloadInfo,
+  startDownloadFromProjection,
   subscribeDownloadEvents,
 } from "@/features/downloads/ipc/download-gateway"
 import { downloadErrorMessage } from "@/features/downloads/lib/download-error"
@@ -104,6 +104,8 @@ const ARTICLE_BUTTON_LABEL: Record<PeriodicalArticleReadState, string> = {
   readable: "打开正文",
   preparing: "准备下载",
   downloading: "下载中",
+  download_paused: "继续下载",
+  download_interrupted: "重试下载",
   download_failed: "重试下载",
   download_only: "下载后阅读",
   metadata_only: "仅元数据",
@@ -159,6 +161,7 @@ export function PeriodicalTreePage() {
   const [downloadAttempts, setDownloadAttempts] = useState<Record<string, ArticleDownloadAttempt>>({})
   // 下载任务身份归属：事件只带 taskId，这里是唯一能把事件映射回文章的地方。
   const taskOwners = useRef(new Map<string, DownloadTaskOwner>())
+  const retiredTasks = useRef(new Set<string>())
 
   // ref 与 state 同步写入：点击时的复核读的是 ref，不能落后于最后一次渲染。
   const replaceCapabilities = useCallback((next: Record<string, ArticleCapability>) => {
@@ -199,9 +202,13 @@ export function PeriodicalTreePage() {
         // 投影仍指向的这一个保留；同一篇在这一代里其余的旧 taskId 一律注销。
         if (knownTaskId === activeTaskId) continue
         taskOwners.current.delete(knownTaskId)
+        retiredTasks.current.add(knownTaskId)
       }
       // 投影仍说这一篇在下载（包括新树重新读到同一个活动任务）：归属继续有效。
-      if (activeTaskId !== null) taskOwners.current.set(activeTaskId, { mediaItemId, generation })
+      if (activeTaskId !== null) {
+        retiredTasks.current.delete(activeTaskId)
+        taskOwners.current.set(activeTaskId, { mediaItemId, generation })
+      }
     }
   }, [])
 
@@ -251,6 +258,7 @@ export function PeriodicalTreePage() {
     const generation = ++capabilityGeneration.current
     // 下载归属同属这一代，随代一并作废：旧代的任务事件不能落到新树的行上。
     taskOwners.current.clear()
+    retiredTasks.current.clear()
     // 上一代的脏标记 / 修订号同样作废：旧代标记不得让新代补跑刷新，修订号表按代
     // 重建也避免它在反复换树时无限增长。
     dirtyCapabilitiesRef.current.clear()
@@ -352,9 +360,17 @@ export function PeriodicalTreePage() {
     let dispose: (() => Promise<void>) | null = null
     void subscribeDownloadEvents((event) => {
       if (!mounted) return
+      if (retiredTasks.current.has(event.data.taskId)) return
       const owner = taskOwners.current.get(event.data.taskId)
-      // 认不出的任务、或属于上一代树的任务：一律丢弃，绝不据此改动当前页面。
-      if (!owner || owner.generation !== capabilityGeneration.current) return
+      // 首次快照落地前可能尚无任务归属。未知终态只让当前行回源，不能被当作行的事实。
+      if (!owner || owner.generation !== capabilityGeneration.current) {
+        if (["completed", "failed", "cancelled", "interrupted"].includes(event.data.state)) {
+          for (const mediaItemId of Object.keys(capabilitiesRef.current)) {
+            void refreshCapability(mediaItemId)
+          }
+        }
+        return
+      }
       if (!capabilitiesRef.current[owner.mediaItemId]) return
       if (event.data.state === "failed" || event.data.state === "interrupted") {
         // 终态失败只带稳定错误码，交给受控码表翻译成可读原因。
@@ -370,7 +386,13 @@ export function PeriodicalTreePage() {
       }
       void refreshCapability(owner.mediaItemId, owner.generation)
     }).then((cleanup) => {
-      if (mounted) dispose = cleanup
+      if (mounted) {
+        dispose = cleanup
+        // 监听就绪后重读，关闭首次快照与订阅建立之间漏掉终态事件的窗口。
+        for (const mediaItemId of Object.keys(capabilitiesRef.current)) {
+          void refreshCapability(mediaItemId)
+        }
+      }
       else void cleanup().catch(() => undefined)
     }).catch(() => undefined)
     return () => {
@@ -407,7 +429,7 @@ export function PeriodicalTreePage() {
   /**
    * 「下载后阅读」是这一页唯一会创建下载的地方。
    *
-   * 它只调用既有 `createDownloadForMediaItem(mediaItemId)`：页面不碰 IPC、URL、SQLite，
+   * 它只调用既有 `startDownloadFromProjection(info, mediaItemId)`：页面不碰 IPC、URL、SQLite，
    * 也不因为创建成功就导航或改口说可读——创建成功只说明任务建好了，能不能读要由重新
    * 读到的真实能力决定。
    *
@@ -426,9 +448,13 @@ export function PeriodicalTreePage() {
     if (!canStartArticleDownload(current?.info, current?.failed ?? false, providerAvailability)) return
     // 点击时复核在途标记：同一篇已有创建请求时不重复提交（不依赖渲染时的旧值）。
     if (downloadAttemptsRef.current[mediaItemId]?.creating === true) return
+    const projected = current?.info
+    if (!projected) return
     setDownloadAttempt(mediaItemId, { creating: true, error: null })
     try {
-      const task = await createDownloadForMediaItem(mediaItemId)
+      // Paused / Interrupted（含仅带 taskId 的恢复事实）由 gateway 按原 taskId 继续 /
+      // 重试，绝不先 create；恢复失败会原样抛出，不会隐式新建另一个任务。
+      const task = await startDownloadFromProjection(projected, mediaItemId)
       if (capabilityGeneration.current !== generation) return
       taskOwners.current.set(task.taskId, { mediaItemId, generation })
       // 创建成功不等于可读：只有重新读到的真实能力才决定这一篇此刻是什么状态。
@@ -655,6 +681,7 @@ function ArticleRow({
   const opens = presentation.state === "readable"
   const retries = presentation.state === "unknown"
   const downloads = presentation.state === "download_only" || presentation.state === "download_failed"
+    || presentation.state === "download_paused" || presentation.state === "download_interrupted"
   const buttonLabel = ARTICLE_BUTTON_LABEL[presentation.state]
 
   return (

@@ -200,7 +200,7 @@ mod tests {
   <Url type="text/html" template="http://www.gutenberg.org/ebooks/search/?query={searchTerms}"/>
   <Url type="application/atom+xml" template="http://m.gutenberg.org/ebooks/search.opds/?query={searchTerms}"/>
 </OpenSearchDescription>"#;
-        let tpl = extract_atom_template(desc).unwrap();
+        let tpl = extract_atom_template(desc).unwrap().template;
         let url = absolutize(
             "https://www.gutenberg.org/catalog/osd-books.xml",
             &tpl.replace("{searchTerms}", &urlencode("frankenstein")),

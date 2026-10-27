@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { MemoryRouter, Route, Routes } from "react-router"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { EditionDetailDto, MediaItemSummaryDto, PrimaryActionDto } from "@/lib/ipc/generated/wire"
+import type { MediaItemDownloadInfo } from "@/features/downloads/ipc/download-gateway"
 import { EditionDetailPage } from "./EditionDetailPage"
 
 const editionGateway = vi.hoisted(() => ({
@@ -16,12 +17,34 @@ const downloadGateway = vi.hoisted(() => ({
   subscribeDownloadEvents: vi.fn(),
 }))
 
+const resumeClient = vi.hoisted(() => ({
+  downloadResume: vi.fn(async ({ taskId }: { taskId: string }) => ({ taskId, state: "queued" })),
+  downloadRetry: vi.fn(async ({ taskId }: { taskId: string }) => ({ taskId, state: "queued" })),
+}))
 vi.mock("@/lib/ipc/runtime", () => ({ getHavenClientMode: () => "tauri" }))
 vi.mock("../ipc/edition-gateway", () => ({
   getEdition: editionGateway.getEdition,
   normalizeEditionError: (error: unknown) => error,
 }))
-vi.mock("@/features/downloads/ipc/download-gateway", () => downloadGateway)
+vi.mock("@/features/downloads/ipc/download-gateway", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/features/downloads/ipc/download-gateway")>()
+  return {
+    ...actual,
+    ...downloadGateway,
+    // Paused / interrupted go through the REAL resume / retry selection, whose
+    // IPC is faked by `resumeClient`; idle creates through the mocked create so
+    // the handler's real mediaItemId stays visible to assertions.
+    startDownloadFromProjection: (
+      info: { status: string },
+      mediaItemId: string,
+      client?: unknown,
+    ) => (
+      info.status === "paused" || info.status === "interrupted"
+        ? actual.startDownloadFromProjection(info as never, mediaItemId, (client ?? resumeClient) as never)
+        : downloadGateway.createDownloadForMediaItem(mediaItemId)
+    ),
+  }
+})
 
 const action = (kind: PrimaryActionDto["kind"], mediaItemId: string): PrimaryActionDto => ({
   kind,
@@ -31,15 +54,10 @@ const action = (kind: PrimaryActionDto["kind"], mediaItemId: string): PrimaryAct
   locator: null,
 })
 
-const capability = (overrides: Partial<{
-  status: "idle" | "queued" | "downloaded"
-  canDownload: boolean
-  hasOfflineResource: boolean
-  canOnlineRead: boolean
-  sourceResourceId: string | null
-  taskId: string | null
-}> = {}) => ({
+const capability = (overrides: Partial<MediaItemDownloadInfo> = {}): MediaItemDownloadInfo => ({
   status: "idle" as const,
+  taskState: null,
+  offlineResourceId: null,
   canDownload: false,
   hasOfflineResource: false,
   canOnlineRead: false,
@@ -112,6 +130,40 @@ afterEach(() => {
 })
 
 describe("EditionDetailPage reading actions", () => {
+  it("closes the event gap after a delayed subscription becomes ready", async () => {
+    let ready!: (cleanup: () => Promise<void>) => void
+    downloadGateway.subscribeDownloadEvents.mockImplementation(() => new Promise((resolve) => { ready = resolve }))
+    let current = capability({ status: "queued", canDownload: true, taskId: "task-1" })
+    downloadGateway.getMediaItemsDownloadInfo.mockResolvedValue(new Map([["media-1", current]]))
+    downloadGateway.getMediaItemDownloadInfo.mockImplementation(async () => current)
+    renderPage()
+    await screen.findByText("下载中")
+    current = capability({ status: "downloaded", hasOfflineResource: true, taskId: "task-1" })
+    ready(async () => undefined)
+    expect(await screen.findByText(/已下载/)).toBeTruthy()
+    expect(screen.getByRole("button", { name: "打开" }).hasAttribute("disabled")).toBe(false)
+  })
+
+  it("does not let the initial batch overwrite a terminal-event refresh", async () => {
+    let release!: (value: Map<string, ReturnType<typeof capability>>) => void
+    const queued = capability({ status: "queued", canDownload: true, taskId: "task-1" })
+    let current = queued
+    let onEvent!: (event: { data: { taskId: string; state: string } }) => void
+    downloadGateway.getMediaItemsDownloadInfo.mockImplementation(() => new Promise((resolve) => { release = resolve }))
+    downloadGateway.getMediaItemDownloadInfo.mockImplementation(async () => current)
+    downloadGateway.subscribeDownloadEvents.mockImplementation(async (callback: typeof onEvent) => {
+      onEvent = callback
+      return async () => undefined
+    })
+    renderPage()
+    await waitFor(() => expect(onEvent).toBeDefined())
+    current = capability({ status: "downloaded", hasOfflineResource: true, taskId: "task-1" })
+    onEvent({ data: { taskId: "task-1", state: "completed" } })
+    release(new Map([["media-1", queued]]))
+    expect(await screen.findByText(/已下载/)).toBeTruthy()
+    expect(screen.getByRole("button", { name: "打开" }).hasAttribute("disabled")).toBe(false)
+  })
+
   it("loads capability for every media item and opens an online-readable document", async () => {
     const readable = item({
       mediaItemId: "media-readable",
@@ -128,6 +180,7 @@ describe("EditionDetailPage reading actions", () => {
       ["media-readable", capability({ canOnlineRead: true })],
       ["media-unavailable", capability()],
     ]))
+    downloadGateway.getMediaItemDownloadInfo.mockImplementation(async (id: string) => capability({ canOnlineRead: id === "media-readable" }))
 
     renderPage()
 
@@ -167,6 +220,55 @@ describe("EditionDetailPage reading actions", () => {
     expect(screen.queryByText("reader route")).toBeNull()
   })
 
+  it("resumes a paused task on the same id instead of creating and never says 下载中", async () => {
+    const row = item({ mediaItemId: "media-paused", title: "暂停的期号", primaryAction: action("reader", "media-paused") })
+    editionGateway.getEdition.mockResolvedValue(detail([row]))
+    let current = capability({
+      status: "paused",
+      taskState: "paused",
+      canDownload: false,
+      canOnlineRead: true,
+      taskId: "task-paused",
+    })
+    downloadGateway.getMediaItemsDownloadInfo.mockResolvedValue(new Map([["media-paused", current]]))
+    downloadGateway.getMediaItemDownloadInfo.mockImplementation(async () => current)
+
+    renderPage()
+
+    expect(await screen.findByText(/下载已暂停/)).toBeTruthy()
+    expect(screen.queryByText("下载中")).toBeNull()
+    resumeClient.downloadResume.mockImplementationOnce(async ({ taskId }) => {
+      current = capability({ status: "queued", taskState: "queued", taskId })
+      return { taskId, state: "queued" }
+    })
+    fireEvent.click(screen.getByRole("button", { name: "继续下载" }))
+    await waitFor(() => expect(resumeClient.downloadResume).toHaveBeenCalledWith({ taskId: "task-paused" }))
+    expect(resumeClient.downloadRetry).not.toHaveBeenCalled()
+    expect(downloadGateway.createDownloadForMediaItem).not.toHaveBeenCalled()
+    expect(await screen.findByText("下载中")).toBeTruthy()
+  })
+
+  it("retries an interrupted task on the same id instead of creating", async () => {
+    const row = item({ mediaItemId: "media-stopped", title: "中断的期号", primaryAction: action("reader", "media-stopped") })
+    editionGateway.getEdition.mockResolvedValue(detail([row]))
+    const current = capability({
+      status: "interrupted",
+      taskState: "interrupted",
+      canDownload: false,
+      canOnlineRead: true,
+      taskId: "task-stopped",
+    })
+    downloadGateway.getMediaItemsDownloadInfo.mockResolvedValue(new Map([["media-stopped", current]]))
+    downloadGateway.getMediaItemDownloadInfo.mockImplementation(async () => current)
+
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "重试下载" }))
+    await waitFor(() => expect(resumeClient.downloadRetry).toHaveBeenCalledWith({ taskId: "task-stopped" }))
+    expect(resumeClient.downloadResume).not.toHaveBeenCalled()
+    expect(downloadGateway.createDownloadForMediaItem).not.toHaveBeenCalled()
+  })
+
   it("uses the article route selected by PrimaryActionDto", async () => {
     const article = item({
       mediaItemId: "media-article",
@@ -176,6 +278,7 @@ describe("EditionDetailPage reading actions", () => {
     })
     editionGateway.getEdition.mockResolvedValue(detail([article]))
     downloadGateway.getMediaItemsDownloadInfo.mockResolvedValue(new Map([["media-article", capability({ canOnlineRead: true })]]))
+    downloadGateway.getMediaItemDownloadInfo.mockResolvedValue(capability({ canOnlineRead: true }))
 
     renderPage()
 
@@ -203,7 +306,10 @@ describe("EditionDetailPage reading actions", () => {
     downloadGateway.getMediaItemsDownloadInfo.mockResolvedValue(new Map([
       ["media-readable", capability({ canOnlineRead: true })],
     ]))
-    downloadGateway.getMediaItemDownloadInfo.mockResolvedValue(capability({ canOnlineRead: true }))
+    downloadGateway.getMediaItemDownloadInfo.mockImplementation(async (id: string) => {
+      if (id === "media-broken") throw new Error("capability unavailable")
+      return capability({ canOnlineRead: true })
+    })
 
     renderPage()
 
@@ -214,6 +320,7 @@ describe("EditionDetailPage reading actions", () => {
     expect(screen.queryByText(/正在读取能力/)).toBeNull()
     expect(screen.queryByText("当前内容暂不可用")).toBeNull()
 
+    downloadGateway.getMediaItemDownloadInfo.mockResolvedValue(capability({ canOnlineRead: true }))
     fireEvent.click(screen.getByRole("button", { name: "重试" }))
     await waitFor(() => expect(downloadGateway.getMediaItemDownloadInfo).toHaveBeenCalledWith("media-broken"))
     // 单篇重查拿到真实能力后，这一行回到可打开状态。

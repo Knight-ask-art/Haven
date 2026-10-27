@@ -9,11 +9,11 @@ import { FootprintsPage } from "./FootprintsPage"
 
 const {
   getContinueFootprintItems, getRecentActivityFootprintItems, getFavoriteFootprintItems, getMarkerFootprintCards,
-  getMediaItemDownloadInfo, subscribeDownloadEvents, createDownloadForMediaItem, deleteOfflineDownload,
+  getMediaItemDownloadInfo, subscribeDownloadEvents, startDownloadFromProjection, deleteOfflineDownload,
 } = vi.hoisted(() => ({
   getContinueFootprintItems: vi.fn<() => Promise<FootprintActionCard[]>>(),
   getRecentActivityFootprintItems: vi.fn(), getFavoriteFootprintItems: vi.fn(), getMarkerFootprintCards: vi.fn(),
-  getMediaItemDownloadInfo: vi.fn(), subscribeDownloadEvents: vi.fn(), createDownloadForMediaItem: vi.fn(), deleteOfflineDownload: vi.fn(),
+  getMediaItemDownloadInfo: vi.fn(), subscribeDownloadEvents: vi.fn(), startDownloadFromProjection: vi.fn(), deleteOfflineDownload: vi.fn(),
 }))
 
 vi.mock("../ipc/footprints-gateway", async (importOriginal) => ({
@@ -22,7 +22,7 @@ vi.mock("../ipc/footprints-gateway", async (importOriginal) => ({
 }))
 vi.mock("@/features/downloads/ipc/download-gateway", () => ({
   getMediaItemDownloadInfo, subscribeDownloadEvents,
-  createDownloadForMediaItem, deleteOfflineDownload, revealOfflineDownload: vi.fn(),
+  startDownloadFromProjection, deleteOfflineDownload, revealOfflineDownload: vi.fn(),
 }))
 vi.mock("@/lib/ipc/runtime", () => ({ getHavenClientMode: () => "tauri" }))
 vi.mock("@/lib/ipc/events", () => ({ onFavoriteChanged: vi.fn(async () => () => undefined) }))
@@ -82,7 +82,7 @@ beforeEach(() => {
   getMarkerFootprintCards.mockReset().mockResolvedValue([])
   getContinueFootprintItems.mockReset()
   getMediaItemDownloadInfo.mockReset()
-  createDownloadForMediaItem.mockReset()
+  startDownloadFromProjection.mockReset().mockResolvedValue({ taskId: "task-hero", state: "queued" })
   subscribeDownloadEvents.mockReset().mockResolvedValue(async () => undefined)
   deleteOfflineDownload.mockReset().mockResolvedValue(undefined)
   vi.spyOn(window, "confirm").mockReturnValue(true)
@@ -90,6 +90,27 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
+})
+
+describe("FootprintsPage hero download recovery", () => {
+  it("hands a paused projection to the recovery path that resumes the same task", async () => {
+    const hero = card("hero", "Hero 项", "2026-09-07T00:00:03.000Z")
+    getContinueFootprintItems.mockResolvedValue([hero])
+    const paused = {
+      status: "paused", taskState: "paused", canDownload: false,
+      hasOfflineResource: false, canOnlineRead: true, sourceResourceId: null, taskId: "task-paused", offlineResourceId: null,
+    }
+    getMediaItemDownloadInfo.mockResolvedValue(paused)
+    startDownloadFromProjection.mockResolvedValue({ taskId: "task-paused", state: "queued" })
+
+    render(<MemoryRouter initialEntries={["/footprints"]}><FootprintsPage /></MemoryRouter>)
+    await waitFor(() => expect(getMediaItemDownloadInfo).toHaveBeenCalled())
+    fireEvent.click(await screen.findByRole("button", { name: /下载/ }))
+
+    // The gateway receives the authoritative projection and decides resume on
+    // the same task id; the page never creates a replacement task.
+    await waitFor(() => expect(startDownloadFromProjection).toHaveBeenCalledWith(expect.objectContaining({ status: "paused", taskId: "task-paused" }), "media-hero"))
+  })
 })
 
 describe("FootprintsPage opening races", () => {
@@ -100,13 +121,14 @@ describe("FootprintsPage opening races", () => {
     getContinueFootprintItems.mockResolvedValue([b, c])
     getMediaItemDownloadInfo
       .mockResolvedValueOnce({ canOnlineRead: true, hasOfflineResource: false, canDownload: false })
+      .mockResolvedValueOnce({ canOnlineRead: true, hasOfflineResource: false, canDownload: false })
       .mockImplementationOnce(() => lateB.promise)
       .mockResolvedValueOnce({ canOnlineRead: true, hasOfflineResource: false, canDownload: false })
 
     render(<MemoryRouter initialEntries={["/footprints"]}><FootprintsPage /><Location /></MemoryRouter>)
     // The Hero's initial capability projection is independent from the two
     // user actions below. Wait for it so the deferred result belongs to B.
-    await waitFor(() => expect(getMediaItemDownloadInfo).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(getMediaItemDownloadInfo).toHaveBeenCalledTimes(2))
     fireEvent.click(await screen.findByRole("button", { name: "打开 B 项" }))
     fireEvent.click(screen.getByRole("button", { name: "打开 C 项" }))
     await waitFor(() => expect(screen.getByTestId("location").textContent).toBe("/reader/media-c"))
@@ -122,6 +144,7 @@ describe("FootprintsPage opening races", () => {
     const hero = card("hero", "Hero 项", "2026-09-07T00:00:03.000Z")
     getContinueFootprintItems.mockResolvedValue([hero])
     getMediaItemDownloadInfo
+      .mockResolvedValueOnce({ canOnlineRead: false, hasOfflineResource: false, canDownload: true, taskId: "task-hero" })
       .mockResolvedValueOnce({ canOnlineRead: false, hasOfflineResource: false, canDownload: true, taskId: "task-hero" })
       .mockImplementation(() => refresh.promise)
     subscribeDownloadEvents.mockImplementation(async (callback: typeof onEvent) => {
@@ -153,6 +176,7 @@ describe("FootprintsPage opening races", () => {
     const removedInfo = { canOnlineRead: false, hasOfflineResource: false, canDownload: true, taskId: null }
     getContinueFootprintItems.mockResolvedValue([hero])
     getMediaItemDownloadInfo
+      .mockResolvedValueOnce(offlineInfo)
       .mockResolvedValueOnce(offlineInfo)
       .mockImplementationOnce(() => staleRefresh.promise)
       .mockResolvedValueOnce(removedInfo)
@@ -191,6 +215,7 @@ describe("FootprintsPage opening races", () => {
     getContinueFootprintItems.mockResolvedValue([hero])
     getMediaItemDownloadInfo
       .mockResolvedValueOnce(offlineInfo)
+      .mockResolvedValueOnce(offlineInfo)
       .mockImplementationOnce(() => {
         queueMicrotask(() => {
           staleEventDispatched = true
@@ -209,7 +234,7 @@ describe("FootprintsPage opening races", () => {
     await waitFor(() => expect(onEvent).toBeDefined())
     fireEvent.click(screen.getByRole("button", { name: "删除离线内容" }))
     await waitFor(() => expect(staleEventDispatched).toBe(true))
-    expect(getMediaItemDownloadInfo).toHaveBeenCalledTimes(2)
+    expect(getMediaItemDownloadInfo).toHaveBeenCalledTimes(3)
 
     deleteReadBack.resolve(removedInfo)
 
@@ -224,6 +249,7 @@ describe("FootprintsPage opening races", () => {
     const removedInfo = { canOnlineRead: false, hasOfflineResource: false, canDownload: true, taskId: null }
     getContinueFootprintItems.mockResolvedValue([hero])
     getMediaItemDownloadInfo
+      .mockResolvedValueOnce(offlineInfo)
       .mockResolvedValueOnce(offlineInfo)
       .mockResolvedValueOnce(removedInfo)
     deleteOfflineDownload.mockRejectedValueOnce(new Error("delete failed"))
@@ -250,6 +276,7 @@ describe("FootprintsPage opening races", () => {
     getContinueFootprintItems.mockResolvedValue([hero])
     getMediaItemDownloadInfo
       .mockResolvedValueOnce(offlineInfo)
+      .mockResolvedValueOnce(offlineInfo)
       .mockRejectedValueOnce(new Error("refresh failed"))
       .mockResolvedValueOnce(removedInfo)
 
@@ -261,7 +288,7 @@ describe("FootprintsPage opening races", () => {
     const retry = screen.getByRole("button", { name: "重试" })
     fireEvent.click(retry)
 
-    await waitFor(() => expect(getMediaItemDownloadInfo).toHaveBeenCalledTimes(3))
+    await waitFor(() => expect(getMediaItemDownloadInfo).toHaveBeenCalledTimes(4))
     expect(screen.getByTestId("hero-offline").textContent).toBe("false")
   })
 
@@ -275,24 +302,28 @@ describe("FootprintsPage opening races", () => {
     getMediaItemDownloadInfo
       .mockResolvedValueOnce(idleInfo)
       .mockResolvedValueOnce(idleInfo)
+      .mockResolvedValueOnce(idleInfo)
       .mockResolvedValueOnce(queuedInfo)
       .mockResolvedValueOnce(completedInfo)
     subscribeDownloadEvents.mockImplementation(async (callback: typeof onEvent) => {
       onEvent = callback
       return async () => undefined
     })
-    createDownloadForMediaItem.mockImplementation(async () => {
+    // 终态事件要在创建请求在途、身份尚未落地时到达：创建响应由测试自己放行。
+    const creation = deferred<{ taskId: string; state: string }>()
+    startDownloadFromProjection.mockImplementation(() => {
       onEvent?.({ data: { taskId: "task-hero" } })
-      return { taskId: "task-hero", state: "downloading" }
+      return creation.promise
     })
 
     render(<MemoryRouter initialEntries={["/footprints"]}><FootprintsPage /></MemoryRouter>)
     await waitFor(() => expect(onEvent).toBeDefined())
-    await waitFor(() => expect(getMediaItemDownloadInfo).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(getMediaItemDownloadInfo).toHaveBeenCalledTimes(2))
     fireEvent.click(screen.getByRole("button", { name: "下载 Hero 项" }))
+    await waitFor(() => expect(startDownloadFromProjection).toHaveBeenCalledTimes(1))
+    creation.resolve({ taskId: "task-hero", state: "downloading" })
 
     await waitFor(() => expect(screen.getByTestId("hero-offline").textContent).toBe("true"))
-    expect(getMediaItemDownloadInfo).toHaveBeenCalledTimes(4)
   })
 
   it("keeps observing a created task when its first read-back is an older idle snapshot", async () => {
@@ -305,17 +336,18 @@ describe("FootprintsPage opening races", () => {
       .mockResolvedValueOnce(idleInfo)
       .mockResolvedValueOnce(idleInfo)
       .mockResolvedValueOnce(idleInfo)
+      .mockResolvedValueOnce(idleInfo)
       .mockResolvedValueOnce(completedInfo)
     subscribeDownloadEvents.mockImplementation(async (callback: typeof onEvent) => {
       onEvent = callback
       return async () => undefined
     })
-    createDownloadForMediaItem.mockResolvedValue({ taskId: "task-hero", state: "downloading" })
+    startDownloadFromProjection.mockResolvedValue({ taskId: "task-hero", state: "downloading" })
 
     render(<MemoryRouter initialEntries={["/footprints"]}><FootprintsPage /></MemoryRouter>)
     await waitFor(() => expect(onEvent).toBeDefined())
     fireEvent.click(screen.getByRole("button", { name: "下载 Hero 项" }))
-    await waitFor(() => expect(getMediaItemDownloadInfo).toHaveBeenCalledTimes(3))
+    await waitFor(() => expect(getMediaItemDownloadInfo).toHaveBeenCalledTimes(4))
 
     onEvent?.({ data: { taskId: "task-hero" } })
 

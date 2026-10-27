@@ -3,6 +3,7 @@ import { useNavigate } from "react-router"
 import { cn } from "@/lib/utils"
 import { Play, Heart, Download, Ellipsis, Info, RotateCcw, Folder, Share2, Trash2 } from "lucide-react"
 import { ShareCardModal } from "@/components/ui/haven/ShareCardModal"
+import { presentMediaItemDownloadAction, type DownloadStatus } from "@/features/downloads/ipc/download-gateway"
 
 export interface HavenStageProps {
   id: string
@@ -14,6 +15,8 @@ export interface HavenStageProps {
   primaryActionLabel: string
   isDownloaded?: boolean
   canManageOffline?: boolean
+  /** Paused / Interrupted download state: the download button says resume / retry. */
+  downloadStatus?: DownloadStatus
   isFavorite?: boolean
   isActionPending?: boolean
   onPrimaryAction?: () => void
@@ -30,6 +33,7 @@ export function HavenStage({
   primaryActionLabel,
   isDownloaded = true,
   canManageOffline = false,
+  downloadStatus = "idle",
   isFavorite: favoriteProp = false,
   isActionPending = false,
   onPrimaryAction,
@@ -41,6 +45,7 @@ export function HavenStage({
   const [isShareModalOpen, setIsShareModalOpen] = useState(false)
   const [isFavorite, setIsFavorite] = useState(favoriteProp)
   const [downloadState, setDownloadState] = useState(isDownloaded)
+  const downloadAction = presentMediaItemDownloadAction(downloadStatus)
   const menuRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => setIsFavorite(favoriteProp), [favoriteProp])
@@ -163,10 +168,15 @@ export function HavenStage({
 
                 <button
                   disabled={isActionPending}
+                  aria-label={downloadState ? "已下载" : downloadAction.label}
                   onClick={() => {
                     onAction?.('download')
                   }}
-                  title={downloadState ? "已下载" : "下载至本地"}
+                  title={downloadState
+                    ? "已下载"
+                    : downloadAction.kind === "resume" || downloadAction.kind === "retry"
+                      ? downloadAction.hint ?? undefined
+                      : "下载至本地"}
                   className={cn(
                     "flex items-center justify-center w-[64px] h-[64px] rounded-full cursor-pointer",
                     "bg-black/5 dark:bg-white/10 backdrop-blur-md border border-black/5 dark:border-white/10",

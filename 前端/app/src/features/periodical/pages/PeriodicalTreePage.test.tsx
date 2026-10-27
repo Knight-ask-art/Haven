@@ -429,6 +429,8 @@ const client = {
     downloadListeners.add(onEvent)
     return async () => { downloadListeners.delete(onEvent) }
   }),
+  downloadResume: vi.fn(),
+  downloadRetry: vi.fn(),
 }
 
 function ArticleReaderMarker() {
@@ -537,6 +539,8 @@ beforeEach(() => {
   client.resourceListByMediaItem.mockClear()
   client.downloadList.mockClear()
   client.downloadCreate.mockClear()
+  client.downloadResume.mockReset()
+  client.downloadRetry.mockReset()
   client.downloadSubscribe.mockClear()
   client.storageLocationList.mockClear()
   client.periodicalTreeGet.mockResolvedValue(tree())
@@ -547,6 +551,28 @@ afterEach(() => {
 })
 
 describe("PeriodicalTreePage", () => {
+  it("re-reads a completed task before its initial snapshot has established ownership", async () => {
+    resourcesByMediaItem.set(MEDIA_A, downloadOnly(MEDIA_A))
+    resourcesByMediaItem.set(MEDIA_B, notReadable())
+    resourcesByMediaItem.set(MEDIA_C, notReadable())
+    const task = await client.downloadCreate({ sourceResourceId: `resource-${MEDIA_A}`, targetStorageId: DOWNLOAD_TARGET })
+    const gate = defer()
+    let held = false
+    client.downloadList.mockImplementationOnce(async () => {
+      const snapshot = downloadTasks.map((item) => ({ ...item }))
+      held = true
+      await gate.promise
+      return snapshot
+    })
+    renderPage()
+    await waitFor(() => expect(held && downloadListeners.size > 0).toBe(true))
+    completeDownload(task.taskId)
+    await act(async () => { emitDownloadEvent({ taskId: task.taskId, state: "completed", offlineResourceId: `offline-${MEDIA_A}` }) })
+    await act(async () => { gate.resolve() })
+    await waitFor(() => expect(within(articleRow(TITLE_A)).getByText("可离线阅读")).toBeTruthy())
+    expect((openButton(TITLE_A) as HTMLButtonElement).disabled).toBe(false)
+  })
+
   it("rechecks after a completion event arrives during an older capability snapshot", async () => {
     resourcesByMediaItem.set(MEDIA_A, downloadOnly(MEDIA_A))
     resourcesByMediaItem.set(MEDIA_B, notReadable())
@@ -760,6 +786,36 @@ describe("PeriodicalTreePage", () => {
     expect(downloading.disabled).toBe(true)
     expect(downloading.textContent).toBe("下载中")
     expect(screen.queryByTestId("article-reader")).toBeNull()
+  })
+
+  it("resumes an interrupted article task on the same id and never creates another", async () => {
+    resourcesByMediaItem.set(MEDIA_A, downloadOnly(MEDIA_A))
+    resourcesByMediaItem.set(MEDIA_B, notReadable())
+    resourcesByMediaItem.set(MEDIA_C, notReadable())
+    const stamp = "2026-09-15T00:00:00.000Z"
+    const interrupted: DownloadTaskDto = {
+      schemaVersion: 1, taskId: "task-interrupted", workId: WORK_ID, editionId: null, mediaItemId: MEDIA_A,
+      sourceResourceId: `resource-${MEDIA_A}`, targetStorageId: DOWNLOAD_TARGET, offlineResourceId: null,
+      title: "示范文章", mediaType: "article", category: "periodical", posterUri: null, state: "interrupted",
+      bytesTotal: null, bytesDownloaded: 10, speedBps: null, etaSeconds: null, progressRatio: null,
+      createdAt: stamp, updatedAt: stamp,
+    }
+    downloadTasks.push({ ...interrupted })
+    client.downloadRetry.mockImplementationOnce(async ({ taskId }: { taskId: string }) => {
+      const task = downloadTasks.find((candidate) => candidate.taskId === taskId)!
+      task.state = "queued"
+      return task
+    })
+    renderPage()
+
+    const button = await waitFor(() => openButton(TITLE_A))
+    await waitFor(() => expect(within(articleRow(TITLE_A)).getByText("下载已中断 · 可重试下载")).toBeTruthy())
+    expect(button.getAttribute("aria-label")).toBe(`重试下载《${TITLE_A}》`)
+    fireEvent.click(button)
+
+    await waitFor(() => expect(client.downloadRetry).toHaveBeenCalledWith({ taskId: "task-interrupted" }))
+    expect(client.downloadCreate).not.toHaveBeenCalled()
+    expect(client.downloadResume).not.toHaveBeenCalled()
   })
 
   it("does not submit a second download while one is being created or queued", async () => {
