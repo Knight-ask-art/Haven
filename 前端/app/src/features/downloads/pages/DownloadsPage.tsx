@@ -325,6 +325,52 @@ export function DownloadsPage() {
   const activeCount = tasks.filter((task) => ACTIVE_STATES.has(task.state)).length
   const completedCount = tasks.filter((task) => task.state === "completed").length
   const issueCount = tasks.filter((task) => task.state === "failed" || task.state === "interrupted").length
+  /**
+   * 是不是"当前筛选没有匹配"，而不是"整个下载库没有任务"。
+   *
+   * 页头计数用的是全量 `tasks`：库里明明有需处理的任务，列表却因为状态/分类/搜索词不匹配
+   * 而空掉，此时显示「当前没有下载任务 / 从作品详情页选择内容」是在否认页头自己刚说出的事实。
+   */
+  const hasActiveFilters = category !== "all" || status !== "all" || query.trim().length > 0
+  const filteredEmpty = tasks.length > 0 && filteredTasks.length === 0 && hasActiveFilters
+  /**
+   * 只清这三项筛选（分类/状态/搜索词）：本地搜索框与排序都是本页状态，分类/状态在 URL 里。
+   *
+   * `setSearchParams` 只删除这两个参数，URL 上其它无关参数原样保留；排序（本地 state）与
+   * 搜索词（同样只在本地）也因此不被牵连——`setQuery("")` 是唯一一处清掉搜索词的地方。
+   */
+  const clearFilters = () => {
+    setQuery("")
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev)
+      next.delete("category")
+      next.delete("status")
+      return next
+    }, { replace: true })
+  }
+  const filteredEmptyState = (
+    <div
+      data-testid="downloads-filter-empty"
+      className="flex min-h-[160px] flex-col items-center justify-center gap-[6px] text-center text-muted-foreground"
+    >
+      <HavenIcon symbol="search" size={32} className="mb-[6px] opacity-60" />
+      <p className="text-sm font-semibold text-foreground">没有符合当前筛选的下载任务</p>
+      <p className="max-w-[420px] text-xs leading-5">
+        下载库中还有 {tasks.length} 个任务，但当前
+        {status !== "all" ? `「${STATUS_OPTIONS.find((option) => option.id === status)?.label ?? ""}」状态` : ""}
+        {category !== "all" ? `「${CATEGORY_OPTIONS.find((option) => option.id === category)?.label ?? ""}」分类` : ""}
+        {query.trim() ? `${status !== "all" || category !== "all" ? "与" : ""}搜索词「${query.trim()}」` : ""}
+        下没有匹配项。
+      </p>
+      <button
+        type="button"
+        onClick={clearFilters}
+        className="mt-[4px] rounded-full border border-border/60 px-[14px] py-[6px] text-xs font-semibold text-foreground transition-colors hover:bg-muted"
+      >
+        清除筛选
+      </button>
+    </div>
+  )
   const visibleErrorMessage = errorMessage ?? subscriptionErrorMessage
   const retryVisibleError = () => {
     if (subscriptionErrorMessage) setSubscriptionRevision((current) => current + 1)
@@ -470,6 +516,19 @@ export function DownloadsPage() {
             )}
             <DownloadTaskList
               tasks={singleTasks}
+              // 批次行本身也算"可见"：批次填充时单条列表不会渲染，照样传 `undefined`
+              // 就会在批次行**下面**再写一句"当前没有下载任务"，否认上面刚画出来的批次。
+              // 因此只有"确实没有任何可见行"时才交空态：筛选无匹配给筛选空态，其余缺省
+              // 交给组件自己的全库空态；批次行可见时传 `null`（不写任何空态）。
+              emptyState={
+                singleTasks.length > 0
+                  ? undefined
+                  : batchGroups.length > 0
+                    ? null
+                    : filteredEmpty
+                      ? filteredEmptyState
+                      : undefined
+              }
               pendingTaskIds={pendingTaskIds}
               onPause={(id) => void runAction(id, pauseDownload)}
               onResume={(id) => void runAction(id, resumeDownload)}

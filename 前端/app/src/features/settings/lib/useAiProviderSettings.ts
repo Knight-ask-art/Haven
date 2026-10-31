@@ -121,7 +121,13 @@ export interface AiProviderSettingsController {
   credentialConfigured: boolean;
   /** 选中的 profile 是否使用明文端点（历史遗留行）。 */
   selectedEndpointInsecure: boolean;
-  /** 保存失败能否重试：只有"重试真的会重做那件事"时才为 true。 */
+  /**
+   * 保存失败能否重试：只有"重试真的会重做那件事"时才为 true。
+   *
+   * "那件事"必须**还在手里**：`profile` 要有提交时记下的草稿与 CAS 依据，`delete` 要有
+   * 失败时记下的目标。重放依据被作废（放弃草稿 / 属主销毁）之后，失败提示可以留下，
+   * 但「重试」不能出现——否则它按下去什么也不会做。
+   */
   canRetrySaveError: boolean;
   selectProfile: (profileId: string | null) => void;
   reload: () => Promise<void>;
@@ -141,6 +147,29 @@ export interface AiProviderSettingsController {
    * 被拒，避免与待确认的那次删除交错留下孤儿 secret。取消纯草稿不算写入，不受影响。
    */
   setDeleteConfirmPending: (pending: boolean) => void;
+  /**
+   * 作废一次**已放弃的 profile 草稿**留下的失败快照。
+   *
+   * 用户点「放弃」时，屏幕上那份输入连同它的重放入口一起失效：若失败快照仍然保留，
+   * 错误横幅上的「重试」仍会重放刚刚被放弃的那一份草稿，把它写回本机——用户明明已经
+   * 反悔，界面恢复成已保存值，片刻之后配置却变成了他放弃的内容。
+   *
+   * 它**只**作废 `profile` 动作：删除 / 凭据的失败与草稿无关，不能被牵连清除。
+   * 写入在途时不受理（那一次写入还没有结论），返回 `false` 让调用方据此拒绝放弃。
+   */
+  discardDraftIntent: () => boolean;
+  /**
+   * 草稿**属主被销毁**（面板卸载 / 切走分区 / 路由离开）时作废重放意图。
+   *
+   * 与 [`discardDraftIntent`] 是同一条失效路径，差别只有一条：写入在途时**也**照样作废。
+   * 用户按「放弃」不能假装取消一次还没有结论的写入，所以那条入口在途时拒绝；但属主消失
+   * 不是用户的取消动作，而是那份输入真的不在了——浏览器历史不会等关闭守卫。写入照旧
+   * 走完（不取消请求、不改 CAS，后端结果如实回读），只是迟到的失败不能再带回来一份
+   * 可被下一次打开面板的「重试」重放的草稿。
+   *
+   * 一样**只**作废 `profile` 动作：删除 / 凭据的失败与草稿无关，不能被牵连清除。
+   */
+  disposeDraftOwner: () => void;
   dismissSaveError: () => void;
 }
 
@@ -242,6 +271,16 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
     draft: AiProviderProfileDraft;
     expectedRevision: string | null;
   } | null>(null);
+  /**
+   * 最近一次**在途**保存，用于在写入在途时拒绝草稿作废。
+   *
+   * 放弃草稿会作废失败的写入，但绝不能作废一次还没有结论的写入：请求可能已经落盘，
+   * 此时把失败快照清掉只会让结果无处可报。
+   *
+   * 同一枚同步闸门也用来拒绝**重复提交**：`state.saving` 落后一次渲染，双击或两个入口
+   * 先后提交时只有它拦得住第二次写入（见 `runProfileSave` 入口）。
+   */
+  const profileSaveInFlight = useRef(false);
 
   /**
    * 失败的那一次删除指向的是**哪一个** profile。
@@ -431,6 +470,11 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
     // 删除确认在途时整段 profile 写入都停下来：确认框是异步的，期间任何一次
     // 保存 / 启用 / 选模型都会写到"用户正在决定要删掉的那一份"上。
     if (deleteConfirmInFlight.current) return false;
+    // 已有一次保存在途时，第二次提交必须在这里就地拒绝：这是一道**同步**闸门，
+    // UI 依赖的 `state.saving` 要等下一次渲染才生效，双击或两个入口同时提交时拦不住。
+    // 它必须在记录重放请求与改动任何状态之前生效——否则第二次提交会覆盖
+    // `lastSaveRequest`（重试改写成另一份输入），并把第一次的结果挤进同一份状态里。
+    if (profileSaveInFlight.current) return false;
     const existing = state.profiles.find(
       (profile) => profile.profileId === draft.profileId,
     );
@@ -482,6 +526,7 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
       return false;
     }
     lastSaveRequest.current = { draft, expectedRevision };
+    profileSaveInFlight.current = true;
     setState((current) => ({
       ...current,
       saving: true,
@@ -526,6 +571,9 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
       // 回读不清空 `saveError`，也不触碰页面持有的草稿：失败提示与未保存输入都保留。
       await load(draft.profileId);
       return false;
+    } finally {
+      // 写入结论已经落到状态里（成功或失败快照），此刻才允许"放弃草稿"去作废失败快照。
+      profileSaveInFlight.current = false;
     }
   }, [load, state.loadError, state.loading, state.profiles]);
 
@@ -746,6 +794,51 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
     }));
   }, []);
 
+  /**
+   * 作废 profile 草稿的重放依据（唯一实现）。
+   *
+   * `discardDraftIntent`（用户显式放弃）与 `disposeDraftOwner`（属主被销毁）共用这一条
+   * 失效路径：两处的差别只在"写入在途时受不受理"，作废本身只有一份。只处理 `profile`：
+   * 删除目标的失败快照与用户交回的草稿无关，作废它等于替用户取消一次他还要重试的删除；
+   * 凭据失败的密钥原文本来就不留存，也不需要在这里处理。
+   */
+  const invalidateDraftReplay = useCallback(() => {
+    // 同步清掉可重放的输入：之后任何一次"重试"都不可能再取到这份草稿。
+    lastSaveRequest.current = null;
+    setState((current) => {
+      if (current.saveErrorAction !== "profile") return current;
+      return {
+        ...current,
+        saveError: null,
+        saveErrorAction: null,
+        saveErrorConflict: false,
+      };
+    });
+  }, []);
+
+  /**
+   * 作废**已放弃的 profile 草稿**留下的失败快照（见接口注释）。
+   *
+   * 只服务"用户显式放弃"：写入还没给出结论时不受理——放弃不能假装取消一次可能已经
+   * 提交的写入。属主被销毁时走 [`disposeDraftOwner`]。
+   */
+  const discardDraftIntent = useCallback((): boolean => {
+    if (profileSaveInFlight.current) return false;
+    invalidateDraftReplay();
+    return true;
+  }, [invalidateDraftReplay]);
+
+  /**
+   * 草稿的属主没了（`AiSettings` 卸载 / 路由离开），见接口注释。
+   *
+   * 在途写入不受影响：这里只作废重放依据，不取消请求、不写任何后端状态。写入的迟到结论
+   * 仍会落到 `saveError` 上（用户确实提交过），但 `lastSaveRequest` 已清空，`runProfileSave`
+   * 的 `catch` 也不会把它写回来，因此不存在可以被重新打开的面板重放的陈旧输入。
+   */
+  const disposeDraftOwner = useCallback(() => {
+    invalidateDraftReplay();
+  }, [invalidateDraftReplay]);
+
   const setDeleteConfirmPending = useCallback((pending: boolean) => {
     deleteConfirmInFlight.current = pending;
   }, []);
@@ -777,11 +870,15 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
       selectedProfile !== null && !isAiEndpointTransportAllowed(selectedProfile.endpoint),
     // 只有"重试真的会重做那件事"时才提供重试——凭据写入的密钥原文按设计不留存，
     // CAS 冲突也不能原样重放（旧 revision 会再次冲突，新 revision 会覆盖未读数据）。
+    // 重放依据必须**仍在手里**：放弃草稿或属主销毁会同步清掉它，而失败结论（以及那次
+    // 写入在途的事实）仍如实呈现；此时给出的「重试」只会是一个按下去什么也不做的按钮。
     canRetrySaveError:
       state.saveError !== null
       && state.saveError.retryable
       && !state.saveErrorConflict
-      && (state.saveErrorAction === "profile" || state.saveErrorAction === "delete"),
+      && (state.saveErrorAction === "profile"
+        ? lastSaveRequest.current !== null
+        : state.saveErrorAction === "delete" && lastDeleteTarget.current !== null),
     selectProfile,
     reload: load,
     refreshModels,
@@ -791,6 +888,8 @@ export function useAiProviderSettings(options: AiProviderSettingsOptions = {}): 
     clearApiKey,
     deleteProfile,
     setDeleteConfirmPending,
+    discardDraftIntent,
+    disposeDraftOwner,
     dismissSaveError,
   };
 }

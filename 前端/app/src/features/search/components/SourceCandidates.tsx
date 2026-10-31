@@ -22,6 +22,9 @@ import {
   type SourceWarning,
 } from "../lib/source-warnings"
 
+/** 与 gateway 的 SOURCE_SEARCH_BUSY_CODE 同名：仅用于选择用户文案，不展示内部状态名。 */
+const SOURCE_SEARCH_BUSY = "SOURCE_SEARCH_BUSY"
+
 interface Candidate {
   index: number
   work: WorkCardDto
@@ -184,6 +187,10 @@ export function SourceCandidates({
 
   if (status === "idle") return null
 
+  // 相同关键词的来源搜索尚未结束时，本次订阅拿不到完整历史，来源候选与
+  // 导入索引都不可信；提示原因并把恢复方式留给显式重试。
+  const busyFailure = status === "failed" && errorCode === SOURCE_SEARCH_BUSY
+
   return (
     <section className="search-results__section" aria-labelledby="source-results-heading" aria-busy={status === "searching"}>
       <header className="search-results__section-header">
@@ -202,7 +209,11 @@ export function SourceCandidates({
       {status === "failed" && errorCode !== null && (
         <div className="search-results__notice" role="alert">
           <div className="search-results__notice-toggle">
-            <span>来源搜索暂时不可用（{errorCode ?? "UNKNOWN"}），本地结果不受影响。</span>
+            <span>
+              {busyFailure
+                ? "相同关键词的来源搜索尚未结束，暂时不能重新查询；本地结果不受影响。"
+                : `来源搜索暂时不可用（${errorCode ?? "UNKNOWN"}），本地结果不受影响。`}
+            </span>
             <button type="button" onClick={() => { setErrorCode(null) }} className="search-results__action">知道了</button>
           </div>
         </div>
@@ -250,7 +261,9 @@ export function SourceCandidates({
           <div className="search-results__notice-toggle">
             <span>
               {status === "failed"
-                ? "来源搜索未完成，可重新查询已启用来源。"
+                ? busyFailure
+                  ? "来源搜索尚未结束，可以稍后重新查询已启用来源。"
+                  : "来源搜索未完成，可重新查询已启用来源。"
                 : "部分来源未返回结果，可重新查询已启用来源。"}
             </span>
             <button

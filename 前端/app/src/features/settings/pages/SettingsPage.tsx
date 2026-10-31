@@ -339,16 +339,38 @@ function SettingsContent() {
   const [aiCloseConfirmOpen, setAiCloseConfirmOpen] = useState(false)
   // AI 工作台与设置面板共享控制器；进入 AI 分区就读取保存的配置。
   const ai = useAiProviderSettings({ enabled: activeSection === "ai" })
+  /**
+   * 用户**显式**放弃草稿的入口（关闭面板 → 确认放弃）。写入在途时 Hook 会拒绝——放弃
+   * 不能假装取消一次还没有结论的写入。页面不另存一份草稿或第二个控制器。
+   */
+  const discardAiDraftIntent = ai.discardDraftIntent
+  /**
+   * 草稿**属主被销毁**的入口（切走分区 / 路由离开 / 面板卸载）。
+   *
+   * 面板可以随分区 / 路由消失，而控制器活在页面之上：不作废的话，失败保存的重放请求会
+   * 活过它写的那份草稿，被下一次打开面板的「重试」重放。销毁不是用户的取消动作——浏览器
+   * 历史不会等关闭守卫——所以写入在途时**也**作废（写入照旧走完，迟到的失败只是不再带回
+   * 一份可重放的输入）。
+   */
+  const disposeAiDraftOwner = ai.disposeDraftOwner
+  const abandonAiDraft = useCallback(() => { disposeAiDraftOwner() }, [disposeAiDraftOwner])
   const handleAiDirtyChange = useCallback((dirty: boolean) => { setAiSettingsDirty(dirty) }, [])
   const handleAiBusyChange = useCallback((busy: boolean) => { setAiSettingsBusy(busy) }, [])
-  /** 关闭面板：唯一一处真正把它关掉的地方，顺带把守卫状态复位，避免下次打开带着旧事实。 */
+  /**
+   * 关闭面板：唯一一处真正把它关掉的地方，顺带把守卫状态复位，避免下次打开带着旧事实。
+   *
+   * 关闭会销毁持有草稿的 `AiSettings`，因此它也是一条**草稿作废**边界：
+   * "保存失败 → 关闭 → 确认放弃 → 重新打开 → 重试"不能把已销毁的草稿写回本机。
+   * 写入在途时 `discardDraftIntent` 会拒绝，这里就不再关闭（那一次写入还没有结论）。
+   */
   const closeAiSettings = useCallback(() => {
+    if (!discardAiDraftIntent()) return
     setAiCloseConfirmOpen(false)
     setAiSettingsDirty(false)
     setAiSettingsBusy(false)
     setAiSettingsOpen(false)
     setSearchDestination(null)
-  }, [])
+  }, [discardAiDraftIntent])
   /** 在途写入一律不关（那次写入的结果只挂在即将消失的界面上）；有未保存输入先确认。 */
   const requestCloseAiSettings = useCallback(() => {
     if (aiSettingsBusy) return
@@ -466,7 +488,12 @@ function SettingsContent() {
     if (section === "sync") return
     if (section !== "overview" && !isSettingsSectionId(section)) return
     setSearchDestination(null)
-    if (section === "ai") setAiSettingsOpen(false)
+    // 切走 AI 分区会卸载面板（及它的草稿），控制器却留在页面上：失败重放必须一起作废。
+    // 只作废，不关闭任何东西——切走时面板本来就会消失。
+    if (section === "ai") {
+      abandonAiDraft()
+      setAiSettingsOpen(false)
+    }
     navigate(`/settings/${section}`, { replace: true })
   }
 
@@ -4637,6 +4664,18 @@ type AiProviderProfileDraftState = {
 }
 
 /**
+ * 「已选模型不在当前目录里」在下拉**触发器**上的呈现。
+ *
+ * 它只属于触发器文案，绝不能混进 `options`：混进去就会变成一项 `role="option"`、点了却
+ * 什么都不写的假模型。`SelectControl` 本来就允许 value 不在 options 里（`NO_MODEL_SELECTED`
+ * 正是这种用法），因此触发器可以如实说出"本机仍记着哪个模型、需要重新选择"，而选项列表
+ * 里只有目录里的真实模型。
+ */
+function savedModelUnavailableLabel(modelId: string): string {
+  return `已选模型不可用：${modelId}（请重新选择）`
+}
+
+/**
  * 关闭「AI 设置」前的未保存草稿确认。
  *
  * 不复用通知中心的 `confirm()`：面板是原生模态 `<dialog>`（top layer），而通知中心渲染在
@@ -4720,6 +4759,22 @@ function AiSettings({ aiSelection, showNotice, registerReloader, onDirtyChange, 
       }
     }
   }, [markDeleteConfirmPending])
+  /**
+   * 本组件被销毁时，作废这份草稿留下的失败重放。
+   *
+   * 草稿只活在 `AiSettings` 里，控制器却挂在分区之上：关闭面板、切走 AI 分区、路由离开
+   * 都会销毁本组件而控制器存活。若不作废，失败保存的重放请求就跟着活下来——重新打开面板
+   * 点「重试」，写回的正是刚刚随组件一起消失的那份草稿。
+   *
+   * 走 `disposeDraftOwner` 而不是 `discardDraftIntent`：浏览器历史后退不经过关闭按钮的
+   * 守卫，写入在途时面板照样会消失（`discardDraftIntent` 此时会拒绝，而它的返回值在这里
+   * 没人能处理）。写入继续跑完，只是迟到的失败不再带着可重放的输入回来。
+   * 这条只在**真的被销毁**时触发：点「继续编辑」取消关闭不会卸载本组件，失败提示与重试
+   * 都原样保留。回调放 ref，卸载清理才不会因为父组件换了个函数身份而提前触发。
+   */
+  const disposeDraftRef = useRef(ai.disposeDraftOwner)
+  useEffect(() => { disposeDraftRef.current = ai.disposeDraftOwner })
+  useEffect(() => () => { disposeDraftRef.current() }, [])
   /** Mock 的凭据与模型目录都是内存 + 契约 fixture：预览路径必须逐条改口径，不能复用"已写入系统凭据管理器"这类生产文案。 */
   const mockMode = getHavenClientMode() === "mock"
 
@@ -4744,18 +4799,44 @@ function AiSettings({ aiSelection, showNotice, registerReloader, onDirtyChange, 
   ))
   // 三个状态必须分开显示：无可用模型（目录为空）/ 未选择（有模型但还没选）/ 已选模型。
   // 把"还没选"显示成"无可用模型"会在目录非空时谎报没有模型。
+  //
+  // 第四个状态必须单独存在：**已选模型不在当前目录里**。保存时保留的 `selectedModelId`
+  // 仍在生效（建议生成按它校验并报告模型不可用），把这种情况显示成"未选择"就是说
+  // 本机没有选择——而用户明明选过，只是这次目录里没有它。
+  const savedModelId = selected?.selectedModelId ?? null
+  const savedModelOption = savedModelId === null
+    ? null
+    : modelOptionStrings.find((option) => option === savedModelId
+      || option.endsWith(`(${savedModelId})`)) ?? null
+  const savedModelUnavailable = ai.hasAvailableModel && savedModelId !== null && savedModelOption === null
+  // 选项列表**只**放目录里的真实模型：已失效的已选项不是候选，做成 option 只会得到一项
+  // 点了没有任何写入的假模型。已失效的事实留在触发器文案里（value 允许不在 options 里）。
+  const catalogModelOptions = modelOptionStrings
   const selectedModelValue = !ai.hasAvailableModel
     ? ai.unavailableModelLabel
-    : selected?.selectedModelId
-      ? modelOptionStrings.find((option) => option === selected.selectedModelId
-        || option.endsWith(`(${selected.selectedModelId})`)) ?? NO_MODEL_SELECTED
-      : NO_MODEL_SELECTED
+    : savedModelUnavailable && savedModelId !== null
+      ? savedModelUnavailableLabel(savedModelId)
+      : savedModelOption ?? NO_MODEL_SELECTED
 
   const draftProfileId = draft?.profileId ?? selected?.profileId ?? ""
   const draftDisplayName = draft?.displayName ?? selected?.displayName ?? ""
   const draftEndpoint = draft?.endpoint ?? selected?.endpoint ?? ""
   const isDirty = draft !== null
   const isCreating = draft?.mode === "create"
+  /**
+   * 放弃草稿：**作废这份草稿留下的失败快照，再收起草稿**。
+   *
+   * 只写 `setDraft(null)` 时，错误横幅仍然开着，它的「重试」仍持有刚被放弃的那份草稿：
+   * 用户看到界面恢复成已保存值，片刻之后配置却变成了他刚刚放弃的内容。新建与编辑是
+   * 同一个意图边界，走同一条退出路径。
+   *
+   * 写入在途时不受理：那一次写入还没有结论，放弃不能假装把它取消掉。
+   */
+  const discardDraft = () => {
+    if (profileDraftLocked) return
+    if (!ai.discardDraftIntent()) return
+    setDraft(null)
+  }
   // 未提交的 API Key 输入也只活在组件状态里（不落盘、不回填），面板一关同样取不回来。
   const hasUnsavedInput = isDirty || apiKeyDraft.length > 0
   // 只取 `saving`：删除确认是另一条生命周期，并进来会拖住关闭；而写入结果只挂在即将消失的界面上。
@@ -4795,6 +4876,10 @@ function AiSettings({ aiSelection, showNotice, registerReloader, onDirtyChange, 
     : ""
 
   const beginCreateProfile = () => {
+    // 新建会把手头的草稿换成另一份（没有草稿时同样要作废）：之前那次 profile 写入的
+    // 失败重放不能再留着。`draft === null` 也要作废——重放依据属于上一次焦点，而不是
+    // "此刻有没有草稿"：否则用户在新草稿上点「重试」，写回的是上一份被放弃的输入。
+    if (!ai.discardDraftIntent()) return
     const occupied = new Set(ai.state.profiles.map((profile) => profile.profileId))
     let index = 1
     while (occupied.has(`provider-${index}`)) index += 1
@@ -4928,6 +5013,8 @@ function AiSettings({ aiSelection, showNotice, registerReloader, onDirtyChange, 
                     (item) => `${item.displayName} (${item.profileId})` === value,
                   )
                   if (!profile) return
+                  // 切换配置同样是放弃这份草稿：失败快照里的重放入口一并作废。
+                  if (!ai.discardDraftIntent()) return
                   setDraft(null)
                   setApiKeyDraft("")
                   setIsKeyEditorOpen(false)
@@ -4966,7 +5053,7 @@ function AiSettings({ aiSelection, showNotice, registerReloader, onDirtyChange, 
             </SettingRow>
             <SettingRow title="保存配置" description="新服务默认启用；API Key 将单独配置。">
               <div className="flex items-center gap-3">
-                <button type="button" onClick={() => setDraft(null)} className="text-[13px] font-medium text-[var(--haven-settings-muted-strong)]">放弃</button>
+                <button type="button" onClick={discardDraft} disabled={profileDraftLocked} className="text-[13px] font-medium text-[var(--haven-settings-muted-strong)] disabled:cursor-not-allowed disabled:opacity-50">放弃</button>
                 <button type="button" onClick={() => void submitProfile()} disabled={ai.state.saving || deleteConfirmPending} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[var(--haven-settings-primary)] px-[16px] text-[12px] font-semibold leading-none text-[var(--haven-settings-primary-foreground)] transition-colors hover:bg-[var(--haven-settings-primary-hover)] disabled:cursor-not-allowed disabled:opacity-50">保存</button>
               </div>
             </SettingRow>
@@ -5018,7 +5105,7 @@ function AiSettings({ aiSelection, showNotice, registerReloader, onDirtyChange, 
             {isDirty && (
               <SettingRow title="保存配置" description="只有本机配置；不包含 API Key。">
                 <div className="flex items-center gap-3">
-                  <button type="button" onClick={() => setDraft(null)} className="text-[13px] font-medium text-[var(--haven-settings-muted-strong)]">放弃</button>
+                  <button type="button" onClick={discardDraft} disabled={profileDraftLocked} className="text-[13px] font-medium text-[var(--haven-settings-muted-strong)] disabled:cursor-not-allowed disabled:opacity-50">放弃</button>
                   <button type="button" onClick={() => void submitProfile()} disabled={ai.state.saving || deleteConfirmPending} className="inline-flex h-[36px] items-center justify-center rounded-full bg-[var(--haven-settings-primary)] px-[16px] text-[12px] font-semibold leading-none text-[var(--haven-settings-primary-foreground)] transition-colors hover:bg-[var(--haven-settings-primary-hover)] disabled:cursor-not-allowed disabled:opacity-50">保存</button>
                 </div>
               </SettingRow>
@@ -5057,19 +5144,25 @@ function AiSettings({ aiSelection, showNotice, registerReloader, onDirtyChange, 
           </SettingRow>
         )}
         {!isCreating && !ai.state.loadError && <SettingRow title="默认模型" description={ai.hasAvailableModel
-          ? (mockMode
-            ? "Mock/预览：这份模型列表来自契约 fixture，不是真实 Provider 的 /models 响应。"
-            : "模型来自 Provider。对话能力未声明时，选定后可尝试生成建议；明确不支持的模型不可调用。")
+          ? (savedModelUnavailable
+            // 只陈述事实与下一步：本机仍然记着那个 id，目录里没有它；不自动替换、不删除。
+            ? `已保存的默认模型 ${savedModelId} 不在当前模型目录里（可能改过 API 地址，或 Provider 提供的模型变了）。本机仍保留这一选择，但调用会因模型不可用失败；请在下拉里选择一个当前可用的模型来替换它。${mockMode ? "Mock/预览：目录来自契约 fixture。" : ""}`
+            : mockMode
+              ? "Mock/预览：这份模型列表来自契约 fixture，不是真实 Provider 的 /models 响应。"
+              : "模型来自 Provider。对话能力未声明时，选定后可尝试生成建议；明确不支持的模型不可调用。")
           : `${ai.unavailableModelLabel}：${ai.unavailableModelHint}`}>
           <div className="flex items-center gap-4">
             <SelectControl
-              value={ai.hasAvailableModel ? selectedModelValue : ai.unavailableModelLabel}
-              options={ai.hasAvailableModel ? modelOptionStrings : [ai.unavailableModelLabel]}
+              // 触发器只陈述事实（含"已选模型不可用：…（请重新选择）"）；选项只来自目录。
+              value={selectedModelValue}
+              options={ai.hasAvailableModel ? catalogModelOptions : [ai.unavailableModelLabel]}
               onChange={(value) => {
                 if (!selected) return
                 const modelId = ai.modelOptions.find((option) => (
                   option.modelId === value || `${option.label} (${option.modelId})` === value
                 ))?.modelId ?? null
+                // 选项里只有目录模型；拿不到 id 就不写（触发器文案本身从不作为选项出现）。
+                if (modelId === null) return
                 void ai.saveProfile({
                   profileId: selected.profileId,
                   displayName: selected.displayName,

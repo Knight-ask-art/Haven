@@ -12,13 +12,15 @@
 // - 模型只能来自 Provider 目录，能力 「未声明」不与「不支持」混淆；
 // - 删除配置回到空态。
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
-import { MemoryRouter, Route, Routes } from "react-router"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { useEffect } from "react"
+import { MemoryRouter, Route, Routes, useNavigate } from "react-router"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { SettingsPage } from "./SettingsPage"
 import { getHavenClient } from "@/lib/ipc/runtime"
 import * as runtime from "@/lib/ipc/runtime"
+import { HavenError } from "@/lib/ipc/errors"
 import { NoticeContext, type NoticeInput } from "@/app/notice-center/notice-context"
 
 const PROFILE_ID = "gw-main"
@@ -201,6 +203,126 @@ describe("设置页 AI Provider 写入路径", () => {
     expect(screen.getByRole("button", { name: "重试读取" })).toBeTruthy()
     expect(screen.queryByRole("button", { name: "删除配置" })).toBeNull()
     expect((screen.getByRole("button", { name: "刷新模型列表" }) as HTMLButtonElement).disabled).toBe(true)
+  })
+})
+
+/**
+ * 放弃草稿必须让它的失败重放一起失效。
+ *
+ * 复现自审计探针：编辑名称 → 保存失败（可重试）→ 点「放弃」（界面恢复已保存值）→
+ * 再点错误横幅上的「重试」。旧实现只 `setDraft(null)`，重试把刚被放弃的名称写了回去。
+ */
+describe("设置页 AI 分组：放弃草稿后失败重试不得重放已放弃的输入", () => {
+  it("编辑放弃后，错误横幅的重试不会写入被放弃的名称", async () => {
+    renderAiSettings()
+    await createProfile()
+
+    fireEvent.change(screen.getByLabelText("配置名称"), { target: { value: "被放弃的名称" } })
+    const client = getHavenClient()
+    vi.spyOn(client, "aiProviderProfileUpsert").mockRejectedValueOnce(new HavenError({
+      code: "AI_PROVIDER_TRANSIENT",
+      userMessage: "临时写入失败",
+      retryable: true,
+    }))
+    // 「保存」按钮位于独立的「保存配置」行，不在「配置名称」行内。
+    const saveRow = screen.getByText("保存配置").closest("[data-settings-row]") as HTMLElement
+    fireEvent.click(within(saveRow).getByRole("button", { name: "保存" }))
+    expect(await screen.findByText("临时写入失败")).toBeTruthy()
+
+    fireEvent.click(screen.getByRole("button", { name: "放弃" }))
+    await waitFor(() => expect((screen.getByLabelText("配置名称") as HTMLInputElement).value).toBe("自建网关"))
+
+    // 失败提示随草稿一起作废：横幅里连「重试」都不该再出现。
+    expect(screen.queryByText("临时写入失败")).toBeNull()
+    expect(screen.queryByRole("button", { name: "重试" })).toBeNull()
+    const { profiles } = await client.aiProviderProfileList()
+    expect(profiles[0]?.displayName).toBe("自建网关")
+  })
+
+  it("新建放弃后，被放弃的配置 id 不会被任何重试写进本机", async () => {
+    renderAiSettings()
+    await createProfile()
+    fireEvent.click(screen.getByRole("button", { name: "新建配置" }))
+    fireEvent.change(screen.getByLabelText("配置 ID"), { target: { value: "abandoned-provider" } })
+    const client = getHavenClient()
+    vi.spyOn(client, "aiProviderProfileUpsert").mockRejectedValueOnce(new HavenError({
+      code: "AI_PROVIDER_TRANSIENT",
+      userMessage: "临时写入失败",
+      retryable: true,
+    }))
+    fireEvent.click(screen.getByRole("button", { name: "保存" }))
+    expect(await screen.findByText("临时写入失败")).toBeTruthy()
+
+    fireEvent.click(screen.getByRole("button", { name: "放弃" }))
+    await waitFor(() => expect(screen.queryByLabelText("配置 ID")).toBeNull())
+
+    const { profiles } = await client.aiProviderProfileList()
+    expect(profiles.map((profile) => profile.profileId)).toEqual([PROFILE_ID])
+  })
+})
+
+/**
+ * 已保存的默认模型不在当前目录里，与"从未选择"是两件事。
+ *
+ * 保存时保留的 `selectedModelId` 仍在生效（后端据此校验并报告模型不可用）。界面把它
+ * 显示成「未选择」，等于告诉用户本机没有选择——而用户明明选过。
+ */
+describe("设置页 AI 分组：已选模型不在当前目录", () => {
+  it("保留已保存的模型 id 并给出重新选择指引，不静默改写或删除它", async () => {
+    const client = getHavenClient()
+    // 预先写入一份**已选模型不在 fixture 目录里**的配置；凭据也要存在，否则目录是 no_credential。
+    await client.aiProviderProfileUpsert({
+      profileId: PROFILE_ID,
+      displayName: "自建网关",
+      kind: "openai_compatible",
+      endpoint: ENDPOINT,
+      enabled: true,
+      selectedModelId: "retired-model",
+      expectedRevision: null,
+    })
+    await client.credentialSet({ provider: "ai", profileId: PROFILE_ID, secret: API_KEY })
+
+    renderAiSettings()
+    const trigger = (await screen.findByRole("button", { name: "默认模型" })) as HTMLButtonElement
+    await waitFor(() => expect(trigger.disabled).toBe(false))
+
+    // 不说「未选择」，也不说「无可用模型」：说清"保存的模型不在目录里"。
+    expect(trigger.textContent).not.toContain("未选择")
+    expect(trigger.textContent).not.toContain("无可用模型")
+    expect(trigger.textContent).toContain("已选模型")
+    const modelRow = trigger.closest("[data-settings-row]") as HTMLElement
+    expect(modelRow.textContent).toContain("retired-model")
+    expect(modelRow.textContent).toContain("替换")
+
+    // 真实模型仍然可选；选项里**只有**目录模型，"已选模型不可用"不是一项可点的假模型。
+    fireEvent.click(trigger)
+    await screen.findByRole("listbox")
+    expect(screen.queryByRole("option", { name: "已选模型已不在当前目录" })).toBeNull()
+    const options = screen.getAllByRole("option").map((option) => option.textContent ?? "")
+    expect(options.some((option) => option.includes("已选模型"))).toBe(false)
+    expect(options.some((option) => option.includes("retired-model"))).toBe(false)
+    expect(options.some((option) => option.includes("GPT-4o mini (gpt-4o-mini)"))).toBe(true)
+
+    // 选中真实模型后写入的是目录里的 id，而不是被自动替换。
+    fireEvent.click(screen.getByRole("option", { name: "GPT-4o mini (gpt-4o-mini)" }))
+    await waitFor(async () => {
+      const listed = await client.aiProviderProfileList()
+      expect(listed.profiles[0]?.selectedModelId).toBe("gpt-4o-mini")
+    })
+  })
+
+  it("从未选择时仍然显示「未选择」，不被失效分支吞掉", async () => {
+    renderAiSettings()
+    await createProfile()
+    fireEvent.click(await screen.findByRole("button", { name: "配置" }))
+    fireEvent.change(await screen.findByLabelText("API Key"), { target: { value: API_KEY } })
+    fireEvent.click(screen.getByRole("button", { name: "保存" }))
+    expect(await screen.findByText("已配置")).toBeTruthy()
+
+    const trigger = (await screen.findByRole("button", { name: "默认模型" })) as HTMLButtonElement
+    await waitFor(() => expect(trigger.disabled).toBe(false))
+    expect(trigger.textContent).toContain("未选择")
+    expect(trigger.textContent).not.toContain("已选模型")
   })
 })
 
@@ -437,6 +559,119 @@ describe("设置页 AI 面板：关闭未保存的草稿要确认", () => {
     )
     expect((screen.getByLabelText("API 地址") as HTMLInputElement).disabled).toBe(true)
     expect((screen.getByRole("button", { name: "保存" }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  /**
+   * 面板关闭会销毁持有草稿的 `AiSettings`，控制器却活在分区之上。
+   *
+   * 不做这条生命周期边界时："保存失败 → 关闭 → 确认放弃修改 → 重新打开 → 点重试"仍会
+   * 把随面板一起消失的那份草稿写回本机。取消关闭（继续编辑）不是放弃，重放必须保留。
+   */
+  it("保存失败后关闭并确认放弃：重新打开面板时没有任何可重放的失败草稿", async () => {
+    await openDirtyEditDraft()
+
+    vi.spyOn(getHavenClient(), "aiProviderProfileUpsert").mockRejectedValueOnce(new HavenError({
+      code: "AI_PROVIDER_TRANSIENT",
+      userMessage: "临时写入失败",
+      retryable: true,
+    }))
+    fireEvent.click(screen.getByRole("button", { name: "保存" }))
+    expect(await screen.findByText("临时写入失败")).toBeTruthy()
+
+    // 先取消一次关闭：这不是放弃，失败提示与重试都该原样留着。
+    fireEvent.click(screen.getByRole("button", { name: "关闭 AI 设置" }))
+    fireEvent.click(screen.getByRole("button", { name: "继续编辑" }))
+    expect(screen.getByText("临时写入失败")).toBeTruthy()
+    expect(screen.getByRole("button", { name: "重试" })).toBeTruthy()
+
+    // 再次关闭并确认放弃：草稿随面板一起消失，它的失败重放也必须作废。
+    fireEvent.click(screen.getByRole("button", { name: "关闭 AI 设置" }))
+    fireEvent.click(screen.getByRole("button", { name: "放弃修改" }))
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "AI 设置" })).toBeNull())
+
+    fireEvent.click(screen.getByRole("button", { name: "AI 设置" }))
+    expect(await screen.findByLabelText("配置名称")).toBeTruthy()
+    expect(screen.queryByText("临时写入失败")).toBeNull()
+    expect(screen.queryByRole("button", { name: "重试" })).toBeNull()
+
+    const { profiles } = await getHavenClient().aiProviderProfileList()
+    expect(profiles).toHaveLength(1)
+    expect(profiles[0]?.displayName).toBe("自建网关")
+  })
+})
+
+/**
+ * 浏览器历史不受关闭守卫约束。
+ *
+ * 普通「关闭」在写入在途时会被拦住（那一次写入还没有结论）；后退 / 前进却会直接把面板
+ * 连同草稿卸载掉，控制器仍活在页面之上。若卸载边界只走"在途就拒绝"的放弃入口，迟到的
+ * 失败会带着 `lastSaveRequest` 回到 Hook 里——重新打开面板就能点「重试」，把随面板一起
+ * 消失的那份输入写回本机。
+ */
+describe("设置页 AI 面板：历史离开后不复活已销毁的草稿", () => {
+  /** 从一个历史条目进来，这样"后退离开 → 前进返回"才是真的浏览器历史。 */
+  function renderWithHistory(): ReturnType<typeof useNavigate> {
+    let navigate!: ReturnType<typeof useNavigate>
+    function Driver() {
+      const routerNavigate = useNavigate()
+      // 在 effect 里取值：渲染期给外部变量赋值是副作用（react(globals) 会告警）。
+      useEffect(() => {
+        navigate = routerNavigate
+      }, [routerNavigate])
+      return <SettingsPage />
+    }
+    render(
+      <MemoryRouter initialEntries={["/settings/privacy", "/settings/ai"]} initialIndex={1}>
+        <Routes>
+          <Route path="/settings/:section" element={<Driver />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+    return navigate
+  }
+
+  it("写入在途时后退离开：迟到的失败不提供重试，也不写回那份草稿", async () => {
+    const navigate = renderWithHistory()
+    fireEvent.click(screen.getByRole("button", { name: "AI 设置" }))
+    await createProfile()
+    fireEvent.change(await screen.findByLabelText("配置名称"), { target: { value: "随面板消失的名字" } })
+
+    const client = getHavenClient()
+    let rejectWrite!: (error: unknown) => void
+    const pending = new Promise<never>((_resolve, reject) => { rejectWrite = reject })
+    const upsert = vi.spyOn(client, "aiProviderProfileUpsert").mockReturnValueOnce(pending)
+    fireEvent.click(screen.getByRole("button", { name: "保存" }))
+    await waitFor(() => expect((screen.getByLabelText("配置名称") as HTMLInputElement).disabled).toBe(true))
+
+    // 后退不是「放弃修改」：关闭守卫拦不住它，面板与草稿一起消失。
+    await act(async () => { await navigate(-1) })
+    await waitFor(() => expect(screen.queryByLabelText("配置名称")).toBeNull())
+
+    // 写入这时才给出结论：失败如实落在状态里，但那份输入已经不在了。
+    await act(async () => {
+      rejectWrite(new HavenError({
+        code: "AI_PROVIDER_TRANSIENT",
+        userMessage: "迟到的写入失败",
+        retryable: true,
+      }))
+      await pending.catch(() => undefined)
+    })
+
+    // 前进回到 AI 分区，重新打开面板。
+    await act(async () => { await navigate(1) })
+    const open = screen.queryByRole("button", { name: "AI 设置" })
+    if (open) fireEvent.click(open)
+    expect(await screen.findByLabelText("配置名称")).toBeTruthy()
+    // 迟到的失败本身如实呈现（用户确实提交过这次写入）……
+    expect(await screen.findByText("迟到的写入失败")).toBeTruthy()
+
+    // ……但没有可重放的输入，就没有「重试」：不给出一个按下去什么也不做的按钮。
+    expect(screen.queryByRole("button", { name: "重试" })).toBeNull()
+    // 只有最初那次被拒绝的写入，迟到的失败没有重放被放弃的名称。
+    expect(upsert).toHaveBeenCalledTimes(1)
+    const { profiles } = await client.aiProviderProfileList()
+    expect(profiles).toHaveLength(1)
+    expect(profiles[0]?.displayName).toBe("自建网关")
   })
 })
 

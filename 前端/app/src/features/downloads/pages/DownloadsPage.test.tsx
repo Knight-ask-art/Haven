@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
-import { MemoryRouter } from "react-router"
+import { MemoryRouter, Route, Routes, useLocation } from "react-router"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { NoticeContext } from "@/app/notice-center/notice-context"
@@ -31,20 +31,27 @@ vi.mock("../ipc/download-gateway", async (importOriginal) => {
   }
 })
 vi.mock("@/lib/ipc/runtime", () => ({ getHavenClientMode: () => "tauri" }))
-vi.mock("../components/DownloadTaskList", () => ({
-  DownloadTaskList: ({ tasks, onRemoveRecord, onDeleteOffline }: { tasks: DownloadTaskDto[]; onRemoveRecord?: (taskId: string) => void; onDeleteOffline?: (taskId: string) => void }) => (
-    <div>
-      {tasks.map((task) => (
-        <article key={task.taskId} data-testid={`task-${task.taskId}`}>
-          {task.title}:{task.bytesDownloaded}
-          <output data-testid={`offline-${task.taskId}`}>{task.offlineResourceId ?? "none"}</output>
-          <button type="button" onClick={() => onRemoveRecord?.(task.taskId)}>删除记录 {task.taskId}</button>
-          <button type="button" onClick={() => onDeleteOffline?.(task.taskId)}>删除离线 {task.taskId}</button>
-        </article>
-      ))}
-    </div>
-  ),
-}))
+vi.mock("../components/DownloadTaskList", async (importOriginal) => {
+  // 空态是这次要验证的行为本身：必须渲染真实组件的空态分支，不能用一个只画 tasks 的
+  // 替身把它藏起来。只有非空列表用替身（需要直接点每行上的管理动作）。
+  const actual = await importOriginal<typeof import("../components/DownloadTaskList")>()
+  return {
+    DownloadTaskList: (props: Parameters<typeof actual.DownloadTaskList>[0]) => props.tasks.length === 0
+      ? actual.DownloadTaskList(props)
+      : (
+        <div>
+          {props.tasks.map((task) => (
+            <article key={task.taskId} data-testid={`task-${task.taskId}`}>
+              {task.title}:{task.bytesDownloaded}
+              <output data-testid={`offline-${task.taskId}`}>{task.offlineResourceId ?? "none"}</output>
+              <button type="button" onClick={() => props.onRemoveRecord?.(task.taskId)}>删除记录 {task.taskId}</button>
+              <button type="button" onClick={() => props.onDeleteOffline?.(task.taskId)}>删除离线 {task.taskId}</button>
+            </article>
+          ))}
+        </div>
+      ),
+  }
+})
 vi.mock("../components/DownloadBatchItem", () => ({ DownloadBatchItem: () => null }))
 
 function deferred<T>() {
@@ -103,6 +110,12 @@ function event(taskId: string, sequence: number, downloaded: number): DownloadEv
 }
 
 let receiveEvent: ((event: DownloadEvent) => void) | undefined
+
+/** 把当前 URL 的查询串写进 DOM，用来断言"清除筛选只动了这两项参数"。 */
+function LocationProbe() {
+  const location = useLocation()
+  return <output data-testid="location-probe">{location.search.replace(/^\?/, "")}</output>
+}
 
 function renderPage() {
   return render(
@@ -205,5 +218,115 @@ describe("DownloadsPage asynchronous refreshes", () => {
 
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(screen.getByTestId("offline-task-1").textContent).toBe("none")
+  })
+})
+
+/**
+ * 筛选无匹配 ≠ 整个下载库没有任务（审计 B04）。
+ *
+ * 库里明明有需处理的任务、页头也这样统计，用户只是把状态切到「已完成」：显示
+ * 「当前没有下载任务 / 从作品详情页选择内容」是在否认页头自己刚说过的事实。
+ */
+describe("DownloadsPage filtered empty state", () => {
+  const failed = task({ taskId: "task-failed", title: "失败的下载", state: "failed" })
+
+  it("says the filter has no matches and offers to clear it, without claiming the library is empty", async () => {
+    listDownloads.mockResolvedValue([failed])
+
+    renderPage()
+    await screen.findByText(/1 个需处理/)
+    fireEvent.click(screen.getByRole("tab", { name: "已完成" }))
+
+    const empty = await screen.findByTestId("downloads-filter-empty")
+    expect(empty.textContent).toContain("没有符合当前筛选的下载任务")
+    expect(empty.textContent).toContain("已完成")
+    expect(screen.queryByText("当前没有下载任务")).toBeNull()
+    expect(screen.queryByText("从作品详情页选择内容后会出现在这里。")).toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: "清除筛选" }))
+    await waitFor(() => expect(screen.getByTestId("task-task-failed")).toBeTruthy())
+    expect(screen.queryByTestId("downloads-filter-empty")).toBeNull()
+    expect(screen.getByRole("tab", { name: "全部任务" }).getAttribute("aria-selected")).toBe("true")
+  })
+
+  it("names a non-matching search query and keeps sorting unrelated", async () => {
+    listDownloads.mockResolvedValue([failed])
+
+    renderPage()
+    await screen.findByTestId("task-task-failed")
+    fireEvent.change(screen.getByPlaceholderText("搜索下载任务"), { target: { value: "不存在的标题" } })
+
+    const empty = await screen.findByTestId("downloads-filter-empty")
+    expect(empty.textContent).toContain("不存在的标题")
+
+    fireEvent.click(screen.getByRole("button", { name: "清除筛选" }))
+    await waitFor(() => expect(screen.getByTestId("task-task-failed")).toBeTruthy())
+    expect((screen.getByPlaceholderText("搜索下载任务") as HTMLInputElement).value).toBe("")
+  })
+
+  it("still shows the whole-library empty state when there really are no tasks", async () => {
+    listDownloads.mockResolvedValue([])
+
+    renderPage()
+    await waitFor(() => expect(screen.getByText("当前没有下载任务")).toBeTruthy())
+    expect(screen.queryByTestId("downloads-filter-empty")).toBeNull()
+  })
+
+  /**
+   * 批次行本身就是可见内容：单条列表空着时不能在其下方再断言「当前没有下载任务」。
+   *
+   * 例如把状态切到「已完成」后只剩批次里的行——页头与批次都列着任务，列表却说自己全空。
+   */
+  it("does not claim the library is empty underneath visible batch rows", async () => {
+    const batched = task({ taskId: "task-batched", title: "批次里的下载", state: "failed", batchId: "batch-1" })
+    listDownloads.mockResolvedValue([batched])
+
+    renderPage()
+    await screen.findByText(/1 个需处理/)
+
+    // 批次分组可见（页头计数列出 1 个批次），单条列表没有行。
+    await waitFor(() => expect(screen.getByText(/1 个批次/)).toBeTruthy())
+    expect(screen.queryByTestId("task-task-batched")).toBeNull()
+    expect(screen.queryByText("当前没有下载任务")).toBeNull()
+    expect(screen.queryByText("从作品详情页选择内容后会出现在这里。")).toBeNull()
+  })
+
+  it("clearing filters keeps unrelated URL params and the local sort, and clears the local query", async () => {
+    listDownloads.mockResolvedValue([
+      task({ taskId: "task-a", title: "甲书", category: "book", state: "failed", createdAt: "2026-09-01T00:00:00.000Z" }),
+      task({ taskId: "task-b", title: "乙书", category: "video", state: "completed", createdAt: "2026-09-02T00:00:00.000Z" }),
+    ])
+
+    render(
+      <NoticeContext.Provider value={{
+        notices: [], push: () => "", dismiss: () => undefined, clear: () => undefined,
+        resolveConfirm: () => undefined, confirm: async () => true,
+      }}>
+        <MemoryRouter initialEntries={["/downloads?storage=storage-1&category=video&status=failed"]}>
+          <Routes>
+            {/* 探针与页面同级：URL 一变它就重渲染，用来断言查询串的最终形态。 */}
+            <Route path="/downloads" element={<><DownloadsPage /><LocationProbe /></>} />
+          </Routes>
+        </MemoryRouter>
+      </NoticeContext.Provider>,
+    )
+    // 排序切到「名称」：清除筛选不该把它复位成「最近添加」。
+    fireEvent.click(await screen.findByRole("button", { name: "最近添加" }))
+    expect(screen.getByRole("button", { name: "名称" })).toBeTruthy()
+
+    // 分类 + 搜索词都无匹配，给出筛选空态。
+    fireEvent.change(screen.getByPlaceholderText("搜索下载任务"), { target: { value: "不存在的标题" } })
+    await screen.findByTestId("downloads-filter-empty")
+
+    fireEvent.click(screen.getByRole("button", { name: "清除筛选" }))
+    await waitFor(() => expect(screen.getByTestId("task-task-a")).toBeTruthy())
+    expect(screen.getByTestId("task-task-b")).toBeTruthy()
+    expect((screen.getByPlaceholderText("搜索下载任务") as HTMLInputElement).value).toBe("")
+    expect(screen.getByRole("button", { name: "名称" })).toBeTruthy()
+    // 无关参数原样保留，只有分类/状态被清掉。
+    const params = new URLSearchParams(screen.getByTestId("location-probe").textContent ?? "")
+    expect(params.get("storage")).toBe("storage-1")
+    expect(params.get("category")).toBeNull()
+    expect(params.get("status")).toBeNull()
   })
 })

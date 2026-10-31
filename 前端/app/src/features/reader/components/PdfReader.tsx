@@ -254,6 +254,8 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
       renderTaskRef.current = null
       textLayerTaskRef.current?.cancel()
       textLayerTaskRef.current = null
+      // 文档即将销毁：这是唯一有权按"当前任务"清理共享句柄的地方；页面级清理只碰
+      // 本轮自己持有的任务，不会误清下一代任务。
       searchAbortRef.current?.abort()
       searchAbortRef.current = null
       const document = loadedDocument
@@ -272,6 +274,11 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
     const requestId = requestRef.current
     let cancelled = false
     let page: PDFPageProxy | null = null
+    // 本轮渲染自己持有的 PDF.js 任务。共享 ref 只用于"取消**当前**这一轮"：
+    // 每一轮的 finally / 清理函数只能碰自己这两个局部引用，不能拿共享 ref 当作自己的
+    // 所有权凭证——旧一轮的 finally 跑得比新一轮晚时，会把新一轮的取消句柄抹掉。
+    let ownedRenderTask: RenderTask | null = null
+    let ownedTextLayer: PdfTextLayer | null = null
 
     renderTaskRef.current?.cancel()
     renderTaskRef.current = null
@@ -293,6 +300,7 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
         container: layerElement,
         viewport,
       })
+      ownedTextLayer = textLayer
       textLayerTaskRef.current = textLayer
       try {
         await textLayer.render()
@@ -342,8 +350,15 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
           viewport,
           transform: outputScale === 1 ? undefined : [outputScale, 0, 0, outputScale, 0, 0],
         })
+        ownedRenderTask = renderTask
         renderTaskRef.current = renderTask
         await renderTask.promise
+        // 光栅已完成；文本提取可能长时间挂着，此时切页与缩放都已取消过本任务。
+        // 先按身份确认共享句柄仍是本任务再清，随后才释放自己的所有权；顺序反过来就再也
+        // 没人能清掉这个已完成的全局句柄，而共享 ref 之后的清理也不该由旧一轮代劳。
+        if (renderTaskRef.current === renderTask) renderTaskRef.current = null
+        ownedRenderTask = null
+        // 文本提取属于这一段渲染：只有仍然是当前文档与当前请求时才继续。
         const textContent = await page.getTextContent()
         if (cancelled || requestRef.current !== requestId) return
         const pageText = await buildTextLayer(viewport, textContent)
@@ -366,16 +381,24 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
       } finally {
         page?.cleanup()
         page = null
-        renderTaskRef.current = null
+        // 只清自己那一份：新一轮可能已经写入了自己的任务，无条件置 null 会夺走它的
+        // 取消句柄，之后切页/缩放/卸载都停不下那份仍在运行的光栅或文本层。
+        if (renderTaskRef.current === ownedRenderTask) renderTaskRef.current = null
+        if (textLayerTaskRef.current === ownedTextLayer) textLayerTaskRef.current = null
+        ownedRenderTask = null
+        ownedTextLayer = null
       }
     }
     void render()
     return () => {
       cancelled = true
-      renderTaskRef.current?.cancel()
-      renderTaskRef.current = null
-      textLayerTaskRef.current?.cancel()
-      textLayerTaskRef.current = null
+      // 清理只动本轮持有的任务，别的一概不碰。
+      ownedRenderTask?.cancel()
+      if (renderTaskRef.current === ownedRenderTask) renderTaskRef.current = null
+      ownedTextLayer?.cancel()
+      if (textLayerTaskRef.current === ownedTextLayer) textLayerTaskRef.current = null
+      ownedRenderTask = null
+      ownedTextLayer = null
       page = null
     }
   }, [state, zoom])
