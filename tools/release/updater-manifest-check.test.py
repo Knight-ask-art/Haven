@@ -87,12 +87,18 @@ PUB_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
 class UpdaterManifestProducerTests(unittest.TestCase):
+    def test_verified_candidate_stays_draft_for_desktop_acceptance(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        self.assertIn("releaseDraft: true", workflow)
+        self.assertNotIn("gh release edit", workflow)
+        self.assertNotIn("--draft=false", workflow)
+
     def test_release_produces_a_public_feed_from_the_uploaded_asset_names(self):
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/release.yml").read_text(encoding="utf-8")
         self.assertIn("uploadUpdaterJson: false", workflow)
         generation = workflow.index("- name: Produce the public Windows updater manifest")
         verification = workflow.index("- name: Download and verify draft update artifacts")
-        publication = workflow.index("- name: Publish verified stable update")
+        publication = len(workflow)
         source = workflow[generation:verification]
         download = source.index("gh release download")
         discover = source.index("Get-ChildItem -LiteralPath $destination")

@@ -1,6 +1,6 @@
 {
   "name": "haven-mcp-server",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "栖阅 Haven 的 MCP server：只读上下文 + 受控提案创建（无 Apply/Approve/Write）",
   "type": "module",
