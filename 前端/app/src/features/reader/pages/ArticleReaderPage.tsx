@@ -633,12 +633,13 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
   // 恢复进度：优先使用与真实大纲同源的 blockId，结构已变时才回退 progression。
   useEffect(() => {
     if (!contentReady || !articleDocument || sessionView.status !== "ready" || state.status !== "ready") return
-    const restored = restoreArticleProgress(state.session, restoredProgressRef, initialPosition)
-    if (!restored) return
     const maxScroll = document.documentElement.scrollHeight - window.innerHeight
     if (maxScroll <= 0) return
+    const restored = restoreArticleProgress(state.session, restoredProgressRef, initialPosition)
+    if (!restored) return
     // 显式文本标记优先按锚点定位；普通进度仍只使用全篇 progression。
-    const markerLocator = initialPosition?.locator
+    const markerLocator = initialPosition?.restoredSessionId === state.session.sessionId
+      ? initialPosition.locator : undefined
     if (markerLocator?.kind === "article" && markerLocator.data.textAnchor) {
       const block = Array.from(articleRef.current?.querySelectorAll<HTMLElement>("[data-article-block-id]") ?? [])
         .find((element) => element.dataset.articleBlockId === markerLocator.data.blockId)

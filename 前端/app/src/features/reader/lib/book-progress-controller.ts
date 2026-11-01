@@ -133,13 +133,14 @@ export function restoreBookProgress(
   mode: BookPaginationMode = "scroll",
   initial?: InitialPosition,
 ): boolean {
-  const { locator, reset, identity } = resolveRestorePosition(session, initial)
+  const { locator, reset, identity, markRestored } = resolveRestorePosition(session, initial)
   if (locator?.kind !== "book") return false
   if (restored?.current === identity) return false
   if (reset) {
     if (mode !== "scroll" && scrollContainer.scrollLeft === undefined) return false
     setBookPaginationOffsetInstant(scrollContainer, 0, mode)
     if (restored) restored.current = identity
+    markRestored()
     return true
   }
   const progression = locator.data.progression
@@ -154,9 +155,14 @@ export function restoreBookProgress(
   }
   const target = bookOffsetForProgression(viewport, progression, mode)
   const current = mode === "scroll" ? scrollContainer.scrollTop : (scrollContainer.scrollLeft ?? 0)
-  if (Math.abs(current - target) < 2) return false
   if (mode !== "scroll" && scrollContainer.scrollLeft === undefined) return false
+  if (Math.abs(current - target) < 2) {
+    if (restored) restored.current = identity
+    markRestored()
+    return false
+  }
   setBookPaginationOffsetInstant(scrollContainer, target, mode)
   if (restored) restored.current = identity
+  markRestored()
   return true
 }

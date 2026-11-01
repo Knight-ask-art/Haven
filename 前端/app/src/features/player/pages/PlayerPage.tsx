@@ -1,4 +1,5 @@
 import { useMarkerNavigation } from "@/features/markers/lib/use-marker-navigation"
+import { initialPositionForSession } from "@/features/progress/lib/restore-position"
 import { useCallback, useMemo, useState, useRef, useEffect, useLayoutEffect } from "react"
 import { useParams, useNavigate } from "react-router"
 import { VideoControls } from "../components/VideoControls"
@@ -324,7 +325,8 @@ export function PlayerPage() {
     if (
       !video ||
       !metadataReadyRef.current ||
-      (!initialPosition && (playbackSettings.status === "loading" || !playbackSettings.autoResume)) ||
+      (!(sessionForProgress && initialPositionForSession(sessionForProgress, initialPosition))
+        && (playbackSettings.status === "loading" || !playbackSettings.autoResume)) ||
       sessionView.status !== "ready" ||
       sessionForProgress === null
     ) return

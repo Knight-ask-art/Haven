@@ -125,7 +125,7 @@ export function createVideoProgressController(options: VideoProgressControllerOp
 }
 
 export function restoreVideoProgress(video: Pick<HTMLVideoElement, "currentTime" | "duration">, session: SessionOpenResultDto, restored?: { current: string | null }, initial?: InitialPosition): boolean {
-  const { locator, reset, identity } = resolveRestorePosition(session, initial)
+  const { locator, reset, identity, markRestored } = resolveRestorePosition(session, initial)
   if (locator?.kind !== "video") return false
   if (restored?.current === identity) return false
   if (reset) {
@@ -133,6 +133,7 @@ export function restoreVideoProgress(video: Pick<HTMLVideoElement, "currentTime"
     // conflict semantics, but consumers must resume from the beginning.
     video.currentTime = 0
     if (restored) restored.current = identity
+    markRestored()
     return true
   }
   const positionMs = locator.data.positionMs
@@ -140,5 +141,6 @@ export function restoreVideoProgress(video: Pick<HTMLVideoElement, "currentTime"
   const duration = video.duration
   video.currentTime = Number.isFinite(duration) && duration >= 0 ? Math.min(positionMs / 1000, duration) : positionMs / 1000
   if (restored) restored.current = identity
+  markRestored()
   return true
 }

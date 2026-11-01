@@ -161,11 +161,12 @@ export function restorePdfProgress(
   initial?: InitialPosition,
 ): { pageIndex: number; zoom: number } | null {
   if (!Number.isInteger(pageCount) || pageCount <= 0) return null
-  const { locator, reset, identity } = resolveRestorePosition(session, initial)
+  const { locator, reset, identity, markRestored } = resolveRestorePosition(session, initial)
   if (locator?.kind !== "pdf") return null
   if (restored?.current === identity) return null
   if (reset) {
     if (restored) restored.current = identity
+    markRestored()
     return { pageIndex: 0, zoom: 1 }
   }
   const data = locator.data
@@ -176,5 +177,6 @@ export function restorePdfProgress(
     zoom,
   }
   if (restored) restored.current = identity
+  markRestored()
   return result
 }

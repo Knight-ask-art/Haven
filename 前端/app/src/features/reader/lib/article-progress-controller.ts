@@ -103,15 +103,17 @@ export function restoreArticleProgress(
   restored?: { current: string | null },
   initial?: InitialPosition,
 ): { progression: number; blockId: string | null } | null {
-  const { locator, reset, identity } = resolveRestorePosition(session, initial)
+  const { locator, reset, identity, markRestored } = resolveRestorePosition(session, initial)
   if (locator?.kind !== "article") return null
   if (restored?.current === identity) return null
   if (reset) {
     if (restored) restored.current = identity
+    markRestored()
     return { progression: 0, blockId: null }
   }
   const data = locator.data
   if (data.progression == null || !Number.isFinite(data.progression) || data.progression < 0) return null
   if (restored) restored.current = identity
+  markRestored()
   return { progression: data.progression, blockId: data.blockId }
 }

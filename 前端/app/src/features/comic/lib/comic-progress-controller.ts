@@ -106,16 +106,18 @@ export function restoreComicProgress(
   restored?: { current: string | null },
   initial?: InitialPosition,
 ): { pageIndex: number; pageProgression: number | null } | null {
-  const { locator, reset, identity } = resolveRestorePosition(session, initial)
+  const { locator, reset, identity, markRestored } = resolveRestorePosition(session, initial)
   if (locator?.kind !== "comic") return null
   if (!Number.isInteger(totalPages) || totalPages <= 0) return null
   if (restored?.current === identity) return null
   if (reset) {
     if (restored) restored.current = identity
+    markRestored()
     return { pageIndex: 1, pageProgression: null }
   }
   const data = locator.data
   if (!Number.isInteger(data.pageIndex) || data.pageIndex < 0 || data.pageIndex >= totalPages) return null
   if (restored) restored.current = identity
+  markRestored()
   return { pageIndex: data.pageIndex + 1, pageProgression: data.pageProgression ?? null }
 }
