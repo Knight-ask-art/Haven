@@ -794,6 +794,8 @@ async fn truncated_comic_refresh_does_not_mark_omitted_chapters_missing() {
 #[tokio::test]
 async fn work_refresh_keeps_successful_source_when_another_source_fails() {
     let fixture = fixture();
+    // Work 刷新遵守来源启用状态，先初始化出厂启用集合再观察 Provider。
+    fixture.registry.list().await.unwrap();
     let first = fixture
         .service
         .import_content_candidate("mangadex", MANGA_ID)
@@ -864,6 +866,8 @@ async fn work_refresh_keeps_successful_source_when_another_source_fails() {
 #[tokio::test]
 async fn work_refresh_scopes_missing_to_the_source_with_a_complete_observation() {
     let fixture = fixture();
+    // Work 刷新遵守来源启用状态，先初始化出厂启用集合再观察 Provider。
+    fixture.registry.list().await.unwrap();
     let first = fixture
         .service
         .import_content_candidate("mangadex", MANGA_ID)
@@ -908,6 +912,8 @@ async fn work_refresh_scopes_missing_to_the_source_with_a_complete_observation()
 #[tokio::test]
 async fn work_refresh_propagates_internal_refresh_transaction_failure() {
     let fixture = fixture();
+    // Work 刷新遵守来源启用状态，先初始化出厂启用集合再观察 Provider。
+    fixture.registry.list().await.unwrap();
     let imported = fixture
         .service
         .import_content_candidate("mangadex", MANGA_ID)
@@ -941,6 +947,8 @@ async fn work_refresh_propagates_internal_refresh_transaction_failure() {
 #[tokio::test]
 async fn work_refresh_generation_conflict_does_not_create_failure_receipt() {
     let fixture = fixture();
+    // Work 刷新遵守来源启用状态，先初始化出厂启用集合再观察 Provider。
+    fixture.registry.list().await.unwrap();
     let imported = fixture
         .service
         .import_content_candidate("mangadex", MANGA_ID)
@@ -985,6 +993,8 @@ async fn work_refresh_generation_conflict_does_not_create_failure_receipt() {
 #[tokio::test]
 async fn work_refresh_complete_observation_marks_omitted_chapter_missing() {
     let fixture = fixture();
+    // Work 刷新遵守来源启用状态，先初始化出厂启用集合再观察 Provider。
+    fixture.registry.list().await.unwrap();
     let imported = fixture
         .service
         .import_content_candidate("mangadex", MANGA_ID)
@@ -1020,6 +1030,8 @@ async fn work_refresh_complete_observation_marks_omitted_chapter_missing() {
 #[tokio::test]
 async fn work_refresh_truncated_observation_keeps_omitted_chapter_available() {
     let fixture = fixture();
+    // Work 刷新遵守来源启用状态，先初始化出厂启用集合再观察 Provider。
+    fixture.registry.list().await.unwrap();
     let imported = fixture
         .service
         .import_content_candidate("mangadex", MANGA_ID)
