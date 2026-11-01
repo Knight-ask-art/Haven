@@ -4,7 +4,13 @@ import { cn } from "@/lib/utils"
 import type { TextAnchorDto } from "@/lib/ipc/generated/wire"
 import { HavenError, toHavenError, type HavenError as HavenErrorType } from "@/lib/ipc/errors"
 import { TextLayer } from "pdfjs-dist/legacy/build/pdf.mjs"
-import type { PDFDocumentProxy, PDFPageProxy, RenderTask, TextLayer as PdfTextLayer } from "pdfjs-dist/legacy/build/pdf.mjs"
+import type {
+  PDFDocumentProxy,
+  PDFPageProxy,
+  RenderTask,
+  TextLayer as PdfTextLayer,
+} from "pdfjs-dist/legacy/build/pdf.mjs"
+type TextContent = Awaited<ReturnType<PDFPageProxy["getTextContent"]>>
 import { destroyPdfDocument, loadPdfDocument, PdfReaderError, type PdfDocumentSource } from "../lib/pdf-document"
 import {
   clampPdfPage,
@@ -18,8 +24,13 @@ import {
 import {
   boundPdfPageText,
   flattenPdfSearchHits,
+  indexPdfPageText,
+  indexablePdfItems,
+  normalizePdfQuery,
   searchPdfPages,
+  type PdfPageTextIndex,
   type PdfSearchHit,
+  type PdfTextFragment,
 } from "../lib/pdf-search"
 
 export interface PdfReaderLocator {
@@ -48,10 +59,82 @@ type PdfState =
 type PdfSearchUiState =
   | { status: "idle" }
   | { status: "scanning"; scanned: number }
-  | { status: "done"; hits: PdfSearchHit[]; flat: Array<{ pageNumber: number; occurrence: number }>; totalMatches: number; activeIndex: number }
+  | { status: "error"; message: string }
+  | { status: "done"; query: string; hits: PdfSearchHit[]; flat: Array<{ pageNumber: number; occurrence: number }>; totalMatches: number; activeIndex: number }
 
 const MAX_CANVAS_PIXELS = 16_000_000
 const MAX_CANVAS_SIDE = 8_192
+
+function pdfScrollContainer(stage: HTMLElement): HTMLElement {
+  let parent = stage.parentElement
+  while (parent) {
+    if (/(auto|scroll|overlay)/.test(window.getComputedStyle(parent).overflowY)) return parent
+    parent = parent.parentElement
+  }
+  return (document.scrollingElement ?? document.documentElement) as HTMLElement
+}
+
+/**
+ * The text nodes and node offsets a match range starts and ends at. The range
+ * may span several text items (including a separator space the index inserted),
+ * so only the endpoints need a DOM node. `undefined` means "not found".
+ */
+interface PdfMatchAnchors {
+  start: { node: Text; offset: number } | undefined
+  end: { node: Text; offset: number } | undefined
+}
+
+/**
+ * Map an occurrence of a query (already normalized) onto the rendered text
+ * layer. Counts and ranges read the same `PdfPageTextIndex`, so a count found
+ * by search always has a range here; only the DOM nodes differ between a
+ * rendered page and one whose text layer is built later.
+ *
+ * `searchText` is case-folded, and folding may change length (`İ` → `i̇`), so the
+ * folded match is first converted back to raw `index.text` offsets; `spans`
+ * are recorded in raw offsets.
+ */
+function locatePdfMatchAnchors(
+  index: PdfPageTextIndex,
+  query: string,
+  occurrence: number,
+  textNode: (itemIndex: number) => Text | null,
+): PdfMatchAnchors {
+  let foldedStart = -1
+  for (let count = 0; count < occurrence; count += 1) {
+    foldedStart = index.searchText.indexOf(query, foldedStart < 0 ? 0 : foldedStart + query.length)
+    if (foldedStart < 0) return { start: undefined, end: undefined }
+  }
+  const matchStart = sourceTextOffset(index.text, foldedStart)
+  const matchEnd = sourceTextOffset(index.text, foldedStart + query.length)
+  let hasStart = true
+  let start: PdfMatchAnchors["start"]
+  let end: PdfMatchAnchors["end"]
+  for (const span of index.spans) {
+    const node = textNode(span.itemIndex)
+    if (hasStart && matchStart >= span.start && matchStart < span.end) {
+      start = node ? { node, offset: span.sourceOffset + (matchStart - span.start) } : undefined
+      hasStart = false
+    }
+    if (matchEnd > span.start && matchEnd <= span.end) {
+      end = node ? { node, offset: span.sourceOffset + (matchEnd - span.start) } : undefined
+      break
+    }
+    if (span.start >= matchEnd) break
+  }
+  return { start, end }
+}
+
+function sourceTextOffset(text: string, foldedOffset: number): number {
+  let sourceOffset = 0
+  let remaining = foldedOffset
+  for (const character of text) {
+    if (remaining <= 0) break
+    remaining -= character.toLowerCase().length
+    sourceOffset += character.length
+  }
+  return sourceOffset
+}
 
 function readablePdfError(error: unknown, fallback: string): HavenErrorType {
   if (!(error instanceof PdfReaderError)) return toHavenError(error)
@@ -80,7 +163,14 @@ function readablePdfError(error: unknown, fallback: string): HavenErrorType {
 export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, className }: PdfReaderProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const stageRef = useRef<HTMLDivElement>(null)
+  const pageScrollRef = useRef<HTMLDivElement>(null)
   const textLayerRef = useRef<HTMLDivElement>(null)
+  const renderedTextRef = useRef<{
+    page: number
+    layer: PdfTextLayer
+    index: PdfPageTextIndex
+    items: PdfTextFragment[]
+  } | null>(null)
   const documentRef = useRef<PDFDocumentProxy | null>(null)
   const renderTaskRef = useRef<RenderTask | null>(null)
   const textLayerTaskRef = useRef<PdfTextLayer | null>(null)
@@ -95,6 +185,8 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
   const [searchOpen, setSearchOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState("")
   const [searchState, setSearchState] = useState<PdfSearchUiState>({ status: "idle" })
+  const [textLayerVersion, setTextLayerVersion] = useState(0)
+  const [searchRects, setSearchRects] = useState<Array<{ left: number; top: number; width: number; height: number }>>([])
 
   useEffect(() => {
     restoreLocatorRef.current = restoreLocator
@@ -162,6 +254,8 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
       renderTaskRef.current = null
       textLayerTaskRef.current?.cancel()
       textLayerTaskRef.current = null
+      // 文档即将销毁：这是唯一有权按"当前任务"清理共享句柄的地方；页面级清理只碰
+      // 本轮自己持有的任务，不会误清下一代任务。
       searchAbortRef.current?.abort()
       searchAbortRef.current = null
       const document = loadedDocument
@@ -180,26 +274,45 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
     const requestId = requestRef.current
     let cancelled = false
     let page: PDFPageProxy | null = null
+    // 本轮渲染自己持有的 PDF.js 任务。共享 ref 只用于"取消**当前**这一轮"：
+    // 每一轮的 finally / 清理函数只能碰自己这两个局部引用，不能拿共享 ref 当作自己的
+    // 所有权凭证——旧一轮的 finally 跑得比新一轮晚时，会把新一轮的取消句柄抹掉。
+    let ownedRenderTask: RenderTask | null = null
+    let ownedTextLayer: PdfTextLayer | null = null
 
     renderTaskRef.current?.cancel()
     renderTaskRef.current = null
     textLayerTaskRef.current?.cancel()
     textLayerTaskRef.current = null
     textLayerRef.current?.replaceChildren()
+    renderedTextRef.current = null
+    setSearchRects([])
 
-    const buildTextLayer = async (source: NonNullable<typeof page>, viewport: import("pdfjs-dist/legacy/build/pdf.mjs").PageViewport): Promise<string | null> => {
+    const buildTextLayer = async (
+      viewport: import("pdfjs-dist/legacy/build/pdf.mjs").PageViewport,
+      textContent: TextContent,
+    ): Promise<string | null> => {
       const layerElement = textLayerRef.current
       if (!layerElement || cancelled || requestRef.current !== requestId) return null
+      layerElement.style.setProperty("--total-scale-factor", String(viewport.scale))
       const textLayer = new TextLayer({
-        textContentSource: source.streamTextContent({ includeMarkedContent: false }),
+        textContentSource: textContent,
         container: layerElement,
         viewport,
       })
+      ownedTextLayer = textLayer
       textLayerTaskRef.current = textLayer
       try {
         await textLayer.render()
-        const normalized = (layerElement.textContent ?? "").replace(/\s+/g, " ").trim()
-        return normalized
+        if (cancelled || requestRef.current !== requestId) return null
+        // The text layer paints one span per text item (whitespace-only items
+        // get no span), in item order; `indexPdfPageText` records which item
+        // every code unit came from, so no DOM geometry is read back here.
+        const items = indexablePdfItems(textContent.items)
+        const index = indexPdfPageText(items)
+        renderedTextRef.current = { page: state.page, layer: textLayer, index, items }
+        setTextLayerVersion((version) => version + 1)
+        return boundPdfPageText(index.text)
       } catch {
         // Selection overlay is best-effort; canvas rendering remains authoritative.
         return null
@@ -237,9 +350,18 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
           viewport,
           transform: outputScale === 1 ? undefined : [outputScale, 0, 0, outputScale, 0, 0],
         })
+        ownedRenderTask = renderTask
         renderTaskRef.current = renderTask
         await renderTask.promise
-        const pageText = await buildTextLayer(page, viewport)
+        // 光栅已完成；文本提取可能长时间挂着，此时切页与缩放都已取消过本任务。
+        // 先按身份确认共享句柄仍是本任务再清，随后才释放自己的所有权；顺序反过来就再也
+        // 没人能清掉这个已完成的全局句柄，而共享 ref 之后的清理也不该由旧一轮代劳。
+        if (renderTaskRef.current === renderTask) renderTaskRef.current = null
+        ownedRenderTask = null
+        // 文本提取属于这一段渲染：只有仍然是当前文档与当前请求时才继续。
+        const textContent = await page.getTextContent()
+        if (cancelled || requestRef.current !== requestId) return
+        const pageText = await buildTextLayer(viewport, textContent)
         let textAnchor: TextAnchorDto | null = null
         if (pageText && pageText.length >= 12) {
           textAnchor = { exact: pageText.slice(0, 200), prefix: null, suffix: null }
@@ -259,19 +381,70 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
       } finally {
         page?.cleanup()
         page = null
-        renderTaskRef.current = null
+        // 只清自己那一份：新一轮可能已经写入了自己的任务，无条件置 null 会夺走它的
+        // 取消句柄，之后切页/缩放/卸载都停不下那份仍在运行的光栅或文本层。
+        if (renderTaskRef.current === ownedRenderTask) renderTaskRef.current = null
+        if (textLayerTaskRef.current === ownedTextLayer) textLayerTaskRef.current = null
+        ownedRenderTask = null
+        ownedTextLayer = null
       }
     }
     void render()
     return () => {
       cancelled = true
-      renderTaskRef.current?.cancel()
-      renderTaskRef.current = null
-      textLayerTaskRef.current?.cancel()
-      textLayerTaskRef.current = null
+      // 清理只动本轮持有的任务，别的一概不碰。
+      ownedRenderTask?.cancel()
+      if (renderTaskRef.current === ownedRenderTask) renderTaskRef.current = null
+      ownedTextLayer?.cancel()
+      if (textLayerTaskRef.current === ownedTextLayer) textLayerTaskRef.current = null
+      ownedRenderTask = null
+      ownedTextLayer = null
       page = null
     }
   }, [state, zoom])
+
+  useEffect(() => {
+    setSearchRects([])
+    const rendered = renderedTextRef.current
+    const stage = stageRef.current
+    if (state.status !== "ready" || searchState.status !== "done" || !rendered || !stage) return
+    const hit = searchState.flat[searchState.activeIndex]
+    if (!hit || hit.pageNumber !== state.page || rendered.page !== state.page) return
+    const layer = rendered.layer
+    const textNodeAt = (itemIndex: number): Text | null => {
+      // Whitespace-only items get no textDiv; a missing node just means "no anchor".
+      const element = layer.textDivs[itemIndex]
+      if (!element) return null
+      const content = element.textContent
+      if (!content || content !== rendered.items[itemIndex]?.str) return null
+      let node = element.firstChild
+      while (node && node.nodeType !== Node.TEXT_NODE) node = node.nextSibling
+      return node as Text | null
+    }
+    const anchors = locatePdfMatchAnchors(rendered.index, searchState.query, hit.occurrence, textNodeAt)
+    if (!anchors.start || !anchors.end) return
+    const range = document.createRange()
+    range.setStart(anchors.start.node, anchors.start.offset)
+    range.setEnd(anchors.end.node, anchors.end.offset)
+    const rectangles = Array.from(range.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0)
+    const stageRect = stage.getBoundingClientRect()
+    setSearchRects(rectangles.map((rect) => ({
+      left: rect.left - stageRect.left + stage.scrollLeft,
+      top: rect.top - stageRect.top + stage.scrollTop,
+      width: rect.width,
+      height: rect.height,
+    })))
+    if (rectangles[0]) {
+      const pageScroll = pageScrollRef.current
+      if (pageScroll) {
+        const pageScrollRect = pageScroll.getBoundingClientRect()
+        pageScroll.scrollLeft += rectangles[0].left - pageScrollRect.left - pageScroll.clientWidth / 2
+      }
+      const scrollContainer = pdfScrollContainer(stage)
+      const containerRect = scrollContainer.getBoundingClientRect()
+      scrollContainer.scrollTop += rectangles[0].top - containerRect.top - scrollContainer.clientHeight / 2
+    }
+  }, [searchState, state, textLayerVersion])
 
   if (state.status === "loading") {
     return <div className={cn("flex min-h-[240px] items-center justify-center text-sm opacity-60", className)}>正在解析 PDF…</div>
@@ -281,8 +454,14 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
   }
 
   const setPage = (page: number) => {
+    const stage = stageRef.current
+    if (stage) {
+      pdfScrollContainer(stage).scrollTop = 0
+      stage.scrollTop = 0
+    }
+    if (pageScrollRef.current) pageScrollRef.current.scrollLeft = 0
     setState((current) => current.status === "ready"
-      ? { ...current, page: clampPdfPage(page, current.numPages) }
+      ? clampPdfPage(page, current.numPages) === current.page ? current : { ...current, page: clampPdfPage(page, current.numPages) }
       : current)
   }
 
@@ -296,13 +475,24 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
   }
 
   const getTextForPage = async (pageNumber: number): Promise<string> => {
+    // The rendered page is indexed from the text items its text layer was
+    // built from, so the highlight can map matches straight onto textDivs.
+    const rendered = renderedTextRef.current
+    if (pageNumber === state.page && rendered?.page === pageNumber) {
+      return rendered.index.text
+    }
     const cached = pageTextCacheRef.current.get(pageNumber)
     if (cached !== undefined) return cached
     const page = await state.document.getPage(pageNumber)
-    const content = await page.getTextContent()
-    const text = boundPdfPageText(content.items.map((item) => ("str" in item ? item.str : "")).join(" "))
-    pageTextCacheRef.current.set(pageNumber, text)
-    return text
+    try {
+      const content = await page.getTextContent()
+      const index = indexPdfPageText(indexablePdfItems(content.items))
+      const text = boundPdfPageText(index.text)
+      pageTextCacheRef.current.set(pageNumber, text)
+      return text
+    } finally {
+      page.cleanup()
+    }
   }
 
   const runSearch = async () => {
@@ -324,10 +514,12 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
       })
       if (controller.signal.aborted) return
       const flat = flattenPdfSearchHits(hits)
-      setSearchState({ status: "done", hits, flat, totalMatches: flat.length, activeIndex: 0 })
+      setSearchState({ status: "done", query: normalizePdfQuery(query), hits, flat, totalMatches: flat.length, activeIndex: 0 })
       if (flat[0]) setPage(flat[0].pageNumber)
     } catch {
-      // Aborted by a newer search or unmount; the newer run owns the UI.
+      if (!controller.signal.aborted) {
+        setSearchState({ status: "error", message: "页面文本读取失败，请重新搜索。" })
+      }
     }
   }
 
@@ -346,12 +538,13 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
   }
 
   const searchSummary = (() => {
+    if (searchState.status === "error") return <span role="alert">{searchState.message}</span>
     if (searchState.status === "scanning") {
       return <span className="opacity-60">扫描中 {searchState.scanned}/{state.numPages}</span>
     }
     if (searchState.status === "done") {
       return searchState.totalMatches > 0
-        ? <span className="tabular-nums">共 {searchState.totalMatches} 处 · 第 {searchState.flat[searchState.activeIndex].pageNumber} 页</span>
+        ? <span className="tabular-nums">第 {searchState.activeIndex + 1}/{searchState.totalMatches} 处 · 第 {searchState.flat[searchState.activeIndex].pageNumber} 页</span>
         : <span className="opacity-60">无匹配</span>
     }
     return null
@@ -423,9 +616,14 @@ export function PdfReader({ bytes, source, restoreLocator, onLocatorChange, clas
         </div>
       )}
 
-      <div ref={stageRef} className="relative max-w-full overflow-auto rounded-sm bg-white shadow-xl">
-        <canvas ref={canvasRef} aria-label={`PDF 第 ${state.page} 页`} className="block h-full w-full" />
-        <div ref={textLayerRef} className="pdf-text-layer" aria-hidden="true" />
+      <div ref={pageScrollRef} className="w-full shrink-0 overflow-x-auto overflow-y-hidden">
+        <div ref={stageRef} className="relative mx-auto overflow-hidden rounded-sm bg-white shadow-xl">
+          <canvas ref={canvasRef} aria-label={`PDF 第 ${state.page} 页`} className="block h-full w-full" />
+          <div ref={textLayerRef} className="pdf-text-layer" aria-hidden="true" />
+          <div className="pointer-events-none absolute inset-0" aria-hidden="true">
+            {searchRects.map((rect, index) => <span key={index} className="absolute bg-amber-400/40 outline outline-1 outline-amber-500/60" style={rect} />)}
+          </div>
+        </div>
       </div>
     </section>
   )

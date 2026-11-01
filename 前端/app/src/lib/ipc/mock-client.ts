@@ -56,6 +56,9 @@ import type {
   DownloadEvent,
   DownloadListRequest,
   DownloadMutationResultDto,
+  DownloadResourceActionRequest,
+  DownloadResourceMutationResultDto,
+  DownloadResourceRevealResultDto,
   DownloadRevealResultDto,
   DownloadTaskActionRequest,
   DownloadTaskDto,
@@ -144,6 +147,8 @@ import type {
   AgentSettingsProposalDto,
   AgentSettingsProposalGetRequest,
   AgentSettingsProposalGetResultDto,
+  AgentSettingsProposalListRequest,
+  AgentSettingsProposalListResultDto,
   AgentSettingsProposalRejectRequest,
   AgentSettingsProposalRejectResultDto,
   AgentTraceGetRequest,
@@ -2034,6 +2039,40 @@ export class MockHavenClient implements HavenClient {
     return { schemaVersion: 1, taskId: request.taskId };
   }
 
+  async downloadDeleteOfflineResource(
+    request: DownloadResourceActionRequest,
+  ): Promise<DownloadResourceMutationResultDto> {
+    this.requireMockOfflineResource(request.resourceId)
+    return {
+      schemaVersion: 1,
+      resourceId: request.resourceId,
+      offlineResourceRemoved: true,
+    };
+  }
+
+  async downloadRevealOfflineResource(
+    request: DownloadResourceActionRequest,
+  ): Promise<DownloadResourceRevealResultDto> {
+    this.requireMockOfflineResource(request.resourceId)
+    return { schemaVersion: 1, resourceId: request.resourceId };
+  }
+
+  /** Mock 不伪造离线文件：只有 fixture 明确登记的 Offline Resource 才可操作。 */
+  private requireMockOfflineResource(resourceId: string): void {
+    const resource = (resourceMixedAvailability as ResourceListDto).items.find((item) => (
+      item.resourceId === resourceId
+      && item.isOffline
+      && item.availability === "offline_available"
+    ))
+    if (!resource) {
+      throw new HavenError({
+        code: "DOWNLOAD_OFFLINE_RESOURCE_INVALID",
+        userMessage: "离线资源登记信息无效，已拒绝文件操作",
+        retryable: false,
+      })
+    }
+  }
+
   async downloadSubscribe(
     _subscriptionId: string,
     _onEvent: (event: DownloadEvent) => void,
@@ -2060,14 +2099,14 @@ export class MockHavenClient implements HavenClient {
         displayName: source.displayName,
         kinds: feed || comic
           ? ["search", "online_read", "offline_download"]
-          : ["search", "offline_download"],
+          : ["search"],
         categories: feed ? ["periodical"] : comic ? ["comic"] : ["book"],
         mode: "single",
         notes: feed
           ? "这是你添加的 RSS/Atom 订阅源；Haven 只读取该订阅源自身提供的条目内容，不会打开条目链接指向的网页。地址必须使用 HTTPS，且不能带查询串。"
           : comic
             ? `这是你添加的 ${comicLabel} 漫画库；搜索、章节列表、在线逐页阅读与 CBZ 下载都只访问该地址。API key 只保存在系统凭据管理器并作为请求头发送，不会出现在地址、日志或来源身份里。`
-            : "这是你添加的自定义 OPDS 书库；可在来源设置中编辑地址或配置访问凭据。",
+            : "这是你添加的自定义 OPDS 书库；当前仅支持搜索，正文导入与下载尚未开放。可编辑地址或配置访问凭据。",
         enabled: this.customSourceEnabled.get(sourceId) ?? false,
         health: "unknown",
         endpointConfigured: source.endpoint.length > 0,
@@ -2873,6 +2912,25 @@ export class MockHavenClient implements HavenClient {
       proposal: mockProposalDto(record),
       receipt: record.receipt ? mockReceiptDto(record) : null,
     }
+  }
+
+  async agentSettingsProposalList(
+    request: AgentSettingsProposalListRequest,
+  ): Promise<AgentSettingsProposalListResultDto> {
+    const records = [...this.agentProposals.values()].sort((left, right) =>
+      right.createdAt.localeCompare(left.createdAt) || right.proposalId.localeCompare(left.proposalId));
+    const cursor = request.before === null ? -1 : records.findIndex((item) => item.proposalId === request.before);
+    const limit = Math.max(1, Math.min(100, request.limit ?? 30));
+    const remaining = request.before !== null && cursor < 0 ? [] : records.slice(cursor + 1);
+    const page = remaining.slice(0, limit);
+    return {
+      schemaVersion: 1,
+      items: page.map((record) => ({
+        proposal: mockProposalDto(record),
+        receipt: record.receipt ? mockReceiptDto(record) : null,
+      })),
+      nextCursor: remaining.length > limit ? page.at(-1)?.proposalId ?? null : null,
+    };
   }
 
   async agentSettingsProposalReject(

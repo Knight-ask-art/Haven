@@ -13,8 +13,11 @@ const comicWorkCatalog = comicWorkCatalogFixture as unknown as ComicWorkChapterC
 const gateway = vi.hoisted(() => ({
   createDownloadForMediaItem: vi.fn(),
   deleteOfflineDownload: vi.fn(),
+  deleteOfflineResource: vi.fn(),
   getMediaItemDownloadInfo: vi.fn(),
+  startDownloadFromProjection: vi.fn(),
   revealOfflineDownload: vi.fn(),
+  revealOfflineResource: vi.fn(),
   subscribeDownloadEvents: vi.fn(),
 }))
 const work = vi.hoisted(() => ({ getWorkDetail: vi.fn() }))
@@ -54,14 +57,17 @@ vi.mock("../lib/edition-mapper", async (importOriginal) => ({
   mapEditionListToDetailItems: editions.mapEditionListToDetailItems,
 }))
 vi.mock("../ipc/favorite-gateway", () => ({ onFavoriteChanged: vi.fn(async () => () => undefined), setFavorite: vi.fn() }))
-vi.mock("@/features/downloads/ipc/download-gateway", () => gateway)
+vi.mock("@/features/downloads/ipc/download-gateway", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/features/downloads/ipc/download-gateway")>()
+  return { ...gateway, presentMediaItemDownloadAction: actual.presentMediaItemDownloadAction }
+})
 vi.mock("@/features/progress/ipc/progress-gateway", () => progress)
 vi.mock("@/components/ui/haven/ArtworkImage", () => ({ ArtworkImage: () => null }))
 vi.mock("@/components/ui/haven/ShareCardModal", () => ({ ShareCardModal: () => null }))
 
-const downloadable = { status: "idle", canDownload: true, hasOfflineResource: false, canOnlineRead: false, sourceResourceId: "source", taskId: null }
+const downloadable = { status: "idle", canDownload: true, hasOfflineResource: false, canOnlineRead: false, sourceResourceId: "source", taskId: null, offlineResourceId: null }
 const queued = { ...downloadable, status: "queued", taskId: "task-a" }
-const offline = { status: "downloaded", canDownload: true, hasOfflineResource: true, canOnlineRead: true, sourceResourceId: "source", taskId: "task-a" }
+const offline = { status: "downloaded", canDownload: true, hasOfflineResource: true, canOnlineRead: true, sourceResourceId: "source", taskId: "task-a", offlineResourceId: "offline-a" }
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -129,6 +135,7 @@ beforeEach(() => {
   editions.mapEditionListToDetailItems.mockReturnValue([])
   comicCatalog.getComicWorkChapterCatalog.mockResolvedValue(comicWorkCatalog)
   gateway.getMediaItemDownloadInfo.mockResolvedValue(downloadable)
+  gateway.startDownloadFromProjection.mockResolvedValue({ state: "queued", taskId: "task-a" })
   gateway.subscribeDownloadEvents.mockResolvedValue(async () => undefined)
   gateway.deleteOfflineDownload.mockResolvedValue(undefined)
   progress.resetProgress.mockResolvedValue(undefined)
@@ -136,6 +143,25 @@ beforeEach(() => {
 afterEach(() => { cleanup(); localStorage.clear(); vi.clearAllMocks(); vi.unstubAllGlobals() })
 
 describe("MediaDetailPage download lifecycle", () => {
+  it("manages retained offline resources after the task record is removed", async () => {
+    gateway.getMediaItemDownloadInfo.mockResolvedValue({ ...offline, taskId: null })
+    gateway.revealOfflineResource.mockResolvedValue(undefined)
+    gateway.deleteOfflineResource.mockImplementation(async () => {
+      gateway.getMediaItemDownloadInfo.mockResolvedValue(downloadable)
+    })
+    renderPage()
+    await screen.findByLabelText("已下载")
+    await openMore()
+    fireEvent.click(screen.getByRole("button", { name: "在文件夹中定位" }))
+    await waitFor(() => expect(gateway.revealOfflineResource).toHaveBeenCalledWith("offline-a"))
+    await openMore()
+    fireEvent.click(screen.getByRole("button", { name: "删除离线内容" }))
+    await waitFor(() => expect(gateway.deleteOfflineResource).toHaveBeenCalledWith("offline-a"))
+    expect(gateway.revealOfflineDownload).not.toHaveBeenCalled()
+    expect(gateway.deleteOfflineDownload).not.toHaveBeenCalled()
+    await screen.findByLabelText("下载至本地")
+  })
+
   it("does not pass an empty source to the native hero image while detail data is loading", () => {
     const pending = deferred<{ id: string }>()
     work.getWorkDetail.mockReturnValue(pending.promise)
@@ -170,7 +196,7 @@ describe("MediaDetailPage download lifecycle", () => {
 
   it("refreshes the full download projection when creation returns completed", async () => {
     let created = false
-    gateway.createDownloadForMediaItem.mockImplementation(async () => {
+    gateway.startDownloadFromProjection.mockImplementation(async () => {
       created = true
       return { state: "completed" }
     })
@@ -184,31 +210,55 @@ describe("MediaDetailPage download lifecycle", () => {
     expect(gateway.getMediaItemDownloadInfo.mock.calls.length).toBeGreaterThanOrEqual(2)
   })
 
+  it("offers resume for a paused task and sends the explicit intent to the recovery path", async () => {
+    const paused = { ...downloadable, status: "paused" as const, taskState: "paused" as const, canDownload: false, taskId: "task-paused" }
+    gateway.getMediaItemDownloadInfo.mockResolvedValue(paused)
+    renderPage()
+    const button = await screen.findByLabelText("继续下载")
+    await waitFor(() => expect(button.hasAttribute("disabled")).toBe(false))
+    expect(screen.getByText("· 下载已暂停，可继续")).toBeTruthy()
+    expect(screen.queryByText("· 已加入下载列表")).toBeNull()
+    fireEvent.click(button)
+    await waitFor(() => expect(gateway.startDownloadFromProjection).toHaveBeenCalledWith(paused, expect.any(String)))
+    expect(gateway.createDownloadForMediaItem).not.toHaveBeenCalled()
+  })
+
+  it("offers retry for an interrupted task", async () => {
+    const interrupted = { ...downloadable, status: "interrupted" as const, taskState: "interrupted" as const, canDownload: false, taskId: "task-stopped" }
+    gateway.getMediaItemDownloadInfo.mockResolvedValue(interrupted)
+    renderPage()
+    const button = await screen.findByLabelText("重试下载")
+    await waitFor(() => expect(button.hasAttribute("disabled")).toBe(false))
+    fireEvent.click(button)
+    await waitFor(() => expect(gateway.startDownloadFromProjection).toHaveBeenCalledWith(interrupted, expect.any(String)))
+    expect(gateway.createDownloadForMediaItem).not.toHaveBeenCalled()
+  })
+
   it("re-enables the download action after creation fails", async () => {
-    gateway.createDownloadForMediaItem.mockRejectedValue(new Error("disk unavailable"))
+    gateway.startDownloadFromProjection.mockRejectedValue(new Error("disk unavailable"))
     renderPage()
     const downloadButton = await screen.findByLabelText("下载至本地")
     await waitFor(() => expect(downloadButton.hasAttribute("disabled")).toBe(false))
 
     fireEvent.click(downloadButton)
 
-    expect(await screen.findByText("创建下载任务失败")).toBeTruthy()
+    expect(await screen.findByText("下载操作失败，请重试")).toBeTruthy()
     await waitFor(() => expect(screen.getByLabelText("下载至本地").hasAttribute("disabled")).toBe(false))
   })
 
   it("refreshes when a newly queued task completes before React commits its task id", async () => {
-    let onEvent: ((event: { data: { taskId: string } }) => void) | undefined
+    let onEvent: ((event: { data: { taskId: string; state?: string } }) => void) | undefined
     gateway.subscribeDownloadEvents.mockImplementation(async (callback: typeof onEvent) => {
       onEvent = callback
       return async () => undefined
     })
-    gateway.getMediaItemDownloadInfo
-      .mockResolvedValueOnce(downloadable)
-      .mockResolvedValue(offline)
-    gateway.createDownloadForMediaItem.mockImplementation(async () => {
+    let completed = false
+    gateway.getMediaItemDownloadInfo.mockImplementation(async () => completed ? offline : downloadable)
+    gateway.startDownloadFromProjection.mockImplementation(async () => {
       // A fast local task can emit its terminal event before command response
       // lets React commit `task-a` into component state.
-      onEvent?.({ data: { taskId: "task-a" } })
+      completed = true
+      onEvent?.({ data: { taskId: "task-a", state: "completed" } })
       return { state: "queued", taskId: "task-a" }
     })
     renderPage()
@@ -218,6 +268,7 @@ describe("MediaDetailPage download lifecycle", () => {
 
     fireEvent.click(downloadButton)
 
+    await waitFor(() => expect(gateway.startDownloadFromProjection).toHaveBeenCalledTimes(1))
     expect(await screen.findByLabelText("已下载")).toBeTruthy()
   })
 
@@ -261,6 +312,7 @@ describe("MediaDetailPage download lifecycle", () => {
     })
     gateway.getMediaItemDownloadInfo
       .mockResolvedValueOnce(queued)
+      .mockResolvedValueOnce(queued)
       .mockImplementation(() => refresh.promise)
     renderPage()
     await screen.findByLabelText("下载至本地")
@@ -282,6 +334,7 @@ describe("MediaDetailPage download lifecycle", () => {
   it("invalidates offline controls immediately when deletion succeeds and exposes refresh retry on failure", async () => {
     const refresh = deferred<typeof downloadable>()
     gateway.getMediaItemDownloadInfo
+      .mockResolvedValueOnce(offline)
       .mockResolvedValueOnce(offline)
       .mockReturnValueOnce(refresh.promise)
       .mockResolvedValueOnce(downloadable)

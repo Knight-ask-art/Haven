@@ -456,6 +456,39 @@ describe("useAiProviderSettings 凭据写入与清除互斥", () => {
  * 和一份新目录，而真正失败的写入仍然没有发生——一次被误认为成功的失败，比直接报错更糟。
  */
 describe("useAiProviderSettings 的重试语义", () => {
+  it("真实 CAS 冲突后回读配置，但不自动升级版本重放保存", async () => {
+    gateway.listAiProviderProfiles.mockResolvedValue([PROFILE])
+    const { result } = renderHook(() => useAiProviderSettings())
+    await waitFor(() => expect(result.current.selectedProfile?.profileId).toBe(PROFILE.profileId))
+    gateway.listAiProviderProfiles.mockResolvedValue([{ ...PROFILE, revision: "revision-new", displayName: "其它操作的修改" }])
+    gateway.upsertAiProviderProfile.mockRejectedValueOnce({
+      code: "AI_PROVIDER_PROFILE_REVISION_CONFLICT", userMessage: "请重新读取", retryable: true,
+    })
+    await act(async () => {
+      await expect(result.current.saveProfile({ ...PROFILE, displayName: "我的草稿" })).resolves.toBe(false)
+    })
+    expect(result.current.selectedProfile?.revision).toBe("revision-new")
+    expect(result.current.canRetrySaveError).toBe(false)
+    await act(async () => { await expect(result.current.retrySaveError()).resolves.toBe(false) })
+    expect(gateway.upsertAiProviderProfile).toHaveBeenCalledTimes(1)
+    expect(result.current.state.saveError).not.toBeNull()
+  })
+
+  it("删除冲突后回读新状态并要求重新确认，不能删除新版配置", async () => {
+    gateway.listAiProviderProfiles.mockResolvedValue([PROFILE])
+    const { result } = renderHook(() => useAiProviderSettings())
+    await waitFor(() => expect(result.current.selectedProfile?.profileId).toBe(PROFILE.profileId))
+    gateway.listAiProviderProfiles.mockResolvedValue([{ ...PROFILE, revision: "revision-new" }])
+    gateway.deleteAiProviderProfile.mockRejectedValueOnce({
+      code: "AI_PROVIDER_PROFILE_REVISION_CONFLICT", userMessage: "请重新读取", retryable: true,
+    })
+    await act(async () => { await expect(result.current.deleteProfile()).resolves.toBe(false) })
+    expect(result.current.selectedProfile?.revision).toBe("revision-new")
+    expect(result.current.canRetrySaveError).toBe(false)
+    await act(async () => { await expect(result.current.retrySaveError()).resolves.toBe(false) })
+    expect(gateway.deleteAiProviderProfile).toHaveBeenCalledTimes(1)
+  })
+
   it("保存失败后的重试重放同一份草稿，而不是去拉模型", async () => {
     gateway.listAiProviderProfiles.mockResolvedValue([PROFILE])
     gateway.upsertAiProviderProfile.mockRejectedValueOnce({
@@ -586,5 +619,141 @@ describe("useAiProviderSettings 的重试语义", () => {
       await expect(result.current.retrySaveError()).resolves.toBe(false)
     })
     expect(gateway.deleteAiProviderProfile).toHaveBeenCalledTimes(1)
+  })
+})
+
+/**
+ * 放弃草稿必须同时作废那次失败草稿的重放入口。
+ *
+ * 曾经的界面在「放弃」里只把草稿收起来，错误横幅和它的「重试」都还留着：用户看到
+ * 界面恢复成已保存值，抬手点一下「重试」，被放弃的输入就被写回了本机。
+ */
+describe("useAiProviderSettings 放弃草稿后作废重放", () => {
+  const draft = {
+    profileId: PROFILE.profileId,
+    displayName: "已放弃的名字",
+    endpoint: PROFILE.endpoint,
+    enabled: true,
+    selectedModelId: null,
+  }
+
+  it("保存失败后放弃草稿：失败提示被作废，重试也不再重放那份草稿", async () => {
+    gateway.listAiProviderProfiles.mockResolvedValue([PROFILE])
+    gateway.upsertAiProviderProfile.mockRejectedValueOnce({
+      code: "AI_PROVIDER_CAS_CONFLICT", userMessage: "写入失败", retryable: true,
+    })
+    const { result } = renderHook(() => useAiProviderSettings())
+    await waitFor(() => expect(result.current.selectedProfile?.profileId).toBe(PROFILE.profileId))
+    await act(async () => { await expect(result.current.saveProfile(draft)).resolves.toBe(false) })
+    expect(result.current.state.saveErrorAction).toBe("profile")
+    expect(result.current.canRetrySaveError).toBe(true)
+
+    act(() => { expect(result.current.discardDraftIntent()).toBe(true) })
+    expect(result.current.state.saveError).toBeNull()
+    expect(result.current.canRetrySaveError).toBe(false)
+    await act(async () => { await expect(result.current.retrySaveError()).resolves.toBe(false) })
+    // 关键断言：只有最初那次失败的写入，放弃之后没有任何重放。
+    expect(gateway.upsertAiProviderProfile).toHaveBeenCalledTimes(1)
+    expect(gateway.upsertAiProviderProfile.mock.calls[0]?.[0]).toMatchObject({ displayName: "已放弃的名字" })
+  })
+
+  it("不牵连独立的删除失败：作废草稿之后删除的重试仍然重放原目标", async () => {
+    gateway.listAiProviderProfiles.mockResolvedValue([PROFILE])
+    gateway.deleteAiProviderProfile.mockRejectedValueOnce({
+      code: "AI_PROVIDER_CAS_CONFLICT", userMessage: "删除失败", retryable: true,
+    })
+    const { result } = renderHook(() => useAiProviderSettings())
+    await waitFor(() => expect(result.current.selectedProfile?.profileId).toBe(PROFILE.profileId))
+    await act(async () => { await expect(result.current.deleteProfile()).resolves.toBe(false) })
+    expect(result.current.state.saveErrorAction).toBe("delete")
+
+    act(() => { result.current.discardDraftIntent() })
+    // 删除失败与草稿无关：提示与重试都还在。
+    expect(result.current.state.saveErrorAction).toBe("delete")
+    expect(result.current.canRetrySaveError).toBe(true)
+    gateway.deleteAiProviderProfile.mockResolvedValueOnce(undefined)
+    await act(async () => { await expect(result.current.retrySaveError()).resolves.toBe(true) })
+    expect(gateway.deleteAiProviderProfile.mock.calls[1]).toEqual([PROFILE.profileId, PROFILE.revision])
+  })
+
+  it("写入在途时拒绝作废：那一次写入还没有结论", async () => {
+    gateway.listAiProviderProfiles.mockResolvedValue([PROFILE])
+    const pending = deferred<AiProviderProfileDto>()
+    gateway.upsertAiProviderProfile.mockImplementationOnce(() => pending.promise)
+    const { result } = renderHook(() => useAiProviderSettings())
+    await waitFor(() => expect(result.current.selectedProfile?.profileId).toBe(PROFILE.profileId))
+
+    let save!: Promise<boolean>
+    act(() => { save = result.current.saveProfile(draft) })
+    await waitFor(() => expect(result.current.state.saving).toBe(true))
+    act(() => { expect(result.current.discardDraftIntent()).toBe(false) })
+
+    pending.reject({ code: "AI_PROVIDER_CAS_CONFLICT", userMessage: "写入失败", retryable: true })
+    await act(async () => { await expect(save).resolves.toBe(false) })
+    // 失败结论照常报告，重放依据仍在（用户没有放弃任何东西：作废被拒绝了）。
+    expect(result.current.state.saveErrorAction).toBe("profile")
+    expect(result.current.canRetrySaveError).toBe(true)
+  })
+
+  it("写入在途时属主被销毁：写入照旧完成，迟到的失败也不再留下可重放的草稿", async () => {
+    gateway.listAiProviderProfiles.mockResolvedValue([PROFILE])
+    const pending = deferred<AiProviderProfileDto>()
+    gateway.upsertAiProviderProfile.mockImplementationOnce(() => pending.promise)
+    const { result } = renderHook(() => useAiProviderSettings())
+    await waitFor(() => expect(result.current.selectedProfile?.profileId).toBe(PROFILE.profileId))
+
+    const owned = { ...draft, displayName: "属主销毁的名字" }
+    let save!: Promise<boolean>
+    act(() => { save = result.current.saveProfile(owned) })
+    await waitFor(() => expect(result.current.state.saving).toBe(true))
+
+    // 面板被浏览器历史 / 路由离开带走：草稿的属主没了，但写入**不取消**。
+    act(() => { result.current.disposeDraftOwner() })
+    expect(gateway.upsertAiProviderProfile).toHaveBeenCalledTimes(1)
+
+    pending.reject({ code: "AI_PROVIDER_TRANSIENT", userMessage: "迟到的写入失败", retryable: true })
+    await act(async () => { await expect(save).resolves.toBe(false) })
+
+    // 失败结论如实报告（用户确实提交过这次写入）……
+    expect(result.current.state.saveErrorAction).toBe("profile")
+    expect(result.current.state.saveError).not.toBeNull()
+    // ……但重放依据已随属主一起作废：不能出现一个按下去什么也不做的「重试」。
+    expect(result.current.canRetrySaveError).toBe(false)
+    await act(async () => { await expect(result.current.retrySaveError()).resolves.toBe(false) })
+    expect(gateway.upsertAiProviderProfile).toHaveBeenCalledTimes(1)
+    expect(gateway.upsertAiProviderProfile.mock.calls[0]?.[0]).toMatchObject({ displayName: "属主销毁的名字" })
+  })
+
+  it("写入在途时的第二次提交被同步拒绝：只发一次写入，也不抢占重放依据", async () => {
+    gateway.listAiProviderProfiles.mockResolvedValue([PROFILE])
+    const pending = deferred<AiProviderProfileDto>()
+    gateway.upsertAiProviderProfile.mockImplementationOnce(() => pending.promise)
+    const { result } = renderHook(() => useAiProviderSettings())
+    await waitFor(() => expect(result.current.selectedProfile?.profileId).toBe(PROFILE.profileId))
+
+    const second = { ...draft, displayName: "第二次提交的名字" }
+    let first!: Promise<boolean>
+    let secondSave!: Promise<boolean>
+    act(() => { first = result.current.saveProfile(draft) })
+    // 同一个 act 内再提交一次：`state.saving` 还没随渲染落下来，只有同步闸门拦得住。
+    act(() => { secondSave = result.current.saveProfile(second) })
+    // 第二次提交不写、也不排队；它只是被拒绝，不是"保存成功"。
+    await act(async () => { await expect(secondSave).resolves.toBe(false) })
+    // 第一次仍在途，`saving` 只由它驱动，第二次没有把它中途放掉。
+    expect(result.current.state.saving).toBe(true)
+    expect(gateway.upsertAiProviderProfile).toHaveBeenCalledTimes(1)
+    expect(gateway.upsertAiProviderProfile.mock.calls[0]?.[0]).toMatchObject({ displayName: "已放弃的名字" })
+
+    // 在途期间依旧不能作废：放弃会假装取消一次还没有结论的写入。
+    act(() => { expect(result.current.discardDraftIntent()).toBe(false) })
+
+    pending.reject({ code: "AI_PROVIDER_CAS_CONFLICT", userMessage: "写入失败", retryable: true })
+    await act(async () => { await expect(first).resolves.toBe(false) })
+    expect(result.current.state.saveErrorAction).toBe("profile")
+
+    // 重放的是**第一次**那份输入：第二次提交没有覆盖重放依据。
+    gateway.upsertAiProviderProfile.mockResolvedValueOnce(PROFILE)
+    await act(async () => { await expect(result.current.retrySaveError()).resolves.toBe(true) })
+    expect(gateway.upsertAiProviderProfile.mock.calls[1]?.[0]).toMatchObject({ displayName: "已放弃的名字" })
   })
 })

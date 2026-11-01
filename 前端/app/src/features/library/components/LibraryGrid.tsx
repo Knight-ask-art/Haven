@@ -1,6 +1,6 @@
 
 import { MediaItem } from "./MediaItem"
-import type { LibraryMediaItemData } from "./MediaItem"
+import type { LibraryMediaItemData, LibrarySpotlightHandler } from "./MediaItem"
 import { useNavigate } from "react-router"
 import { ArtworkImage } from "@/components/ui/haven/ArtworkImage"
 import { defaultCoverCategoryForMediaType } from "@/lib/default-cover"
@@ -16,7 +16,7 @@ interface LibraryGridProps {
   viewMode?: ViewMode
   searchQuery?: string
   density?: "regular" | "compact"
-  onHoverItem?: (item: LibraryMediaItemData) => void
+  onHoverItem?: LibrarySpotlightHandler
   /** 数据源注入（IPC-MOCK-001）：缺省回落共享 Mock（搜索/下载页迁移前保持原行为）。 */
   items?: LibraryMediaItemData[]
   selectionMode?: boolean
@@ -371,7 +371,9 @@ export function LibraryGrid({
               if (selectionMode) onToggleSelect?.(item.id)
               else navigate(`/work/${item.id}`, { state: { favorite: item.favorite } })
             }}
-            onMouseEnter={() => onHoverItem?.(item)}
+            onMouseEnter={() => onHoverItem?.(item, "hover")}
+            onMouseLeave={() => onHoverItem?.(item, "leave")}
+            onFocus={() => onHoverItem?.(item, "focus")}
             className="flex items-center gap-6 p-3.5 rounded-2xl bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 transition-all cursor-pointer group border border-black/5 dark:border-white/5"
           >
             {/* Thumbnail */}

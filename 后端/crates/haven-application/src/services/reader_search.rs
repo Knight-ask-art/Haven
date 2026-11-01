@@ -317,21 +317,28 @@ pub fn normalize_for_match(text: &str) -> String {
     result
 }
 
+/// 归一化 + offset 映射。段落内部被折叠的空白映射到原空白位置（而不是 -1），
+/// 让跨空白的短语仍算同一段；只有 `build_book_search_index` 插入的段间分隔符
+/// 才是 -1。与前端 `normalizeWithMap` 保持 1:1。
 pub fn normalize_with_map(text: &str) -> (String, Vec<i32>) {
     let mut norm = Vec::new();
     let mut map: Vec<i32> = Vec::new();
     let mut pending_space = false;
+    let mut pending_space_index: i32 = 0;
     let mut index: i32 = 0;
     for ch in full_width_to_half_width(text).chars() {
         let code = ch as u32;
         if is_whitespace_code(code) {
+            if !pending_space {
+                pending_space_index = index;
+            }
             pending_space = true;
             index += 1;
             continue;
         }
         if pending_space && !norm.is_empty() {
             norm.push(' ');
-            map.push(-1);
+            map.push(pending_space_index);
         }
         pending_space = false;
         for lower in ch.to_lowercase() {

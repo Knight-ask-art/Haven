@@ -96,6 +96,37 @@ beforeEach(() => {
 afterEach(() => cleanup())
 
 describe("SearchPage result presentation and existing actions", () => {
+  it("clears submitted results and URL when the input is erased by keyboard", async () => {
+    await renderPage()
+    await act(async () => {
+      fireEvent.change(screen.getByPlaceholderText("搜索本地媒体库"), { target: { value: "" } })
+    })
+    expect(screen.getByRole("heading", { name: "热门排行" })).toBeTruthy()
+    expect(screen.queryByRole("region", { name: "本地媒体库" })).toBeNull()
+    expect(screen.queryByRole("region", { name: "来源结果" })).toBeNull()
+    expect(screen.getByTestId("location").textContent).not.toContain("q=")
+  })
+
+  it("accepts 200 Unicode characters and explains longer input without submitting it", async () => {
+    await renderPage("/search");
+    const input = screen.getByPlaceholderText("搜索本地媒体库");
+    const query = "📚".repeat(200);
+    fireEvent.change(input, { target: { value: query } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await act(async () => {});
+    expect(mocks.startSourceSearch).toHaveBeenCalledWith(query, expect.any(Function), undefined);
+    const previousCalls = mocks.startSourceSearch.mock.calls.length;
+    fireEvent.change(input, { target: { value: "书".repeat(201) } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getByRole("alert").textContent).toContain("200 个字符");
+    expect(mocks.startSourceSearch).toHaveBeenCalledTimes(previousCalls);
+    fireEvent.change(input, { target: { value: "书".repeat(67) } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await act(async () => {});
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(mocks.startSourceSearch).toHaveBeenLastCalledWith("书".repeat(67), expect.any(Function), undefined);
+  })
+
   it("shows the query, local and source sections in mock preview instead of a blank page", async () => {
     const { container } = await renderPage()
     expect(screen.getByRole("heading", { level: 1, name: "“三体”" })).toBeTruthy()
@@ -179,6 +210,8 @@ describe("SearchPage result presentation and existing actions", () => {
     await act(async () => { fireEvent.click(screen.getByRole("button", { name: "重试" })) })
     expect(screen.getByRole("button", { name: "查看作品：三体" })).toBeTruthy()
     expect(mocks.searchLocalLibrary).toHaveBeenCalledTimes(2)
+    // 本地重试只重启本地检索，不触发来源搜索。
+    expect(mocks.startSourceSearch).toHaveBeenCalledOnce()
   })
 
   it("keeps completed source results completed even if events arrive before the start promise resolves", async () => {
@@ -256,11 +289,171 @@ describe("SearchPage result presentation and existing actions", () => {
     expect(sourceRegion.getByRole("button", { name: "导入媒体库：来源里的三体" })).toBeTruthy()
   })
 
+  it("restarts the source search from the notice after a terminal failure", async () => {
+    mocks.startSourceSearch
+      .mockImplementationOnce(async (_query, onEvent) => {
+        onEvent({ ...event("warning"), data: { sourceId: "tvmaze", works: [], code: "SOURCE_UNAVAILABLE", message: "目录服务暂时不可用" } })
+        onEvent(event("source_result", [candidate("content-candidate-stale", "过期的来源条目")], "opds_gutenberg"))
+        onEvent(event("failed"))
+        return { operationId: "op-test", taskId: "task-test", alreadyRunning: false }
+      })
+      .mockImplementationOnce(async (_query, onEvent) => {
+        onEvent(event("source_result", [candidate("content-candidate-fresh", "刷新后的来源条目")], "opds_gutenberg"))
+        onEvent(event("completed"))
+        return { operationId: "op-test-2", taskId: "task-test-2", alreadyRunning: false }
+      })
+    await renderPage()
+    const sourceRegion = () => within(screen.getByRole("region", { name: "来源结果" }))
+    expect(sourceRegion().getByRole("alert")).toBeTruthy()
+    expect(sourceRegion().getByRole("heading", { name: "过期的来源条目" })).toBeTruthy()
+    expect(sourceRegion().getByText(/个来源未返回结果/)).toBeTruthy()
+
+    await act(async () => { fireEvent.click(sourceRegion().getByRole("button", { name: "重试" })) })
+
+    expect(mocks.startSourceSearch).toHaveBeenCalledTimes(2)
+    expect(mocks.startSourceSearch.mock.calls[1][0]).toBe("三体")
+    expect(sourceRegion().queryByRole("alert")).toBeNull()
+    expect(sourceRegion().queryByText(/个来源未返回结果/)).toBeNull()
+    expect(sourceRegion().queryByRole("heading", { name: "过期的来源条目" })).toBeNull()
+    expect(sourceRegion().getByRole("heading", { name: "刷新后的来源条目" })).toBeTruthy()
+  })
+
+  it("starts a fresh source request when the same keyword is submitted again after the search ended", async () => {
+    mocks.startSourceSearch
+      .mockImplementationOnce(async (_query, onEvent) => {
+        onEvent(event("failed"))
+        return { operationId: "op-test", taskId: "task-test", alreadyRunning: false }
+      })
+      .mockImplementationOnce(async (_query, onEvent) => {
+        onEvent(event("source_result", [candidate("content-candidate-fresh", "刷新后的来源条目")], "opds_gutenberg"))
+        onEvent(event("completed"))
+        return { operationId: "op-test-2", taskId: "task-test-2", alreadyRunning: false }
+      })
+    await renderPage()
+    const sourceRegion = () => within(screen.getByRole("region", { name: "来源结果" }))
+    expect(sourceRegion().getByRole("alert")).toBeTruthy()
+
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "搜索" })) })
+
+    expect(mocks.startSourceSearch).toHaveBeenCalledTimes(2)
+    expect(mocks.startSourceSearch.mock.calls[1][0]).toBe("三体")
+    expect(sourceRegion().queryByRole("alert")).toBeNull()
+    expect(sourceRegion().getByRole("heading", { name: "刷新后的来源条目" })).toBeTruthy()
+  })
+
+  it("ignores a repeat submit while the source search is still running", async () => {
+    let finishSourceSearch!: () => void
+    mocks.startSourceSearch.mockImplementation(async (_query, onEvent) => {
+      onEvent(event("source_result", [candidate("content-candidate-running", "进行中的来源条目")], "opds_gutenberg"))
+      await new Promise<void>((resolve) => { finishSourceSearch = resolve })
+      onEvent(event("completed"))
+      return { operationId: "op-test", taskId: "task-test", alreadyRunning: false }
+    })
+    await renderPage()
+    const sourceRegion = () => within(screen.getByRole("region", { name: "来源结果" }))
+    expect(screen.getByRole("region", { name: "来源结果" }).getAttribute("aria-busy")).toBe("true")
+
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "搜索" })) })
+
+    expect(mocks.startSourceSearch).toHaveBeenCalledOnce()
+    expect(sourceRegion().getByRole("heading", { name: "进行中的来源条目" })).toBeTruthy()
+
+    // 终态到达后也不会补做一次迟到的重启。
+    await act(async () => { finishSourceSearch() })
+
+    expect(mocks.startSourceSearch).toHaveBeenCalledOnce()
+    expect(sourceRegion().getByRole("heading", { name: "进行中的来源条目" })).toBeTruthy()
+    expect(screen.getByRole("region", { name: "来源结果" }).getAttribute("aria-busy")).toBe("false")
+  })
+
+  it("dispatches a changed-keyword submit exactly once", async () => {
+    await renderPage()
+    await act(async () => { fireEvent.change(screen.getByPlaceholderText("搜索本地媒体库"), { target: { value: "沙丘" } }) })
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "搜索" })) })
+    expect(mocks.startSourceSearch).toHaveBeenCalledTimes(2)
+    expect(mocks.startSourceSearch.mock.calls[1][0]).toBe("沙丘")
+    expect(within(screen.getByRole("region", { name: "来源结果" })).queryByRole("button", { name: "重试" })).toBeNull()
+  })
+
   it("clears the submitted query and returns to the existing search entry", async () => {
     await renderPage()
     await act(async () => { fireEvent.click(screen.getByRole("button", { name: "清空搜索" })) })
     expect(screen.getByTestId("location").textContent).toBe("/search")
     expect(screen.queryByRole("region", { name: "本地媒体库" })).toBeNull()
     expect(mocks.cancelSourceSearch).toHaveBeenCalledWith("op-test")
+  })
+
+  it("does not let an old import redirect a newer search or block its import buttons", async () => {
+    let finishImport!: (result: { workId: string }) => void
+    mocks.importSourceWork.mockImplementation(() => new Promise((resolve) => { finishImport = resolve }))
+    mocks.startSourceSearch.mockImplementation(async (query, onEvent) => {
+      onEvent(event("source_result", [candidate(`content-candidate-${query}`, `${query}来源条目`)], "m3u"))
+      onEvent(event("completed"))
+      return { operationId: "op-test", taskId: "task-test", alreadyRunning: false }
+    })
+    await renderPage()
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "导入媒体库：三体来源条目" })) })
+    await act(async () => { fireEvent.change(screen.getByPlaceholderText("搜索本地媒体库"), { target: { value: "沙丘" } }) })
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "搜索" })) })
+    expect((screen.getByRole("button", { name: "导入媒体库：沙丘来源条目" }) as HTMLButtonElement).disabled).toBe(false)
+    const currentLocation = screen.getByTestId("location").textContent
+    await act(async () => { finishImport({ workId: "old-query-work" }) })
+    expect(screen.getByTestId("location").textContent).toBe(currentLocation)
+    expect(screen.getByRole("heading", { name: "沙丘来源条目" })).toBeTruthy()
+  })
+
+  it("ignores an old import failure while the new query has an import in flight", async () => {
+    let rejectOld!: (error: Error) => void
+    let finishNew!: (result: { workId: string }) => void
+    mocks.importSourceWork
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectOld = reject }))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishNew = resolve }))
+    mocks.startSourceSearch.mockImplementation(async (query, onEvent) => {
+      onEvent(event("source_result", [candidate(`content-candidate-${query}`, `${query}来源条目`)], "m3u"))
+      onEvent(event("completed"))
+      return { operationId: "op-test", taskId: "task-test", alreadyRunning: false }
+    })
+    await renderPage()
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "导入媒体库：三体来源条目" })) })
+    await act(async () => { fireEvent.change(screen.getByPlaceholderText("搜索本地媒体库"), { target: { value: "沙丘" } }) })
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "搜索" })) })
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "导入媒体库：沙丘来源条目" })) })
+    await act(async () => { rejectOld(new Error("旧来源请求失败")) })
+    expect(within(screen.getByRole("region", { name: "来源结果" })).queryByRole("alert")).toBeNull()
+    expect((screen.getByRole("button", { name: "导入中…：沙丘来源条目" }) as HTMLButtonElement).disabled).toBe(true)
+    await act(async () => { finishNew({ workId: "new-query-work" }) })
+    expect(screen.getByTestId("location").textContent).toBe("/work/new-query-work")
+  })
+
+  it("does not navigate after the source list was unmounted by clearing the query", async () => {
+    let finishImport!: (result: { workId: string }) => void
+    mocks.importSourceWork.mockImplementation(() => new Promise((resolve) => { finishImport = resolve }))
+    mocks.startSourceSearch.mockImplementation(async (_query, onEvent) => {
+      onEvent(event("source_result", [candidate()], "m3u"))
+      onEvent(event("completed"))
+      return { operationId: "op-test", taskId: "task-test", alreadyRunning: false }
+    })
+    await renderPage()
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "导入媒体库：来源里的三体" })) })
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "清空搜索" })) })
+    await act(async () => { finishImport({ workId: "old-query-work" }) })
+    expect(screen.getByTestId("location").textContent).toBe("/search")
+    expect(screen.queryByRole("region", { name: "来源结果" })).toBeNull()
+  })
+
+  it("keeps a current import failure visible and allows retry", async () => {
+    mocks.importSourceWork.mockRejectedValueOnce(new Error("来源暂时不可用"))
+    mocks.startSourceSearch.mockImplementation(async (_query, onEvent) => {
+      onEvent(event("source_result", [candidate()], "m3u"))
+      onEvent(event("completed"))
+      return { operationId: "op-test", taskId: "task-test", alreadyRunning: false }
+    })
+    await renderPage()
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "导入媒体库：来源里的三体" })) })
+    expect(within(screen.getByRole("region", { name: "来源结果" })).getByRole("alert")).toBeTruthy()
+    expect((screen.getByRole("button", { name: "导入媒体库：来源里的三体" }) as HTMLButtonElement).disabled).toBe(false)
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "导入媒体库：来源里的三体" })) })
+    expect(mocks.importSourceWork).toHaveBeenCalledTimes(2)
+    expect(screen.getByTestId("location").textContent).toBe("/work/imported-work")
   })
 })

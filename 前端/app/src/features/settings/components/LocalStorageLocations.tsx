@@ -20,9 +20,10 @@ export function LocalStorageLocations({ storage }: { storage: ReturnType<typeof 
       {locations.map(location => {
         const scan = storage.scans[location.locationId]
         const running = scan && !scan.terminal
-        return <tr key={location.locationId}><td><strong>{location.displayName}</strong>{scan && <span className="storage-detail" role="status">{scan.phase} · 已见 {scan.filesSeen} · 新增 {scan.newItem}{scan.message ? ` · ${scan.message}` : ""}</span>}</td>
+        const errorSummary = scan && scan.errors > 0 ? `${scan.errors} 个条目未能索引` : ""
+        return <tr key={location.locationId}><td><strong>{location.displayName}</strong>{scan && <span className="storage-detail" role="status">{scan.phase} · 已见 {scan.filesSeen} · 新增 {scan.newItem}{errorSummary ? ` · ${errorSummary}` : ""}{scan.message && scan.message !== errorSummary ? ` · ${scan.message}` : ""}{scan.warning && scan.warning !== scan.message ? ` · 最近警告：${scan.warning}` : ""}</span>}</td>
           <td>本地目录</td><td>{STATUS_LABELS[location.status] ?? location.status}</td><td><div className="storage-actions">
-            {running ? <button type="button" className="storage-action" disabled={storage.busy} onClick={() => void storage.cancelDirectoryScan(location, scan)}>取消扫描</button>
+            {running ? <button type="button" className="storage-action" disabled={storage.busy || scan.cancelling} onClick={() => void storage.cancelDirectoryScan(location, scan)}>{scan.cancelling ? "正在取消…" : "取消扫描"}</button>
               : <button type="button" className="storage-action" disabled={storage.busy || location.status !== "connected"} onClick={() => void storage.scanDirectory(location)}>扫描</button>}
             <details className="storage-row-menu"><summary aria-label={`${location.displayName}的更多操作`}>···</summary><div>
               <button type="button" className="storage-action" disabled={storage.busy || Boolean(running)} onClick={() => void storage.rebindDirectory(location)}>重新绑定</button>

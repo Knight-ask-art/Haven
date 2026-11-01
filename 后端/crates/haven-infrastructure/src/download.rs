@@ -11,11 +11,15 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use haven_application::services::download_batch::DownloadBatchService;
-use haven_application::services::ports::RemoteAcquisitionPort;
+use haven_application::services::ports::{
+    RemoteAcquisitionObserver, RemoteAcquisitionPort, RemoteAcquisitionProgress,
+    RemoteTransferContext,
+};
 use haven_application::services::settings::SettingsService;
 use haven_application::services::source_import::{
-    source_key_for_id, validate_remote_source_object,
+    source_key_for_id, split_comic_library_chapter_remote_id, validate_remote_source_object,
 };
+use haven_application::services::source_registry::SourceRegistryService;
 use haven_application::services::{DownloadEventSink, DownloadRunner, OfflineResourceFiles};
 use haven_common::{AppError, ErrorKind};
 use haven_domain::contracts::{DownloadRepository, ResourceRepository, StorageLocationRepository};
@@ -38,6 +42,9 @@ const CHUNK_SIZE: usize = 1024 * 1024;
 const DISK_SPACE_RESERVE_BYTES: u64 = 16 * 1024 * 1024;
 const SPACE_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_WORKER_RETRIES: u8 = 2;
+/// 远端获取期间「最新进度」的落库与事件发布间隔（同时是取消/暂停状态轮询间隔）。
+/// 每块网络读取只更新内存里的最新值，不做每块数据库写入。
+const REMOTE_PROGRESS_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DownloadWorkerFailure {
@@ -129,6 +136,19 @@ fn refill_bucket(tokens: f64, elapsed_secs: f64, weight: f64) -> f64 {
     (tokens + elapsed_secs * BUCKET_REFILL_PER_SEC_PER_WEIGHT * weight).min(weight)
 }
 
+/// Token 不足时距离“攒够 1 个 token”的等待时长；按当前权重对应的补液速率推算，
+/// 因此下一次醒来时刚好够用。已有 ≥1 token 时返回 `None`（无需等待补液）。
+/// 不变式：`weight` 只取 8/4/1，故速率为正的有限值，无需零速率兜底；
+/// 时长只是唤醒截止时间，不受桶容量约束。1ms 下限仅用于规避浮点导致的零时长自旋。
+fn token_wait_duration(tokens: f64, weight: f64) -> Option<Duration> {
+    if tokens >= 1.0 {
+        return None;
+    }
+    let rate = BUCKET_REFILL_PER_SEC_PER_WEIGHT * weight;
+    let secs = (1.0 - tokens) / rate;
+    Some(Duration::from_secs_f64(secs).max(Duration::from_millis(1)))
+}
+
 /// 进程内下载准入控制。设置变更会在下一个任务获得槽位时生效，
 /// 不强制中断已经运行的任务。
 struct DownloadScheduler {
@@ -153,22 +173,46 @@ impl DownloadScheduler {
         }
     }
 
+    #[cfg(test)]
     async fn acquire(
         self: &Arc<Self>,
         task: &DownloadTask,
         settings: &SettingsService,
     ) -> DownloadPermit {
+        self.acquire_inner(task, settings, None)
+            .await
+            .expect("unconditional admission")
+    }
+
+    async fn acquire_inner(
+        self: &Arc<Self>,
+        task: &DownloadTask,
+        settings: &SettingsService,
+        repos: Option<&SqliteRepositories>,
+    ) -> Option<DownloadPermit> {
         let provider = task
             .provider_key
             .clone()
             .unwrap_or_else(|| "default".into());
         let host = task.host_key.clone().unwrap_or_else(|| "default".into());
+        let enforce_host_limit = !matches!(provider.as_str(), "local" | "feed");
         let weight = priority_weight(task.priority);
         loop {
-            // 先建立通知 future，再检查计数，避免释放发生在检查与 await 之间时丢唤醒。
+            // 通知 future 必须先 pin + enable 再读取设置/检查计数：
+            // enable 会在检查状态前完成注册，确保此后到达的多次唤醒不会被合并成
+            // 一个 permit 而漏掉未注册的等待者。
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let policy = load_download_policy(settings).await;
-            let acquired = {
+            if let Some(repos) = repos {
+                if !matches!(repos.download.get(task.id).await,
+                    Ok(Some(current)) if matches!(current.state, DownloadState::Queued | DownloadState::Interrupted))
+                {
+                    return None;
+                }
+            }
+            let (acquired, token_wait) = {
                 let mut global = self
                     .global_active
                     .lock()
@@ -192,25 +236,35 @@ impl DownloadScheduler {
                 bucket.last_refill = Instant::now();
                 let host_count = hosts.get(&host).copied().unwrap_or(0);
                 if *global < policy.max_concurrent
-                    && host_count < HOST_MAX_CONCURRENT
+                    && (!enforce_host_limit || host_count < HOST_MAX_CONCURRENT)
                     && bucket.tokens >= 1.0
                 {
                     *global += 1;
                     *hosts.entry(host.clone()).or_insert(0) += 1;
                     bucket.tokens -= 1.0;
-                    true
+                    (true, None)
                 } else {
-                    false
+                    (false, token_wait_duration(bucket.tokens, weight))
                 }
             };
             if acquired {
-                return DownloadPermit {
+                return Some(DownloadPermit {
                     scheduler: Arc::clone(self),
                     provider,
                     host,
-                };
+                });
             }
-            notified.await;
+            // 计数/Host 满时只等通知；Token 不足时补液没有通知源，
+            // 必须同时等一个按当前补液速率算出的截止时间，否则会永久挂起。
+            match token_wait {
+                Some(delay) => {
+                    tokio::select! {
+                        _ = notified => {}
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
+                None => notified.await,
+            }
         }
     }
 
@@ -232,7 +286,9 @@ impl DownloadScheduler {
             }
         }
         drop(hosts);
-        self.notify.notify_one();
+        // 槽位释放必须广播：被唤醒的等待者可能因自身已暂停/取消而直接退出，
+        // 单次 notify_one 会把唯一唤醒交给它并吞掉，其他等待者永久排队。
+        self.notify.notify_waiters();
     }
 }
 
@@ -289,6 +345,42 @@ impl RemoteAcquisitionPort for UnavailableRemoteAcquisition {
             "远端来源当前不可用",
             true,
         ))
+    }
+
+    /// 未接线远端来源时受控路径与既有路径同样明确失败（保持同一错误码与可重试性），
+    /// 不因为默认实现的「不支持限速」分支改变这里的用户可见行为。
+    async fn acquire_controlled(
+        &self,
+        source_key: &str,
+        remote_id: &str,
+        destination: &Path,
+        _transfer: &RemoteTransferContext<'_>,
+    ) -> Result<haven_application::services::ports::RemoteAcquiredFile, AppError> {
+        self.acquire(source_key, remote_id, destination).await
+    }
+}
+
+/// 远端获取的最新进度槽：观察者只写最新值（不做 IO），Worker 按界读取并落库/发布。
+#[derive(Default)]
+struct RemoteProgressSlot {
+    latest: Mutex<Option<RemoteAcquisitionProgress>>,
+}
+
+impl RemoteProgressSlot {
+    fn latest(&self) -> Option<RemoteAcquisitionProgress> {
+        *self
+            .latest
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+impl RemoteAcquisitionObserver for RemoteProgressSlot {
+    fn on_progress(&self, progress: RemoteAcquisitionProgress) {
+        *self
+            .latest
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(progress);
     }
 }
 
@@ -406,17 +498,28 @@ impl LocalDownloadRunner {
 
     async fn run(&self, task_id: DownloadTaskId) {
         // 先取任务以获取 provider/host/priority（三层调度入参），再申请准入槽位。
-        let Some(task) = self.repos.download.get(task_id).await.ok().flatten() else {
+        let Some(mut task) = self.repos.download.get(task_id).await.ok().flatten() else {
             self.active
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .remove(&task_id);
             return;
         };
-        let _permit = self.scheduler.acquire(&task, &self.settings).await;
+        // Derive admission identity from the current owned Resource, including
+        // old/batch tasks whose persisted scheduler fields were never filled.
+        let (provider, host) = self.scheduling_identity(&task).await;
+        task.provider_key = Some(provider);
+        task.host_key = Some(host);
+        let permit = self
+            .scheduler
+            .acquire_inner(&task, &self.settings, Some(&self.repos))
+            .await;
         let policy = load_download_policy(&self.settings).await;
         let mut failure = None;
         for attempt in 0..=MAX_WORKER_RETRIES {
+            if permit.is_none() {
+                break;
+            }
             match self.run_inner(task_id, policy).await {
                 Ok(()) => break,
                 Err(error) if error.retryable && attempt < MAX_WORKER_RETRIES => {
@@ -463,11 +566,62 @@ impl LocalDownloadRunner {
             .remove(&task_id);
         // Resume 可能与旧 Worker 退出同时发生。旧 Worker 释放去重标记后再次检查，
         // 确保该竞态不会把已转回 Queued 的任务永久遗留在队列中。
-        if matches!(
-            self.repos.download.get(task_id).await,
-            Ok(Some(task)) if task.state == DownloadState::Queued
-        ) {
-            self.start(task_id);
+        if let Ok(Some(task)) = self.repos.download.get(task_id).await {
+            if task.state == DownloadState::Queued {
+                self.start(task_id);
+            } else if task.state == DownloadState::Cancelled {
+                // Cancellation can arrive after a paused worker's last state
+                // read. Reconcile after releasing the slot so either this
+                // worker or the cancelling call can claim cleanup.
+                let _ = self.discard_partial(&task).await;
+            }
+        }
+    }
+
+    async fn scheduling_identity(&self, task: &DownloadTask) -> (String, String) {
+        let Ok(Some(resource)) = self.repos.resource.get(task.source_resource_id).await else {
+            return ("unknown".into(), "unknown-network".into());
+        };
+        match &resource.locator {
+            ResourceLocator::LocalPath { .. } | ResourceLocator::StorageObject { .. } => {
+                ("local".into(), "non-network".into())
+            }
+            ResourceLocator::SourceObject {
+                source_id,
+                remote_id,
+            } => {
+                let Some(source_key) = source_key_for_id(*source_id) else {
+                    return ("unknown".into(), "unknown-network".into());
+                };
+                if source_key == "feed" {
+                    return ("feed".into(), "non-network".into());
+                }
+                let source_id = if matches!(source_key, "komga" | "kavita") {
+                    match split_comic_library_chapter_remote_id(remote_id) {
+                        Ok((source_id, _, _)) => source_id,
+                        Err(_) => return (source_key.to_owned(), "unknown-network".into()),
+                    }
+                } else {
+                    source_key.to_owned()
+                };
+                let registry = SourceRegistryService::new(self.repos.clone());
+                let endpoint = match source_key {
+                    "mangadex" => Some(crate::online_sources::MANGADEX_API.to_owned()),
+                    "arxiv" => Some(crate::online_sources::ARXIV_API.to_owned()),
+                    "europepmc" => Some(crate::online_sources::EUROPE_PMC_API.to_owned()),
+                    "wikisource" => Some(crate::online_sources::WIKISOURCE_API.to_owned()),
+                    _ => registry.endpoint(&source_id).await.ok().flatten(),
+                };
+                let host = endpoint
+                    .and_then(|endpoint| reqwest::Url::parse(&endpoint).ok())
+                    .and_then(|url| {
+                        url.host_str()
+                            .map(|host| format!("http-host:{}", host.to_ascii_lowercase()))
+                    })
+                    .unwrap_or_else(|| "unknown-network".into());
+                (source_key.to_owned(), host)
+            }
+            _ => ("unknown".into(), "unknown-network".into()),
         }
     }
 
@@ -485,6 +639,9 @@ impl LocalDownloadRunner {
         {
             return Ok(());
         }
+        // 状态真正推进到 Resolving 后立刻发布一次任务事件：远端获取在拿到第一个
+        // 字节前可能等待很久，UI 不能一直停在 Queued/0。
+        self.emit_current(task_id).await;
         let task = self
             .repos
             .download
@@ -520,7 +677,9 @@ impl LocalDownloadRunner {
         } = &resource.locator
         {
             return self
-                .run_remote_inner(task_id, &task, &resource, &storage, *source_id, remote_id)
+                .run_remote_inner(
+                    task_id, &task, &resource, &storage, *source_id, remote_id, policy,
+                )
                 .await;
         }
         let source_path = match &resource.locator {
@@ -593,6 +752,9 @@ impl LocalDownloadRunner {
                 false,
             ));
         }
+        let mut source = File::open(&source_path)
+            .await
+            .map_err(|error| io_failure(&error, "DOWNLOAD_SOURCE_UNAVAILABLE"))?;
 
         let offline_dir = download_category_dir(Path::new(&storage.root_ref), &resource);
         fs::create_dir_all(&offline_dir)
@@ -603,7 +765,10 @@ impl LocalDownloadRunner {
         let part_path = offline_dir.join(format!("{}.part", task_id));
 
         match fs::metadata(&final_path).await {
-            Ok(final_meta) if final_meta.len() == total => {
+            Ok(final_meta)
+                if final_meta.len() == total
+                    && file_prefix_matches(&mut source, &final_path, total).await? =>
+            {
                 let offline = match self
                     .ensure_offline_resource(&resource, task.target_storage_id, &final_path, total)
                     .await
@@ -689,11 +854,16 @@ impl LocalDownloadRunner {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
             Err(error) => return Err(io_failure(&error, "DOWNLOAD_DIRECTORY_UNAVAILABLE")),
         };
+        // A path and byte count are not a source identity. Verify the saved
+        // prefix against the file opened for this attempt before appending.
+        if partial > 0 && !file_prefix_matches(&mut source, &part_path, partial).await? {
+            fs::remove_file(&part_path)
+                .await
+                .map_err(|error| io_failure(&error, "DOWNLOAD_DIRECTORY_UNAVAILABLE"))?;
+            partial = 0;
+        }
         self.ensure_space(&offline_dir, total.saturating_sub(partial))
             .await?;
-        let mut source = File::open(&source_path)
-            .await
-            .map_err(|error| io_failure(&error, "DOWNLOAD_SOURCE_UNAVAILABLE"))?;
         source
             .seek(std::io::SeekFrom::Start(partial))
             .await
@@ -842,6 +1012,25 @@ impl LocalDownloadRunner {
         if part_meta.len() != total {
             return Err(DownloadWorkerFailure::new("DOWNLOAD_PARTIAL_INVALID", true));
         }
+        // Reopen the current source to detect replacement/in-place edits during
+        // transfer as well as changes made while the task was paused.
+        let mut verification_source = File::open(&source_path)
+            .await
+            .map_err(|error| io_failure(&error, "DOWNLOAD_SOURCE_UNAVAILABLE"))?;
+        let current_size = verification_source
+            .metadata()
+            .await
+            .map_err(|error| io_failure(&error, "DOWNLOAD_SOURCE_UNAVAILABLE"))?
+            .len();
+        if current_size != total
+            || !file_prefix_matches(&mut verification_source, &part_path, total).await?
+        {
+            let _ = fs::remove_file(&part_path).await;
+            return Err(DownloadWorkerFailure::new(
+                "DOWNLOAD_SOURCE_UNAVAILABLE",
+                false,
+            ));
+        }
         // 同一目录内 rename 是原子的；完成态之前不暴露最终文件。
         fs::rename(&part_path, &final_path)
             .await
@@ -890,6 +1079,8 @@ impl LocalDownloadRunner {
         Ok(())
     }
 
+    // Keep the validated source identity explicit alongside the queued task and resource.
+    #[allow(clippy::too_many_arguments)]
     async fn run_remote_inner(
         &self,
         task_id: DownloadTaskId,
@@ -898,6 +1089,7 @@ impl LocalDownloadRunner {
         storage: &haven_domain::entities::StorageLocation,
         source_id: haven_domain::ids::SourceId,
         remote_id: &str,
+        policy: DownloadPolicy,
     ) -> Result<(), DownloadWorkerFailure> {
         let source_key = source_key_for_id(source_id)
             .ok_or_else(|| DownloadWorkerFailure::new("DOWNLOAD_SOURCE_UNAVAILABLE", false))?;
@@ -1026,11 +1218,20 @@ impl LocalDownloadRunner {
         {
             return Ok(());
         }
+        // 进入 Downloading 后立即发布状态事件（远端获取的首个字节可能还要等很久）。
+        self.emit_current(task_id).await;
 
         // Poll the task state while the provider is awaiting network IO. The
         // future is dropped on cancellation, which aborts reqwest's in-flight
         // request; providers also clean their own temporary file on errors.
-        let acquisition = self.remote.acquire(source_key, remote_id, &part_path);
+        //
+        // 进度走同一次获取内的共享上下文：有限速率（B/s）作用于真实网络字节读取，
+        // 观察者只写最新值，本循环按界落库并发布 bytes/known total/speed/ETA。
+        let progress_slot = RemoteProgressSlot::default();
+        let transfer = RemoteTransferContext::new(policy.speed_limit_bps, &progress_slot);
+        let acquisition = self
+            .remote
+            .acquire_controlled(source_key, remote_id, &part_path, &transfer);
         tokio::pin!(acquisition);
         let acquired = loop {
             tokio::select! {
@@ -1041,7 +1242,9 @@ impl LocalDownloadRunner {
                         return Err(map_remote_error(error));
                     }
                 },
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                _ = tokio::time::sleep(REMOTE_PROGRESS_FLUSH_INTERVAL) => {
+                    // 进度落库失败只影响进度显示，不能把仍在正常获取的任务判为失败。
+                    let _ = self.flush_remote_progress(task_id, &progress_slot).await;
                     let state = self
                         .repos
                         .download
@@ -1176,6 +1379,49 @@ impl LocalDownloadRunner {
         Ok(())
     }
 
+    /// 立即发布一次当前任务快照（状态切换等即时事件；失败静默，不改变任务状态）。
+    async fn emit_current(&self, task_id: DownloadTaskId) {
+        if let Ok(Some(snapshot)) = self.repos.download.get(task_id).await {
+            self.events.emit_task(&snapshot, None);
+        }
+    }
+
+    /// 远端获取期间按界落库并发布最新进度。
+    ///
+    /// `bytes` 是累计真实网络字节，`total_bytes` 未知时保持 `None`（不伪造百分比）；
+    /// 最终产物大小在获取成功后由 `RemoteAcquiredFile::size_bytes` 单独写入。
+    async fn flush_remote_progress(
+        &self,
+        task_id: DownloadTaskId,
+        slot: &RemoteProgressSlot,
+    ) -> Result<(), DownloadWorkerFailure> {
+        let Some(progress) = slot.latest() else {
+            return Ok(());
+        };
+        self.repos
+            .download
+            .update_progress(
+                task_id,
+                DownloadState::Downloading,
+                progress.total_bytes,
+                progress.bytes,
+                progress.speed_bps,
+                progress.eta_seconds,
+            )
+            .await
+            .map_err(|_| repository_failure())?;
+        if let Ok(Some(mut snapshot)) = self.repos.download.get(task_id).await {
+            if snapshot.state == DownloadState::Downloading {
+                snapshot.bytes_total = progress.total_bytes;
+                snapshot.bytes_downloaded = progress.bytes;
+                snapshot.speed_bps = progress.speed_bps;
+                snapshot.eta_seconds = progress.eta_seconds;
+                self.events.emit_task(&snapshot, None);
+            }
+        }
+        Ok(())
+    }
+
     async fn ensure_offline_resource(
         &self,
         source: &Resource,
@@ -1189,9 +1435,9 @@ impl LocalDownloadRunner {
             .list_by_media_item(source.media_item_id)
             .await
             .map_err(|_| repository_failure())?;
-        let final_string = final_path.to_string_lossy().into_owned();
+        let final_string = crate::local_path_identity(final_path);
         if let Some(existing) = resources.iter().find(|item| {
-            matches!(&item.locator, ResourceLocator::LocalPath { path } if path == &final_string)
+            matches!(&item.locator, ResourceLocator::LocalPath { path } if crate::local_path_identity(Path::new(path)) == final_string)
         }) {
             return Ok(OfflineResourceHandle {
                 id: existing.id,
@@ -1284,6 +1530,84 @@ impl LocalDownloadRunner {
         }
     }
 
+    async fn discard_idle_partial(&self, task: &DownloadTask) -> Result<(), AppError> {
+        let Some(current) = self.repos.download.get(task.id).await? else {
+            return Ok(());
+        };
+        if !matches!(
+            current.state,
+            DownloadState::Cancelled | DownloadState::Failed
+        ) {
+            return Err(AppError::new(
+                "DOWNLOAD_STATE_CONFLICT",
+                ErrorKind::Conflict,
+                "下载任务状态已变化，请刷新后重试",
+                true,
+            ));
+        }
+        let storage = self
+            .repos
+            .storage_location
+            .get(current.target_storage_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::new(
+                    "DOWNLOAD_DIRECTORY_UNAVAILABLE",
+                    ErrorKind::Io,
+                    "下载目录不可用，请恢复存储位置后重试清理",
+                    true,
+                )
+            })?;
+        if storage.provider_type != StorageProviderType::Local {
+            return Err(AppError::new(
+                "DOWNLOAD_DIRECTORY_UNAVAILABLE",
+                ErrorKind::Validation,
+                "该存储位置不支持本地临时文件清理",
+                false,
+            ));
+        }
+        let io_error = || {
+            AppError::new(
+                "DOWNLOAD_PARTIAL_CLEANUP_FAILED",
+                ErrorKind::Io,
+                "无法清理下载临时文件，请稍后重试",
+                true,
+            )
+        };
+        let root = fs::canonicalize(&storage.root_ref)
+            .await
+            .map_err(|_| io_error())?;
+        for category in ["books", "comics", "articles"] {
+            let directory = match fs::canonicalize(root.join(category)).await {
+                Ok(directory) => directory,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return Err(io_error()),
+            };
+            if directory == root || !directory.starts_with(&root) {
+                return Err(AppError::new(
+                    "SECURITY_POLICY_DENIED",
+                    ErrorKind::Security,
+                    "下载临时目录不在登记存储位置内",
+                    false,
+                ));
+            }
+            let partial = directory.join(format!("{}.part", current.id));
+            match fs::symlink_metadata(&partial).await {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    match fs::remove_file(&partial).await {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(_) => return Err(io_error()),
+                    }
+                }
+                Ok(_) => return Err(io_error()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(io_error()),
+            }
+        }
+        Ok(())
+    }
+
     async fn remove_partial_if_cancelled(&self, task_id: DownloadTaskId, part_path: &Path) {
         if matches!(
             self.repos.download.get(task_id).await,
@@ -1363,6 +1687,7 @@ async fn resolve_registered_local_source(
     Ok(canonical)
 }
 
+#[async_trait]
 impl DownloadRunner for LocalDownloadRunner {
     fn start(&self, task_id: DownloadTaskId) {
         let should_start = self
@@ -1384,6 +1709,103 @@ impl DownloadRunner for LocalDownloadRunner {
         };
         handle.spawn(async move { runner.run(task_id).await });
     }
+
+    async fn discard_partial(&self, task: &DownloadTask) -> Result<(), AppError> {
+        self.cleanup_task(task, false).await.map(|_| ())
+    }
+
+    async fn remove_task_record(
+        &self,
+        task: &DownloadTask,
+        _downloads: &(dyn DownloadRepository + Sync),
+    ) -> Result<bool, AppError> {
+        self.cleanup_task(task, true).await
+    }
+}
+
+impl LocalDownloadRunner {
+    async fn cleanup_task(
+        &self,
+        task: &DownloadTask,
+        remove_record: bool,
+    ) -> Result<bool, AppError> {
+        self.scheduler.notify.notify_waiters();
+        // Claim the same slot as start(): never unlink a worker's open output.
+        if !self
+            .active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(task.id)
+        {
+            return Err(AppError::new(
+                "DOWNLOAD_CLEANUP_BUSY",
+                ErrorKind::Conflict,
+                "下载正在停止，请稍后重试清理或移除记录",
+                true,
+            ));
+        }
+        let result = async {
+            let Some(current) = self.repos.download.get(task.id).await? else {
+                return Ok(false);
+            };
+            if current.state != DownloadState::Completed {
+                self.discard_idle_partial(&current).await?;
+            }
+            if remove_record {
+                self.repos.download.delete_terminal(task.id).await
+            } else {
+                Ok(true)
+            }
+        }
+        .await;
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&task.id);
+        // A retry may have queued while cleanup owned the worker slot.
+        if matches!(self.repos.download.get(task.id).await, Ok(Some(current)) if current.state == DownloadState::Queued)
+        {
+            self.start(task.id);
+        }
+        result
+    }
+}
+
+async fn file_prefix_matches(
+    source: &mut File,
+    candidate_path: &Path,
+    bytes: u64,
+) -> Result<bool, DownloadWorkerFailure> {
+    source
+        .seek(std::io::SeekFrom::Start(0))
+        .await
+        .map_err(|error| io_failure(&error, "DOWNLOAD_SOURCE_UNAVAILABLE"))?;
+    let mut candidate = File::open(candidate_path)
+        .await
+        .map_err(|error| io_failure(&error, "DOWNLOAD_PARTIAL_INVALID"))?;
+    let mut source_buffer = vec![0; CHUNK_SIZE];
+    let mut candidate_buffer = vec![0; CHUNK_SIZE];
+    let mut remaining = bytes;
+    while remaining > 0 {
+        let length = remaining.min(CHUNK_SIZE as u64) as usize;
+        if let Err(error) = source.read_exact(&mut source_buffer[..length]).await {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Ok(false);
+            }
+            return Err(io_failure(&error, "DOWNLOAD_SOURCE_UNAVAILABLE"));
+        }
+        if let Err(error) = candidate.read_exact(&mut candidate_buffer[..length]).await {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Ok(false);
+            }
+            return Err(io_failure(&error, "DOWNLOAD_PARTIAL_INVALID"));
+        }
+        if source_buffer[..length] != candidate_buffer[..length] {
+            return Ok(false);
+        }
+        remaining -= length as u64;
+    }
+    Ok(true)
 }
 
 async fn throttle_transfer(started: Instant, bytes: u64, limit_bps: u64) {
@@ -2077,6 +2499,55 @@ mod tests {
         drop(third);
     }
 
+    #[tokio::test]
+    async fn scheduler_waits_for_token_refill_instead_of_hanging_when_bucket_is_empty() {
+        let db = Arc::new(crate::Db::open_in_memory().unwrap());
+        let settings = settings_service(db);
+
+        let scheduler = Arc::new(DownloadScheduler::new());
+        let task = scheduling_task(
+            Some("provider-a".into()),
+            Some("host-1".into()),
+            DownloadPriority::Normal,
+        );
+        // 四个快速获取/释放循环（Normal 权重 4）会把桶耗尽，且中间没有补液时间。
+        for _ in 0..4 {
+            let permit = scheduler.acquire(&task, &settings).await;
+            drop(permit);
+        }
+        assert_eq!(
+            *scheduler
+                .global_active
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            0,
+            "四个快速循环结束后不应残留活跃任务"
+        );
+
+        // 桶空且无其它活跃任务时，第五次获取必须靠补液截止时间自行醒来：
+        // 依赖通知会永久挂起。
+        let fifth =
+            tokio::time::timeout(Duration::from_secs(3), scheduler.acquire(&task, &settings))
+                .await
+                .expect("桶耗尽后必须由补液唤醒，而不是无限等待通知");
+        assert_eq!(
+            *scheduler
+                .global_active
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            1
+        );
+        drop(fifth);
+        assert_eq!(
+            *scheduler
+                .global_active
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            0,
+            "释放许可后活跃计数必须回到 0"
+        );
+    }
+
     #[test]
     fn drr_weights_follow_8_4_1_and_bucket_refill_is_weighted() {
         assert_eq!(priority_weight(DownloadPriority::High), 8.0);
@@ -2376,6 +2847,30 @@ mod tests {
             .unwrap();
         assert_eq!(retry.state, DownloadStateDto::Queued);
         assert_eq!(retry_runner.starts.load(Ordering::Relaxed), 1);
+
+        // A removed task must not remove the user's ability to manage its
+        // retained download. Resource actions must still reject original files.
+        let rejected = retry_service
+            .reveal_offline_resource(haven_application::wire::DownloadResourceActionRequest {
+                resource_id: source_id.to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            rejected.code().as_str(),
+            "DOWNLOAD_OFFLINE_RESOURCE_INVALID"
+        );
+        std::fs::write(path, b"haven offline content").unwrap();
+        let deleted = retry_service
+            .delete_offline_resource(haven_application::wire::DownloadResourceActionRequest {
+                resource_id: offline.id.to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(deleted.offline_resource_removed);
+        assert!(!Path::new(path).exists());
+        assert!(repos.resource.get(offline.id).await.unwrap().is_none());
+        assert!(repos.resource.get(source_id).await.unwrap().is_some());
     }
 
     #[derive(Clone)]

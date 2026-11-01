@@ -5,7 +5,8 @@
 //!   每条携带 progress + primaryAction（labelHint=continue，与进度存在语义一致）。
 //! - `recently_added`：`library_list`（sort=recently_added，category=all）首页投影。
 //! - `shelves`：0.1 仅包含收藏 Work 的稳定 Shelf；无收藏时不返回空架子。
-//! - 组装为批量查询（list_by_works/list_by_editions），与页大小无关（消除 N+1）。
+//! - Work 只按 Continue 实际引用的 ID 读取（数量受 Continue 上限约束，不受
+//!   Work 列表分页窗口限制）；Edition/MediaItem 仍批量查询（消除 N+1）。
 //! - 0.1 不等远程 Source；首页不得为构造 Hero 响应而串行等待（契约 §14.1）。
 
 use std::collections::{HashMap, HashSet};
@@ -72,13 +73,21 @@ impl HomeService {
         if progress_items.is_empty() {
             return Ok(Vec::new());
         }
-        // 进度已含 work_id/edition_id/media_item_id；据此批量取 Work/Edition/MediaItem。
-        let work_ids: Vec<_> = progress_items.iter().map(|p| p.work_id).collect();
-        let works: HashMap<_, _> = WorkRepository::list(&*self.ports, MAX_LIMIT, 0)
-            .await?
-            .into_iter()
-            .map(|w| (w.id, w))
-            .collect();
+        // 进度已含 work_id/edition_id/media_item_id；Work 按实际需要的 ID 读取，
+        // 避免进度对应的 Work 落在首个列表分页窗口之后时从 Continue 中消失。
+        let mut work_ids = Vec::with_capacity(progress_items.len());
+        let mut seen_work_ids = HashSet::with_capacity(progress_items.len());
+        for progress in &progress_items {
+            if seen_work_ids.insert(progress.work_id) {
+                work_ids.push(progress.work_id);
+            }
+        }
+        let mut works = HashMap::with_capacity(work_ids.len());
+        for work_id in work_ids.iter().copied() {
+            if let Some(work) = WorkRepository::get(&*self.ports, work_id).await? {
+                works.insert(work.id, work);
+            }
+        }
         let editions = EditionRepository::list_by_works(&*self.ports, &work_ids).await?;
         let editions_by_work: HashMap<_, Vec<_>> = {
             let mut map: HashMap<_, Vec<_>> = HashMap::new();
@@ -658,6 +667,27 @@ mod tests {
         assert!(home.continue_items.is_empty());
         assert!(home.recently_added.is_empty());
         assert!(home.shelves.is_empty());
+    }
+
+    #[tokio::test]
+    async fn home_continue_resolves_a_work_beyond_the_library_first_page() {
+        let work = sample_work(WorkId::new(), "Last title");
+        let edition = sample_edition(work.id);
+        let item = sample_item(edition.id);
+        let progress = sample_progress(work.id, edition.id, item.id);
+        let mut works: Vec<_> = (0..200)
+            .map(|i| sample_work(WorkId::new(), &format!("First {i:03}")))
+            .collect();
+        works.push(work.clone());
+        let ports = Arc::new(
+            MemPorts::new(works)
+                .with_edition(edition)
+                .with_item(item)
+                .with_progress(progress),
+        );
+        let home = HomeService::new(ports).get().await.unwrap();
+        assert_eq!(home.continue_items.len(), 1);
+        assert_eq!(home.continue_items[0].work_id, work.id.to_string());
     }
 
     #[tokio::test]

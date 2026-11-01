@@ -1,3 +1,4 @@
+import { useMarkerNavigation } from "@/features/markers/lib/use-marker-navigation"
 import { createElement, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import type { CSSProperties, KeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode } from "react"
 import { useNavigate, useParams } from "react-router"
@@ -209,6 +210,7 @@ function ArticleReaderUnavailable() {
 function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleReaderMode }) {
   const navigate = useNavigate()
   const { mediaItemId } = useParams<{ mediaItemId?: string }>()
+  const initialPosition = useMarkerNavigation(mediaItemId)
   const runtimeState = resolveArticleReaderRuntimeState(clientMode)
   const tauriRuntime = runtimeState === "production"
   const demoRuntime = canUseDemoArticleReaderTools(clientMode)
@@ -299,6 +301,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
   const resourceRequestRef = useRef(0)
   const markerListRequestRef = useRef(0)
   const bookmarkRequestRef = useRef(0)
+  const highlightRequestRef = useRef(0)
   const storageScopeRef = useRef(storageScope)
   const persistedStorageScopeRef = useRef(storageScope)
   const readingSettingsAppliedRef = useRef(false)
@@ -382,6 +385,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
     migrationFailedRef.current.clear()
     markerListRequestRef.current += 1
     bookmarkRequestRef.current += 1
+    highlightRequestRef.current += 1
     setIsBookmarked(loadDemoArticleReaderValue(
       clientMode,
       () => (
@@ -392,6 +396,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
     ))
     setArticleMarkerId(null)
     setIsBookmarkPending(false)
+    setIsHighlightPending(false)
     setSessionMarkers([])
     setMarkersLoaded(false)
     setHighlights(loadDemoArticleReaderValue(clientMode, () => readHighlights(storageId), []))
@@ -628,15 +633,28 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
   // 恢复进度：优先使用与真实大纲同源的 blockId，结构已变时才回退 progression。
   useEffect(() => {
     if (!contentReady || !articleDocument || sessionView.status !== "ready" || state.status !== "ready") return
-    const restored = restoreArticleProgress(state.session, restoredProgressRef)
-    if (!restored) return
     const maxScroll = document.documentElement.scrollHeight - window.innerHeight
     if (maxScroll <= 0) return
+    const restored = restoreArticleProgress(state.session, restoredProgressRef, initialPosition)
+    if (!restored) return
+    // 显式文本标记优先按锚点定位；普通进度仍只使用全篇 progression。
+    const markerLocator = initialPosition?.restoredSessionId === state.session.sessionId
+      ? initialPosition.locator : undefined
+    if (markerLocator?.kind === "article" && markerLocator.data.textAnchor) {
+      const block = Array.from(articleRef.current?.querySelectorAll<HTMLElement>("[data-article-block-id]") ?? [])
+        .find((element) => element.dataset.articleBlockId === markerLocator.data.blockId)
+      const anchor = block && resolveArticleTextAnchor(block.textContent ?? "", markerLocator.data.textAnchor)
+      const range = block && anchor && createArticleTextRange(block, anchor.start, anchor.end)
+      if (range) {
+        window.scrollTo({ top: Math.max(0, window.scrollY + range.getBoundingClientRect().top - 96) })
+        return
+      }
+    }
     // `progression` is the whole-document ratio. A block id is only a coarse
     // activity label, not a second coordinate; applying both double-counts
     // the remaining distance (p * (2 - p)).
     window.scrollTo({ top: Math.min(maxScroll, Math.max(0, restored.progression * maxScroll)) })
-  }, [articleDocument, contentReady, outline, sessionView.status, state, sessionContentUri])
+  }, [articleDocument, contentReady, initialPosition, outline, sessionView.status, state, sessionContentUri])
 
   useEffect(() => {
     if (!demoRuntime) {
@@ -824,7 +842,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
   }
 
   const addHighlight = () => {
-    if (isHighlightPending || !selectedText || !selectedBlockId) return
+    if (isHighlightPending || !selectedText || !selectedBlockId || (tauriRuntime && !markersLoaded)) return
     const blockId = selectedBlockId
     const text = selectedText
     if (tauriRuntime && mediaItemId) {
@@ -843,6 +861,14 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
         dismissSelection()
         return
       }
+      // A pending list must not replace a marker saved after its snapshot.
+      markerListRequestRef.current += 1
+      const requestId = ++highlightRequestRef.current
+      const requestStorageScope = storageScope
+      const requestIsCurrent = () => (
+        highlightRequestRef.current === requestId
+        && storageScopeRef.current === requestStorageScope
+      )
       setIsHighlightPending(true)
       setMarkerError(null)
       setMarkerRetryKind(null)
@@ -854,17 +880,21 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
         excerpt: text,
         note: null,
       })
-        .then((marker) => setSessionMarkers((current) => [...current, marker]))
-        .then(() => {
+        .then((marker) => {
+          if (!requestIsCurrent()) return
+          setSessionMarkers((current) => [...current.filter((item) => item.markerId !== marker.markerId), marker])
           setMarkerError(null)
           setMarkerRetryKind(null)
           dismissSelection()
         })
         .catch(() => {
+          if (!requestIsCurrent()) return
           setMarkerRetryKind("highlight")
           setMarkerError("划线保存失败，请重试；当前选择仍保留")
         })
-        .finally(() => setIsHighlightPending(false))
+        .finally(() => {
+          if (requestIsCurrent()) setIsHighlightPending(false)
+        })
       return
     }
     const markerId = crypto.randomUUID()
@@ -1142,8 +1172,8 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
             )}
           </div>
         )}
-        {contentReady && pdfSource && state.status === "ready" && <PdfReader key={state.session.sessionId} source={pdfSource} restoreLocator={(pageCount) => (
-          restorePdfProgress(pageCount, state.session, restoredPdfProgressRef)
+        {contentReady && pdfSource && state.status === "ready" && <PdfReader key={`${state.session.sessionId}:${initialPosition?.key ?? ""}`} source={pdfSource} restoreLocator={(pageCount) => (
+          restorePdfProgress(pageCount, state.session, restoredPdfProgressRef, initialPosition)
         )} onLocatorChange={(locator) => {
           const progression = locator.pageCount <= 1 ? 0 : locator.pageIndex / (locator.pageCount - 1)
           setProgress(progression * 100)
@@ -1263,7 +1293,7 @@ function ArticleReaderExperience({ clientMode }: { clientMode: ActiveArticleRead
 
       {selectionPosition && (
         <div style={{ left: selectionPosition.x, top: selectionPosition.y }} className="fixed z-[70] flex -translate-x-1/2 -translate-y-full items-center gap-1 rounded-full border border-white/15 bg-[#1c1c1e]/95 px-[8px] py-1.5 text-xs font-semibold text-white shadow-2xl backdrop-blur-xl">
-          <button type="button" onClick={addHighlight} disabled={isHighlightPending || !selectedBlockId} className="flex items-center gap-1 rounded-full px-[10px] py-1.5 hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-45"><Highlighter className="h-3.5 w-3.5 text-amber-300" />{isHighlightPending ? "保存中" : "划线"}</button>
+          <button type="button" onClick={addHighlight} disabled={isHighlightPending || !selectedBlockId || (tauriRuntime && !markersLoaded)} className="flex items-center gap-1 rounded-full px-[10px] py-1.5 hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-45"><Highlighter className="h-3.5 w-3.5 text-amber-300" />{isHighlightPending ? "保存中" : tauriRuntime && !markersLoaded ? "加载划线中" : "划线"}</button>
           {demoRuntime && <button type="button" onClick={askAboutSelection} className="flex items-center gap-1 rounded-full px-[10px] py-1.5 text-amber-200 hover:bg-white/15"><Sparkles className="h-3.5 w-3.5" />问 AI</button>}
         </div>
       )}

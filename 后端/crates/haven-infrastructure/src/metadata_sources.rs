@@ -1160,10 +1160,9 @@ fn parse_m3u_entries(text: &str) -> Vec<M3uEntry> {
     let mut pending: Option<(String, Option<String>)> = None;
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         if line.starts_with("#EXTINF") {
-            let title = line
-                .split_once(',')
-                .map(|(_, title)| title.trim().to_owned())
+            let title = extinf_title(line)
                 .filter(|title| !title.is_empty())
+                .map(str::to_owned)
                 .or_else(|| attribute(line, "tvg-name"))
                 .unwrap_or_else(|| "未命名频道".to_owned());
             pending = Some((title, attribute(line, "group-title")));
@@ -1185,6 +1184,22 @@ fn parse_m3u_entries(text: &str) -> Vec<M3uEntry> {
         }
     }
     entries
+}
+
+/// `#EXTINF` 行里标题的起点：**引号外的第一个逗号**之后。
+///
+/// 属性值可能自带逗号（`group-title="News, International"`），按第一个逗号盲切会把
+/// 属性内容粘进标题；最后一个逗号也不对，标题本身可以含逗号。
+fn extinf_title(line: &str) -> Option<&str> {
+    let mut quoted = false;
+    for (index, ch) in line.char_indices() {
+        match ch {
+            '"' => quoted = !quoted,
+            ',' if !quoted => return Some(line[index + 1..].trim()),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn attribute(line: &str, name: &str) -> Option<String> {
@@ -1708,6 +1723,27 @@ mod tests {
         assert_eq!(entries[0].group.as_deref(), Some("Live"));
         assert_eq!(entries[1].title, "LAN");
         assert_eq!(entries[1].url, "http://127.0.0.1:8080/live.m3u8");
+    }
+
+    #[test]
+    fn m3u_extinf_title_starts_after_the_first_unquoted_comma() {
+        let entries = parse_m3u_entries(
+            "#EXTM3U\n\
+             #EXTINF:-1 group-title=\"News, International\",BBC World\nhttps://cdn.example/world.m3u8\n\
+             #EXTINF:-1 group-title=\"A, B\",Comma, In Title\nhttps://cdn.example/comma.m3u8\n\
+             #EXTINF:-1 tvg-name=\"Fallback Channel\" group-title=\"News, International\",\nhttps://cdn.example/fallback.m3u8\n\
+             #EXTINF:-1 group-title=\"News, International\",\nhttps://cdn.example/unnamed.m3u8\n",
+        );
+        assert_eq!(entries.len(), 4);
+        // 属性里的逗号不能进入标题；标题里的逗号必须保留。
+        assert_eq!(entries[0].title, "BBC World");
+        assert_eq!(entries[0].group.as_deref(), Some("News, International"));
+        assert_eq!(entries[1].title, "Comma, In Title");
+        assert_eq!(entries[1].group.as_deref(), Some("A, B"));
+        // 逗号后没有标题时，仍回退到 tvg-name，最后才是「未命名频道」。
+        assert_eq!(entries[2].title, "Fallback Channel");
+        assert_eq!(entries[2].group.as_deref(), Some("News, International"));
+        assert_eq!(entries[3].title, "未命名频道");
     }
 
     #[test]

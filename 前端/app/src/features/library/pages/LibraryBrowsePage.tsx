@@ -160,6 +160,17 @@ function parseBeforeYear(value: string): number | null {
   return match ? Number(match[1]) : null
 }
 
+/**
+ * 年份筛选的唯一判定：`year <= 0`（含 gateway 对缺省 releaseYear 的 0 投影）
+ * 表示年份未知，任何年份筛选都不命中——它不是「很旧」，也不能被 `0` 字符串匹配。
+ */
+function matchesYearFilter(item: LibraryMediaItemData, value: string): boolean {
+  if (item.year <= 0) return false
+  const beforeYear = parseBeforeYear(value)
+  if (beforeYear !== null) return item.year <= beforeYear
+  return String(item.year) === value
+}
+
 function matchesMetaFilter(item: LibraryMediaItemData, key: string, value: string): boolean {
   if (value === "全部" || !value) return true
 
@@ -169,10 +180,7 @@ function matchesMetaFilter(item: LibraryMediaItemData, key: string, value: strin
   }
 
   if (key === "year") {
-    const beforeYear = parseBeforeYear(value)
-    if (beforeYear !== null) return item.year > 0 && item.year <= beforeYear
-    const exactYear = Number(value)
-    return Number.isInteger(exactYear) && item.year === exactYear
+    return matchesYearFilter(item, value)
   }
 
   const meta = ITEM_META[item.id]
@@ -361,10 +369,14 @@ export function LibraryBrowsePage() {
     }, { replace: true })
   }
 
+  // Tauri 的 library_list 已按 query 做服务端检索（含原名/描述等命中的
+  // 权威结果），页面不能再按标题子串二次过滤，否则会丢掉 FTS 命中项。
+  // 浏览器演示目录不消费 query，仍保留本地标题匹配。
+  const queryFilteredByBackend = isTauriRuntime()
   const filteredItems = browseItems
     .filter((item) => matchesLibraryCategory(item, categoryKey))
     .filter((item) => {
-      const normalizedQuery = query.trim().toLowerCase()
+      const normalizedQuery = queryFilteredByBackend ? "" : query.trim().toLowerCase()
       const matchesQuery = !normalizedQuery
         || item.title.toLowerCase().includes(normalizedQuery)
         || item.originalTitle?.toLowerCase().includes(normalizedQuery)
@@ -381,9 +393,7 @@ export function LibraryBrowsePage() {
         }
 
         if (group.key === "year") {
-          const beforeYear = parseBeforeYear(value)
-          const matchesYear = beforeYear !== null ? item.year <= beforeYear : String(item.year) === value
-          if (!matchesYear) return false
+          if (!matchesYearFilter(item, value)) return false
           continue
         }
 
@@ -544,7 +554,10 @@ export function LibraryBrowsePage() {
               {query && (
                 <button
                   type="button"
-                  onClick={() => setQuery("")}
+                  onClick={() => {
+                    setQuery("")
+                    syncParams(filters, "", sortBy)
+                  }}
                   aria-label="清除搜索"
                   className="text-muted-foreground hover:text-foreground transition-colors"
                 >

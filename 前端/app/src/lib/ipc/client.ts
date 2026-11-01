@@ -38,6 +38,9 @@ import type {
   DownloadEvent,
   DownloadListRequest,
   DownloadMutationResultDto,
+  DownloadResourceActionRequest,
+  DownloadResourceMutationResultDto,
+  DownloadResourceRevealResultDto,
   DownloadRevealResultDto,
   DownloadTaskActionRequest,
   DownloadTaskDto,
@@ -119,6 +122,8 @@ import type {
   AgentSettingsProposalDto,
   AgentSettingsProposalGetRequest,
   AgentSettingsProposalGetResultDto,
+  AgentSettingsProposalListRequest,
+  AgentSettingsProposalListResultDto,
   AgentSettingsProposalRejectRequest,
   AgentSettingsProposalRejectResultDto,
   AgentTraceGetRequest,
@@ -291,6 +296,13 @@ export interface HavenClient extends CloudStorageClient {
   downloadRemoveRecord(request: DownloadTaskActionRequest): Promise<DownloadMutationResultDto>;
   downloadDeleteOffline(request: DownloadTaskActionRequest): Promise<DownloadMutationResultDto>;
   downloadRevealOffline(request: DownloadTaskActionRequest): Promise<DownloadRevealResultDto>;
+  // Resource-level offline actions: the Task row may already be gone.
+  downloadDeleteOfflineResource(
+    request: DownloadResourceActionRequest,
+  ): Promise<DownloadResourceMutationResultDto>;
+  downloadRevealOfflineResource(
+    request: DownloadResourceActionRequest,
+  ): Promise<DownloadResourceRevealResultDto>;
   downloadSubscribe(
     subscriptionId: string,
     onEvent: (event: DownloadEvent) => void,
@@ -376,6 +388,10 @@ export interface HavenClient extends CloudStorageClient {
   agentSettingsProposalGet(
     request: AgentSettingsProposalGetRequest,
   ): Promise<AgentSettingsProposalGetResultDto>;
+  /** 有界恢复全局阅读 Agent 提案与回执（含外部接入创建的提案）。 */
+  agentSettingsProposalList(
+    request: AgentSettingsProposalListRequest,
+  ): Promise<AgentSettingsProposalListResultDto>;
   /** 拒绝提案（零设置写入）。 */
   agentSettingsProposalReject(
     request: AgentSettingsProposalRejectRequest,

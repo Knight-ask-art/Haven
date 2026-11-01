@@ -61,13 +61,15 @@ const MAX_YEAR = 2_999
 
 /**
  * 传输事实模式：`scheme://` 地址、`data:` 载荷、绝对/UNC/回溯路径、带凭据的
- * 查询串、认证头前缀。
+ * 查询串。
  *
  * 其中 `://` 与 `data:` 与后端 `identity_text` 完全一致；路径与凭据是前端加固。
  * 刻意不把裸斜杠当作地址——DOI（`10.1038/xxx`）与页码区间（`S1-S5`）都含斜杠。
+ * 查询串里的凭据只在 `?` / `&` / `;` 这类参数分隔处成立：`auth=` 与 `token=` 不做
+ * 无边界匹配，`Basic life support` 这类普通标题不会被当成 `Basic` 认证头前缀。
  */
 const TRANSPORT_FACT_PATTERN =
-  /(?:[a-z][a-z0-9+.-]*:\/\/)|(?:^data:)|(?:^[\\/])|(?:^[a-z]:[\\/])|(?:\\\\)|(?:(?:^|[\\/])\.\.(?:[\\/]|$))|(?:[?&;,](?:cookie|authorization|auth|token|access_token|api[_-]?key|apikey|signature|sig|secret|password|credential|session|sessionid|session_id)=)|(?:^(?:bearer|basic)\s)/i
+  /(?:[a-z][a-z0-9+.-]*:\/\/)|(?:^data:)|(?:^[\\/])|(?:^[a-z]:[\\/])|(?:\\\\)|(?:(?:^|[\\/])\.\.(?:[\\/]|$))|(?:[?&;,](?:cookie|authorization|auth|token|access_token|api[_-]?key|apikey|signature|sig|secret|password|credential|session|sessionid|session_id)=)/i
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)

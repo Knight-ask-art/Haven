@@ -80,6 +80,27 @@ pub(crate) fn purge_location_content(
     storage_location_id: StorageLocationId,
 ) -> Result<(), AppError> {
     let loc = storage_location_id.to_string();
+    // Task rows own temporary files until the runner has cleaned them. This
+    // transaction is also the serialization boundary for enqueue/finalize;
+    // never erase a live or terminal-but-uncleaned task beneath its worker.
+    let owns_download: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM download_tasks d
+             WHERE d.state <> 'completed' AND (d.target_storage_id = ?1 OR
+               EXISTS(SELECT 1 FROM resources r WHERE r.id = d.source_resource_id
+                      AND r.storage_location_id = ?1)))",
+            rusqlite::params![&loc],
+            |row| row.get(0),
+        )
+        .map_err(|e| tx_err("检查位置下载任务失败", e))?;
+    if owns_download {
+        return Err(AppError::new(
+            "STORAGE_DOWNLOAD_IN_PROGRESS",
+            ErrorKind::Conflict,
+            "该位置仍有下载记录，请先取消下载并移除未完成记录，再移除存储位置",
+            true,
+        ));
+    }
     let exec = |sql: &str| -> Result<(), AppError> {
         conn.execute(sql, [])
             .map_err(|e| tx_err("位置内容清理失败", e))?;
@@ -145,38 +166,99 @@ pub(crate) fn purge_location_content(
     if let Some(max_depth) = max_depth {
         let mut depth = 0;
         while depth <= max_depth {
-            // 只有本轮确实可删的叶节点才允许先清用户状态。候选父条目若仍有
-            // 另一个非候选/共享子节点，必须连同 progress/history/marker/favorite
-            // 一起保留，不能因为它出现在祖先闭包里就提前丢用户数据。
-            exec(&format!("DELETE FROM {purge_temp} WHERE stage = 4"))?;
+            // Compute the entire deletable subtree before changing user state,
+            // so comic subjects shared with surviving items can be identified.
             let mark_deletable = format!(
                 "INSERT INTO {purge_temp}(stage, id, parent, depth)
                  SELECT DISTINCT 4, m.id, m.edition_id, {depth}
                  FROM media_items m
                  JOIN {purge_temp} p ON p.stage = 1 AND p.id = m.id AND p.depth = {depth}
                  WHERE NOT EXISTS (SELECT 1 FROM resources r WHERE r.media_item_id = m.id)
-                   AND NOT EXISTS (SELECT 1 FROM media_items child WHERE child.parent_id = m.id)"
+                   AND NOT EXISTS (SELECT 1 FROM media_items child WHERE child.parent_id = m.id
+                       AND child.id NOT IN (SELECT id FROM {purge_temp} WHERE stage = 4))"
             );
             exec(&mark_deletable)?;
-            exec(&format!(
-                "DELETE FROM history_entries WHERE media_item_id IN (SELECT id FROM {purge_temp} WHERE stage = 4)"
-            ))?;
-            exec(&format!(
-                "DELETE FROM progress WHERE media_item_id IN (SELECT id FROM {purge_temp} WHERE stage = 4)"
-            ))?;
-            exec(&format!(
-                "DELETE FROM markers WHERE media_item_id IN (SELECT id FROM {purge_temp} WHERE stage = 4)"
-            ))?;
-            exec(&format!(
-                "DELETE FROM favorites WHERE media_item_id IN (SELECT id FROM {purge_temp} WHERE stage = 4)"
-            ))?;
-            exec(&format!(
-                "DELETE FROM download_tasks WHERE media_item_id IN (SELECT id FROM {purge_temp} WHERE stage = 4)"
-            ))?;
-            exec(&format!(
-                "DELETE FROM media_items WHERE id IN (SELECT id FROM {purge_temp} WHERE stage = 4)"
-            ))?;
             depth += 1;
+        }
+
+        // A surviving member or redirect retains its subject's canonical item.
+        // Protect its ancestors too. Both sets only shrink, so the fixed point
+        // terminates and never deletes another location's progress ownership.
+        loop {
+            exec(&format!("DELETE FROM {purge_temp} WHERE stage = 5"))?;
+            exec(&format!(
+                "INSERT INTO {purge_temp}(stage, id, depth)
+                 SELECT 5, s.id, 0 FROM comic_progress_subjects s
+                 WHERE s.canonical_media_item_id IN (SELECT id FROM {purge_temp} WHERE stage = 4)
+                   AND NOT EXISTS(SELECT 1 FROM comic_progress_subject_members m
+                       WHERE m.subject_id = s.id AND m.media_item_id NOT IN
+                           (SELECT id FROM {purge_temp} WHERE stage = 4))"
+            ))?;
+            loop {
+                let removed = conn
+                    .execute(
+                        &format!(
+                            "DELETE FROM {purge_temp} WHERE stage = 5 AND id IN (
+                     SELECT s.redirect_subject_id FROM comic_progress_subjects s
+                     WHERE s.redirect_subject_id IS NOT NULL AND s.id NOT IN
+                         (SELECT id FROM {purge_temp} WHERE stage = 5))"
+                        ),
+                        [],
+                    )
+                    .map_err(|e| tx_err("保护共享漫画主体失败", e))?;
+                if removed == 0 {
+                    break;
+                }
+            }
+            let protected = conn.execute(&format!(
+                "DELETE FROM {purge_temp} WHERE stage = 4 AND (
+                 id IN (SELECT canonical_media_item_id FROM comic_progress_subjects
+                        WHERE id NOT IN (SELECT id FROM {purge_temp} WHERE stage = 5))
+                 OR EXISTS(SELECT 1 FROM media_items child
+                           WHERE child.parent_id = _haven_storage_purge_media_ids.id AND child.id NOT IN
+                               (SELECT id FROM {purge_temp} WHERE stage = 4)))"
+            ), []).map_err(|e| tx_err("保护共享漫画条目失败", e))?;
+            if protected == 0 {
+                break;
+            }
+        }
+
+        // Explicit index removal retires undo receipts touching removed media;
+        // current progress on surviving media is left intact.
+        exec(&format!(
+            "DELETE FROM comic_progress_migration_snapshots
+             WHERE source_media_item_id IN (SELECT id FROM {purge_temp} WHERE stage = 4)
+                OR target_media_item_id IN (SELECT id FROM {purge_temp} WHERE stage = 4)"
+        ))?;
+        exec(&format!(
+            "DELETE FROM comic_progress_subject_members
+             WHERE media_item_id IN (SELECT id FROM {purge_temp} WHERE stage = 4)"
+        ))?;
+        // Clear redirects only inside the subject set that is about to vanish,
+        // avoiding immediate RESTRICT order dependencies between retired rows.
+        exec(&format!(
+            "UPDATE comic_progress_subjects SET state = 'active', redirect_subject_id = NULL
+             WHERE id IN (SELECT id FROM {purge_temp} WHERE stage = 5)"
+        ))?;
+        exec(&format!(
+            "DELETE FROM comic_progress_subjects WHERE id IN (SELECT id FROM {purge_temp} WHERE stage = 5)"
+        ))?;
+        for table in [
+            "history_entries",
+            "progress",
+            "markers",
+            "favorites",
+            "download_tasks",
+        ] {
+            exec(&format!(
+                "DELETE FROM {table} WHERE media_item_id IN (SELECT id FROM {purge_temp} WHERE stage = 4)"
+            ))?;
+        }
+        for depth in 0..=max_depth {
+            exec(&format!(
+                "DELETE FROM media_items WHERE id IN
+                 (SELECT id FROM {purge_temp} WHERE stage = 4 AND depth = {depth})"
+            ))?;
         }
     }
 
@@ -211,6 +293,9 @@ pub(crate) fn purge_location_content(
         "DELETE FROM download_tasks WHERE work_id IN (SELECT id FROM {purge_temp} WHERE stage = 3)"
     ))?;
     // work_favorite_versions 随 works 外键 CASCADE。
+    exec(&format!(
+        "DELETE FROM comic_catalog_refresh_outcomes WHERE work_id IN (SELECT id FROM {purge_temp} WHERE stage = 3)"
+    ))?;
     exec(&format!(
         "DELETE FROM works WHERE id IN (SELECT id FROM {purge_temp} WHERE stage = 3)"
     ))?;

@@ -70,6 +70,18 @@ describe("periodical presentation", () => {
       canOnlineRead: false,
     })).toEqual({ state: "queued", label: "下载中" })
     expect(resolveMediaItemCapability({
+      status: "paused",
+      canDownload: false,
+      hasOfflineResource: false,
+      canOnlineRead: true,
+    })).toEqual({ state: "paused", label: "下载已暂停" })
+    expect(resolveMediaItemCapability({
+      status: "interrupted",
+      canDownload: false,
+      hasOfflineResource: false,
+      canOnlineRead: true,
+    })).toEqual({ state: "interrupted", label: "下载已中断" })
+    expect(resolveMediaItemCapability({
       status: "idle",
       canDownload: false,
       hasOfflineResource: false,

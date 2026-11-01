@@ -75,6 +75,8 @@ export type MediaItemCapabilityState =
   | "error"
   | "offline"
   | "queued"
+  | "paused"
+  | "interrupted"
   | "online"
   | "download_only"
   | "unavailable"
@@ -93,6 +95,10 @@ export function resolveMediaItemCapability(
   if (!info) return { state: "loading", label: "正在读取能力" }
   if (info.hasOfflineResource || info.status === "downloaded") return { state: "offline", label: "已下载" }
   if (info.status === "queued") return { state: "queued", label: "下载中" }
+  // Paused / Interrupted tasks are retained by the backend but not running;
+  // they are recoverable on the same task and must say so instead of "下载中".
+  if (info.status === "paused") return { state: "paused", label: "下载已暂停" }
+  if (info.status === "interrupted") return { state: "interrupted", label: "下载已中断" }
   if (info.canOnlineRead) return { state: "online", label: "可在线阅读" }
   if (info.canDownload) return { state: "download_only", label: "需要下载后阅读" }
   return { state: "unavailable", label: "当前内容暂不可用" }

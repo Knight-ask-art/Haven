@@ -1,3 +1,4 @@
+import { useMarkerNavigation } from "@/features/markers/lib/use-marker-navigation"
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from "react"
 import { useNavigate, useParams } from "react-router"
 import {
@@ -119,6 +120,9 @@ function ComicPageView({
   onLoad,
   onError,
   resourcePool,
+  recoverable,
+  onRecover,
+  failedByProvider = false,
 }: {
   page: ComicPageModel | null
   src: string | null
@@ -128,6 +132,11 @@ function ComicPageView({
   onLoad?: React.ReactEventHandler<HTMLImageElement>
   onError?: React.ReactEventHandler<HTMLImageElement>
   resourcePool?: ComicPageResourcePool | null
+  /** 生产页只在主阅读位给出重开动作；缩略图不重复提供。 */
+  recoverable?: boolean
+  onRecover?: (pageNumber: number) => void
+  /** 页面级已判定该页加载失败（失败集合），缩略图同样要显示失败而不是无限等待。 */
+  failedByProvider?: boolean
 }) {
   const [managedResource, setManagedResource] = useState<ComicPageResource | null>(null)
   const [managedError, setManagedError] = useState(false)
@@ -164,10 +173,33 @@ function ComicPageView({
   }, [managed, page, resourcePool])
 
   const imageSrc = managed ? managedResource?.src ?? null : src
-  if (!page || page.availability !== "ready" || !imageSrc) {
+  const failed = managedError || (page !== null && failedByProvider)
+  // Provider 已判失败的页面即使地址非空也必须进入恢复分支：过期租约签发的地址
+  // 仍可能指向 404，不能继续渲染（否则重开入口永远不出现）。
+  if (!page || page.availability !== "ready" || !imageSrc || failed) {
+    if (failed && recoverable && onRecover && page) {
+      // 会话租约过期后，已签发的页面地址会 404；这里只给出用户可触发的重开入口，
+      // 真正的恢复走既有 session retry / 租约流水线，不在页面里刷新地址或延长 TTL。
+      return (
+        <div className={cn("flex flex-col items-center justify-center gap-2 rounded-md border border-white/10 bg-white/[0.03] px-5 py-6 text-center text-xs text-white/60", className)}>
+          <span>第 {page.pageNumber} 页加载失败，页面地址可能已过期</span>
+          <button
+            type="button"
+            onTouchStart={(event) => event.stopPropagation()}
+            onTouchMove={(event) => event.stopPropagation()}
+            onTouchEnd={(event) => event.stopPropagation()}
+            onTouchCancel={(event) => event.stopPropagation()}
+            onClick={(event) => { event.stopPropagation(); onRecover(page.pageNumber) }}
+            className="rounded-full bg-white px-4 py-1.5 text-[11px] font-semibold text-black hover:bg-white/85"
+          >
+            重新打开页面
+          </button>
+        </div>
+      )
+    }
     return (
       <div className={cn("flex min-h-[180px] items-center justify-center rounded-md border border-white/10 bg-white/[0.03] px-5 text-center text-xs text-white/50", className)}>
-        {managedError ? `第 ${page?.pageNumber ?? "?"} 页加载失败` : `第 ${page?.pageNumber ?? "?"} 页暂不可用`}
+        {failed ? `第 ${page?.pageNumber ?? "?"} 页加载失败` : `第 ${page?.pageNumber ?? "?"} 页暂不可用`}
       </div>
     )
   }
@@ -334,6 +366,7 @@ function ComicWorkChapterCard({
 function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
   const navigate = useNavigate()
   const { mediaItemId } = useParams<{ mediaItemId?: string }>()
+  const initialPosition = useMarkerNavigation(mediaItemId)
 
   // Session + 进度：Tauri 环境接真实 useMediaSession（engine=comic）；
   // 浏览器演示环境保持既有静态演示内容。
@@ -409,9 +442,64 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     ? manifestState.sequence
     : null
 
+  const pendingReopenTargetRef = useRef<{ key: string; page: number; mediaItemId: string } | null>(null)
+  // 在途重开：同步闩锁，从点击到新会话 manifest + 进度恢复完成前一直持有，
+  // 期间所有恢复按钮都保持禁用/隐藏，避免并发触发第二份 retry。
+  const reopenInFlightRef = useRef(false)
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => { mountedRef.current = false }
+  }, [])
+  const [reopenInFlight, setReopenInFlight] = useState(false)
+  const releaseReopenTarget = useCallback((key: string | null) => {
+    if (key !== null && pendingReopenTargetRef.current?.key !== key) return
+    pendingReopenTargetRef.current = null
+    reopenInFlightRef.current = false
+    if (mountedRef.current) setReopenInFlight(false)
+  }, [])
+  const hasPendingReopen = reopenInFlight
+
   // 阅读器状态
   const [currentPage, setCurrentPage] = useState(1)
   const totalPages = sequence?.pageCount ?? 0
+  const mediaItemIdRef = useRef(mediaItemId)
+  mediaItemIdRef.current = mediaItemId
+  const totalPagesRef = useRef(totalPages)
+  totalPagesRef.current = totalPages
+  const recoverySessionRef = useRef(readerSessionIdentity)
+  useLayoutEffect(() => { recoverySessionRef.current = readerSessionIdentity }, [readerSessionIdentity])
+
+  const recoverPage = useCallback((pageNumber: number) => {
+    // 同步守卫：同一帧里的重复点击、以及切作品 / 换会话后到达的迟到点击一律忽略。
+    const key = readerSessionIdentity
+    if (demoMode || key === null || totalPagesRef.current <= 0 || mediaItemIdRef.current !== mediaItemId) return
+    if (reopenInFlightRef.current || pendingReopenTargetRef.current?.key === key) return
+    const target = { key, page: Math.max(1, Math.min(totalPagesRef.current, pageNumber)), mediaItemId: mediaItemIdRef.current ?? "" }
+    pendingReopenTargetRef.current = target
+    reopenInFlightRef.current = true
+    setReopenInFlight(true)
+    // 恢复必须开一个新会话而不是重取同一个过期会话。既有租约流水线：先等进度控制器
+    // cleanup（flush）落盘，再触发 retry()；useMediaSession 的 retryNonce 会让租约
+    // 释放同样等待这份 barrier。这里不延长 TTL、不改资源鉴权，也不轮询刷新。
+    const controller = progressControllerRef.current
+    const flush = controller !== null
+      ? controller.cleanup().catch(() => undefined)
+      : Promise.resolve()
+    void flush.then(() => {
+      if (!mountedRef.current || mediaItemIdRef.current !== target.mediaItemId) {
+        // 组件已卸载或已切换作品：没有可触发的新会话，释放闩锁即可。
+        releaseReopenTarget(target.key)
+        return
+      }
+      // A progress conflict can already have reopened the session during flush.
+      // Its new generation owns recovery; do not issue a second retry from the old callback.
+      if (recoverySessionRef.current !== target.key) return
+      retry()
+    })
+  }, [demoMode, mediaItemId, readerSessionIdentity, releaseReopenTarget, retry])
+  const recover = demoMode ? undefined : recoverPage
+
   const [viewMode, setViewMode] = useState<ViewMode>("single")
   const [direction, setDirection] = useState<ReadDirection>("rtl")
   const [pageGapPx, setPageGapPx] = useState<0 | 12 | 24>(12)
@@ -450,13 +538,37 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     startedAt: number
     pinchDistance: number | null
     pinchZoom: number
+    /** The whole touch sequence has involved more than one finger. */
+    multiTouch: boolean
   } | null>(null)
+  // Survives a pan-y pointercancel: the remaining finger's own touchend must
+  // not be treated as a single-finger tap. Only a fresh sequence resets it.
+  const multiTouchGestureRef = useRef(false)
+  const clickSuppressionTimerRef = useRef<number | null>(null)
+  const suppressCompatibilityClick = () => {
+    suppressClickRef.current = true
+    if (clickSuppressionTimerRef.current !== null) window.clearTimeout(clickSuppressionTimerRef.current)
+    clickSuppressionTimerRef.current = window.setTimeout(() => {
+      suppressClickRef.current = false
+      clickSuppressionTimerRef.current = null
+    }, 350)
+  }
+  useEffect(() => () => {
+    if (clickSuppressionTimerRef.current !== null) window.clearTimeout(clickSuppressionTimerRef.current)
+  }, [])
 
   // 条漫模式只保留视口附近的页面节点，避免几百张图片同时进入 DOM。
   const [stripWindow, setStripWindow] = useState({ start: 1, end: 8 })
   const [stripViewportWidth, setStripViewportWidth] = useState(760)
   const [stripHeights, setStripHeights] = useState<Record<number, number>>({})
   const stripModeInitializedRef = useRef(false)
+  const stripNavigationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => {
+    if (stripNavigationTimerRef.current !== null) {
+      clearTimeout(stripNavigationTimerRef.current)
+      stripNavigationTimerRef.current = null
+    }
+  }, [readerSessionIdentity, viewMode])
   const previousStripOffsetsRef = useRef<readonly number[] | null>(null)
   const previousStripAnchorPageRef = useRef<number | null>(null)
 
@@ -464,6 +576,7 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
   const [imageDimensions, setImageDimensions] = useState<Record<number, { width: number, height: number }>>({})
   const progressControllerRef = useRef<ComicProgressController | null>(null)
   const restoredProgressRef = useRef<string | null>(null)
+  const [progressRestoredIdentity, setProgressRestoredIdentity] = useState<string | null>(null)
   const markerListRequestRef = useRef(0)
   const bookmarkOperationRef = useRef(0)
 
@@ -478,6 +591,7 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     setIsBookmarkPending(false)
     setMarkersLoaded(false)
     restoredProgressRef.current = null
+    setProgressRestoredIdentity(demoMode ? "demo" : null)
     setCurrentPage(1)
     setViewMode("single")
     setDirection("rtl")
@@ -491,7 +605,38 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     previousStripOffsetsRef.current = null
     previousStripAnchorPageRef.current = null
     setEditionFilter(null)
-  }, [readerSessionIdentity])
+  }, [demoMode, readerSessionIdentity])
+
+  useEffect(() => {
+    // 新的页面池（新会话 / 新 manifest）就绪后清空失败集合，让恢复后的页面重新尝试加载。
+    setFailedPages(new Set())
+  }, [readerSessionIdentity, sequence])
+
+  useEffect(() => () => {
+    // 卸载后不再保留重开目标与闩锁。
+    pendingReopenTargetRef.current = null
+    reopenInFlightRef.current = false
+  }, [])
+
+  useEffect(() => {
+    const key = readerSessionIdentity ?? ""
+    const pending = pendingReopenTargetRef.current
+    // 目标跨越旧会话 → opening → 新会话保留；只有新会话的 manifest 就绪、且进度
+    // 恢复已按该身份落页之后才释放。旧身份、opening 或新会话出错时都不释放，
+    // 避免迟到点击在恢复完成前再次触发重开。
+    if (pending === null || pending.mediaItemId !== (mediaItemId ?? "")) {
+      // 目标属于已离开的作品：不再等待，释放闩锁以免恢复入口永久禁用。
+      if (pending !== null) releaseReopenTarget(null)
+      return
+    }
+    if (state.status === "retryable_error" || state.status === "terminal_error") {
+      releaseReopenTarget(pending.key)
+      return
+    }
+    if (key === "" || key === pending.key || manifestState.status !== "ready" || totalPages <= 0) return
+    if (progressRestoredIdentity !== key) return
+    releaseReopenTarget(null)
+  }, [manifestState.status, mediaItemId, progressRestoredIdentity, readerSessionIdentity, releaseReopenTarget, state.status, totalPages])
 
   useEffect(() => {
     if (!readerSessionIdentity || comicSettingsState.status === "loading") return
@@ -556,15 +701,19 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     setComicMarkerId(marker?.markerId ?? null)
   }, [currentPage, isBookmarkPending, manifestState.status, markersLoaded, mediaItemId, sessionMarkers, sessionView.status, totalPages])
 
-  // 进度控制器生命周期：仅 Tauri 环境 session ready 时创建。
+  // 进度控制器生命周期：仅 Tauri 环境 session ready 时创建。每次创建（含同一会话的
+  // manifest 重取）都重新注册 barrier，保证协议打开时租约释放等的一定是当前控制器。
   useEffect(() => {
     progressControllerRef.current = null
     if (totalPages <= 0 || sessionView.status !== "ready" || state.status !== "ready" || manifestState.status !== "ready") return
     const controller = createComicProgressController({ session: state.session, totalPages, retry })
     progressControllerRef.current = controller
+    // 重开时旧会话的租约释放仍会等待已注册的 barrier：新会话的 barrier 只清理新会话
+    // 的页面池，绝不能在旧会话的 barrier 里 dispose 新会话的页面池。
+    const ownedPool = resourcePoolRef.current
     registerReleaseBarrier(async () => {
       await controller.cleanup()
-      resourcePoolRef.current?.dispose()
+      ownedPool?.dispose()
     })
     return () => { progressControllerRef.current = null; registerReleaseBarrier(null) }
   }, [manifestState.status, sessionIdentity, sessionView.status, state, retry, registerReleaseBarrier, totalPages])
@@ -572,16 +721,24 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
   // 恢复进度：session ready 时恢复至上次阅读页。
   useEffect(() => {
     if (totalPages <= 0 || sessionView.status !== "ready" || state.status !== "ready" || manifestState.status !== "ready") return
-    const restored = restoreComicProgress(totalPages, state.session, restoredProgressRef)
-    if (restored) setCurrentPage(restored.pageIndex)
-  }, [manifestState.status, sessionIdentity, sessionView.status, state, totalPages])
+    const restored = restoreComicProgress(totalPages, state.session, restoredProgressRef, initialPosition)
+    // 同一作品内的「重新打开页面」：保留失败时所在页，优先于已保存的旧进度。
+    const reopen = pendingReopenTargetRef.current
+    const reopenPage = reopen !== null && reopen.mediaItemId === (mediaItemId ?? "")
+      ? Math.max(1, Math.min(totalPages, reopen.page))
+      : null
+    if (reopenPage !== null) setCurrentPage(reopenPage)
+    else if (restored) setCurrentPage(restored.pageIndex)
+    setProgressRestoredIdentity(readerSessionIdentity)
+  }, [initialPosition, manifestState.status, readerSessionIdentity, sessionIdentity, sessionView.status, state, totalPages, mediaItemId])
 
   // currentPage 变化时向进度控制器上报（Tauri 环境节流）。
   useEffect(() => {
-    if (isTauriRuntime() && sessionView.status === "ready" && manifestState.status === "ready") {
+    if (isTauriRuntime() && sessionView.status === "ready" && manifestState.status === "ready"
+      && readerSessionIdentity !== null && progressRestoredIdentity === readerSessionIdentity) {
       progressControllerRef.current?.pageChange(currentPage)
     }
-  }, [currentPage, manifestState.status, sessionView.status])
+  }, [currentPage, manifestState.status, progressRestoredIdentity, readerSessionIdentity, sessionView.status])
 
   useEffect(() => {
     if (totalPages <= 0) return
@@ -787,68 +944,6 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     return () => document.removeEventListener("fullscreenchange", handleFullscreenChange)
   }, [])
 
-  // 翻页控制
-  const nextPage = useCallback(() => {
-    setCurrentPage((prev) => {
-      if (viewMode !== "double") return Math.min(totalPages, prev + 1)
-      const currentSpread = getSpreadForPage(prev)
-      const currentIndex = spreads.findIndex((spread) => spread === currentSpread)
-      const nextSpread = spreads[currentIndex + 1]
-      return nextSpread ? nextSpread[0] : totalPages
-    })
-    resetAutoHideTimer()
-  }, [getSpreadForPage, resetAutoHideTimer, spreads, totalPages, viewMode])
-
-  const prevPage = useCallback(() => {
-    setCurrentPage((prev) => {
-      if (viewMode !== "double") return Math.max(1, prev - 1)
-      const currentSpread = getSpreadForPage(prev)
-      const currentIndex = spreads.findIndex((spread) => spread === currentSpread)
-      return currentIndex > 0 ? spreads[currentIndex - 1][0] : 1
-    })
-    resetAutoHideTimer()
-  }, [getSpreadForPage, resetAutoHideTimer, spreads, viewMode])
-
-  // 按阅读方向处理左右点击翻页
-  const handleLeftClick = () => {
-    if (direction === "rtl") {
-      nextPage() // 日漫: 点击左侧前进
-    } else {
-      prevPage() // 国漫: 点击左侧后退
-    }
-  }
-
-  const handleRightClick = () => {
-    if (direction === "rtl") {
-      prevPage() // 日漫: 点击右侧后退
-    } else {
-      nextPage() // 国漫: 点击右侧前进
-    }
-  }
-
-  // 键盘快捷键监听
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "ArrowLeft") {
-        if (direction === "rtl") nextPage()
-        else prevPage()
-      } else if (e.key === "ArrowRight") {
-        if (direction === "rtl") prevPage()
-        else nextPage()
-      } else if (e.key === " ") {
-        e.preventDefault()
-        nextPage()
-      } else if (e.key === "Escape") {
-        setIsDrawerOpen(false)
-      } else if (e.key === "f" || e.key === "F") {
-        toggleFullscreen()
-      }
-    }
-
-    window.addEventListener("keydown", handleKeyDown)
-    return () => window.removeEventListener("keydown", handleKeyDown)
-  }, [direction, nextPage, prevPage])
-
   // 全屏切换
   const toggleFullscreen = () => {
     if (!document.fullscreenElement) {
@@ -925,6 +1020,7 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
   }, [preloadRadius, totalPages])
 
   const handleStripScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
+    if (!stripModeInitializedRef.current) return
     const container = e.currentTarget
     const scrollTop = container.scrollTop
     const containerCenter = scrollTop + container.clientHeight / 2
@@ -952,22 +1048,60 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     })
   }, [currentPage, getStripPageOffset, getStripWindowForPage, totalPages])
 
-  // 进度条拖动响应
-  const handleSliderChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const page = Number(e.target.value)
+  // 显式跳页入口（目录/滑块/上一页下一页/轻点/滑动）把目标页对齐到 pageOffset 页顶。
+  const goToPage = useCallback((requestedPage: number) => {
+    const page = Math.max(1, Math.min(totalPages, requestedPage))
     setCurrentPage(page)
     if (viewMode === "strip" && stripScrollRef.current) {
       setStripWindow(getStripWindowForPage(page))
-      window.setTimeout(() => {
+      if (stripNavigationTimerRef.current !== null) clearTimeout(stripNavigationTimerRef.current)
+      stripNavigationTimerRef.current = setTimeout(() => {
+        stripNavigationTimerRef.current = null
         const container = stripScrollRef.current
         if (container) {
-          container.scrollTo({ top: getStripPageOffset(page) - container.clientHeight / 2 + getStripPageHeight(page) / 2, behavior: "smooth" })
+          container.scrollTo({ top: getStripPageOffset(page), behavior: "auto" })
         }
       }, 0)
     }
+    resetAutoHideTimer()
+  }, [getStripPageOffset, getStripWindowForPage, resetAutoHideTimer, totalPages, viewMode])
+
+  const nextPage = useCallback(() => {
+    if (viewMode !== "double") return goToPage(currentPage + 1)
+    const index = spreads.findIndex((spread) => spread === getSpreadForPage(currentPage))
+    goToPage(spreads[index + 1]?.[0] ?? totalPages)
+  }, [currentPage, getSpreadForPage, goToPage, spreads, totalPages, viewMode])
+
+  const prevPage = useCallback(() => {
+    if (viewMode !== "double") return goToPage(currentPage - 1)
+    const index = spreads.findIndex((spread) => spread === getSpreadForPage(currentPage))
+    goToPage(index > 0 ? spreads[index - 1][0] : 1)
+  }, [currentPage, getSpreadForPage, goToPage, spreads, viewMode])
+
+  const handleLeftClick = () => direction === "rtl" ? nextPage() : prevPage()
+  const handleRightClick = () => direction === "rtl" ? prevPage() : nextPage()
+  const handleSliderChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    goToPage(Number(e.target.value))
   }
 
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target instanceof HTMLElement ? e.target : null
+      if (e.defaultPrevented || target?.closest("input, textarea, select, button, [contenteditable='true'], [role='slider']")) return
+      if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === " ") {
+        e.preventDefault()
+        if (e.key === " ") nextPage()
+        else if ((e.key === "ArrowLeft") === (direction === "rtl")) nextPage()
+        else prevPage()
+      } else if (e.key === "Escape") setIsDrawerOpen(false)
+      else if (e.key === "f" || e.key === "F") toggleFullscreen()
+    }
+    window.addEventListener("keydown", handleKeyDown)
+    return () => window.removeEventListener("keydown", handleKeyDown)
+  }, [direction, nextPage, prevPage])
+
   // 触屏：中心轻点显示工具栏，边缘轻点和左右滑动翻页，双指手势缩放。
+  // 一旦本次触摸序列出现过多指，序列结束时既不翻页也不切换工具栏。
   const getTouchDistance = (touches: React.TouchList) => {
     if (touches.length < 2) return null
     const first = touches[0]
@@ -979,12 +1113,20 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     resetAutoHideTimer()
     const firstTouch = e.touches[0]
     const pinchDistance = getTouchDistance(e.touches)
+    if (e.touches.length === 1) {
+      // A fresh single-finger sequence can only start when no contact is left
+      // (any earlier sequence ended normally or was cancelled by pan-y).
+      multiTouchGestureRef.current = false
+    } else if (e.touches.length > 1 || pinchDistance !== null) {
+      multiTouchGestureRef.current = true
+    }
     touchRef.current = {
       x: firstTouch.clientX,
       y: firstTouch.clientY,
       startedAt: Date.now(),
       pinchDistance,
       pinchZoom: zoomScale,
+      multiTouch: multiTouchGestureRef.current,
     }
   }
 
@@ -992,6 +1134,10 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     const gesture = touchRef.current
     if (!gesture) return
     const pinchDistance = getTouchDistance(e.touches)
+    if (pinchDistance !== null && e.touches.length > 1) {
+      multiTouchGestureRef.current = true
+      gesture.multiTouch = true
+    }
     if (pinchDistance && gesture.pinchDistance) {
       e.preventDefault()
       setZoomScale(Math.min(2.5, Math.max(1, gesture.pinchZoom * (pinchDistance / gesture.pinchDistance))))
@@ -1001,8 +1147,16 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
   const handleTouchEnd = (e: React.TouchEvent<HTMLElement>) => {
     const gesture = touchRef.current
     touchRef.current = null
+    const multiTouch = gesture?.multiTouch || multiTouchGestureRef.current
+    if (e.touches.length === 0) {
+      // Every contact of this sequence has left; the next touch starts clean.
+      multiTouchGestureRef.current = false
+    }
+    if (multiTouch) {
+      suppressCompatibilityClick()
+      return
+    }
     if (!gesture) return
-
     const lastTouch = e.changedTouches[0]
     const dx = lastTouch.clientX - gesture.x
     const dy = lastTouch.clientY - gesture.y
@@ -1033,8 +1187,13 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     }
 
     if (suppressClickRef.current) {
-      window.setTimeout(() => { suppressClickRef.current = false }, 350)
+      suppressCompatibilityClick()
     }
+  }
+  const handleTouchCancel = (e: React.TouchEvent<HTMLElement>) => {
+    touchRef.current = null
+    if (e.touches.length === 0) multiTouchGestureRef.current = false
+    suppressCompatibilityClick()
   }
 
   useEffect(() => {
@@ -1049,26 +1208,33 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
     const resizeObserver = new ResizeObserver(updateViewportWidth)
     resizeObserver.observe(container)
     return () => resizeObserver.disconnect()
-  }, [viewMode])
+  }, [totalPages, viewMode])
 
   useEffect(() => {
     if (viewMode !== "strip") {
       stripModeInitializedRef.current = false
       return
     }
+    if (!sequence || totalPages <= 0 || !readerSessionIdentity
+      || progressRestoredIdentity !== readerSessionIdentity || !stripScrollRef.current) {
+      stripModeInitializedRef.current = false
+      return
+    }
     if (stripModeInitializedRef.current) return
-    stripModeInitializedRef.current = true
-    setStripWindow(getStripWindowForPage(currentPage))
+    const window = getStripWindowForPage(currentPage)
+    setStripWindow((previous) => previous.start === window.start && previous.end === window.end ? previous : window)
     const frame = requestAnimationFrame(() => {
       const container = stripScrollRef.current
       if (!container) return
+      // 初始入页与显式跳页一致：对齐页顶，让长图从上半段开始阅读。
       container.scrollTo({
-        top: getStripPageOffset(currentPage) - container.clientHeight / 2 + getStripPageHeight(currentPage) / 2,
+        top: getStripPageOffset(currentPage),
         behavior: "auto",
       })
+      stripModeInitializedRef.current = true
     })
     return () => cancelAnimationFrame(frame)
-  }, [currentPage, getStripPageHeight, getStripPageOffset, getStripWindowForPage, totalPages, viewMode])
+  }, [currentPage, getStripPageOffset, getStripWindowForPage, progressRestoredIdentity, readerSessionIdentity, sequence, totalPages, viewMode])
 
   if (!demoMode && (!sequence || manifestState.status !== "ready")) {
     return (
@@ -1168,6 +1334,11 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
       {/* 主阅读区域 */}
       <main
         className="relative flex h-[100dvh] w-full items-center justify-center pt-[calc(4rem+env(safe-area-inset-top))] pb-[calc(5rem+env(safe-area-inset-bottom))]"
+        onClickCapture={(event) => {
+          if (!suppressClickRef.current) return
+          event.preventDefault()
+          event.stopPropagation()
+        }}
         onClick={() => {
           if (suppressClickRef.current) return
           setShowTools(prev => !prev)
@@ -1175,6 +1346,7 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
         onTouchStart={handleTouchStart}
         onTouchMove={handleTouchMove}
         onTouchEnd={handleTouchEnd}
+        onTouchCancel={handleTouchCancel}
         style={{ touchAction: viewMode === "strip" ? "pan-y" : "none" }}
       >
         {/* 左右两侧交互翻页热区 */}
@@ -1219,6 +1391,9 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
               )}
               style={{ transform: `scale(${zoomScale})` }}
               resourcePool={renderResourcePool}
+              failedByProvider={failedPages.has(currentPage)}
+              recoverable={!hasPendingReopen}
+              onRecover={recover}
             />
           </div>
         )}
@@ -1244,6 +1419,9 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                       className="h-full w-auto max-w-[48%] rounded-r-md object-contain shadow-2xl"
                       style={{ transform: `scale(${zoomScale})` }}
                       resourcePool={renderResourcePool}
+                      failedByProvider={failedPages.has(spread[1])}
+                      recoverable={!hasPendingReopen}
+                      onRecover={recover}
                     />
                     <ComicPageView
                       page={getPage(spread[0])}
@@ -1254,6 +1432,9 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                       className="h-full w-auto max-w-[48%] rounded-l-md object-contain shadow-2xl"
                       style={{ transform: `scale(${zoomScale})` }}
                       resourcePool={renderResourcePool}
+                      failedByProvider={failedPages.has(spread[0])}
+                      recoverable={!hasPendingReopen}
+                      onRecover={recover}
                     />
                   </>
                 ) : (
@@ -1267,6 +1448,9 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                       className="h-full w-auto max-w-[48%] rounded-l-md object-contain shadow-2xl"
                       style={{ transform: `scale(${zoomScale})` }}
                       resourcePool={renderResourcePool}
+                      failedByProvider={failedPages.has(spread[0])}
+                      recoverable={!hasPendingReopen}
+                      onRecover={recover}
                     />
                     <ComicPageView
                       page={getPage(spread[1])}
@@ -1277,6 +1461,9 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                       className="h-full w-auto max-w-[48%] rounded-r-md object-contain shadow-2xl"
                       style={{ transform: `scale(${zoomScale})` }}
                       resourcePool={renderResourcePool}
+                      failedByProvider={failedPages.has(spread[1])}
+                      recoverable={!hasPendingReopen}
+                      onRecover={recover}
                     />
                   </>
                 )
@@ -1291,6 +1478,9 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                     className="h-full w-full rounded-md object-contain shadow-2xl"
                     style={{ transform: `scale(${zoomScale})` }}
                     resourcePool={renderResourcePool}
+                    failedByProvider={failedPages.has(spread[0])}
+                    recoverable={!hasPendingReopen}
+                    onRecover={recover}
                   />
                 )
               }
@@ -1330,6 +1520,9 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                     alt={`第 ${pageNum} 页`}
                     className="w-full h-auto object-contain block"
                     resourcePool={renderResourcePool}
+                    failedByProvider={failedPages.has(pageNum)}
+                    recoverable={!hasPendingReopen}
+                    onRecover={recover}
                     onLoad={(e) => {
                       handlePageLoad(pageNum, e, renderResourcePoolGeneration)
                       // React 的事件对象在异步 state updater 执行前可能已经释放 currentTarget。
@@ -1508,17 +1701,7 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                   key={pageNum}
                   type="button"
                   onClick={() => {
-                    setCurrentPage(pageNum)
-                    if (viewMode === "strip") {
-                      setStripWindow(getStripWindowForPage(pageNum))
-                      window.setTimeout(() => {
-                        const container = stripScrollRef.current
-                        if (container) container.scrollTo({
-                          top: getStripPageOffset(pageNum) - container.clientHeight / 2 + getStripPageHeight(pageNum) / 2,
-                          behavior: "smooth",
-                        })
-                      }, 0)
-                    }
+                    goToPage(pageNum)
                     setIsDrawerOpen(false)
                   }}
                   className={cn(
@@ -1536,6 +1719,9 @@ function ComicReaderExperience({ demoMode }: { demoMode: boolean }) {
                     alt={`Page ${pageNum}`}
                     className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
                     resourcePool={renderResourcePool}
+                    failedByProvider={failedPages.has(pageNum)}
+                    recoverable={!hasPendingReopen}
+                    onRecover={recover}
                   />
                   <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent p-[8px] pt-6">
                     <span className="text-[11px] font-bold text-white drop-shadow-md">

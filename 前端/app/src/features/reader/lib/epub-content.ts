@@ -294,19 +294,135 @@ function stripXmlUnsafeConstructs(xml: string): string {
   return xml.replace(/<!--(?:.|[\r\n])*?-->/g, "")
 }
 
-function parseAttributes(tag: string): Map<string, string> {
+/**
+ * One quote-aware tag scan shared by attribute parsing, title extraction,
+ * anchor annotation and plain-text conversion, mirroring the backend
+ * `reader_search.rs` rules: a tag ends at the first `>` outside `"`/`'`
+ * quotes, comments run to `-->` (or swallow the rest of the document), and a
+ * `<` that never closes is literal text. Attribute tokens are split on
+ * whitespace so `data-id="x"` is never read as `id` and text inside one
+ * quoted value is never read as another attribute.
+ */
+type MarkupToken =
+  | { kind: "text"; start: number; end: number }
+  | { kind: "comment"; start: number; end: number }
+  | { kind: "tag"; start: number; end: number; name: string; closing: boolean; attributes: Map<string, string> }
+
+const ATTRIBUTE_NAME = /[A-Za-z_:][\w:.-]*/y
+
+function attributeNameAt(tag: string, offset: number): string | null {
+  ATTRIBUTE_NAME.lastIndex = offset
+  const match = ATTRIBUTE_NAME.exec(tag)
+  return match ? match[0].toLowerCase() : null
+}
+
+/** Parse attributes from the end of the tag name; quoted `>` never terminates. */
+function parseTagAttributes(tag: string, cursor: number): Map<string, string> {
   const attributes = new Map<string, string>()
-  const pattern = /([A-Za-z_][\w:.-]*)\s*=\s*(["'])(.*?)\2/g
-  for (const match of tag.matchAll(pattern)) {
-    attributes.set(match[1].toLowerCase(), match[3])
+  const length = tag.length
+  while (cursor < length) {
+    const ch = tag[cursor]
+    if (/\s/.test(ch) || ch === "/") {
+      cursor += 1
+      continue
+    }
+    const name = attributeNameAt(tag, cursor)
+    if (!name) {
+      cursor += 1
+      continue
+    }
+    cursor += name.length
+    while (cursor < length && /\s/.test(tag[cursor])) cursor += 1
+    if (tag[cursor] !== "=") continue
+    cursor += 1
+    while (cursor < length && /\s/.test(tag[cursor])) cursor += 1
+    const quote = tag[cursor]
+    if (quote !== '"' && quote !== "'") {
+      let valueEnd = cursor
+      while (valueEnd < length && !/[\s>]/.test(tag[valueEnd])) valueEnd += 1
+      if (!attributes.has(name)) attributes.set(name, tag.slice(cursor, valueEnd))
+      cursor = valueEnd
+      continue
+    }
+    const valueEnd = tag.indexOf(quote, cursor + 1)
+    if (valueEnd < 0) break
+    if (!attributes.has(name)) attributes.set(name, tag.slice(cursor + 1, valueEnd))
+    cursor = valueEnd + 1
   }
   return attributes
 }
 
+function findTagEnd(html: string, cursor: number): number {
+  let quote = ""
+  while (cursor < html.length) {
+    const ch = html[cursor]
+    if (quote) {
+      if (ch === quote) quote = ""
+    } else if (ch === '"' || ch === "'") {
+      quote = ch
+    } else if (ch === ">") {
+      return cursor
+    }
+    cursor += 1
+  }
+  return -1
+}
+
+function* lexMarkup(html: string): Generator<MarkupToken> {
+  let cursor = 0
+  while (cursor < html.length) {
+    const tagStart = html.indexOf("<", cursor)
+    if (tagStart < 0) {
+      yield { kind: "text", start: cursor, end: html.length }
+      return
+    }
+    if (tagStart > cursor) yield { kind: "text", start: cursor, end: tagStart }
+    if (html.startsWith("<!--", tagStart)) {
+      const commentEnd = html.indexOf("-->", tagStart + 4)
+      if (commentEnd < 0) {
+        // A malformed comment has no end: discard the remainder rather than
+        // exposing active markup.
+        yield { kind: "comment", start: tagStart, end: html.length }
+        return
+      }
+      yield { kind: "comment", start: tagStart, end: commentEnd + 3 }
+      cursor = commentEnd + 3
+      continue
+    }
+    const tagEnd = findTagEnd(html, tagStart + 1)
+    if (tagEnd < 0) {
+      yield { kind: "text", start: tagStart, end: html.length }
+      return
+    }
+    const body = html.slice(tagStart + 1, tagEnd)
+    // A closing tag's leading `/` and any spaces before it belong to the
+    // marker, not the name; `< /p>` would otherwise yield an empty name and
+    // never close the skipped or title block.
+    let nameStart = 0
+    while (nameStart < body.length && /\s/.test(body[nameStart])) nameStart += 1
+    const closing = body[nameStart] === "/"
+    if (closing) nameStart += 1
+    let nameEnd = nameStart
+    while (nameEnd < body.length && !/[\s/]/.test(body[nameEnd])) nameEnd += 1
+    yield {
+      kind: "tag",
+      start: tagStart,
+      end: tagEnd + 1,
+      name: body.slice(nameStart, nameEnd).toLowerCase(),
+      closing,
+      attributes: parseTagAttributes(body, nameEnd),
+    }
+    cursor = tagEnd + 1
+  }
+}
+
 function findTags(xml: string, tagName: string): Map<string, string>[] {
-  const escaped = tagName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-  const pattern = new RegExp(`<(?:(?:[A-Za-z_][\\w.-]*):)?${escaped}\\b([^>]*)>`, "gi")
-  return [...xml.matchAll(pattern)].map((match) => parseAttributes(match[1]))
+  const tags: Map<string, string>[] = []
+  for (const token of lexMarkup(xml)) {
+    if (token.kind !== "tag" || token.closing) continue
+    if (token.name === tagName || token.name.endsWith(`:${tagName}`)) tags.push(token.attributes)
+  }
+  return tags
 }
 
 function xmlEntityText(value: string): string {
@@ -360,11 +476,18 @@ function resolveHref(directory: string, rawHref: string): string {
   return safeArchiveName(directory ? `${directory}/${decoded}` : decoded)
 }
 
+/** The first boundary-valid opening tag decides that tag name (backend parity). */
 function extractTagText(html: string, names: readonly string[]): string | null {
+  const tags = [...lexMarkup(html)].filter((token) => token.kind === "tag") as Extract<MarkupToken, { kind: "tag" }>[]
   for (const name of names) {
-    const match = new RegExp(`<${name}\\b[^>]*>([\\s\\S]*?)</${name}>`, "i").exec(html)
-    if (!match) continue
-    const value = htmlToPlainText(match[1])
+    const tagsByName = tags.filter((token) => token.name === name)
+    const openingIndex = tagsByName.findIndex((token) => !token.closing)
+    if (openingIndex < 0) continue
+    const opening = tagsByName[openingIndex]
+    const closing = tagsByName.slice(openingIndex + 1).find((token) => token.closing)
+    // An unterminated candidate leaves the scan looking for a later pair.
+    if (!closing) continue
+    const value = htmlToPlainText(html.slice(opening.end, closing.start))
     if (value) return value.split("\n", 1)[0].trim().slice(0, 160)
   }
   return null
@@ -384,18 +507,39 @@ function htmlEntityText(value: string): string {
     })
 }
 
+const ACTIVE_TAGS = new Set(["head", "script", "style", "iframe", "object", "embed", "svg", "math", "form", "textarea"])
+const BOUNDARY_TAGS = new Set(["p", "div", "section", "article", "header", "footer", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "pre", "tr", "td", "th"])
+
 /** Convert untrusted XHTML to plain text; scripts and active embeds never reach React. */
 export function htmlToPlainText(html: string): string {
-  const withoutDocumentMetadata = html.replace(/<head\b[^>]*>[\s\S]*?<\/head>/gi, "\n")
-  const withoutActiveContent = withoutDocumentMetadata
-    .replace(/<(?:script|style|iframe|object|embed|svg|math|form|textarea)\b[^>]*>[\s\S]*?<\/(?:script|style|iframe|object|embed|svg|math|form|textarea)>/gi, "\n")
-    .replace(/<(?:script|style|iframe|object|embed|svg|math|form|textarea)\b[^>]*\/?\s*>/gi, "\n")
-  const withBoundaries = withoutActiveContent
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<(?:p|div|section|article|header|footer|h[1-6]|li|blockquote|pre|tr|td|th)\b[^>]*>/gi, "\n")
-    .replace(/<\/(?:p|div|section|article|header|footer|h[1-6]|li|blockquote|pre|tr|td|th)>/gi, "\n")
-    .replace(/<[^>]*>/g, "")
-  return htmlEntityText(withBoundaries)
+  return convertMarkupToPlainText(html)
+}
+
+function convertMarkupToPlainText(html: string): string {
+  const chunks: string[] = []
+  let skippedTag = ""
+  for (const token of lexMarkup(html)) {
+    if (token.kind === "comment") continue
+    if (token.kind === "text") {
+      if (!skippedTag) chunks.push(html.slice(token.start, token.end))
+      continue
+    }
+    if (skippedTag) {
+      if (token.closing && token.name === skippedTag) skippedTag = ""
+      continue
+    }
+    const selfClosing = /\/\s*>$/.test(html.slice(token.start, token.end))
+    if (ACTIVE_TAGS.has(token.name)) {
+      if (!token.closing && !selfClosing) skippedTag = token.name
+      continue
+    }
+    if (token.name === "br") {
+      chunks.push("\n")
+      continue
+    }
+    if (BOUNDARY_TAGS.has(token.name)) chunks.push("\n")
+  }
+  return htmlEntityText(chunks.join(""))
     .replace(/\u00a0/g, " ")
     .replace(/[ \t]+/g, " ")
     .replace(/\n[ \t]+/g, "\n")
@@ -408,73 +552,113 @@ export function htmlToPlainText(html: string): string {
  * Gutenberg 导出常把「START OF THE PROJECT GUTENBERG EBOOK」头页整节、
  * 以及「*** END OF … ***」之后的许可与捐赠样板拼进正文文档。
  * 阅读流按标记裁剪；磁盘上的 EPUB 文件保持原样，不修改用户数据。
+ *
+ * 只有真实样板形态（`*** … ***`）的 START/END 标记才裁剪：正文里偶然提到的
+ * 书名或句子不会被当成标记。标记与正文同处一个文档时裁掉标记之前的头页并
+ * 保留其后的正文；裁剪后只有真正没有内容的文档才跳过，其余内容（包括无法
+ * 判定的许可文案）一律保留，不做关键词猜测。
+ *
+ * 后端 `reader_search.rs` 必须保持同一套标记与裁剪语义，否则同一章的段落
+ * 下标会与阅读器 DOM 漂移。
  */
-const PG_START_MARKER = /START OF THE PROJECT GUTENBERG EBOOK/i
+const PG_START_MARKER = /\*{3}\s*START OF (?:THE|THIS) PROJECT GUTENBERG EBOOK\b[^\r\n]{0,200}?\*{3}/i
 const PG_END_MARKER = /\*{3}\s*END OF THE PROJECT GUTENBERG EBOOK/i
 
-function trimGutenbergBoilerplate(html: string): string | null {
-  if (PG_START_MARKER.test(html)) return null
-  const endMatch = PG_END_MARKER.exec(html)
-  return endMatch ? html.slice(0, endMatch.index) : html
+/**
+ * Markers are often wrapped in an HTML comment. Cropping through the marker
+ * alone would leave an unterminated comment (or a stray `-->`) in the body, so
+ * resolve the enclosing comment bounds before slicing.
+ */
+function enclosingCommentStart(html: string, index: number): number {
+  const commentStart = html.lastIndexOf("<!--", index)
+  if (commentStart < 0) return -1
+  if (html.lastIndexOf("-->", index) > commentStart) return -1
+  return commentStart
 }
 
-function buildAnchorMap(html: string, text: string, paragraphs: readonly string[]): Readonly<Record<string, number>> {
-  const result: Record<string, number> = {}
-  const paragraphStarts: number[] = []
+function enclosingCommentEnd(html: string, index: number): number {
+  if (enclosingCommentStart(html, index) < 0) return -1
+  const commentEnd = html.indexOf("-->", index)
+  return commentEnd < 0 ? -1 : commentEnd + 3
+}
+
+function trimGutenbergBoilerplate(html: string): string | null {
+  let body = html
+  const startMatch = PG_START_MARKER.exec(body)
+  if (startMatch) {
+    const markerEnd = startMatch.index + startMatch[0].length
+    const commentEnd = enclosingCommentEnd(body, startMatch.index)
+    body = body.slice(commentEnd > markerEnd ? commentEnd : markerEnd)
+  }
+  const endMatch = PG_END_MARKER.exec(body)
+  if (endMatch) {
+    const commentStart = enclosingCommentStart(body, endMatch.index)
+    body = body.slice(0, commentStart >= 0 ? commentStart : endMatch.index)
+  }
+  // Cropping is the only reason to drop a document: what survives is kept
+  // verbatim, including licence prose this parser cannot classify.
+  return htmlToPlainText(body) ? body : null
+}
+
+/** Project inert anchor markers through the same whole-document text conversion. */
+function buildAnchorMap(html: string, paragraphs: readonly string[], titleRemoved: boolean): Readonly<Record<string, number>> {
+  const result: Record<string, number> = Object.create(null) as Record<string, number>
+  if (paragraphs.length === 0) return result
+  let markerPrefix = "\uE000HAVEN"
+  while (html.includes(markerPrefix)) markerPrefix += "\uE000"
+  const anchors: string[] = []
+  const annotated: string[] = []
   let cursor = 0
-  for (const paragraph of paragraphs) {
-    const start = text.indexOf(paragraph, cursor)
-    if (start < 0) {
-      paragraphStarts.push(cursor)
-      cursor += paragraph.length + 2
-    } else {
-      paragraphStarts.push(start)
-      cursor = start + paragraph.length + 2
+  for (const token of lexMarkup(html)) {
+    if (token.kind === "text" || token.kind === "comment") continue
+    annotated.push(html.slice(cursor, token.end))
+    cursor = token.end
+    // Attribute tokens come from the shared lexer, so `data-id` is not `id`
+    // and text inside an unrelated quoted value is never an anchor.
+    if (token.closing || ACTIVE_TAGS.has(token.name)) continue
+    for (const name of ["id", "name"]) {
+      const raw = token.attributes.get(name)
+      if (raw === undefined) continue
+      const anchor = htmlEntityText(raw).trim()
+      if (!anchor || anchor.length > 512
+        || [...anchor].some((ch) => ch.codePointAt(0)! < 0x20 || /[\\/?#<>"']/.test(ch))) continue
+      annotated.push(`${markerPrefix}${anchors.length}\uE001`)
+      anchors.push(anchor)
     }
   }
-
-  const tagPattern = /<[^>]+>/g
-  for (const tagMatch of html.matchAll(tagPattern)) {
-    const tag = tagMatch[0]
-    const tagName = /^<\s*([A-Za-z][\w:.-]*)/.exec(tag)?.[1]?.toLowerCase()
-    if (!tagName || /^(?:script|style|svg|math|iframe|object|embed|form|textarea)$/.test(tagName)) continue
-    const attributePattern = /\b(?:id|name)\s*=\s*(["'])(.*?)\1/gi
-    for (const attributeMatch of tag.matchAll(attributePattern)) {
-      let anchor: string
-      try {
-        anchor = htmlEntityText(attributeMatch[2]).trim()
-      } catch {
-        continue
-      }
-      if (
-        !anchor
-        || anchor.length > 512
-        || [...anchor].some((character) => character.codePointAt(0)! < 0x20 || /[\\/?#<>"']/.test(character))
-        || result[anchor] !== undefined
-      ) continue
-      const prefix = htmlToPlainText(html.slice(0, (tagMatch.index ?? 0)))
-      let paragraphIndex = 0
-      for (let index = 0; index < paragraphStarts.length; index += 1) {
-        if (paragraphStarts[index] <= prefix.length) paragraphIndex = index
-      }
-      result[anchor] = paragraphIndex
+  annotated.push(html.slice(cursor))
+  const markerPattern = new RegExp(`${markerPrefix}(\\d+)\uE001`, "g")
+  let paragraphIndex = 0
+  for (const chunk of htmlToPlainText(annotated.join("")).split(/\n{2,}/)) {
+    const indexes = [...chunk.matchAll(markerPattern)].map((match) => Number(match[1]))
+    const content = chunk.replace(markerPattern, "").replace(/\s*\n\s*/g, " ").trim()
+    const target = Math.max(0, Math.min(paragraphs.length - 1, paragraphIndex - Number(titleRemoved)))
+    for (const index of indexes) {
+      const anchor = anchors[index]
+      if (!Object.prototype.hasOwnProperty.call(result, anchor)) result[anchor] = target
     }
+    // A container's marker can occupy an empty chunk before its first child.
+    // It points forward but must never count as a rendered paragraph itself.
+    if (content) paragraphIndex += 1
   }
   return result
 }
 
-function chapterFromXhtml(index: number, item: PublicationManifestItem, html: string, sourceHref: string): BookChapter | null {
+function chapterFromXhtml(index: number, spineCount: number, item: PublicationManifestItem, html: string, sourceHref: string): BookChapter | null {
   const trimmedHtml = trimGutenbergBoilerplate(html)
   if (!trimmedHtml) return null
   const text = htmlToPlainText(trimmedHtml)
   if (!text) return null
-  const title = extractTagText(html, ["h1", "h2", "h3", "title"])
+  // The title must come from the surviving content, otherwise a cropped header
+  // page would name a chapter whose text now starts at the real story.
+  const title = extractTagText(trimmedHtml, ["h1", "h2", "h3", "title"])
     ?? `第 ${index + 1} 章`
   const paragraphs = text
     .split(/\n{2,}/)
     .map((paragraph) => paragraph.replace(/\s*\n\s*/g, " ").trim())
     .filter(Boolean)
-  if (paragraphs[0] === title) paragraphs.shift()
+  const titleRemoved = paragraphs[0] === title
+  if (titleRemoved) paragraphs.shift()
   if (paragraphs.length === 0) return null
   return {
     id: `epub-chapter-${index + 1}`,
@@ -482,7 +666,9 @@ function chapterFromXhtml(index: number, item: PublicationManifestItem, html: st
     title: title || item.id,
     paragraphs,
     sourceHref,
-    anchorMap: buildAnchorMap(trimmedHtml, text, paragraphs),
+    spineIndex: index,
+    spineCount,
+    anchorMap: buildAnchorMap(trimmedHtml, paragraphs, titleRemoved),
   }
 }
 
@@ -544,11 +730,13 @@ export async function parseEpubBook(bytes: ArrayBuffer, signal?: AbortSignal): P
       throw unsupported("EPUB spine 包含不支持的文档")
     }
     const path = resolveHref(opfDirectory, item.href)
+    // A spine document that cannot be read fails the whole book: silently
+    // dropping it would hide content and shift what the reader shows.
     const chapterBytes = await readEntry(bytes, entries, path, signal)
     totalTextBytes += chapterBytes.byteLength
     if (totalTextBytes > MAX_EPUB_TEXT_BYTES) throw denied("EPUB 正文总大小超过安全限制")
     const chapterHtml = decodeUtf8(chapterBytes)
-    const chapter = chapterFromXhtml(index, item, chapterHtml, path)
+    const chapter = chapterFromXhtml(index, spineAttributes.length, item, chapterHtml, path)
     if (chapter) chapters.push(chapter)
   }
   const title = extractTagText(opfXml, ["dc:title", "title"])

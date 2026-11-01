@@ -137,6 +137,14 @@ function normal(): PeriodicalTreeDto {
   }
 }
 
+it("accepts an ordinary Basic article title without treating it as an authentication header", () => {
+  const tree = normal()
+  tree.volumes[0].issues[0].articles[0].title = "Basic life support"
+  expect(isPeriodicalTreeDto(tree)).toBe(true)
+  tree.volumes[0].issues[0].articles[0].title = "https://example.invalid/secret"
+  expect(isPeriodicalTreeDto(tree)).toBe(false)
+})
+
 type Json = Record<string, unknown>
 
 function clone(): Json {

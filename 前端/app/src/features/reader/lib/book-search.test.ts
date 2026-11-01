@@ -35,7 +35,7 @@ describe("normalizeWithMap", () => {
   it("preserves offset mapping", () => {
     const { norm, map } = normalizeWithMap("a  b")
     expect(norm).toBe("a b")
-    expect(map).toEqual([0, -1, 3])
+    expect(map).toEqual([0, 1, 3])
   })
 
   it("handles full-width", () => {

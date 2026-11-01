@@ -33,10 +33,13 @@ import { canConsumeEdition, getEditionListState, type EditionListState } from ".
 import { primaryActionRoute } from "../lib/primary-action-route"
 import type { ComicWorkChapterCatalogDto, PrimaryActionDto } from "@/lib/ipc/generated/wire"
 import {
-  createDownloadForMediaItem,
   deleteOfflineDownload,
+  deleteOfflineResource,
   getMediaItemDownloadInfo,
+  presentMediaItemDownloadAction,
   revealOfflineDownload,
+  revealOfflineResource,
+  startDownloadFromProjection,
   subscribeDownloadEvents,
   type MediaItemDownloadInfo,
   type DownloadStatus,
@@ -879,9 +882,13 @@ function MediaDetailExperience({ production }: { production: boolean }) {
   const editionOpenRequestRef = useRef(0)
   const [editionOpeningId, setEditionOpeningId] = useState<string | null>(null)
   const [isDownloadSaving, setIsDownloadSaving] = useState(false)
+  const downloadActionInFlightRef = useRef<number | null>(null)
   const favoriteRequestRef = useRef(0)
   const [downloadStatus, setDownloadStatus] = useState<DownloadStatus>("idle")
   const [downloadTaskId, setDownloadTaskId] = useState<string | null>(null)
+  // The Offline Resource outlives the task record: reveal/delete must remain
+  // available after the user removes the completed row from Downloads.
+  const [offlineResourceId, setOfflineResourceId] = useState<string | null>(null)
   const [hasOfflineResource, setHasOfflineResource] = useState(false)
   const [moreActionPending, setMoreActionPending] = useState<"folder" | "reset" | "delete" | null>(null)
   const mediaActionGenerationRef = useRef(0)
@@ -903,8 +910,9 @@ function MediaDetailExperience({ production }: { production: boolean }) {
     setDownloadStatus(info.status)
     downloadTaskIdRef.current = info.taskId
     setDownloadTaskId(info.taskId)
+    setOfflineResourceId(info.offlineResourceId)
     setHasOfflineResource(info.hasOfflineResource)
-    setDownloadCapability(info.canDownload || info.hasOfflineResource || info.status === "queued" ? "available" : "unavailable")
+    setDownloadCapability(info.canDownload || info.hasOfflineResource || info.status === "queued" || info.status === "paused" || info.status === "interrupted" ? "available" : "unavailable")
     setOnlineReadCapability(info.canOnlineRead ? "available" : "unavailable")
     setDownloadRefreshError(false)
   }, [])
@@ -913,6 +921,7 @@ function MediaDetailExperience({ production }: { production: boolean }) {
     setDownloadStatus("idle")
     downloadTaskIdRef.current = null
     setDownloadTaskId(null)
+    setOfflineResourceId(null)
     setHasOfflineResource(false)
     setDownloadCapability("loading")
     setOnlineReadCapability("loading")
@@ -930,6 +939,7 @@ function MediaDetailExperience({ production }: { production: boolean }) {
       setDownloadStatus("idle")
       downloadTaskIdRef.current = null
       setDownloadTaskId(null)
+      setOfflineResourceId(null)
       setHasOfflineResource(false)
       setDownloadCapability("error")
       setOnlineReadCapability("error")
@@ -986,11 +996,13 @@ function MediaDetailExperience({ production }: { production: boolean }) {
     setEditionOpeningId(null)
     setIsFavoriteSaving(false)
     setIsDownloadSaving(false)
+    downloadActionInFlightRef.current = null
     setMoreActionPending(null)
     setToastMessage(null)
     setDownloadStatus("idle")
     downloadTaskIdRef.current = null
     setDownloadTaskId(null)
+    setOfflineResourceId(null)
     setHasOfflineResource(false)
     setDownloadCapability(production ? "loading" : "unavailable")
     setOnlineReadCapability(production ? "loading" : "available")
@@ -1087,11 +1099,29 @@ function MediaDetailExperience({ production }: { production: boolean }) {
       setTimeout(() => setToastMessage(null), 2500)
       return
     }
-    setIsDownloadSaving(true)
     const requestGeneration = mediaActionGenerationRef.current
+    if (downloadActionInFlightRef.current === requestGeneration) return
+    downloadActionInFlightRef.current = requestGeneration
+    setIsDownloadSaving(true)
     const isCurrent = () => mediaActionGenerationRef.current === requestGeneration
     try {
-      const task = await createDownloadForMediaItem(downloadableMediaItemId)
+      // Re-read the projection at click time: a Paused / Interrupted task is
+      // resumed / retried on its own id; only an idle item creates a task.
+      const current = await getMediaItemDownloadInfo(downloadableMediaItemId)
+      if (!isCurrent()) return
+      applyDownloadInfo(current)
+      if (current.status === "queued") {
+        setToastMessage("已加入下载列表")
+        setTimeout(() => setToastMessage(null), 2500)
+        return
+      }
+      if (current.status === "downloaded") {
+        setToastMessage("该作品已有离线内容")
+        setTimeout(() => setToastMessage(null), 2500)
+        return
+      }
+      const resuming = current.status === "paused" || current.status === "interrupted"
+      const task = await startDownloadFromProjection(current, downloadableMediaItemId)
       if (!isCurrent()) return
       if (task.state === "completed") {
         const refreshed = await refreshDownloadInfo(downloadableMediaItemId, requestGeneration)
@@ -1103,17 +1133,19 @@ function MediaDetailExperience({ production }: { production: boolean }) {
         // fast local task may emit a terminal event in this same turn.
         downloadTaskIdRef.current = task.taskId
         setDownloadTaskId(task.taskId)
+        setOfflineResourceId(null)
         setHasOfflineResource(false)
         // The command response and its progress event have no ordering
         // guarantee. Re-read the authoritative resource/task projection so a
         // completion emitted before the component observes taskId is not lost.
         void refreshDownloadInfo(downloadableMediaItemId, requestGeneration)
-        setToastMessage("已加入下载列表")
+        setToastMessage(resuming ? "已继续下载" : "已加入下载列表")
       }
     } catch (error) {
-      if (isCurrent()) setToastMessage(error instanceof HavenError ? error.dto.userMessage : "创建下载任务失败")
+      if (isCurrent()) setToastMessage(error instanceof HavenError ? error.dto.userMessage : "下载操作失败，请重试")
     } finally {
       if (isCurrent()) {
+        downloadActionInFlightRef.current = null
         setIsDownloadSaving(false)
         setTimeout(() => {
           if (isCurrent()) setToastMessage(null)
@@ -1143,13 +1175,22 @@ function MediaDetailExperience({ production }: { production: boolean }) {
         setToastMessage("已重置进度")
         return
       }
-      if (!downloadTaskId || !hasOfflineResource) throw new Error(action === "folder" ? "当前作品没有可定位的离线文件" : "当前作品没有可删除的离线内容")
+      // The task row may have been removed from Downloads while the Offline
+      // Resource remains. Prefer the task handle when present; otherwise fall
+      // back to the Resource identity, which the backend validates on its own.
+      const taskId = downloadTaskId
+      const resourceId = offlineResourceId
+      if (!hasOfflineResource || (!taskId && !resourceId)) {
+        throw new Error(action === "folder" ? "当前作品没有可定位的离线文件" : "当前作品没有可删除的离线内容")
+      }
       if (action === "folder") {
-        await revealOfflineDownload(downloadTaskId)
+        if (taskId) await revealOfflineDownload(taskId)
+        else if (resourceId) await revealOfflineResource(resourceId)
         if (!isCurrent()) return
         setToastMessage("已打开离线文件夹")
       } else {
-        await deleteOfflineDownload(downloadTaskId)
+        if (taskId) await deleteOfflineDownload(taskId)
+        else if (resourceId) await deleteOfflineResource(resourceId)
         if (!isCurrent()) return
         invalidateOfflineDownload()
         const refreshed = await refreshDownloadInfo(downloadableMediaItemId, requestGeneration)
@@ -1299,6 +1340,9 @@ function MediaDetailExperience({ production }: { production: boolean }) {
       ? getConsumeRoute(media.type, media.id)
       : null
   const canConsume = canConsumeDetail(production, detailState) && canConsumeEdition(production, editionState, primaryActionTarget !== null)
+  // Paused / Interrupted tasks stay visually recoverable and actionable; the
+  // label says resume / retry instead of pretending to be downloading.
+  const downloadAction = presentMediaItemDownloadAction(downloadStatus)
   const heroImageUrl = media.backdropUrl || media.posterUrl
 
   // Download state is a projection of server resources/tasks. It is deliberately
@@ -1309,6 +1353,7 @@ function MediaDetailExperience({ production }: { production: boolean }) {
       setDownloadStatus("idle")
       downloadTaskIdRef.current = null
       setDownloadTaskId(null)
+      setOfflineResourceId(null)
       setHasOfflineResource(false)
       setDownloadCapability("unavailable")
       setOnlineReadCapability(production && detailState === "data" ? "unavailable" : production ? "loading" : "available")
@@ -1356,11 +1401,18 @@ function MediaDetailExperience({ production }: { production: boolean }) {
     }
     void subscribeDownloadEvents((event) => {
       if (!mounted || mediaActionGenerationRef.current !== generation) return
-      if (event.data.taskId !== downloadTaskIdRef.current) return
+      const state = event.data.state
+      if (event.data.taskId !== downloadTaskIdRef.current
+        && state !== "completed" && state !== "failed" && state !== "cancelled" && state !== "interrupted") return
+      // 终态事件可能早于本页读到任务身份（首次快照/创建后的首次投影还没落地）。
+      // 认不出身份时不丢弃：让这一页的可见 MediaItem 做一次失效重读，事实仍以
+      // 重读到的投影为准；在途重读只会被标记为脏并尾随一次，不会逐事件重读。
       refreshForDownloadEvent()
     }).then((dispose) => {
       if (!mounted) void dispose().catch(() => undefined)
       else cleanup = dispose
+      // 订阅就绪后回读一次，关闭「首次快照之后、监听建立之前」已结束任务的窗口。
+      if (mounted && mediaActionGenerationRef.current === generation) refreshForDownloadEvent()
     }).catch(() => undefined)
     return () => { mounted = false; if (cleanup) void cleanup().catch(() => undefined) }
   }, [detailState, downloadableMediaItemId, production, refreshDownloadInfo])
@@ -1630,20 +1682,14 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                   <button
                     onClick={handleDownloadAction}
                     disabled={isDownloadSaving || downloadCapability !== "available" || !production}
-                    title={downloadStatus === "downloaded"
-                      ? "已下载"
-                      : downloadStatus === "queued"
-                        ? "已加入下载列表"
-                        : !production
-                          ? "下载功能仅在桌面应用中可用"
-                          : downloadCapability === "loading"
-                            ? "正在读取下载能力"
-                            : downloadCapability === "error"
-                              ? "下载能力读取失败"
-                              : downloadCapability === "unavailable"
-                                ? "当前内容没有可下载资源"
-                                : "下载至本地"}
-                    aria-label={downloadStatus === "downloaded" ? "已下载" : "下载至本地"}
+                    title={downloadAction.kind === "download" && downloadCapability !== "available" && production
+                      ? downloadCapability === "loading"
+                        ? "正在读取下载能力"
+                        : downloadCapability === "error"
+                          ? "下载能力读取失败"
+                          : "当前内容没有可下载资源"
+                      : downloadAction.hint ?? (!production ? "下载功能仅在桌面应用中可用" : downloadAction.label)}
+                    aria-label={downloadAction.kind === "download" && !production ? "下载至本地" : downloadAction.label}
                     className={cn(
                       "w-14 h-14 rounded-full flex items-center justify-center transition-all duration-300 cursor-pointer shrink-0",
                       "bg-black/5 dark:bg-white/10 hover:bg-black/10 dark:hover:bg-white/20 hover:scale-105 active:scale-95",
@@ -1652,7 +1698,9 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                         ? "text-[#007aff] bg-[#007aff]/10 dark:bg-[#007aff]/20"
                         : downloadStatus === "downloaded"
                           ? "text-emerald-500 bg-emerald-500/10 dark:bg-emerald-500/20"
-                          : "text-foreground"
+                          : downloadStatus === "paused" || downloadStatus === "interrupted"
+                            ? "text-amber-500 bg-amber-500/10 dark:bg-amber-500/20"
+                            : "text-foreground"
                     )}
                   >
                     <Download className="w-6 h-6" />
@@ -1684,8 +1732,8 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                           "bg-white/90 dark:bg-zinc-900/90 backdrop-blur-2xl border border-black/10 dark:border-white/15",
                           "flex flex-col gap-1.5 animate-in fade-in zoom-in-95 duration-150"
                         )}>
-                          <button 
-                            disabled={moreActionPending !== null || !hasOfflineResource || !downloadTaskId}
+                          <button
+                            disabled={moreActionPending !== null || !hasOfflineResource || (!downloadTaskId && !offlineResourceId)}
                             onClick={() => void handleMoreAction("folder")}
                             className="flex items-center gap-3.5 px-[16px] py-3 rounded-xl text-base font-medium text-foreground hover:bg-black/5 dark:hover:bg-white/10 transition-colors text-left whitespace-nowrap disabled:opacity-40"
                           >
@@ -1701,8 +1749,8 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                             重置进度
                           </button>
                           <div className="h-px bg-black/5 dark:bg-white/10 my-1.5" />
-                          <button 
-                            disabled={moreActionPending !== null || !hasOfflineResource || !downloadTaskId}
+                          <button
+                            disabled={moreActionPending !== null || !hasOfflineResource || (!downloadTaskId && !offlineResourceId)}
                             onClick={() => void handleMoreAction("delete")}
                             className="flex items-center gap-3.5 px-[16px] py-3 rounded-xl text-base font-medium text-destructive hover:bg-destructive/10 transition-colors text-left whitespace-nowrap disabled:opacity-40"
                           >
@@ -1721,6 +1769,8 @@ function MediaDetailExperience({ production }: { production: boolean }) {
                     {media.progressText && <span>上次定位：{media.progressText}</span>}
                     {downloadStatus === "queued" && <span className="text-[#007aff]">· 已加入下载列表</span>}
                     {downloadStatus === "downloaded" && <span className="text-emerald-500">· 已下载</span>}
+                    {downloadStatus === "paused" && <span className="text-amber-500">· {downloadAction.hint}</span>}
+                    {downloadStatus === "interrupted" && <span className="text-amber-500">· {downloadAction.hint}</span>}
                     {downloadStatus === "idle" && downloadCapability === "loading" && <span>· 正在读取下载能力</span>}
                     {downloadStatus === "idle" && downloadCapability === "unavailable" && <span>· 暂无可下载资源</span>}
                     {downloadStatus === "idle" && downloadCapability === "error" && <span>· 下载能力读取失败</span>}

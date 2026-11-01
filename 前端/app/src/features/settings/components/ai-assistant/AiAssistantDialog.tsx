@@ -29,8 +29,12 @@ import { MockHavenClient } from "@/lib/ipc/mock-client"
 import type {
   AiSettingsRecommendationGenerateRequest,
   PreferenceReadingPatchDto,
+  AgentSettingsProposalApproveResultDto,
+  AgentSettingsProposalGetResultDto,
 } from "@/lib/ipc/generated/wire"
+import type { SettingsSectionWire } from "@/lib/ipc/settings-wire"
 import { guardAiSettingsRecommendation } from "@/lib/ipc/ai-recommendation-wire"
+import { useAiProposalHistory } from "../../lib/useAiProposalHistory"
 import "./ai-assistant.css"
 
 /**
@@ -112,6 +116,7 @@ export type AiAssistantAgentClient = {
   agentSettingsProposalCreate: HavenClientShape["agentSettingsProposalCreate"]
   agentSettingsProposalApprove: HavenClientShape["agentSettingsProposalApprove"]
   agentSettingsProposalReject: HavenClientShape["agentSettingsProposalReject"]
+  agentSettingsProposalList?: HavenClientShape["agentSettingsProposalList"]
   aiSettingsRecommendationGenerate?: HavenClientShape["aiSettingsRecommendationGenerate"]
 }
 type HavenClientShape = import("@/lib/ipc/client").HavenClient
@@ -140,6 +145,11 @@ export interface AiAssistantDialogProps {
   profileId?: string | null
   /** Profile initialization is owned by the settings controller. */
   providerLoading?: boolean
+  /**
+   * 一次**成功写入**后通知外层失效：只回传受影响的分区名（来自提案 / 回执契约），
+   * 不回传回执里的 before/after 值。外层必须据此回源读取 authoritative 快照。
+   */
+  onSettingsApplied?: (sections: readonly SettingsSectionWire[]) => void
   /**
    * 纯预览模式：不获取任何客户端，批准只产生「本地预览」回执。
    * 保留它是为了让"尚未接线"这条路径可被测试钉住。
@@ -254,6 +264,7 @@ interface AiAssistantTraceStep {
 
 type AiAssistantAction =
   | { type: "reset" }
+  | { type: "history-loaded"; items: AgentSettingsProposalGetResultDto[]; mock: boolean; append: boolean }
   | { type: "submit"; prompt: string }
   | { type: "answer"; prompt: string; text: string }
   | { type: "advance-trace" }
@@ -342,6 +353,40 @@ function classifyProposalFailure(error: unknown): AiAssistantBlockedKind {
     default:
       return "failed"
   }
+}
+
+const SETTINGS_SECTION_VALUES: readonly SettingsSectionWire[] = [
+  "general",
+  "appearance",
+  "playback",
+  "reading",
+  "comic",
+  "downloads",
+  "privacy",
+]
+
+function isSettingsSectionWire(value: string): value is SettingsSectionWire {
+  return (SETTINGS_SECTION_VALUES as readonly string[]).includes(value)
+}
+
+/**
+ * 成功应用后需要回源的分区。
+ *
+ * 只从提案的 `subject.section` 与回执 `changes[].key` 的分区前缀推导；回执里的
+ * `before` / `after` 是审计展示用的历史值，绝不能当成"当前已保存值"写回表单。
+ */
+function appliedSettingsSections(result: AgentSettingsProposalApproveResultDto): SettingsSectionWire[] {
+  const sections = new Set<SettingsSectionWire>()
+  const subjectSection = result.proposal.subject.section
+  if (isSettingsSectionWire(subjectSection)) {
+    sections.add(subjectSection)
+  }
+  for (const change of result.receipt.changes) {
+    const separator = change.key.indexOf(".")
+    const prefix = separator === -1 ? change.key : change.key.slice(0, separator)
+    if (isSettingsSectionWire(prefix)) sections.add(prefix)
+  }
+  return [...sections]
 }
 
 /** 设置项档位值 → 中文文案（未知值原样展示，不隐藏上游改动）。 */
@@ -600,7 +645,7 @@ const QUICK_ACTIONS: Array<{ id: string; label: string; prompt: string }> = [
   { id: "capability", label: "当前能改什么", prompt: "当前能改什么设置" },
 ]
 
-/** 本阶段只接入「阅读排版」一个确定性意图；其余输入只给出能力说明，不生成提案。 */
+/** 仅用于固定模板预览；真实 Provider 接收用户原话，由后端的阅读 patch 契约限制能力。 */
 const READING_INTENT_KEYWORDS = ["阅读", "排版", "字体", "字号", "行高", "正文宽度", "优化"]
 
 export function wantsReadingProposal(prompt: string): boolean {
@@ -671,14 +716,64 @@ function patchProposal(
   return proposals.map((proposal) => (proposal.id === proposalId ? { ...proposal, ...patch } : proposal))
 }
 
-/** 按 id 取出仍待批准的记录：只有 pending 的卡片才允许被批准/拒绝。 */
+/** 批准只接受基线仍可用的 pending 卡片。 */
 function pendingProposalOf(state: AiAssistantState, proposalId: string): AiAssistantProposalRecord | null {
   const record = state.proposals.find((proposal) => proposal.id === proposalId) ?? null
   return record && record.status === "pending" ? record : null
 }
 
+/** 基线冲突只阻止应用；服务端仍允许通过原 digest 拒绝待处理提案。 */
+function canRejectProposal(record: AiAssistantProposalRecord): boolean {
+  return record.status === "pending" || record.status === "conflict"
+}
+
+function rejectableProposalOf(state: AiAssistantState, proposalId: string): AiAssistantProposalRecord | null {
+  const record = state.proposals.find((proposal) => proposal.id === proposalId) ?? null
+  return record && canRejectProposal(record) ? record : null
+}
+
 function reducer(state: AiAssistantState, action: AiAssistantAction): AiAssistantState {
   switch (action.type) {
+    case "history-loaded": {
+      const recovered = action.items.map(({ proposal, receipt }): AiAssistantProposalRecord => {
+        const existing = state.proposals.find((item) => item.id === proposal.proposalId)
+        return {
+          id: proposal.proposalId,
+          title: existing?.title ?? "阅读设置提案",
+          summary: proposal.baselineStale
+            ? "阅读设置已变化，原提案基线已失效；旧记录未保留改前快照，请重新生成提案。"
+            : existing?.summary ?? "已从本机记录恢复，请核对改动后决定是否批准。",
+          target: "global",
+          targetLabel: proposal.targetLabel,
+          expectedRevision: proposal.baseRevision,
+          digest: proposal.digest,
+          modelId: existing?.modelId ?? null,
+          changes: proposal.changes.map((change) => ({ key: change.key, label: settingKeyLabel(change.key), from: settingValueLabel(change.before), to: settingValueLabel(change.after) })),
+          status: proposal.status === "pending"
+            ? Date.parse(proposal.expiresAt) <= Date.now() ? "expired" : proposal.baselineStale ? "conflict" : "pending"
+            : proposal.status,
+          receipt: receipt ? {
+            revision: receipt.appliedRevision ?? "unchanged", appliedAt: receipt.appliedAt,
+            changedCount: receipt.changes.length, preview: action.mock, receiptId: receipt.receiptId, digest: receipt.proposalDigest,
+          } : null,
+          digestPreview: false,
+          mock: action.mock,
+          template: existing?.template ?? false,
+          notice: null,
+        }
+      })
+      const recoveredIds = new Set(recovered.map((item) => item.id))
+      const retained = state.proposals.filter((item) => !recoveredIds.has(item.id))
+      const latest = recovered.find((item) => item.id === state.latestProposalId)
+      const settled = latest && (latest.status === "applied" || latest.status === "rejected" || latest.status === "expired") ? latest.status : null
+      return {
+        ...state,
+        status: settled ?? state.status,
+        errorMessage: settled ? null : state.errorMessage,
+        failedStage: settled ? null : state.failedStage,
+        proposals: action.append ? [...retained, ...recovered] : [...recovered, ...retained],
+      }
+    }
     case "reset":
       // 新会话只清空当前对话内容；提案记录和最近一条成功执行轨迹仍可从历史中查看。
       // turn 保持单调递增，避免新会话复用上一轮请求的归属编号。
@@ -765,7 +860,7 @@ function reducer(state: AiAssistantState, action: AiAssistantAction): AiAssistan
       }
     }
     case "reject": {
-      if (!pendingProposalOf(state, action.proposalId)) return state
+      if (!rejectableProposalOf(state, action.proposalId)) return state
       // 只有作用于**最新**提案时才推进本轮状态与轨迹；处理旧卡片不得串改最新轨迹。
       const isLatest = state.latestProposalId === action.proposalId
       return {
@@ -784,8 +879,8 @@ function reducer(state: AiAssistantState, action: AiAssistantAction): AiAssistan
     }
     case "reject-failed": {
       // 拒绝失败**不改变提案状态**：服务端提案仍然是 pending，本轮也没有进入终态，
-      // 因此卡片保持可重试（批准/拒绝按钮继续可用），文案只承诺零写入。
-      if (!pendingProposalOf(state, action.proposalId)) return state
+      // 因此保留拒绝重试；基线冲突卡片仍不允许批准，文案只承诺零写入。
+      if (!rejectableProposalOf(state, action.proposalId)) return state
       return {
         ...state,
         proposals: patchProposal(state.proposals, action.proposalId, {
@@ -793,7 +888,7 @@ function reducer(state: AiAssistantState, action: AiAssistantAction): AiAssistan
             tone: "warning",
             title: "拒绝失败",
             message: action.message,
-            detail: "本次没有写入任何设置，提案仍待批准，可以重试。",
+            detail: "本次没有写入任何设置，提案仍待处理，可以重试拒绝。",
           },
         }),
       }
@@ -819,7 +914,7 @@ function reducer(state: AiAssistantState, action: AiAssistantAction): AiAssistan
       }
     }
     case "apply-blocked": {
-      if (!pendingProposalOf(state, action.proposalId)) return state
+      if (!rejectableProposalOf(state, action.proposalId)) return state
       const isLatest = state.latestProposalId === action.proposalId
       return {
         ...state,
@@ -1100,6 +1195,7 @@ export function AiAssistantDialog({
   client,
   profileId = null,
   providerLoading = false,
+  onSettingsApplied,
   previewOnly = false,
   traceStepMs = 420,
 }: AiAssistantDialogProps) {
@@ -1113,7 +1209,12 @@ export function AiAssistantDialog({
   const titleId = useId()
   const inputId = useId()
   const panelRef = useRef<HTMLDivElement>(null)
-  const lastPromptRef = useRef("")
+  const submittedRequestRef = useRef<{
+    client: AiAssistantAgentClient | null
+    profileId: string | null
+    userIntent: string
+    mock: boolean
+  }>({ client: null, profileId: null, userIntent: "", mock: false })
   const tabButtonRefs = useRef<Partial<Record<AiAssistantView, HTMLButtonElement | null>>>({})
 
   // 客户端只解析一次：Tauri → 真实 IPC；浏览器 dev / 显式注入 → Mock。
@@ -1129,6 +1230,10 @@ export function AiAssistantDialog({
   }, [client, previewOnly])
 
   const mockMode = resolvedClient instanceof MockHavenClient
+  const restoreHistory = useCallback((items: AgentSettingsProposalGetResultDto[], append: boolean) => {
+    dispatch({ type: "history-loaded", items, mock: mockMode, append })
+  }, [mockMode])
+  const history = useAiProposalHistory(resolvedClient, open && view === "proposals" && !busy, restoreHistory)
 
   useEffect(() => {
     if (open) setView("conversation")
@@ -1197,7 +1302,8 @@ export function AiAssistantDialog({
       dispatch(action)
     }
 
-    if (!resolvedClient) {
+    const submitted = submittedRequestRef.current
+    if (!submitted.client) {
       settle({
         type: "proposal-ready",
         draft: createPreviewProposal(turn),
@@ -1208,19 +1314,15 @@ export function AiAssistantDialog({
       return
     }
 
-    // 用户原话经 ref 传入：它是提交那一刻的输入，不是渲染期的状态，
-    // 因此不参与依赖数组，也不会被后续输入改写。
-    void buildAgentProposal(resolvedClient, {
-      profileId,
-      userIntent: lastPromptRef.current,
-      mock: mockMode,
-    }).then(
+    // 原话、Provider 和客户端共同属于提交时的这一轮；轨迹动画期间
+    // 切换配置不能改变已提交请求的接收方或 Mock/真实语义。
+    void buildAgentProposal(submitted.client, submitted).then(
       (draft) => {
         settle({
           type: "proposal-ready",
           draft,
           digestPreview: false,
-          mock: mockMode,
+          mock: submitted.mock,
           // 只有后端明确返回非空模型 id 才能声称结果来自模型；undefined 等畸形值必须 fail closed。
           template: !draft.modelId,
         })
@@ -1231,7 +1333,7 @@ export function AiAssistantDialog({
         settle({ type: "proposal-failed", message })
       },
     )
-  }, [state.status, state.traceRevealed, state.turn, traceStepMs, resolvedClient, mockMode, profileId])
+  }, [state.status, state.traceRevealed, state.turn, traceStepMs])
 
   const isDrafting = state.status === "drafting"
   const issue = buildIssue(state)
@@ -1242,7 +1344,8 @@ export function AiAssistantDialog({
     const prompt = raw.trim()
     if (!prompt || providerLoading || Array.from(prompt).length > MAX_USER_INTENT_CHARS || state.status === "drafting") return
     setInput("")
-    if (!wantsReadingProposal(prompt)) {
+    const usesProvider = !mockMode && typeof resolvedClient?.aiSettingsRecommendationGenerate === "function"
+    if (prompt === "当前能改什么设置" || (!usesProvider && !wantsReadingProposal(prompt))) {
       dispatch({
         type: "answer",
         prompt,
@@ -1252,9 +1355,14 @@ export function AiAssistantDialog({
       })
       return
     }
-    lastPromptRef.current = prompt
+    submittedRequestRef.current = {
+      client: resolvedClient,
+      profileId,
+      userIntent: prompt,
+      mock: mockMode,
+    }
     dispatch({ type: "submit", prompt })
-  }, [state.status, previewMode, providerLoading])
+  }, [state.status, previewMode, providerLoading, mockMode, resolvedClient, profileId])
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -1271,8 +1379,9 @@ export function AiAssistantDialog({
    */
   const handleReject = async (proposalId: string) => {
     if (busy) return
-    const record = pendingProposalOf(state, proposalId)
+    const record = rejectableProposalOf(state, proposalId)
     if (!record) return
+    history.invalidate()
     // 预览草稿没有服务端提案可拒绝，也不该走写入路径：直接推进本地状态。
     if (record.digestPreview || !resolvedClient) {
       dispatch({ type: "reject", proposalId })
@@ -1306,6 +1415,7 @@ export function AiAssistantDialog({
     if (busy) return
     const record = pendingProposalOf(state, proposalId)
     if (!record) return
+    history.invalidate()
     setBusy(true)
     try {
       // 双重防护：即使客户端在提案生成后不可用，也以记录来源标记为准。
@@ -1356,6 +1466,11 @@ export function AiAssistantDialog({
           digest: result.receipt.proposalDigest,
         },
       })
+      // 只有真实写入才要求外层回源；Mock/本地预览没有写任何设置，回执的
+      // before/after 也不能作为持久化事实。回源参数只有分区名。
+      if (!mockMode && result.receipt.changed) {
+        onSettingsApplied?.(appliedSettingsSections(result))
+      }
     } catch (error) {
       // 已知 code 一律是服务端已确定的零写入结论；只有归不到任何 code 才是未确认写入。
       const message = describeIpcError(error, "应用失败，未确认写入结果。")
@@ -1508,6 +1623,24 @@ export function AiAssistantDialog({
     ? null
     : state.proposals.find((proposal) => proposal.id === selectedProposalId) ?? null
 
+  const historyPane = (
+    <>
+      {history.available && <div className="mb-3 flex items-center justify-between gap-3 text-xs">
+        <span>本机保存的全局阅读提案</span>
+        <button type="button" disabled={history.loading || busy} onClick={() => void history.reload()} className="font-semibold text-[var(--haven-settings-primary)] disabled:opacity-50">重新读取提案</button>
+      </div>}
+      {history.loading && <p role="status" className="mb-3 text-xs">正在读取提案历史…</p>}
+      {history.error && <p role="alert" className="mb-3 text-xs text-[var(--haven-settings-danger)]">{history.error}</p>}
+      {(state.proposals.length > 0 || (!history.loading && !history.error)) && <ProposalHistory
+        proposals={state.proposals}
+        selectedProposalId={selectedProposalId}
+        onSelect={setSelectedProposalId}
+      />}
+      {history.nextCursor && !history.error && <button type="button" disabled={history.loading || busy} onClick={() => void history.loadMore()} className="mt-3 text-xs font-semibold text-[var(--haven-settings-primary)] disabled:opacity-50">加载更多提案</button>}
+      {selectedProposal && <div className="mt-[16px]" aria-label="提案详情">{renderProposalAttachment(selectedProposal.id)}</div>}
+    </>
+  )
+
   if (embedded) {
     return (
       <section
@@ -1607,16 +1740,7 @@ export function AiAssistantDialog({
         {view === "proposals" && (
           <div role="tabpanel" aria-label="提案历史" className="settings-scrollbar-hidden min-h-0 flex-1 overflow-y-auto px-6 py-6 sm:px-10">
             <div className="mx-auto w-full max-w-[760px]">
-              <ProposalHistory
-                proposals={state.proposals}
-                selectedProposalId={selectedProposalId}
-                onSelect={setSelectedProposalId}
-              />
-              {selectedProposal && (
-                <div className="mt-[16px]" aria-label="提案详情">
-                  {renderProposalAttachment(selectedProposal.id)}
-                </div>
-              )}
+              {historyPane}
             </div>
           </div>
         )}
@@ -1760,16 +1884,7 @@ export function AiAssistantDialog({
                 aria-labelledby={`${titleId}-tab-proposals`}
                 className="settings-scrollbar-hidden min-h-0 flex-1 overflow-y-auto px-5 py-5 sm:px-6"
               >
-                <ProposalHistory
-                  proposals={state.proposals}
-                  selectedProposalId={selectedProposalId}
-                  onSelect={setSelectedProposalId}
-                />
-                {selectedProposal && (
-                  <div className="mt-[16px]" aria-label="提案详情">
-                    {renderProposalAttachment(selectedProposal.id)}
-                  </div>
-                )}
+                {historyPane}
               </div>
             )}
           </div>
@@ -1795,6 +1910,7 @@ function ProposalAttachment({
   onApprove: (proposalId: string) => Promise<void>
 }) {
   const isPending = record.status === "pending"
+  const isRejectable = canRejectProposal(record)
   // 卡片结论：pending / rejected 之外的每一类都在服务端确定了"本次没有写入"，
   // 只有 failed 是未确认写入——文案逐字来自 PROPOSAL_STATUS_NOTE。
   const statusNote = PROPOSAL_STATUS_NOTE[record.status]
@@ -1850,6 +1966,9 @@ function ProposalAttachment({
         </span>
       </div>
 
+      {record.changes.length === 0 && (
+        <p className="mt-3 text-[12px] leading-5 text-[var(--haven-settings-muted-strong)]">{record.summary}</p>
+      )}
       <ul className="mt-3 space-y-1.5">
         {record.changes.map((change) => (
           <li
@@ -1920,25 +2039,25 @@ function ProposalAttachment({
         >
           查看执行轨迹
         </button>
+        {isRejectable && (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => { void onReject(record.id) }}
+            className="rounded-full border border-[var(--haven-settings-border)] px-3 py-1.5 text-[12px] font-semibold text-[#d70015] transition-colors hover:bg-[#d70015]/[0.06] disabled:cursor-not-allowed disabled:opacity-50 dark:border-[var(--haven-settings-border)]"
+          >
+            拒绝
+          </button>
+        )}
         {isPending && (
-          <>
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => { void onReject(record.id) }}
-              className="rounded-full border border-[var(--haven-settings-border)] px-3 py-1.5 text-[12px] font-semibold text-[#d70015] transition-colors hover:bg-[#d70015]/[0.06] disabled:cursor-not-allowed disabled:opacity-50 dark:border-[var(--haven-settings-border)]"
-            >
-              拒绝
-            </button>
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => { void onApprove(record.id) }}
-              className="rounded-full bg-[var(--haven-settings-primary)] px-[16px] py-1.5 text-[12px] font-semibold text-[var(--haven-settings-primary-foreground)] transition-colors hover:bg-[var(--haven-settings-primary-hover)] disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              批准并应用
-            </button>
-          </>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => { void onApprove(record.id) }}
+            className="rounded-full bg-[var(--haven-settings-primary)] px-[16px] py-1.5 text-[12px] font-semibold text-[var(--haven-settings-primary-foreground)] transition-colors hover:bg-[var(--haven-settings-primary-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            批准并应用
+          </button>
         )}
       </div>
     </section>

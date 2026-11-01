@@ -56,6 +56,18 @@ afterEach(() => {
 })
 
 describe("LibraryBrowsePage pagination races", () => {
+  it("keeps backend FTS matches and clears the URL query with the clear button", async () => {
+    getLibraryBrowsePage.mockImplementation((_cursor, query) => Promise.resolve({
+      items: query.query ? [item("match", "Spider-Man")] : [item("all", "全部作品")],
+      nextCursor: null, total: 1,
+    }))
+    renderPage("/library/video?q=spider%20man")
+    expect(await screen.findByText("Spider-Man")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "清除搜索" }))
+    expect(await screen.findByText("全部作品")).toBeTruthy()
+    expect(getLibraryBrowsePage.mock.calls.at(-1)?.[1].query).toBe("")
+  })
+
   it("stops filtered auto-pagination after failure until the user retries", async () => {
     getLibraryBrowsePage
       .mockResolvedValueOnce({ items: [item("first", "第一页")], nextCursor: "cursor-200", total: 2 })

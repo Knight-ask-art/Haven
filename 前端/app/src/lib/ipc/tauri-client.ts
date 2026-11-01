@@ -46,6 +46,9 @@ import type {
   DownloadEvent,
   DownloadListRequest,
   DownloadMutationResultDto,
+  DownloadResourceActionRequest,
+  DownloadResourceMutationResultDto,
+  DownloadResourceRevealResultDto,
   DownloadRevealResultDto,
   DownloadTaskActionRequest,
   DownloadTaskDto,
@@ -127,6 +130,8 @@ import type {
   AgentSettingsProposalDto,
   AgentSettingsProposalGetRequest,
   AgentSettingsProposalGetResultDto,
+  AgentSettingsProposalListRequest,
+  AgentSettingsProposalListResultDto,
   AgentSettingsProposalRejectRequest,
   AgentSettingsProposalRejectResultDto,
   AgentTraceGetRequest,
@@ -747,6 +752,24 @@ export class TauriHavenClient implements HavenClient {
     return this.invokeDownloadManagement<DownloadRevealResultDto>("download_reveal_offline", request);
   }
 
+  async downloadDeleteOfflineResource(
+    request: DownloadResourceActionRequest,
+  ): Promise<DownloadResourceMutationResultDto> {
+    return this.invokeDownloadManagement<DownloadResourceMutationResultDto>(
+      "download_delete_offline_resource",
+      request,
+    );
+  }
+
+  async downloadRevealOfflineResource(
+    request: DownloadResourceActionRequest,
+  ): Promise<DownloadResourceRevealResultDto> {
+    return this.invokeDownloadManagement<DownloadResourceRevealResultDto>(
+      "download_reveal_offline_resource",
+      request,
+    );
+  }
+
   async downloadSubscribe(
     subscriptionId: string,
     onEvent: (event: DownloadEvent) => void,
@@ -785,7 +808,7 @@ export class TauriHavenClient implements HavenClient {
 
   private async invokeDownloadManagement<T>(
     command: string,
-    request: DownloadTaskActionRequest,
+    request: DownloadTaskActionRequest | DownloadResourceActionRequest,
   ): Promise<T> {
     try {
       return await invoke<T>(command, { request });
@@ -1132,6 +1155,16 @@ export class TauriHavenClient implements HavenClient {
   ): Promise<AgentSettingsProposalGetResultDto> {
     try {
       return await invoke<AgentSettingsProposalGetResultDto>("agent_settings_proposal_get", { request });
+    } catch (error) {
+      throw toHavenError(error);
+    }
+  }
+
+  async agentSettingsProposalList(
+    request: AgentSettingsProposalListRequest,
+  ): Promise<AgentSettingsProposalListResultDto> {
+    try {
+      return await invoke<AgentSettingsProposalListResultDto>("agent_settings_proposal_list", { request });
     } catch (error) {
       throw toHavenError(error);
     }

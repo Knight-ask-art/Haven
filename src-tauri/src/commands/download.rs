@@ -3,7 +3,9 @@ use tauri::State;
 
 use haven_application::wire::{
     DownloadCreateRequest, DownloadEvent, DownloadListRequest, DownloadMutationResultDto,
-    DownloadRevealResultDto, DownloadTaskActionRequest, DownloadTaskDto, ErrorDto,
+    DownloadResourceActionRequest, DownloadResourceMutationResultDto,
+    DownloadResourceRevealResultDto, DownloadRevealResultDto, DownloadTaskActionRequest,
+    DownloadTaskDto, ErrorDto,
 };
 use haven_common::{AppError, ErrorKind};
 
@@ -136,6 +138,49 @@ management_command!(
     run_reveal_offline,
     DownloadRevealResultDto
 );
+
+async fn run_delete_offline_resource(
+    state: &AppState,
+    request: DownloadResourceActionRequest,
+) -> Result<DownloadResourceMutationResultDto, ErrorDto> {
+    state
+        .download
+        .delete_offline_resource(request)
+        .await
+        .map_err(|error| to_error_dto(&error))
+}
+
+async fn run_reveal_offline_resource(
+    state: &AppState,
+    request: DownloadResourceActionRequest,
+) -> Result<DownloadResourceRevealResultDto, ErrorDto> {
+    state
+        .download
+        .reveal_offline_resource(request)
+        .await
+        .map_err(|error| to_error_dto(&error))
+}
+
+/// Resource-level offline management. These commands exist because a completed
+/// DownloadTask record can be removed while its Offline Resource stays behind;
+/// the resource identity is the only honest handle left.
+#[tauri::command]
+pub async fn download_delete_offline_resource(
+    state: State<'_, AppState>,
+    request: DownloadResourceActionRequest,
+) -> Result<DownloadResourceMutationResultDto, ErrorDto> {
+    let state = (*state.inner()).clone();
+    run_blocking(move || async move { run_delete_offline_resource(&state, request).await }).await
+}
+
+#[tauri::command]
+pub async fn download_reveal_offline_resource(
+    state: State<'_, AppState>,
+    request: DownloadResourceActionRequest,
+) -> Result<DownloadResourceRevealResultDto, ErrorDto> {
+    let state = (*state.inner()).clone();
+    run_blocking(move || async move { run_reveal_offline_resource(&state, request).await }).await
+}
 
 /// 绑定下载进度 Channel。订阅不创建任务，也不读取路径；事件由共享 sink
 /// 从 Rust Worker 有序推送，并由同一订阅 ID 显式释放。

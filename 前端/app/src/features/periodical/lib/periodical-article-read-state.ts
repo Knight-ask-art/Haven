@@ -34,6 +34,8 @@ export type PeriodicalArticleReadState =
   | "readable"
   | "preparing"
   | "downloading"
+  | "download_paused"
+  | "download_interrupted"
   | "download_failed"
   | "download_only"
   | "metadata_only"
@@ -92,7 +94,7 @@ export interface ArticleCapability {
  * 没有投影时返回 `null`：调用方在拿到真实事实之前不据此对账，既不能登记也不能注销。
  */
 export function activeDownloadTaskId(info: CapabilityFacts | null | undefined): string | null {
-  if (!info || info.status !== "queued") return null
+  if (!info || (info.status !== "queued" && info.status !== "paused" && info.status !== "interrupted")) return null
   return info.taskId ?? null
 }
 
@@ -124,6 +126,14 @@ export function resolvePeriodicalArticleReadState(
   if (info.status === "queued") {
     return { state: "downloading", label: "下载中", canOpen: false }
   }
+  // Paused / Interrupted：后端保留了同一任务但并没有在运行，不能说「下载中」。
+  // 这是可恢复的处境（继续 / 重试同一个 taskId），因此仍然不可打开。
+  if (info.status === "paused") {
+    return { state: "download_paused", label: "下载已暂停 · 可继续下载", canOpen: false }
+  }
+  if (info.status === "interrupted") {
+    return { state: "download_interrupted", label: "下载已中断 · 可重试下载", canOpen: false }
+  }
   if (download.creating) {
     return { state: "preparing", label: "正在创建下载任务", canOpen: false }
   }
@@ -137,7 +147,14 @@ export function resolvePeriodicalArticleReadState(
 }
 
 /**
- * 下载动作边界的判据：只有这条为真时，页面才允许为这一篇创建下载任务。
+ * 这一篇是否仍有后端保留、可恢复的下载任务（Paused / Interrupted）。
+ * 页面据此允许用户对同一个 taskId 继续 / 重试，而不是重新创建任务。
+ */
+export function isRecoverableArticleDownload(info: CapabilityFacts | null | undefined): boolean {
+  return info?.status === "paused" || info?.status === "interrupted"
+}
+
+/**
  *
  * `resolvePeriodicalArticleReadState` 说得出「仅有元数据」还不够——动作一旦被调用就
  * 不再经过那个状态机，只要能力投影说 `canDownload`，下载任务就会真的建出来。因此
@@ -156,6 +173,7 @@ export function canStartArticleDownload(
   // 来源侧的结论压过能力投影：能下载不等于有正文可下载。
   if (providerAvailability === "metadata_only") return false
   if (failed) return false
+  if (isRecoverableArticleDownload(info)) return true
   return info?.canDownload === true
 }
 
@@ -185,6 +203,10 @@ export function periodicalArticleAccessibleName(
       return `正在创建《${title}》的下载任务`
     case "downloading":
       return `《${title}》正在下载`
+    case "download_paused":
+      return `继续下载《${title}》`
+    case "download_interrupted":
+      return `重试下载《${title}》`
     case "download_failed":
       return `重试下载《${title}》`
     case "download_only":

@@ -225,6 +225,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "052_cloud_drive_storage",
         include_str!("../../../../migrations/052_cloud_drive_storage.sql"),
     ),
+    (
+        "053_local_resource_path_identity",
+        include_str!("../../../../migrations/053_local_resource_path_identity.sql"),
+    ),
 ];
 
 pub fn run(conn: &mut Connection) -> Result<(), AppError> {
@@ -2619,7 +2623,7 @@ mod tests {
             before.as_slice(),
             "已有 001-048 迁移记录必须原样保留",
         );
-        assert_eq!(after.len(), before.len() + 4);
+        assert_eq!(after.len(), before.len() + 5);
         assert_eq!(
             after[before.len()..]
                 .iter()
@@ -2630,6 +2634,7 @@ mod tests {
                 "050_agent_skills",
                 "051_source_config_cache",
                 "052_cloud_drive_storage",
+                "053_local_resource_path_identity",
             ],
         );
 
@@ -2729,12 +2734,12 @@ mod tests {
         );
         assert_eq!(
             migrations_after.len(),
-            migrations_before.len() + 9,
-            "只允许追加 045-048 外观/总览迁移、049、050 AI 迁移、051 来源配置缓存与 052 云盘存储"
+            migrations_before.len() + 10,
+            "只允许追加已登记的外观、AI、来源缓存、云盘与本地路径索引迁移"
         );
         assert_eq!(
             migrations_after.last().map(|(version, _)| version.as_str()),
-            Some("052_cloud_drive_storage")
+            Some("053_local_resource_path_identity")
         );
         for expected in [
             "045_interface_font_assets",
@@ -2746,6 +2751,7 @@ mod tests {
             "050_agent_skills",
             "051_source_config_cache",
             "052_cloud_drive_storage",
+            "053_local_resource_path_identity",
         ] {
             assert!(
                 recorded_checksum(&conn, expected).is_some(),

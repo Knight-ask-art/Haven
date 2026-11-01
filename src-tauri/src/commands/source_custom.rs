@@ -8,7 +8,9 @@
 //! - `source_remove` 在来源事务中先撤销引用并登记凭据／配置缓存的清理义务，再清理外部
 //!   存储；失败的义务保留供重试。此顺序仅适用于来源，不改变其他凭据家族的契约。
 //!
-//! Command 只做不可信输入校验、Application 调用与错误映射。
+//! Command 只做 `sourceId` 路由键形状校验、Application 调用与错误映射；显示名/端点
+//! 这类用户文本的长度与格式由 Application 注册表服务按来源种类唯一裁定，命令层不再
+//! 用字节数重复判一遍（两层口径不同会让同一份输入在命令层被拒、在服务层通过）。
 
 use tauri::State;
 
@@ -23,16 +25,14 @@ use crate::state::AppState;
 
 /// `source_add` 命令核心。种类由 `request.kind` 决定，缺省为 OPDS，
 /// 因此新增该字段之前的调用行为完全不变。
+///
+/// 显示名与端点的空值/长度**不在这里重复校验**：注册表服务按来源种类给出唯一口径
+/// （显示名按字符数计，端点按种类分别计），命令层再用字节数判一遍只会让同一份输入
+/// 在两层得到不同结论。
 pub async fn run_source_add(
     state: &AppState,
     request: SourceAddRequest,
 ) -> Result<SourceAddResult, ErrorDto> {
-    if request.display_name.trim().is_empty() || request.display_name.len() > 100 {
-        return Err(invalid_argument("显示名不能为空且不超过 100 字符"));
-    }
-    if request.endpoint.trim().is_empty() || request.endpoint.len() > 500 {
-        return Err(invalid_argument("端点地址不能为空且不超过 500 字符"));
-    }
     let added = match request.kind {
         SourceAddKindDto::Opds => {
             state
@@ -70,22 +70,17 @@ pub async fn source_add(
 }
 
 /// `source_update` 命令核心（幂等）。
+///
+/// 显示名/端点的长度与格式交给注册表服务（唯一口径）；这里只保留 `sourceId` 的
+/// 字节形状守卫，因为它是路由键而不是用户文本。
 pub async fn run_source_update(
     state: &AppState,
     request: SourceUpdateRequest,
 ) -> Result<SourceUpdateResult, ErrorDto> {
     if request.source_id.trim().is_empty() || request.source_id.len() > 64 {
+        // sourceId 是路由键，不是用户文本：这里按字节限制它的形状，长度/格式的
+        // 语义校验由注册表服务按来源种类给出。
         return Err(invalid_argument("sourceId 非法"));
-    }
-    if let Some(name) = &request.display_name {
-        if name.trim().is_empty() || name.len() > 100 {
-            return Err(invalid_argument("显示名不能为空且不超过 100 字符"));
-        }
-    }
-    if let Some(endpoint) = &request.endpoint {
-        if endpoint.trim().is_empty() || endpoint.len() > 500 {
-            return Err(invalid_argument("端点地址不能为空且不超过 500 字符"));
-        }
     }
     state
         .source_registry
@@ -144,6 +139,8 @@ pub async fn run_source_set_credential(
         if secret.is_empty() {
             return Err(invalid_argument("凭据内容不能为空"));
         }
+        // 凭据不是路由键：这里保留字节上限，避免把任意大的 secret 交给 keyring；
+        // 各来源家族自己的字符数上限由 Application 凭据路径判定。
         if secret.len() > 512 {
             return Err(invalid_argument("凭据内容超长"));
         }

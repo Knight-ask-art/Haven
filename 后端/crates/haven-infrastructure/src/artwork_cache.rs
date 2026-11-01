@@ -179,21 +179,19 @@ impl ArtworkCache {
                 .ok_or_else(artwork_not_found);
         }
 
-        // A missing variant can be rebuilt from a still-valid original without
+        // A missing variant can be rebuilt from a fresh original without
         // touching the network.
         if variant != ArtworkVariant::Original {
             if let Some(original) = self
                 .read_cached(artwork_id, ArtworkVariant::Original, now)
                 .await?
             {
-                if original.within_stale_window {
-                    match self
+                if original.fresh {
+                    if let Ok(response) = self
                         .generate_variant(artwork_id, variant, &original.response.bytes)
                         .await
                     {
-                        Ok(response) => return Ok(response),
-                        Err(_) if !original.fresh => return Ok(original.response),
-                        Err(_) => {}
+                        return Ok(response);
                     }
                 }
             }
@@ -211,11 +209,26 @@ impl ArtworkCache {
             Err(error) => {
                 // stale-if-error: an already verified old file wins over a
                 // transient provider outage or invalid refresh response.
-                self.read_cached(artwork_id, variant, now)
+                if let Some(cached) = self
+                    .read_cached(artwork_id, variant, now)
                     .await?
                     .filter(|cached| cached.within_stale_window)
-                    .map(|cached| cached.response)
-                    .ok_or(error)
+                {
+                    return Ok(cached.response);
+                }
+                if variant != ArtworkVariant::Original {
+                    if let Some(original) = self
+                        .read_cached(artwork_id, ArtworkVariant::Original, now)
+                        .await?
+                        .filter(|cached| cached.within_stale_window)
+                    {
+                        // 离线派生只返回本次响应，不给旧内容重新签发缓存有效期。
+                        return encode_variant(variant, &original.response.bytes)
+                            .await
+                            .or(Err(error));
+                    }
+                }
+                Err(error)
             }
         }
     }
@@ -296,18 +309,12 @@ impl ArtworkCache {
         variant: ArtworkVariant,
         original: &[u8],
     ) -> Result<ArtworkResponse, AppError> {
-        let width = variant
-            .width()
-            .ok_or_else(|| artwork_format("图片变体宽度无效"))?;
-        let source = original.to_vec();
-        let encoded = tokio::task::spawn_blocking(move || encode_webp_variant(&source, width))
-            .await
-            .map_err(|_| artwork_internal("图片变体任务失败"))??;
+        let response = encode_variant(variant, original).await?;
         let now = UtcMillis::now().0;
         self.store_entry(
             artwork_id,
             variant,
-            &encoded,
+            &response.bytes,
             CacheMetadata {
                 mime: "image/webp",
                 etag: None,
@@ -317,10 +324,7 @@ impl ArtworkCache {
         )
         .await?;
         self.evict(Some(artwork_id)).await;
-        Ok(ArtworkResponse {
-            bytes: encoded,
-            mime: "image/webp".to_owned(),
-        })
+        Ok(response)
     }
 
     async fn fetch_remote(&self, record: &ImageProxyRecord) -> Result<RemotePayload, AppError> {
@@ -666,6 +670,23 @@ struct CachedResponse {
     response: ArtworkResponse,
     fresh: bool,
     within_stale_window: bool,
+}
+
+async fn encode_variant(
+    variant: ArtworkVariant,
+    original: &[u8],
+) -> Result<ArtworkResponse, AppError> {
+    let width = variant
+        .width()
+        .ok_or_else(|| artwork_format("图片变体宽度无效"))?;
+    let source = original.to_vec();
+    let bytes = tokio::task::spawn_blocking(move || encode_webp_variant(&source, width))
+        .await
+        .map_err(|_| artwork_internal("图片变体任务失败"))??;
+    Ok(ArtworkResponse {
+        bytes,
+        mime: "image/webp".to_owned(),
+    })
 }
 
 fn validate_image_bytes(bytes: &[u8]) -> Result<(&'static str, u32, u32), AppError> {

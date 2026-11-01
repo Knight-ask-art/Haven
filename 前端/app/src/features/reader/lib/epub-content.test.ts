@@ -141,6 +141,68 @@ function validEpub(overrides: Partial<Record<string, string>> = {}, options: Epu
 }
 
 describe("epub-content", () => {
+  it("maps block, inline and prototype-named anchors to rendered paragraphs after removing the title", async () => {
+    const publication = await parseEpubBook(validEpub({
+      first: '<html><head><title>Title</title><meta id="hidden"/></head><body><h1>Title</h1><section id="container"><p id="constructor">Same</p><p id="toString">Same <span id="inline">&amp; more</span><br/>text.</p><p id="__proto__">Last</p></section><script><span id="hidden-script">ignored</span></script></body></html>',
+    }))
+    const chapter = publication.chapters[0]
+    expect(chapter.paragraphs).toEqual(["Same", "Same & more text.", "Last"])
+    expect(chapter.anchorMap).toEqual({ container: 0, constructor: 0, toString: 1, inline: 1, ["__proto__"]: 2 })
+    expect(Object.hasOwn(chapter.anchorMap!, "__proto__")).toBe(true)
+    expect(chapter.anchorMap?.hidden).toBeUndefined()
+    expect(chapter.anchorMap?.["hidden-script"]).toBeUndefined()
+  })
+
+  it("ignores data-id/data-name and quoted attribute text when mapping anchors", async () => {
+    const publication = await parseEpubBook(validEpub({
+      first: '<html><head><title>Title</title></head><body><h1>Title</h1>'
+        + '<p data-id="target">Intro</p>'
+        + '<p data-name="target">Intro two</p>'
+        + "<p title='a > b data-id=\"target\" id=\"fake\"' data-id='target'>Quoted</p>"
+        + '<p id="target">Target</p>'
+        + '</body></html>',
+    }))
+    const chapter = publication.chapters[0]
+    expect(chapter.title).toBe("Title")
+    expect(chapter.paragraphs).toEqual(["Intro", "Intro two", "Quoted", "Target"])
+    expect(chapter.anchorMap).toEqual({ target: 3 })
+    expect(chapter.anchorMap?.fake).toBeUndefined()
+  })
+
+  it("maps inline and container anchors through a quote-aware whole-document projection", async () => {
+    const publication = await parseEpubBook(validEpub({
+      first: '<html><body><h1>Résumé</h1>'
+        + "<div id=\"chapter-start\"><p title=\"a > b\" name='c > d'>正文 <span id=\"inner\">内文</span></p>"
+        + '<p data-id="decoy">第二段</p>'
+        + '<p class="x" id="end" title="1 > 0">尾段。</p></div>'
+        + "<script>var s = \"<span id='bad'>x</span>\"</script>"
+        + '</body></html>',
+    }))
+    const chapter = publication.chapters[0]
+    expect(chapter.paragraphs).toEqual(["正文 内文", "第二段", "尾段。"])
+    // The container marker projects onto its first rendered paragraph; the
+    // removed title paragraph is not part of the offset.
+    expect(chapter.anchorMap).toEqual({ "chapter-start": 0, inner: 0, end: 2 })
+    expect(chapter.anchorMap?.decoy).toBeUndefined()
+    expect(chapter.anchorMap?.bad).toBeUndefined()
+    expect(chapter.anchorMap && Object.getPrototypeOf(chapter.anchorMap)).toBeNull()
+  })
+
+  it("keeps quoted '>' inside attributes out of plain text for both quote kinds", () => {
+    expect(htmlToPlainText('<p title="a > b">正文。</p>')).toBe("正文。")
+    expect(htmlToPlainText("<p title='a > b'>正文。</p>")).toBe("正文。")
+    expect(htmlToPlainText("<p data-x=\"<span id='x'>\">可见。<script>bad</script></p><p>后段</p>")).toBe("可见。\n\n后段")
+  })
+
+  it("decodes entities in anchor names and keeps the first real anchor", async () => {
+    const publication = await parseEpubBook(validEpub({
+      first: '<html><body><p id="a&amp;b">One</p><p id="a&amp;b">Two</p><p id="c&#x3e;d">Three</p></body></html>',
+    }))
+    const chapter = publication.chapters[0]
+    expect(chapter.anchorMap?.["a&b"]).toBe(0)
+    expect(chapter.anchorMap?.["c>d"]).toBeUndefined()
+  })
+
   it("parses package/spine order and renders inert chapter text", async () => {
     const publication = await parseEpubBook(validEpub())
 
@@ -272,15 +334,20 @@ describe("epub-content", () => {
     expect(publication.chapters[1].paragraphs.join(" ")).not.toContain("General Information")
   })
 
-  it("skips whole Gutenberg front-matter documents", async () => {
+  it("keeps post-marker prose instead of guessing at Gutenberg boilerplate", async () => {
     const publication = await parseEpubBook(validEpub({
       first: "<html><body><h1>The Project Gutenberg eBook of Frankenstein</h1>"
         + "<p>*** START OF THE PROJECT GUTENBERG EBOOK FRANKENSTEIN ***</p>"
         + "<p>donations to the Project Gutenberg Literary Archive Foundation.</p>"
         + "</body></html>",
     }))
-    expect(publication.chapters).toHaveLength(1)
-    expect(publication.chapters[0].title).toBe("第二章")
+    // The same words can be story text, so only the marker itself is cropped
+    // and the prose that follows must be preserved.
+    expect(publication.chapters).toHaveLength(2)
+    expect(publication.chapters[0].paragraphs).toEqual([
+      "donations to the Project Gutenberg Literary Archive Foundation.",
+    ])
+    expect(publication.chapters[1].title).toBe("第二章")
   })
 
   it("enforces the bounded resource input", async () => {

@@ -26,9 +26,14 @@ export interface LibraryMediaItemData {
   progressLocator?: LocatorDto | null
 }
 
+export type LibrarySpotlightHandler = (
+  item: LibraryMediaItemData,
+  interaction?: "hover" | "focus" | "leave",
+) => void
+
 interface MediaItemProps {
   item: LibraryMediaItemData
-  onHover?: (item: LibraryMediaItemData) => void
+  onHover?: LibrarySpotlightHandler
   density?: "regular" | "compact"
   selectionMode?: boolean
   selected?: boolean
@@ -67,7 +72,9 @@ export function MediaItem({ item, onHover, density = "regular", selectionMode = 
         event.preventDefault()
         activate()
       }}
-      onMouseEnter={() => onHover?.(item)}
+      onMouseEnter={() => onHover?.(item, "hover")}
+      onMouseLeave={() => onHover?.(item, "leave")}
+      onFocus={() => onHover?.(item, "focus")}
       className={cn(
         "group relative flex cursor-pointer select-none outline-none",
         isCompact ? "flex-col gap-4 py-8" : "flex-col gap-[8px] py-[16px]"

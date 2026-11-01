@@ -4,6 +4,15 @@ import { isReaderTocResultDto, isTocItemDto } from "./reader-toc"
 const item = { id: "9a00d70e24a8f7b1", title: "序言", depth: 0, progression: 0.25 }
 
 describe("isTocItemDto", () => {
+  it("accepts serialized optional fragments and rejects malformed fragment payloads", () => {
+    for (const fragment of [null, "section-2", "constructor", "正文"]) {
+      expect(isTocItemDto({ ...item, fragment })).toBe(true)
+    }
+    for (const fragment of [1, {}, "", " section ", "../section", "a#b", "a\u0000b", "x".repeat(513)]) {
+      expect(isTocItemDto({ ...item, fragment })).toBe(false)
+    }
+  })
+
   it("accepts a canonical item", () => {
     expect(isTocItemDto(item)).toBe(true)
   })

@@ -1,3 +1,4 @@
+import { useMarkerNavigation } from "@/features/markers/lib/use-marker-navigation"
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react"
 import { useNavigate, useParams } from "react-router"
 import { ArrowLeft, Bookmark, ChevronLeft, ChevronRight, ListTree, Minus, Plus, Search, Trash2, X } from "lucide-react"
@@ -311,6 +312,7 @@ function BookReaderUnavailable() {
 function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode }) {
   const navigate = useNavigate()
   const { mediaItemId } = useParams<{ mediaItemId?: string }>()
+  const initialPosition = useMarkerNavigation(mediaItemId)
   const runtimeState = resolveBookReaderRuntimeState(clientMode)
   const tauriRuntime = runtimeState === "production"
   const demoRuntime = runtimeState === "demo"
@@ -384,6 +386,9 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
   // horizontal offset (always 0) can be flushed as a real progress update
   // before the persisted position has been mapped to the current columns.
   const progressRestoreSettledRef = useRef(!tauriRuntime)
+  useEffect(() => {
+    progressRestoreSettledRef.current = !tauriRuntime
+  }, [initialPosition?.key, tauriRuntime])
   // A mode change rerenders the columns before the new layout effect can read
   // the old axis. Capture the format-independent progression in the click
   // handler so the first measurement of the new layout cannot overwrite it.
@@ -405,9 +410,15 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
     setFontSize(presentation.fontSizePx)
     setLineHeight(readingSettings.lineHeight)
     setColumnWidth(readingSettings.contentWidth)
-    pendingPaginationProgressionRef.current = null
+    // 设置可能在内容已按默认 scroll 恢复之后才到达：这次 setPaginationMode 是
+    // 程序化切换，新轴上的首个测量值（0）会覆盖当前阅读位置，所以像用户手动
+    // 切换那样先捕获已恢复的 progression。尚未恢复完成时保持 null，把定位交给
+    // 恢复流程，避免把初始 0 当成已恢复的位置。
+    pendingPaginationProgressionRef.current = progressRestoreSettledRef.current && presentation.pagination !== paginationMode
+      ? latestBookProgressionRef.current
+      : null
     setPaginationMode(presentation.pagination)
-  }, [readingSettings, readingSettingsScopeKey, readingSettingsStatus])
+  }, [readingSettings, readingSettingsScopeKey, readingSettingsStatus, paginationMode])
 
   const changePaginationMode = (next: BookPaginationMode) => {
     if (next === paginationMode) return
@@ -772,6 +783,8 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
   // 分页模式沿用同一个 progression，但把它映射到当前水平 page/spread。
   // 等待两帧让 CSS columns 完成布局，并在恢复完成前禁止首个 0 位置
   // 写回 Progress；这对“首次打开即为分页模式”的 Session 尤其重要。
+  // 恢复只对每个 Session 生效一次：之后的分页模式/视口宽度变化只重排布局，
+  // 不能再用 Session 的初始快照覆盖当前阅读位置。
   useEffect(() => {
     if (sessionView.status !== "ready" || state.status !== "ready") return
     if (tauriRuntime && (contentState.status !== "ready" || !contentMatchesSession)) return
@@ -783,7 +796,7 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
     let attempts = 0
     const restore = () => {
       if (cancelled) return
-      const safeProgress = bookResumeProgression(state.session)
+      const safeProgress = bookResumeProgression(state.session, initialPosition)
       const layoutReady = paginationMode === "scroll"
         ? scrollContainer.clientHeight > 0 && (safeProgress <= 0 || scrollContainer.scrollHeight > scrollContainer.clientHeight)
         : scrollContainer.clientWidth > 0 && (safeProgress <= 0 || scrollContainer.scrollWidth > scrollContainer.clientWidth)
@@ -793,7 +806,14 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
         return
       }
 
-      restoreBookProgress(scrollContainer, state.session, restoredProgressRef, paginationMode)
+      // 恢复的写入者只有一次。分页模式或视口宽度变化会重建列布局并重新触发
+      // 本 effect，此时 Session 的初始快照已经过期：继续写回会把刚保存的
+      // 当前位置（例如 60%）退回成打开时的旧值（例如 20%）。
+      // 模式/布局切换的位置延续由 changePaginationMode 的
+      // pendingPaginationProgressionRef 与滚动测量的 latestBookProgressionRef 负责。
+      if (progressRestoreSettledRef.current) return
+
+      restoreBookProgress(scrollContainer, state.session, restoredProgressRef, paginationMode, initialPosition)
       latestBookProgressionRef.current = safeProgress
       setReadingProgress(Math.round(safeProgress * 100))
       // Keep the controller's latest value aligned with the restored locator;
@@ -808,7 +828,7 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
       cancelled = true
       if (frame !== null) cancelAnimationFrame(frame)
     }
-  }, [contentMatchesSession, contentState.status, paginationMode, paginationViewportWidth, sessionView.status, state, sessionContentUri, tauriRuntime])
+  }, [contentMatchesSession, contentState.status, initialPosition, paginationMode, paginationViewportWidth, sessionView.status, state, sessionContentUri, tauriRuntime])
 
   useEffect(() => {
     if (demoRuntime) localStorage.setItem(bookmarkStorageKey, JSON.stringify(bookmarks))
@@ -929,28 +949,45 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
     setDrawerOpen(false)
   }
 
-  // 目录条目跳转：progression 在滚动模式映射到纵向位置，在分页模式映射到
-  // 水平 page/spread；TXT/Markdown 回退章节 id 跳转。
+  // 目录条目跳转：progression 是原始 spine 文档坐标（含被过滤的纯标题文档），
+  // 先按章节显式记录的 spineIndex 精确对应。fragment 只在同一 spine 文档内
+  // 查找，不能跨文档命中同名锚点；标题仅作同文档内或无 spine 坐标时的降级。
   const scrollToTocItem = (item: TocItemDto) => {
     const scrollContainer = readerScrollRef.current
     if (!scrollContainer) return
     const operation = ++navigationOperationRef.current
+    const chaptersWithSpine = chapters.filter((chapter) => chapter.spineIndex !== undefined)
+    const spineCount = chaptersWithSpine[0]?.spineCount
+      ?? Math.max(0, ...chaptersWithSpine.map((chapter) => (chapter.spineIndex ?? -1) + 1))
+    // Clamped target spine document. Title-only documents are filtered out of
+    // `chapters`; the first retained document at or after the target is the
+    // closest readable fallback for such an entry. Rounding avoids float error
+    // (`29/100*100` is `28.999…`) landing on the previous chapter.
+    const targetSpine = spineCount > 0
+      ? Math.min(spineCount - 1, Math.max(0, Math.round(item.progression * spineCount)))
+      : null
+    const spineChapter = targetSpine === null ? undefined : (
+      chaptersWithSpine.find((chapter) => chapter.spineIndex === targetSpine)
+      ?? chaptersWithSpine.find((chapter) => (chapter.spineIndex ?? -1) > targetSpine)
+      ?? chaptersWithSpine[chaptersWithSpine.length - 1]
+    )
+    const fragment = item.fragment ?? ""
+    const fragmentCandidates = spineChapter
+      ? (spineChapter.anchorMap?.[fragment] !== undefined ? [spineChapter] : [])
+      : chapters.filter((chapter) => chapter.anchorMap?.[fragment] !== undefined)
+    const titleCandidates = spineChapter
+      ? (spineChapter.title.trim() === item.title.trim() ? [spineChapter] : [])
+      : chapters.filter((chapter) => chapter.title.trim() === item.title.trim())
     const expectedIndex = chapters.length === 0
       ? 0
       : Math.min(chapters.length - 1, Math.max(0, Math.floor(item.progression * chapters.length)))
-    const fragmentCandidates = item.fragment
-      ? chapters
-        .map((chapter, index) => ({ chapter, index }))
-        .filter(({ chapter }) => chapter.anchorMap?.[item.fragment!] !== undefined)
-      : []
-    const candidates = fragmentCandidates.length > 0
-      ? fragmentCandidates
-      : chapters
-        .map((chapter, index) => ({ chapter, index }))
-        .filter(({ chapter }) => chapter.title.trim() === item.title.trim())
-    const targetChapter = (candidates.length > 0
-      ? candidates.slice().sort((left, right) => Math.abs(left.index - expectedIndex) - Math.abs(right.index - expectedIndex))[0]
-      : { chapter: chapters[expectedIndex], index: expectedIndex })?.chapter
+    const nearestByIndex = (candidates: BookChapter[]) => candidates
+      .map((chapter) => ({ chapter, index: chapters.indexOf(chapter) }))
+      .sort((left, right) => Math.abs(left.index - expectedIndex) - Math.abs(right.index - expectedIndex))[0].chapter
+    const targetChapter = spineChapter
+      ?? (fragmentCandidates.length > 0
+        ? nearestByIndex(fragmentCandidates)
+        : titleCandidates.length > 0 ? nearestByIndex(titleCandidates) : chapters[expectedIndex])
     if (!targetChapter) {
       setDrawerOpen(false)
       return
@@ -1264,8 +1301,8 @@ function BookReaderExperience({ clientMode }: { clientMode: ActiveBookReaderMode
             </button>
           </>
         )}
-        {contentReady && pdfSource && state.status === "ready" && <PdfReader key={state.session.sessionId} source={pdfSource} restoreLocator={(pageCount) => (
-          restorePdfProgress(pageCount, state.session, restoredPdfProgressRef)
+        {contentReady && pdfSource && state.status === "ready" && <PdfReader key={`${state.session.sessionId}:${initialPosition?.key ?? ""}`} source={pdfSource} restoreLocator={(pageCount) => (
+          restorePdfProgress(pageCount, state.session, restoredPdfProgressRef, initialPosition)
         )} onLocatorChange={(locator) => {
           const percentage = locator.pageCount <= 1 ? 0 : Math.round((locator.pageIndex / (locator.pageCount - 1)) * 100)
           setReadingProgress(percentage)

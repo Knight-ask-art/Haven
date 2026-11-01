@@ -13,10 +13,10 @@ use haven_domain::contracts::{
 };
 use haven_domain::entities::{DownloadTask, Resource, ResourceLocator, StorageLocation};
 use haven_domain::enums::{
-    Availability, ContentCategory, DownloadPriority, DownloadState, MediaType, StorageProviderType,
-    StorageStatus,
+    Availability, ContentCategory, DownloadPriority, DownloadState, MediaType, ResourceType,
+    StorageProviderType, StorageStatus,
 };
-use haven_domain::ids::{DownloadTaskId, ResourceId, StorageLocationId};
+use haven_domain::ids::{DownloadTaskId, MediaItemId, ResourceId, StorageLocationId};
 use haven_domain::settings::{SettingsSection, SettingsValue};
 
 use crate::mapper::time::utc_millis_to_rfc3339;
@@ -27,8 +27,9 @@ use crate::services::source_import::{
 };
 use crate::wire::{
     ContentCategory as ContentCategoryDto, DownloadCreateRequest, DownloadEventData,
-    DownloadListRequest, DownloadMutationResultDto, DownloadRevealResultDto, DownloadStateDto,
-    DownloadTaskActionRequest, DownloadTaskDto, MediaTypeDto,
+    DownloadListRequest, DownloadMutationResultDto, DownloadResourceActionRequest,
+    DownloadResourceMutationResultDto, DownloadResourceRevealResultDto, DownloadRevealResultDto,
+    DownloadStateDto, DownloadTaskActionRequest, DownloadTaskDto, MediaTypeDto,
 };
 
 const SCHEMA_VERSION: u32 = 1;
@@ -46,7 +47,7 @@ pub trait DownloadPorts:
     + Send
     + Sync
 {
-    fn as_download(&self) -> &dyn DownloadRepository;
+    fn as_download(&self) -> &(dyn DownloadRepository + Sync);
     fn as_resource(&self) -> &dyn ResourceRepository;
     fn as_storage(&self) -> &dyn StorageLocationRepository;
     fn as_media_item(&self) -> &dyn MediaItemRepository;
@@ -65,7 +66,7 @@ where
         + Send
         + Sync,
 {
-    fn as_download(&self) -> &dyn DownloadRepository {
+    fn as_download(&self) -> &(dyn DownloadRepository + Sync) {
         self
     }
     fn as_resource(&self) -> &dyn ResourceRepository {
@@ -86,8 +87,25 @@ where
 }
 
 /// 具体传输实现由 Infrastructure 注入；Command 不直接触碰文件或网络。
+#[async_trait]
 pub trait DownloadRunner: Send + Sync {
     fn start(&self, task_id: DownloadTaskId);
+    /// Serialize cleanup with the worker before discarding an unfinished task.
+    /// Non-filesystem runners have no partial file to release.
+    async fn discard_partial(&self, _task: &DownloadTask) -> Result<(), AppError> {
+        Ok(())
+    }
+    /// Filesystem runners keep their worker slot through terminal deletion.
+    async fn remove_task_record(
+        &self,
+        task: &DownloadTask,
+        downloads: &(dyn DownloadRepository + Sync),
+    ) -> Result<bool, AppError> {
+        if task.state != DownloadState::Completed {
+            self.discard_partial(task).await?;
+        }
+        downloads.delete_terminal(task.id).await
+    }
 }
 
 /// 下载长任务的有序进度出口。具体 Channel 注册与发送由 Tauri Interface 实现。
@@ -168,6 +186,16 @@ impl DownloadService {
             ));
         }
         if matches!(&resource.locator, ResourceLocator::Http { .. }) {
+            return Err(AppError::new(
+                "DOWNLOAD_SOURCE_UNSUPPORTED",
+                ErrorKind::Validation,
+                "该资源没有受控的可下载来源",
+                false,
+            ));
+        }
+        // 下载器只传输单个文件；ImageSequence 本地漫画是目录，没有受控的
+        // 目录归档传输，必须在创建任务前拒绝，而不是等 Worker 解析目录失败。
+        if resource.resource_type == ResourceType::ImageSequence {
             return Err(AppError::new(
                 "DOWNLOAD_SOURCE_UNSUPPORTED",
                 ErrorKind::Validation,
@@ -448,7 +476,11 @@ impl DownloadService {
                 false,
             ));
         }
-        if !self.ports.as_download().delete_terminal(id).await? {
+        if !self
+            .runner
+            .remove_task_record(&task, self.ports.as_download())
+            .await?
+        {
             return Err(AppError::new(
                 "DOWNLOAD_TASK_REMOVE_CONFLICT",
                 ErrorKind::Conflict,
@@ -504,6 +536,46 @@ impl DownloadService {
         })
     }
 
+    /// 删除已完成下载留下的离线文件与 Offline Resource。
+    ///
+    /// 任务记录（DownloadTask）可能已经被用户从下载列表移除，因此这里只以
+    /// Resource 身份为准；授权校验与任务路径共用同一套离线资源规则。
+    pub async fn delete_offline_resource(
+        &self,
+        request: DownloadResourceActionRequest,
+    ) -> Result<DownloadResourceMutationResultDto, AppError> {
+        let resource_id: ResourceId = parse_id(&request.resource_id, "离线资源")?;
+        let (resource, storage) = self.offline_resource_context(resource_id).await?;
+        self.offline_files.delete(&storage, &resource).await?;
+        if !self.ports.as_resource().delete(resource.id).await? {
+            return Err(AppError::new(
+                "DOWNLOAD_OFFLINE_DELETE_CONFLICT",
+                ErrorKind::Conflict,
+                "离线资源状态已变化，请刷新后重试",
+                true,
+            ));
+        }
+        Ok(DownloadResourceMutationResultDto {
+            schema_version: SCHEMA_VERSION,
+            resource_id: resource_id.to_string(),
+            offline_resource_removed: true,
+        })
+    }
+
+    /// 在文件管理器中定位已完成下载留下的离线文件。
+    pub async fn reveal_offline_resource(
+        &self,
+        request: DownloadResourceActionRequest,
+    ) -> Result<DownloadResourceRevealResultDto, AppError> {
+        let resource_id: ResourceId = parse_id(&request.resource_id, "离线资源")?;
+        let (resource, storage) = self.offline_resource_context(resource_id).await?;
+        self.offline_files.reveal(&storage, &resource).await?;
+        Ok(DownloadResourceRevealResultDto {
+            schema_version: SCHEMA_VERSION,
+            resource_id: resource_id.to_string(),
+        })
+    }
+
     async fn get_task(&self, id: DownloadTaskId) -> Result<DownloadTask, AppError> {
         self.ports
             .as_download()
@@ -542,28 +614,70 @@ impl DownloadService {
                     "该下载任务的离线资源不存在",
                 )
             })?;
+        let media_item_id = task.media_item_id.ok_or_else(invalid_offline_resource)?;
+        let storage = self
+            .validate_offline_resource(&resource, Some((media_item_id, task.target_storage_id)))
+            .await?;
+        Ok((task, resource, storage))
+    }
+
+    /// 任务路径与 Resource 路径共用的离线资源授权校验。
+    ///
+    /// 只有绑定到已登记本地存储位置、登记为 OfflineAvailable 且 locator 为
+    /// LocalPath 的 Resource 才可删除/定位；文件本身是否位于受控离线目录由
+    /// `OfflineResourceFiles` 再次校验。扫描器导入的原始库文件是 `Available`，
+    /// 永远不会通过这里被当成可删除的下载产物。
+    async fn validate_offline_resource(
+        &self,
+        resource: &Resource,
+        task_scope: Option<(MediaItemId, StorageLocationId)>,
+    ) -> Result<StorageLocation, AppError> {
+        let storage_id = resource
+            .storage_location_id
+            .ok_or_else(invalid_offline_resource)?;
+        if let Some((media_item_id, target_storage_id)) = task_scope {
+            if resource.media_item_id != media_item_id || storage_id != target_storage_id {
+                return Err(invalid_offline_resource());
+            }
+        }
+        if resource.availability != Availability::OfflineAvailable
+            || !matches!(&resource.locator, ResourceLocator::LocalPath { .. })
+        {
+            return Err(invalid_offline_resource());
+        }
         let storage = self
             .ports
             .as_storage()
-            .get(task.target_storage_id)
+            .get(storage_id)
             .await?
             .ok_or_else(|| not_found("STORAGE_LOCATION_NOT_FOUND", "目标存储位置不存在"))?;
-        let media_matches = task
-            .media_item_id
-            .is_some_and(|media_item_id| media_item_id == resource.media_item_id);
-        if resource.storage_location_id != Some(task.target_storage_id)
-            || !media_matches
-            || resource.availability != Availability::OfflineAvailable
-            || storage.provider_type != StorageProviderType::Local
-        {
-            return Err(AppError::new(
-                "DOWNLOAD_OFFLINE_RESOURCE_INVALID",
-                ErrorKind::Security,
-                "离线资源登记信息无效，已拒绝文件操作",
-                false,
-            ));
+        if storage.provider_type != StorageProviderType::Local {
+            return Err(invalid_offline_resource());
         }
-        Ok((task, resource, storage))
+        if self
+            .ports
+            .as_media_item()
+            .get(resource.media_item_id)
+            .await?
+            .is_none()
+        {
+            return Err(invalid_offline_resource());
+        }
+        Ok(storage)
+    }
+
+    async fn offline_resource_context(
+        &self,
+        resource_id: ResourceId,
+    ) -> Result<(Resource, StorageLocation), AppError> {
+        let resource = self
+            .ports
+            .as_resource()
+            .get(resource_id)
+            .await?
+            .ok_or_else(|| not_found("DOWNLOAD_OFFLINE_RESOURCE_NOT_FOUND", "离线资源不存在"))?;
+        let storage = self.validate_offline_resource(&resource, None).await?;
+        Ok((resource, storage))
     }
 
     async fn transition(
@@ -580,7 +694,12 @@ impl DownloadService {
                 .await?
                 .ok_or_else(|| not_found("DOWNLOAD_TASK_NOT_FOUND", "下载任务不存在"))?;
             let next = match transition.next(current.state) {
-                TransitionResult::Noop => return self.to_dto(current).await,
+                TransitionResult::Noop => {
+                    if matches!(transition, Transition::Cancel) {
+                        self.finish_cancel_cleanup(&current).await?;
+                    }
+                    return self.to_dto(current).await;
+                }
                 TransitionResult::Invalid => {
                     return Err(AppError::new(
                         "DOWNLOAD_STATE_INVALID",
@@ -616,6 +735,9 @@ impl DownloadService {
                     .await?
                     .ok_or_else(|| not_found("DOWNLOAD_TASK_NOT_FOUND", "下载任务不存在"))?;
                 self.events.emit_task(&updated, None);
+                if next == DownloadState::Cancelled {
+                    self.finish_cancel_cleanup(&updated).await?;
+                }
                 return self.to_dto(updated).await;
             }
         }
@@ -625,6 +747,15 @@ impl DownloadService {
             "下载任务状态已变化，请刷新后重试",
             true,
         ))
+    }
+
+    async fn finish_cancel_cleanup(&self, task: &DownloadTask) -> Result<(), AppError> {
+        match self.runner.discard_partial(task).await {
+            // The live worker observes Cancelled and releases its output.
+            // Removing the record still requires successful idle cleanup.
+            Err(error) if error.code().as_str() == "DOWNLOAD_CLEANUP_BUSY" => Ok(()),
+            result => result,
+        }
     }
 
     async fn to_dto(&self, task: DownloadTask) -> Result<DownloadTaskDto, AppError> {
@@ -797,6 +928,15 @@ fn parse_id<T: std::str::FromStr>(value: &str, label: &str) -> Result<T, AppErro
 
 fn not_found(code: &'static str, message: &'static str) -> AppError {
     AppError::new(code, ErrorKind::NotFound, message, false)
+}
+
+fn invalid_offline_resource() -> AppError {
+    AppError::new(
+        "DOWNLOAD_OFFLINE_RESOURCE_INVALID",
+        ErrorKind::Security,
+        "离线资源登记信息无效，已拒绝文件操作",
+        false,
+    )
 }
 
 fn state_dto(value: DownloadState) -> DownloadStateDto {

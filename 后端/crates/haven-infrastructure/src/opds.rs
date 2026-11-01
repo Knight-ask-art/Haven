@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use haven_application::services::SourceRegistryService;
 use haven_application::services::ports::{
     RemoteAcquiredFile, RemoteAcquisitionPort, RemoteByteRange, RemoteContentRange,
-    RemoteSessionBody, RemoteSessionPort,
+    RemoteSessionBody, RemoteSessionPort, RemoteTransferContext,
 };
 use haven_application::services::search_source::SearchSourceParticipant;
 use haven_application::services::source_import::{
@@ -93,6 +93,18 @@ const BOOK_CAP_BYTES: u64 = 64 * 1024 * 1024;
 const ONLINE_EPUB_CAP_BYTES: usize = 32 * 1024 * 1024;
 const EPUB_MIME: &str = "application/epub+zip";
 const MAX_REDIRECTS: usize = 3;
+/// 单个网络等待（连接、响应头、每一块正文读取）的上界，与既有整段请求超时相同。
+///
+/// 远端获取带有限速时，限速睡眠发生在两次读取之间，**不计入**任何网络等待超时；
+/// 否则一个大文件在有限速率下会因为「等待配额」被误判为网络超时。
+const NETWORK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Atom 解析允许的元素嵌套深度。作用域栈每层保存一份有效 XML Base；8 MiB 输入
+/// 足以放下十万层嵌套，若没有上限，逐层 join 出来的祖先 URL 会累积成二次方内存。
+const MAX_XML_NESTING_DEPTH: usize = 256;
+/// 单个 `xml:base` 原文与解析后的作用域基准长度上限。超长值在 URL join 之前、
+/// 结果进入作用域栈之前一律退回父作用域，避免一个巨大基准被复制进每一层。
+const MAX_SCOPED_BASE_BYTES: usize = 16 * 1024;
 
 /// 单条 OPDS 条目（解析投影）。
 ///
@@ -156,8 +168,21 @@ struct EntryBuilder {
     epub_href: Option<String>,
 }
 
+/// 正在累积文本的字段及其元素在作用域栈中的深度。
+///
+/// Atom 允许 `title`/`summary`/`content` 使用 xhtml 内联标记；只有字段元素**自己的**
+/// 结束标签才能结束捕获，嵌套的 `<em>` 等内联元素不得清空目标，否则 `前<em>中</em>后`
+/// 会丢掉 `后`。
+#[derive(Clone, Copy)]
+struct TextCapture {
+    field: &'static str,
+    depth: usize,
+}
+
 /// 解析 Atom feed：条目级 link 只在 `<entry>` 作用域内收集；feed 级 link
-/// （如 rel="search"）单独返回。命名空间前缀按 local-name 归一；链接按 base 绝对化。
+/// （如 rel="search"）单独返回。命名空间前缀按 local-name 归一；链接按**元素作用域**的
+/// XML Base 绝对化——`xml:base` 从 feed/entry/link 逐层继承，相对值按父作用域解析。
+/// feed 级链接也已是绝对地址；调用方仍会逐条做来源授权校验。
 fn parse_atom(xml: &str, base: &str) -> (Vec<OpdsEntry>, Vec<(String, String)>) {
     use quick_xml::events::Event;
 
@@ -166,50 +191,98 @@ fn parse_atom(xml: &str, base: &str) -> (Vec<OpdsEntry>, Vec<(String, String)>) 
     let mut feed_links: Vec<(String, String)> = Vec::new();
     let mut depth_entry = 0usize;
     let mut builder = EntryBuilder::default();
-    // 当前正在累积文本的字段：title | summary | author_name | id
-    let mut text_target: Option<&'static str> = None;
+    // 元素作用域栈：`base_stack[0]` 是文档/响应 base，之后每一项是某个已打开元素的
+    // 有效 XML Base（父作用域 + 自身 `xml:base`）。空元素不入栈。
+    let mut base_stack: Vec<String> = vec![base.to_owned()];
+    let mut text_target: Option<TextCapture> = None;
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
+                // 深度上限必须在计算/压入下一个作用域基准**之前**判定：一旦超限，
+                // 继续解析只会把祖先 URL 再复制一份并 join 出更长的值。
+                if base_stack.len() > MAX_XML_NESTING_DEPTH {
+                    break;
+                }
                 let name = local_name(&e);
+                let element_base =
+                    scoped_base(base_stack.last().map(String::as_str).unwrap_or(base), &e);
+                base_stack.push(element_base.clone());
                 match name.as_str() {
                     "entry" => {
                         depth_entry += 1;
                         builder = EntryBuilder::default();
+                        // 条目边界是硬边界：上一条目的字段状态不得流入下一条。
+                        text_target = None;
                     }
-                    "title" if depth_entry > 0 => text_target = Some("title"),
-                    "summary" | "content" if depth_entry > 0 => text_target = Some("summary"),
-                    "id" if depth_entry > 0 => text_target = Some("id"),
-                    "name" if depth_entry > 0 => text_target = Some("author"),
+                    // 字段只在当前没有捕获时开始：字段内部嵌套的元素（包括同名字段）
+                    // 属于内联内容，不能把文本改投到另一个 builder 字段。
+                    "title" if depth_entry > 0 && text_target.is_none() => {
+                        text_target = Some(TextCapture {
+                            field: "title",
+                            depth: base_stack.len(),
+                        });
+                    }
+                    "summary" | "content" if depth_entry > 0 && text_target.is_none() => {
+                        text_target = Some(TextCapture {
+                            field: "summary",
+                            depth: base_stack.len(),
+                        });
+                    }
+                    "id" if depth_entry > 0 && text_target.is_none() => {
+                        text_target = Some(TextCapture {
+                            field: "id",
+                            depth: base_stack.len(),
+                        });
+                    }
+                    "name" if depth_entry > 0 && text_target.is_none() => {
+                        text_target = Some(TextCapture {
+                            field: "author",
+                            depth: base_stack.len(),
+                        });
+                    }
                     _ => {}
                 }
                 if name == "link" {
-                    collect_link(&e, depth_entry, base, &mut builder, &mut feed_links);
+                    collect_link(
+                        &e,
+                        depth_entry,
+                        &element_base,
+                        &mut builder,
+                        &mut feed_links,
+                    );
                 }
             }
             Ok(Event::Empty(e)) => {
                 if local_name(&e) == "link" {
-                    collect_link(&e, depth_entry, base, &mut builder, &mut feed_links);
+                    let element_base =
+                        scoped_base(base_stack.last().map(String::as_str).unwrap_or(base), &e);
+                    collect_link(
+                        &e,
+                        depth_entry,
+                        &element_base,
+                        &mut builder,
+                        &mut feed_links,
+                    );
                 }
             }
             Ok(Event::Text(t)) => {
-                if let Some(field) = text_target {
+                if let Some(capture) = text_target {
                     let text = crate::unescape_xml_text(&t).unwrap_or_default();
-                    apply_text(field, &text, &mut builder);
+                    apply_text(capture.field, &text, &mut builder);
                 }
             }
             Ok(Event::CData(t)) => {
-                if let Some(field) = text_target {
+                if let Some(capture) = text_target {
                     let raw = t.into_inner();
                     let text = std::str::from_utf8(raw.as_ref()).unwrap_or("");
-                    apply_text(field, text, &mut builder);
+                    apply_text(capture.field, text, &mut builder);
                 }
             }
             Ok(Event::GeneralRef(reference)) => {
-                if let Some(field) = text_target {
+                if let Some(capture) = text_target {
                     let text = crate::unescape_xml_reference(&reference).unwrap_or_default();
-                    apply_text(field, &text, &mut builder);
+                    apply_text(capture.field, &text, &mut builder);
                 }
             }
             Ok(Event::End(e)) => {
@@ -228,17 +301,23 @@ fn parse_atom(xml: &str, base: &str) -> (Vec<OpdsEntry>, Vec<(String, String)>) 
                     } else {
                         builder = EntryBuilder::default();
                     }
+                    // 条目结束是硬边界：无论字段是否正常闭合，都不把捕获带进下一条。
+                    text_target = None;
+                } else if text_target.is_some_and(|capture| capture.depth == base_stack.len()) {
+                    // 只有字段元素自己的结束标签才收尾；嵌套内联元素的 End 保留捕获。
+                    text_target = None;
                 }
-                text_target = None;
+                if base_stack.len() > 1 {
+                    base_stack.pop();
+                }
             }
             Ok(Event::Eof) => break,
-            Err(_)
-            | Ok(Event::Comment(_))
+            // 注释 / 处理指令 / 声明 / DOCTYPE 不是元素边界：字段内的注释不能清空捕获。
+            Ok(Event::Comment(_))
             | Ok(Event::PI(_))
             | Ok(Event::Decl(_))
-            | Ok(Event::DocType(_)) => {
-                text_target = None;
-            }
+            | Ok(Event::DocType(_)) => {}
+            Err(_) => text_target = None,
         }
     }
     (entries, feed_links)
@@ -329,7 +408,13 @@ fn take_summary(raw: &mut str) -> Option<String> {
         None
     } else {
         let mut out = cleaned;
-        out.truncate(2000);
+        if out.len() > 2000 {
+            let mut end = 2000;
+            while !out.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.truncate(end);
+        }
         Some(out)
     }
 }
@@ -365,11 +450,54 @@ fn attr(e: &quick_xml::events::BytesStart<'_>, key: &str) -> Option<String> {
         let a = a.ok()?;
         let k = String::from_utf8_lossy(a.key.as_ref());
         if k.rsplit(':').next()? == key {
-            Some(String::from_utf8_lossy(&a.value).into_owned())
+            a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .ok()
+                .map(|value| value.into_owned())
         } else {
             None
         }
     })
+}
+
+/// 元素自身 XML Base 的**原文**（`xml:base`），只接受 XML 保留前缀 `xml`：
+/// 普通同名属性 `base` 不是 XML Base，不能改变解析基准。
+fn element_xml_base(e: &quick_xml::events::BytesStart<'_>) -> Option<String> {
+    e.attributes().find_map(|a| {
+        let a = a.ok()?;
+        let key = String::from_utf8_lossy(a.key.as_ref());
+        let (prefix, local) = key.rsplit_once(':')?;
+        if prefix != "xml" || local != "base" {
+            return None;
+        }
+        a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+            .ok()
+            .map(|value| value.into_owned())
+    })
+}
+
+/// 计算一个元素的作用域基准：父作用域 base 与本元素 `xml:base` 按 RFC 3986 解析。
+///
+/// 畸形引用、无法与父 base join 的值，以及非 http(s) 的基准都被忽略，退回父作用域：
+/// 绝不凭一个解析不出（或不能用于目录请求）的值去构造目标地址。退回的父 base 仍然
+/// 是文档/响应的真实地址，链接随后还要经过来源授权校验。
+fn scoped_base(parent: &str, e: &quick_xml::events::BytesStart<'_>) -> String {
+    let Some(raw) = element_xml_base(e) else {
+        return parent.to_owned();
+    };
+    // 超长原文在 join 之前拒绝：否则一个巨大 base 会先被解析、再原样进入作用域栈。
+    if raw.len() > MAX_SCOPED_BASE_BYTES {
+        return parent.to_owned();
+    }
+    match absolutize(parent, &raw) {
+        Some(base)
+            if base.len() <= MAX_SCOPED_BASE_BYTES
+                && reqwest::Url::parse(&base)
+                    .is_ok_and(|url| matches!(url.scheme(), "http" | "https")) =>
+        {
+            base
+        }
+        _ => parent.to_owned(),
+    }
 }
 
 fn collect_link(
@@ -383,7 +511,9 @@ fn collect_link(
     let rel = attr(e, "rel").unwrap_or_default();
     let typ = attr(e, "type").unwrap_or_default();
     if depth_entry == 0 {
-        feed_links.push((rel, href));
+        // feed 级 link（如 rel="search"）同样按元素作用域的 XML Base 绝对化；解析
+        // 失败时保留原文，交给既有调用方的错误路径，不在解析层猜测地址。
+        feed_links.push((rel, absolutize(base, &href).unwrap_or(href)));
         return;
     }
     let absolute = absolutize(base, &href);
@@ -425,8 +555,11 @@ pub type CredentialResolver = dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future:
 
 #[derive(Clone)]
 pub struct OpdsClient {
-    /// 每个端点的 OpenSearch atom 模板（含 `{searchTerms}`）。二次搜索跳过根目录 + 描述文件 hop。
-    search_templates: Arc<Mutex<HashMap<String, String>>>,
+    /// 每个端点的 OpenSearch atom 模板（含 `{searchTerms}` 与 Url 级 `indexOffset`/
+    /// `pageOffset`）及**发现它的描述文件地址**。模板可能是相对 `results.opds?...`：
+    /// 二次搜索必须仍以描述文件为解析基准，不能改用登记端点（否则会落到端点所在的目录下）。
+    /// 二次搜索跳过根目录 + 描述文件 hop；偏移量随结构化模板一起缓存。
+    search_templates: Arc<Mutex<HashMap<String, (SearchTemplate, String)>>>,
     /// 私有源凭据提供方。
     credential_resolver: Option<Arc<CredentialResolver>>,
     /// 注册表：用来**正向确认**某个 `sourceId` 确实是已登记的自定义 OPDS 书源，并给出它
@@ -574,20 +707,42 @@ impl OpdsClient {
         context: &OpdsRequestContext,
         url: &str,
         cap: usize,
-    ) -> Result<Vec<u8>, AppError> {
-        // 网络对部分书目站存在间歇性 TLS 重置：传输层错误单次重试（响应上限不变）。
-        match self.get_limited_once(context, url, cap).await {
-            Err(e) if e.retryable() => self.get_limited_once(context, url, cap).await,
-            other => other,
-        }
+    ) -> Result<(String, Vec<u8>), AppError> {
+        self.get_limited_with(context, url, cap, None, false).await
     }
 
-    async fn get_limited_once(
+    /// 受控读取：`transfer` 携带本次获取共享的有限速率与进度观察者。
+    /// `total_from_response` 只在「响应体就是最终产物」时置真；目录/元数据响应
+    /// 必须保持未知总大小。
+    async fn get_limited_with(
         &self,
         context: &OpdsRequestContext,
         url: &str,
         cap: usize,
-    ) -> Result<Vec<u8>, AppError> {
+        transfer: Option<&RemoteTransferContext<'_>>,
+        total_from_response: bool,
+    ) -> Result<(String, Vec<u8>), AppError> {
+        // 网络对部分书目站存在间歇性 TLS 重置：传输层错误单次重试（响应上限不变）。
+        match self
+            .get_limited_once_with(context, url, cap, transfer, total_from_response)
+            .await
+        {
+            Err(e) if e.retryable() => {
+                self.get_limited_once_with(context, url, cap, transfer, total_from_response)
+                    .await
+            }
+            other => other,
+        }
+    }
+
+    async fn get_limited_once_with(
+        &self,
+        context: &OpdsRequestContext,
+        url: &str,
+        cap: usize,
+        transfer: Option<&RemoteTransferContext<'_>>,
+        total_from_response: bool,
+    ) -> Result<(String, Vec<u8>), AppError> {
         let origin = self.validate_request_url(url, context)?;
         let mut current = origin.clone();
         for _ in 0..=MAX_REDIRECTS {
@@ -602,9 +757,11 @@ impl OpdsClient {
             if context.is_registered_custom_opds() && !context.authorizes_url(&target.url) {
                 return Err(invalid_feed("目录重定向来源不一致"));
             }
+            // 连接与响应头各有独立超时；不再设置整段请求超时，否则有限速时的
+            // 限速睡眠会被计入网络超时，大文件必然失败。
             let builder = reqwest::Client::builder()
                 .user_agent("haven/0.1")
-                .timeout(std::time::Duration::from_secs(15))
+                .connect_timeout(NETWORK_WAIT_TIMEOUT)
                 // Redirects are followed explicitly below so every hop gets
                 // a fresh URL policy and DNS decision.
                 .redirect(reqwest::redirect::Policy::none());
@@ -618,9 +775,9 @@ impl OpdsClient {
                     builder = apply_opds_auth(builder, &secret)?;
                 }
             }
-            let resp = builder
-                .send()
+            let resp = tokio::time::timeout(NETWORK_WAIT_TIMEOUT, builder.send())
                 .await
+                .map_err(|_| invalid_feed("目录服务不可达"))?
                 .map_err(|_| invalid_feed("目录服务不可达"))?;
             if resp.status().is_redirection() {
                 let location = resp
@@ -643,36 +800,73 @@ impl OpdsClient {
                     return Err(invalid_feed("目录响应超出大小上限"));
                 }
             }
+            if let (Some(transfer), true) = (transfer, total_from_response) {
+                // 一次新的产物尝试（首次读取、传输层重试或主机回退）：产物进度归零、
+                // 总大小回到未知，累计网络字节保持不变。只有一个跳转后的最终响应且
+                // 响应体就是产物时，Content-Length 才是这次尝试的整体总大小；
+                // 重定向前的 hop 不会走到这里。
+                transfer.begin_artifact_attempt();
+                transfer.set_total_bytes(resp.content_length());
+            }
             let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
             let mut stream = resp;
-            while let Some(chunk) = stream
-                .chunk()
-                .await
-                .map_err(|_| invalid_feed("目录读取中断"))?
-            {
+            loop {
+                let next = tokio::time::timeout(NETWORK_WAIT_TIMEOUT, stream.chunk())
+                    .await
+                    .map_err(|_| invalid_feed("目录读取中断"))?
+                    .map_err(|_| invalid_feed("目录读取中断"))?;
+                let Some(chunk) = next else { break };
                 if out.len().saturating_add(chunk.len()) > cap {
                     return Err(invalid_feed("目录响应超出大小上限"));
                 }
                 out.extend_from_slice(chunk.as_ref());
+                if let Some(transfer) = transfer {
+                    // 真实网络字节：限速睡眠发生在这次读取之后，不在网络超时窗口内。
+                    // 只有响应体就是最终产物时才同时计入产物进度；目录/条目元数据
+                    // 只计网络字节，绝不能冒充 EPUB 的完成度。
+                    if total_from_response {
+                        transfer.record_artifact(chunk.len() as u64).await;
+                    } else {
+                        transfer.record(chunk.len() as u64).await;
+                    }
+                }
             }
-            return Ok(out);
+            return Ok((current.to_string(), out));
         }
         Err(invalid_feed("目录重定向次数过多"))
     }
 
-    async fn get_feed(&self, context: &OpdsRequestContext, url: &str) -> Result<Vec<u8>, AppError> {
+    #[cfg(test)]
+    async fn get_feed(
+        &self,
+        context: &OpdsRequestContext,
+        url: &str,
+    ) -> Result<(String, Vec<u8>), AppError> {
         self.get_limited(context, url, FEED_CAP_BYTES).await
+    }
+
+    /// 受控目录读取：把同一次获取的 `transfer` 带到目录/条目元数据的正文读取循环。
+    /// 目录响应不是产物，`total_from_response` 保持 false（总大小未知，且不计入产物进度）。
+    async fn get_feed_with(
+        &self,
+        context: &OpdsRequestContext,
+        url: &str,
+        transfer: Option<&RemoteTransferContext<'_>>,
+    ) -> Result<(String, Vec<u8>), AppError> {
+        self.get_limited_with(context, url, FEED_CAP_BYTES, transfer, false)
+            .await
     }
 
     async fn get_feed_with_host_fallback(
         &self,
         context: &OpdsRequestContext,
         url: &str,
+        transfer: Option<&RemoteTransferContext<'_>>,
     ) -> Result<(String, Vec<u8>), AppError> {
         let mut last = None;
         for candidate in with_gutenberg_host_fallbacks(url) {
-            match self.get_feed(context, &candidate).await {
-                Ok(body) => return Ok((candidate, body)),
+            match self.get_feed_with(context, &candidate, transfer).await {
+                Ok(response) => return Ok(response),
                 Err(err) => last = Some(err),
             }
         }
@@ -685,31 +879,55 @@ impl OpdsClient {
         url: &str,
         cap: usize,
     ) -> Result<Vec<u8>, AppError> {
+        self.get_limited_with_host_fallback_with(context, url, cap, None, false)
+            .await
+    }
+
+    /// 主机回退的受控版本：所有候选主机共享同一个 `transfer`（累计网络字节与
+    /// 限速不随一次失败的主机重置）。
+    async fn get_limited_with_host_fallback_with(
+        &self,
+        context: &OpdsRequestContext,
+        url: &str,
+        cap: usize,
+        transfer: Option<&RemoteTransferContext<'_>>,
+        total_from_response: bool,
+    ) -> Result<Vec<u8>, AppError> {
         let mut last = None;
         for candidate in with_gutenberg_host_fallbacks(url) {
-            match self.get_limited(context, &candidate, cap).await {
-                Ok(body) => return Ok(body),
+            match self
+                .get_limited_with(context, &candidate, cap, transfer, total_from_response)
+                .await
+            {
+                Ok((_, body)) => return Ok(body),
                 Err(err) => last = Some(err),
             }
         }
         Err(last.unwrap_or_else(|| invalid_feed("目录服务不可达")))
     }
 
-    fn cached_template(&self, endpoint: &str) -> Option<String> {
+    /// 返回缓存的 `(模板, 描述文件地址)`。描述文件地址是相对模板的唯一解析基准。
+    fn cached_template(&self, endpoint: &str) -> Option<(SearchTemplate, String)> {
         self.search_templates
             .lock()
             .ok()
             .and_then(|g| g.get(endpoint).cloned())
     }
 
-    fn remember_template(&self, endpoint: &str, template: String) {
+    /// 连同发现模板的描述文件地址一起缓存：模板里的 `{searchTerms}` 原样保留，
+    /// 二次搜索才能在不重新访问根目录/描述文件的前提下解析出同一个结果地址；
+    /// Url 的 `indexOffset`/`pageOffset` 同样随模板缓存，二次搜索走同一套分页换算。
+    fn remember_template(&self, endpoint: &str, template: SearchTemplate, base: String) {
         if let Ok(mut g) = self.search_templates.lock() {
-            g.insert(endpoint.to_owned(), template);
+            g.insert(endpoint.to_owned(), (template, base));
         }
     }
 
-    fn apply_template(template: &str, query: &str, base: &str) -> Option<String> {
-        absolutize(base, &template.replace("{searchTerms}", &urlencode(query)))
+    /// 模板展开的唯一所有者：缓存模板与刚发现的模板都走这里。
+    ///
+    /// `None` 表示模板不可用；已发现的搜索描述不能静默退回另一个查询协议。
+    fn apply_template(template: &SearchTemplate, query: &str, base: &str) -> Option<String> {
+        expand_search_template(template, query).and_then(|expanded| absolutize(base, &expanded))
     }
 
     /// 搜索地址解析：优先缓存模板 → OpenSearch atom 模板 → Gutenberg search.opds → `?query=`。
@@ -731,36 +949,42 @@ impl OpdsClient {
         endpoint: &str,
         query: &str,
     ) -> Result<String, AppError> {
-        if let Some(tpl) = self.cached_template(endpoint) {
-            if let Some(url) = Self::apply_template(&tpl, query, endpoint) {
-                if self.is_source_url_allowed(context, endpoint, &url) {
-                    return Ok(url);
-                }
+        if let Some((tpl, base)) = self.cached_template(endpoint) {
+            let url = Self::apply_template(&tpl, query, &base)
+                .ok_or_else(|| invalid_feed("搜索描述模板含不支持的必填变量或格式无效"))?;
+            if self.is_source_url_allowed(context, endpoint, &url) {
+                return Ok(url);
             }
+            return Err(invalid_feed("搜索地址解析失败"));
         }
         // Gutenberg 的 m./www. 镜像在部分网络中的可用性不同；根目录解析
         // 也必须走同一组受控镜像回退，否则仅因根目录一次 TLS/504 波动就
         // 会把一个已经有真实搜索实现的内置来源误判为不可搜索。
         let (resolved_endpoint, root) = if is_gutenberg_endpoint(endpoint) {
-            self.get_feed_with_host_fallback(context, endpoint).await?
+            self.get_feed_with_host_fallback(context, endpoint, None)
+                .await?
         } else {
-            (endpoint.to_owned(), self.get_feed(context, endpoint).await?)
+            self.get_feed_with(context, endpoint, None).await?
         };
         let xml = std::str::from_utf8(&root).map_err(|_| invalid_feed("目录编码异常"))?;
         let (_, feed_links) = parse_atom(xml, &resolved_endpoint);
         if let Some((_, search_desc)) = feed_links.iter().find(|(rel, _)| rel == "search") {
+            // feed 级链接已按作用域 XML Base 绝对化；这里再 join 一次只用于兜住解析层
+            // 保留的畸形原文（既有错误路径），不会把绝对地址改到别的地址。
             let absolute_desc = absolutize(&resolved_endpoint, search_desc)
                 .ok_or_else(|| invalid_feed("搜索描述地址非法"))?;
             if self.is_source_url_allowed(context, endpoint, &absolute_desc)
-                && let Ok(desc) = self.get_limited(context, &absolute_desc, 256 * 1024).await
+                && let Ok((descriptor_url, desc)) =
+                    self.get_limited(context, &absolute_desc, 256 * 1024).await
             {
                 if let Some(tpl) = extract_atom_template(&String::from_utf8_lossy(&desc)) {
-                    if let Some(url) = Self::apply_template(&tpl, query, &absolute_desc) {
-                        if self.is_source_url_allowed(context, endpoint, &url) {
-                            self.remember_template(endpoint, tpl);
-                            return Ok(url);
-                        }
+                    let url = Self::apply_template(&tpl, query, &descriptor_url)
+                        .ok_or_else(|| invalid_feed("搜索描述模板含不支持的必填变量或格式无效"))?;
+                    if !self.is_source_url_allowed(context, endpoint, &url) {
+                        return Err(invalid_feed("搜索地址解析失败"));
                     }
+                    self.remember_template(endpoint, tpl, descriptor_url);
+                    return Ok(url);
                 }
             }
         }
@@ -835,19 +1059,20 @@ impl OpdsClient {
         last_err: &mut Option<AppError>,
     ) -> Option<Vec<OpdsEntry>> {
         for url in urls {
-            match self.get_feed(context, url).await {
-                Ok(body) => {
+            match self.get_feed_with(context, url, None).await {
+                Ok((resolved_url, body)) => {
                     let xml = String::from_utf8_lossy(&body);
                     if !valid_search_feed(&xml) {
                         *last_err = Some(invalid_feed("目录返回了无效的 Atom 搜索结果"));
                         continue;
                     }
-                    let mut entries: Vec<OpdsEntry> = book_candidates(parse_atom(&xml, url).0)
-                        .into_iter()
-                        .filter(|entry| {
-                            self.candidate_stays_on_source(context, source_endpoint, entry)
-                        })
-                        .collect();
+                    let mut entries: Vec<OpdsEntry> =
+                        book_candidates(parse_atom(&xml, &resolved_url).0)
+                            .into_iter()
+                            .filter(|entry| {
+                                self.candidate_stays_on_source(context, source_endpoint, entry)
+                            })
+                            .collect();
                     // 空结果同样是**成功读到的**事实：截断后返回，不再继续试下一个候选。
                     entries.truncate(limit as usize);
                     return Some(entries);
@@ -891,17 +1116,20 @@ impl OpdsClient {
         entry_page_url: &str,
     ) -> Result<OpdsEntry, AppError> {
         let context = self.request_context(source_id).await?;
-        self.fetch_entry_metadata_with(&context, entry_page_url)
+        self.fetch_entry_metadata_with(&context, entry_page_url, None)
             .await
     }
 
+    /// `transfer` 只在**显式下载**的获取上下文中存在：同一次受控获取里先读条目页、
+    /// 再读 EPUB，条目页字节必须计入同一次网络限速，但不得计入产物进度。
     async fn fetch_entry_metadata_with(
         &self,
         context: &OpdsRequestContext,
         entry_page_url: &str,
+        transfer: Option<&RemoteTransferContext<'_>>,
     ) -> Result<OpdsEntry, AppError> {
         let (page_url, body) = self
-            .get_feed_with_host_fallback(context, entry_page_url)
+            .get_feed_with_host_fallback(context, entry_page_url, transfer)
             .await?;
         let xml = String::from_utf8_lossy(&body);
         let entries = parse_atom(&xml, &page_url).0;
@@ -921,7 +1149,7 @@ impl OpdsClient {
     ) -> Result<(OpdsEntry, Vec<u8>), AppError> {
         let context = self.request_context(source_id).await?;
         let entry = self
-            .fetch_entry_metadata_with(&context, entry_page_url)
+            .fetch_entry_metadata_with(&context, entry_page_url, None)
             .await?;
         let href = entry
             .epub_href
@@ -934,9 +1162,146 @@ impl OpdsClient {
     }
 }
 
+/// 搜索调用方不传分页参数，因此模板里只出现 searchTerms 时地址与旧行为逐字节一致；
+/// 分页变量取「第 1 页」的一致默认值，避免把空串塞进 `startIndex`/`count` 造成服务端
+/// 解析失败或溢出（OpenSearch 未给 count 时的标准默认是每页 10 条，这里沿用常见的
+/// 20 条目录页大小）。`startIndex` / `startPage` 的**实际取值**由 Url 元素的
+/// `indexOffset` / `pageOffset` 抬升，见 [OpenSearch 分页偏移]。
+const OPENSEARCH_DEFAULT_COUNT: u32 = 20;
+/// Url 元素未给出 `indexOffset` / `pageOffset` 时的标准默认值（OpenSearch 1.1 规定，
+/// 显式写 `0` 同样合法并且必须照用——它表示索引/页码从 0 起计）。
+///
+/// 「OpenSearch 分页偏移」策略见 `url_paging_offsets` 与 `paging_values`：缺失 → 1，
+/// 合法整数（含 0）照用，畸形逐属性退回 1。没有分页参数时，`{startIndex}` /
+/// `{startPage}` 的取值**就是**这两个偏移本身，不再额外加 1。
+const OPENSEARCH_DEFAULT_OFFSET: u32 = 1;
+/// 展开后模板地址的长度上界：既限制输入量，也保证描述文件给出的模板不能借展开把
+/// 请求放大到任意长度。
+const MAX_TEMPLATE_EXPANDED_BYTES: usize = 8 * 1024;
+
+/// 一个可用的 OpenSearch atom 模板：模板原文 + 该 `<Url>` 元素的分页偏移。
+///
+/// 偏移是**元素级**属性，必须与模板绑定在一起传播：首次发现时用它展开搜索地址，随后
+/// 整个结构（含 base）进入缓存，二次搜索换关键字而不重新访问描述文件，也不会丢掉它。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchTemplate {
+    template: String,
+    /// OpenSearch 1.1 `indexOffset`：`{startIndex}` 的最小值。
+    index_offset: u32,
+    /// OpenSearch 1.1 `pageOffset`：`{startPage}` 的最小值。
+    page_offset: u32,
+}
+
+impl SearchTemplate {
+    /// 未声明偏移的模板：两个偏移都是标准默认 1。
+    #[cfg(test)]
+    fn bare(template: impl Into<String>) -> Self {
+        Self {
+            template: template.into(),
+            index_offset: OPENSEARCH_DEFAULT_OFFSET,
+            page_offset: OPENSEARCH_DEFAULT_OFFSET,
+        }
+    }
+}
+
+/// 读取 `<Url>` 元素上的 `indexOffset` / `pageOffset`（按 local-name 匹配，命名空间前缀
+/// 无所谓；复用既有 `attr` 解析器，属性值经 XML 规范化）。
+///
+/// [OpenSearch 分页偏移] 的确定性策略：
+/// - 属性缺失 → 默认 1（OpenSearch 1.1 规定的默认）。
+/// - 出现且去空白后是合法 u32 字面量 → 照用，包括显式 `0`（从 0 起计）。
+/// - 出现但畸形（非整数、负数、超出 u32）→ **该属性**退回默认 1；绝不猜测、
+///   绝不放过畸形值、也绝不让整份描述文件失效。搜索仍可能返回结果，只是分页起点按
+///   标准默认值计算，与旧行为逐字节一致。
+fn url_paging_offsets(e: &quick_xml::events::BytesStart<'_>) -> (u32, u32) {
+    let offset = |key: &str| -> u32 {
+        attr(e, key)
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .unwrap_or(OPENSEARCH_DEFAULT_OFFSET)
+    };
+    let index_offset = offset("indexOffset");
+    let page_offset = offset("pageOffset");
+    (index_offset, page_offset)
+}
+
+/// 按 OpenSearch 1.1 换算分页变量的取值。
+///
+/// 没有分页参数时请求的是**第一页**：`startIndex` **就是** Url 的 `indexOffset`，
+/// `startPage` **就是** `pageOffset`——OpenSearch 1.1 规定这两个属性的值即对应变量
+/// 的取值（未给出时的默认值同样是 1）。两者独立，混合偏移同样成立。
+fn paging_values(index_offset: u32, page_offset: u32) -> (u32, u32) {
+    (index_offset, page_offset)
+}
+
+/// 按 OpenSearch 1.1 语法展开搜索模板。
+///
+/// - `{searchTerms}` 与 `{searchTerms?}` → 百分号编码后的关键字。
+/// - `{count}` → 有界默认值；`{startIndex}` → `indexOffset`；`{startPage}` →
+///   `pageOffset`（两者均见 `<Url>` 元素，缺省 1）。没有分页参数时请求第一页。
+/// - `{language}` / `{inputEncoding}` / `{outputEncoding}` → 编码 `UTF-8`，语言 `*`
+///   （OpenSearch 约定的「未指定」通配）。
+/// - 其余 `{name?}` 可选变量省略；其余 `{name}` 必填变量视为模板不可用。
+/// - 花括号不配对、空变量名、变量名含非 ASCII 字母数字字符、展开结果超过
+///   `MAX_TEMPLATE_EXPANDED_BYTES` 时不可用。
+fn expand_search_template(search: &SearchTemplate, query: &str) -> Option<String> {
+    let template = search.template.as_str();
+    if template.len() > MAX_TEMPLATE_EXPANDED_BYTES || query.len() > MAX_TEMPLATE_EXPANDED_BYTES {
+        return None;
+    }
+    let terms = urlencode(query);
+    let count = OPENSEARCH_DEFAULT_COUNT.to_string();
+    // count 决定整页大小；没有分页参数时是描述文件声明的第一页。
+    let (start_index, start_page) = paging_values(search.index_offset, search.page_offset);
+    let start_index = start_index.to_string();
+    let start_page = start_page.to_string();
+    let mut out = String::with_capacity(template.len().min(MAX_TEMPLATE_EXPANDED_BYTES));
+    let mut rest = template;
+    while let Some(open) = rest.find(['{', '}']) {
+        if rest[open..].starts_with('}') {
+            return None;
+        }
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let close = after.find('}')?;
+        let (name, optional) = match after[..close].strip_suffix('?') {
+            Some(base) => (base, true),
+            None => (&after[..close], false),
+        };
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_:.-".contains(&b))
+        {
+            return None;
+        }
+        let value = match name {
+            "searchTerms" => Some(terms.as_str()),
+            "count" => Some(count.as_str()),
+            "startIndex" => Some(start_index.as_str()),
+            "startPage" => Some(start_page.as_str()),
+            "language" => Some("*"),
+            "inputEncoding" | "outputEncoding" => Some("UTF-8"),
+            _ if optional => None,
+            _ => return None,
+        };
+        if let Some(value) = value {
+            out.push_str(value);
+        }
+        if out.len() > MAX_TEMPLATE_EXPANDED_BYTES {
+            return None;
+        }
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    (out.len() <= MAX_TEMPLATE_EXPANDED_BYTES).then_some(out)
+}
+
 /// OpenSearch 描述里第一个 type 含 atom 的 `<Url template="...">`（首个命中即返回；
 /// Gutenberg 的描述文件中 text/html 与 suggestions 条目排在 atom 前后，不能取末尾）。
-fn extract_atom_template(desc: &str) -> Option<String> {
+///
+/// 分页偏移（`indexOffset` / `pageOffset`）是**同一个元素**上的属性，必须与模板一起
+/// 取出：首次发现与缓存查找都只经过这一个结构，偏移不会在两条路径上分叉。
+fn extract_atom_template(desc: &str) -> Option<SearchTemplate> {
     let mut reader = quick_xml::Reader::from_str(desc);
     loop {
         match reader.read_event() {
@@ -945,7 +1310,12 @@ fn extract_atom_template(desc: &str) -> Option<String> {
                     let typ = attr(&e, "type").unwrap_or_default();
                     if typ.contains("atom") {
                         if let Some(tpl) = attr(&e, "template") {
-                            return Some(tpl);
+                            let (index_offset, page_offset) = url_paging_offsets(&e);
+                            return Some(SearchTemplate {
+                                template: tpl,
+                                index_offset,
+                                page_offset,
+                            });
                         }
                     }
                 }
@@ -1186,7 +1556,7 @@ impl SourceCatalogProvider for OpdsCatalogProvider {
         }
         let entry = self
             .client
-            .fetch_entry_metadata_with(&context, entry_url.as_str())
+            .fetch_entry_metadata_with(&context, entry_url.as_str(), None)
             .await?;
 
         Ok(SourceCatalogEntry {
@@ -1224,6 +1594,30 @@ impl RemoteAcquisitionPort for OpdsCatalogProvider {
         remote_id: &str,
         destination: &Path,
     ) -> Result<RemoteAcquiredFile, AppError> {
+        self.acquire_inner(source_key, remote_id, destination, None)
+            .await
+    }
+
+    async fn acquire_controlled(
+        &self,
+        source_key: &str,
+        remote_id: &str,
+        destination: &Path,
+        transfer: &RemoteTransferContext<'_>,
+    ) -> Result<RemoteAcquiredFile, AppError> {
+        self.acquire_inner(source_key, remote_id, destination, Some(transfer))
+            .await
+    }
+}
+
+impl OpdsCatalogProvider {
+    async fn acquire_inner(
+        &self,
+        source_key: &str,
+        remote_id: &str,
+        destination: &Path,
+        transfer: Option<&RemoteTransferContext<'_>>,
+    ) -> Result<RemoteAcquiredFile, AppError> {
         if source_key != OPDS_SOURCE_GUTENBERG {
             return Err(AppError::new(
                 "INVALID_ARGUMENT",
@@ -1237,9 +1631,11 @@ impl RemoteAcquisitionPort for OpdsCatalogProvider {
         }
         let remote_url = validate_builtin_gutenberg_url(remote_id)?;
         let context = OpdsRequestContext::builtin_gutenberg(source_key);
+        // 条目页与 EPUB 属于**同一次**受控获取：元数据正文只计网络字节与限速，
+        // 随后 EPUB 的产物进度从 0 开始，二者绝不能相加成完成度。
         let entry = self
             .client
-            .fetch_entry_metadata_with(&context, remote_url.as_str())
+            .fetch_entry_metadata_with(&context, remote_url.as_str(), transfer)
             .await?;
         let href = entry
             .epub_href
@@ -1248,7 +1644,13 @@ impl RemoteAcquisitionPort for OpdsCatalogProvider {
         let href = validate_builtin_gutenberg_url(href)?;
         let bytes = self
             .client
-            .get_limited_with_host_fallback(&context, href.as_str(), BOOK_CAP_BYTES as usize)
+            .get_limited_with_host_fallback_with(
+                &context,
+                href.as_str(),
+                BOOK_CAP_BYTES as usize,
+                transfer,
+                true,
+            )
             .await?;
         validate_epub_payload(&bytes)?;
         let size_bytes = write_epub_atomic(destination, &bytes).await?;
@@ -1289,7 +1691,7 @@ impl RemoteSessionPort for OpdsCatalogProvider {
         let context = OpdsRequestContext::builtin_gutenberg(source_key);
         let entry = self
             .client
-            .fetch_entry_metadata_with(&context, entry_url.as_str())
+            .fetch_entry_metadata_with(&context, entry_url.as_str(), None)
             .await?;
         let epub_href = entry
             .epub_href
@@ -1360,6 +1762,41 @@ impl RemoteAcquisitionPort for RoutingRemoteAcquisitionPort {
         } else {
             self.online
                 .acquire(source_key, remote_id, destination)
+                .await
+        }
+    }
+
+    /// 受控获取必须**逐分支转发**：若落到端口默认实现，有限速率会被静默绕过。
+    async fn acquire_controlled(
+        &self,
+        source_key: &str,
+        remote_id: &str,
+        destination: &Path,
+        transfer: &RemoteTransferContext<'_>,
+    ) -> Result<RemoteAcquiredFile, AppError> {
+        if source_key == OPDS_SOURCE_GUTENBERG {
+            self.opds
+                .acquire_controlled(source_key, remote_id, destination, transfer)
+                .await
+        } else if matches!(
+            source_key,
+            haven_application::services::source_import::KOMGA_SOURCE_KEY
+                | haven_application::services::source_import::KAVITA_SOURCE_KEY
+        ) {
+            let provider = self.comic_library.as_ref().ok_or_else(|| {
+                AppError::new(
+                    "SOURCE_UNAVAILABLE",
+                    ErrorKind::Network,
+                    "自托管漫画库尚未接入当前运行实例",
+                    true,
+                )
+            })?;
+            provider
+                .acquire_controlled(source_key, remote_id, destination, transfer)
+                .await
+        } else {
+            self.online
+                .acquire_controlled(source_key, remote_id, destination, transfer)
                 .await
         }
     }
@@ -1839,6 +2276,217 @@ mod tests {
     use std::io::{Cursor, Write as _};
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
+
+    #[test]
+    fn expands_opensearch_optional_terms_and_paging_without_literal_braces() {
+        let expanded = OpdsClient::apply_template(
+            &SearchTemplate::bare(
+                "search?q={searchTerms?}&count={count?}&start={startIndex}&page={startPage?}&extra={vendor:unused?}",
+            ),
+            "a & 中",
+            "https://catalog.example.invalid/opensearch/description.xml",
+        ).unwrap();
+        let url = reqwest::Url::parse(&expanded).unwrap();
+        let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(url.path(), "/opensearch/search");
+        assert_eq!(pairs.get("q").map(String::as_str), Some("a & 中"));
+        assert_eq!(pairs.get("count").map(String::as_str), Some("20"));
+        assert_eq!(pairs.get("start").map(String::as_str), Some("1"));
+        assert_eq!(pairs.get("page").map(String::as_str), Some("1"));
+        assert_eq!(pairs.get("extra").map(String::as_str), Some(""));
+        for template in ["?q={unknown}", "?q={searchTerms", "?q=}", "?q={?}"] {
+            assert!(
+                OpdsClient::apply_template(
+                    &SearchTemplate::bare(template),
+                    "q",
+                    "https://catalog.example.invalid/"
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_opensearch_template_uses_the_same_expansion_and_reports_invalid_required_variables()
+     {
+        let endpoint = "https://catalog.example.invalid/opds";
+        let (registry, source) = seeded_opds_registry(endpoint, false).await;
+        let client = OpdsClient::new().unwrap().with_source_registry(registry);
+        let context = client.request_context(Some(&source)).await.unwrap();
+        client.remember_template(
+            endpoint,
+            SearchTemplate::bare("?q={searchTerms?}&count={count?}"),
+            endpoint.into(),
+        );
+        let url = client
+            .search_url_with(&context, endpoint, "test")
+            .await
+            .unwrap();
+        assert!(url.contains("q=test&count=20"));
+        client.remember_template(
+            endpoint,
+            SearchTemplate::bare("?q={unknownRequired}"),
+            endpoint.into(),
+        );
+        assert!(
+            client
+                .search_url_with(&context, endpoint, "test")
+                .await
+                .is_err()
+        );
+    }
+
+    /// 模板按**偏移换算后**的第一页展开：把描述文件里 `<Url>` 的 `indexOffset` /
+    /// `pageOffset` 换成结构化模板，其余路径与搜索相同。
+    ///
+    /// 首次发现与缓存命中共用这一条：模板与 base 一起缓存，偏移随结构一起保存，因此
+    /// 二次搜索（不重新访问描述文件）得到的分页起点与首次完全一致。
+    #[tokio::test]
+    async fn cached_template_keeps_url_offsets_for_later_searches() {
+        let endpoint = "https://catalog.example.invalid/opds";
+        let (registry, source) = seeded_opds_registry(endpoint, false).await;
+        let client = OpdsClient::new().unwrap().with_source_registry(registry);
+        let context = client.request_context(Some(&source)).await.unwrap();
+        let template = SearchTemplate {
+            template: "?q={searchTerms}&i={startIndex}&p={startPage}".into(),
+            index_offset: 0,
+            page_offset: 4,
+        };
+        for query in ["first", "second"] {
+            client.remember_template(endpoint, template.clone(), endpoint.into());
+            let url = client
+                .search_url_with(&context, endpoint, query)
+                .await
+                .unwrap();
+            assert_eq!(
+                url,
+                format!("{endpoint}?q={query}&i=0&p=4"),
+                "显式 0 的 indexOffset 缓存命中后仍然生效"
+            );
+        }
+    }
+
+    // ---- OpenSearch 1.1 Url 级分页偏移（indexOffset / pageOffset） ----
+    //
+    // 真实请求（根目录 → 描述文件 → 搜索结果，以及缓存命中后的第二次搜索）在
+    // `super::catalog_tests`：那里用夹具服务器抓取真实的查询串断言。这里只覆盖结构化
+    // 模板的解析、换算与畸形属性的确定性策略。
+
+    /// 描述文件里 `<Url>` 的偏移解析：缺失 → 1，显式 0 合法，混合偏移各自独立；
+    /// 没有分页参数时 `{startIndex}`/`{startPage}` 的取值**就是**偏移本身。
+    #[test]
+    fn opensearch_url_offsets_default_to_one_and_honor_explicit_zero() {
+        let page = |attrs: &str| {
+            format!(
+                r#"<?xml version="1.0"?>
+<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+  <Url type="text/html" template="results.html?q={{searchTerms}}"/>
+  <Url {attrs} type="application/atom+xml" template="results.opds?q={{searchTerms}}&amp;start={{startIndex}}&amp;page={{startPage}}"/>
+</OpenSearchDescription>"#
+            )
+        };
+        let template_of = |attrs: &str| extract_atom_template(&page(attrs)).unwrap();
+
+        // 缺失：两个偏移都是标准默认 1。
+        let defaulted = template_of("");
+        assert_eq!(
+            defaulted.template,
+            "results.opds?q={searchTerms}&start={startIndex}&page={startPage}"
+        );
+        assert_eq!((defaulted.index_offset, defaulted.page_offset), (1, 1));
+        let expanded = expand_search_template(&defaulted, "a & 中").unwrap();
+        assert_eq!(
+            expanded,
+            "results.opds?q=a%20%26%20%E4%B8%AD&start=1&page=1"
+        );
+
+        // 显式 0：完全合法，按 0 起计（不是「未声明」）。
+        let zeroed = template_of(r#"indexOffset="0" pageOffset="0""#);
+        assert_eq!((zeroed.index_offset, zeroed.page_offset), (0, 0));
+        assert_eq!(
+            expand_search_template(&zeroed, "q").unwrap(),
+            "results.opds?q=q&start=0&page=0"
+        );
+
+        // 混合偏移：startIndex/startPage 分别取各自偏移。
+        let mixed = template_of(r#"indexOffset="40" pageOffset="3""#);
+        assert_eq!((mixed.index_offset, mixed.page_offset), (40, 3));
+        assert_eq!(
+            expand_search_template(&mixed, "q").unwrap(),
+            "results.opds?q=q&start=40&page=3"
+        );
+        // 只有 pageOffset：indexOffset 保持默认 1。
+        let page_only = template_of(r#"pageOffset="7""#);
+        assert_eq!((page_only.index_offset, page_only.page_offset), (1, 7));
+        assert_eq!(
+            expand_search_template(&page_only, "q").unwrap(),
+            "results.opds?q=q&start=1&page=7"
+        );
+
+        // 属性值可以带 XML 字符引用/前导空白：规范化后去空白仍是同一个非负整数。
+        let normalized = template_of(r#"indexOffset="&#49;0" pageOffset=" 2 ""#);
+        assert_eq!((normalized.index_offset, normalized.page_offset), (10, 2));
+    }
+
+    /// 畸形偏移：**逐属性**退回默认 1，不影响另一属性、模板与模板内的其它变量。
+    #[test]
+    fn malformed_opensearch_url_offsets_fall_back_to_one_per_attribute() {
+        for (index, page, expected) in [
+            ("abc", "2", (1, 2)),
+            ("-1", "2", (1, 2)),
+            ("1.5", "2", (1, 2)),
+            ("", "2", (1, 2)),
+            ("4294967296", "2", (1, 2)), // u32 溢出
+            ("999999999999999999999", "2", (1, 2)),
+            ("3", "x", (3, 1)),
+            ("3", "page1", (3, 1)),
+            ("3", "999999999999999999999", (3, 1)),
+            ("0x10", "1", (1, 1)),
+        ] {
+            let desc = format!(
+                r#"<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/"><Url type="application/atom+xml" template="s?q={{searchTerms}}&amp;i={{startIndex}}&amp;p={{startPage}}" indexOffset="{index}" pageOffset="{page}"/></OpenSearchDescription>"#
+            );
+            let template = extract_atom_template(&desc).unwrap();
+            assert_eq!(
+                (template.index_offset, template.page_offset),
+                expected,
+                "indexOffset={index:?} pageOffset={page:?}"
+            );
+            // 模板本身仍然可用：畸形偏移只影响分页起点取值。
+            let expanded = expand_search_template(&template, "q").unwrap();
+            assert_eq!(expanded, format!("s?q=q&i={}&p={}", expected.0, expected.1));
+        }
+    }
+
+    /// 偏移只取 atom 类型的 `<Url>`：排在它前面的 text/html 条目上的偏移不得混用；
+    /// u32::MAX 原样展开；可选/必填变量的既有行为不变。
+    #[test]
+    fn opensearch_offsets_bind_to_the_atom_url_and_keep_variable_rules() {
+        let desc = r#"<OpenSearchDescription>
+  <Url type="text/html" template="results.html?q={searchTerms}" indexOffset="99" pageOffset="99"/>
+  <Url type="application/atom+xml" template="results.opds?q={searchTerms}&amp;s={startIndex}&amp;p={startPage?}&amp;c={count?}" indexOffset="4294967295" pageOffset="0"/>
+</OpenSearchDescription>"#;
+        let template = extract_atom_template(desc).unwrap();
+        assert_eq!((template.index_offset, template.page_offset), (u32::MAX, 0));
+        assert_eq!(
+            expand_search_template(&template, "x").unwrap(),
+            format!("results.opds?q=x&s={}&p=0&c=20", u32::MAX)
+        );
+        assert!(extract_atom_template(
+            r#"<OpenSearchDescription><Url type="text/html" template="x?q={searchTerms}"/></OpenSearchDescription>"#
+        )
+        .is_none());
+        let required = extract_atom_template(
+            r#"<OpenSearchDescription><Url type="application/atom+xml" template="x?q={vendorRequired}"/></OpenSearchDescription>"#,
+        )
+        .unwrap();
+        assert!(expand_search_template(&required, "x").is_none());
+        let optional = extract_atom_template(
+            r#"<OpenSearchDescription><Url type="application/atom+xml" template="x?q={searchTerms}&amp;v={vendorOptional?}"/></OpenSearchDescription>"#,
+        )
+        .unwrap();
+        assert_eq!(expand_search_template(&optional, "x").unwrap(), "x?q=x&v=");
+    }
 
     #[test]
     fn builtin_gutenberg_policy_rejects_untrusted_urls() {

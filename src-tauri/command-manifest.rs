@@ -139,6 +139,11 @@ define_commands!(
         commands::agent::agent_settings_proposal_get
     ),
     (
+        "agent_settings_proposal_list",
+        "allow-agent-settings-proposal-list",
+        commands::agent::agent_settings_proposal_list
+    ),
+    (
         "agent_settings_proposal_reject",
         "allow-agent-settings-proposal-reject",
         commands::agent::agent_settings_proposal_reject
@@ -401,6 +406,16 @@ define_commands!(
         "download_reveal_offline",
         "allow-download-reveal-offline",
         commands::download::download_reveal_offline
+    ),
+    (
+        "download_delete_offline_resource",
+        "allow-download-delete-offline-resource",
+        commands::download::download_delete_offline_resource
+    ),
+    (
+        "download_reveal_offline_resource",
+        "allow-download-reveal-offline-resource",
+        commands::download::download_reveal_offline_resource
     ),
     (
         "download_subscribe",

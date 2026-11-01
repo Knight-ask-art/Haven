@@ -613,6 +613,26 @@ impl SourceRegistryService {
         Ok(self.custom_source(source_id).await?.map(|c| c.endpoint))
     }
 
+    /// Read enablement without health projection or configuration writes.
+    pub async fn is_enabled(&self, source_id: &str) -> Result<bool, AppError> {
+        Ok(enabled_from_payload(&self.payload().await?).contains(source_id))
+    }
+
+    /// Enablement and endpoint belong to the same configuration snapshot.
+    pub async fn enabled_endpoint(&self, source_id: &str) -> Result<Option<String>, AppError> {
+        let payload = self.payload().await?;
+        if !enabled_from_payload(&payload).contains(source_id) {
+            return Ok(None);
+        }
+        Ok(payload.endpoints.get(source_id).cloned().or_else(|| {
+            payload
+                .custom_sources
+                .iter()
+                .find(|source| source.source_id == source_id)
+                .map(|source| source.endpoint.clone())
+        }))
+    }
+
     /// 由 `sourceId` 前缀恢复的**自定义**来源种类（非 `custom_` 家族返回 `None`）。
     ///
     /// 前缀是注册表生成 `sourceId` 时唯一决定种类的地方，因此这个判定与持久化记录里的
@@ -900,8 +920,7 @@ impl SourceRegistryService {
             return Err(invalid_argument("显示名不能为空且不超过 100 字符"));
         }
         let normalized = match kind {
-            CustomSourceKind::Opds => validate_user_provided_endpoint(endpoint)?
-                .ok_or_else(|| invalid_argument("端点地址不能为空"))?,
+            CustomSourceKind::Opds => validate_opds_endpoint(endpoint)?,
             CustomSourceKind::Feed => validate_feed_endpoint(endpoint)?,
             CustomSourceKind::Komga | CustomSourceKind::Kavita => {
                 validate_comic_library_endpoint(endpoint)?
@@ -1007,8 +1026,7 @@ impl SourceRegistryService {
                         ));
                     }
                     let next = match record.kind {
-                        CustomSourceKind::Opds => validate_user_provided_endpoint(endpoint)?
-                            .ok_or_else(|| invalid_argument("端点地址不能为空"))?,
+                        CustomSourceKind::Opds => validate_opds_endpoint(endpoint)?,
                         CustomSourceKind::Feed => validate_feed_endpoint(endpoint)?,
                         CustomSourceKind::Komga | CustomSourceKind::Kavita => {
                             validate_comic_library_endpoint(endpoint)?
@@ -1201,6 +1219,12 @@ fn validate_user_provided_endpoint(raw: &str) -> Result<Option<String>, AppError
     validate_source_endpoint_with(raw, HttpUrlPolicy::UserProvidedSource)
 }
 
+/// OPDS 目录路径必须原样保留：尾斜杠既决定服务端路由，也决定相对链接的基址。
+fn validate_opds_endpoint(raw: &str) -> Result<String, AppError> {
+    validate_user_provided_endpoint(raw)?.ok_or_else(|| invalid_argument("端点地址不能为空"))?;
+    Ok(raw.trim().to_owned())
+}
+
 fn validate_source_endpoint_with(
     raw: &str,
     policy: HttpUrlPolicy,
@@ -1236,15 +1260,18 @@ fn endpoint_validator(source_id: &str) -> fn(&str) -> Result<Option<String>, App
 /// M3U 地址由用户提供，因而可指向本机/局域网及任意非零端口。
 /// 带 query 的播放列表 URL 可能包含访问令牌，因此只允许 HTTPS 承载 query。
 fn validate_m3u_playlist_endpoint(raw: &str) -> Result<Option<String>, AppError> {
-    let endpoint = validate_user_provided_endpoint(raw)?;
-    if let Some(endpoint) = endpoint.as_deref() {
-        let parsed = parse_http_url(endpoint, HttpUrlPolicy::UserProvidedSource)
-            .map_err(|_| invalid_endpoint())?;
-        if parsed.as_url().query().is_some() && parsed.as_url().scheme() != "https" {
-            return Err(invalid_argument("带查询参数的 M3U 地址必须使用 HTTPS"));
-        }
+    if validate_user_provided_endpoint(raw)?.is_none() {
+        return Ok(None);
     }
-    Ok(endpoint)
+    // A playlist is a complete request URL, not a base URL. Preserve path
+    // delimiters and query values after validation, including a trailing '/'.
+    let endpoint = raw.trim();
+    let parsed = parse_http_url(endpoint, HttpUrlPolicy::UserProvidedSource)
+        .map_err(|_| invalid_endpoint())?;
+    if parsed.as_url().query().is_some() && parsed.as_url().scheme() != "https" {
+        return Err(invalid_argument("带查询参数的 M3U 地址必须使用 HTTPS"));
+    }
+    Ok(Some(endpoint.to_owned()))
 }
 
 /// TVBox / FongMi 配置地址：在**用户提供来源**策略之上只放宽**长度**，不改任何安全判定。
@@ -1339,7 +1366,7 @@ fn validate_scoped_user_endpoint(
 /// 自定义源种类 → 能力投影（契约 §36.2 的 `kinds`）。
 fn custom_kind_kinds(kind: CustomSourceKind) -> &'static [SourceKindDto] {
     match kind {
-        CustomSourceKind::Opds => &[SourceKindDto::Search, SourceKindDto::OfflineDownload],
+        CustomSourceKind::Opds => &[SourceKindDto::Search],
         CustomSourceKind::Feed => &[
             SourceKindDto::Search,
             SourceKindDto::OnlineRead,
@@ -1369,7 +1396,9 @@ fn custom_kind_categories(kind: CustomSourceKind) -> &'static [SourceCategoryDto
 /// 自定义源种类 → 设置页固定安全文案（不得包含端点或凭据）。
 fn custom_kind_notes(kind: CustomSourceKind) -> &'static str {
     match kind {
-        CustomSourceKind::Opds => "这是你添加的自定义 OPDS 书库；可在下方编辑地址或配置访问凭据。",
+        CustomSourceKind::Opds => {
+            "这是你添加的自定义 OPDS 书库；当前仅支持搜索，正文导入与下载尚未开放。可编辑地址或配置访问凭据。"
+        }
         CustomSourceKind::Feed => {
             "这是你添加的 RSS/Atom 订阅源；Haven 只读取该订阅源自身提供的条目内容，不会打开条目链接指向的网页。地址必须使用 HTTPS，且不能带查询串。"
         }
@@ -2001,7 +2030,7 @@ mod tests {
         let (service, source_id) = seeded_custom_source().await;
         assert!(source_id.starts_with(CUSTOM_SOURCE_PREFIX));
 
-        // 注册表合并投影：默认停用、端点已配置、kinds 为 search+offline_download。
+        // 注册表合并投影：默认停用、端点已配置；自定义 OPDS 当前仅支持搜索。
         let registry = service.list().await.unwrap();
         let custom = registry
             .sources
@@ -2488,7 +2517,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_opds_sources_keep_their_existing_behaviour() {
+    async fn custom_opds_sources_advertise_only_supported_search_capability() {
         let service = service_from_memory();
         let opds = service
             .add_custom_source("书源", "http://example.invalid/opds/")
@@ -2503,10 +2532,8 @@ mod tests {
             .find(|source| source.source_id == opds.source_id)
             .unwrap();
         assert_eq!(descriptor.categories, vec![SourceCategoryDto::Book]);
-        assert_eq!(
-            descriptor.kinds,
-            vec![SourceKindDto::Search, SourceKindDto::OfflineDownload]
-        );
+        assert_eq!(descriptor.kinds, vec![SourceKindDto::Search]);
+        assert!(descriptor.notes.contains("当前仅支持搜索"));
     }
 
     /// 用户提供端点的来源（自定义 OPDS/订阅源/漫画库/TVBox 配置、CMS10）保存时接受任意

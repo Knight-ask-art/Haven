@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import type { ReactNode } from "react"
-import { Check, Info, LockKeyhole, MoreHorizontal, Plus, Search, Settings2, TriangleAlert } from "lucide-react"
+import { Check, Info, LockKeyhole, MoreHorizontal, Plus, Search, Settings2, Trash2, TriangleAlert } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { toHavenError, type HavenError } from "@/lib/ipc/errors"
 import { useNotice } from "@/app/notice-center/notice-context"
@@ -242,6 +242,7 @@ function M3uEndpointRow({
 }
 
 export function SourcesSettings({ showNotice }: { showNotice: (message: string) => void }) {
+  const { confirm } = useNotice()
   const [registry, setRegistry] = useState<SourceRegistryDto | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [loadError, setLoadError] = useState<HavenError | null>(null)
@@ -253,6 +254,9 @@ export function SourcesSettings({ showNotice }: { showNotice: (message: string) 
   const [tvboxOpenRequest, setTvboxOpenRequest] = useState(0)
   const addMenuRef = useRef<HTMLDivElement>(null)
   const loadEpochRef = useRef(0)
+  const mountedRef = useRef(true)
+  const removingRef = useRef<string | null>(null)
+  const [removingId, setRemovingId] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     const epoch = ++loadEpochRef.current
@@ -269,9 +273,37 @@ export function SourcesSettings({ showNotice }: { showNotice: (message: string) 
   }, [])
 
   useEffect(() => {
+    mountedRef.current = true
     void load()
-    return () => { loadEpochRef.current += 1 }
+    return () => { mountedRef.current = false; loadEpochRef.current += 1 }
   }, [load])
+
+  const removeCustomSource = async (sourceId: string) => {
+    if (removingRef.current !== null) return
+    removingRef.current = sourceId
+    setRemovingId(sourceId)
+    let attempted = false
+    try {
+      const confirmed = await confirm({
+        title: "删除自定义来源",
+        message: "删除该自定义来源？系统凭据与本机保存的来源配置将一并清理。",
+        confirmLabel: "删除",
+        cancelLabel: "取消",
+        dedupeKey: `settings:source:${sourceId}:remove-confirm`,
+      })
+      if (!confirmed || !mountedRef.current) return
+      attempted = true
+      await removeSource({ sourceId })
+      if (mountedRef.current) showNotice("来源已删除")
+    } catch (error) {
+      if (mountedRef.current) showNotice(toHavenError(error).dto.userMessage)
+    } finally {
+      // 清理失败前记录可能已撤销；同一次回源也覆盖 TVBox 的配置缓存清理失败。
+      if (attempted && mountedRef.current) await load()
+      removingRef.current = null
+      if (mountedRef.current) setRemovingId(null)
+    }
+  }
 
   useEffect(() => {
     if (!addMenuOpen) return undefined
@@ -333,7 +365,7 @@ export function SourcesSettings({ showNotice }: { showNotice: (message: string) 
         <div ref={addMenuRef} className="relative">
           <button
             type="button"
-            disabled={registry === null || loadError !== null}
+            disabled={registry === null || loadError !== null || removingId !== null}
             aria-haspopup="menu"
             aria-expanded={addMenuOpen}
             onClick={() => setAddMenuOpen((open) => !open)}
@@ -417,7 +449,7 @@ export function SourcesSettings({ showNotice }: { showNotice: (message: string) 
               <BuiltinSourceRow
                 key={source.sourceId}
                 source={source}
-                toggling={isLoading || loadError !== null || togglingId === source.sourceId}
+                toggling={isLoading || loadError !== null || removingId !== null || togglingId === source.sourceId}
                 onToggle={() => toggleSource(source)}
                 showNotice={showNotice}
                 onChanged={() => { void load() }}
@@ -428,7 +460,8 @@ export function SourcesSettings({ showNotice }: { showNotice: (message: string) 
               category={category}
               searchQuery={sourceQuery}
               requestedAddKind={customAddRequest}
-              unavailable={isLoading || loadError !== null}
+              unavailable={isLoading || loadError !== null || removingId !== null}
+              onRemove={removeCustomSource}
               onAddRequestConsumed={() => setCustomAddRequest(null)}
               showEmptyState={false}
               showNotice={showNotice}
@@ -448,7 +481,14 @@ export function SourcesSettings({ showNotice }: { showNotice: (message: string) 
                   capabilityLabel="已导入配置 · 影视搜索与播放未接入"
                   statusLabel="暂不可用"
                   statusHint="当前版本不支持启用"
-                  controls={<span className="rounded-full bg-[var(--haven-settings-control)] px-2.5 py-1 text-[10px] font-medium text-[var(--haven-settings-muted)]">只读</span>}
+                  controls={(
+                    <>
+                      <span className="rounded-full bg-[var(--haven-settings-control)] px-2.5 py-1 text-[10px] font-medium text-[var(--haven-settings-muted)]">只读</span>
+                      <button type="button" aria-label={`删除来源：${source.displayName}`} disabled={isLoading || loadError !== null || removingId !== null} onClick={() => { void removeCustomSource(source.sourceId) }} className="flex h-[28px] w-[28px] shrink-0 items-center justify-center rounded-lg text-[var(--haven-settings-danger)] hover:bg-[var(--haven-settings-card-hover)] disabled:opacity-50">
+                        <Trash2 className="h-[14px] w-[14px]" aria-hidden="true" />
+                      </button>
+                    </>
+                  )}
                 />
               )}
               showNotice={showNotice}
@@ -704,6 +744,7 @@ function CustomSourceManager({
   searchQuery,
   requestedAddKind,
   unavailable = false,
+  onRemove,
   onAddRequestConsumed,
   showEmptyState = true,
   showNotice,
@@ -714,12 +755,12 @@ function CustomSourceManager({
   searchQuery: string
   requestedAddKind: SourceAddKind | null
   unavailable?: boolean
+  onRemove: (sourceId: string) => Promise<void>
   onAddRequestConsumed: () => void
   showEmptyState?: boolean
   showNotice: (message: string) => void
   onChanged: () => void
 }) {
-  const { confirm } = useNotice()
   const [adding, setAdding] = useState(false)
   const [addStep, setAddStep] = useState<"details" | "credential" | "done">("details")
   const [addKind, setAddKind] = useState<SourceAddKind>("opds")
@@ -839,26 +880,6 @@ function CustomSourceManager({
       showNotice(toHavenError(error).dto.userMessage)
     } finally {
       setSubmitting(false)
-    }
-  }
-
-  const submitRemove = async (sourceId: string) => {
-    const confirmed = await confirm({
-      title: "删除自定义来源",
-      message: "删除该自定义来源？其凭据将从系统凭据管理器一并清除。",
-      confirmLabel: "删除",
-      cancelLabel: "取消",
-      dedupeKey: `settings:source:${sourceId}:remove-confirm`,
-    })
-    if (!confirmed) return
-    try {
-      await removeSource({ sourceId })
-      showNotice("来源已删除")
-    } catch (error) {
-      showNotice(toHavenError(error).dto.userMessage)
-    } finally {
-      // 外部清理失败前，来源记录可能已原子撤销；回源读取，不从异常推断旧状态。
-      onChanged()
     }
   }
 
@@ -1058,7 +1079,7 @@ function CustomSourceManager({
                       setCredentialConfigured(source.credentialConfigured)
                       setCredentialError(null)
                     }}
-                    onRemove={() => { void submitRemove(source.sourceId) }}
+                    onRemove={() => { void onRemove(source.sourceId) }}
                   />
                 </>
               )}

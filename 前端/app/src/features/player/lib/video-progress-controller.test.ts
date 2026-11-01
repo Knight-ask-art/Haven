@@ -24,6 +24,18 @@ describe("video progress controller", () => {
   it("uses ended position and completed", async () => {
     const save = vi.fn().mockResolvedValue({ revision: "r1" }); const c = createVideoProgressController({ session: session(), save }); await c.ended(7.25); expect(save).toHaveBeenCalledWith(expect.objectContaining({ completion: "completed", locator: expect.objectContaining({ data: { positionMs: 7250 } }) }))
   })
+  it("keeps a completed session completed on ordinary pause and seek", async () => {
+    const done = session({ mediaItemId: session().mediaItemId, completion: "completed", progressRatio: 1, revision: "progress-rev-done", updatedAt: "2026-08-18T00:00:00.000Z", locator: { version: 1, kind: "video", data: { positionMs: 40_000 } } })
+    const save = vi.fn().mockResolvedValue({ revision: "r1" }); const c = createVideoProgressController({ session: done, save })
+    await c.pause(10); await c.seeked(20)
+    expect(save).toHaveBeenNthCalledWith(1, expect.objectContaining({ completion: "completed" }))
+    expect(save).toHaveBeenNthCalledWith(2, expect.objectContaining({ completion: "completed" }))
+
+    const saveReset = vi.fn().mockResolvedValue({ revision: "r1" })
+    const reset = createVideoProgressController({ session: session({ ...done.progress!, completion: "not_started" }), save: saveReset })
+    await reset.pause(10)
+    expect(saveReset).toHaveBeenCalledWith(expect.objectContaining({ completion: "in_progress" }))
+  })
   it("queues only the latest update while a save is in flight", async () => {
     let resolveFirst!: (value: { revision: string }) => void
     const save = vi.fn()

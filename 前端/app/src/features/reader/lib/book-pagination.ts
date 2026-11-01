@@ -211,11 +211,10 @@ export function alignBookOffsetToPage(
   const metrics = getBookPaginationMetrics(viewport, mode)
   if (metrics.pageCount <= 1) return 0
   const pageStride = Math.max(1, viewport.clientWidth)
-  const normalIndex = clamp(Math.round(offset / pageStride), 0, metrics.pageCount - 1)
-  const normal = offsetForPage(normalIndex, metrics.pageCount, pageStride, metrics.maxOffset)
-  const distanceNormal = Math.abs(offset - normal)
-  const distanceLast = Math.abs(offset - metrics.maxOffset)
-  return distanceLast < distanceNormal ? metrics.maxOffset : normal
+  // An anchor belongs to the spread containing it, including its right column.
+  // Nearest-snap rounding can move that column off the left of the viewport.
+  const normalIndex = clamp(Math.floor(offset / pageStride), 0, metrics.pageCount - 1)
+  return offsetForPage(normalIndex, metrics.pageCount, pageStride, metrics.maxOffset)
 }
 
 /** Return the offset for a relative page/spread move. */

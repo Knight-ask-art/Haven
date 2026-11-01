@@ -222,11 +222,17 @@ fn extract_epub_content(path: &Path) -> Result<RawBookContent, AppError> {
             return Err(policy_denied("EPUB 正文总大小超过安全限制"));
         }
         let html = String::from_utf8(bytes).map_err(|_| format_unsupported())?;
-        let plain = html_to_plain_text(&html);
+        // Crop Project Gutenberg header/footer boilerplate exactly like the
+        // frontend reader (`trimGutenbergBoilerplate`), then derive both the
+        // plain text and the title from the surviving document. Otherwise the
+        // paragraph indexes computed here would address different paragraphs
+        // than the ones the reader renders.
+        let trimmed = trim_gutenberg_boilerplate(&html);
+        let plain = html_to_plain_text(trimmed);
         if plain.trim().is_empty() {
             continue;
         }
-        let paragraphs: Vec<String> = plain
+        let mut paragraphs: Vec<String> = plain
             .split("\n\n")
             .map(|p| p.replace('\n', " ").trim().to_string())
             .filter(|p| !p.is_empty())
@@ -234,7 +240,17 @@ fn extract_epub_content(path: &Path) -> Result<RawBookContent, AppError> {
         if paragraphs.is_empty() {
             continue;
         }
-        let title = extract_title(&html).unwrap_or_else(|| format!("第 {} 章", idx + 1));
+        let title = extract_title(trimmed).unwrap_or_else(|| format!("第 {} 章", idx + 1));
+        // The frontend reader drops the leading heading paragraph when it is
+        // the chapter title (`chapterFromXhtml`). Mirror that shape so search
+        // paragraph indexes address the same DOM nodes, without offset hacks
+        // in the caller.
+        if paragraphs.first().is_some_and(|first| first == &title) {
+            paragraphs.remove(0);
+        }
+        if paragraphs.is_empty() {
+            continue;
+        }
         chapters.push(RawChapter {
             id: format!("epub-chapter-{}", idx + 1),
             title,
@@ -242,6 +258,125 @@ fn extract_epub_content(path: &Path) -> Result<RawBookContent, AppError> {
         });
     }
     Ok(RawBookContent { chapters })
+}
+
+/// Crop Project Gutenberg front/back matter the same way the frontend reader
+/// does. Only the genuine `*** START OF … ***` / `*** END OF THE PROJECT
+/// GUTENBERG EBOOK …` markers crop a document: prose that merely mentions the
+/// Project Gutenberg name stays searchable, and a document is skipped only
+/// when cropping leaves no text at all. Markers are usually wrapped in an HTML
+/// comment, so the enclosing comment bounds are resolved before slicing to
+/// avoid leaving an unterminated comment (or a stray `-->`) behind.
+fn trim_gutenberg_boilerplate(html: &str) -> &str {
+    let mut body = html;
+    if let Some((marker_start, marker_end)) = find_pg_start_marker(body) {
+        let cut = match enclosing_comment_end(body, marker_start) {
+            Some(comment_end) if comment_end > marker_end => comment_end,
+            _ => marker_end,
+        };
+        body = &body[cut..];
+    }
+    if let Some(marker_start) = find_pg_end_marker(body) {
+        let cut = enclosing_comment_start(body, marker_start).unwrap_or(marker_start);
+        body = &body[..cut];
+    }
+    body
+}
+
+/// `\*{3}\s*START OF (?:THE|THIS) PROJECT GUTENBERG EBOOK\b[^\r\n]{0,200}?\*{3}`
+/// Returns the byte range of the first genuine marker. Matching runs on an
+/// ASCII-lowercased copy, which keeps byte offsets identical to `html`.
+fn find_pg_start_marker(html: &str) -> Option<(usize, usize)> {
+    let lower = html.to_ascii_lowercase();
+    let mut search = 0usize;
+    while let Some(relative) = lower[search..].find("***") {
+        let stars = search + relative;
+        let after_stars = skip_whitespace(&lower, stars + 3);
+        for phrase in [
+            "start of the project gutenberg ebook",
+            "start of this project gutenberg ebook",
+        ] {
+            let after_phrase = after_stars + phrase.len();
+            if lower[after_stars..].starts_with(phrase) && is_word_boundary(&lower, after_phrase) {
+                if let Some(end) = find_marker_close(&lower, after_phrase) {
+                    return Some((stars, end));
+                }
+            }
+        }
+        search = stars + 3;
+    }
+    None
+}
+
+/// `\*{3}\s*END OF THE PROJECT GUTENBERG EBOOK` — returns the marker start.
+fn find_pg_end_marker(html: &str) -> Option<usize> {
+    let lower = html.to_ascii_lowercase();
+    let mut search = 0usize;
+    while let Some(relative) = lower[search..].find("***") {
+        let stars = search + relative;
+        let after_stars = skip_whitespace(&lower, stars + 3);
+        if lower[after_stars..].starts_with("end of the project gutenberg ebook") {
+            return Some(stars);
+        }
+        search = stars + 3;
+    }
+    None
+}
+
+/// `[^\r\n]{0,200}?\*{3}` — the earliest closing marker on the same line.
+fn find_marker_close(text: &str, from: usize) -> Option<usize> {
+    let mut cursor = from;
+    let mut consumed = 0usize;
+    while consumed <= 200 {
+        if text[cursor..].starts_with("***") {
+            return Some(cursor + 3);
+        }
+        let character = text[cursor..].chars().next()?;
+        if character == '\r' || character == '\n' {
+            return None;
+        }
+        cursor += character.len_utf8();
+        consumed += 1;
+    }
+    None
+}
+
+fn skip_whitespace(text: &str, mut cursor: usize) -> usize {
+    while let Some(character) = text[cursor..].chars().next() {
+        if !character.is_whitespace() {
+            break;
+        }
+        cursor += character.len_utf8();
+    }
+    cursor
+}
+
+/// `\b` for the ASCII markers: the next character must not continue a word.
+fn is_word_boundary(text: &str, index: usize) -> bool {
+    match text[index..].chars().next() {
+        Some(character) => !(character.is_ascii_alphanumeric() || character == '_'),
+        None => true,
+    }
+}
+
+/// Byte offset just past the comment enclosing `index`, when there is one.
+fn enclosing_comment_end(html: &str, index: usize) -> Option<usize> {
+    enclosing_comment_start(html, index)?;
+    let comment_end = html[index..].find("-->")?;
+    Some(index + comment_end + 3)
+}
+
+/// Byte offset of the `<!--` enclosing `index`, when `index` is inside a
+/// comment rather than after a completed one.
+fn enclosing_comment_start(html: &str, index: usize) -> Option<usize> {
+    let comment_start = html[..index].rfind("<!--")?;
+    if html[..index]
+        .rfind("-->")
+        .is_some_and(|end| end > comment_start)
+    {
+        return None;
+    }
+    Some(comment_start)
 }
 
 /// Convert untrusted XHTML to the same paragraph-preserving plain-text shape
@@ -433,21 +568,42 @@ fn normalize_html_text(text: &str) -> String {
 }
 
 fn extract_title(html: &str) -> Option<String> {
-    for tag in ["h1", "h2", "h3", "title"] {
-        let lower = html.to_lowercase();
-        if let Some(start) = lower.find(&format!("<{tag}")) {
-            if let Some(tag_end) = lower[start..].find('>') {
-                let content_start = start + tag_end + 1;
-                if let Some(end) = lower[content_start..].find(&format!("</{tag}>")) {
-                    let raw = &html[content_start..content_start + end];
-                    let plain = html_to_plain_text(raw);
-                    let first_line = plain.lines().next().unwrap_or("").trim();
-                    if !first_line.is_empty() {
-                        return Some(first_line.chars().take(160).collect());
-                    }
-                }
-            }
+    ["h1", "h2", "h3", "title"]
+        .iter()
+        .find_map(|tag| extract_tag_text(html, tag))
+}
+
+/// Mirrors the frontend `<h1\b[^>]*>…</h1>` scan: the opening tag must end at a
+/// real tag-name boundary, so `<h10>` is not mistaken for `<h1>`. As in the
+/// frontend, the first boundary-valid opening tag decides that tag name; an
+/// empty candidate falls through to the next tag in h1 → h2 → h3 → title order.
+fn extract_tag_text(html: &str, tag: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let opening = format!("<{tag}");
+    let closing = format!("</{tag}>");
+    let mut cursor = 0usize;
+    while let Some(relative) = lower[cursor..].find(&opening) {
+        let after_name = cursor + relative + opening.len();
+        cursor = after_name;
+        let boundary = lower[after_name..].chars().next().is_some_and(|character| {
+            character.is_ascii_whitespace() || character == '>' || character == '/'
+        });
+        if !boundary {
+            continue;
         }
+        let tag_end = lower[after_name..].find('>')?;
+        let content_start = after_name + tag_end + 1;
+        let Some(content_end) = lower[content_start..].find(&closing) else {
+            // An unterminated candidate leaves the regex engine scanning for a
+            // later, complete opening/closing pair.
+            continue;
+        };
+        let plain = html_to_plain_text(&html[content_start..content_start + content_end]);
+        let first_line = plain.lines().next().unwrap_or("").trim();
+        if first_line.is_empty() {
+            return None;
+        }
+        return Some(first_line.chars().take(160).collect());
     }
     None
 }

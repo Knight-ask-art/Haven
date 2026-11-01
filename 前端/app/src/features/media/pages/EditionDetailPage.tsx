@@ -6,9 +6,10 @@ import type { EditionDetailDto, MediaItemSummaryDto } from "@/lib/ipc/generated/
 import { HavenError } from "@/lib/ipc/errors"
 import { getHavenClientMode } from "@/lib/ipc/runtime"
 import {
-  createDownloadForMediaItem,
   getMediaItemDownloadInfo,
   getMediaItemsDownloadInfo,
+  presentMediaItemDownloadAction,
+  startDownloadFromProjection,
   subscribeDownloadEvents,
   type MediaItemDownloadInfo,
 } from "@/features/downloads/ipc/download-gateway"
@@ -49,6 +50,8 @@ export function EditionDetailPage() {
   const requestSequence = useRef(0)
   const capabilityGeneration = useRef(0)
   const capabilityRequests = useRef(new Map<string, number>())
+  const capabilityInFlight = useRef(new Map<string, number>())
+  const capabilityDirty = useRef(new Map<string, number>())
   const capabilitiesRef = useRef<Record<string, ItemCapability>>({})
   const [capabilities, setCapabilities] = useState<Record<string, ItemCapability>>({})
   const [downloadPending, setDownloadPending] = useState<Record<string, boolean>>({})
@@ -78,20 +81,20 @@ export function EditionDetailPage() {
   }, [load])
 
   useEffect(() => {
-    capabilitiesRef.current = capabilities
-  }, [capabilities])
-
-  useEffect(() => {
     const generation = ++capabilityGeneration.current
     capabilityRequests.current.clear()
+    capabilityInFlight.current.clear()
+    capabilityDirty.current.clear()
     setDownloadPending({})
     setDownloadErrors({})
     if (!detail || detail.items.length === 0) {
+      capabilitiesRef.current = {}
       setCapabilities({})
       return
     }
 
     const ids = detail.items.map((item) => item.mediaItemId)
+    const revisions = new Map(ids.map((id) => [id, capabilityRequests.current.get(id) ?? 0]))
     const initial: Record<string, ItemCapability> = {}
     for (const id of ids) initial[id] = { info: null, failed: false }
     capabilitiesRef.current = initial
@@ -108,7 +111,9 @@ export function EditionDetailPage() {
           // forever, and an empty projection would claim the item has no
           // resource.
           const info = projected.get(id)
-          next[id] = info ? { info, failed: false } : { info: null, failed: true }
+          next[id] = (capabilityRequests.current.get(id) ?? 0) === revisions.get(id)
+            ? info ? { info, failed: false } : { info: null, failed: true }
+            : capabilitiesRef.current[id]
         }
         capabilitiesRef.current = next
         setCapabilities(next)
@@ -116,31 +121,55 @@ export function EditionDetailPage() {
       .catch(() => {
         if (capabilityGeneration.current !== generation) return
         const next: Record<string, ItemCapability> = {}
-        for (const id of ids) next[id] = { info: null, failed: true }
+        for (const id of ids) next[id] = (capabilityRequests.current.get(id) ?? 0) === revisions.get(id)
+          ? { info: null, failed: true }
+          : capabilitiesRef.current[id]
         capabilitiesRef.current = next
         setCapabilities(next)
       })
+    return () => {
+      if (capabilityGeneration.current === generation) capabilityGeneration.current += 1
+    }
   }, [detail])
 
   const refreshItemCapability = useCallback(async (mediaItemId: string, generation = capabilityGeneration.current) => {
+    if (capabilityGeneration.current !== generation) return null
+    if (capabilityInFlight.current.get(mediaItemId) === generation) {
+      capabilityDirty.current.set(mediaItemId, generation)
+      return null
+    }
+    capabilityInFlight.current.set(mediaItemId, generation)
     const requestId = (capabilityRequests.current.get(mediaItemId) ?? 0) + 1
     capabilityRequests.current.set(mediaItemId, requestId)
-    setCapabilities((current) => ({ ...current, [mediaItemId]: { info: null, failed: false } }))
+    const apply = (capability: ItemCapability) => {
+      const next = { ...capabilitiesRef.current, [mediaItemId]: capability }
+      capabilitiesRef.current = next
+      setCapabilities(next)
+    }
+    apply({ info: null, failed: false })
     try {
       const info = await getMediaItemDownloadInfo(mediaItemId)
       if (
         capabilityGeneration.current !== generation
         || capabilityRequests.current.get(mediaItemId) !== requestId
       ) return info
-      setCapabilities((current) => ({ ...current, [mediaItemId]: { info, failed: false } }))
+      apply({ info, failed: false })
       return info
     } catch {
       if (
         capabilityGeneration.current !== generation
         || capabilityRequests.current.get(mediaItemId) !== requestId
       ) return null
-      setCapabilities((current) => ({ ...current, [mediaItemId]: { info: null, failed: true } }))
+      apply({ info: null, failed: true })
       return null
+    } finally {
+      if (capabilityInFlight.current.get(mediaItemId) === generation) capabilityInFlight.current.delete(mediaItemId)
+      if (capabilityGeneration.current === generation && capabilityDirty.current.get(mediaItemId) === generation) {
+        capabilityDirty.current.delete(mediaItemId)
+        queueMicrotask(() => {
+          if (capabilityGeneration.current === generation) void refreshItemCapability(mediaItemId, generation)
+        })
+      }
     }
   }, [])
 
@@ -155,9 +184,15 @@ export function EditionDetailPage() {
         capabilitiesRef.current[candidate.mediaItemId]?.info?.taskId === event.data.taskId
       ))
       if (item) void refreshItemCapability(item.mediaItemId, generation)
+      else if (["completed", "failed", "cancelled", "interrupted"].includes(event.data.state)) {
+        for (const current of detail.items) void refreshItemCapability(current.mediaItemId, generation)
+      }
     }).then((dispose) => {
       if (!mounted) void dispose().catch(() => undefined)
-      else cleanup = dispose
+      else {
+        cleanup = dispose
+        for (const item of detail.items) void refreshItemCapability(item.mediaItemId, generation)
+      }
     }).catch(() => undefined)
     return () => {
       mounted = false
@@ -168,7 +203,10 @@ export function EditionDetailPage() {
   const handleDownload = useCallback(async (item: MediaItemSummaryDto) => {
     const generation = capabilityGeneration.current
     const current = capabilitiesRef.current[item.mediaItemId]?.info
-    if (!current?.canDownload) {
+    // Paused / Interrupted tasks keep `canDownload` false-capable (their source
+    // may be reading as unavailable) but are still recoverable on the same
+    // task id through `startDownloadFromProjection`.
+    if (!current || (presentMediaItemDownloadAction(current.status).kind === "none" && !current.canDownload)) {
       await refreshItemCapability(item.mediaItemId, generation)
       return
     }
@@ -179,7 +217,8 @@ export function EditionDetailPage() {
     })
     setDownloadPending((previous) => ({ ...previous, [item.mediaItemId]: true }))
     try {
-      await createDownloadForMediaItem(item.mediaItemId)
+      // Resume / retry keeps the same task id; only idle projections create.
+      await startDownloadFromProjection(current, item.mediaItemId)
       await refreshItemCapability(item.mediaItemId, generation)
     } catch (cause) {
       if (capabilityGeneration.current === generation) {
@@ -292,22 +331,29 @@ function MediaItemRow({
   const canOpen = !selfEditionAction
     && route !== null
     && (capabilityPresentation.state === "online" || capabilityPresentation.state === "offline")
-  const canDownload = !canOpen && capabilityPresentation.state === "download_only"
+  const downloadAction = presentMediaItemDownloadAction(capability?.info?.status ?? "idle")
+  // Recoverable states (paused / interrupted) are actionable on the same task
+  // even when the row also has an online-read route.
+  const recoverable = downloadAction.kind === "resume" || downloadAction.kind === "retry"
+  const canDownload = recoverable
+    || (!canOpen && capabilityPresentation.state === "download_only")
   const disabled = downloadPending
     || (!canOpen && !canDownload && capabilityPresentation.state !== "error")
   const buttonLabel = downloadPending
-    ? "准备下载"
-    : canOpen
-      ? item.primaryAction?.labelHint === "continue" ? "继续" : "打开"
-      : canDownload
-        ? "下载后阅读"
-        : capabilityPresentation.state === "queued"
-          ? "下载中"
-          : capabilityPresentation.state === "loading"
-            ? "读取能力"
-            : capabilityPresentation.state === "error"
-              ? "重试"
-              : "不可用"
+    ? "处理中"
+    : recoverable
+      ? downloadAction.label
+      : canOpen
+        ? item.primaryAction?.labelHint === "continue" ? "继续" : "打开"
+        : canDownload
+          ? "下载后阅读"
+          : capabilityPresentation.state === "queued"
+            ? "下载中"
+            : capabilityPresentation.state === "loading"
+              ? "读取能力"
+              : capabilityPresentation.state === "error"
+                ? "重试"
+                : "不可用"
   const statusLabel = downloadError ?? (
     selfEditionAction ? "当前内容暂不可用" : capabilityPresentation.label
   )
@@ -322,7 +368,8 @@ function MediaItemRow({
         type="button"
         disabled={disabled}
         onClick={() => {
-          if (canOpen && route) onOpen(route)
+          if (recoverable) onDownload()
+          else if (canOpen && route) onOpen(route)
           else if (canDownload) onDownload()
           else if (capabilityPresentation.state === "error") onRetry()
         }}

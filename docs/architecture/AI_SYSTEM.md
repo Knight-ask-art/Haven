@@ -40,6 +40,12 @@ review_after: 2027-01-04
 实现入口为 Application 的 `agent_settings_ipc`、`setting_proposals` 服务，
 Domain 的 `setting_proposal` 内核和 Tauri 的 `commands/agent.rs`。
 
+工作台的提案历史通过 `agent_settings_proposal_list` 分页回读后端存储，按创建时间与 ID
+倒序排列，使用最后一项 ID 作为下一页游标。当前列表只包含有 Agent 绑定的全局阅读
+提案，包含外部 Agent 创建的同作用域记录；资源级提案继续使用独立契约。列表与详情均
+复用原有完整性校验和脱敏投影，已应用项回读同一回执。页面切换不改变提案状态；
+用户批准仍须提交该条提案的 ID 与 canonical digest，列表读取不授予写入权限。
+
 ### 1.1 资源级部分 patch
 
 Agent 资源提案只存请求修改的字段，不复制合并后的完整偏好。

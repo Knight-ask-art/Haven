@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from "react"
+import { useEffect, useState, useRef, type FocusEvent } from "react"
 import { useNavigate, useSearchParams } from "react-router"
 import { ArrowDownWideNarrow, ChevronRight, Library, Star, RefreshCw, Search, SearchX } from "lucide-react"
 import { SearchBar } from "../components/SearchBar"
@@ -62,40 +62,72 @@ export function SearchPage() {
   const hasSubmittedQuery = submittedQuery.length > 0
   const [searchValue, setSearchValue] = useState(queryParam)
   const debouncedSearchValue = useDebouncedValue(searchValue, 300)
+  const searchInputTooLong = Array.from(searchValue.trim()).length > 200
   const searchRuntimeState = resolveSearchRuntimeState(clientMode, submittedQuery)
   const localMode = searchRuntimeState === "ready_empty" || searchRuntimeState === "ready_query"
   const [history, setHistory] = useState<string[]>([])
-  const [historyEnabled, setHistoryEnabled] = useState(true)
+  // 隐私状态三态：未知（读取中/失败）时一律禁止记录，失败关闭。
+  const [historyEnabled, setHistoryEnabled] = useState(false)
   const [historyLoaded, setHistoryLoaded] = useState(false)
+  const [historyLoadFailed, setHistoryLoadFailed] = useState(false)
+  const [historyRetryRevision, setHistoryRetryRevision] = useState(0)
   const [filterType, setFilterType] = useState<ResultFilter>(() => parseFilter(categoryParam))
   const [sortMode, setSortMode] = useState<SortMode>(() => parseSort(sortParam))
   const [localStatus, setLocalStatus] = useState<LocalSearchStatus>("idle")
   const [localResults, setLocalResults] = useState<LocalSearchResult[]>([])
   const [localErrorMessage, setLocalErrorMessage] = useState<string | null>(null)
   const [retryRevision, setRetryRevision] = useState(0)
+  // 来源搜索专用的重试信号：只有同关键词的显式提交才递增，与本地检索的
+  // retryRevision 保持独立，本地重试不会重启来源搜索。
+  const [sourceRetryRevision, setSourceRetryRevision] = useState(0)
+  // 输入法组合态由 SearchBar 上报：组词中不提交、不响应 Enter/Escape。
+  const [isComposing, setIsComposing] = useState(false)
 
+  // 隐私开关与历史列表分开读取：历史列表会触发遗留迁移（写 SQLite），
+  // 只有在隐私状态已确认为开启之后才允许发起，避免在未知隐私时产生隐式写入。
   useEffect(() => {
     if (clientMode === "unavailable") {
       setHistory([])
+      setHistoryEnabled(false)
       setHistoryLoaded(true)
+      setHistoryLoadFailed(false)
       return
     }
     let active = true
     setHistoryLoaded(false)
-    void Promise.all([listSearchHistory(), getSearchHistorySetting()]).then(([terms, enabled]) => {
-      if (!active) return
-      setHistory(terms)
-      setHistoryEnabled(enabled)
-      setHistoryLoaded(true)
-    }).catch(() => {
-      if (!active) return
-      setHistory([])
-      setHistoryLoaded(true)
-    })
+    setHistoryEnabled(false)
+    setHistoryLoadFailed(false)
+    void getSearchHistorySetting()
+      .then(async (enabled) => {
+        if (!active) return
+        setHistoryEnabled(enabled)
+        setHistoryLoaded(true)
+        if (!enabled) {
+          setHistory([])
+          return
+        }
+        try {
+          const terms = await listSearchHistory()
+          if (!active) return
+          setHistory(terms)
+        } catch {
+          if (!active) return
+          setHistory([])
+          setHistoryLoadFailed(true)
+        }
+      })
+      .catch(() => {
+        // 隐私读取失败：保持禁止记录，并给出可见的重试入口。
+        if (!active) return
+        setHistoryEnabled(false)
+        setHistory([])
+        setHistoryLoaded(false)
+        setHistoryLoadFailed(true)
+      })
     return () => {
       active = false
     }
-  }, [clientMode])
+  }, [clientMode, historyRetryRevision])
 
   useEffect(() => {
     setSearchValue(queryParam)
@@ -136,26 +168,57 @@ export function SearchPage() {
     return () => controller.abort()
   }, [filterType, localMode, retryRevision, submittedQuery])
 
-  // 防抖：输入 300ms 后自动提交（AbortController 已在 localMode effect 中处理取消）
+  // 防抖：输入 300ms 后自动提交（AbortController 已在 localMode effect 中处理取消）。
+  // 输入法组词期间不提交。compositionEnd 后（isComposing 变 false）只会在防抖值
+  // 已等于当前输入时提交：避免把组词前 300ms 内的旧拼音/旧中间值提交上去。
   const debouncedCommittedRef = useRef<string>(submittedQuery)
+  const isComposingRef = useRef(isComposing)
+  isComposingRef.current = isComposing
+  const searchValueRef = useRef(searchValue)
+  searchValueRef.current = searchValue
   useEffect(() => {
+    // 组合结束后仍等待最终输入稳定，不读取事件之前的中间值。
+    if (isComposingRef.current) return
+    if (debouncedSearchValue !== searchValueRef.current) return
     const trimmed = debouncedSearchValue.trim()
     if (trimmed && trimmed !== debouncedCommittedRef.current && trimmed !== submittedQuery) {
       debouncedCommittedRef.current = trimmed
       commitSearch(trimmed)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedSearchValue])
+  }, [debouncedSearchValue, isComposing])
 
   useEffect(() => {
     debouncedCommittedRef.current = submittedQuery
   }, [submittedQuery])
 
+  // 清空输入、按 Escape、按清除按钮必须同一语义：同时移除 URL 的 q，
+  // 否则输入框已空但旧提交结果与发现区会同时出现。
+  const clearSubmittedQuery = () => {
+    setSearchParams(
+      (prev) => {
+        if (!prev.has("q")) return prev
+        const next = new URLSearchParams(prev)
+        next.delete("q")
+        return next
+      },
+      { replace: true }
+    )
+  }
+
+  const handleSearchValueChange = (value: string) => {
+    setSearchValue(value)
+    if (!value.trim()) clearSubmittedQuery()
+  }
+
   const commitSearch = (value: string) => {
-    if (clientMode === "unavailable") return
     const trimmed = value.trim()
-    if (!trimmed) return
-    if (trimmed.length > 200) return
+    if (!trimmed) {
+      clearSearch()
+      return
+    }
+    if (clientMode === "unavailable") return
+    if (Array.from(trimmed).length > 200) return
     // 设置读取完成前不产生隐式写入，避免用户在冷启动窗口中绕过已关闭的搜索历史开关。
     if (historyLoaded && historyEnabled) {
       void recordSearchHistory(trimmed).then(setHistory).catch(() => undefined)
@@ -169,6 +232,12 @@ export function SearchPage() {
       },
       { replace: true }
     )
+    // 同关键词的显式提交不会改变 query，来源搜索需要一次显式重查信号；
+    // 关键词变化时由 query 变化驱动，不能再叠加信号（防抖提交时 URL 尚未更新，
+    // 也不能发信号）。进行中的来源搜索会忽略该信号（见 SourceCandidates 的忙碌判定）。
+    if (trimmed === submittedQuery) {
+      setSourceRetryRevision((current) => current + 1)
+    }
   }
 
   const handleClearHistory = () => {
@@ -200,9 +269,7 @@ export function SearchPage() {
 
   const clearSearch = () => {
     setSearchValue("")
-    const next = new URLSearchParams(searchParams)
-    next.delete("q")
-    setSearchParams(next, { replace: true })
+    clearSubmittedQuery()
   }
 
   const suggestItems = searchValue.trim()
@@ -210,34 +277,107 @@ export function SearchPage() {
     : []
   const [showSuggest, setShowSuggest] = useState(false)
 
+  // 焦点作用域是整个搜索控件区：输入框、清空与搜索按钮、联想列表（含列表内按钮）。
+  // 焦点在作用域内任意控件之间移动都不收起；只有离开整个作用域才收起。
+  // 指针按下列表项时 SearchBar 的输入框会失焦，而焦点在作用域外，所以延迟收起，
+  // 让 onClick 先完成选择（选择本身会立即收起）。
+  const searchControlsRef = useRef<HTMLDivElement>(null)
+  const suggestHideTimerRef = useRef<number | null>(null)
+
+  const cancelSuggestHide = () => {
+    if (suggestHideTimerRef.current === null) return
+    window.clearTimeout(suggestHideTimerRef.current)
+    suggestHideTimerRef.current = null
+  }
+
+  const handleSearchControlsBlur = (event: FocusEvent<HTMLDivElement>) => {
+    if (event.currentTarget.contains(event.relatedTarget as Node | null)) return
+    cancelSuggestHide()
+    suggestHideTimerRef.current = window.setTimeout(() => {
+      suggestHideTimerRef.current = null
+      const active = document.activeElement
+      if (active instanceof Node && searchControlsRef.current?.contains(active)) return
+      setShowSuggest(false)
+    }, 150)
+  }
+
+  // 唯一的选择路径：键盘 Enter/Space 与指针点击都会走到 onClick，不会各触发一次搜索。
+  const selectSuggestion = (item: string) => {
+    cancelSuggestHide()
+    setShowSuggest(false)
+    setSearchValue(item)
+    commitSearch(item)
+  }
+
+  useEffect(() => () => {
+    if (suggestHideTimerRef.current !== null) window.clearTimeout(suggestHideTimerRef.current)
+  }, [])
+
   return (
     <div className={hasSubmittedQuery
       ? "search-results-page"
       : "w-full flex flex-col min-h-full bg-background/50 pt-[32px] pb-[120px] px-[24px] md:px-[48px] lg:px-[64px] gap-10 max-w-[1600px] mx-auto"}>
       {/* 巨型搜索框 + 联想下拉 */}
-      <div className={hasSubmittedQuery ? "search-results__search-wrap" : "w-full max-w-5xl mx-auto relative"}>
+      <div
+        ref={searchControlsRef}
+        className={hasSubmittedQuery ? "search-results__search-wrap" : "w-full max-w-5xl mx-auto relative"}
+        // 焦点重新进入作用域（含输入框重新聚焦）就取消待执行的收起。
+        onFocusCapture={cancelSuggestHide}
+        onBlurCapture={handleSearchControlsBlur}
+      >
         <SearchBar
           value={searchValue}
-          onChange={(e) => setSearchValue(e.target.value)}
-          onSearch={() => commitSearch(searchValue)}
-          onClear={clearSearch}
-          onFocus={() => setShowSuggest(true)}
-          onBlur={() => setTimeout(() => setShowSuggest(false), 150)}
+          onChange={(e) => handleSearchValueChange(e.target.value)}
+          onCompositionChange={(composing, value) => {
+            setIsComposing(composing)
+            if (!composing) handleSearchValueChange(value)
+          }}
+          onSearch={() => {
+            if (isComposing) return
+            commitSearch(searchValue)
+          }}
+          onClear={() => {
+            if (isComposing) return
+            clearSearch()
+          }}
+          onFocus={() => {
+            cancelSuggestHide()
+            setShowSuggest(true)
+          }}
           disabled={clientMode === "unavailable"}
           placeholder={clientMode === "unavailable" ? "搜索服务未启用" : "搜索本地媒体库"}
         />
+        {searchInputTooLong && <p role="alert" className="mt-2 px-6 text-sm text-destructive">搜索词过长，请缩短到 200 个字符以内。</p>}
+        {historyLoadFailed && (
+          <div role="alert" className="mt-2 flex items-center gap-3 px-6 text-xs text-muted-foreground">
+            <span>{historyLoadFailed
+              ? (historyEnabled
+                ? "无法读取搜索历史，本次搜索仍会照常记录。"
+                : "无法读取隐私设置，本次不会记录搜索历史。")
+              : ""}</span>
+            <button
+              type="button"
+              onClick={() => setHistoryRetryRevision((current) => current + 1)}
+              className="font-semibold text-primary"
+            >
+              重试
+            </button>
+          </div>
+        )}
         {showSuggest && suggestItems.length > 0 && (
-          <div className="search-results__suggestions absolute left-0 right-0 top-full z-20 mt-2 rounded-2xl border border-black/5 bg-white p-1.5 shadow-xl dark:border-white/10 dark:bg-zinc-900">
+          <div
+            className="search-results__suggestions absolute left-0 right-0 top-full z-20 mt-2 rounded-2xl border border-black/5 bg-white p-1.5 shadow-xl dark:border-white/10 dark:bg-zinc-900"
+          >
             {suggestItems.map((item) => (
               <button
                 key={item}
                 type="button"
-                onMouseDown={(e) => {
-                  e.preventDefault()
-                  setSearchValue(item)
-                  commitSearch(item)
-                  setShowSuggest(false)
-                }}
+                // 指针按下时不夺取输入框焦点（保留原生输入焦点与 IME 行为），
+                // 选择统一由 onClick 完成：键盘 Enter/Space 与指针点击是同一条路径。
+                onPointerDown={cancelSuggestHide}
+                onMouseDown={(e) => e.preventDefault()}
+                onFocus={cancelSuggestHide}
+                onClick={() => selectSuggestion(item)}
                 className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm hover:bg-black/5 dark:hover:bg-white/10"
               >
                 <Search className="h-3.5 w-3.5 text-muted-foreground" />
@@ -293,7 +433,11 @@ export function SearchPage() {
       )}
 
       {searchRuntimeState === "ready_query" && submittedQuery && (
-        <SourceCandidates query={submittedQuery} category={filterType} />
+        <SourceCandidates
+          query={submittedQuery}
+          category={filterType}
+          retryRevision={sourceRetryRevision}
+        />
       )}
     </div>
   )

@@ -1,8 +1,9 @@
 //! EnrichmentService：元数据自动流水线（契约 §36.8，V2-F 批次）。
 //!
-//! 流程：扫描完成后对新 Work 入队 → CMS10 标题精确匹配 → 命中走既有
-//! `SourceImportService`（external_ids 去重 work_upsert，幂等）→ enriched；
-//! 未命中/失败标 failed，不回滚扫描（保留原始名 Work）。
+//! 流程：扫描完成后对新 Work 入队 → CMS10 标题精确匹配 → 命中后只把来源条目的
+//! **缺失**元数据补到原 Work 上（单一事务，不新建 Work/Edition/MediaItem/Resource）
+//! → enriched；未命中/失败标 failed，不回滚扫描（保留原始名 Work）。
+//! 来源未启用（或未配置端点）时不发起任何 CMS10 请求，也不算已补全。
 //! 状态经 `enrichment_status` 查询；变更以 `metadata.changed` 事件广播。
 
 use std::collections::HashSet;
@@ -12,8 +13,8 @@ use haven_common::{AppError, ErrorKind, UtcMillis};
 use haven_domain::contracts::{EnrichmentRepository, EnrichmentState, WorkRepository};
 use haven_domain::ids::WorkId;
 
-use crate::services::ports::EnrichmentPorts;
-use crate::services::source_import::SourceImportService;
+use crate::services::ports::{EnrichmentPorts, WorkEnrichmentOutcome};
+use crate::services::source_import::{Cms10WorkMetadataOutcome, SourceImportService};
 use crate::wire::{EnrichmentStateDto, EnrichmentStatusWire};
 
 /// `metadata.changed` 事件出口（application 构造负载，transport 层负责投递）。
@@ -74,45 +75,85 @@ impl EnrichmentService {
         let stale =
             EnrichmentRepository::list_stale_pending(&*self.ports, cutoff_ms, MAX_BATCH as u32)
                 .await?;
-        let all = WorkRepository::list(&*self.ports, MAX_BATCH as u32, 0).await?;
+        let states = EnrichmentRepository::list(&*self.ports, None).await?;
+        let source_available = self.import.cms10_enrichment_available().await?;
 
         let mut candidates = Vec::with_capacity(MAX_BATCH);
+        let mut outcomes = Vec::new();
         let mut seen = HashSet::new();
 
         // 先处理恢复项，避免新作品很多时陈旧 pending 长期饥饿。
-        for state in stale {
-            if candidates.len() >= MAX_BATCH {
+        // pending without an error denotes an interrupted/in-flight attempt and
+        // retains the crash-recovery delay. A pending row with an error denotes
+        // a finished, deferred attempt (source unavailable), eligible next scan.
+        let deferred = states
+            .iter()
+            .filter(|state| source_available && state.status == "pending" && state.error.is_some())
+            .cloned();
+        for state in stale.into_iter().chain(deferred) {
+            if candidates.len() + outcomes.len() >= MAX_BATCH {
                 break;
+            }
+            if !seen.insert(state.work_id) {
+                continue;
             }
             let work_exists = WorkRepository::get(&*self.ports, state.work_id)
                 .await?
                 .is_some();
             let eligible = !work_exists
                 || !WorkRepository::has_any_source_ref(&*self.ports, state.work_id).await?;
-            if eligible && seen.insert(state.work_id) {
+            if eligible {
                 candidates.push(state.work_id);
+            } else if !eligible {
+                // An import may have completed between pending and a crash.
+                // Retire that recovery entry so it cannot occupy the oldest
+                // pending window forever; do not claim a new CMS10 match.
+                self.record(
+                    state.work_id,
+                    "failed",
+                    None,
+                    Some("已有来源引用，无需自动补全"),
+                )
+                .await?;
+                outcomes.push(EnrichedWorkOutcome {
+                    work_id: state.work_id,
+                    status: EnrichmentStatusWire::Failed,
+                });
             }
         }
 
-        // 无 external 引用且无记录的 Work 即"新作品"；新鲜 pending 会被跳过。
-        for work in all {
-            if candidates.len() >= MAX_BATCH {
+        // 已有记录（含新鲜 pending）的 Work 不再重跑。一次读取全部状态，
+        // 避免为一页页扫描的每个 Work 单独查询。
+        let recorded: HashSet<_> = states.into_iter().map(|state| state.work_id).collect();
+
+        // 无 external 引用且无记录的 Work 即"新作品"；必须按页遍历完整作品集。
+        // 只读首批 MAX_BATCH 条时，若这些作品都已有记录，后面的作品将永远轮不到。
+        let page_size = MAX_BATCH as u32;
+        let mut offset = 0u32;
+        while candidates.len() + outcomes.len() < MAX_BATCH {
+            let page = WorkRepository::list(&*self.ports, page_size, offset).await?;
+            let page_len = page.len() as u32;
+            for work in page {
+                if candidates.len() + outcomes.len() >= MAX_BATCH {
+                    break;
+                }
+                if seen.contains(&work.id) || recorded.contains(&work.id) {
+                    continue;
+                }
+                if !WorkRepository::has_any_source_ref(&*self.ports, work.id).await? {
+                    seen.insert(work.id);
+                    candidates.push(work.id);
+                }
+            }
+            if page_len < page_size {
                 break;
             }
-            if seen.contains(&work.id) {
-                continue;
-            }
-            if EnrichmentRepository::get(&*self.ports, work.id)
-                .await?
-                .is_none()
-                && !WorkRepository::has_any_source_ref(&*self.ports, work.id).await?
-            {
-                seen.insert(work.id);
-                candidates.push(work.id);
-            }
+            let Some(next_offset) = offset.checked_add(page_len) else {
+                break;
+            };
+            offset = next_offset;
         }
 
-        let mut outcomes = Vec::new();
         for work_id in candidates {
             match self.enrich_one(work_id).await {
                 Ok(outcome) => outcomes.push(outcome),
@@ -139,40 +180,66 @@ impl EnrichmentService {
         };
         self.record(work_id, "pending", None, None).await?;
 
-        let outcome = match self
-            .import
-            .match_cms10_by_title(&work.canonical_title)
-            .await
-        {
-            Ok(Some(_import)) => EnrichedWorkOutcome {
-                work_id,
-                status: EnrichmentStatusWire::Enriched,
-            },
-            Ok(None) => EnrichedWorkOutcome {
-                work_id,
-                status: EnrichmentStatusWire::Failed,
-            },
+        match self.import.enrich_existing_work_from_cms10(&work).await {
+            Ok(Cms10WorkMetadataOutcome::Applied(
+                WorkEnrichmentOutcome::Applied | WorkEnrichmentOutcome::NothingToFill,
+            )) => {
+                self.record(work_id, "enriched", Some(CMS10_SOURCE_ID), None)
+                    .await?;
+                Ok(EnrichedWorkOutcome {
+                    work_id,
+                    status: EnrichmentStatusWire::Enriched,
+                })
+            }
+            Ok(Cms10WorkMetadataOutcome::Applied(
+                WorkEnrichmentOutcome::WorkMissing
+                | WorkEnrichmentOutcome::TitleChanged
+                | WorkEnrichmentOutcome::MediaTypeMismatch,
+            )) => {
+                self.record(
+                    work_id,
+                    "failed",
+                    None,
+                    Some("作品已变化或媒介类型与来源条目不一致，未补全"),
+                )
+                .await?;
+                Ok(EnrichedWorkOutcome {
+                    work_id,
+                    status: EnrichmentStatusWire::Failed,
+                })
+            }
+            Ok(Cms10WorkMetadataOutcome::SourceUnavailable) => {
+                // 停用/未配置不是「已补全」：状态留在 pending，下次扫描时重新检查，
+                // 用户启用来源后无需重建作品记录即可补全。
+                self.record(
+                    work_id,
+                    "pending",
+                    None,
+                    Some("来源未启用或未配置端点，暂不自动补全"),
+                )
+                .await?;
+                Ok(EnrichedWorkOutcome {
+                    work_id,
+                    status: EnrichmentStatusWire::Pending,
+                })
+            }
+            Ok(Cms10WorkMetadataOutcome::NotFound) => {
+                self.record(work_id, "failed", None, Some("未在来源中找到匹配条目"))
+                    .await?;
+                Ok(EnrichedWorkOutcome {
+                    work_id,
+                    status: EnrichmentStatusWire::Failed,
+                })
+            }
             Err(err) => {
                 self.record(work_id, "failed", None, Some(&safe_error(&err)))
                     .await?;
-                return Ok(EnrichedWorkOutcome {
+                Ok(EnrichedWorkOutcome {
                     work_id,
                     status: EnrichmentStatusWire::Failed,
-                });
-            }
-        };
-
-        match outcome.status {
-            EnrichmentStatusWire::Enriched => {
-                self.record(work_id, "enriched", Some(CMS10_SOURCE_ID), None)
-                    .await?;
-            }
-            _ => {
-                self.record(work_id, "failed", None, Some("未在来源中找到匹配条目"))
-                    .await?;
+                })
             }
         }
-        Ok(outcome)
     }
 
     async fn record(
@@ -299,13 +366,20 @@ mod tests {
             crate::services::source_registry::SourceRegistryService::new(registry_ports.clone());
         let import = SourceImportService::new(
             import_ports,
-            Arc::new(NoopImportUnitOfWork),
+            Arc::new(MetadataOutcomeUnitOfWork),
             registry.clone(),
             Arc::new(FakeCatalog),
         );
         // 预配置端点（settings KV 直写）。
         registry
             .set_endpoint(CMS10_SOURCE_ID, "http://ep.example.com")
+            .await
+            .unwrap();
+        registry
+            .set(crate::wire::SourceRegistrySetRequest {
+                source_id: CMS10_SOURCE_ID.into(),
+                enabled: true,
+            })
             .await
             .unwrap();
         (
@@ -315,9 +389,12 @@ mod tests {
         )
     }
 
-    struct NoopImportUnitOfWork;
+    // These cases exercise orchestration outcomes. The infrastructure dev
+    // dependency links a separate application crate, so its UoW trait cannot
+    // be used as this unit-test crate's trait object.
+    struct MetadataOutcomeUnitOfWork;
 
-    impl crate::services::ports::UnitOfWork for NoopImportUnitOfWork {
+    impl crate::services::ports::UnitOfWork for MetadataOutcomeUnitOfWork {
         fn run_favorite(
             &self,
             _f: &dyn Fn(&dyn crate::services::ports::FavoriteTxPorts) -> Result<(), AppError>,
@@ -325,7 +402,7 @@ mod tests {
             Err(AppError::new(
                 "INTERNAL_ERROR",
                 ErrorKind::Internal,
-                "enrichment 测试 UnitOfWork 不支持收藏事务",
+                "不支持收藏事务",
                 false,
             ))
         }
@@ -334,14 +411,24 @@ mod tests {
             &self,
             _provider: &str,
             _external_id: &str,
-            _work: &haven_domain::entities::Work,
+            _work: &Work,
             _edition: &haven_domain::entities::Edition,
             _items: &[haven_domain::entities::MediaItem],
             _resources: &[haven_domain::entities::Resource],
         ) -> Result<(), AppError> {
-            // Enrichment tests exercise the state machine; persistence atomicity
-            // is covered by the real SQLite UnitOfWork tests in infrastructure.
-            Ok(())
+            Err(AppError::new(
+                "INTERNAL_ERROR",
+                ErrorKind::Internal,
+                "补全不得调用作品导入",
+                false,
+            ))
+        }
+
+        fn run_work_enrichment(
+            &self,
+            _plan: &crate::services::ports::WorkEnrichmentPlan,
+        ) -> Result<WorkEnrichmentOutcome, AppError> {
+            Ok(WorkEnrichmentOutcome::Applied)
         }
     }
 
@@ -385,6 +472,17 @@ mod tests {
         let miss_state = svc.status(Some(miss.to_string())).await.unwrap();
         assert_eq!(miss_state[0].status, EnrichmentStatusWire::Failed);
         assert!(miss_state[0].error.is_some(), "failed 必须携带安全文案");
+    }
+
+    #[tokio::test]
+    async fn run_pending_advances_beyond_processed_first_page() {
+        let (svc, ports, _registry) = fixture().await;
+        for index in 0..51 {
+            seed_work(ports.as_ref(), &format!("Title {index:03}")).await;
+        }
+        assert_eq!(svc.run_pending().await.unwrap().len(), 50);
+        assert_eq!(svc.run_pending().await.unwrap().len(), 1);
+        assert!(svc.run_pending().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -444,6 +542,59 @@ mod tests {
             svc.status(Some(work_id.to_string())).await.unwrap()[0].status,
             EnrichmentStatusWire::Enriched
         );
+    }
+
+    #[tokio::test]
+    async fn linked_stale_pending_entries_release_the_recovery_window() {
+        let (svc, ports, _registry) = fixture().await;
+        for index in 0..MAX_BATCH {
+            let id = seed_work(ports.as_ref(), &format!("Imported {index:03}")).await;
+            WorkRepository::save_source_ref(
+                ports.as_ref(),
+                "manual",
+                &format!("import-{index}"),
+                id,
+            )
+            .await
+            .unwrap();
+            EnrichmentRepository::upsert(
+                ports.as_ref(),
+                &EnrichmentState {
+                    work_id: id,
+                    status: "pending".into(),
+                    source_id: None,
+                    error: None,
+                    updated_at: UtcMillis(1),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let recover = seed_work(ports.as_ref(), "三体").await;
+        EnrichmentRepository::upsert(
+            ports.as_ref(),
+            &EnrichmentState {
+                work_id: recover,
+                status: "pending".into(),
+                source_id: None,
+                error: None,
+                updated_at: UtcMillis(2),
+            },
+        )
+        .await
+        .unwrap();
+        let first = svc.run_pending().await.unwrap();
+        assert_eq!(first.len(), MAX_BATCH);
+        assert!(
+            first
+                .iter()
+                .all(|outcome| outcome.status == EnrichmentStatusWire::Failed)
+        );
+        let second = svc.run_pending().await.unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].work_id, recover);
+        assert_eq!(second[0].status, EnrichmentStatusWire::Enriched);
+        assert!(svc.run_pending().await.unwrap().is_empty());
     }
 
     #[tokio::test]

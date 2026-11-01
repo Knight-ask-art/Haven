@@ -19,6 +19,7 @@ import { contentCategoryLabel } from "@/features/media/lib/periodical-presentati
 import type {
 
   HistoryEntryDto,
+  LocatorDto,
   MarkerDto,
   PageDto,
   ProgressSummaryDto,
@@ -110,15 +111,9 @@ export async function getFavoriteFootprintItems(): Promise<FootprintActionCard[]
     }))
   }
   if (mode !== "tauri") return []
-  const page: PageDto<WorkCardDto> = await getHavenClient().libraryList({
-    category: "all",
-    mediaTypes: null,
-    query: null,
-    sort: "recently_added",
-    cursor: null,
-    limit: LIST_LIMIT,
-  })
-  return page.items.filter((card) => card.favorite).map(toMediaCard)
+  // 收藏可能落在任意分页，必须复用完整 cursor 链；只取首屏会漏掉第 200 项之后的作品。
+  const cards = await loadAllWorkCards()
+  return cards.filter((card) => card.favorite).map(toMediaCard)
 }
 
 const PROGRESS_LABEL: Record<string, string> = {
@@ -298,6 +293,7 @@ export interface FootprintMarkerCard {
   id: string
   mode: string
   mediaItemId: string
+  locator: LocatorDto
   title: string
   subtitle: string
   type: string
@@ -330,6 +326,7 @@ export async function getMarkerFootprintCards(): Promise<FootprintMarkerCard[]> 
       id: marker.markerId,
       mode,
       mediaItemId: marker.mediaItemId,
+      locator: marker.locator,
       title: card?.title ?? "媒体条目",
       subtitle: marker.title ?? "在阅读 / 播放时标记的位置",
       type: MARKER_MODE_LABEL[mode] ?? "阅读",

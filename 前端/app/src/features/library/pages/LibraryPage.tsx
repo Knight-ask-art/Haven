@@ -4,7 +4,7 @@ import { LibraryTVExpandedSidebar } from "../components/LibraryTVExpandedSidebar
 import { LibraryTVHeroInfo } from "../components/LibraryTVHeroInfo"
 import { LibraryTVRowShelf } from "../components/LibraryTVRowShelf"
 import { LibraryGrid } from "../components/LibraryGrid"
-import type { LibraryMediaItemData } from "../components/MediaItem"
+import type { LibraryMediaItemData, LibrarySpotlightHandler } from "../components/MediaItem"
 import { getLibraryBrowseItems, markLibraryItemCompleted } from "../ipc/gateway"
 import { isTauriRuntime } from "@/lib/ipc/runtime"
 import { onFavoriteChanged, onLibraryChanged } from "@/lib/ipc/events"
@@ -32,6 +32,11 @@ export function LibraryPage() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set())
   const [batchSaving, setBatchSaving] = useState(false)
   const [batchMessage, setBatchMessage] = useState<string | null>(null)
+  const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const cancelHoverSpotlight = useCallback(() => {
+    if (hoverTimerRef.current !== null) clearTimeout(hoverTimerRef.current)
+    hoverTimerRef.current = null
+  }, [])
 
   const loadLibrary = useCallback(async () => {
     const requestId = ++loadRequestRef.current
@@ -116,6 +121,7 @@ export function LibraryPage() {
 
   const handleSelectCategory = (categoryId: string) => {
     if (batchSaving) return
+    cancelHoverSpotlight()
     // A selection is scoped to the category visible when it was made. Keep
     // batch mode open across category changes, but never carry hidden items.
     setSelectedIds(new Set())
@@ -142,13 +148,22 @@ export function LibraryPage() {
     }
   }, [libraryItems])
 
-  // 悬停意图防抖：快速划过货架不触发焦点切换（每次切换 = 整页重渲染 +
-  // 背景 <img key> 卸载重挂 + 大图解码，是悬停卡顿主因）
-  const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const handleHoverSpotlight = useCallback((item: LibraryMediaItemData) => {
-    if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current)
-    hoverTimerRef.current = setTimeout(() => setFocusedItem(item), 220)
-  }, [])
+  // Keep one hover intent for the entire page; keyboard focus takes precedence.
+  const handleHoverSpotlight = useCallback<LibrarySpotlightHandler>((item, interaction = "hover") => {
+    cancelHoverSpotlight()
+    if (interaction === "leave") return
+    const current = filterLibraryItemsByCategory(libraryItems, activeCategory)
+      .find((candidate) => candidate.id === item.id)
+    if (!current) return
+    if (interaction === "focus") {
+      setFocusedItem(current)
+      return
+    }
+    hoverTimerRef.current = setTimeout(() => {
+      hoverTimerRef.current = null
+      setFocusedItem(current)
+    }, 220)
+  }, [activeCategory, libraryItems, cancelHoverSpotlight])
 
   const toggleSelected = useCallback((id: string) => {
     if (batchSaving) return
@@ -188,17 +203,14 @@ export function LibraryPage() {
       setBatchSaving(false)
     }
   }, [activeCategory, batchSaving, libraryItems, loadLibrary, selectedIds])
-  useEffect(() => () => {
-    if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current)
-  }, [])
-
   // 直接带分类参数进入页面或数据到达时，同步 Hero 焦点（首项优先）
   useEffect(() => {
+    cancelHoverSpotlight()
     const categoryItems = filterLibraryItemsByCategory(libraryItems, activeCategory)
-    setFocusedItem((current) => current && categoryItems.some((item) => item.id === current.id)
-      ? current
-      : categoryItems[0] ?? null)
-  }, [activeCategory, libraryItems])
+    setFocusedItem((current) => categoryItems.find((item) => item.id === current?.id)
+      ?? categoryItems[0] ?? null)
+    return cancelHoverSpotlight
+  }, [activeCategory, libraryItems, cancelHoverSpotlight])
 
   // 根据分类预筛选不同的陈列栏数据 (Shelves)
   const movies = useMemo(() => libraryItems.filter((i) => i.type === "movie" || i.type === "tv"), [libraryItems])

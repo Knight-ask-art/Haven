@@ -461,6 +461,19 @@ fn reject_writes_nothing_and_is_digest_checked() {
     let reread: serde_json::Value = response.deserialize().unwrap();
     assert_eq!(reread["proposal"]["status"], "rejected");
     assert_eq!(reread["receipt"], serde_json::Value::Null);
+
+    let response = get_ipc_response(
+        &webview,
+        invoke_request(
+            "agent_settings_proposal_list",
+            serde_json::json!({ "request": { "before": null, "limit": 1 } }),
+        ),
+    )
+    .expect("主窗口必须能分页回读提案历史");
+    let history: serde_json::Value = response.deserialize().unwrap();
+    assert_eq!(history["items"][0], reread);
+    assert_eq!(history["nextCursor"], serde_json::Value::Null);
+    assert!(reading_row(&db).is_none());
 }
 
 #[test]
@@ -471,6 +484,10 @@ fn malformed_ids_return_invalid_argument_without_side_effects() {
         .unwrap();
 
     for (command, body) in [
+        (
+            "agent_settings_proposal_list",
+            serde_json::json!({ "request": { "before": "not-a-uuid", "limit": 30 } }),
+        ),
         (
             "agent_settings_proposal_get",
             serde_json::json!({ "request": { "proposalId": "not-a-uuid" } }),
@@ -532,6 +549,7 @@ fn agent_commands_are_denied_for_unmatching_window() {
         "agent_settings_proposal_approve",
         "agent_settings_proposal_reject",
         "agent_settings_proposal_get",
+        "agent_settings_proposal_list",
         "agent_setting_change_receipt_get",
     ] {
         let error = get_ipc_response(&webview, invoke_request(command, serde_json::json!({})))

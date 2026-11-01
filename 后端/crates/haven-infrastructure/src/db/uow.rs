@@ -23,11 +23,13 @@ use haven_domain::ids::{MediaItemId, WorkId};
 use haven_domain::locator::{ComicLocator, Locator};
 
 use crate::db::Db;
+use crate::db::repos::enum_to_db_str;
 use haven_application::services::ports::{
     ComicChapterRefreshPlan, ComicPageIdentityWriteCandidate, ComicProgressSubjectMergePlan,
     ComicProgressSubjectWritePlan, ComicProgressSubjectWritePrecondition,
     ComicProgressSubjectWriteResult, ComicProgressWriteCandidate, FavoriteState, FavoriteTxPorts,
-    PeriodicalImportPlan, UnitOfWork,
+    PeriodicalImportPlan, UnitOfWork, WorkEnrichmentOutcome, WorkEnrichmentPlan,
+    WorkEnrichmentSourceRef,
 };
 
 /// SQLite 版 UnitOfWork。
@@ -81,6 +83,29 @@ impl UnitOfWork for SqliteUnitOfWork {
             }
             Ok(())
         })
+    }
+
+    /// 把「只补空缺」的元数据补丁应用到既有 Work（单一 Immediate 事务）。
+    ///
+    /// 网络读取（来源搜索、海报登记）必须已经发生在该方法外：这里只接收
+    /// Application 已匹配好、且不含 URL 的补丁计划，并在事务内重新校验目标
+    /// Work 仍然合格后才写入。
+    fn run_work_enrichment(
+        &self,
+        plan: &WorkEnrichmentPlan,
+    ) -> Result<WorkEnrichmentOutcome, AppError> {
+        let mut guard = self.db.lock();
+        let tx = guard
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| tx_err("开启作品元数据补全 Immediate 事务失败", e))?;
+        match apply_work_enrichment(&tx, plan) {
+            Ok(outcome) => {
+                tx.commit()
+                    .map_err(|e| tx_err("提交作品元数据补全事务失败", e))?;
+                Ok(outcome)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn run_comic_chapter_refresh(&self, plan: &ComicChapterRefreshPlan) -> Result<(), AppError> {
@@ -306,6 +331,193 @@ impl UnitOfWork for SqliteUnitOfWork {
             Err(error) => Err(error),
         }
     }
+}
+
+/// 在单一 Immediate 事务内把「只补空缺」的元数据补丁应用到既有 Work。
+///
+/// 事务内重新读取目标行的相关列与它的 Edition 类型，不相信 Application 在事务外读到的
+/// 快照：Work 已删除、标题已变化、或来源条目的媒介类型与本地版本类型不同类时都不写入。
+/// `UPDATE` 只列出补丁涉及的列（含派生的 FTS 列 `search_body`，由迁移 027 的触发器同步
+/// 进 `work_fts`），因此并发的其它字段编辑（标题、评分、封面、背景图、缩略图）不会被
+/// 这次写入覆盖，也不会新建任何行。
+fn apply_work_enrichment(
+    tx: &rusqlite::Transaction<'_>,
+    plan: &WorkEnrichmentPlan,
+) -> Result<WorkEnrichmentOutcome, AppError> {
+    let current = match tx.query_row(
+        "SELECT canonical_title, description, release_year, director, actor, poster
+         FROM works WHERE id = ?1",
+        rusqlite::params![plan.work_id.to_string()],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<i32>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        },
+    ) {
+        Ok(row) => row,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return Ok(WorkEnrichmentOutcome::WorkMissing);
+        }
+        Err(error) => return Err(tx_err("读取自动补全目标作品失败", error)),
+    };
+    let (canonical_title, description, release_year, director, actor, poster) = current;
+    if canonical_title != plan.expected_title {
+        return Ok(WorkEnrichmentOutcome::TitleChanged);
+    }
+    if !edition_types_match_remote(tx, plan.work_id, plan.remote_media_type)? {
+        return Ok(WorkEnrichmentOutcome::MediaTypeMismatch);
+    }
+
+    let merged_description =
+        merge_missing_text(description.as_deref(), plan.description.as_deref());
+    let merged_release_year = release_year.or(plan.release_year);
+    let merged_director = merge_missing_text(director.as_deref(), plan.director.as_deref());
+    let merged_actor = merge_missing_text(actor.as_deref(), plan.actor.as_deref());
+    let merged_poster = match (&poster, plan.poster.as_ref()) {
+        (None, Some(artwork)) => Some(
+            serde_json::to_string(artwork)
+                .map_err(|e| crate::db::repos::json_err("海报引用序列化失败", e))?,
+        ),
+        _ => poster.clone(),
+    };
+    let changed = merged_description != description
+        || merged_release_year != release_year
+        || merged_director != director
+        || merged_actor != actor
+        || merged_poster != poster;
+
+    if changed {
+        // 作品搜索正文的派生规则由 `work::save_on_conn` 唯一给出（简介 + 导演 + 主演 →
+        // 分词），这里只重算 search_body，不触碰 search_title/search_original_title。
+        let search_body = crate::db::repos::work::work_search_body(
+            merged_description.as_deref(),
+            merged_director.as_deref(),
+            merged_actor.as_deref(),
+        );
+        tx.execute(
+            "UPDATE works
+             SET description = ?2, release_year = ?3, director = ?4, actor = ?5,
+                 poster = ?6, search_body = ?7, updated_at = ?8
+             WHERE id = ?1 AND canonical_title = ?9",
+            rusqlite::params![
+                plan.work_id.to_string(),
+                merged_description,
+                merged_release_year,
+                merged_director,
+                merged_actor,
+                merged_poster,
+                search_body,
+                plan.updated_at.0,
+                plan.expected_title,
+            ],
+        )
+        .map_err(|e| tx_err("写入作品元数据补全失败", e))?;
+    }
+
+    let bound = match &plan.source_ref {
+        Some(binding) => bind_source_ref_if_safe(tx, plan.work_id, binding)?,
+        None => false,
+    };
+    Ok(if changed || bound {
+        WorkEnrichmentOutcome::Applied
+    } else {
+        WorkEnrichmentOutcome::NothingToFill
+    })
+}
+
+/// 「只补空缺」：既有值非空（非纯空白）时保留既有值，否则采用来源候选值。
+fn merge_missing_text(existing: Option<&str>, candidate: Option<&str>) -> Option<String> {
+    match candidate {
+        Some(value) if existing.is_none_or(|current| current.trim().is_empty()) => {
+            Some(value.to_owned())
+        }
+        _ => existing.map(str::to_owned),
+    }
+}
+
+/// 目标 Work 的版本类型必须与来源条目的媒介类型同类（视频 ↔ 视频，非视频 ↔ 非视频）。
+///
+/// CMS10 只提供视频条目，因此同名书籍/漫画/报刊的 Work 即使标题完全相等也不能被套上
+/// 视频元数据；目标没有任何版本时无法证明类型，同样 fail closed。
+fn edition_types_match_remote(
+    tx: &rusqlite::Transaction<'_>,
+    work_id: WorkId,
+    remote_media_type: MediaType,
+) -> Result<bool, AppError> {
+    let total: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM editions WHERE work_id = ?1",
+            rusqlite::params![work_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|e| tx_err("统计作品版本数量失败", e))?;
+    if total == 0 {
+        return Ok(false);
+    }
+    let video_editions: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM editions
+             WHERE work_id = ?1 AND edition_type IN (?2, ?3, ?4)",
+            rusqlite::params![
+                work_id.to_string(),
+                enum_to_db_str(&MediaType::Movie)?,
+                enum_to_db_str(&MediaType::Series)?,
+                enum_to_db_str(&MediaType::Episode)?,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|e| tx_err("统计作品视频版本数量失败", e))?;
+    let remote_is_video = matches!(
+        remote_media_type,
+        MediaType::Movie | MediaType::Series | MediaType::Episode
+    );
+    Ok((video_editions == total) == remote_is_video)
+}
+
+/// 只在安全时把来源身份绑到目标 Work，返回是否真的绑定了。
+///
+/// 安全 = 该 `(provider, external_id)` 尚未被任何 Work 占用，且目标 Work 尚无任何来源
+/// 引用（不把两个来源身份混到同一个 Work 上）。任一条件不满足都只跳过绑定：元数据补丁
+/// 仍然有效，绝不因此抢占别的 Work 的引用或回滚整次补全。
+fn bind_source_ref_if_safe(
+    tx: &rusqlite::Transaction<'_>,
+    work_id: WorkId,
+    binding: &WorkEnrichmentSourceRef,
+) -> Result<bool, AppError> {
+    let owner = match tx.query_row(
+        "SELECT work_id FROM work_source_refs WHERE provider = ?1 AND external_id = ?2",
+        rusqlite::params![binding.provider, binding.external_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(value) => Some(value),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(error) => return Err(tx_err("查询来源作品引用失败", error)),
+    };
+    if owner.is_some() {
+        return Ok(false);
+    }
+    let existing_refs: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM work_source_refs WHERE work_id = ?1",
+            rusqlite::params![work_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|e| tx_err("统计作品来源引用数量失败", e))?;
+    if existing_refs > 0 {
+        return Ok(false);
+    }
+    crate::db::repos::work::save_source_ref_on_conn(
+        tx,
+        &binding.provider,
+        &binding.external_id,
+        work_id,
+    )?;
+    Ok(true)
 }
 
 /// 在单一事务内写入一次报刊文章导入的全部行。
@@ -1677,6 +1889,34 @@ impl haven_application::services::storage_location::StorageTxPorts for SqliteSto
         location: &haven_domain::entities::StorageLocation,
     ) -> Result<(), AppError> {
         use crate::db::repos::enum_to_db_str;
+        // Serialize root changes with task creation/completion on the same DB
+        // transaction. Queued/running/paused tasks must keep their roots stable.
+        // Terminal failed/cancelled records retain their UUID-owned partials,
+        // but allow an explicit rebind after a directory move so cleanup can
+        // resolve those partials through the newly registered root.
+        let download_owns_root: bool = self
+            .tx
+            .query_row(
+                "SELECT EXISTS(
+                SELECT 1 FROM storage_locations s
+                JOIN download_tasks d ON d.target_storage_id = s.id
+                    OR EXISTS (SELECT 1 FROM resources r
+                               WHERE r.id = d.source_resource_id AND r.storage_location_id = s.id)
+                WHERE s.id = ?1 AND s.root_ref <> ?2
+                  AND d.state NOT IN ('completed', 'failed', 'cancelled')
+             )",
+                rusqlite::params![location.id.to_string(), location.root_ref],
+                |row| row.get(0),
+            )
+            .map_err(|e| tx_err("检查存储位置下载任务失败", e))?;
+        if download_owns_root {
+            return Err(AppError::new(
+                "STORAGE_DOWNLOAD_IN_PROGRESS",
+                haven_common::ErrorKind::Conflict,
+                "该位置仍有待下载、下载中或暂停的任务，请先完成或取消任务再更换目录",
+                true,
+            ));
+        }
         self.tx
             .execute(
                 "INSERT INTO storage_locations

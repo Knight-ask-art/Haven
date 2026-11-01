@@ -112,7 +112,7 @@ impl ProgressService {
 
         // 4. percentage 由 Locator 派生（DOMAIN_MODEL §30：事实来源是 Locator；
         //    mapper 只投影已派生的 percentage）。
-        let percentage = derive_ratio(&media_item, &locator);
+        let percentage = self.derive_percentage(&media_item, &locator).await?;
 
         let completion: CompletionState = request
             .completion
@@ -202,7 +202,7 @@ impl ProgressService {
                 false,
             ));
         }
-        let percentage = derive_ratio(&media_item, &locator);
+        let percentage = self.derive_percentage(&media_item, &locator).await?;
         let updated_at = haven_common::UtcMillis::now();
         let candidate = Progress {
             id: ProgressId::new(),
@@ -236,6 +236,18 @@ impl ProgressService {
     ) -> Result<Option<ProgressSummaryDto>, AppError> {
         let progress = self.read_for_media_item(media_item_id).await?;
         progress.as_ref().map(progress_summary).transpose()
+    }
+
+    async fn derive_percentage(
+        &self,
+        item: &haven_domain::entities::MediaItem,
+        locator: &Locator,
+    ) -> Result<Option<f32>, AppError> {
+        let observed_comic_pages = match (&self.comic_progress_subjects, locator) {
+            (Some(subjects), Locator::Comic(_)) => subjects.known_page_count(item.id).await?,
+            _ => None,
+        };
+        Ok(derive_ratio(item, locator, observed_comic_pages))
     }
 
     /// Domain Progress 读取入口；非漫画路径保持既有 Repository 读取语义。
@@ -421,7 +433,11 @@ fn parse_id(s: &str) -> Result<MediaItemId, AppError> {
 }
 
 /// 从 Locator 派生 percentage（DOMAIN_MODEL §30）。无法派生时返回 None。
-fn derive_ratio(item: &haven_domain::entities::MediaItem, locator: &Locator) -> Option<f32> {
+fn derive_ratio(
+    item: &haven_domain::entities::MediaItem,
+    locator: &Locator,
+    observed_comic_pages: Option<u32>,
+) -> Option<f32> {
     let clamp01 = |v: f32| v.clamp(0.0, 1.0);
     match locator {
         Locator::Video(v) => item
@@ -433,7 +449,14 @@ fn derive_ratio(item: &haven_domain::entities::MediaItem, locator: &Locator) -> 
             .page_count
             .filter(|c| *c > 0)
             .map(|c| clamp01((p.page_index as f32 + 1.0) / c as f32)),
-        Locator::Comic(c) => c.page_progression.map(clamp01),
+        // page_progression is the offset within a page, not the chapter ratio.
+        // Paged readers omit it; count the current page as read, as for PDF.
+        Locator::Comic(c) => observed_comic_pages
+            .or(item.page_count)
+            .filter(|count| *count > 0)
+            .map(|count| {
+                clamp01((c.page_index as f32 + c.page_progression.unwrap_or(1.0)) / count as f32)
+            }),
         Locator::Article(a) => a.progression.map(clamp01),
         Locator::Generic(_) => None,
     }

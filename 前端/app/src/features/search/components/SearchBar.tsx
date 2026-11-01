@@ -1,10 +1,12 @@
-import React from "react"
+import React, { useRef } from "react"
 import { Search, X } from "lucide-react"
 import { cn } from "@/lib/utils"
 
 export interface SearchBarProps {
   value?: string
   onChange?: (e: React.ChangeEvent<HTMLInputElement>) => void
+  /** 输入法组合态变化：组词开始为 true，compositionEnd 为 false。 */
+  onCompositionChange?: (composing: boolean, value: string) => void
   onSearch?: () => void
   onClear?: () => void
   onFocus?: () => void
@@ -17,6 +19,7 @@ export interface SearchBarProps {
 export function SearchBar({
   value,
   onChange,
+  onCompositionChange,
   onSearch,
   onClear,
   onFocus,
@@ -25,6 +28,8 @@ export function SearchBar({
   className,
   disabled = false,
 }: SearchBarProps) {
+  // 组合态以原生事件为准：Enter/Escape 守卫要比 React 状态更早生效。
+  const composingRef = useRef(false)
   return (
     <div className={cn("flex items-center gap-[16px] w-full", className)}>
       <div className="relative flex-1 group">
@@ -39,7 +44,17 @@ export function SearchBar({
           onBlur={onBlur}
           placeholder={placeholder}
           disabled={disabled}
+          onCompositionStart={(event) => {
+            composingRef.current = true
+            onCompositionChange?.(true, event.currentTarget.value)
+          }}
+          onCompositionEnd={(event) => {
+            composingRef.current = false
+            onCompositionChange?.(false, event.currentTarget.value)
+          }}
           onKeyDown={(event) => {
+            // IME 上的 Enter/Escape 属于候选框：不提交、不清空。
+            if (composingRef.current || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return
             if (event.key === "Enter") onSearch?.()
             if (event.key === "Escape" && value) onClear?.()
           }}

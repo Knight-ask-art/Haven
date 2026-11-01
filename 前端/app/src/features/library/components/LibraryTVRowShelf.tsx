@@ -1,14 +1,14 @@
 import { useRef } from "react"
 import { useNavigate } from "react-router"
 import { MediaItem } from "./MediaItem"
-import type { LibraryMediaItemData } from "./MediaItem"
+import type { LibraryMediaItemData, LibrarySpotlightHandler } from "./MediaItem"
 import { ChevronRight, ChevronLeft } from "lucide-react"
 
 interface LibraryTVRowShelfProps {
   title: string
   subCategoryKey?: string
   items: LibraryMediaItemData[]
-  onHoverSpotlight?: (item: LibraryMediaItemData) => void
+  onHoverSpotlight?: LibrarySpotlightHandler
   onSeeMore?: () => void
   selectionMode?: boolean
   selectedIds?: Set<string>

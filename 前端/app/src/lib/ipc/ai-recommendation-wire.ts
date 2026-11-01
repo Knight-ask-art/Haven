@@ -74,7 +74,7 @@ function guardReadingPatch(value: unknown): value is PreferenceReadingPatchDto {
       continue
     }
     if (field === "customBackground" || field === "customText") {
-      if (typeof entry !== "string" || !/^#[0-9a-fA-F]{6}$/.test(entry)) return false
+      if (typeof entry !== "string" || (entry.trim() !== "" && !/^#[0-9a-fA-F]{6}$/.test(entry.trim()))) return false
       continue
     }
     if (field === "systemAuto" && typeof entry !== "boolean") return false
@@ -88,8 +88,8 @@ function guardSettingChange(value: unknown): value is AgentSettingChangeDto {
   return isRecord(value)
     && hasExactFields(value, CHANGE_FIELDS)
     && isText(value.key)
-    && isText(value.before)
-    && isText(value.after)
+    && typeof value.before === "string"
+    && typeof value.after === "string"
 }
 
 const PROPOSAL_FIELDS = [
@@ -105,23 +105,29 @@ const PROPOSAL_FIELDS = [
   "changes",
 ] as const
 
-function guardProposal(value: unknown): value is AgentSettingsProposalDto {
-  if (!isRecord(value) || !hasExactFields(value, PROPOSAL_FIELDS)) return false
+export function guardAgentSettingsProposal(value: unknown, pendingOnly = false): value is AgentSettingsProposalDto {
+  if (!isRecord(value)
+    || !(hasExactFields(value, PROPOSAL_FIELDS) || hasExactFields(value, [...PROPOSAL_FIELDS, "baselineStale"]))) return false
   const subject = value.subject
   return value.schemaVersion === 1
     && isText(value.proposalId)
-    && value.status === "pending"
+    && typeof value.status === "string"
+    && (pendingOnly ? value.status === "pending" : ["pending", "applied", "rejected", "expired"].includes(value.status))
     && isRecord(subject)
     && hasExactFields(subject, ["section"])
     && subject.section === "reading"
     && isText(value.targetLabel)
     && isNullableText(value.baseRevision)
+    && (value.baselineStale === undefined || typeof value.baselineStale === "boolean")
+    && (!pendingOnly || value.baselineStale !== true)
     && typeof value.digest === "string"
     && /^[0-9a-f]{64}$/.test(value.digest)
     && isText(value.createdAt)
     && isText(value.expiresAt)
+    && Number.isFinite(Date.parse(value.createdAt))
+    && Number.isFinite(Date.parse(value.expiresAt))
     && Array.isArray(value.changes)
-    && value.changes.length > 0
+    && (!pendingOnly || value.changes.length > 0)
     && value.changes.every(guardSettingChange)
 }
 
@@ -148,5 +154,5 @@ export function guardAiSettingsRecommendation(
     && isText(value.modelId)
     && (value.explanation === null || typeof value.explanation === "string")
     && guardReadingPatch(value.recommendedPatch)
-    && guardProposal(value.proposal)
+    && guardAgentSettingsProposal(value.proposal, true)
 }

@@ -7,6 +7,8 @@ import {
   getMediaItemDownloadInfo,
   getMediaItemsDownloadInfo,
   getWorkDownloadState,
+  presentMediaItemDownloadAction,
+  startDownloadFromProjection,
 } from "./download-gateway"
 
 const BASE_TASK: DownloadTaskDto = {
@@ -62,6 +64,7 @@ function clientWith(
   storageLocations: StorageLocationDto[] = [],
   downloadList: (request: { limit: number; offset: number }) => Promise<DownloadTaskDto[]> = async () => tasks,
 ): HavenClient {
+  // Live task list so callers observe the same (immutable) facts.
   const client = {
     downloadList,
     resourceListByMediaItem: async () => resources,
@@ -146,7 +149,9 @@ describe("getWorkDownloadState", () => {
       }],
     }
     await expect(getMediaItemDownloadInfo("media-1", clientWith([queued], resources)))
-      .resolves.toMatchObject({ status: "downloaded", hasOfflineResource: true, taskId: null })
+      .resolves.toMatchObject({ status: "downloaded", hasOfflineResource: true, taskId: null, offlineResourceId: "offline-1" })
+    await expect(getMediaItemDownloadInfo("media-1", clientWith([], resources)))
+      .resolves.toMatchObject({ status: "downloaded", taskId: null, offlineResourceId: "offline-1" })
 
     const completed = { ...BASE_TASK, taskId: "completed-task", offlineResourceId: "offline-1" }
     await expect(getMediaItemDownloadInfo("media-1", clientWith([queued, completed], resources)))
@@ -467,5 +472,115 @@ describe("getWorkDownloadState", () => {
 
     await expect(getMediaItemsDownloadInfo(["media-1", "media-2"], client))
       .rejects.toThrow("download list failed")
+  })
+})
+
+describe("recoverable download tasks (C5)", () => {
+  const target: StorageLocationDto = {
+    locationId: "storage-1",
+    displayName: "离线库",
+    providerType: "local",
+    status: "connected",
+  }
+  const resources = downloadableResources("remote-1")
+
+  function recoverableClient(state: "paused" | "interrupted") {
+    const task = { ...BASE_TASK, state, offlineResourceId: null, bytesDownloaded: 40, progressRatio: 0.4 }
+    const tasksRef: DownloadTaskDto[] = [task]
+    const downloadCreate = vi.fn(async () => task)
+    const downloadResume = vi.fn(async ({ taskId }: { taskId: string }) => ({ ...task, taskId, state: "queued" as const }))
+    const downloadRetry = vi.fn(async ({ taskId }: { taskId: string }) => ({ ...task, taskId, state: "queued" as const }))
+    const client = {
+      ...clientWith(tasksRef),
+      downloadCreate,
+      downloadResume,
+      downloadRetry,
+    } as unknown as HavenClient
+    return { task, client, downloadCreate, downloadResume, downloadRetry }
+  }
+
+  it("projects a paused task as paused with its task id, not queued", async () => {
+    const { client } = recoverableClient("paused")
+    const info = await getMediaItemDownloadInfo("media-1", client)
+    expect(info.status).toBe("paused")
+    expect(info.taskState).toBe("paused")
+    expect(info.taskId).toBe("task-1")
+    expect(presentMediaItemDownloadAction(info.status)).toMatchObject({ kind: "resume", label: "继续下载", disabled: false })
+    await expect(getWorkDownloadState("work-1", "media-1", client)).resolves.toBe("paused")
+  })
+
+  it("projects an interrupted task as interrupted with its task id", async () => {
+    const { client } = recoverableClient("interrupted")
+    const info = await getMediaItemDownloadInfo("media-1", client)
+    expect(info.status).toBe("interrupted")
+    expect(info.taskState).toBe("interrupted")
+    expect(info.taskId).toBe("task-1")
+    expect(presentMediaItemDownloadAction(info.status)).toMatchObject({ kind: "retry", label: "重试下载", disabled: false })
+    await expect(getWorkDownloadState("work-1", "media-1", client)).resolves.toBe("interrupted")
+  })
+
+  it("resumes a paused task by its existing id and never creates", async () => {
+    const { client, downloadCreate, downloadResume, downloadRetry } = recoverableClient("paused")
+    const info = await getMediaItemDownloadInfo("media-1", client)
+    const started = await startDownloadFromProjection(info, "media-1", client)
+    expect(started.taskId).toBe("task-1")
+    expect(downloadResume).toHaveBeenCalledWith({ taskId: "task-1" })
+    expect(downloadCreate).not.toHaveBeenCalled()
+    expect(downloadRetry).not.toHaveBeenCalled()
+  })
+
+  it("retries an interrupted task by its existing id and never creates", async () => {
+    const { client, downloadCreate, downloadResume, downloadRetry } = recoverableClient("interrupted")
+    const info = await getMediaItemDownloadInfo("media-1", client)
+    await startDownloadFromProjection(info, "media-1", client)
+    expect(downloadRetry).toHaveBeenCalledWith({ taskId: "task-1" })
+    expect(downloadCreate).not.toHaveBeenCalled()
+    expect(downloadResume).not.toHaveBeenCalled()
+  })
+
+  it("surfaces a rejected retry instead of creating a different task", async () => {
+    const { client, downloadCreate, downloadRetry } = recoverableClient("interrupted")
+    downloadRetry.mockRejectedValueOnce(Object.assign(new Error("download task changed"), { code: "DOWNLOAD_TASK_NOT_FOUND" }))
+    const info = await getMediaItemDownloadInfo("media-1", client)
+    await expect(startDownloadFromProjection(info, "media-1", client)).rejects.toThrow("download task changed")
+    expect(downloadCreate).not.toHaveBeenCalled()
+  })
+
+  it.each(["paused", "interrupted"] as const)("recovers an existing %s task returned by idempotent creation", async (state) => {
+    const { client, downloadCreate, downloadResume, downloadRetry } = recoverableClient(state)
+    client.resourceListByMediaItem = async () => resources
+    client.storageLocationList = async () => [target]
+    const result = await createDownloadForMediaItem("media-1", client)
+    expect(result.taskId).toBe("task-1")
+    expect(result.state).toBe("queued")
+    expect(downloadCreate).toHaveBeenCalledTimes(1)
+    expect(state === "paused" ? downloadResume : downloadRetry).toHaveBeenCalledWith({ taskId: "task-1" })
+    expect(state === "paused" ? downloadRetry : downloadResume).not.toHaveBeenCalled()
+  })
+
+  it("does not create a new task when recovery has no task identity", async () => {
+    const { client, downloadCreate, downloadResume, downloadRetry } = recoverableClient("interrupted")
+    await expect(startDownloadFromProjection({ status: "interrupted", taskId: null }, "media-1", client))
+      .rejects.toMatchObject({ code: "DOWNLOAD_TASK_UNAVAILABLE" })
+    expect(downloadCreate).not.toHaveBeenCalled()
+    expect(downloadResume).not.toHaveBeenCalled()
+    expect(downloadRetry).not.toHaveBeenCalled()
+  })
+
+  it("still creates for an idle projection and refuses a queued one", async () => {
+    const created = { ...BASE_TASK, state: "queued" as const }
+    const downloadCreate = vi.fn(async () => created)
+    const client = {
+      ...clientWith([], resources, [target]),
+      downloadCreate,
+    } as unknown as HavenClient
+    const info = await getMediaItemDownloadInfo("media-1", client)
+    expect(info.status).toBe("idle")
+    await expect(startDownloadFromProjection(info, "media-1", client)).resolves.toBe(created)
+    expect(downloadCreate).toHaveBeenCalledTimes(1)
+
+    await expect(startDownloadFromProjection({ ...info, status: "queued", taskId: "task-1" }, "media-1", client))
+      .rejects.toMatchObject({ code: "DOWNLOAD_ALREADY_ACTIVE" })
+    expect(downloadCreate).toHaveBeenCalledTimes(1)
   })
 })

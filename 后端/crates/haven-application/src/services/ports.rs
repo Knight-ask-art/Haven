@@ -3,9 +3,11 @@
 //! 依赖方向：Application → Domain 契约；具体实现由组装层（src-tauri / 测试）提供。
 
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use haven_common::AppError;
+use haven_common::{AppError, ErrorKind, UtcMillis};
 use haven_domain::comic_catalog::{ComicCatalogRefreshReceipt, ComicChapterCatalogState};
 use haven_domain::comic_identity::{
     ChapterSourceRef, ComicProgressMigrationSnapshot, EditionProfile, PageIdentity,
@@ -18,7 +20,10 @@ use haven_domain::contracts::{
     MediaItemRepository, ProgressRepository, ResourceRepository, SettingsRepository,
     StorageLocationRepository, WorkRepository,
 };
-use haven_domain::entities::{Edition, FavoriteTarget, MediaItem, Progress, Resource, Work};
+use haven_domain::entities::{
+    ArtworkRef, Edition, FavoriteTarget, MediaItem, Progress, Resource, Work,
+};
+use haven_domain::enums::MediaType;
 use haven_domain::ids::{ComicCatalogRefreshId, ComicProgressMigrationId, MediaItemId, WorkId};
 use haven_domain::periodical::{Periodical, PeriodicalArticle, PeriodicalIssue, PeriodicalVolume};
 
@@ -367,6 +372,76 @@ pub trait UnitOfWork: Send + Sync {
             false,
         ))
     }
+
+    /// 把一次「自动补全」的缺失元数据补丁应用到**既有** Work。
+    ///
+    /// 补丁只提供候选值，因此实现必须在同一事务内重新读取目标 Work 后**只补空缺**：
+    /// 不改写已有值（含用户编辑），不改变 identity、Work 类型或任何本地关系，也不
+    /// 新建 Work/Edition/MediaItem/Resource。默认实现给不支持该事务的测试替身返回
+    /// 明确的 Unsupported，避免退化成事务外的读-改-写或整包覆盖写。
+    fn run_work_enrichment(
+        &self,
+        _plan: &WorkEnrichmentPlan,
+    ) -> Result<WorkEnrichmentOutcome, AppError> {
+        Err(AppError::new(
+            "WORK_ENRICHMENT_UOW_UNAVAILABLE",
+            haven_common::ErrorKind::Internal,
+            "当前 UnitOfWork 不支持作品元数据补全事务",
+            false,
+        ))
+    }
+}
+
+/// 一次「自动补全」对既有 Work 的**元数据补丁**。
+///
+/// 只携带来源条目的展示型元数据与受控海报引用：不含播放地址、集数、远端请求细节
+/// 或本地路径。语义是「只补空缺」——实现方绝不能覆盖 Work 上已有的值，也不能据此
+/// 创建任何新的 Work/Edition/MediaItem/Resource。
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkEnrichmentPlan {
+    pub work_id: WorkId,
+    /// 事务内 CAS 前置条件：目标 Work 的标题必须仍与该值完全相等。标题在事务外被
+    /// 改写（用户改名）后，本次匹配结果不再可信，整个补丁必须放弃。
+    pub expected_title: String,
+    /// 来源条目的媒介类型（Application 已按 `type_name`/集数推导）。实现方据此拒绝
+    /// 把视频元数据套到非视频作品（例如同名书籍）上。
+    pub remote_media_type: MediaType,
+    /// 以下字段是候选值：`None` 表示来源没有该字段，`Some` 也只用于补空缺。
+    pub description: Option<String>,
+    pub release_year: Option<i32>,
+    pub director: Option<String>,
+    pub actor: Option<String>,
+    /// 受控海报引用（`haven://artwork/<id>`）；外部 URL 已在事务外经图片代理注册。
+    pub poster: Option<ArtworkRef>,
+    /// 可选的来源身份绑定；只在安全时（目标 Work 尚无任何来源引用且该身份未被其它
+    /// Work 占用）由实现方绑定，见 [`WorkEnrichmentOutcome`]。
+    pub source_ref: Option<WorkEnrichmentSourceRef>,
+    pub updated_at: UtcMillis,
+}
+
+/// 自动补全可以绑定的来源身份（`work_source_refs` 的键）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkEnrichmentSourceRef {
+    pub provider: String,
+    pub external_id: String,
+}
+
+/// 一次元数据补丁的事务内结果。
+///
+/// 前两项都表示「本次补全成立」（来源条目与目标 Work 匹配），区别只在有没有真正写入；
+/// 后三项表示补丁被放弃，调用方不得把状态记成已补全。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkEnrichmentOutcome {
+    /// 至少写入了一列（元数据或来源身份）。
+    Applied,
+    /// 目标 Work 已具备全部候选字段且没有可绑定的来源身份：没有任何写入。
+    NothingToFill,
+    /// 目标 Work 已不存在（删除竞态）。
+    WorkMissing,
+    /// 目标 Work 的标题已变化，本次匹配结果不再可信。
+    TitleChanged,
+    /// 目标 Work 的版本类型与来源条目的媒介类型不同类（例如同名书籍与视频）。
+    MediaTypeMismatch,
 }
 
 /// 一次报刊文章导入的完整原子写入计划。
@@ -545,14 +620,195 @@ pub struct RemoteContentRange {
     pub total: u64,
 }
 
+/// 一次远端获取的**真实网络字节**进度快照。
+///
+/// `bytes` 是**当前产物尝试**已经读到的字节（限速与速率仍按累计网络字节计算）：
+/// 已知总大小时它夹在总大小内，且绝不把失败/被丢弃尝试读到的字节算进完成度；
+/// 总大小未知时它就是本次获取累计读取的网络字节，此时不宣称任何百分比。
+/// 它**不是**最终产物大小：转换类来源（订阅源、Europe PMC、Wikisource）的网络字节
+/// 与落盘产物不同，最终产物大小只由 [`RemoteAcquiredFile::size_bytes`] 给出。
+/// `total_bytes` 未知时为 `None`（诚实表达未知），绝不拿单页/单次响应大小冒充整体。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemoteAcquisitionProgress {
+    pub bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub speed_bps: Option<u64>,
+    pub eta_seconds: Option<u64>,
+}
+
+/// 远端获取进度观察者。
+///
+/// 实现方会在网络读取路径上被同步调用，因此**只能保存最新值**：不得执行阻塞 IO、
+/// 数据库写入或 IPC 发布；持久化与事件发布由调用方按界（例如 100ms）完成。
+pub trait RemoteAcquisitionObserver: Send + Sync {
+    fn on_progress(&self, progress: RemoteAcquisitionProgress);
+}
+
+/// 一次受控远端获取的作用域上下文：有限速率（字节/秒）+ 进度上报。
+///
+/// 同一个 `acquire_controlled` 调用内的多页下载、重试与主机回退**必须共享**同一个
+/// 实例：限速按累计网络字节计算，不随单页或单次尝试重置。获取产物之前为定位产物而
+/// 发出的元数据/目录请求（条目页、页清单）同样必须携带这个实例：它们只计网络字节，
+/// 不计入产物进度。上下文只在该次获取内存在，不使用全局状态或任务局部上下文。
+///
+/// 限速语义：`record` 在**网络读取之外**按累计字节补齐应等待的时长，因此调用方
+/// 必须把每块网络等待（连接/响应头/单块读取）各自包在独立超时里，不能用一个总
+/// 超时同时约束限速睡眠——否则大文件在有限速率下必然超时失败。
+pub struct RemoteTransferContext<'a> {
+    limit_bps: Option<u64>,
+    observer: &'a dyn RemoteAcquisitionObserver,
+    started: Instant,
+    state: Mutex<RemoteTransferState>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RemoteTransferState {
+    /// 累计网络字节：限速与速率的唯一依据，跨重试/主机回退**从不重置**。
+    network_bytes: u64,
+    /// 当前**产物**尝试已经读到的字节；每次尝试（重试/主机回退）开始时归零。
+    artifact_bytes: u64,
+    total_bytes: Option<u64>,
+}
+
+impl<'a> RemoteTransferContext<'a> {
+    /// `limit_bps`：字节/秒；`None` 表示不限速（仍然上报进度）。
+    pub fn new(limit_bps: Option<u64>, observer: &'a dyn RemoteAcquisitionObserver) -> Self {
+        Self {
+            limit_bps: limit_bps.filter(|limit| *limit > 0),
+            observer,
+            started: Instant::now(),
+            state: Mutex::new(RemoteTransferState::default()),
+        }
+    }
+
+    /// 本次获取生效的有限速率（字节/秒）；`None` 表示不限速。
+    pub fn limit_bps(&self) -> Option<u64> {
+        self.limit_bps
+    }
+
+    /// 声明**当前产物尝试**的已知总大小。只有「响应体就是最终产物」的获取可以声明；
+    /// 分页下载与转换类来源必须保持 `None`（未知总大小是诚实值）。
+    /// 每次新的产物尝试（[`RemoteTransferContext::begin_artifact_attempt`]）都会把它
+    /// 清回未知，避免上一次尝试的响应大小冒充这一次的整体大小。
+    pub fn set_total_bytes(&self, total_bytes: Option<u64>) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .total_bytes = total_bytes;
+    }
+
+    /// 开始一次**产物**获取尝试：产物进度归零，已知总大小回到未知。
+    ///
+    /// 只由「响应体就是最终产物」的获取在每次尝试（传输层重试、主机回退、逐页读取）
+    /// 开始时调用。累计网络字节与限速依据**不重置**：被丢弃尝试读到的字节仍然计入
+    /// 网络上限，只是不再冒充当前产物的完成度。
+    pub fn begin_artifact_attempt(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.artifact_bytes = 0;
+        state.total_bytes = None;
+    }
+
+    /// 记录一次**非产物**网络读取的字节数（目录页、条目元数据、分页响应、转换类正文）：
+    /// 只计入限速与速率，不计入产物进度——元数据字节绝不能冒充产物完成度。
+    /// 先记账，再按有限速率补齐应等待的时长，最后把最新进度交给观察者；
+    /// 等待发生在网络读取之外。
+    pub async fn record(&self, bytes: u64) {
+        self.record_read(bytes, false).await;
+    }
+
+    /// 记录一次**产物**响应体的网络读取：同时计入限速、速率与当前产物尝试的进度。
+    pub async fn record_artifact(&self, bytes: u64) {
+        self.record_read(bytes, true).await;
+    }
+
+    async fn record_read(&self, bytes: u64, artifact: bool) {
+        let network_bytes = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.network_bytes = state.network_bytes.saturating_add(bytes);
+            if artifact {
+                state.artifact_bytes = state.artifact_bytes.saturating_add(bytes);
+            }
+            state.network_bytes
+        };
+        if let Some(limit) = self.limit_bps {
+            let delay = transfer_delay(self.started.elapsed(), network_bytes, limit);
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+        }
+        self.observer.on_progress(self.progress());
+    }
+
+    /// 当前进度快照。
+    ///
+    /// 已知总大小时上报的是**当前产物尝试**读到的字节（夹在总大小内，不超过 100%）：
+    /// 失败尝试读到的字节已经计入网络与限速，但绝不能与当前尝试的产物字节相加，
+    /// 否则回退/重试后的累计网络字节一碰到总大小就会谎报 100%。总大小未知时保持
+    /// 未知，只报累计网络字节，不伪造百分比。
+    pub fn progress(&self) -> RemoteAcquisitionProgress {
+        let state = *self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let speed_bps =
+            (elapsed > 0.0).then(|| (state.network_bytes as f64 / elapsed).round() as u64);
+        let bytes = match state.total_bytes {
+            Some(total) => state.artifact_bytes.min(total),
+            None => state.network_bytes,
+        };
+        let eta_seconds = state.total_bytes.and_then(|total| {
+            speed_bps
+                .filter(|speed| *speed > 0)
+                .map(|speed| total.saturating_sub(bytes).div_ceil(speed))
+        });
+        RemoteAcquisitionProgress {
+            bytes,
+            total_bytes: state.total_bytes,
+            speed_bps,
+            eta_seconds,
+        }
+    }
+}
+
+/// 按累计字节与有限速率推算还需等待的时长（限速睡眠不进入任何网络超时窗口）。
+fn transfer_delay(elapsed: Duration, bytes: u64, limit_bps: u64) -> Duration {
+    if limit_bps == 0 || bytes == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_secs_f64(bytes as f64 / limit_bps as f64).saturating_sub(elapsed)
+}
+
 #[async_trait]
 pub trait RemoteAcquisitionPort: Send + Sync {
+    /// 既有获取路径：无观察者、无显式限速。保留以兼容既有调用方与夹具；
+    /// 生产 Provider 必须同时实现 [`RemoteAcquisitionPort::acquire_controlled`]。
     async fn acquire(
         &self,
         source_key: &str,
         remote_id: &str,
         destination: &Path,
     ) -> Result<RemoteAcquiredFile, AppError>;
+
+    /// 受控获取：把有限速率约束贯穿到**真实网络字节读取路径**（不是获取完成后的
+    /// 补睡眠），并按界上报进度。取消语义与 `acquire` 一致：future 被丢弃即中止。
+    ///
+    /// 默认实现只在**没有**有限速率约束时退化为 `acquire`；一旦调用方施加了有限
+    /// 速率，默认实现必须显式失败，绝不静默绕过限速。
+    async fn acquire_controlled(
+        &self,
+        source_key: &str,
+        remote_id: &str,
+        destination: &Path,
+        transfer: &RemoteTransferContext<'_>,
+    ) -> Result<RemoteAcquiredFile, AppError> {
+        if transfer.limit_bps().is_some() {
+            return Err(AppError::new(
+                "INTERNAL_ERROR",
+                ErrorKind::Internal,
+                "该来源尚未实现受控获取路径，无法应用下载限速",
+                false,
+            ));
+        }
+        self.acquire(source_key, remote_id, destination).await
+    }
 }
 
 /// Controlled remote read port used by Article/PDF sessions.  Implementations

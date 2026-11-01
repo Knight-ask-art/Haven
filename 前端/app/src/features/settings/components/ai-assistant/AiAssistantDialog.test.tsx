@@ -19,6 +19,7 @@ import type {
   AgentSettingsProposalCreateRequest,
   AgentSettingsProposalRejectRequest,
   AiSettingsRecommendationGenerateRequest,
+  AgentSettingsProposalGetResultDto,
 } from "@/lib/ipc/generated/wire"
 import {
   AiAssistantDialog,
@@ -635,7 +636,7 @@ describe("栖伴提案状态机", () => {
 
     await waitFor(() => expect(within(region).getByRole("alert").textContent).toContain("拒绝失败"))
     expect(within(region).getByText("待批准")).toBeTruthy()
-    expect(within(region).getByText("本次没有写入任何设置，提案仍待批准，可以重试。")).toBeTruthy()
+    expect(within(region).getByText("本次没有写入任何设置，提案仍待处理，可以重试拒绝。")).toBeTruthy()
     expect((within(region).getByRole("button", { name: "拒绝" }) as HTMLButtonElement).disabled).toBe(false)
     expect((within(region).getByRole("button", { name: "批准并应用" }) as HTMLButtonElement).disabled).toBe(false)
 
@@ -1145,17 +1146,27 @@ describe("栖伴真实 Provider 路径", () => {
     expect(proposalRegion()).toBeTruthy()
   })
 
-  it("不构成阅读排版意图的输入不会触达 Provider", async () => {
+  it("能力说明快捷操作留在本机，不触达 Provider", async () => {
     const { client, generate } = providerClient()
     renderDialog({ client, profileId: PROFILE_ID })
 
     fireEvent.change(screen.getByLabelText("描述你想要的设置改动"), {
-      target: { value: "今天天气怎么样" },
+      target: { value: "当前能改什么设置" },
     })
     fireEvent.click(screen.getByRole("button", { name: "发送" }))
 
     await screen.findByText(/我只接入了阅读排版提案/)
     expect(generate).not.toHaveBeenCalled()
+  })
+
+  it.each(["把行距调宽松一点", "字稍微粗一点", "改成双页模式"])("真实 Provider 接收自然表达：%s", async (userIntent) => {
+    const { client, generate } = providerClient()
+    renderDialog({ client, profileId: PROFILE_ID })
+    fireEvent.change(screen.getByLabelText("描述你想要的设置改动"), { target: { value: userIntent } })
+    fireEvent.click(screen.getByRole("button", { name: "发送" }))
+    await screen.findByRole("button", { name: "批准并应用" })
+    expect(generate).toHaveBeenCalledWith(expect.objectContaining({ userIntent }))
+    expect(client.agentSettingsProposalCreate).not.toHaveBeenCalled()
   })
 
   it("Mock 客户端不调用真实 Provider 路径，模板结果必须带 Mock/预览 标识", async () => {
@@ -1175,6 +1186,112 @@ describe("栖伴真实 Provider 路径", () => {
 })
 
 describe("正式嵌入式 AI 工作台", () => {
+  it("基线失效的历史提案明确提示且不再提供批准入口", async () => {
+    const list = vi.fn().mockResolvedValue({ schemaVersion: 1, items: [{
+      proposal: { ...proposalDto(), expiresAt: "2099-01-01T00:00:00Z", baselineStale: true, changes: [] },
+      receipt: null,
+    }], nextCursor: null })
+    const approve = vi.fn()
+    renderDialog({ client: fakeClient({ agentSettingsProposalList: list, agentSettingsProposalApprove: approve }), embedded: true })
+    fireEvent.click(screen.getByRole("button", { name: "提案历史" }))
+    const entries = await screen.findByRole("list", { name: "提案记录" })
+    fireEvent.click(within(entries).getByRole("button"))
+    expect(screen.getAllByText(/原提案基线已失效/).length).toBeGreaterThan(0)
+    expect(screen.queryByRole("button", { name: "批准并应用" })).toBeNull()
+    expect(approve).not.toHaveBeenCalled()
+  })
+
+  it("批准响应丢失后，权威回执消除未确认写入的错误状态", async () => {
+    const list = vi.fn()
+      .mockResolvedValueOnce({ schemaVersion: 1, items: [{ proposal: { ...proposalDto(), expiresAt: "2099-01-01T00:00:00Z" }, receipt: null }], nextCursor: null })
+      .mockResolvedValue({ schemaVersion: 1, items: [appliedResult()], nextCursor: null })
+    const client = fakeClient({ agentSettingsProposalList: list, agentSettingsProposalApprove: vi.fn(async () => { throw new Error("response lost") }) })
+    renderDialog({ client, embedded: true })
+    await openProposal()
+    fireEvent.click(screen.getByRole("button", { name: "提案历史" }))
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(1))
+    fireEvent.click(within(screen.getByRole("list", { name: "提案记录" })).getByRole("button"))
+    fireEvent.click(screen.getByRole("button", { name: "批准并应用" }))
+    await waitFor(() => expect(within(proposalRegion()).getAllByText("已应用", { exact: true }).length).toBeGreaterThan(0))
+    expect(screen.queryByRole("alert", { name: "应用失败" })).toBeNull()
+    expect(client.agentSettingsProposalApprove).toHaveBeenCalledTimes(1)
+  })
+
+  it("刷新失败保留已恢复提案，停用旧游标，并能重新读取", async () => {
+    const page = { schemaVersion: 1, items: [{ proposal: proposalDto(), receipt: null }], nextCursor: PROPOSAL_ID }
+    const list = vi.fn().mockResolvedValueOnce(page).mockRejectedValueOnce(new Error("history unavailable"))
+      .mockResolvedValueOnce({ ...page, nextCursor: null })
+    renderDialog({ client: fakeClient({ agentSettingsProposalList: list }), embedded: true })
+    fireEvent.click(screen.getByRole("button", { name: "提案历史" }))
+    await screen.findByRole("list", { name: "提案记录" })
+    fireEvent.click(screen.getByRole("button", { name: "重新读取提案" }))
+    await screen.findByRole("alert")
+    expect(screen.getByRole("list", { name: "提案记录" })).toBeTruthy()
+    expect(screen.queryByText(/还没有设置提案/)).toBeNull()
+    expect(screen.queryByRole("button", { name: "加载更多提案" })).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: "重新读取提案" }))
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull())
+    expect(list).toHaveBeenLastCalledWith({ before: null, limit: 30 })
+  })
+
+  it("继续加载的旧提案追加在当前页后面，并使用上一页游标", async () => {
+    const newest = proposalDtoFor(SECOND_PROPOSAL_ID, SECOND_PROPOSAL_DIGEST)
+    const older = proposalDto()
+    const list = vi.fn()
+      .mockResolvedValueOnce({ schemaVersion: 1, items: [{ proposal: newest, receipt: null }], nextCursor: newest.proposalId })
+      .mockResolvedValueOnce({ schemaVersion: 1, items: [{ proposal: older, receipt: null }], nextCursor: null })
+    renderDialog({ client: fakeClient({ agentSettingsProposalList: list }), embedded: true })
+    fireEvent.click(screen.getByRole("button", { name: "提案历史" }))
+    fireEvent.click(await screen.findByRole("button", { name: "加载更多提案" }))
+    await waitFor(() => expect(within(screen.getByRole("list", { name: "提案记录" })).getAllByRole("button")).toHaveLength(2))
+    const entries = within(screen.getByRole("list", { name: "提案记录" })).getAllByRole("button")
+    expect(entries[0].textContent).toContain(SECOND_PROPOSAL_DIGEST)
+    expect(entries[1].textContent).toContain(PROPOSAL_DIGEST)
+    expect(list).toHaveBeenLastCalledWith({ before: newest.proposalId, limit: 30 })
+  })
+
+  it("重新挂载后从本机提案恢复待批准项，并继续使用同一 ID 与摘要批准", async () => {
+    let stored: AgentSettingsProposalGetResultDto = { proposal: { ...proposalDto(), expiresAt: "2099-01-01T00:00:00Z" }, receipt: null }
+    const list = vi.fn(async () => ({ schemaVersion: 1 as const, items: [stored], nextCursor: null }))
+    const approve = vi.fn(async () => { stored = appliedResult(); return appliedResult() })
+    const client = fakeClient({ agentSettingsProposalList: list, agentSettingsProposalApprove: approve })
+    const first = renderDialog({ client, embedded: true })
+    await openProposal()
+    first.unmount()
+    renderDialog({ client, embedded: true })
+    fireEvent.click(screen.getByRole("button", { name: "提案历史" }))
+    const entries = await screen.findByRole("list", { name: "提案记录" })
+    fireEvent.click(within(entries).getByRole("button"))
+    fireEvent.click(screen.getByRole("button", { name: "批准并应用" }))
+    await waitFor(() => expect(approve).toHaveBeenCalledWith({ proposalId: PROPOSAL_ID, expectedDigest: PROPOSAL_DIGEST }))
+    await waitFor(() => expect(within(proposalRegion()).getAllByText("已应用", { exact: true }).length).toBeGreaterThan(0))
+  })
+
+  it("迟到的 pending 历史读取不能撤销刚完成的批准", async () => {
+    const stale = deferred<{ schemaVersion: 1; items: AgentSettingsProposalGetResultDto[]; nextCursor: null }>()
+    const list = vi.fn().mockReturnValueOnce(stale.promise).mockResolvedValue({ schemaVersion: 1, items: [appliedResult()], nextCursor: null })
+    const client = fakeClient({ agentSettingsProposalList: list })
+    renderDialog({ client, embedded: true })
+    await openProposal()
+    fireEvent.click(screen.getByRole("button", { name: "提案历史" }))
+    fireEvent.click(within(screen.getByRole("list", { name: "提案记录" })).getByRole("button"))
+    fireEvent.click(screen.getByRole("button", { name: "批准并应用" }))
+    await waitFor(() => expect(within(proposalRegion()).getAllByText("已应用", { exact: true }).length).toBeGreaterThan(0))
+    await act(async () => stale.resolve({ schemaVersion: 1, items: [{ proposal: { ...proposalDto(), expiresAt: "2099-01-01T00:00:00Z" }, receipt: null }], nextCursor: null }))
+    expect(screen.queryByRole("button", { name: "批准并应用" })).toBeNull()
+    expect(within(proposalRegion()).getAllByText("已应用", { exact: true }).length).toBeGreaterThan(0)
+  })
+
+  it("历史读取失败可重新读取，不伪报没有提案", async () => {
+    const list = vi.fn().mockRejectedValueOnce(new Error("history unavailable")).mockResolvedValue({ schemaVersion: 1, items: [{ proposal: proposalDto(), receipt: null }], nextCursor: null })
+    renderDialog({ client: fakeClient({ agentSettingsProposalList: list }), embedded: true })
+    fireEvent.click(screen.getByRole("button", { name: "提案历史" }))
+    await screen.findByRole("alert")
+    expect(screen.queryByText(/还没有设置提案/)).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: "重新读取提案" }))
+    expect(await screen.findByRole("list", { name: "提案记录" })).toBeTruthy()
+  })
+
   it("设置入口调用真实回调，历史和执行记录均可返回对话，不提供隐藏全局导航", () => {
     const openSettings = vi.fn()
     renderDialog({ embedded: true, previewOnly: true, onOpenSettings: openSettings })

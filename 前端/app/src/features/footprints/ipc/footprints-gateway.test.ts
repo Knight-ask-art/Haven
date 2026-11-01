@@ -83,6 +83,16 @@ describe("footprints gateway runtime boundary", () => {
     expect(libraryList).toHaveBeenCalledOnce()
   })
 
+  it("includes favorites beyond the first library cursor page", async () => {
+    mocks.getHavenClientMode.mockReturnValue("tauri")
+    const libraryList = vi.fn()
+      .mockResolvedValueOnce({ ...page([{ ...workCard(), favorite: false }]), nextCursor: "next" })
+      .mockResolvedValueOnce(page([{ ...workCard(), workId: "old-favorite" }]))
+    mocks.getHavenClient.mockReturnValue({ libraryList })
+    expect((await getFavoriteFootprintItems()).map((item) => item.id)).toEqual(["old-favorite"])
+    expect(libraryList.mock.calls[1][0].cursor).toBe("next")
+  })
+
   it("fails closed for an unavailable browser instead of reading Demo storage", async () => {
     mocks.getHavenClientMode.mockReturnValue("unavailable")
     mocks.getStoredFavoriteIds.mockImplementation(() => {

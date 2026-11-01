@@ -22,7 +22,8 @@ use haven_application::wire::{
     AgentSettingChangeReceiptGetRequest, AgentSettingsContextDto,
     AgentSettingsProposalApproveRequest, AgentSettingsProposalApproveResultDto,
     AgentSettingsProposalCreateRequest, AgentSettingsProposalDto, AgentSettingsProposalGetRequest,
-    AgentSettingsProposalGetResultDto, AgentSettingsProposalRejectRequest,
+    AgentSettingsProposalGetResultDto, AgentSettingsProposalListRequest,
+    AgentSettingsProposalListResultDto, AgentSettingsProposalRejectRequest,
     AgentSettingsProposalRejectResultDto, AgentTraceGetRequest, AgentTraceGetResultDto, ErrorDto,
 };
 use haven_domain::ids::{AgentRequestId, AgentSessionId, SettingProposalId};
@@ -82,6 +83,17 @@ pub async fn run_agent_settings_proposal_get(
 ) -> Result<AgentSettingsProposalGetResultDto, ErrorDto> {
     agent_settings
         .get_proposal(&request)
+        .await
+        .map_err(|error| to_error_dto(&error))
+}
+
+/// 有界读取全局阅读 Agent 提案与回执。
+pub async fn run_agent_settings_proposal_list(
+    agent_settings: &AgentSettingsIpcService,
+    request: AgentSettingsProposalListRequest,
+) -> Result<AgentSettingsProposalListResultDto, ErrorDto> {
+    agent_settings
+        .list_proposals(&request)
         .await
         .map_err(|error| to_error_dto(&error))
 }
@@ -214,6 +226,18 @@ pub async fn agent_settings_proposal_reject(
     run_blocking(move || async move {
         run_agent_settings_proposal_reject(&agent_settings, request).await
     })
+    .await
+}
+
+#[tauri::command]
+pub async fn agent_settings_proposal_list(
+    state: State<'_, AppState>,
+    request: AgentSettingsProposalListRequest,
+) -> Result<AgentSettingsProposalListResultDto, ErrorDto> {
+    let agent_settings = state.agent_settings.clone();
+    run_blocking(
+        move || async move { run_agent_settings_proposal_list(&agent_settings, request).await },
+    )
     .await
 }
 

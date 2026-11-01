@@ -37,7 +37,8 @@ use crate::wire::{
     AgentSettingChangeDto, AgentSettingChangeReceiptDto, AgentSettingsContextDto,
     AgentSettingsProposalApproveRequest, AgentSettingsProposalApproveResultDto,
     AgentSettingsProposalCreateRequest, AgentSettingsProposalDto, AgentSettingsProposalGetRequest,
-    AgentSettingsProposalGetResultDto, AgentSettingsProposalRejectRequest,
+    AgentSettingsProposalGetResultDto, AgentSettingsProposalListRequest,
+    AgentSettingsProposalListResultDto, AgentSettingsProposalRejectRequest,
     AgentSettingsProposalRejectResultDto, AgentSettingsReadingSnapshotDto,
     AgentSettingsRedactedFieldDto, AgentSettingsSectionDto, AgentSettingsSubjectDto, ErrorDto,
 };
@@ -254,7 +255,7 @@ impl AgentSettingsIpcService {
             .ok_or_else(setting_proposal_not_found)?;
         ensure_global_reading_proposal(&proposal)?;
         let receipt = self.proposals.get_receipt(proposal_id).await?;
-        let (_, reading) = self.read_authoritative().await?;
+        let (revision, reading) = self.read_authoritative().await?;
         // 已应用提案的当前值就是 after；用它重新投影会把 Diff 压成空列表。
         // Receipt 的 before 是同一 UoW 写入的审计事实，因此优先用它重建提案 Diff。
         let proposal_before = receipt
@@ -266,9 +267,49 @@ impl AgentSettingsIpcService {
             .as_ref()
             .map(|receipt| self.project_receipt(receipt, &proposal, &reading))
             .transpose()?;
+        let mut projected = self.project_proposal(&proposal, &proposal_before)?;
+        if receipt.is_none() && proposal.base_revision() != revision.as_deref() {
+            projected.baseline_stale = Some(true);
+            projected.changes.clear();
+        }
         Ok(AgentSettingsProposalGetResultDto {
-            proposal: self.project_proposal(&proposal, &proposal_before)?,
+            proposal: projected,
             receipt: projected_receipt,
+        })
+    }
+
+    /// 从持久化存储恢复当前工作台支持的全局阅读提案，包含外部 Agent 创建的记录。
+    pub async fn list_proposals(
+        &self,
+        request: &AgentSettingsProposalListRequest,
+    ) -> Result<AgentSettingsProposalListResultDto, AppError> {
+        let before = request
+            .before
+            .as_deref()
+            .map(parse_proposal_id)
+            .transpose()?;
+        let limit = request.limit.unwrap_or(30).clamp(1, 100);
+        let mut proposals = self.proposals.list_agent_reading(before, limit + 1).await?;
+        let has_more = proposals.len() > limit as usize;
+        proposals.truncate(limit as usize);
+        let next_cursor = if has_more {
+            proposals.last().map(|proposal| proposal.id().to_string())
+        } else {
+            None
+        };
+        let mut items = Vec::with_capacity(proposals.len());
+        for proposal in proposals {
+            items.push(
+                self.get_proposal(&AgentSettingsProposalGetRequest {
+                    proposal_id: proposal.id().to_string(),
+                })
+                .await?,
+            );
+        }
+        Ok(AgentSettingsProposalListResultDto {
+            schema_version: 1,
+            items,
+            next_cursor,
         })
     }
 
@@ -437,6 +478,7 @@ impl AgentSettingsIpcService {
             },
             target_label: "全局默认 · 阅读".to_owned(),
             base_revision: proposal.base_revision().map(str::to_owned),
+            baseline_stale: None,
             digest: proposal.digest().to_owned(),
             created_at: format_millis(proposal.created_at()),
             expires_at: format_millis(proposal.expires_at()),
@@ -963,6 +1005,37 @@ pub(crate) mod tests {
             Ok(self.state.lock().unwrap().proposals.get(&id).cloned())
         }
 
+        async fn list_agent_reading(
+            &self,
+            before: Option<SettingProposalId>,
+            limit: u32,
+        ) -> Result<Vec<SettingProposal>, AppError> {
+            let state = self.state.lock().unwrap();
+            let cursor = before
+                .and_then(|id| state.proposals.get(&id))
+                .map(|proposal| (proposal.created_at().0, proposal.id().to_string()));
+            let mut proposals: Vec<_> = state
+                .proposals
+                .values()
+                .filter(|proposal| {
+                    state.bindings.contains_key(&proposal.id())
+                        && proposal.target()
+                            == haven_domain::setting_proposal::SettingTarget::global(
+                                haven_domain::settings::SettingsSection::Reading,
+                            )
+                        && cursor.as_ref().is_none_or(|key| {
+                            (proposal.created_at().0, proposal.id().to_string()) < *key
+                        })
+                })
+                .cloned()
+                .collect();
+            proposals.sort_by_key(|proposal| {
+                std::cmp::Reverse((proposal.created_at().0, proposal.id().to_string()))
+            });
+            proposals.truncate(limit as usize);
+            Ok(proposals)
+        }
+
         async fn get_receipt(
             &self,
             id: SettingProposalId,
@@ -1429,6 +1502,93 @@ pub(crate) mod tests {
     // ---------- 读取边界 ----------
 
     #[tokio::test]
+    async fn proposal_history_restores_receipts_and_terminal_states_with_pagination() {
+        let store = FakeStore::new();
+        seed_reading(&store, Some("rev-0001"));
+        let service = service(&store);
+        let context = service.context().await.unwrap();
+        let (session, request_id) = ids();
+        let rejected = service
+            .create_proposal(
+                session,
+                request_id,
+                &create_request(&context, patch(ReadingFontSize::Large)),
+            )
+            .await
+            .unwrap();
+        let (session, request_id) = ids();
+        let applied = service
+            .create_proposal(
+                session,
+                request_id,
+                &create_request(&context, patch(ReadingFontSize::Small)),
+            )
+            .await
+            .unwrap();
+        service
+            .reject_proposal(&AgentSettingsProposalRejectRequest {
+                proposal_id: rejected.proposal_id.clone(),
+                expected_digest: rejected.digest,
+            })
+            .await
+            .unwrap();
+        service
+            .approve_proposal(&AgentSettingsProposalApproveRequest {
+                proposal_id: applied.proposal_id.clone(),
+                expected_digest: applied.digest,
+            })
+            .await
+            .unwrap();
+        let first = service
+            .list_proposals(&AgentSettingsProposalListRequest {
+                before: None,
+                limit: Some(1),
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.items.len(), 1);
+        let second = service
+            .list_proposals(&AgentSettingsProposalListRequest {
+                before: first.next_cursor,
+                limit: Some(1),
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert!(second.next_cursor.is_none());
+        let mut items = first.items;
+        items.extend(second.items);
+        let applied = items
+            .iter()
+            .find(|item| item.proposal.proposal_id == applied.proposal_id)
+            .unwrap();
+        assert_eq!(
+            applied.proposal.status,
+            AgentSettingsProposalStatusDto::Applied
+        );
+        assert!(!applied.proposal.changes.is_empty());
+        assert!(applied.receipt.as_ref().unwrap().changed);
+        let rejected = items
+            .iter()
+            .find(|item| item.proposal.proposal_id == rejected.proposal_id)
+            .unwrap();
+        assert_eq!(
+            rejected.proposal.status,
+            AgentSettingsProposalStatusDto::Rejected
+        );
+        assert!(rejected.receipt.is_none());
+        assert!(
+            service
+                .list_proposals(&AgentSettingsProposalListRequest {
+                    before: Some("invalid".into()),
+                    limit: None
+                })
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn context_is_redacted_and_has_no_secrets_or_paths() {
         let store = FakeStore::new();
         seed_reading(&store, Some("rev-0001"));
@@ -1703,6 +1863,29 @@ pub(crate) mod tests {
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
         assert_eq!(keys.len(), 2, "批准响应只有 proposal 与 receipt");
+    }
+
+    #[tokio::test]
+    async fn stale_pending_history_never_rebases_its_display_or_changes_digest() {
+        let store = FakeStore::new();
+        seed_reading(&store, Some("rev-0001"));
+        let (service, proposal) = run_full_flow(&store).await;
+        store.write_reading_for_test(ReadingPatch {
+            font_size: Some(ReadingFontSize::Large),
+            ..ReadingPatch::default()
+        });
+        let reread = service
+            .get_proposal(&crate::wire::AgentSettingsProposalGetRequest {
+                proposal_id: proposal.proposal_id.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(reread.proposal.baseline_stale, Some(true));
+        assert!(reread.proposal.changes.is_empty());
+        assert_eq!(reread.proposal.digest, proposal.digest);
+        assert_eq!(reread.proposal.base_revision, proposal.base_revision);
+        assert!(reread.receipt.is_none());
+        assert_eq!(store.target_writes(), 0);
     }
 
     #[tokio::test]

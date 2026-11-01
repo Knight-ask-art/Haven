@@ -1,4 +1,6 @@
-import { useCallback, useState, useRef, useEffect, useLayoutEffect } from "react"
+import { useMarkerNavigation } from "@/features/markers/lib/use-marker-navigation"
+import { initialPositionForSession } from "@/features/progress/lib/restore-position"
+import { useCallback, useMemo, useState, useRef, useEffect, useLayoutEffect } from "react"
 import { useParams, useNavigate } from "react-router"
 import { VideoControls } from "../components/VideoControls"
 import { EpisodeDrawer, type EpisodeItem } from "../components/EpisodeDrawer"
@@ -26,6 +28,12 @@ import { SubtitleTrackRuntime, type SubtitleTrackAsset } from "../lib/subtitle-t
 import { externalSubtitleOption, hlsSubtitleOptions as mapHlsSubtitleOptions, type PlayerSubtitleOption } from "../lib/subtitle-options"
 import { defaultCoverPath } from "@/lib/default-cover"
 import { useNotice } from "@/app/notice-center/notice-context"
+import { usePlayerEpisodeActions } from "../hooks/usePlayerEpisodeActions"
+import {
+  episodeBadgeLabel,
+  presentEpisodeDownload,
+  summarizeEpisodeDownloadsText,
+} from "../lib/episode-actions-state"
 
 // 模拟播放展示数据（实际内容源始终来自媒体会话）
 interface PlayerPresentation {
@@ -57,6 +65,7 @@ const SAMPLE_VIDEOS: Record<string, PlayerPresentation> = {
 
 export function PlayerPage() {
   const { mediaItemId } = useParams<{ mediaItemId: string }>()
+  const initialPosition = useMarkerNavigation(mediaItemId)
   const navigate = useNavigate()
   const clientMode = getHavenClientMode()
   const runtimeState = resolvePlayerRuntimeState(clientMode)
@@ -150,13 +159,16 @@ export function PlayerPage() {
   const [posterRawUri, setPosterRawUri] = useState<string | null>(null)
   const posterUri = artworkRequestUri(posterRawUri) || undefined
   const [drawerMeta, setDrawerMeta] = useState<{ year?: number; description?: string } | null>(null)
+  const [drawerWorkResolved, setDrawerWorkResolved] = useState(false)
   useEffect(() => {
     if (!productionMode || !workIdForPoster) {
       setPosterRawUri(null)
       setDrawerMeta(null)
+      setDrawerWorkResolved(false)
       return undefined
     }
     let active = true
+    setDrawerWorkResolved(false)
     void getWorkDetail(workIdForPoster)
       .then((detail) => {
         if (!active) return
@@ -168,8 +180,46 @@ export function PlayerPage() {
         setPosterRawUri(null)
         setDrawerMeta(null)
       })
+      .finally(() => {
+        if (active) setDrawerWorkResolved(true)
+      })
     return () => { active = false }
   }, [productionMode, workIdForPoster])
+
+  // 选集抽屉的收藏 / 下载动作：真实 IPC 只在 production 接线，组件仅渲染 hook 结论。
+  const drawerEpisodeIds = useMemo(() => (demoMode ? videoData.episodes ?? [] : editionEpisodes ?? []), [demoMode, editionEpisodes, videoData.episodes])
+  const drawerWorkId = demoMode ? null : workIdForPoster
+  const drawerActions = usePlayerEpisodeActions(clientMode, {
+    enabled: productionMode,
+    episodeIds: drawerEpisodeIds.map((episode) => episode.id),
+    workId: drawerWorkId,
+    currentEpisodeId: demoMode ? demoCurrentEpisodeId : (mediaItemId ?? null),
+    // 收藏需要权威 Work Header；未读到时说明原因，而不是给出假的收藏状态。
+    unavailableReason: !productionMode ? null : workIdForPoster === null
+      ? "播放会话尚未建立，暂时无法收藏或下载该作品"
+      : (drawerWorkResolved ? null : "正在读取作品信息…"),
+  })
+  const drawerDownloadPresentationOf = useCallback((episodeId: string) => (
+    presentEpisodeDownload(drawerActions.downloads.viewOf(episodeId), null)
+  ), [drawerActions.downloads.viewOf])
+  const drawerDownloadBadgeOf = useCallback((episodeId: string) => (
+    episodeBadgeLabel(drawerDownloadPresentationOf(episodeId))
+  ), [drawerDownloadPresentationOf])
+  const drawerFavoriteDisabledReason = demoMode
+    ? "浏览器预览没有本地作品数据，收藏不可用"
+    : !drawerActions.favorite.canWrite
+      ? "未读取到作品的权威收藏状态，暂时无法收藏"
+      : null
+  const downloadCurrent = drawerActions.downloads.downloadCurrent
+  const downloadAll = drawerActions.downloads.downloadAll
+  const handleDownloadAll = useCallback(async () => {
+    const summary = await downloadAll()
+    return summary ? summarizeEpisodeDownloadsText(summary) : null
+  }, [downloadAll])
+  const handleDownloadCurrent = useCallback(async () => {
+    const summary = await downloadCurrent()
+    return summary ? summarizeEpisodeDownloadsText(summary) : null
+  }, [downloadCurrent])
 
   const videoRef = useRef<HTMLVideoElement>(null)
   const activePlaybackSourceRef = useRef<string | null>(sessionContentUri)
@@ -227,6 +277,14 @@ export function PlayerPage() {
   const activeSessionId = state.status === "ready" && sessionView.status === "ready"
     ? state.session.sessionId
     : null
+  const autoAdvanceGenerationRef = useRef(0)
+  const cancelPendingAutoAdvance = useCallback(() => {
+    autoAdvanceGenerationRef.current += 1
+  }, [])
+  useLayoutEffect(() => {
+    cancelPendingAutoAdvance()
+    return cancelPendingAutoAdvance
+  }, [activeSessionId, currentEpisodeId, sessionContentUri, playbackSettings.autoNext, playbackSettings.status, cancelPendingAutoAdvance])
   const subtitleOptions: PlayerSubtitleOption[] = [
     ...sessionSubtitleTracks.map(externalSubtitleOption),
     ...hlsSubtitleOptionList,
@@ -267,13 +325,13 @@ export function PlayerPage() {
     if (
       !video ||
       !metadataReadyRef.current ||
-      playbackSettings.status === "loading" ||
-      !playbackSettings.autoResume ||
+      (!(sessionForProgress && initialPositionForSession(sessionForProgress, initialPosition))
+        && (playbackSettings.status === "loading" || !playbackSettings.autoResume)) ||
       sessionView.status !== "ready" ||
       sessionForProgress === null
     ) return
-    restoreVideoProgress(video, sessionForProgress, restoredProgressRef)
-  }, [playbackSettings.autoResume, playbackSettings.status, sessionForProgress, sessionView.status])
+    restoreVideoProgress(video, sessionForProgress, restoredProgressRef, initialPosition)
+  }, [initialPosition, playbackSettings.autoResume, playbackSettings.status, sessionForProgress, sessionView.status])
 
   useEffect(() => {
     restoreProgressIfAllowed()
@@ -305,7 +363,22 @@ export function PlayerPage() {
   }, [])
 
   // 缓冲态 + 看门狗：waiting 300ms 后显 spinner，playing/canplay 消；4s 无进展兜底 nudge
+  //
+  // `<video key={sessionContentUri}>` 在换源 / 重开会话时会替换整个元素，所以本 effect 必须
+  // 绑定到真正挂载的那一个视频元素，而不是首次渲染时的元素：换源后旧元素不再收事件，
+  // 迟到的 waiting / stalled 计时器还会把 spinner 留在新会话上。绑定前先清掉上一条源的
+  // 计时器、监听、缓冲区间与 spinner，watchdog 也只观察当前元素。换源时的清除与重置
+  // 完全由本 effect 的入口负责，不再用渲染期 setState 镜像源地址。
   useEffect(() => {
+    if (bufferingTimeoutRef.current) clearTimeout(bufferingTimeoutRef.current)
+    bufferingTimeoutRef.current = null
+    if (watchdogRef.current) window.clearInterval(watchdogRef.current as unknown as number)
+    watchdogRef.current = null
+    setIsBuffering(false)
+    setBufferedRanges([])
+    lastTimeRef.current = 0
+    lastTimeUpdateRef.current = Date.now()
+
     const video = videoRef.current
     if (!video) return undefined
     const onWaiting = () => {
@@ -343,7 +416,7 @@ export function PlayerPage() {
     // 看门狗：!paused && readyState<=2 持续 >4s 则 nudge
     watchdogRef.current = window.setInterval(() => {
       const v = videoRef.current
-      if (!v || v.paused || v.ended) return
+      if (!v || v !== video || v.paused || v.ended) return
       const now = Date.now()
       const progressed = Math.abs(v.currentTime - lastTimeRef.current) > 0.05
       if (progressed) {
@@ -366,9 +439,11 @@ export function PlayerPage() {
       video.removeEventListener("stalled", onStalled)
       window.clearInterval(bufferedTimer)
       if (watchdogRef.current) window.clearInterval(watchdogRef.current as unknown as number)
+      watchdogRef.current = null
       if (bufferingTimeoutRef.current) clearTimeout(bufferingTimeoutRef.current)
+      bufferingTimeoutRef.current = null
     }
-  }, [])
+  }, [sessionContentUri])
 
   // Clear media element state whenever the route or validated session changes.
   useLayoutEffect(() => {
@@ -718,6 +793,7 @@ export function PlayerPage() {
   // 播放 / 暂停切换
   const togglePlay = () => {
     if (!videoRef.current || sessionView.status !== "ready") return
+    cancelPendingAutoAdvance()
     if (isPlaying) {
       videoRef.current.pause()
       setIsPlaying(false)
@@ -731,6 +807,7 @@ export function PlayerPage() {
   // 进度跳转
   const handleSeek = (time: number) => {
     if (!videoRef.current || sessionView.status !== "ready") return
+    cancelPendingAutoAdvance()
     const nextTime = clampVideoSeek(time, videoRef.current.duration)
     videoRef.current.currentTime = nextTime
     setCurrentTime(nextTime)
@@ -891,18 +968,24 @@ export function PlayerPage() {
   }, [currentEpisodeId, demoMode, drawerEpisodes, navigate, playbackSettings.autoNext, playbackSettings.status])
 
   const handleVideoEnded = useCallback(() => {
+    const generation = ++autoAdvanceGenerationRef.current
+    const advanceIfCurrent = () => {
+      if (autoAdvanceGenerationRef.current !== generation) return
+      cancelPendingAutoAdvance()
+      advanceToNextEpisode()
+    }
     setIsPlaying(false)
     const positionSeconds = videoRef.current?.currentTime
     const completion = positionSeconds === undefined
       ? undefined
       : progressControllerRef.current?.ended(positionSeconds)
     if (!completion) {
-      advanceToNextEpisode()
+      advanceIfCurrent()
       return
     }
     // 先提交完成进度，再切换到下一项；写入失败也不能把用户卡在结束画面。
-    void completion.then(advanceToNextEpisode, advanceToNextEpisode)
-  }, [advanceToNextEpisode])
+    void completion.then(advanceIfCurrent, advanceIfCurrent)
+  }, [advanceToNextEpisode, cancelPendingAutoAdvance])
 
   const showScreenshotNotice = useCallback((
     message: string,
@@ -970,20 +1053,39 @@ export function PlayerPage() {
     return () => window.removeEventListener("keydown", onKeyDown)
   }, [handleVideoScreenshot])
 
-  // 快捷键支持 (Space / F)
+  // 快捷键支持 (Space / F / ← →)
   useEffect(() => {
+    // 交互控件自己处理按键（输入框、下拉、按钮、滑块、菜单、对话框等），全局处理器必须让路，
+    // 否则滑块的方向键会被二次 seek、下拉框无法切换选项、聚焦按钮时空格会被劫持。
+    const KEY_OWNING_ROLES = [
+      "slider", "spinbutton", "combobox", "listbox", "option", "menu", "menubar",
+      "menuitem", "menuitemradio", "menuitemcheckbox", "dialog", "alertdialog", "tablist", "tab",
+      "textbox", "searchbox", "switch", "checkbox", "radio", "tree", "treeitem", "grid",
+    ].map((role) => `[role='${role}']`).join(",")
+    const ownsKey = (target: EventTarget | null) => {
+      const element = target instanceof HTMLElement ? target : null
+      if (!element) return false
+      return element.isContentEditable
+        || element.closest(`input, textarea, select, button, a, summary, ${KEY_OWNING_ROLES}, [contenteditable]:not([contenteditable='false'])`) !== null
+    }
     const handleKeyDown = (e: KeyboardEvent) => {
+      // 已被更具体的处理器（如进度条滑块）消费的按键不再重复处理。
+      if (e.defaultPrevented || e.isComposing) return
       if (e.code === "Space") {
+        if (ownsKey(e.target)) return
         e.preventDefault()
         togglePlay()
         resetHideTimer()
       } else if (e.code === "KeyF") {
+        if (ownsKey(e.target)) return
         e.preventDefault()
         toggleFullscreen()
       } else if (e.code === "ArrowRight") {
+        if (ownsKey(e.target)) return
         if (videoRef.current) handleSeek(videoRef.current.currentTime + 5)
         resetHideTimer()
       } else if (e.code === "ArrowLeft") {
+        if (ownsKey(e.target)) return
         if (videoRef.current) handleSeek(videoRef.current.currentTime - 5)
         resetHideTimer()
       }
@@ -1157,7 +1259,10 @@ export function PlayerPage() {
           onRateChange={handleRateChange}
           onQualityChange={demoMode ? setQuality : undefined}
           onToggleFullscreen={toggleFullscreen}
-          onBack={() => navigate(-1)}
+          onBack={() => {
+            cancelPendingAutoAdvance()
+            navigate(-1)
+          }}
           onOpenEpisodes={drawerEpisodes ? () => setIsSidePanelOpen(!isSidePanelOpen) : undefined}
           onToggleBookmark={toggleVideoBookmark}
           onSubtitleChange={subtitleOptions.length > 0 ? handleSubtitleChange : undefined}
@@ -1173,6 +1278,7 @@ export function PlayerPage() {
           currentEpisodeId={currentEpisodeId}
           castMediaItemId={currentEpisodeId || mediaItemId}
           onSelectEpisode={(ep) => {
+            cancelPendingAutoAdvance()
             if (demoMode) {
               setDemoCurrentEpisodeId(ep.id)
               if (videoRef.current) {
@@ -1185,11 +1291,30 @@ export function PlayerPage() {
             }
             navigate(`/player/${ep.id}`)
           }}
-          onOpenDetails={() => navigate(`/work/${state.status === "ready" ? state.session.workId : (mediaItemId || "4")}`)}
+          onOpenDetails={() => {
+            cancelPendingAutoAdvance()
+            navigate(`/work/${state.status === "ready" ? state.session.workId : (mediaItemId || "4")}`)
+          }}
           mediaTitle={playerTitle}
           secondaryTitle={currentEp ? `${currentEp.number}` : (demoMode ? (videoData.subtitle || "正片") : undefined)}
           mediaYear={drawerMeta?.year}
           mediaDescription={drawerMeta?.description}
+          isFavorited={demoMode ? null : drawerActions.favorite.isFavorite}
+          isFavoritePending={drawerActions.favorite.saving || drawerActions.favorite.loading}
+          favoriteError={demoMode ? null : drawerActions.favorite.error}
+          favoriteDisabledReason={drawerFavoriteDisabledReason}
+          onToggleFavorite={demoMode ? undefined : () => { void drawerActions.favorite.toggle() }}
+          onReloadFavorite={productionMode ? () => { void drawerActions.favorite.reload() } : undefined}
+          downloadStateOf={productionMode ? drawerDownloadPresentationOf : undefined}
+          downloadBadgeOf={productionMode ? drawerDownloadBadgeOf : undefined}
+          onDownloadCurrent={productionMode ? handleDownloadCurrent : undefined}
+          onDownloadAll={productionMode ? handleDownloadAll : undefined}
+          onReloadDownloads={productionMode ? () => { void drawerActions.downloads.reload() } : undefined}
+          downloadUnavailableReason={productionMode
+            ? (workIdForPoster === null ? "播放会话尚未建立，暂时无法创建下载任务" : null)
+            : "浏览器预览不会创建真实下载任务。"}
+          downloadPending={drawerActions.downloads.pending}
+          downloadError={drawerActions.downloads.error}
         />
       )}
     </div>

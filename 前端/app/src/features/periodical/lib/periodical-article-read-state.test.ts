@@ -12,7 +12,7 @@ import {
 } from "./periodical-article-read-state"
 
 type Info = {
-  status: "idle" | "queued" | "downloaded"
+  status: "idle" | "queued" | "paused" | "interrupted" | "downloaded"
   canDownload: boolean
   hasOfflineResource: boolean
   canOnlineRead: boolean
@@ -188,8 +188,22 @@ describe("article download lifecycle", () => {
     expect(presentation).toEqual({ state: "downloading", label: "下载中", canOpen: false })
   })
 
-  it("lets the queued fact win over the page's own in-flight marker", () => {
-    // 页面自己记的「正在创建」只是本地动作状态；后端已经报出排队中的任务时，
+  it("keeps a paused or interrupted task recoverable instead of saying 下载中", () => {
+    const paused = resolvePeriodicalArticleReadState(info({ status: "paused", taskId: "task-1" }))
+    expect(paused).toEqual({ state: "download_paused", label: "下载已暂停 · 可继续下载", canOpen: false })
+    const interrupted = resolvePeriodicalArticleReadState(info({ status: "interrupted", taskId: "task-1" }))
+    expect(interrupted.state).toBe("download_interrupted")
+    expect(interrupted.label).toContain("可重试下载")
+    expect(paused.label).not.toBe("下载中")
+    // Same task identity stays owned so external resume events still land here.
+    expect(activeDownloadTaskId(info({ status: "paused", taskId: "task-1" }))).toBe("task-1")
+    expect(canStartArticleDownload(info({ status: "interrupted", taskId: "task-1" }), false, "full_text")).toBe(true)
+    expect(canStartArticleDownload(info({ status: "interrupted", taskId: "task-1" }), false, "metadata_only")).toBe(false)
+    expect(periodicalArticleAccessibleName(paused, "第一篇")).toBe("继续下载《第一篇》")
+    expect(periodicalArticleAccessibleName(interrupted, "第一篇")).toBe("重试下载《第一篇》")
+  })
+
+  it("lets the queued fact win over the page's own in-flight marker", () => {    // 页面自己记的「正在创建」只是本地动作状态；后端已经报出排队中的任务时，
     // 屏幕上应当说真实进度，而不是停留在更早的那一步。
     const presentation = resolvePeriodicalArticleReadState(
       info({ canDownload: true, status: "queued", taskId: "task-1" }),
@@ -316,6 +330,8 @@ describe("provider content availability", () => {
       loading: resolvePeriodicalArticleReadState(null, false, "metadata_only"),
       preparing: resolvePeriodicalArticleReadState(downloadable, false, "unknown", { creating: true, error: null }),
       downloading: resolvePeriodicalArticleReadState(info({ canDownload: true, status: "queued" }), false, "unknown"),
+      download_paused: resolvePeriodicalArticleReadState(info({ status: "paused", taskId: "task-1" }), false, "unknown"),
+  download_interrupted: resolvePeriodicalArticleReadState(info({ status: "interrupted", taskId: "task-2" }), false, "unknown"),
       download_failed: resolvePeriodicalArticleReadState(downloadable, false, "unknown", {
         creating: false,
         error: "下载失败，请重试",

@@ -527,18 +527,37 @@ impl ScanService {
                 Err(_join_err) => ScanOutcome::Panicked,
             };
             // 终态裁决：取消优先于失败（取消时 scanner 应返回 Ok，但防御性处理）。
+            // 终态消息：失败只带稳定错误码；已完成/已取消但存在**权威失败条目数**时，
+            // 带一句有界的计数摘要，避免「Completed + message=None」把文件级失败
+            // 静默抹掉（不改变终态本身，也不把部分成功改判为失败）。
             let (phase, final_progress, message) = match outcome {
                 ScanOutcome::Done(report) => {
                     if cancel.load(Ordering::Acquire) {
-                        (ScanPhase::Cancelled, report, None)
+                        (
+                            ScanPhase::Cancelled,
+                            report,
+                            terminal_error_summary(report.errors),
+                        )
                     } else {
-                        (ScanPhase::Completed, report, None)
+                        (
+                            ScanPhase::Completed,
+                            report,
+                            terminal_error_summary(report.errors),
+                        )
                     }
                 }
-                ScanOutcome::Cancelled(report) => (ScanPhase::Cancelled, report, None),
+                ScanOutcome::Cancelled(report) => (
+                    ScanPhase::Cancelled,
+                    report,
+                    terminal_error_summary(report.errors),
+                ),
                 ScanOutcome::Failed(report, err) => {
                     if cancel.load(Ordering::Acquire) {
-                        (ScanPhase::Cancelled, report, None)
+                        (
+                            ScanPhase::Cancelled,
+                            report,
+                            terminal_error_summary(report.errors),
+                        )
                     } else {
                         let msg = err.code().as_str().to_string();
                         (ScanPhase::Failed, report, Some(msg))
@@ -553,11 +572,7 @@ impl ScanService {
             *state.lock().unwrap_or_else(|e| e.into_inner()) = phase_to_state(phase);
 
             // 终态事件只发一次（统一出口，无重复）。
-            if phase == ScanPhase::Failed {
-                observer.emit(phase, final_progress.into(), message);
-            } else {
-                observer.emit(phase, final_progress.into(), None);
-            }
+            observer.emit(phase, final_progress.into(), message);
 
             // 终态后发一次 library.changed（带完整 envelope）。
             observer.emit_library_changed(None);
@@ -628,6 +643,12 @@ async fn run_scan_inner(
         }
         Err(e) => ScanOutcome::Failed(ScanReport::default(), e),
     }
+}
+
+/// 终态消息摘要：只保留权威失败条目数与固定文案，不含路径、文件名或错误原文。
+/// 无失败条目时返回 `None`（终态消息保持为空，不伪造额外状态）。
+fn terminal_error_summary(errors: u64) -> Option<String> {
+    (errors > 0).then(|| format!("{errors} 个条目未能索引"))
 }
 
 fn phase_to_state(phase: ScanPhase) -> TaskState {

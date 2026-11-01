@@ -202,13 +202,33 @@ function parseTimingLine(line: string): TimingLine | null {
   }
 }
 
-function escapeHtml(value: string): string {
+/**
+ * WebVTT cue text is not HTML: quotes are ordinary characters, and only the
+ * six character references below are defined. A cue text serializer must
+ * therefore decode those references once (otherwise `Tom &amp; Jerry` renders
+ * as literal `&amp;`) and re-escape only `&`, `<` and `>` so no markup can be
+ * injected. `>` escaping also keeps the reserved `-->` sequence out of cues.
+ */
+const WEBVTT_ENTITIES: Readonly<Record<string, string>> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  lrm: String.fromCharCode(0x200e),
+  rlm: String.fromCharCode(0x200f),
+  nbsp: String.fromCharCode(0x00a0),
+}
+
+function decodeWebVttEntities(value: string): string {
+  return value.replace(/&(amp|lt|gt|lrm|rlm|nbsp);/g, (whole, name: string) => (
+    WEBVTT_ENTITIES[name] ?? whole
+  ))
+}
+
+function escapeWebVttText(value: string): string {
   return value
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;")
 }
 
 function isSafeWebVttTag(value: string): boolean {
@@ -225,11 +245,12 @@ function sanitiseCueText(
   return raw
     .split(/(<[^>]*>)/g)
     .map((part) => {
-      if (!part.startsWith("<")) return escapeHtml(part)
+      // Decode only text segments: `&lt;b&gt;` is cue text, not markup.
+      if (!part.startsWith("<")) return escapeWebVttText(decodeWebVttEntities(part))
       if (/^<br\s*\/?>(?:$)/i.test(part)) return "\n"
       if (isSafeWebVttTag(part)) return part.toLowerCase()
       warnings.push(diagnostic("unsafe_markup", "字幕标签已转义，未允许的标记不会交给播放器解析。", cueIndex, line))
-      return escapeHtml(part)
+      return escapeWebVttText(part)
     })
     .join("")
 }
