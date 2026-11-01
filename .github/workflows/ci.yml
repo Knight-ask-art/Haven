@@ -198,7 +198,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@v7.1.0
         with:
           python-version: "3.x"
 
@@ -276,7 +276,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v7.1.0
         with:
           node-version-file: .node-version
           cache: npm
@@ -323,7 +323,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v7.1.0
         with:
           node-version-file: .node-version
           cache: npm
@@ -364,12 +364,12 @@ jobs:
           persist-credentials: false
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@v7.1.0
         with:
           python-version: "3.x"
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v7.1.0
         with:
           node-version-file: .node-version
           cache: npm
@@ -467,7 +467,7 @@ jobs:
           }
 
       - name: Upload the MCP runtime bundle
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mcp-runtime-${{ github.run_id }}
           path: |
@@ -511,7 +511,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@v7.1.0
         with:
           python-version: "3.x"
 
@@ -598,7 +598,7 @@ jobs:
       # Tauri-only checkout does not contain the ignored frontend dist output,
       # so create it here without running the unrelated frontend test suite.
       - name: Setup Node.js for Tauri bundle
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v7.1.0
         with:
           node-version-file: .node-version
           cache: npm
@@ -662,7 +662,7 @@ jobs:
       # root .node-version the other jobs use.  No Linux Rust target is installed:
       # this job builds the host target only.
       - name: Setup Node.js for Tauri assets
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v7.1.0
         with:
           node-version-file: .node-version
           cache: npm
@@ -720,14 +720,14 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "TMP=$temp"
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v7.1.0
         with:
           node-version-file: .node-version
           cache: npm
           cache-dependency-path: 前端/app/package-lock.json
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@v7.1.0
         with:
           python-version: "3.x"
 
@@ -759,7 +759,7 @@ jobs:
 
       - name: Upload film/TV CI evidence summary
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: film-tv-ci-evidence-${{ github.run_id }}
           path: ${{ runner.temp }}/film-tv-ci-evidence.json
