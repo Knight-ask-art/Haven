@@ -245,7 +245,7 @@ jobs:
           fi
 
       - name: Check release versions
-        run: python tools/release/version-check.py --version 0.1.0
+        run: python tools/release/version-check.py --version 0.1.1
 
       - name: Check repository whitespace integrity
         shell: pwsh
