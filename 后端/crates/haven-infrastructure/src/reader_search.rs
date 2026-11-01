@@ -370,7 +370,10 @@ fn enclosing_comment_end(html: &str, index: usize) -> Option<usize> {
 /// comment rather than after a completed one.
 fn enclosing_comment_start(html: &str, index: usize) -> Option<usize> {
     let comment_start = html[..index].rfind("<!--")?;
-    if html[..index].rfind("-->").is_some_and(|end| end > comment_start) {
+    if html[..index]
+        .rfind("-->")
+        .is_some_and(|end| end > comment_start)
+    {
         return None;
     }
     Some(comment_start)
@@ -582,18 +585,13 @@ fn extract_tag_text(html: &str, tag: &str) -> Option<String> {
     while let Some(relative) = lower[cursor..].find(&opening) {
         let after_name = cursor + relative + opening.len();
         cursor = after_name;
-        let boundary = lower[after_name..]
-            .chars()
-            .next()
-            .is_some_and(|character| {
-                character.is_ascii_whitespace() || character == '>' || character == '/'
-            });
+        let boundary = lower[after_name..].chars().next().is_some_and(|character| {
+            character.is_ascii_whitespace() || character == '>' || character == '/'
+        });
         if !boundary {
             continue;
         }
-        let Some(tag_end) = lower[after_name..].find('>') else {
-            return None;
-        };
+        let tag_end = lower[after_name..].find('>')?;
         let content_start = after_name + tag_end + 1;
         let Some(content_end) = lower[content_start..].find(&closing) else {
             // An unterminated candidate leaves the regex engine scanning for a

@@ -95,6 +95,8 @@ async function createProfileWith(profileId: string, endpoint: string) {
   await waitFor(() => expect(screen.queryByLabelText("配置 ID")).toBeNull())
   // 列表回读的 loading 分支也会暂时隐藏 ID；等待真正的草稿收敛。
   await waitFor(() => expect(screen.queryByTestId("ai-profile-draft-notice")).toBeNull())
+  // 父面板通过 effect 接收保存完成状态，等关闭入口解冻后才继续操作。
+  await waitFor(() => expect((screen.getByRole("button", { name: "关闭 AI 设置" }) as HTMLButtonElement).disabled).toBe(false))
 }
 
 describe("设置页 AI Provider 写入路径", () => {
@@ -577,6 +579,9 @@ describe("设置页 AI 面板：关闭未保存的草稿要确认", () => {
     }))
     fireEvent.click(screen.getByRole("button", { name: "保存" }))
     expect(await screen.findByText("临时写入失败")).toBeTruthy()
+
+    // 错误先渲染，父面板的 busy 状态由 effect 同步；等关闭入口可用后再模拟点击。
+    await waitFor(() => expect((screen.getByRole("button", { name: "关闭 AI 设置" }) as HTMLButtonElement).disabled).toBe(false))
 
     // 先取消一次关闭：这不是放弃，失败提示与重试都该原样留着。
     fireEvent.click(screen.getByRole("button", { name: "关闭 AI 设置" }))

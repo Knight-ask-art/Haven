@@ -1122,7 +1122,10 @@ mod tests {
         assert_eq!(entries[0].title, "News & more");
         assert_eq!(entries[1].title, "<b>Literal</b>");
         assert_eq!(entries[2].title, "A bold title");
-        let rss = parse_feed("<rss><channel><item><title>&lt;b&gt;Literal&lt;/b&gt;</title></item></channel></rss>").unwrap();
+        let rss = parse_feed(
+            "<rss><channel><item><title>&lt;b&gt;Literal&lt;/b&gt;</title></item></channel></rss>",
+        )
+        .unwrap();
         assert_eq!(rss[0].title, "<b>Literal</b>");
     }
 

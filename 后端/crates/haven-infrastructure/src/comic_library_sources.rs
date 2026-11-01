@@ -138,7 +138,8 @@ pub trait ComicLibraryGateway: Send + Sync {
         max_bytes: usize,
         transfer: Option<&'a RemoteTransferContext<'a>>,
         total_from_response: bool,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<LibraryResponse, AppError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<LibraryResponse, AppError>> + Send + 'a>>
+    {
         Box::pin(async move {
             let _ = total_from_response;
             if transfer.is_some_and(|value| value.limit_bps().is_some()) {
@@ -175,7 +176,8 @@ impl ComicLibraryGateway for HttpComicLibraryGateway {
         max_bytes: usize,
         transfer: Option<&'a RemoteTransferContext<'a>>,
         total_from_response: bool,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<LibraryResponse, AppError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<LibraryResponse, AppError>> + Send + 'a>>
+    {
         // `send_inner` 是 `async fn`，返回的 future 不能直接当作装箱 trait object；
         // 这里显式装箱，trait 的签名与所有 `send_with` 调用点保持不变。
         Box::pin(self.send_inner(request, max_bytes, transfer, total_from_response))

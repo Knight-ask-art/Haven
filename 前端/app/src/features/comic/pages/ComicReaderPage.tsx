@@ -185,6 +185,10 @@ function ComicPageView({
           <span>第 {page.pageNumber} 页加载失败，页面地址可能已过期</span>
           <button
             type="button"
+            onTouchStart={(event) => event.stopPropagation()}
+            onTouchMove={(event) => event.stopPropagation()}
+            onTouchEnd={(event) => event.stopPropagation()}
+            onTouchCancel={(event) => event.stopPropagation()}
             onClick={(event) => { event.stopPropagation(); onRecover(page.pageNumber) }}
             className="rounded-full bg-white px-4 py-1.5 text-[11px] font-semibold text-black hover:bg-white/85"
           >

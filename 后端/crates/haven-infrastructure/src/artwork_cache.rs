@@ -187,12 +187,11 @@ impl ArtworkCache {
                 .await?
             {
                 if original.fresh {
-                    match self
+                    if let Ok(response) = self
                         .generate_variant(artwork_id, variant, &original.response.bytes)
                         .await
                     {
-                        Ok(response) => return Ok(response),
-                        Err(_) => {}
+                        return Ok(response);
                     }
                 }
             }

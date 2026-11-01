@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use haven_application::services::download_batch::DownloadBatchService;
 use haven_application::services::ports::{
-    RemoteAcquisitionObserver, RemoteAcquisitionProgress, RemoteAcquisitionPort,
+    RemoteAcquisitionObserver, RemoteAcquisitionPort, RemoteAcquisitionProgress,
     RemoteTransferContext,
 };
 use haven_application::services::settings::SettingsService;
@@ -368,13 +368,19 @@ struct RemoteProgressSlot {
 
 impl RemoteProgressSlot {
     fn latest(&self) -> Option<RemoteAcquisitionProgress> {
-        *self.latest.lock().unwrap_or_else(|error| error.into_inner())
+        *self
+            .latest
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 }
 
 impl RemoteAcquisitionObserver for RemoteProgressSlot {
     fn on_progress(&self, progress: RemoteAcquisitionProgress) {
-        *self.latest.lock().unwrap_or_else(|error| error.into_inner()) = Some(progress);
+        *self
+            .latest
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(progress);
     }
 }
 
@@ -672,13 +678,7 @@ impl LocalDownloadRunner {
         {
             return self
                 .run_remote_inner(
-                    task_id,
-                    &task,
-                    &resource,
-                    &storage,
-                    *source_id,
-                    remote_id,
-                    policy,
+                    task_id, &task, &resource, &storage, *source_id, remote_id, policy,
                 )
                 .await;
         }
@@ -1079,6 +1079,8 @@ impl LocalDownloadRunner {
         Ok(())
     }
 
+    // Keep the validated source identity explicit alongside the queued task and resource.
+    #[allow(clippy::too_many_arguments)]
     async fn run_remote_inner(
         &self,
         task_id: DownloadTaskId,

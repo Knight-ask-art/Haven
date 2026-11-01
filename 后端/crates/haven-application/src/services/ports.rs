@@ -748,7 +748,8 @@ impl<'a> RemoteTransferContext<'a> {
     pub fn progress(&self) -> RemoteAcquisitionProgress {
         let state = *self.state.lock().unwrap_or_else(|error| error.into_inner());
         let elapsed = self.started.elapsed().as_secs_f64();
-        let speed_bps = (elapsed > 0.0).then(|| (state.network_bytes as f64 / elapsed).round() as u64);
+        let speed_bps =
+            (elapsed > 0.0).then(|| (state.network_bytes as f64 / elapsed).round() as u64);
         let bytes = match state.total_bytes {
             Some(total) => state.artifact_bytes.min(total),
             None => state.network_bytes,

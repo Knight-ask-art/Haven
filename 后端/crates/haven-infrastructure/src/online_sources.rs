@@ -565,7 +565,13 @@ impl OnlineCatalogProvider {
             let url = format!("{}/data/{hash}/{name}", base_url.trim_end_matches('/'));
             let bytes = self
                 .client
-                .bytes_with(&url, HostPolicy::MangadexCdn, MAX_MANGA_PAGE_BYTES, transfer, false)
+                .bytes_with(
+                    &url,
+                    HostPolicy::MangadexCdn,
+                    MAX_MANGA_PAGE_BYTES,
+                    transfer,
+                    false,
+                )
                 .await?;
             let extension = image_extension(&bytes)
                 .ok_or_else(|| source_unavailable("MangaDex 返回了非图片页面"))?;

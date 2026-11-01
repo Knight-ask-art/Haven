@@ -10,6 +10,7 @@
 //! - D1：改名/移动只在同一存储、同一根内、类型+MIME+size+首末指纹一致且有全量哈希相等、
 //!   旧路径缺失、目标未被占用、旧/新候选均唯一时复用原 Resource/MediaItem 链（保留进度、
 //!   书签、收藏、历史）；写入事务内重读复核，不猜测、不删除用户数据。
+//!
 //! 原则：
 //! - 扫描快、元数据后台（本版不做网络 enrichment）。
 //! - 文件身份 = StorageLocationId + Path + Size + ModifiedTime + FastFingerprint；

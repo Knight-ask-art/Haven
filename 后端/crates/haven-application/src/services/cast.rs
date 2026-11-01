@@ -944,8 +944,7 @@ pub mod test_doubles {
             let mut h = self.held.lock().unwrap_or_else(|e| e.into_inner());
             let before = h.len();
             h.retain(|g| g != grant);
-            let removed = h.len() != before;
-            removed
+            h.len() != before
         }
         fn lan_url(&self, grant: &str) -> Option<String> {
             Some(format!("http://127.0.0.1:3500/cast/{}", grant))
