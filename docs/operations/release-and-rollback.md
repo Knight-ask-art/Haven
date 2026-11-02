@@ -38,7 +38,10 @@ GitHub `releases/latest/download/latest.json` endpoint. The release workflow
 first creates a draft, validates version and frontend asset hashes, verifies
 the NSIS signature against the application's tracked public key, and extracts
 the installer to inspect the shipped executable's embedded build manifest.
-Only a verified stable draft is published as latest; prereleases stay drafts.
+Tag builds stay drafts, including stable versions, so installation and upgrade
+acceptance can use the exact signed candidate. After acceptance, publish that
+stable draft with `gh release edit <tag> --draft=false --latest --repo github.com/Knight-ask-art/Haven`. Do not rerun the build or replace assets between
+acceptance and publication; prereleases stay drafts.
 
 The updater manifest prefers NSIS. MSI remains a manual-download artifact.
 Published releases are immutable: retries cannot overwrite them, and fixes

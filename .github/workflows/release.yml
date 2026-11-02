@@ -242,14 +242,5 @@ jobs:
           gh release upload "$env:RELEASE_REF" '前端/app/dist/build-info.json#desktop-build-info.json' --clobber
           if ($LASTEXITCODE -ne 0) { throw 'Build provenance upload failed' }
 
-      # Stable versions alone advance releases/latest. Prereleases remain a
-      # verified draft and cannot silently alter the installed stable channel.
-      - name: Publish verified stable update
-        if: steps.release-version.outputs.prerelease == 'false'
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_REF: ${{ steps.release-version.outputs.release_ref }}
-        run: |
-          gh release edit "$env:RELEASE_REF" --draft=false --latest
-          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
+      # Keep the exact verified artifacts in draft for desktop/upgrade acceptance.
+      # Publish that draft after acceptance without rebuilding or replacing assets.

@@ -11,7 +11,7 @@ async-trait = "0.1.92"
 base64 = "0.23"
 fast-webp = { version = "=0.1.1", default-features = false, features = ["image"] }
 fs2 = "0.4.3"
-haven-application = { version = "0.1.0", path = "../haven-application" }
+haven-application = { version = "0.1.1", path = "../haven-application" }
 haven-common = { path = "../haven-common" }
 haven-domain = { path = "../haven-domain" }
 # workspace 的 reqwest 关掉了默认特性，因此不含任何压缩解码器。TVBox / FongMi 配置
